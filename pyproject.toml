@@ -1,0 +1,15 @@
+ [build-system]
+ requires = ["setuptools>=61"]
+ build-backend = "setuptools.build_meta"
+
+ [project]
+ name = "robo_trader"
+ version = "0.1.0"
+ description = "IBKR paper-trading scaffold with risk controls and tests"
+ requires-python = ">=3.10"
+ authors = [{ name = "Oliver" }]
+ dependencies = []
+
+ [tool.setuptools]
+ packages = ["robo_trader"]
+

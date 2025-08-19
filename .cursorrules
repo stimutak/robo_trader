@@ -1,0 +1,135 @@
+## Cursor Rules — Robo Trader
+
+### Project Overview
+- **Name**: robo_trader
+- **Mission**: Build a safe, testable, risk-managed trading framework that connects to IBKR for market data and supports paper trading by default. The system emphasizes capital preservation, clarity, and reproducibility. Live execution is gated behind explicit user approval and risk checks.
+
+### Current Structure
+```
+robo_trader/
+├── robo_trader/
+│   ├── __init__.py
+│   ├── config.py              # Env-driven configuration
+│   ├── ibkr_client.py         # Async ib_insync client wrapper
+│   ├── execution.py           # Paper execution simulator
+│   ├── risk.py                # Position sizing & exposure checks
+│   ├── strategies.py          # SMA crossover example
+│   └── runner.py              # Example orchestrator (paper only)
+├── tests/
+│   ├── test_risk.py
+│   └── test_strategies.py
+├── requirements.txt
+└── pyproject.toml
+```
+
+### Core Philosophy (adapted from CLAUDE.md)
+- **Capital Preservation First**: Risk limits are non-negotiable.
+- **Clarity Over Cleverness**: Prefer straightforward, readable code.
+- **No Unnecessary Abstraction**: Solve the problem directly; keep modules small and purpose-driven.
+- **Fix In Place**: Improve existing modules before adding new ones.
+- **Test Everything**: Maintain and extend tests for risk logic, strategies, and integrations.
+- **Determinism & Reproducibility**: Make results reproducible given the same inputs and environment.
+
+### Critical Constraints
+#### NEVER DO
+- ❌ Execute live trades by default. Live execution requires explicit user approval and risk sign-off.
+- ❌ Commit API keys, credentials, or PII. Use environment variables via `.env` + `python-dotenv`.
+- ❌ Create duplicate files (e.g., `*-v2.py`, `*-enhanced.py`). Refactor in place.
+- ❌ Add complex frameworks or abstractions for simple tasks.
+- ❌ Bypass or weaken risk checks (daily loss, symbol exposure, leverage).
+- ❌ Promise profits or rely on unverified predictive claims.
+- ❌ Use `print` debugging in library code. Prefer structured logging (future module) and tests.
+
+#### ALWAYS DO
+- ✅ Search for existing code before adding new modules.
+- ✅ Keep paper trading as the default runtime. Guard any live path behind config and explicit approval.
+- ✅ Enforce strict type hints and readable naming.
+- ✅ Write tests for new features; keep the test suite green.
+- ✅ Document the why for meaningful changes in module docstrings.
+- ✅ Validate inputs; handle error/edge cases first.
+- ✅ Keep functions small, with clear responsibilities.
+
+### Tech Stack
+- **Language**: Python (>=3.10, currently 3.13)
+- **Data & IO**: pandas, numpy
+- **Broker API**: ib_insync (IBKR)
+- **Config**: python-dotenv
+- **Tests**: pytest
+
+### Development Commands
+```bash
+# Setup
+python3 -m venv .venv && source .venv/bin/activate
+pip install -U pip setuptools wheel
+pip install -r requirements.txt
+pip install -e .
+
+# Tests
+pytest -q
+
+# Run example paper-trading loop
+python -m robo_trader.runner
+```
+
+### Configuration
+- All runtime configuration is read via `robo_trader/config.py` from environment variables.
+- Defaults are conservative; symbols default to `AAPL,MSFT,SPY`.
+- Required envs for IBKR connectivity: `IBKR_HOST`, `IBKR_PORT`, `IBKR_CLIENT_ID`.
+- Trading mode: `TRADING_MODE=paper` by default. Live requires explicit change and approval.
+
+### Risk Management
+- Implemented in `robo_trader/risk.py` with tests in `tests/test_risk.py`.
+- Enforces: max daily loss, per-symbol exposure cap, and leverage limit.
+- Position sizing uses a fraction of available cash; size calculations must be deterministic.
+
+### Strategy Guidelines
+- Example SMA crossover is in `robo_trader/strategies.py` and covered by tests.
+- Keep signals pure and reproducible. Input → Output with no side effects.
+- Add more strategies only when tests and risk interactions are clear.
+
+### Testing Requirements (relevant from CLAUDE.md)
+- Run unit tests before any commit. Add/extend tests for new logic.
+- Cover edge cases, especially around risk limits and order validation.
+- Keep the test suite fast and deterministic.
+
+### Security Checklist (relevant from CLAUDE.md)
+- [ ] API keys only via environment variables
+- [ ] Never commit `.env` or secrets
+- [ ] Sanitize logs (no PII/secrets)
+- [ ] Respect IBKR pacing/rate limits when added
+- [ ] Pin or vet dependencies regularly
+
+### Git Workflow (relevant from CLAUDE.md)
+1. Branch from main: `feature/short-description`
+2. Use semantic commits with concise rationale
+3. Keep tests green locally before PR
+4. Squash merge to main
+
+### File Creation Policy (relevant from CLAUDE.md)
+- Create new files only when the change cannot be made clearly in-place.
+- If adding a new module, document why it exists, expected inputs/outputs, and tests.
+
+### Logging & Observability
+- Prefer structured logging (planned) over `print`. For now, keep library code quiet; rely on tests.
+- When adding logging, route through a central logger with levels and context.
+
+### Live Trading Safeguards
+- Live execution paths must:
+  - Check `TRADING_MODE == "live"` and require explicit user confirmation in PR/commit context.
+  - Pass all tests and include integration tests or dry-run harnesses.
+  - Enforce risk checks identically to paper mode.
+  - Provide clear rollback switches and maximum notional limits.
+
+### Code Style
+- Descriptive names, explicit types, early returns, narrow responsibilities, and comprehensive docstrings for complex logic.
+- Avoid deep nesting; validate inputs and errors first.
+- Keep formatting consistent with existing files; do not reformat unrelated code in edits.
+
+### Non-Goals
+- Predicting markets or guaranteeing returns.
+- Building UI or web services unless explicitly requested.
+
+---
+This ruleset adapts the relevant ALWAYS/NEVER, testing discipline, security checklist, and workflow guidance from the provided CLAUDE.md while grounding them in this Python/IBKR trading context. Use these rules to guide all automated edits and assistance in this repository.
+
+
