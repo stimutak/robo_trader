@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Dict
+from typing import Dict, List
 
 import pandas as pd
 
@@ -10,9 +10,19 @@ from .execution import Order, PaperExecutor
 from .ibkr_client import IBKRClient
 from .risk import Position, RiskManager
 from .strategies import sma_crossover_signals
+from .logger import get_logger
+
+import argparse
 
 
-async def run_once() -> None:
+logger = get_logger(__name__)
+
+
+async def run_once(
+    override_symbols: List[str] | None = None,
+    duration: str = "10 D",
+    bar_size: str = "30 mins",
+) -> None:
     cfg = load_config()
     ib = IBKRClient(cfg.ibkr_host, cfg.ibkr_port, cfg.ibkr_client_id)
     await ib.connect(readonly=True)
@@ -30,8 +40,11 @@ async def run_once() -> None:
     daily_pnl = 0.0
     positions: Dict[str, Position] = {}
 
-    for symbol in cfg.symbols:
-        df = await ib.fetch_recent_bars(symbol, duration="10 D", bar_size="30 mins")
+    symbols = override_symbols if override_symbols else cfg.symbols
+    logger.info(f"Processing symbols: {symbols}")
+
+    for symbol in symbols:
+        df = await ib.fetch_recent_bars(symbol, duration=duration, bar_size=bar_size)
         if df.empty:
             continue
         # Normalize columns
@@ -59,7 +72,19 @@ async def run_once() -> None:
 
 
 def main() -> None:
-    asyncio.run(run_once())
+    parser = argparse.ArgumentParser(description="Robo Trader runner (paper by default)")
+    parser.add_argument("--symbols", type=str, help="Comma-separated symbols to override config", default="")
+    parser.add_argument("--duration", type=str, help="IB duration string (e.g. '10 D')", default="10 D")
+    parser.add_argument("--bar-size", type=str, help="IB bar size (e.g. '30 mins')", default="30 mins")
+    parser.add_argument("--confirm-live", action="store_true", help="Required confirmation flag for live mode")
+    args = parser.parse_args()
+
+    cfg = load_config()
+    if cfg.trading_mode.lower() == "live" and not args.confirm_live:
+        raise SystemExit("Refusing to run in live mode without --confirm-live")
+
+    override_symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()] if args.symbols else None
+    asyncio.run(run_once(override_symbols, args.duration, args.bar_size))
 
 
 if __name__ == "__main__":
