@@ -4,6 +4,7 @@ import asyncio
 from typing import Optional
 
 from ib_insync import IB, Stock, util
+import pandas as pd
 
 
 class IBKRClient:
@@ -53,5 +54,54 @@ class IBKRClient:
             useRTH=True,
             formatDate=1,
         )
-        return util.df(bars)
+        raw_df = util.df(bars)
+        return normalize_bars_df(raw_df)
+
+
+def normalize_bars_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize IB historical bars DataFrame for deterministic downstream use.
+
+    - Lowercase column names
+    - Keep standard OHLCV columns when present
+    - Coerce numeric types where possible
+    - Drop rows with NaN in close
+    - Sort by index if datetime index, else by a 'date'/'time' column if present
+    """
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
+
+    data = df.copy()
+    data.columns = [str(c).lower() for c in data.columns]
+
+    # Standard column subset if present
+    preferred_cols = [c for c in ["date", "time", "open", "high", "low", "close", "volume"] if c in data.columns]
+    if preferred_cols:
+        data = data[preferred_cols]
+
+    # Coerce numerics
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col in data.columns:
+            data[col] = pd.to_numeric(data[col], errors="coerce")
+
+    # Drop rows without close
+    if "close" in data.columns:
+        data = data.dropna(subset=["close"])
+
+    # Sort chronologically
+    if isinstance(data.index, pd.DatetimeIndex):
+        data = data.sort_index()
+    elif "date" in data.columns:
+        try:
+            data["date"] = pd.to_datetime(data["date"], errors="coerce")
+            data = data.sort_values("date")
+        except Exception:
+            pass
+    elif "time" in data.columns:
+        try:
+            data["time"] = pd.to_datetime(data["time"], errors="coerce")
+            data = data.sort_values("time")
+        except Exception:
+            pass
+
+    return data.reset_index(drop=False)
 
