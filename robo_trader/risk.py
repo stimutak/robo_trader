@@ -23,11 +23,15 @@ class RiskManager:
         max_position_risk_pct: float,
         max_symbol_exposure_pct: float,
         max_leverage: float,
+        max_order_notional: float | None = None,
+        max_daily_notional: float | None = None,
     ) -> None:
         self.max_daily_loss = float(max_daily_loss)
         self.max_position_risk_pct = float(max_position_risk_pct)
         self.max_symbol_exposure_pct = float(max_symbol_exposure_pct)
         self.max_leverage = float(max_leverage)
+        self.max_order_notional = float(max_order_notional) if max_order_notional is not None else None
+        self.max_daily_notional = float(max_daily_notional) if max_daily_notional is not None else None
 
     def position_size(self, cash_available: float, entry_price: float) -> int:
         """Risk-based position size using a fraction of equity per position.
@@ -47,6 +51,7 @@ class RiskManager:
         equity: float,
         daily_pnl: float,
         current_positions: Dict[str, Position],
+        daily_executed_notional: float = 0.0,
     ) -> Tuple[bool, str]:
         if daily_pnl <= -abs(self.max_daily_loss):
             return False, "Daily loss limit reached"
@@ -56,6 +61,14 @@ class RiskManager:
             return False, "Invalid price"
 
         symbol_exposure_notional = price * order_qty
+
+        # Per-order notional ceiling
+        if self.max_order_notional is not None and symbol_exposure_notional > self.max_order_notional:
+            return False, "Order notional exceeds per-order limit"
+
+        # Per-day notional ceiling
+        if self.max_daily_notional is not None and (daily_executed_notional + symbol_exposure_notional) > self.max_daily_notional:
+            return False, "Daily notional exceeds limit"
         max_symbol_notional = equity * self.max_symbol_exposure_pct
         if symbol_exposure_notional > max_symbol_notional:
             return False, "Symbol exposure exceeds limit"

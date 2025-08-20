@@ -32,8 +32,9 @@ class PaperExecutor(AbstractExecutor):
     to test logic without touching live accounts.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, slippage_bps: float = 0.0) -> None:
         self.fills: Dict[str, Tuple[dt.datetime, Order, float]] = {}
+        self.slippage_bps = float(slippage_bps)
 
     def place_order(self, order: Order) -> ExecutionResult:
         if order.quantity <= 0:
@@ -42,7 +43,10 @@ class PaperExecutor(AbstractExecutor):
         if side not in {"BUY", "SELL"}:
             return ExecutionResult(False, "Side must be BUY or SELL")
         # For paper, we mark fill at limit price if provided else 0.0 as placeholder
-        fill = order.price if order.price is not None else 0.0
+        base = order.price if order.price is not None else 0.0
+        # Apply symmetric slippage in basis points
+        slip = base * (self.slippage_bps / 10_000.0) if base > 0 else 0.0
+        fill = base + slip if side == "BUY" else base - slip
         self.fills[f"{order.symbol}-{len(self.fills)+1}"] = (dt.datetime.utcnow(), order, fill)
         return ExecutionResult(True, "Paper fill", fill)
 
