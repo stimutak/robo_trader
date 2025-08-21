@@ -1,0 +1,315 @@
+"""
+AI-powered trading runner with news analysis and event processing.
+Integrates news feeds, Claude AI, and Kelly position sizing.
+"""
+
+import asyncio
+from typing import Dict, List, Optional
+from datetime import datetime, timezone
+import os
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from .config import load_config
+from .execution import Order, PaperExecutor
+from .ibkr_client import IBKRClient
+from .risk import RiskManager
+from .logger import get_logger
+from .portfolio import Portfolio
+from .retry import retry_async
+
+# AI components
+from .news import NewsAggregator
+from .intelligence import ClaudeTrader
+from .events import EventProcessor, EventType, SignalEvent, OrderEvent
+from .kelly import KellyCalculator
+
+logger = get_logger(__name__)
+
+
+class AITradingSystem:
+    """Complete AI-powered trading system."""
+    
+    def __init__(
+        self,
+        symbols: List[str],
+        use_ai: bool = True,
+        news_check_interval: int = 300,  # 5 minutes
+        capital: float = 100000.0
+    ):
+        """
+        Initialize AI trading system.
+        
+        Args:
+            symbols: List of symbols to trade
+            use_ai: Whether to use Claude AI for analysis
+            news_check_interval: Seconds between news checks
+            capital: Starting capital
+        """
+        self.symbols = symbols
+        self.use_ai = use_ai
+        self.news_check_interval = news_check_interval
+        self.capital = capital
+        
+        # Core components (will be initialized in setup)
+        self.ib_client: Optional[IBKRClient] = None
+        self.risk_manager: Optional[RiskManager] = None
+        self.executor: Optional[PaperExecutor] = None
+        self.portfolio: Optional[Portfolio] = None
+        
+        # AI components
+        self.news_aggregator: Optional[NewsAggregator] = None
+        self.ai_trader: Optional[ClaudeTrader] = None
+        self.event_processor: Optional[EventProcessor] = None
+        self.kelly_calc: Optional[KellyCalculator] = None
+        
+        # State tracking
+        self.is_running = False
+        self.stats = {
+            "news_processed": 0,
+            "signals_generated": 0,
+            "trades_executed": 0,
+            "ai_analyses": 0
+        }
+        
+    async def setup(self):
+        """Initialize all components."""
+        logger.info("Setting up AI Trading System...")
+        
+        # Load config
+        cfg = load_config()
+        
+        # Setup IB connection
+        self.ib_client = IBKRClient(cfg.ibkr_host, cfg.ibkr_port, cfg.ibkr_client_id)
+        await retry_async(lambda: self.ib_client.connect(readonly=False))
+        logger.info("✓ Connected to Interactive Brokers")
+        
+        # Setup risk and execution
+        self.risk_manager = RiskManager(
+            max_daily_loss=cfg.max_daily_loss,
+            max_position_risk_pct=cfg.max_position_risk_pct,
+            max_symbol_exposure_pct=cfg.max_symbol_exposure_pct,
+            max_leverage=cfg.max_leverage
+        )
+        self.executor = PaperExecutor(slippage_bps=5.0)
+        self.portfolio = Portfolio(self.capital)
+        logger.info("✓ Risk management and execution ready")
+        
+        # Setup AI components
+        self.news_aggregator = NewsAggregator(self.symbols, lookback_hours=6)
+        logger.info("✓ News aggregator initialized")
+        
+        if self.use_ai and os.getenv("ANTHROPIC_API_KEY"):
+            try:
+                self.ai_trader = ClaudeTrader()
+                logger.info("✓ Claude AI trader initialized")
+            except Exception as e:
+                logger.warning(f"Could not initialize Claude AI: {e}")
+                self.use_ai = False
+        
+        self.kelly_calc = KellyCalculator(capital=self.capital)
+        logger.info("✓ Kelly calculator ready")
+        
+        # Setup event processor
+        self.event_processor = EventProcessor(
+            symbols=self.symbols,
+            risk_manager=self.risk_manager,
+            ai_trader=self.ai_trader,
+            news_aggregator=self.news_aggregator
+        )
+        
+        # Register custom handlers
+        self.event_processor.register_handler(EventType.ORDER, self._handle_order)
+        logger.info("✓ Event processor configured")
+        
+        logger.info("AI Trading System setup complete!")
+        
+    async def _handle_order(self, event: OrderEvent):
+        """Execute orders through IB."""
+        try:
+            # Get current price
+            bars = await self.ib_client.request_historical_data(
+                symbol=event.symbol,
+                duration="1 D",
+                bar_size="1 min"
+            )
+            
+            if bars.empty:
+                logger.warning(f"No price data for {event.symbol}")
+                return
+                
+            current_price = bars.iloc[-1]['close']
+            
+            # Create order
+            order = Order(
+                symbol=event.symbol,
+                action=event.action,
+                quantity=event.quantity,
+                order_type=event.order_type,
+                limit_price=event.limit_price
+            )
+            
+            # Risk check
+            position = Position(
+                symbol=event.symbol,
+                quantity=event.quantity if event.action == "BUY" else -event.quantity,
+                entry_price=current_price
+            )
+            
+            if self.risk_manager.check_position_risk(position, self.portfolio.equity):
+                # Execute
+                fill = self.executor.execute(order, current_price)
+                if fill:
+                    self.portfolio.update_position(
+                        event.symbol,
+                        event.quantity if event.action == "BUY" else -event.quantity,
+                        fill.fill_price
+                    )
+                    
+                    logger.info(
+                        f"✓ Executed: {event.action} {event.quantity} {event.symbol} "
+                        f"@ ${fill.fill_price:.2f}"
+                    )
+                    self.stats["trades_executed"] += 1
+            else:
+                logger.warning(f"Risk check failed for {event.symbol} order")
+                
+        except Exception as e:
+            logger.error(f"Error executing order: {e}")
+            
+    async def process_news_cycle(self):
+        """Fetch and process news in a cycle."""
+        while self.is_running:
+            try:
+                # Fetch latest news
+                logger.info("Fetching latest news...")
+                new_count, total = await self.news_aggregator.update()
+                
+                if new_count > 0:
+                    logger.info(f"Found {new_count} new articles")
+                    self.stats["news_processed"] += new_count
+                    
+                    # Process high-impact news through events
+                    high_impact = self.news_aggregator.get_high_impact_news(min_relevance=0.4)
+                    
+                    for news_item in high_impact[:5]:  # Process top 5
+                        # The event processor will handle AI analysis
+                        pass  # Events are processed automatically
+                        
+                # Wait before next check
+                await asyncio.sleep(self.news_check_interval)
+                
+            except Exception as e:
+                logger.error(f"Error in news cycle: {e}")
+                await asyncio.sleep(60)  # Wait a bit on error
+                
+    async def process_market_data(self):
+        """Monitor market data and generate signals."""
+        while self.is_running:
+            try:
+                # Get latest prices for all symbols
+                for symbol in self.symbols:
+                    bars = await self.ib_client.request_historical_data(
+                        symbol=symbol,
+                        duration="1 D",
+                        bar_size="5 mins"
+                    )
+                    
+                    if not bars.empty:
+                        current_price = bars.iloc[-1]['close']
+                        prev_close = bars.iloc[-2]['close'] if len(bars) > 1 else current_price
+                        
+                        # Calculate basic metrics
+                        price_change = (current_price - prev_close) / prev_close
+                        
+                        # Log significant moves
+                        if abs(price_change) > 0.01:  # 1% move
+                            logger.info(f"{symbol}: ${current_price:.2f} ({price_change:+.2%})")
+                            
+                await asyncio.sleep(60)  # Check every minute
+                
+            except Exception as e:
+                logger.error(f"Error processing market data: {e}")
+                await asyncio.sleep(30)
+                
+    async def run(self):
+        """Main trading loop."""
+        if not self.is_running:
+            self.is_running = True
+            logger.info("Starting AI Trading System...")
+            
+            # Start all async tasks
+            tasks = [
+                asyncio.create_task(self.event_processor.process_events()),
+                asyncio.create_task(self.event_processor.ingest_news()),
+                asyncio.create_task(self.process_market_data()),
+            ]
+            
+            if self.use_ai:
+                tasks.append(asyncio.create_task(self.process_news_cycle()))
+                
+            try:
+                await asyncio.gather(*tasks)
+            except KeyboardInterrupt:
+                logger.info("Shutting down AI Trading System...")
+                self.is_running = False
+                
+    async def stop(self):
+        """Stop the trading system."""
+        self.is_running = False
+        if self.ib_client and self.ib_client.ib:
+            self.ib_client.ib.disconnect()
+        logger.info("AI Trading System stopped")
+        
+    def get_status(self) -> Dict:
+        """Get system status for dashboard."""
+        return {
+            "is_running": self.is_running,
+            "ai_enabled": self.use_ai and self.ai_trader is not None,
+            "symbols": self.symbols,
+            "stats": self.stats,
+            "portfolio": {
+                "equity": self.portfolio.equity if self.portfolio else 0,
+                "cash": self.portfolio.cash if self.portfolio else 0,
+                "positions": self.portfolio.positions if self.portfolio else {}
+            },
+            "event_stats": self.event_processor.get_event_stats() if self.event_processor else {}
+        }
+
+
+async def main():
+    """Run the AI trading system."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="AI-Powered Trading System")
+    parser.add_argument("--symbols", type=str, default="SPY,QQQ,AAPL,TSLA,NVDA",
+                       help="Comma-separated symbols to trade")
+    parser.add_argument("--no-ai", action="store_true",
+                       help="Disable AI analysis")
+    parser.add_argument("--capital", type=float, default=100000,
+                       help="Starting capital")
+    
+    args = parser.parse_args()
+    
+    symbols = args.symbols.split(",")
+    
+    # Create and setup system
+    system = AITradingSystem(
+        symbols=symbols,
+        use_ai=not args.no_ai,
+        capital=args.capital
+    )
+    
+    await system.setup()
+    
+    # Run
+    try:
+        await system.run()
+    except KeyboardInterrupt:
+        logger.info("\nShutting down...")
+        await system.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

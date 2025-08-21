@@ -7,6 +7,11 @@ Tests: News → Sentiment → Claude AI → Signal → Kelly Sizing
 import asyncio
 import os
 from datetime import datetime, timezone
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
 from robo_trader.news import NewsAggregator
 from robo_trader.intelligence import ClaudeTrader
 from robo_trader.events import EventProcessor, NewsEvent, EventType
