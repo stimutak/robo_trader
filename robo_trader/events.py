@@ -226,9 +226,11 @@ class EventProcessor:
         
         # Get AI analysis
         try:
+            # Convert to format expected by ClaudeTrader
             analysis = await self.ai_trader.analyze_market_event(
-                event_type="news",
-                event_data=market_context
+                event_text=f"{event.news_item.title}\n\n{event.news_item.summary}",
+                symbol=event.news_item.symbols[0] if event.news_item.symbols else "SPY",
+                market_data=market_context
             )
             
             if analysis and analysis.get("conviction", 0) > 0.6:
