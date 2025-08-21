@@ -67,8 +67,9 @@ pip install -r requirements.txt
 #   - ANTHROPIC_API_KEY (for Claude AI)
 #   - IBKR_PORT=7497 (TWS paper trading)
 
-# 3) START AI TRADING! 🤖
-python start_ai_trading.py
+# 3) START EVERYTHING! 🤖
+./restart_trading.sh
+# This starts both dashboard and AI trading system
 ```
 
 That's it! The bot will:
@@ -81,9 +82,8 @@ That's it! The bot will:
 ### 📊 Monitor Your Bot
 
 **Web Dashboard** (http://localhost:5555):
-```bash
-python app.py  # Start web dashboard
-```
+- Automatically starts with `./restart_trading.sh`
+- Or run separately: `python app.py`
 
 **Test Components**:
 ```bash

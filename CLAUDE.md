@@ -150,7 +150,19 @@ pip install -e .
 # Tests
 pytest -q
 
-# Run paper trading
+# PREFERRED: Start complete system (dashboard + AI trading)
+./restart_trading.sh
+# This script:
+# - Kills any existing processes cleanly
+# - Starts dashboard at http://localhost:5555
+# - Starts AI trading with all 21 symbols
+# - Activates virtual environment automatically
+
+# Alternative: Manual startup
+python app.py &  # Start dashboard
+python start_ai_trading.py  # Start AI trading with 21 symbols
+
+# Legacy: Direct runner (requires manual symbol list)
 python -m robo_trader.runner --symbols SPY,QQQ,TSLA
 
 # Run with custom parameters
