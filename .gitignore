@@ -10,4 +10,19 @@ build/
 dist/
 *.egg-info/
 
+# IB Client Portal Gateway
+clientportal.gw/logs/
+clientportal.gw/.vertx/
+*.log
+cookies.txt
+
+# Downloaded files
+*.zip
+*.dmg
+
+# Duplicate files from extraction
+/root/
+/doc/
+/bin/
+
 
