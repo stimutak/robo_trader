@@ -1,9 +1,35 @@
 {
   "default": {
-    "symbols": ["AAPL", "NVDA", "TSLA", "IXHL", "NUAI", "BZAI", "ELTP", "OPEN", "ADA", "HBAR", "CEG", "VRT", "PLTR", "UPST", "TEM", "HTFL", "SDGR", "APLD", "SOFI", "CORZ", "WULF"],
-    "risk_level": "moderate",
+    "symbols": [
+      "AAPL",
+      "NVDA",
+      "TSLA",
+      "IXHL",
+      "NUAI",
+      "BZAI",
+      "ELTP",
+      "OPEN",
+      "ADA",
+      "HBAR",
+      "CEG",
+      "VRT",
+      "PLTR",
+      "UPST",
+      "TEM",
+      "HTFL",
+      "SDGR",
+      "APLD",
+      "SOFI",
+      "CORZ",
+      "WULF"
+    ],
+    "risk_level": "aggressive",
     "max_daily_loss": 1000,
-    "news_sources": ["bloomberg", "cnbc", "marketwatch"],
+    "news_sources": [
+      "bloomberg",
+      "cnbc",
+      "marketwatch"
+    ],
     "conviction_threshold": 75,
     "position_size_pct": 2.0
   }

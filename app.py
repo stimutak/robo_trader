@@ -472,6 +472,7 @@ DASHBOARD_HTML = '''
             background: var(--surface-hover);
         }
     </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
     <div class="container">
@@ -523,6 +524,19 @@ DASHBOARD_HTML = '''
             <div class="ticker-label">LIVE</div>
             <div id="tickerContent" class="ticker-content">
                 Loading market news...
+            </div>
+        </div>
+        
+        <!-- Price Chart -->
+        <div class="section">
+            <div class="section-header">
+                <h2 class="section-title">Price Chart</h2>
+                <select id="chartSymbol" class="select" style="width: 120px;" onchange="updateChartSymbol()">
+                    <!-- Will be populated dynamically -->
+                </select>
+            </div>
+            <div class="section-content" style="height: 250px; padding: 16px; position: relative;">
+                <canvas id="priceChart"></canvas>
             </div>
         </div>
         
@@ -619,6 +633,200 @@ DASHBOARD_HTML = '''
         // Load settings on page load
         loadSettings();
         
+        // Chart setup
+        let priceChart = null;
+        let priceHistory = {};
+        let currentChartSymbol = 'AAPL';  // Default to first watchlist symbol
+        let watchlistSymbols = [];
+        
+        function initChart() {
+            const ctx = document.getElementById('priceChart').getContext('2d');
+            priceChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: 'Price',
+                        data: [],
+                        borderColor: '#4a9eff',
+                        backgroundColor: 'rgba(74, 158, 255, 0.05)',
+                        borderWidth: 2,
+                        tension: 0.3,
+                        pointRadius: 0,
+                        pointHoverRadius: 5,
+                        pointHoverBackgroundColor: '#4a9eff',
+                        pointHoverBorderColor: '#4a9eff'
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        intersect: false,
+                        mode: 'index'
+                    },
+                    plugins: {
+                        legend: {
+                            display: false
+                        },
+                        tooltip: {
+                            backgroundColor: 'rgba(17, 17, 17, 0.95)',
+                            titleColor: '#b4b4b4',
+                            bodyColor: '#8b8b8b',
+                            borderColor: '#2a2a2a',
+                            borderWidth: 1,
+                            padding: 10,
+                            displayColors: false,
+                            callbacks: {
+                                label: function(context) {
+                                    return '$' + context.parsed.y.toFixed(2);
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            grid: {
+                                color: 'rgba(255, 255, 255, 0.03)',
+                                drawBorder: false
+                            },
+                            ticks: {
+                                color: '#5a5a5a',
+                                font: {
+                                    size: 10
+                                },
+                                maxRotation: 0,
+                                autoSkip: true,
+                                maxTicksLimit: 8
+                            }
+                        },
+                        y: {
+                            position: 'right',
+                            grid: {
+                                color: 'rgba(255, 255, 255, 0.03)',
+                                drawBorder: false
+                            },
+                            ticks: {
+                                color: '#5a5a5a',
+                                font: {
+                                    size: 10
+                                },
+                                callback: function(value) {
+                                    return '$' + value.toFixed(0);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        
+        function updateChartSymbol() {
+            currentChartSymbol = document.getElementById('chartSymbol').value;
+            
+            // Check if we have data for this symbol, if not fetch it
+            if (!priceHistory[currentChartSymbol] || priceHistory[currentChartSymbol].length === 0) {
+                fetch(`/api/prices/${currentChartSymbol}`)
+                    .then(r => r.json())
+                    .then(prices => {
+                        priceHistory[currentChartSymbol] = prices;
+                        updateChart();
+                    })
+                    .catch(err => {
+                        console.error('Failed to fetch price data:', err);
+                    });
+            } else {
+                updateChart();
+            }
+        }
+        
+        function updateChart() {
+            if (!priceChart) return;
+            
+            const data = priceHistory[currentChartSymbol] || [];
+            if (data.length > 0) {
+                priceChart.data.labels = data.map(d => d.time);
+                priceChart.data.datasets[0].data = data.map(d => d.price);
+                priceChart.update('none');
+            }
+        }
+        
+        function addPricePoint(symbol, price) {
+            if (!priceHistory[symbol]) {
+                priceHistory[symbol] = [];
+            }
+            
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString('en-US', { 
+                hour: '2-digit', 
+                minute: '2-digit',
+                hour12: false 
+            });
+            
+            priceHistory[symbol].push({
+                time: timeStr,
+                price: price
+            });
+            
+            // Keep only last 30 points
+            if (priceHistory[symbol].length > 30) {
+                priceHistory[symbol].shift();
+            }
+            
+            // Update chart if showing this symbol
+            if (symbol === currentChartSymbol) {
+                updateChart();
+            }
+        }
+        
+        // Initialize chart on load
+        window.addEventListener('DOMContentLoaded', () => {
+            initChart();
+            // Load settings and populate symbols
+            loadChartSymbols();
+            // Load initial price data
+            loadInitialPrices();
+        });
+        
+        function loadChartSymbols() {
+            // Get user symbols from settings
+            fetch('/api/settings')
+                .then(r => r.json())
+                .then(settings => {
+                    watchlistSymbols = settings.symbols || [
+                        "AAPL", "NVDA", "TSLA", "IXHL", "NUAI", "BZAI", "ELTP", 
+                        "OPEN", "ADA", "HBAR", "CEG", "VRT", "PLTR", "UPST", 
+                        "TEM", "HTFL", "SDGR", "APLD", "SOFI", "CORZ", "WULF"
+                    ];
+                    
+                    // Populate dropdown
+                    const select = document.getElementById('chartSymbol');
+                    select.innerHTML = '';
+                    watchlistSymbols.forEach(symbol => {
+                        const option = document.createElement('option');
+                        option.value = symbol;
+                        option.textContent = symbol;
+                        select.appendChild(option);
+                    });
+                    
+                    // Set initial symbol
+                    currentChartSymbol = watchlistSymbols[0];
+                    select.value = currentChartSymbol;
+                });
+        }
+        
+        function loadInitialPrices() {
+            // Load price data for default symbol
+            setTimeout(() => {
+                fetch(`/api/prices/${currentChartSymbol}`)
+                    .then(r => r.json())
+                    .then(prices => {
+                        priceHistory[currentChartSymbol] = prices;
+                        updateChart();
+                    });
+            }, 500);  // Small delay to ensure symbols are loaded
+        }
+        
         // Update dashboard every 2 seconds
         setInterval(updateDashboard, 2000);
         
@@ -691,6 +899,13 @@ DASHBOARD_HTML = '''
                     
                     // Update log
                     updateLog(data.log);
+                    
+                    // Update price data for charts
+                    if (data.price_data) {
+                        for (const [symbol, price] of Object.entries(data.price_data)) {
+                            addPricePoint(symbol, price);
+                        }
+                    }
                 });
         }
         
@@ -873,6 +1088,14 @@ def index():
 @app.route('/api/status')
 def get_status():
     global trading_status, pnl, positions, ai_decisions, trading_log, news_feed, trading_signals, options_flow
+    
+    # Extract current prices from positions
+    price_data = {}
+    if positions:
+        for symbol, pos in positions.items():
+            if 'current_price' in pos:
+                price_data[symbol] = pos['current_price']
+    
     return jsonify({
         'status': trading_status,
         'pnl': pnl,
@@ -881,7 +1104,8 @@ def get_status():
         'news_feed': news_feed[-10:],
         'trading_signals': trading_signals[-5:],
         'options_flow': options_flow[-5:],
-        'log': trading_log[-20:]
+        'log': trading_log[-20:],
+        'price_data': price_data
     })
 
 @app.route('/api/start', methods=['POST'])
@@ -931,6 +1155,55 @@ def update_news():
         news_feed = data['news']
         return jsonify({'status': 'updated'})
     return jsonify({'error': 'Invalid data'}), 400
+
+@app.route('/api/prices/<symbol>')
+def get_price_history(symbol):
+    """Get simulated price history for a symbol."""
+    import random
+    import datetime
+    
+    # Generate simulated price data
+    base_prices = {
+        'AAPL': 175.0,
+        'NVDA': 480.0,
+        'TSLA': 250.0,
+        'IXHL': 35.0,
+        'NUAI': 3.50,
+        'BZAI': 2.80,
+        'ELTP': 4.20,
+        'OPEN': 2.10,
+        'CEG': 215.0,
+        'VRT': 45.0,
+        'PLTR': 22.0,
+        'UPST': 48.0,
+        'TEM': 280.0,
+        'HTFL': 68.0,
+        'SDGR': 65.0,
+        'APLD': 12.0,
+        'SOFI': 7.50,
+        'CORZ': 8.20,
+        'WULF': 3.90,
+        'SPY': 450.0,
+        'QQQ': 385.0
+    }
+    
+    base_price = base_prices.get(symbol, 100.0)
+    prices = []
+    current_price = base_price
+    
+    # Generate 30 data points
+    now = datetime.datetime.now()
+    for i in range(30):
+        time = now - datetime.timedelta(minutes=30-i)
+        # Random walk
+        change = random.uniform(-0.5, 0.5) * 0.01 * base_price
+        current_price += change
+        prices.append({
+            'time': time.strftime('%H:%M'),
+            'price': round(current_price, 2)
+        })
+    
+    return jsonify(prices)
 
 @app.route('/api/settings', methods=['GET'])
 def get_settings():
