@@ -1509,12 +1509,19 @@ def update_options():
 
 @app.route('/api/prices/<symbol>')
 def get_price_history(symbol):
-    """Get simulated price history for a symbol."""
-    import random
+    """Get historical price data for a symbol.
+    
+    Note: Returns empty array after hours since we only show real data.
+    During market hours, this would be populated from actual positions.
+    """
     import datetime
     
-    # Generate simulated price data
-    base_prices = {
+    # During market hours, this would return actual price history
+    # For now, return empty to avoid showing fake data
+    return jsonify([])
+    
+    # TODO: Implement historical data storage
+    # base_prices = {
         'AAPL': 175.0,
         'NVDA': 480.0,
         'TSLA': 250.0,
@@ -1574,87 +1581,6 @@ def save_settings():
         return jsonify({'status': 'saved'})
     return jsonify({'error': 'Invalid data'}), 400
 
-@app.route('/api/test-options', methods=['GET'])
-def test_options_flow():
-    """Generate test options flow data for visualization."""
-    global options_flow
-    
-    # Create sample options flow data
-    test_flows = [
-        {
-            'symbol': 'NVDA',
-            'option_type': 'CALL',
-            'strike': 500.0,
-            'expiry': '20250829',
-            'volume': 5000,
-            'open_interest': 1200,
-            'volume_oi_ratio': 4.2,
-            'premium': 250000,
-            'signal_type': 'sweep',
-            'confidence': 85,
-            'interpretation': 'Aggressive sweep buying suggests institutional accumulation - BULLISH on NVDA',
-            'time': '14:23'
-        },
-        {
-            'symbol': 'TSLA',
-            'option_type': 'PUT',
-            'strike': 240.0,
-            'expiry': '20250822',
-            'volume': 3000,
-            'open_interest': 800,
-            'volume_oi_ratio': 3.75,
-            'premium': 180000,
-            'signal_type': 'block',
-            'confidence': 72,
-            'interpretation': '3000 contract block suggests institutional hedging - BEARISH on TSLA',
-            'time': '14:15'
-        },
-        {
-            'symbol': 'AAPL',
-            'option_type': 'CALL',
-            'strike': 180.0,
-            'expiry': '20250905',
-            'volume': 2500,
-            'open_interest': 500,
-            'volume_oi_ratio': 5.0,
-            'premium': 125000,
-            'signal_type': 'unusual_volume',
-            'confidence': 78,
-            'interpretation': 'Volume 5.0x open interest suggests new institutional positioning - BULLISH on AAPL',
-            'time': '13:45'
-        },
-        {
-            'symbol': 'SPY',
-            'option_type': 'PUT',
-            'strike': 445.0,
-            'expiry': '20250822',
-            'volume': 8000,
-            'open_interest': 2000,
-            'volume_oi_ratio': 4.0,
-            'premium': 320000,
-            'signal_type': 'high_premium',
-            'confidence': 88,
-            'interpretation': '$320,000 premium indicates large institutional bet - BEARISH on SPY',
-            'time': '13:30'
-        },
-        {
-            'symbol': 'PLTR',
-            'option_type': 'CALL',
-            'strike': 25.0,
-            'expiry': '20250919',
-            'volume': 1500,
-            'open_interest': 300,
-            'volume_oi_ratio': 5.0,
-            'premium': 75000,
-            'signal_type': 'sweep',
-            'confidence': 70,
-            'interpretation': 'SWEEP DETECTED across multiple strikes - BULLISH on PLTR',
-            'time': '12:45'
-        }
-    ]
-    
-    options_flow = test_flows
-    return jsonify({'status': 'Test options flow generated', 'count': len(test_flows)})
 
 @app.route('/api/test-ai', methods=['POST'])
 def test_ai():
