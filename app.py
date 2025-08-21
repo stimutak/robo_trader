@@ -531,12 +531,45 @@ DASHBOARD_HTML = '''
         <div class="section">
             <div class="section-header">
                 <h2 class="section-title">Price Chart</h2>
-                <select id="chartSymbol" class="select" style="width: 120px;" onchange="updateChartSymbol()">
-                    <!-- Will be populated dynamically -->
-                </select>
+                <div style="display: flex; align-items: center; gap: 12px;">
+                    <span style="font-size: 11px; color: var(--text-dimmer);">30 min history</span>
+                    <select id="chartSymbol" class="select" style="width: 120px;" onchange="updateChartSymbol()">
+                        <!-- Will be populated dynamically -->
+                    </select>
+                </div>
             </div>
             <div class="section-content" style="height: 250px; padding: 16px; position: relative;">
                 <canvas id="priceChart"></canvas>
+            </div>
+        </div>
+        
+        <!-- Analytics Row -->
+        <div style="display: grid; grid-template-columns: 1fr 2fr; gap: 16px; margin: 16px 0;">
+            <!-- AI Conviction Gauge -->
+            <div class="section">
+                <div class="section-header">
+                    <h2 class="section-title">AI Conviction</h2>
+                </div>
+                <div class="section-content" style="height: 200px; display: flex; align-items: center; justify-content: center;">
+                    <div style="position: relative; width: 180px; height: 180px;">
+                        <canvas id="convictionGauge"></canvas>
+                        <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center;">
+                            <div id="convictionValue" style="font-size: 32px; font-weight: 600; color: var(--text-bright);">--</div>
+                            <div id="convictionLabel" style="font-size: 12px; color: var(--text-dimmer); text-transform: uppercase; margin-top: 4px;">Waiting</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- P&L Chart -->
+            <div class="section">
+                <div class="section-header">
+                    <h2 class="section-title">P&L History</h2>
+                    <span style="font-size: 11px; color: var(--text-dimmer);">Live updates</span>
+                </div>
+                <div class="section-content" style="height: 200px; padding: 16px; position: relative;">
+                    <canvas id="pnlChart"></canvas>
+                </div>
             </div>
         </div>
         
@@ -635,9 +668,118 @@ DASHBOARD_HTML = '''
         
         // Chart setup
         let priceChart = null;
+        let convictionGauge = null;
+        let pnlChart = null;
         let priceHistory = {};
+        let pnlHistory = [];
         let currentChartSymbol = 'AAPL';  // Default to first watchlist symbol
         let watchlistSymbols = [];
+        let currentConviction = 0;
+        let currentDirection = 'neutral';
+        
+        function initConvictionGauge() {
+            const ctx = document.getElementById('convictionGauge').getContext('2d');
+            convictionGauge = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    datasets: [{
+                        data: [0, 100],
+                        backgroundColor: [
+                            'rgba(74, 158, 255, 0.8)',  // Conviction color
+                            'rgba(255, 255, 255, 0.03)' // Background
+                        ],
+                        borderWidth: 0
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    circumference: 180,
+                    rotation: 270,
+                    cutout: '75%',
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: { enabled: false }
+                    }
+                }
+            });
+        }
+        
+        function initPnLChart() {
+            const ctx = document.getElementById('pnlChart').getContext('2d');
+            pnlChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: 'P&L',
+                        data: [],
+                        borderColor: '#22c55e',
+                        backgroundColor: 'rgba(34, 197, 94, 0.1)',
+                        borderWidth: 2,
+                        tension: 0.3,
+                        fill: true,
+                        pointRadius: 0,
+                        pointHoverRadius: 4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        intersect: false,
+                        mode: 'index'
+                    },
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            backgroundColor: 'rgba(17, 17, 17, 0.95)',
+                            titleColor: '#b4b4b4',
+                            bodyColor: '#8b8b8b',
+                            borderColor: '#2a2a2a',
+                            borderWidth: 1,
+                            padding: 10,
+                            displayColors: false,
+                            callbacks: {
+                                label: function(context) {
+                                    const value = context.parsed.y;
+                                    return (value >= 0 ? '+' : '') + '$' + value.toFixed(2);
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            grid: {
+                                color: 'rgba(255, 255, 255, 0.03)',
+                                drawBorder: false
+                            },
+                            ticks: {
+                                color: '#5a5a5a',
+                                font: { size: 10 },
+                                maxRotation: 0,
+                                autoSkip: true,
+                                maxTicksLimit: 6
+                            }
+                        },
+                        y: {
+                            position: 'right',
+                            grid: {
+                                color: 'rgba(255, 255, 255, 0.03)',
+                                drawBorder: false
+                            },
+                            ticks: {
+                                color: '#5a5a5a',
+                                font: { size: 10 },
+                                callback: function(value) {
+                                    return '$' + value.toFixed(0);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
         
         function initChart() {
             const ctx = document.getElementById('priceChart').getContext('2d');
@@ -782,6 +924,8 @@ DASHBOARD_HTML = '''
         // Initialize chart on load
         window.addEventListener('DOMContentLoaded', () => {
             initChart();
+            initConvictionGauge();
+            initPnLChart();
             // Load settings and populate symbols
             loadChartSymbols();
             // Load initial price data
@@ -888,8 +1032,9 @@ DASHBOARD_HTML = '''
                     // Update positions
                     updatePositions(data.positions);
                     
-                    // Update AI decisions
+                    // Update AI decisions and conviction
                     updateAIDecisions(data.ai_decisions);
+                    updateConvictionGauge(data.ai_decisions);
                     
                     // Update news feed
                     updateNewsFeed(data.news_feed);
@@ -905,6 +1050,11 @@ DASHBOARD_HTML = '''
                         for (const [symbol, price] of Object.entries(data.price_data)) {
                             addPricePoint(symbol, price);
                         }
+                    }
+                    
+                    // Update P&L history
+                    if (data.pnl) {
+                        updatePnLHistory(data.pnl);
                     }
                 });
         }
@@ -968,6 +1118,80 @@ DASHBOARD_HTML = '''
                 </div>`;
             }
             container.innerHTML = html;
+        }
+        
+        function updateConvictionGauge(decisions) {
+            if (!decisions || decisions.length === 0 || !convictionGauge) return;
+            
+            // Get latest AI decision
+            const latest = decisions[decisions.length - 1];
+            if (latest && latest.confidence !== undefined) {
+                currentConviction = latest.confidence;
+                currentDirection = latest.action || 'neutral';
+                
+                // Update gauge
+                convictionGauge.data.datasets[0].data = [currentConviction, 100 - currentConviction];
+                
+                // Update color based on conviction level
+                let color = '#4a9eff';  // Default blue
+                if (currentConviction >= 80) {
+                    color = '#22c55e';  // Green for high conviction
+                } else if (currentConviction >= 60) {
+                    color = '#4a9eff';  // Blue for medium
+                } else if (currentConviction >= 40) {
+                    color = '#f59e0b';  // Orange for low
+                } else {
+                    color = '#ef4444';  // Red for very low
+                }
+                
+                convictionGauge.data.datasets[0].backgroundColor[0] = color;
+                convictionGauge.update('none');
+                
+                // Update text
+                document.getElementById('convictionValue').textContent = currentConviction + '%';
+                
+                // Update label
+                let label = 'Neutral';
+                if (currentDirection === 'buy' || currentDirection === 'BUY') label = 'Bullish';
+                else if (currentDirection === 'sell' || currentDirection === 'SELL') label = 'Bearish';
+                else if (currentDirection === 'hold' || currentDirection === 'HOLD') label = 'Hold';
+                
+                document.getElementById('convictionLabel').textContent = label;
+            }
+        }
+        
+        function updatePnLHistory(pnl) {
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString('en-US', { 
+                hour: '2-digit', 
+                minute: '2-digit',
+                hour12: false 
+            });
+            
+            // Add to history
+            pnlHistory.push({
+                time: timeStr,
+                value: pnl.total || 0
+            });
+            
+            // Keep last 50 points
+            if (pnlHistory.length > 50) {
+                pnlHistory.shift();
+            }
+            
+            // Update chart
+            if (pnlChart) {
+                pnlChart.data.labels = pnlHistory.map(p => p.time);
+                pnlChart.data.datasets[0].data = pnlHistory.map(p => p.value);
+                
+                // Update color based on P&L
+                const isPositive = (pnl.total || 0) >= 0;
+                pnlChart.data.datasets[0].borderColor = isPositive ? '#22c55e' : '#ef4444';
+                pnlChart.data.datasets[0].backgroundColor = isPositive ? 
+                    'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)';
+                
+                pnlChart.update('none');
+            }
         }
         
         function updateNewsFeed(news) {
