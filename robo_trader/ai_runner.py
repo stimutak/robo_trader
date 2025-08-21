@@ -265,6 +265,9 @@ class AITradingSystem:
                     )
                     self.stats["options_signals"] += len(signals)
                     
+                    # Send to dashboard
+                    await self._push_options_to_dashboard(signals)
+                    
                     # Process high-confidence signals through AI
                     for signal in signals[:3]:  # Top 3 signals
                         if signal.confidence >= 70:
@@ -354,6 +357,34 @@ class AITradingSystem:
                         logger.warning(f"Dashboard returned status {resp.status}")
         except Exception as e:
             logger.warning(f"Could not push news to dashboard: {e}")
+    
+    async def _push_options_to_dashboard(self, signals):
+        """Push options flow signals to dashboard."""
+        try:
+            import aiohttp
+            from dataclasses import asdict
+            
+            # Convert signals to dict format
+            options_data = []
+            for signal in signals[:10]:  # Top 10 signals
+                signal_dict = asdict(signal)
+                # Convert datetime to string
+                signal_dict['timestamp'] = signal.timestamp.strftime("%H:%M")
+                signal_dict['time'] = signal.timestamp.strftime("%H:%M")
+                options_data.append(signal_dict)
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    'http://localhost:5555/api/options',
+                    json={'options': options_data},
+                    timeout=aiohttp.ClientTimeout(total=2)
+                ) as resp:
+                    if resp.status == 200:
+                        logger.info(f"Successfully pushed {len(options_data)} options signals to dashboard")
+                    else:
+                        logger.warning(f"Dashboard returned status {resp.status} for options")
+        except Exception as e:
+            logger.warning(f"Could not push options to dashboard: {e}")
     
     async def stop(self):
         """Stop the trading system."""

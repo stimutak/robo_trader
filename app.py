@@ -573,6 +573,19 @@ DASHBOARD_HTML = '''
             </div>
         </div>
         
+        <!-- Options Flow Section -->
+        <div class="section">
+            <div class="section-header">
+                <h2 class="section-title">Options Flow</h2>
+                <span id="flowSummary" style="font-size: 11px; color: var(--text-dimmer);">Scanning for unusual activity...</span>
+            </div>
+            <div class="section-content">
+                <div id="optionsFlowContainer" style="min-height: 150px;">
+                    <div class="empty-state">No unusual options activity detected</div>
+                </div>
+            </div>
+        </div>
+        
         <!-- Content Grid -->
         <div class="content-grid">
             <!-- Left Column -->
@@ -1042,6 +1055,9 @@ DASHBOARD_HTML = '''
                     // Update trading signals
                     updateTradingSignals(data.trading_signals);
                     
+                    // Update options flow
+                    updateOptionsFlow(data.options_flow);
+                    
                     // Update log
                     updateLog(data.log);
                     
@@ -1158,6 +1174,91 @@ DASHBOARD_HTML = '''
                 
                 document.getElementById('convictionLabel').textContent = label;
             }
+        }
+        
+        function updateOptionsFlow(flows) {
+            const container = document.getElementById('optionsFlowContainer');
+            const summary = document.getElementById('flowSummary');
+            
+            if (!flows || flows.length === 0) {
+                container.innerHTML = '<div class="empty-state">No unusual options activity detected</div>';
+                summary.textContent = 'Scanning for unusual activity...';
+                return;
+            }
+            
+            // Calculate summary stats
+            let bullishCount = 0;
+            let bearishCount = 0;
+            let totalPremium = 0;
+            
+            flows.forEach(flow => {
+                if (flow.option_type === 'CALL') bullishCount++;
+                else if (flow.option_type === 'PUT') bearishCount++;
+                totalPremium += flow.premium || 0;
+            });
+            
+            // Update summary
+            summary.textContent = `${flows.length} signals | Bullish: ${bullishCount} | Bearish: ${bearishCount}`;
+            
+            // Create flow visualization
+            let html = '<div style="display: grid; gap: 8px;">';
+            
+            for (const flow of flows.slice(0, 10)) {  // Show top 10
+                const isCall = flow.option_type === 'CALL';
+                const color = flow.confidence >= 80 ? '#22c55e' : 
+                             flow.confidence >= 60 ? '#4a9eff' :
+                             flow.confidence >= 40 ? '#f59e0b' : '#ef4444';
+                
+                const directionIcon = isCall ? '📈' : '📉';
+                const signalIcon = flow.signal_type === 'sweep' ? '🔥' : 
+                                  flow.signal_type === 'block' ? '🏢' :
+                                  flow.signal_type === 'high_premium' ? '💰' : '⚡';
+                
+                html += `
+                    <div style="
+                        background: var(--surface);
+                        border: 1px solid var(--border);
+                        border-left: 3px solid ${color};
+                        border-radius: 6px;
+                        padding: 12px;
+                        display: grid;
+                        grid-template-columns: auto 1fr auto;
+                        gap: 12px;
+                        align-items: center;
+                        transition: all 0.15s;
+                        cursor: pointer;
+                    " onmouseover="this.style.background='var(--surface-hover)'" onmouseout="this.style.background='var(--surface)'">
+                        <div style="font-size: 20px;">${directionIcon}</div>
+                        <div>
+                            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
+                                <span style="font-weight: 600; color: var(--text-bright);">${flow.symbol}</span>
+                                <span style="font-size: 11px; padding: 2px 6px; background: ${color}20; color: ${color}; border-radius: 4px;">
+                                    ${flow.confidence}% ${signalIcon}
+                                </span>
+                                <span style="font-size: 11px; color: var(--text-dimmer);">${flow.signal_type}</span>
+                            </div>
+                            <div style="font-size: 12px; color: var(--text);">
+                                ${flow.option_type} $${flow.strike} exp ${flow.expiry} 
+                                | Vol: ${flow.volume} | V/OI: ${flow.volume_oi_ratio?.toFixed(1)}x
+                            </div>
+                            <div style="font-size: 11px; color: var(--text-dimmer); margin-top: 4px;">
+                                ${flow.interpretation}
+                            </div>
+                        </div>
+                        <div style="text-align: right;">
+                            <div style="font-size: 14px; font-weight: 600; color: ${isCall ? '#22c55e' : '#ef4444'};">
+                                $${(flow.premium / 1000).toFixed(0)}K
+                            </div>
+                            <div style="font-size: 10px; color: var(--text-dimmer);">
+                                ${flow.time || 'now'}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+            
+            html += '</div>';
+            container.innerHTML = html;
         }
         
         function updatePnLHistory(pnl) {
@@ -1380,6 +1481,17 @@ def update_news():
         return jsonify({'status': 'updated'})
     return jsonify({'error': 'Invalid data'}), 400
 
+@app.route('/api/options', methods=['POST'])
+def update_options():
+    """Receive options flow updates from AI runner."""
+    global options_flow
+    
+    data = request.json
+    if data and 'options' in data:
+        options_flow = data['options']
+        return jsonify({'status': 'updated'})
+    return jsonify({'error': 'Invalid data'}), 400
+
 @app.route('/api/prices/<symbol>')
 def get_price_history(symbol):
     """Get simulated price history for a symbol."""
@@ -1446,6 +1558,88 @@ def save_settings():
         save_user_settings(user_settings)
         return jsonify({'status': 'saved'})
     return jsonify({'error': 'Invalid data'}), 400
+
+@app.route('/api/test-options', methods=['GET'])
+def test_options_flow():
+    """Generate test options flow data for visualization."""
+    global options_flow
+    
+    # Create sample options flow data
+    test_flows = [
+        {
+            'symbol': 'NVDA',
+            'option_type': 'CALL',
+            'strike': 500.0,
+            'expiry': '20250829',
+            'volume': 5000,
+            'open_interest': 1200,
+            'volume_oi_ratio': 4.2,
+            'premium': 250000,
+            'signal_type': 'sweep',
+            'confidence': 85,
+            'interpretation': 'Aggressive sweep buying suggests institutional accumulation - BULLISH on NVDA',
+            'time': '14:23'
+        },
+        {
+            'symbol': 'TSLA',
+            'option_type': 'PUT',
+            'strike': 240.0,
+            'expiry': '20250822',
+            'volume': 3000,
+            'open_interest': 800,
+            'volume_oi_ratio': 3.75,
+            'premium': 180000,
+            'signal_type': 'block',
+            'confidence': 72,
+            'interpretation': '3000 contract block suggests institutional hedging - BEARISH on TSLA',
+            'time': '14:15'
+        },
+        {
+            'symbol': 'AAPL',
+            'option_type': 'CALL',
+            'strike': 180.0,
+            'expiry': '20250905',
+            'volume': 2500,
+            'open_interest': 500,
+            'volume_oi_ratio': 5.0,
+            'premium': 125000,
+            'signal_type': 'unusual_volume',
+            'confidence': 78,
+            'interpretation': 'Volume 5.0x open interest suggests new institutional positioning - BULLISH on AAPL',
+            'time': '13:45'
+        },
+        {
+            'symbol': 'SPY',
+            'option_type': 'PUT',
+            'strike': 445.0,
+            'expiry': '20250822',
+            'volume': 8000,
+            'open_interest': 2000,
+            'volume_oi_ratio': 4.0,
+            'premium': 320000,
+            'signal_type': 'high_premium',
+            'confidence': 88,
+            'interpretation': '$320,000 premium indicates large institutional bet - BEARISH on SPY',
+            'time': '13:30'
+        },
+        {
+            'symbol': 'PLTR',
+            'option_type': 'CALL',
+            'strike': 25.0,
+            'expiry': '20250919',
+            'volume': 1500,
+            'open_interest': 300,
+            'volume_oi_ratio': 5.0,
+            'premium': 75000,
+            'signal_type': 'sweep',
+            'confidence': 70,
+            'interpretation': 'SWEEP DETECTED across multiple strikes - BULLISH on PLTR',
+            'time': '12:45'
+        }
+    ]
+    
+    options_flow = test_flows
+    return jsonify({'status': 'Test options flow generated', 'count': len(test_flows)})
 
 @app.route('/api/test-ai', methods=['POST'])
 def test_ai():

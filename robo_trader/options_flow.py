@@ -393,8 +393,8 @@ async def main():
     
     cfg = load_config()
     
-    # Setup IB client
-    ib_client = IBKRClient(cfg.ibkr_host, cfg.ibkr_port, cfg.ibkr_client_id)
+    # Setup IB client with different ID to avoid conflicts
+    ib_client = IBKRClient(cfg.ibkr_host, cfg.ibkr_port, 3)
     await ib_client.connect(readonly=True)
     
     # Create analyzer
