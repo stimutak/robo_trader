@@ -342,7 +342,8 @@ class AITradingSystem:
                     'title': item.title[:100] if hasattr(item, 'title') else str(item).split('-')[0][:100],
                     'source': item.source if hasattr(item, 'source') else 'Unknown',
                     'sentiment': item.sentiment_score if hasattr(item, 'sentiment_score') else 0.0,
-                    'time': item.published.strftime("%H:%M") if hasattr(item, 'published') else datetime.now().strftime("%H:%M")
+                    'time': item.published.strftime("%H:%M") if hasattr(item, 'published') else datetime.now().strftime("%H:%M"),
+                    'url': item.url if hasattr(item, 'url') else None
                 })
             
             async with aiohttp.ClientSession() as session:

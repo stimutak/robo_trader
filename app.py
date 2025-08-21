@@ -1301,16 +1301,23 @@ DASHBOARD_HTML = '''
             
             if (!news || news.length === 0) {
                 container.innerHTML = '<div class="list-item"><div class="list-item-title">No recent news</div></div>';
+                ticker.textContent = 'Loading market news...';
                 return;
             }
             
-            // Update news feed
+            // Update news feed with clickable links
             let html = '';
             for (const item of news) {
                 const sentClass = item.sentiment > 0.2 ? 'badge-green' : 
                                  item.sentiment < -0.2 ? 'badge-red' : '';
+                const titleHtml = item.url ? 
+                    `<a href="${item.url}" target="_blank" style="color: inherit; text-decoration: none; cursor: pointer;" 
+                       onmouseover="this.style.color='var(--accent)'" 
+                       onmouseout="this.style.color='inherit'">${item.title}</a>` : 
+                    item.title;
+                    
                 html += `<div class="list-item">
-                    <div class="list-item-title">${item.title}</div>
+                    <div class="list-item-title">${titleHtml}</div>
                     <div class="list-item-meta">
                         <span>${item.source}</span>
                         ${sentClass ? `<span class="badge ${sentClass}">
@@ -1322,9 +1329,17 @@ DASHBOARD_HTML = '''
             }
             container.innerHTML = html;
             
-            // Update ticker
-            const tickerText = news.map(item => item.title).join(' • ');
-            ticker.textContent = tickerText + ' • ' + tickerText;
+            // Update ticker with clickable links
+            let tickerHtml = '';
+            for (const item of news) {
+                const link = item.url ? 
+                    `<a href="${item.url}" target="_blank" style="color: inherit; text-decoration: none;" 
+                       onmouseover="this.style.textDecoration='underline'" 
+                       onmouseout="this.style.textDecoration='none'">${item.title}</a>` : 
+                    item.title;
+                tickerHtml += link + ' • ';
+            }
+            ticker.innerHTML = tickerHtml + tickerHtml; // Duplicate for scrolling effect
         }
         
         function updateTradingSignals(signals) {
