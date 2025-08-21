@@ -1,8 +1,8 @@
 ## Robo Trader - Intelligent Autonomous Trading Bot
 
-An AI-powered trading system that uses LLMs to understand market events and make profitable trades. Combines real-time news analysis, institutional flow tracking, and adaptive strategies to generate consistent returns.
+An AI-powered trading system that uses Claude AI to understand market events and make profitable trades. Combines real-time news analysis, options flow tracking, and risk management for intelligent trading decisions.
 
-> **✅ Current Status**: AI Intelligence Layer COMPLETE | IB Connection WORKING | Ready for Live Testing!
+> **✅ Current Status**: System RUNNING during market hours | Dashboard at http://localhost:5555 | Paper Trading Active
 
 ### 🎯 Mission
 Build a profitable trading bot that thinks like a master trader - focusing on **intelligence over speed**. The system analyzes market events using AI, detects institutional positioning, and adapts strategies to market conditions.

@@ -14,7 +14,7 @@ load_dotenv()
 from .config import load_config
 from .execution import Order, PaperExecutor
 from .ibkr_client import IBKRClient
-from .risk import RiskManager
+from .risk import RiskManager, Position
 from .logger import get_logger
 from .portfolio import Portfolio
 from .retry import retry_async
@@ -24,6 +24,7 @@ from .news import NewsAggregator
 from .intelligence import ClaudeTrader
 from .events import EventProcessor, EventType, SignalEvent, OrderEvent
 from .kelly import KellyCalculator
+from .options_flow import OptionsFlowAnalyzer
 
 logger = get_logger(__name__)
 
@@ -63,6 +64,7 @@ class AITradingSystem:
         self.ai_trader: Optional[ClaudeTrader] = None
         self.event_processor: Optional[EventProcessor] = None
         self.kelly_calc: Optional[KellyCalculator] = None
+        self.options_flow: Optional[OptionsFlowAnalyzer] = None
         
         # State tracking
         self.is_running = False
@@ -70,7 +72,8 @@ class AITradingSystem:
             "news_processed": 0,
             "signals_generated": 0,
             "trades_executed": 0,
-            "ai_analyses": 0
+            "ai_analyses": 0,
+            "options_signals": 0
         }
         
     async def setup(self):
@@ -111,6 +114,10 @@ class AITradingSystem:
         self.kelly_calc = KellyCalculator(capital=self.capital)
         logger.info("✓ Kelly calculator ready")
         
+        # Setup options flow analyzer
+        self.options_flow = OptionsFlowAnalyzer(self.ib_client)
+        logger.info("✓ Options flow analyzer initialized")
+        
         # Setup event processor
         self.event_processor = EventProcessor(
             symbols=self.symbols,
@@ -129,7 +136,7 @@ class AITradingSystem:
         """Execute orders through IB."""
         try:
             # Get current price
-            bars = await self.ib_client.request_historical_data(
+            bars = await self.ib_client.fetch_recent_bars(
                 symbol=event.symbol,
                 duration="1 D",
                 bar_size="1 min"
@@ -193,6 +200,9 @@ class AITradingSystem:
                     # Process high-impact news through events
                     high_impact = self.news_aggregator.get_high_impact_news(min_relevance=0.4)
                     
+                    # Push news to dashboard
+                    await self._push_news_to_dashboard(high_impact)
+                    
                     for news_item in high_impact[:5]:  # Process top 5
                         # The event processor will handle AI analysis
                         pass  # Events are processed automatically
@@ -206,32 +216,95 @@ class AITradingSystem:
                 
     async def process_market_data(self):
         """Monitor market data and generate signals."""
+        await asyncio.sleep(5)  # Initial delay to avoid event loop conflict
         while self.is_running:
             try:
                 # Get latest prices for all symbols
                 for symbol in self.symbols:
-                    bars = await self.ib_client.request_historical_data(
-                        symbol=symbol,
-                        duration="1 D",
-                        bar_size="5 mins"
-                    )
-                    
-                    if not bars.empty:
-                        current_price = bars.iloc[-1]['close']
-                        prev_close = bars.iloc[-2]['close'] if len(bars) > 1 else current_price
+                    try:
+                        bars = await self.ib_client.fetch_recent_bars(
+                            symbol=symbol,
+                            duration="1 D",
+                            bar_size="5 mins"
+                        )
                         
-                        # Calculate basic metrics
-                        price_change = (current_price - prev_close) / prev_close
-                        
-                        # Log significant moves
-                        if abs(price_change) > 0.01:  # 1% move
-                            logger.info(f"{symbol}: ${current_price:.2f} ({price_change:+.2%})")
+                        if not bars.empty:
+                            current_price = bars.iloc[-1]['close']
+                            prev_close = bars.iloc[-2]['close'] if len(bars) > 1 else current_price
+                            
+                            # Calculate basic metrics
+                            price_change = (current_price - prev_close) / prev_close
+                            
+                            # Log significant moves
+                            if abs(price_change) > 0.01:  # 1% move
+                                logger.info(f"{symbol}: ${current_price:.2f} ({price_change:+.2%})")
+                    except Exception as e:
+                        logger.debug(f"Could not fetch data for {symbol}: {e}")
                             
                 await asyncio.sleep(60)  # Check every minute
                 
             except Exception as e:
-                logger.error(f"Error processing market data: {e}")
+                logger.debug(f"Market data cycle error: {e}")
                 await asyncio.sleep(30)
+                
+    async def process_options_flow(self):
+        """Monitor options flow for unusual activity."""
+        while self.is_running:
+            try:
+                # Scan options every 5 minutes
+                logger.info("Scanning options flow for unusual activity...")
+                signals = await self.options_flow.scan_options_flow(self.symbols)
+                
+                if signals:
+                    # Get summary
+                    summary = self.options_flow.get_flow_summary(signals)
+                    logger.info(
+                        f"Options flow: {summary['total_signals']} signals, "
+                        f"Bullish: {summary['bullish_flow']}, "
+                        f"Bearish: {summary['bearish_flow']}"
+                    )
+                    self.stats["options_signals"] += len(signals)
+                    
+                    # Process high-confidence signals through AI
+                    for signal in signals[:3]:  # Top 3 signals
+                        if signal.confidence >= 70:
+                            # Create synthetic news item for AI analysis
+                            options_news = {
+                                'title': f"OPTIONS ALERT: {signal.interpretation}",
+                                'summary': (
+                                    f"{signal.symbol} {signal.option_type} "
+                                    f"Strike: ${signal.strike} Expiry: {signal.expiry} "
+                                    f"Volume: {signal.volume} (Volume/OI: {signal.volume_oi_ratio:.1f}x) "
+                                    f"Premium: ${signal.premium:,.0f} "
+                                    f"Signal: {signal.signal_type.upper()}"
+                                ),
+                                'source': 'options_flow',
+                                'symbols': [signal.symbol],
+                                'relevance': signal.confidence / 100
+                            }
+                            
+                            # Have AI analyze this options activity
+                            if self.ai_trader:
+                                analysis = await self.ai_trader.analyze_event(
+                                    signal.symbol,
+                                    options_news['title'],
+                                    options_news['summary']
+                                )
+                                
+                                if analysis and analysis['conviction'] >= 75:
+                                    logger.info(
+                                        f"HIGH CONVICTION OPTIONS SIGNAL: "
+                                        f"{signal.symbol} {analysis['direction']} "
+                                        f"({analysis['conviction']}% confidence)"
+                                    )
+                                    self.stats["ai_analyses"] += 1
+                
+                # Wait 5 minutes before next scan
+                await asyncio.sleep(300)
+                
+            except Exception as e:
+                logger.error(f"Error processing options flow: {e}")
+                await asyncio.sleep(60)
                 
     async def run(self):
         """Main trading loop."""
@@ -248,6 +321,7 @@ class AITradingSystem:
             
             if self.use_ai:
                 tasks.append(asyncio.create_task(self.process_news_cycle()))
+                tasks.append(asyncio.create_task(self.process_options_flow()))
                 
             try:
                 await asyncio.gather(*tasks)
@@ -255,6 +329,30 @@ class AITradingSystem:
                 logger.info("Shutting down AI Trading System...")
                 self.is_running = False
                 
+    async def _push_news_to_dashboard(self, news_items):
+        """Push news to dashboard for ticker display."""
+        try:
+            import aiohttp
+            news_data = []
+            for item in news_items[:20]:  # Top 20 for ticker
+                news_data.append({
+                    'title': item.title[:100],  # Truncate long titles
+                    'source': item.source,
+                    'sentiment': item.sentiment_score,
+                    'time': datetime.now().strftime("%H:%M")
+                })
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    'http://localhost:5555/api/news',
+                    json={'news': news_data},
+                    timeout=aiohttp.ClientTimeout(total=2)
+                ) as resp:
+                    if resp.status == 200:
+                        logger.debug(f"Pushed {len(news_data)} news items to dashboard")
+        except Exception as e:
+            logger.debug(f"Could not push news to dashboard: {e}")
+    
     async def stop(self):
         """Stop the trading system."""
         self.is_running = False

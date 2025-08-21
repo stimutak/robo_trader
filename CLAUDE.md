@@ -227,6 +227,13 @@ python -m robo_trader.runner --sma-fast 10 --sma-slow 20 --slippage-bps 5 --max-
   - "🤖 Generated with Claude Code"
   - Co-Authored-By: Claude <noreply@anthropic.com>
 
+### Handoff Document Convention
+- Location: `/handoff/` directory in project root
+- Naming: `YYYY-MM-DD_HHMM_handoff.md` (24-hour format, local time)
+- Latest: Symlink `LATEST_HANDOFF.md` → most recent handoff doc
+- Archive: Keep last 5 handoffs, archive older ones to `/handoff/archive/`
+- Content: Status, running processes, next steps, blockers, session notes
+
 ### Remember
 **The Goal**: Build a profitable trading bot that thinks like a master trader. One intelligent, high-conviction trade beats 1000 fast but dumb trades. Focus on understanding market events through AI, not competing on speed.
 

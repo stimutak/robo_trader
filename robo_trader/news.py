@@ -47,8 +47,9 @@ class NewsAggregator:
     RSS_FEEDS = {
         "yahoo_market": "https://finance.yahoo.com/news/rssindex",
         "yahoo_top": "https://finance.yahoo.com/rss/topfinstories",
-        "reuters_business": "https://feeds.reuters.com/reuters/businessNews",
-        "reuters_markets": "https://feeds.reuters.com/reuters/marketsNews",
+        # Reuters feeds currently broken - commented out
+        # "reuters_business": "https://feeds.reuters.com/reuters/businessNews",
+        # "reuters_markets": "https://feeds.reuters.com/reuters/marketsNews",
         "bloomberg": "https://feeds.bloomberg.com/markets/news.rss",
         "marketwatch": "https://feeds.marketwatch.com/marketwatch/topstories/",
         "cnbc_top": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114",
@@ -216,7 +217,8 @@ class NewsAggregator:
             tasks.append(self.fetch_rss_feed(url, source_name))
         
         # Symbol-specific feeds
-        for symbol in self.symbols[:5]:  # Limit to avoid too many requests
+        # Fetch RSS for all watched symbols (21 total) for comprehensive coverage
+        for symbol in self.symbols:
             yahoo_url = self.SYMBOL_RSS_TEMPLATE["yahoo"].format(symbol=symbol)
             tasks.append(self.fetch_rss_feed(yahoo_url, f"yahoo_{symbol}"))
         

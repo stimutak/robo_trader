@@ -155,12 +155,31 @@ AI-powered market analysis system is COMPLETE and working!
 
 ## 🎯 Immediate Next Steps
 
-### Phase 2: Enhanced Intelligence (This Week)
-- [ ] **Web Dashboard Updates**
-  - [ ] Add live news feed display
-  - [ ] Show AI analysis decisions in real-time
-  - [ ] Display Kelly-sized positions
-  - [ ] Add performance metrics
+### URGENT: Add Company-Specific Intelligence
+- [ ] **SEC Filings Integration**
+  - [ ] EDGAR API for 8-K material events
+  - [ ] Form 4 insider trading alerts
+  - [ ] 13F institutional holdings
+- [ ] **Earnings & Catalysts**
+  - [ ] Earnings calendar API
+  - [ ] FDA approval calendar (for IXHL, ELTP)
+  - [ ] Crypto regulatory news (for ADA, HBAR, CORZ, WULF)
+- [ ] **Social Sentiment**
+  - [ ] Reddit r/wallstreetbets monitoring
+  - [ ] StockTwits API integration
+  - [ ] Twitter/X mention tracking
+
+### Phase 2: Modern Dashboard UI (This Week)
+- [ ] **Cursor-Style Dark Theme**
+  - [ ] Sleek dark background with subtle gradients
+  - [ ] Glowing accent colors for key metrics
+  - [ ] Smooth animations and transitions
+  - [ ] Modern card layouts with glass morphism
+- [ ] **Enhanced Visualizations**
+  - [ ] Real-time price charts with TradingView widgets
+  - [ ] Options flow heatmap
+  - [ ] AI conviction gauge (0-100% visual)
+  - [ ] P&L performance chart
 
 - [ ] **Market Hours Testing**
   - [ ] Test during 9:30 AM - 4:00 PM ET

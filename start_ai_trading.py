@@ -7,6 +7,7 @@ Following CLAUDE.md: Clarity over cleverness
 import asyncio
 import sys
 import signal
+import os
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -15,8 +16,10 @@ from robo_trader.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Default configuration
-DEFAULT_SYMBOLS = ["SPY", "QQQ", "AAPL", "TSLA", "NVDA"]
+# Default configuration - your watchlist
+DEFAULT_SYMBOLS = ["AAPL", "NVDA", "TSLA", "IXHL", "NUAI", "BZAI", "ELTP", 
+                   "OPEN", "ADA", "HBAR", "CEG", "VRT", "PLTR", "UPST", 
+                   "TEM", "HTFL", "SDGR", "APLD", "SOFI", "CORZ", "WULF"]
 DEFAULT_CAPITAL = 100000
 
 async def main():
@@ -33,6 +36,9 @@ async def main():
     print("\nStarting system...")
     
     # Create system
+    # Use consistent client ID from environment or default
+    client_id = os.environ.get('IBKR_CLIENT_ID', '1')
+    
     system = AITradingSystem(
         symbols=DEFAULT_SYMBOLS,
         use_ai=True,

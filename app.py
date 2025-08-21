@@ -12,6 +12,8 @@ from datetime import datetime
 import subprocess
 import os
 import signal
+import glob
+import time
 from robo_trader.config import load_config
 from robo_trader.logger import get_logger
 
@@ -34,6 +36,33 @@ pnl = {"daily": 0.0, "total": 0.0}
 ai_decisions = []
 news_feed = []  # Recent news items
 trading_signals = []  # Trading signals from AI
+options_flow = []  # Options flow signals
+
+# Load user settings
+USER_SETTINGS_FILE = "user_settings.json"
+
+def load_user_settings():
+    """Load saved user settings."""
+    try:
+        with open(USER_SETTINGS_FILE, 'r') as f:
+            return json.load(f)
+    except:
+        return {
+            "default": {
+                "symbols": ["AAPL", "NVDA", "TSLA", "IXHL", "NUAI", "BZAI", "ELTP", 
+                           "OPEN", "ADA", "HBAR", "CEG", "VRT", "PLTR", "UPST", 
+                           "TEM", "HTFL", "SDGR", "APLD", "SOFI", "CORZ", "WULF"],
+                "risk_level": "moderate",
+                "max_daily_loss": 1000
+            }
+        }
+
+def save_user_settings(settings):
+    """Save user settings."""
+    with open(USER_SETTINGS_FILE, 'w') as f:
+        json.dump(settings, f, indent=2)
+
+user_settings = load_user_settings()
 
 # HTML template with inline CSS and JS (single file simplicity)
 DASHBOARD_HTML = '''
@@ -91,6 +120,19 @@ DASHBOARD_HTML = '''
             color: #333;
             margin-bottom: 15px;
             font-size: 18px;
+        }
+        /* Make all text selectable and copyable */
+        .card, .log, .positions-table, .ai-decision, .news-item {
+            user-select: text !important;
+            -webkit-user-select: text !important;
+            -moz-user-select: text !important;
+            -ms-user-select: text !important;
+        }
+        .card *, .log *, .positions-table *, .ai-decision *, .news-item * {
+            user-select: text !important;
+            -webkit-user-select: text !important;
+            -moz-user-select: text !important;
+            -ms-user-select: text !important;
         }
         .big-button {
             width: 100%;
@@ -189,15 +231,21 @@ DASHBOARD_HTML = '''
             display: grid;
             gap: 10px;
         }
+        @keyframes scroll-left {
+            0% { transform: translateX(0); }
+            100% { transform: translateX(-100%); }
+        }
         .settings label {
             font-weight: bold;
             color: #666;
         }
-        .settings input, .settings select {
+        .settings input, .settings select, .settings textarea {
             width: 100%;
             padding: 8px;
             border: 1px solid #ddd;
             border-radius: 5px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            resize: vertical;
         }
     </style>
 </head>
@@ -208,6 +256,18 @@ DASHBOARD_HTML = '''
                 <span id="status" class="status stopped">STOPPED</span>
             </h1>
             <p>AI-Powered Trading with Claude 3.5 Sonnet</p>
+        </div>
+        
+        <!-- Live News Ticker -->
+        <div style="background: linear-gradient(90deg, #2c3e50, #34495e); color: #fff; padding: 12px; margin: 20px 0; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1); position: relative;">
+            <div style="display: flex; align-items: center;">
+                <span style="font-weight: bold; margin-right: 15px; background: #e74c3c; padding: 5px 10px; border-radius: 5px; z-index: 10; position: relative;">📰 LIVE</span>
+                <div id="newsTicker" style="flex: 1; overflow: hidden; white-space: nowrap; font-size: 14px; font-weight: 500;">
+                    <div id="tickerContent" style="display: inline-block; padding-left: 100%; animation: scroll-left 90s linear infinite;">
+                        Loading market news...
+                    </div>
+                </div>
+            </div>
         </div>
 
         <div class="grid">
@@ -276,6 +336,14 @@ DASHBOARD_HTML = '''
                     <p style="color: #999;">No signals yet</p>
                 </div>
             </div>
+            
+            <!-- Options Flow -->
+            <div class="card">
+                <h2>🔥 Options Flow</h2>
+                <div id="optionsFlow" style="max-height: 300px; overflow-y: auto;">
+                    <p style="color: #999;">Scanning for unusual options activity...</p>
+                </div>
+            </div>
         </div>
 
         <div class="grid">
@@ -283,8 +351,8 @@ DASHBOARD_HTML = '''
             <div class="card">
                 <h2>⚙️ Quick Settings</h2>
                 <div class="settings">
-                    <label>Symbols to Trade</label>
-                    <input id="symbols" value="SPY,QQQ,AAPL" />
+                    <label>Symbols to Trade (21 symbols)</label>
+                    <textarea id="symbols" style="height: 60px; font-size: 12px;">AAPL,NVDA,TSLA,IXHL,NUAI,BZAI,ELTP,OPEN,ADA,HBAR,CEG,VRT,PLTR,UPST,TEM,HTFL,SDGR,APLD,SOFI,CORZ,WULF</textarea>
                     
                     <label>Risk Level</label>
                     <select id="riskLevel">
@@ -294,7 +362,11 @@ DASHBOARD_HTML = '''
                     </select>
                     
                     <label>Max Daily Loss</label>
-                    <input id="maxLoss" value="$1000" />
+                    <input id="maxDailyLoss" value="1000" />
+                    
+                    <button onclick="saveSettings()" style="width: 100%; background: #27ae60; color: white; padding: 10px; border: none; border-radius: 5px; cursor: pointer; margin-top: 10px; font-weight: bold;">
+                        💾 Save Settings
+                    </button>
                 </div>
             </div>
 
@@ -309,8 +381,47 @@ DASHBOARD_HTML = '''
     </div>
 
     <script>
+        // Load settings on page load
+        loadSettings();
+        
         // Update dashboard every 2 seconds
         setInterval(updateDashboard, 2000);
+        
+        function loadSettings() {
+            fetch('/api/settings')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.symbols) {
+                        document.getElementById('symbols').value = data.symbols.join(',');
+                    }
+                    if (data.risk_level) {
+                        document.getElementById('riskLevel').value = data.risk_level;
+                    }
+                    if (data.max_daily_loss) {
+                        document.getElementById('maxDailyLoss').value = data.max_daily_loss;
+                    }
+                });
+        }
+        
+        function saveSettings() {
+            const settings = {
+                symbols: document.getElementById('symbols').value.split(',').map(s => s.trim()),
+                risk_level: document.getElementById('riskLevel').value,
+                max_daily_loss: parseInt(document.getElementById('maxDailyLoss').value)
+            };
+            
+            fetch('/api/settings', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(settings)
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.status === 'saved') {
+                    alert('Settings saved!');
+                }
+            });
+        }
         
         function updateDashboard() {
             fetch('/api/status')
@@ -339,6 +450,9 @@ DASHBOARD_HTML = '''
                     
                     // Update trading signals
                     updateTradingSignals(data.trading_signals);
+                    
+                    // Update options flow
+                    updateOptionsFlow(data.options_flow);
                     
                     // Update log
                     updateLog(data.log);
@@ -406,13 +520,39 @@ DASHBOARD_HTML = '''
             container.innerHTML = html;
         }
         
-        function updateNewsFeed(news) {
-            const container = document.getElementById('newsFeed');
-            if (!news || news.length === 0) {
-                container.innerHTML = '<p style="color: #999;">No recent news</p>';
+        function updateOptionsFlow(flows) {
+            const container = document.getElementById('optionsFlow');
+            if (!flows || flows.length === 0) {
+                container.innerHTML = '<p style="color: #999;">No unusual options activity detected</p>';
                 return;
             }
             
+            let html = '';
+            flows.forEach(flow => {
+                const directionClass = flow.type === 'CALL' ? 'positive' : 'negative';
+                html += `<div style="padding: 8px; border-bottom: 1px solid #eee;">
+                    <strong style="color: ${flow.type === 'CALL' ? '#4caf50' : '#f44336'}">
+                        ${flow.symbol} ${flow.type}
+                    </strong>
+                    <br>Strike: $${flow.strike} | Exp: ${flow.expiry}
+                    <br>Volume: ${flow.volume} | Premium: $${flow.premium.toLocaleString()}
+                    <br><em style="font-size: 12px; color: #666;">${flow.signal}</em>
+                </div>`;
+            });
+            container.innerHTML = html;
+        }
+        
+        function updateNewsFeed(news) {
+            const container = document.getElementById('newsFeed');
+            const ticker = document.getElementById('tickerContent');
+            
+            if (!news || news.length === 0) {
+                container.innerHTML = '<p style="color: #999;">No recent news</p>';
+                ticker.innerHTML = 'Waiting for news...';
+                return;
+            }
+            
+            // Update news feed section
             let html = '';
             for (const item of news.slice(-10)) {  // Last 10 news items
                 const sentClass = item.sentiment > 0.2 ? 'positive' : 
@@ -426,6 +566,16 @@ DASHBOARD_HTML = '''
                 </div>`;
             }
             container.innerHTML = html;
+            
+            // Update scrolling ticker with headlines
+            const tickerItems = news.slice(-20).map(item => {
+                const symbol = item.sentiment > 0.2 ? '🟢' : 
+                              item.sentiment < -0.2 ? '🔴' : '⚪';
+                return `${symbol} ${item.title}`;
+            }).join(' • ');
+            
+            // Duplicate for seamless scrolling
+            ticker.innerHTML = tickerItems + ' • ' + tickerItems;
         }
         
         function updateTradingSignals(signals) {
@@ -488,7 +638,7 @@ def index():
 
 @app.route('/api/status')
 def get_status():
-    global trading_status, pnl, positions, ai_decisions, trading_log, news_feed, trading_signals
+    global trading_status, pnl, positions, ai_decisions, trading_log, news_feed, trading_signals, options_flow
     return jsonify({
         'status': trading_status,
         'pnl': pnl,
@@ -496,6 +646,7 @@ def get_status():
         'ai_decisions': ai_decisions[-10:],  # Last 10
         'news_feed': news_feed[-10:],  # Last 10 news items
         'trading_signals': trading_signals[-5:],  # Last 5 signals
+        'options_flow': options_flow[-5:],  # Last 5 options flow signals
         'log': trading_log[-20:]  # Last 20 entries
     })
 
@@ -543,6 +694,35 @@ def stop_trading():
         trading_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Stopped trading")
     
     return jsonify({'status': 'stopped'})
+
+@app.route('/api/news', methods=['POST'])
+def update_news():
+    """Receive news updates from AI runner."""
+    global news_feed
+    
+    data = request.json
+    if data and 'news' in data:
+        news_feed = data['news']
+        return jsonify({'status': 'updated'})
+    return jsonify({'error': 'Invalid data'}), 400
+
+@app.route('/api/settings', methods=['GET'])
+def get_settings():
+    """Get user settings."""
+    global user_settings
+    return jsonify(user_settings.get('default', {}))
+
+@app.route('/api/settings', methods=['POST'])
+def save_settings():
+    """Save user settings."""
+    global user_settings
+    
+    data = request.json
+    if data:
+        user_settings['default'].update(data)
+        save_user_settings(user_settings)
+        return jsonify({'status': 'saved'})
+    return jsonify({'error': 'Invalid data'}), 400
 
 @app.route('/api/test-ai', methods=['POST'])
 def test_ai():
