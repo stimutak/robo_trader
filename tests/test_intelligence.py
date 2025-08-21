@@ -12,7 +12,7 @@ async def test_claude_trader_initialization():
     """Test ClaudeTrader initialization"""
     with patch.dict('os.environ', {'ANTHROPIC_API_KEY': 'test-key'}):
         trader = ClaudeTrader()
-        assert trader.model == "claude-3-5-sonnet-20250107"
+        assert trader.model == "claude-3-5-sonnet-latest"
 
 
 @pytest.mark.asyncio

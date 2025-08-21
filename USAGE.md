@@ -1,32 +1,50 @@
 # Robo Trader - Usage Guide
 
-## Quick Start
+## \ud83c\udf89 NEW: Web Dashboard (Easiest Way!)
 
-### 1. Prerequisites
+### 1. Start the Dashboard
 ```bash
-# Ensure you have IB Gateway or TWS running
-# Paper trading: Port 7497 (default)
-# Live trading: Port 7496 (requires explicit flags)
+# Just run this one command:
+python app.py
+```
 
-# Check your .env file has:
+### 2. Open Your Browser
+Go to: **http://localhost:5555**
+
+### 3. Start Trading
+- Click the big green **START TRADING** button
+- Watch AI analyze markets in real-time
+- Monitor your P&L and positions
+- Click **STOP TRADING** when done
+
+That's it! No more command line needed.
+
+## Prerequisites
+
+### TWS Setup (One Time)
+1. Open TWS (Trader Workstation)
+2. Login with **Paper Trading** selected
+3. Enable API: File → Global Configuration → API → Settings
+   - Check "Enable ActiveX and Socket Clients"
+   - Add 127.0.0.1 to Trusted IPs
+4. Your .env file should have:
+```bash
 ANTHROPIC_API_KEY=sk-ant-...  # Your Claude API key
 IBKR_HOST=127.0.0.1
 IBKR_PORT=7497
 IBKR_CLIENT_ID=1
 ```
 
-### 2. Basic Trading (Current)
+## Alternative: Command Line Usage
 ```bash
-# Run the basic SMA strategy (no AI yet)
+# Run with default settings
 python -m robo_trader.runner
 
 # With custom parameters
 python -m robo_trader.runner \
   --symbols SPY,QQQ,TSLA \
   --duration "5 D" \
-  --bar-size "5 mins" \
-  --sma-fast 10 \
-  --sma-slow 20
+  --bar-size "5 mins"
 ```
 
 ## 🧠 Using the Intelligence Layer
