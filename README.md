@@ -2,7 +2,7 @@
 
 An AI-powered trading system that uses LLMs to understand market events and make profitable trades. Combines real-time news analysis, institutional flow tracking, and adaptive strategies to generate consistent returns.
 
-> **⚠️ Current Status**: AI Intelligence Layer ✅ COMPLETE | IB Broker Connection ❌ BLOCKED (authentication issue)
+> **✅ Current Status**: AI Intelligence Layer COMPLETE | IB Connection WORKING | Ready for Live Testing!
 
 ### 🎯 Mission
 Build a profitable trading bot that thinks like a master trader - focusing on **intelligence over speed**. The system analyzes market events using AI, detects institutional positioning, and adapts strategies to market conditions.
@@ -34,11 +34,14 @@ robo_trader/
 │   ├── strategies.py          # Trading strategies
 │   ├── portfolio.py           # Portfolio & PnL tracking
 │   ├── logger.py              # Centralized logging
-│   ├── runner.py              # Main orchestrator
+│   ├── runner.py              # Basic runner (SMA strategy)
+│   ├── ai_runner.py           # ✅ AI-powered trading system
+│   ├── intelligence.py        # ✅ Claude 3.5 Sonnet integration
+│   ├── news.py               # ✅ RSS news aggregation (9+ feeds)
+│   ├── events.py             # ✅ Event-driven framework
+│   ├── kelly.py              # ✅ Kelly Criterion sizing
+│   ├── sentiment.py          # ✅ Sentiment analysis
 │   └── (planned)
-│       ├── intelligence.py    # LLM market analysis
-│       ├── news.py           # News ingestion pipeline
-│       ├── events.py         # Event-driven framework
 │       ├── options_flow.py   # Options analysis
 │       └── regime.py         # Market regime detection
 ├── tests/
@@ -52,33 +55,45 @@ robo_trader/
 └── CLAUDE.md                 # AI assistant context
 ```
 
-### Quickstart
+### 🚀 Quick Start - AI Trading in 3 Steps
+
 ```bash
-# 1) Create venv
+# 1) Setup (one time)
 python3 -m venv .venv && source .venv/bin/activate
-
-# 2) Install deps
-pip install -U pip setuptools wheel
 pip install -r requirements.txt
-pip install -e .
 
-# 3) Configure env
-cp .env.example .env
-# Edit .env - MUST add your ANTHROPIC_API_KEY for AI features
-# Also configure IBKR connection settings
+# 2) Configure (already done if you have .env)
+# Make sure .env has:
+#   - ANTHROPIC_API_KEY (for Claude AI)
+#   - IBKR_PORT=7497 (TWS paper trading)
 
-# 4) Run tests
-pytest -q
+# 3) START AI TRADING! 🤖
+python start_ai_trading.py
+```
 
-# 5) Test AI analysis
-python test_claude.py  # Test Claude market analysis
-python test_sentiment.py  # Test sentiment analysis
+That's it! The bot will:
+- ✅ Fetch news from 9+ sources every 5 minutes
+- ✅ Analyze with Claude AI for trading opportunities  
+- ✅ Size positions optimally with Kelly Criterion
+- ✅ Execute trades through Interactive Brokers
+- ✅ Manage risk automatically
 
-# 6) Run AI-powered trading example
-python ai_trading_example.py  # Analyzes events and makes trades
+### 📊 Monitor Your Bot
 
-# 7) Run basic paper trading (no AI yet)
-python -m robo_trader.runner
+**Web Dashboard** (http://localhost:5555):
+```bash
+python app.py  # Start web dashboard
+```
+
+**Test Components**:
+```bash
+# Test complete pipeline
+python test_integration.py
+
+# Test individual components
+python -m robo_trader.news       # Test news feeds
+python -m robo_trader.events     # Test event processing
+python -m robo_trader.kelly      # Test position sizing
 ```
 
 ### 🎯 How to Use the AI Trading Bot
