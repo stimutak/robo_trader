@@ -94,7 +94,7 @@ class ClaudeTrader:
             raise ValueError("ANTHROPIC_API_KEY not found in environment. Please add it to .env file")
         
         self.client = AsyncAnthropic(api_key=api_key)
-        self.model = "claude-3-5-sonnet-20250107"  # Latest Claude 3.5 Sonnet model
+        self.model = "claude-3-5-sonnet-latest"  # Latest Claude 3.5 Sonnet model
         logger.info("ClaudeTrader initialized with model: %s", self.model)
         
     async def analyze_market_event(
