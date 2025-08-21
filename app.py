@@ -15,6 +15,13 @@ import signal
 from robo_trader.config import load_config
 from robo_trader.logger import get_logger
 
+# Import news aggregator for real-time news
+try:
+    from robo_trader.news import NewsAggregator
+    news_aggregator = None
+except ImportError:
+    news_aggregator = None
+
 app = Flask(__name__)
 logger = get_logger(__name__)
 
@@ -25,6 +32,8 @@ trading_log = []
 positions = {}
 pnl = {"daily": 0.0, "total": 0.0}
 ai_decisions = []
+news_feed = []  # Recent news items
+trading_signals = []  # Trading signals from AI
 
 # HTML template with inline CSS and JS (single file simplicity)
 DASHBOARD_HTML = '''
@@ -150,6 +159,32 @@ DASHBOARD_HTML = '''
             padding: 2px 8px;
             border-radius: 3px;
         }
+        .news-item {
+            padding: 8px;
+            border-bottom: 1px solid #eee;
+            font-size: 13px;
+        }
+        .news-time {
+            color: #999;
+            font-size: 11px;
+        }
+        .news-sentiment {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 11px;
+            margin-left: 5px;
+        }
+        .news-sentiment.positive { background: #c8e6c9; color: #2e7d32; }
+        .news-sentiment.negative { background: #ffcdd2; color: #c62828; }
+        .news-sentiment.neutral { background: #f5f5f5; color: #666; }
+        .signal-item {
+            padding: 10px;
+            margin-bottom: 8px;
+            border-radius: 5px;
+        }
+        .signal-item.buy { background: #e8f5e9; border-left: 3px solid #4caf50; }
+        .signal-item.sell { background: #ffebee; border-left: 3px solid #f44336; }
         .settings {
             display: grid;
             gap: 10px;
@@ -210,11 +245,11 @@ DASHBOARD_HTML = '''
         </div>
 
         <div class="grid">
-            <!-- Positions -->
+            <!-- News Feed -->
             <div class="card">
-                <h2>📈 Current Positions</h2>
-                <div id="positions">
-                    <p style="color: #999;">No positions yet</p>
+                <h2>📰 Market News</h2>
+                <div id="newsFeed" style="max-height: 300px; overflow-y: auto;">
+                    <p style="color: #999;">Loading news...</p>
                 </div>
             </div>
 
@@ -223,6 +258,22 @@ DASHBOARD_HTML = '''
                 <h2>🧠 AI Analysis Feed</h2>
                 <div id="aiDecisions">
                     <p style="color: #999;">Waiting for market events...</p>
+                </div>
+            </div>
+
+            <!-- Positions -->
+            <div class="card">
+                <h2>📈 Current Positions</h2>
+                <div id="positions">
+                    <p style="color: #999;">No positions yet</p>
+                </div>
+            </div>
+
+            <!-- Trading Signals -->
+            <div class="card">
+                <h2>🎯 Trading Signals</h2>
+                <div id="tradingSignals">
+                    <p style="color: #999;">No signals yet</p>
                 </div>
             </div>
         </div>
@@ -282,6 +333,12 @@ DASHBOARD_HTML = '''
                     
                     // Update AI decisions
                     updateAIDecisions(data.ai_decisions);
+                    
+                    // Update news feed
+                    updateNewsFeed(data.news_feed);
+                    
+                    // Update trading signals
+                    updateTradingSignals(data.trading_signals);
                     
                     // Update log
                     updateLog(data.log);
@@ -349,6 +406,48 @@ DASHBOARD_HTML = '''
             container.innerHTML = html;
         }
         
+        function updateNewsFeed(news) {
+            const container = document.getElementById('newsFeed');
+            if (!news || news.length === 0) {
+                container.innerHTML = '<p style="color: #999;">No recent news</p>';
+                return;
+            }
+            
+            let html = '';
+            for (const item of news.slice(-10)) {  // Last 10 news items
+                const sentClass = item.sentiment > 0.2 ? 'positive' : 
+                                 item.sentiment < -0.2 ? 'negative' : 'neutral';
+                html += `<div class="news-item">
+                    <div class="news-time">${item.time || 'Now'}</div>
+                    <div>${item.title}</div>
+                    <span class="news-sentiment ${sentClass}">
+                        ${sentClass.toUpperCase()}
+                    </span>
+                </div>`;
+            }
+            container.innerHTML = html;
+        }
+        
+        function updateTradingSignals(signals) {
+            const container = document.getElementById('tradingSignals');
+            if (!signals || signals.length === 0) {
+                container.innerHTML = '<p style="color: #999;">No signals yet</p>';
+                return;
+            }
+            
+            let html = '';
+            for (const signal of signals.slice(-5)) {  // Last 5 signals
+                html += `<div class="signal-item ${signal.action.toLowerCase()}">
+                    <strong>${signal.action} ${signal.symbol}</strong>
+                    <div>${signal.shares} shares @ $${signal.price}</div>
+                    <div style="font-size: 11px; color: #666;">
+                        Conviction: ${signal.conviction}%
+                    </div>
+                </div>`;
+            }
+            container.innerHTML = html;
+        }
+        
         function startTrading() {
             const symbols = document.getElementById('symbols').value;
             fetch('/api/start', {
@@ -389,12 +488,14 @@ def index():
 
 @app.route('/api/status')
 def get_status():
-    global trading_status, pnl, positions, ai_decisions, trading_log
+    global trading_status, pnl, positions, ai_decisions, trading_log, news_feed, trading_signals
     return jsonify({
         'status': trading_status,
         'pnl': pnl,
         'positions': positions,
         'ai_decisions': ai_decisions[-10:],  # Last 10
+        'news_feed': news_feed[-10:],  # Last 10 news items
+        'trading_signals': trading_signals[-5:],  # Last 5 signals
         'log': trading_log[-20:]  # Last 20 entries
     })
 
