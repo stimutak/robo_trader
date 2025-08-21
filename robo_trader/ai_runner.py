@@ -336,10 +336,10 @@ class AITradingSystem:
             news_data = []
             for item in news_items[:20]:  # Top 20 for ticker
                 news_data.append({
-                    'title': item.title[:100],  # Truncate long titles
-                    'source': item.source,
-                    'sentiment': item.sentiment_score,
-                    'time': datetime.now().strftime("%H:%M")
+                    'title': item.title[:100] if hasattr(item, 'title') else str(item).split('-')[0][:100],
+                    'source': item.source if hasattr(item, 'source') else 'Unknown',
+                    'sentiment': item.sentiment_score if hasattr(item, 'sentiment_score') else 0.0,
+                    'time': item.published.strftime("%H:%M") if hasattr(item, 'published') else datetime.now().strftime("%H:%M")
                 })
             
             async with aiohttp.ClientSession() as session:
@@ -349,9 +349,11 @@ class AITradingSystem:
                     timeout=aiohttp.ClientTimeout(total=2)
                 ) as resp:
                     if resp.status == 200:
-                        logger.debug(f"Pushed {len(news_data)} news items to dashboard")
+                        logger.info(f"Successfully pushed {len(news_data)} news items to dashboard")
+                    else:
+                        logger.warning(f"Dashboard returned status {resp.status}")
         except Exception as e:
-            logger.debug(f"Could not push news to dashboard: {e}")
+            logger.warning(f"Could not push news to dashboard: {e}")
     
     async def stop(self):
         """Stop the trading system."""
