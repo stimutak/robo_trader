@@ -174,10 +174,10 @@ class AITradingSystem:
                 
             current_price = bars.iloc[-1]['close']
             
-            # Create order
+            # Create order (Order expects 'side' not 'action')
             order = Order(
                 symbol=event.symbol,
-                action=event.action,
+                side=event.action,  # Order class expects 'side' not 'action'
                 quantity=event.quantity,
                 order_type=event.order_type,
                 limit_price=event.limit_price
@@ -384,9 +384,10 @@ class AITradingSystem:
                                     }
                                     self.db.save_ai_decision(decision_data)
                                 
-                                if analysis and analysis['conviction'] >= 75:
+                                # Aggressive mode: lower threshold to 50%
+                                if analysis and analysis['conviction'] >= 50:
                                     logger.info(
-                                        f"HIGH CONVICTION OPTIONS SIGNAL: "
+                                        f"TRADING SIGNAL (50%+ conviction): "
                                         f"{signal.symbol} {analysis['direction']} "
                                         f"({analysis['conviction']}% confidence)"
                                     )
@@ -448,18 +449,31 @@ class AITradingSystem:
                                             f"Conviction={analysis.get('conviction')}%"
                                         )
                                         
-                                        # Execute trade if conviction is high
-                                        if analysis.get('conviction', 0) >= 75:
+                                        # Execute trade if conviction meets aggressive threshold (50%)
+                                        if analysis.get('conviction', 0) >= 50:
+                                            # Convert direction to signal strength
+                                            from robo_trader.events import SignalStrength
+                                            direction = analysis.get('direction', '').upper()
+                                            conviction_pct = analysis['conviction'] / 100.0  # Convert to 0-1 scale
+                                            
+                                            if direction == 'BULLISH':
+                                                signal_strength = SignalStrength.STRONG_BUY if conviction_pct >= 0.7 else SignalStrength.BUY
+                                            elif direction == 'BEARISH':
+                                                signal_strength = SignalStrength.STRONG_SELL if conviction_pct >= 0.7 else SignalStrength.SELL
+                                            else:
+                                                signal_strength = SignalStrength.HOLD
+                                            
                                             # Create signal event for processing
                                             signal = SignalEvent(
                                                 symbol=event.symbol,
-                                                action=analysis['action'].upper(),
-                                                conviction=analysis['conviction'],
-                                                reason=f"{event.event_type.value}: {event.headline}"
+                                                signal=signal_strength,
+                                                conviction=conviction_pct,
+                                                reasoning=f"{event.event_type.value}: {event.headline}"
                                             )
                                             
                                             # Add to event queue for processing
-                                            self.event_processor.event_queue.append(signal)
+                                            self.event_processor.event_queue.push(signal)
+                                            logger.info(f"Created {direction} signal for {event.symbol} with {analysis['conviction']}% conviction")
                                 except Exception as e:
                                     logger.warning(f"Could not analyze company event: {e}")
                 

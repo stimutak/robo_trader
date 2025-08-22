@@ -241,18 +241,23 @@ class EventProcessor:
                 )
                 
                 for symbol in event.news_item.symbols[:3]:  # Limit to 3 symbols
+                    # Convert conviction to 0-1 scale if it's in percentage
+                    conviction_value = analysis["conviction"]
+                    if conviction_value > 1:  # Assume it's a percentage
+                        conviction_value = conviction_value / 100.0
+                    
                     signal_event = SignalEvent(
                         symbol=symbol,
                         signal=signal_strength,
-                        conviction=analysis["conviction"],
-                        reasoning=analysis["reasoning"],
+                        conviction=conviction_value,
+                        reasoning=analysis.get("reasoning", f"AI analysis of: {event.news_item.title[:100]}"),
                         source_events=[event]
                     )
                     
                     self.event_queue.push(signal_event)
                     logger.info(
                         f"Generated {signal_strength.value} signal for {symbol} "
-                        f"(conviction: {analysis['conviction']:.0%})"
+                        f"(conviction: {conviction_value:.0%})"
                     )
                     
         except Exception as e:

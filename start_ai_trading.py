@@ -22,7 +22,7 @@ DEFAULT_ASSETS = {
                "OPEN", "CEG", "VRT", "PLTR", "UPST", 
                "TEM", "HTFL", "SDGR", "APLD", "SOFI", "CORZ", "WULF"],
     "gold": ["GLD"],  # Gold ETF - trades like a stock
-    "crypto": ["BTC-USD", "ETH-USD"]  # Major cryptocurrencies
+    "crypto": []  # Removed - not available on IB paper account
 }
 
 # Flatten for backward compatibility
