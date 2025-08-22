@@ -260,6 +260,12 @@ class AITradingSystem:
                             current_price = bars.iloc[-1]['close']
                             prev_close = bars.iloc[-2]['close'] if len(bars) > 1 else current_price
                             
+                            # Save price to database for chart display
+                            self.db.save_price_point(symbol, current_price)
+                            
+                            # Send price update to dashboard
+                            await self._push_price_to_dashboard(symbol, current_price)
+                            
                             # Calculate basic metrics
                             price_change = (current_price - prev_close) / prev_close
                             
@@ -475,26 +481,43 @@ class AITradingSystem:
         while self.is_running:
             try:
                 if self.db and self.portfolio:
+                    # Calculate total P&L (realized + unrealized)
+                    current_prices = {}
+                    for symbol in self.portfolio.positions.keys():
+                        try:
+                            bars = await self.ib_client.fetch_recent_bars(
+                                symbol=symbol,
+                                duration="1 D",
+                                bar_size="1 min"
+                            )
+                            if not bars.empty:
+                                current_prices[symbol] = bars.iloc[-1]['close']
+                        except:
+                            pass
+                    
+                    unrealized = self.portfolio.compute_unrealized(current_prices)
+                    total_pnl = self.portfolio.realized_pnl + unrealized
+                    
                     # Get current P&L data
                     pnl_data = {
-                        'total_pnl': self.portfolio.total_pnl,
-                        'daily_pnl': self.portfolio.daily_pnl,
+                        'total_pnl': total_pnl,
+                        'daily_pnl': total_pnl,  # For now, same as total
                         'realized_pnl': self.portfolio.realized_pnl,
-                        'unrealized_pnl': self.portfolio.unrealized_pnl,
+                        'unrealized_pnl': unrealized,
                         'positions_count': len(self.portfolio.positions),
                         'positions': [
                             {
                                 'symbol': symbol,
                                 'quantity': pos.quantity,
-                                'entry_price': pos.entry_price,
-                                'current_price': pos.current_price,
-                                'pnl': pos.unrealized_pnl
+                                'entry_price': pos.avg_price,
+                                'current_price': current_prices.get(symbol, pos.avg_price),
+                                'pnl': (current_prices.get(symbol, pos.avg_price) - pos.avg_price) * pos.quantity
                             }
                             for symbol, pos in self.portfolio.positions.items()
                         ]
                     }
                     self.db.save_pnl_snapshot(pnl_data)
-                    logger.debug(f"Saved P&L snapshot: ${pnl_data['total_pnl']:.2f}")
+                    logger.debug(f"Saved P&L snapshot: ${total_pnl:.2f}")
                 
                 await asyncio.sleep(600)  # Save every 10 minutes
             except Exception as e:
@@ -552,6 +575,35 @@ class AITradingSystem:
                         logger.warning(f"Dashboard returned status {resp.status}")
         except Exception as e:
             logger.warning(f"Could not push news to dashboard: {e}")
+    
+    async def _push_price_to_dashboard(self, symbol: str, price: float):
+        """Push price update to dashboard."""
+        try:
+            import aiohttp
+            from datetime import datetime
+            
+            # Calculate minute index for chart
+            now = datetime.now()
+            market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+            minutes_since_open = int((now - market_open).total_seconds() / 60)
+            
+            price_data = {
+                'symbol': symbol,
+                'price': price,
+                'timestamp': now.isoformat(),
+                'minute_index': minutes_since_open
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    'http://localhost:5555/api/save-price',
+                    json=price_data,
+                    timeout=aiohttp.ClientTimeout(total=2)
+                ) as resp:
+                    if resp.status != 200:
+                        logger.debug(f"Dashboard returned status {resp.status} for price update")
+        except Exception as e:
+            logger.debug(f"Could not push price to dashboard: {e}")
     
     async def _push_options_to_dashboard(self, signals):
         """Push options flow signals to dashboard."""

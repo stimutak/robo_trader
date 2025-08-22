@@ -4,7 +4,7 @@ Cursor-style Dashboard for Robo Trader
 Ultra-minimal design inspired by cursor.com/dashboard
 """
 
-from flask import Flask, render_template_string, jsonify, request
+from flask import Flask, render_template_string, jsonify, request, Response
 import asyncio
 import threading
 import json
@@ -14,12 +14,49 @@ import os
 import signal
 import glob
 import time
+import hashlib
+from functools import wraps
 from robo_trader.config import load_config
 from robo_trader.logger import get_logger
 from robo_trader.database import TradingDatabase
 
 app = Flask(__name__)
 logger = get_logger(__name__)
+
+# Authentication configuration
+AUTH_ENABLED = os.getenv('DASH_AUTH_ENABLED', 'false').lower() == 'true'
+AUTH_USER = os.getenv('DASH_USER', 'admin')
+AUTH_PASS_HASH = os.getenv('DASH_PASS_HASH', '')  # SHA256 hash of password
+
+def check_auth(username, password):
+    """Check if username/password is valid."""
+    if not AUTH_ENABLED:
+        return True
+    if not AUTH_PASS_HASH:
+        return True  # No password set, allow access
+    password_hash = hashlib.sha256(password.encode()).hexdigest()
+    return username == AUTH_USER and password_hash == AUTH_PASS_HASH
+
+def authenticate():
+    """Send 401 response that enables basic auth."""
+    return Response(
+        'Authentication required to access the trading dashboard.\n'
+        'Please enter your username and password.',
+        401,
+        {'WWW-Authenticate': 'Basic realm="Robo Trader Dashboard"'}
+    )
+
+def requires_auth(f):
+    """Decorator to require authentication for routes."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not AUTH_ENABLED:
+            return f(*args, **kwargs)
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return authenticate()
+        return f(*args, **kwargs)
+    return decorated
 
 # Initialize database
 db = TradingDatabase()
@@ -35,6 +72,7 @@ news_feed = []
 trading_signals = []
 options_flow = []
 company_events = []  # Store SEC filings, earnings, FDA events
+last_price_update_time = None  # Track when we last received price data
 
 # Load user settings
 USER_SETTINGS_FILE = "user_settings.json"
@@ -257,6 +295,24 @@ DASHBOARD_HTML = '''
         
         .card-value.green { color: var(--green); }
         .card-value.red { color: var(--red); }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        
+        .market-open {
+            background: rgba(34, 197, 94, 0.1);
+            color: var(--green);
+            border: 1px solid rgba(34, 197, 94, 0.2);
+        }
+        
+        .market-closed {
+            background: rgba(100, 100, 100, 0.1);
+            color: #888;
+            border: 1px solid rgba(100, 100, 100, 0.2);
+        }
         
         .card-subtitle {
             font-size: 13px;
@@ -566,6 +622,11 @@ DASHBOARD_HTML = '''
             <div class="logo">
                 <h1>Robo Trader</h1>
                 <span id="status" class="status-badge stopped">Stopped</span>
+                <span id="marketStatus" class="status-badge" style="margin-left: 10px;">Market Closed</span>
+                <span id="liveIndicator" style="display: none; margin-left: 10px;">
+                    <span style="display: inline-block; width: 8px; height: 8px; background: #22c55e; border-radius: 50%; animation: pulse 2s infinite;"></span>
+                    <span style="color: #22c55e; font-size: 12px; margin-left: 5px;">LIVE DATA</span>
+                </span>
             </div>
             <div style="color: var(--text-dim); font-size: 13px;">
                 AI-Powered Trading • Claude 3.5 Sonnet
@@ -1248,6 +1309,28 @@ DASHBOARD_HTML = '''
         // Update dashboard every 2 seconds
         setInterval(updateDashboard, 2000);
         
+        // Fetch price data every 30 seconds during market hours
+        setInterval(() => {
+            const now = new Date();
+            const hour = now.getHours();
+            const minute = now.getMinutes();
+            const day = now.getDay();
+            const currentTime = hour + minute / 60;
+            
+            const isWeekday = day >= 1 && day <= 5;
+            const isMarketHours = isWeekday && currentTime >= 6.5 && currentTime <= 13;
+            
+            if (isMarketHours && currentChartSymbol) {
+                fetch(`/api/prices/${currentChartSymbol}`)
+                    .then(r => r.json())
+                    .then(prices => {
+                        priceHistory[currentChartSymbol] = prices;
+                        updateChart();
+                    })
+                    .catch(err => console.log('Failed to fetch prices:', err));
+            }
+        }, 30000);  // Every 30 seconds
+        
         function loadSettings() {
             fetch('/api/settings')
                 .then(r => r.json())
@@ -1287,6 +1370,42 @@ DASHBOARD_HTML = '''
             });
         }
         
+        let lastPriceUpdate = null;
+        
+        function checkMarketStatus() {
+            const now = new Date();
+            const hour = now.getHours();
+            const minute = now.getMinutes();
+            const day = now.getDay();
+            
+            // Market hours: 9:30 AM - 4:00 PM ET (6:30 AM - 1:00 PM PT)
+            const marketOpen = 6.5;  // 6:30 AM PT
+            const marketClose = 13;   // 1:00 PM PT
+            const currentTime = hour + minute / 60;
+            
+            const isWeekday = day >= 1 && day <= 5;
+            const isMarketHours = isWeekday && currentTime >= marketOpen && currentTime <= marketClose;
+            
+            const marketStatusEl = document.getElementById('marketStatus');
+            const liveIndicatorEl = document.getElementById('liveIndicator');
+            
+            if (isMarketHours) {
+                marketStatusEl.className = 'status-badge market-open';
+                marketStatusEl.textContent = 'Market Open';
+                
+                // Show live indicator if we've received price updates recently
+                if (lastPriceUpdate && (now - lastPriceUpdate) < 120000) {  // Within 2 minutes
+                    liveIndicatorEl.style.display = 'inline-block';
+                } else {
+                    liveIndicatorEl.style.display = 'none';
+                }
+            } else {
+                marketStatusEl.className = 'status-badge market-closed';
+                marketStatusEl.textContent = 'Market Closed';
+                liveIndicatorEl.style.display = 'none';
+            }
+        }
+        
         function updateDashboard() {
             fetch('/api/status')
                 .then(r => r.json())
@@ -1295,6 +1414,14 @@ DASHBOARD_HTML = '''
                     const statusEl = document.getElementById('status');
                     statusEl.className = 'status-badge ' + data.status;
                     statusEl.textContent = data.status;
+                    
+                    // Track last price update
+                    if (data.last_price_update) {
+                        lastPriceUpdate = new Date(data.last_price_update);
+                    }
+                    
+                    // Check market status
+                    checkMarketStatus();
                     
                     // Update buttons
                     document.getElementById('startBtn').disabled = data.status === 'running';
@@ -1840,10 +1967,21 @@ DASHBOARD_HTML = '''
 
 # Copy all the API routes from original app.py
 @app.route('/')
+@requires_auth
 def index():
     return render_template_string(DASHBOARD_HTML)
 
+@app.route('/api/health')
+def health_check():
+    """Health check endpoint for monitoring - no auth required."""
+    return jsonify({
+        'status': 'healthy',
+        'trading_active': trading_status == 'running',
+        'timestamp': datetime.now().isoformat()
+    })
+
 @app.route('/api/status')
+@requires_auth
 def get_status():
     global trading_status, pnl, positions, ai_decisions, trading_log, news_feed, trading_signals, options_flow, company_events
     
@@ -1873,12 +2011,14 @@ def get_status():
         'news_feed': news_feed[-10:],
         'trading_signals': trading_signals[-5:],
         'options_flow': options_flow[-5:],
+        'last_price_update': last_price_update_time.isoformat() if last_price_update_time else None,
         'company_events': company_events[-10:],
         'log': trading_log[-20:],
         'price_data': price_data
     })
 
 @app.route('/api/start', methods=['POST'])
+@requires_auth
 def start_trading():
     global trading_process, trading_status, trading_log
     
@@ -1904,6 +2044,7 @@ def start_trading():
     return jsonify({'status': 'started'})
 
 @app.route('/api/stop', methods=['POST'])
+@requires_auth
 def stop_trading():
     global trading_process, trading_status, trading_log
     
@@ -2074,19 +2215,26 @@ def get_pnl_history():
         db.close()
 
 @app.route('/api/save-price', methods=['POST'])
+@requires_auth
 def save_price():
-    """Save price data to database."""
+    """Save price data to database and update live chart."""
     from robo_trader.database import TradingDatabase
     
     data = request.json
     db = TradingDatabase()
     try:
+        # Save to database
         db.save_price_point(
             symbol=data['symbol'],
             price=data['price'],
-            minute_index=data.get('index')
+            minute_index=data.get('minute_index')
         )
-        return jsonify({'status': 'saved'})
+        
+        # Track price update for live indicator
+        global last_price_update_time
+        last_price_update_time = datetime.now()
+        
+        return jsonify({'status': 'saved', 'timestamp': datetime.now().isoformat()})
     finally:
         db.close()
 
@@ -2097,6 +2245,7 @@ def get_settings():
     return jsonify(user_settings.get('default', {}))
 
 @app.route('/api/settings', methods=['POST'])
+@requires_auth
 def save_settings():
     """Save user settings."""
     global user_settings
@@ -2110,6 +2259,7 @@ def save_settings():
 
 
 @app.route('/api/test-ai', methods=['POST'])
+@requires_auth
 def test_ai():
     event = request.json.get('event', '')
     
