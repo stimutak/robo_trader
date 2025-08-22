@@ -11,9 +11,12 @@ Build a profitable trading bot that thinks like a master trader - focusing on **
 - **AI Market Analysis**: LLM integration for understanding news, earnings, Fed speeches
 - **Event-Driven Trading**: React to catalysts before retail traders
 - **Smart Money Tracking**: Options flow and institutional footprint detection
+- **Multi-Asset Support**: Trade stocks, gold (GLD ETF), and crypto (BTC, ETH)*
 - **Adaptive Strategies**: Dynamic strategy selection based on market regime
 - **Risk-First Design**: Paper trading default with strict risk controls
 - **Profit Focused**: Target 2-5% monthly returns with <15% max drawdown
+
+*Note: Crypto requires IB live account, not available in paper trading
 
 ### Architecture
 ```
@@ -41,9 +44,9 @@ robo_trader/
 │   ├── events.py             # ✅ Event-driven framework
 │   ├── kelly.py              # ✅ Kelly Criterion sizing
 │   ├── sentiment.py          # ✅ Sentiment analysis
-│   └── (planned)
-│       ├── options_flow.py   # Options analysis
-│       └── regime.py         # Market regime detection
+│   ├── options_flow.py       # ✅ Options flow analysis
+│   ├── company_intelligence.py # ✅ SEC filings, earnings, FDA tracking
+│   └── database.py           # ✅ SQLite persistence for trading data
 ├── tests/
 │   ├── test_risk.py
 │   ├── test_strategies.py
@@ -146,15 +149,38 @@ See `USAGE.md` for comprehensive guide including:
 - Safety features
 - Troubleshooting
 
+### 📦 Multi-Asset Trading Support
+
+The system now supports multiple asset classes:
+
+**Supported Assets:**
+- **Stocks**: All US equities (AAPL, NVDA, TSLA, etc.)
+- **Gold**: GLD ETF for gold exposure
+- **Crypto**: BTC-USD, ETH-USD (requires IB live account)
+
+**Default Watchlist** (21 symbols):
+```python
+STOCKS = ["AAPL", "NVDA", "TSLA", "IXHL", "NUAI", "BZAI", "ELTP", 
+          "OPEN", "CEG", "VRT", "PLTR", "UPST", "TEM", "HTFL", 
+          "SDGR", "APLD", "SOFI", "CORZ", "WULF"]
+GOLD = ["GLD"]  # Gold ETF
+CRYPTO = ["BTC-USD", "ETH-USD"]  # Major cryptocurrencies
+```
+
+**Asset Type Indicators** in Dashboard:
+- 🥇 Gold assets
+- ₿ Cryptocurrency
+- Regular stocks (no indicator)
+
 ### Configuration
 All values are read in `robo_trader/config.py` via environment variables. Defaults are conservative.
 
 **Required for IBKR connectivity:**
 - `IBKR_HOST`, `IBKR_PORT`, `IBKR_CLIENT_ID`
 
-**AI/ML Integration (planned):**
-- `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` for LLM analysis
-- News API keys for data feeds
+**AI/ML Integration:**
+- `ANTHROPIC_API_KEY` for Claude AI analysis (required)
+- News feeds configured automatically
 
 **Risk and trading mode:**
 - `TRADING_MODE` defaults to `paper` (live requires explicit flags)
@@ -173,12 +199,13 @@ All values are read in `robo_trader/config.py` via environment variables. Defaul
 - **Live Trading Gate**: Requires `TRADING_MODE=live` + `--confirm-live` flag
 - **Emergency Stop**: Manual kill switch for all positions
 
-### 🧠 Intelligence Features (Coming Soon)
-1. **LLM Market Analysis**: Understand Fed speeches, earnings calls, breaking news
-2. **Event Detection**: Identify high-impact catalysts in real-time
-3. **Sentiment Analysis**: Gauge market psychology from news and social media
-4. **Options Flow**: Track smart money and institutional positioning
-5. **Regime Detection**: Adapt strategies to market conditions
+### 🧠 Intelligence Features (Live Now!)
+1. **✅ LLM Market Analysis**: Claude 3.5 Sonnet analyzes all market events
+2. **✅ Event Detection**: Real-time SEC filings, earnings, FDA approvals
+3. **✅ Sentiment Analysis**: Market psychology from 9+ news sources
+4. **✅ Options Flow**: Track unusual options activity and institutional moves
+5. **✅ Company Intelligence**: Monitor 8-K, 10-Q, Form 4 filings automatically
+6. **🔄 Regime Detection**: Adapt strategies to market conditions (in progress)
 
 ### 📊 Development Roadmap
 See `PROJECT_PLAN.md` for detailed phases:
