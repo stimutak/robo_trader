@@ -657,6 +657,24 @@ DASHBOARD_HTML = '''
         .table tr:hover td {
             background: var(--surface-hover);
         }
+        
+        /* Custom scrollbar for symbol list */
+        #symbolSelectorContainer::-webkit-scrollbar {
+            height: 6px;
+        }
+        
+        #symbolSelectorContainer::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        
+        #symbolSelectorContainer::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 3px;
+        }
+        
+        #symbolSelectorContainer::-webkit-scrollbar-thumb:hover {
+            background: var(--text-dimmer);
+        }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
@@ -724,9 +742,22 @@ DASHBOARD_HTML = '''
                 <h2 class="section-title">Price Chart <span id="assetTypeIndicator" style="margin-left: 8px;"></span></h2>
                 <div style="display: flex; align-items: center; gap: 12px;">
                     <span id="marketHoursLabel" style="font-size: 11px; color: var(--text-dimmer);">Today (9:30 AM - 4:00 PM ET)</span>
-                    <select id="chartSymbol" class="select" style="width: 120px;" onchange="updateChartSymbol()">
-                        <!-- Will be populated dynamically -->
-                    </select>
+                </div>
+            </div>
+            <!-- Symbol Selector List -->
+            <div id="symbolSelectorContainer" style="
+                padding: 8px 16px;
+                background: var(--bg-darker);
+                border-bottom: 1px solid var(--border);
+                overflow-x: auto;
+                overflow-y: hidden;
+                white-space: nowrap;
+                -webkit-overflow-scrolling: touch;
+                scrollbar-width: thin;
+                scrollbar-color: var(--border) transparent;
+            ">
+                <div id="symbolList" style="display: inline-flex; gap: 8px;">
+                    <!-- Will be populated dynamically -->
                 </div>
             </div>
             <div class="section-content" style="height: 250px; padding: 16px; position: relative;">
@@ -1144,8 +1175,21 @@ DASHBOARD_HTML = '''
             });
         }
         
-        function updateChartSymbol() {
-            currentChartSymbol = document.getElementById('chartSymbol').value;
+        function selectSymbol(symbol) {
+            currentChartSymbol = symbol;
+            
+            // Update visual selection
+            document.querySelectorAll('.symbol-link').forEach(link => {
+                if (link.dataset.symbol === symbol) {
+                    link.style.background = 'var(--primary)';
+                    link.style.color = 'var(--bg-darkest)';
+                    link.style.borderColor = 'var(--primary)';
+                } else {
+                    link.style.background = 'var(--bg-darkest)';
+                    link.style.color = 'var(--text-dimmer)';
+                    link.style.borderColor = 'var(--border)';
+                }
+            });
             
             // Update asset type indicator in header
             const assetType = symbolInfo[currentChartSymbol] || 'stocks';
@@ -1322,25 +1366,48 @@ DASHBOARD_HTML = '''
                     
                     symbolInfo = settings.symbol_info || {};
                     
-                    // Populate dropdown with asset type indicators
-                    const select = document.getElementById('chartSymbol');
-                    select.innerHTML = '';
-                    watchlistSymbols.forEach(symbol => {
-                        const option = document.createElement('option');
-                        option.value = symbol;
-                        const assetType = symbolInfo[symbol] || 'stocks';
-                        // Show emoji in dropdown
-                        const typeEmoji = assetType === 'gold' ? '🥇 ' : assetType === 'crypto' ? '₿ ' : '';
-                        option.textContent = typeEmoji + symbol;
-                        select.appendChild(option);
-                    });
+                    // Populate symbol list with clickable links
+                    const symbolList = document.getElementById('symbolList');
+                    if (symbolList) {
+                        symbolList.innerHTML = '';
+                        watchlistSymbols.forEach((symbol, index) => {
+                            const link = document.createElement('a');
+                            link.href = '#';
+                            link.dataset.symbol = symbol;
+                            link.className = 'symbol-link';
+                            link.style.cssText = `
+                                padding: 6px 12px;
+                                background: var(--bg-darkest);
+                                border: 1px solid var(--border);
+                                border-radius: 6px;
+                                color: var(--text-dimmer);
+                                text-decoration: none;
+                                font-size: 12px;
+                                font-weight: 500;
+                                transition: all 0.2s ease;
+                                display: inline-flex;
+                                align-items: center;
+                                gap: 4px;
+                                white-space: nowrap;
+                            `;
+                            
+                            const assetType = symbolInfo[symbol] || 'stocks';
+                            // Show emoji in list
+                            const typeEmoji = assetType === 'gold' ? '🥇 ' : assetType === 'crypto' ? '₿ ' : '';
+                            link.innerHTML = typeEmoji + symbol;
+                            
+                            link.onclick = (e) => {
+                                e.preventDefault();
+                                selectSymbol(symbol);
+                            };
+                            
+                            symbolList.appendChild(link);
+                        });
+                    }
                     
                     // Set initial symbol
                     currentChartSymbol = watchlistSymbols[0];
-                    select.value = currentChartSymbol;
-                    
-                    // Update the chart header indicators for initial symbol
-                    updateChartSymbol();
+                    selectSymbol(currentChartSymbol);
                 });
         }
         

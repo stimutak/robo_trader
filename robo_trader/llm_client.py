@@ -23,6 +23,16 @@ from .logger import get_logger
 logger = get_logger(__name__)
 
 
+def json_serialize_with_datetime(obj):
+    """Custom JSON serializer for objects not serializable by default json code"""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    elif hasattr(obj, '__dict__'):
+        return obj.__dict__
+    else:
+        return str(obj)
+
+
 DECISIVE_TRADING_PROMPT = """Role
 You are an elite, data-driven discretionary/quant hybrid trader focused on producing positive risk-adjusted returns net of costs. You reason explicitly, quantify uncertainty, and act decisively when edge is present.
 
@@ -167,15 +177,20 @@ class DecisiveLLMClient:
                 raise ValueError("No valid JSON in response")
             
             # Log raw Claude response for debugging (temporarily use INFO to see it)
-            logger.info(f"Raw Claude JSON (first 1000 chars): {json.dumps(decision_data, indent=2)[:1000]}")
+            logger.info(f"Raw Claude JSON (first 1000 chars): {json.dumps(decision_data, indent=2, default=json_serialize_with_datetime)[:1000]}")
             
             # Fix common field mismatches from Claude
             if 'recommendation' in decision_data:
                 rec = decision_data['recommendation']
                 
                 # Handle null recommendation for neutral/watchlist modes
-                if rec is None or (isinstance(rec, dict) and rec.get('symbol') is None and decision_data.get('mode') in ['neutral', 'watchlist']):
-                    # Don't process null recommendations for neutral/watchlist
+                # Also check for invalid entry_type values that indicate no real trade
+                if (rec is None or 
+                    (isinstance(rec, dict) and rec.get('symbol') is None) or
+                    (isinstance(rec, dict) and rec.get('entry_type') in ['none', None, 'null']) or
+                    (isinstance(rec, dict) and rec.get('entry_price') in [0, None]) or
+                    decision_data.get('mode') in ['neutral', 'watchlist']):
+                    # Don't process null/invalid recommendations for neutral/watchlist
                     decision_data['recommendation'] = None
                 elif rec and isinstance(rec, dict):
                     # Handle ticker vs symbol
@@ -328,7 +343,7 @@ class DecisiveLLMClient:
                 prompt_version=self.prompt_version,
                 timestamp=datetime.utcnow(),
                 latency_ms=latency_ms,
-                raw_response=json.dumps(decision_data),
+                raw_response=json.dumps(decision_data, default=json_serialize_with_datetime),
                 parsed_decision=decision,
                 market_snapshot={s: m.dict() for s, m in market_data.items()},
                 news_context=[n.headline for n in news_events[:5]]
@@ -348,10 +363,13 @@ class DecisiveLLMClient:
             
         except ValidationError as e:
             logger.error(f"Decision validation failed: {e}")
-            # Return neutral decision on validation error
+            # Try to preserve conviction from the original response if available
+            original_conviction = decision_data.get('conviction', 0) if 'decision_data' in locals() else 0
+            # Return neutral decision on validation error but preserve conviction
             return self._create_neutral_decision(
                 reason=f"Validation error: {str(e)}",
-                market_data=market_data
+                market_data=market_data,
+                conviction=original_conviction
             )
         except Exception as e:
             logger.error(f"LLM decision failed: {e}")
@@ -453,14 +471,14 @@ class DecisiveLLMClient:
                 f"Anti-stall warning: {self.consecutive_no_trades} consecutive sessions without trades"
             )
     
-    def _create_neutral_decision(self, reason: str, market_data: Dict[str, MarketData]) -> TradingDecision:
+    def _create_neutral_decision(self, reason: str, market_data: Dict[str, MarketData], conviction: int = 0) -> TradingDecision:
         """Create a neutral decision when unable to analyze."""
         from .schemas import ComplianceCheck, RiskState, CostEstimate
         
         return TradingDecision(
             mode=TradingMode.NEUTRAL,
             universe_checked=list(market_data.keys()),
-            conviction=0,
+            conviction=conviction,
             compliance_checks=ComplianceCheck(
                 liquidity_ok=True,
                 spread_ok=True,

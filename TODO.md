@@ -183,6 +183,12 @@ AI-powered market analysis system is COMPLETE and working!
   - [ ] AI conviction gauge (0-100% visual)
   - [ ] P&L performance chart
 
+- [ ] **Dashboard Enhancements**
+  - [ ] Add clickable AI analysis listings that show decision reasoning
+  - [ ] Store full AI reasoning/analysis in database for each decision
+  - [ ] Create modal or detail view to display AI reasoning when clicked
+  - [ ] Add API endpoint to fetch detailed reasoning for specific decision ID
+
 - [ ] **Market Hours Testing**
   - [ ] Test during 9:30 AM - 4:00 PM ET
   - [ ] Monitor AI signal generation

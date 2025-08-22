@@ -10,6 +10,16 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def json_serialize_with_datetime(obj):
+    """Custom JSON serializer for objects not serializable by default json code"""
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    elif hasattr(obj, '__dict__'):
+        return obj.__dict__
+    else:
+        return str(obj)
+
+
 class TradingDatabase:
     """SQLite database for storing trading history and analytics."""
     
@@ -508,8 +518,8 @@ class TradingDatabase:
             decision_data.get('expected_value_pct'),
             decision_data.get('risk_reward_ratio'),
             decision_data.get('p_win'),
-            json.dumps(decision_data['raw_decision']),
-            json.dumps(decision_data.get('market_snapshot', {})),
+            json.dumps(decision_data['raw_decision'], default=json_serialize_with_datetime),
+            json.dumps(decision_data.get('market_snapshot', {}), default=json_serialize_with_datetime),
             decision_data.get('latency_ms', 0)
         ))
         self.conn.commit()

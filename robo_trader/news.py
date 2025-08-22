@@ -15,6 +15,8 @@ from typing import Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 import feedparser
 import aiohttp
+import ssl
+import certifi
 from robo_trader.logger import get_logger
 from robo_trader.sentiment import SimpleSentimentAnalyzer
 
@@ -52,7 +54,7 @@ class NewsAggregator:
         "investing_analysis": "https://www.investing.com/rss/market_overview_analysis.rss",
         "marketwatch": "https://feeds.marketwatch.com/marketwatch/topstories/",
         "cnbc_top": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114",
-        "benzinga": "https://feeds.benzinga.com/benzinga/news",
+        # "benzinga": "https://feeds.benzinga.com/benzinga/news",  # Disabled: SSL connection issues
         "nasdaq": "https://www.nasdaq.com/feed/rss/nasdaq-original",
     }
     
@@ -157,8 +159,25 @@ class NewsAggregator:
         """Fetch and parse a single RSS feed."""
         items = []
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=10) as response:
+            # Create SSL context with proper certificate validation
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            # Benzinga has SSL issues, so we relax verification for them
+            if "benzinga" in url:
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+            
+            # Increase timeout for slower feeds like NASDAQ
+            # NASDAQ is particularly slow, so give it more time
+            if "nasdaq" in url.lower():
+                timeout = aiohttp.ClientTimeout(total=60, connect=15)
+            else:
+                timeout = aiohttp.ClientTimeout(total=30, connect=10)
+            
+            async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=ssl_context),
+                timeout=timeout
+            ) as session:
+                async with session.get(url) as response:
                     if response.status == 200:
                         content = await response.text()
                         feed = feedparser.parse(content)
@@ -201,9 +220,13 @@ class NewsAggregator:
                             items.append(item)
                             
         except asyncio.TimeoutError:
-            logger.warning(f"Timeout fetching {source_name}")
+            logger.warning(f"Timeout fetching {source_name} from {url} - consider increasing timeout")
+        except aiohttp.ClientError as e:
+            logger.error(f"Network error fetching {source_name} from {url}: {e}")
+        except ssl.SSLError as e:
+            logger.error(f"SSL error fetching {source_name} from {url}: {e}")
         except Exception as e:
-            logger.error(f"Error fetching {source_name}: {e}")
+            logger.error(f"Unexpected error fetching {source_name} from {url}: {type(e).__name__}: {e}")
         
         return items
     

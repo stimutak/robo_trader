@@ -464,8 +464,8 @@ class AITradingSystem:
                                     
                                     # Use existing analyze_market_event method
                                     analysis = await self.ai_trader.analyze_market_event(
-                                        event.symbol,
                                         f"{event.event_type.value}: {event.headline}",
+                                        event.symbol,
                                         market_data  # Pass actual market data
                                     )
                                     

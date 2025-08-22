@@ -196,7 +196,7 @@ class ClaudeTrader:
                 'expected_value_pct': decision.recommendation.expected_value_pct if decision.recommendation else None,
                 'risk_reward_ratio': decision.recommendation.risk_reward if decision.recommendation else None,
                 'p_win': decision.recommendation.p_win if decision.recommendation else None,
-                'raw_decision': json.loads(decision.json()),
+                'raw_decision': decision.dict(),  # Use dict() instead of json.loads(decision.json())
                 'market_snapshot': market_data
             }
             self.db.save_llm_decision(decision_data)
