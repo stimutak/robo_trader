@@ -16,9 +16,13 @@ import glob
 import time
 from robo_trader.config import load_config
 from robo_trader.logger import get_logger
+from robo_trader.database import TradingDatabase
 
 app = Flask(__name__)
 logger = get_logger(__name__)
+
+# Initialize database
+db = TradingDatabase()
 
 # Global state
 trading_process = None
@@ -56,6 +60,61 @@ def save_user_settings(settings):
         json.dump(settings, f, indent=2)
 
 user_settings = load_user_settings()
+
+def load_historical_data():
+    """Load historical data from database on startup."""
+    global pnl, positions, ai_decisions, trading_signals, options_flow
+    
+    try:
+        # Load today's P&L
+        today_pnl = db.get_today_pnl()
+        pnl['daily'] = today_pnl.get('total_pnl', 0)
+        
+        # Load recent trades
+        recent_trades = db.get_recent_trades(limit=50)
+        for trade in recent_trades[:10]:  # Show last 10 trades
+            trading_signals.append({
+                'time': trade['timestamp'],
+                'symbol': trade['symbol'],
+                'action': trade['action'],
+                'price': trade['price'],
+                'confidence': trade.get('ai_confidence', 0)
+            })
+        
+        # Load recent options flow
+        recent_options = db.get_recent_options_flow(limit=20)
+        for opt in recent_options:
+            options_flow.append({
+                'symbol': opt['symbol'],
+                'type': opt['signal_type'],
+                'strike': opt['strike'],
+                'expiry': opt['expiry'],
+                'confidence': opt.get('confidence', 0)
+            })
+        
+        # Load performance metrics
+        metrics = db.get_performance_metrics(days=30)
+        pnl['total'] = metrics.get('total_pnl', 0)
+        
+        # If after hours, load previous day's P&L
+        import datetime
+        now = datetime.datetime.now()
+        market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+        
+        if now < market_open or now > market_close:
+            prev_pnl = db.get_previous_day_pnl()
+            if prev_pnl:
+                pnl['daily'] = prev_pnl.get('daily_pnl', 0)
+                pnl['total'] = prev_pnl.get('total_pnl', 0)
+                
+        logger.info(f"Loaded historical data: P&L ${pnl['total']:.2f}, {len(recent_trades)} trades")
+        
+    except Exception as e:
+        logger.error(f"Error loading historical data: {e}")
+
+# Load historical data on startup
+load_historical_data()
 
 # Cursor-style HTML template
 DASHBOARD_HTML = '''
@@ -1437,6 +1496,17 @@ def index():
 @app.route('/api/status')
 def get_status():
     global trading_status, pnl, positions, ai_decisions, trading_log, news_feed, trading_signals, options_flow
+    
+    # Get real-time database metrics
+    try:
+        today_metrics = db.get_today_pnl()
+        pnl['daily'] = today_metrics.get('total_pnl', pnl['daily'])
+        
+        # Get 30-day metrics for total P&L
+        monthly_metrics = db.get_performance_metrics(days=30)
+        pnl['total'] = monthly_metrics.get('total_pnl', pnl['total'])
+    except:
+        pass  # Use cached values if database fails
     
     # Extract current prices from positions
     price_data = {}

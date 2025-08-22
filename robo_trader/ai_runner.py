@@ -25,6 +25,7 @@ from .intelligence import ClaudeTrader
 from .events import EventProcessor, EventType, SignalEvent, OrderEvent
 from .kelly import KellyCalculator
 from .options_flow import OptionsFlowAnalyzer
+from .database import TradingDatabase
 
 logger = get_logger(__name__)
 
@@ -66,6 +67,9 @@ class AITradingSystem:
         self.kelly_calc: Optional[KellyCalculator] = None
         self.options_flow: Optional[OptionsFlowAnalyzer] = None
         
+        # Database for persistence
+        self.db: Optional[TradingDatabase] = None
+        
         # State tracking
         self.is_running = False
         self.stats = {
@@ -98,6 +102,10 @@ class AITradingSystem:
         self.executor = PaperExecutor(slippage_bps=5.0)
         self.portfolio = Portfolio(self.capital)
         logger.info("✓ Risk management and execution ready")
+        
+        # Initialize database
+        self.db = TradingDatabase()
+        logger.info("✓ Database initialized for data persistence")
         
         # Setup AI components
         self.news_aggregator = NewsAggregator(self.symbols, lookback_hours=6)
@@ -179,6 +187,21 @@ class AITradingSystem:
                         f"@ ${fill.fill_price:.2f}"
                     )
                     self.stats["trades_executed"] += 1
+                    
+                    # Save trade to database
+                    if self.db:
+                        trade_data = {
+                            'symbol': event.symbol,
+                            'action': event.action,
+                            'quantity': event.quantity,
+                            'price': fill.fill_price,
+                            'notional': fill.fill_price * event.quantity,
+                            'ai_confidence': getattr(event, 'conviction', None),
+                            'ai_reasoning': getattr(event, 'reasoning', None),
+                            'strategy': 'AI_EVENT_DRIVEN',
+                            'commission': 1.0  # Estimate
+                        }
+                        self.db.save_trade(trade_data)
             else:
                 logger.warning(f"Risk check failed for {event.symbol} order")
                 
@@ -265,6 +288,23 @@ class AITradingSystem:
                     )
                     self.stats["options_signals"] += len(signals)
                     
+                    # Save options signals to database
+                    if self.db:
+                        for signal in signals:
+                            signal_data = {
+                                'symbol': signal.symbol,
+                                'strike': signal.strike,
+                                'expiry': signal.expiry,
+                                'option_type': signal.option_type,
+                                'signal_type': signal.signal_type,
+                                'volume': signal.volume,
+                                'open_interest': signal.open_interest,
+                                'confidence': signal.confidence,
+                                'premium': signal.premium,
+                                'implied_volatility': getattr(signal, 'implied_volatility', None)
+                            }
+                            self.db.save_options_signal(signal_data)
+                    
                     # Send to dashboard
                     await self._push_options_to_dashboard(signals)
                     
@@ -294,6 +334,24 @@ class AITradingSystem:
                                     options_news['summary']
                                 )
                                 
+                                # Save AI decision to database
+                                if analysis and self.db:
+                                    decision_data = {
+                                        'event_type': 'OPTIONS_FLOW',
+                                        'event_data': {
+                                            'symbol': signal.symbol,
+                                            'signal_type': signal.signal_type,
+                                            'strike': signal.strike,
+                                            'expiry': str(signal.expiry),
+                                            'volume': signal.volume,
+                                            'premium': signal.premium
+                                        },
+                                        'decision': analysis.get('direction', 'HOLD').upper(),
+                                        'confidence': analysis.get('conviction', 0),
+                                        'reasoning': analysis.get('reasoning', '')
+                                    }
+                                    self.db.save_ai_decision(decision_data)
+                                
                                 if analysis and analysis['conviction'] >= 75:
                                     logger.info(
                                         f"HIGH CONVICTION OPTIONS SIGNAL: "
@@ -309,6 +367,38 @@ class AITradingSystem:
                 logger.error(f"Error processing options flow: {e}")
                 await asyncio.sleep(60)
                 
+    async def save_pnl_snapshot(self):
+        """Save P&L snapshot to database every 10 minutes."""
+        await asyncio.sleep(10)  # Initial delay
+        while self.is_running:
+            try:
+                if self.db and self.portfolio:
+                    # Get current P&L data
+                    pnl_data = {
+                        'total_pnl': self.portfolio.total_pnl,
+                        'daily_pnl': self.portfolio.daily_pnl,
+                        'realized_pnl': self.portfolio.realized_pnl,
+                        'unrealized_pnl': self.portfolio.unrealized_pnl,
+                        'positions_count': len(self.portfolio.positions),
+                        'positions': [
+                            {
+                                'symbol': symbol,
+                                'quantity': pos.quantity,
+                                'entry_price': pos.entry_price,
+                                'current_price': pos.current_price,
+                                'pnl': pos.unrealized_pnl
+                            }
+                            for symbol, pos in self.portfolio.positions.items()
+                        ]
+                    }
+                    self.db.save_pnl_snapshot(pnl_data)
+                    logger.debug(f"Saved P&L snapshot: ${pnl_data['total_pnl']:.2f}")
+                
+                await asyncio.sleep(600)  # Save every 10 minutes
+            except Exception as e:
+                logger.error(f"Error saving P&L snapshot: {e}")
+                await asyncio.sleep(60)
+    
     async def run(self):
         """Main trading loop."""
         if not self.is_running:
@@ -320,6 +410,7 @@ class AITradingSystem:
                 asyncio.create_task(self.event_processor.process_events()),
                 asyncio.create_task(self.event_processor.ingest_news()),
                 asyncio.create_task(self.process_market_data()),
+                asyncio.create_task(self.save_pnl_snapshot()),  # Add P&L tracking
             ]
             
             if self.use_ai:
