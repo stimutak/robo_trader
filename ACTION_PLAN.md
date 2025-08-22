@@ -88,6 +88,37 @@
 - [ ] Create operational runbook
 - [ ] Set up monitoring and alerting
 
+## Future Enhancements
+
+### Advanced Event Impact Analysis 🎯
+- [ ] **Primary Impact Detection**: Analyze major news events to identify most directly affected companies
+  - Fed rate decisions → Banks (JPM, BAC), REITs (O, SPG), Utilities (NEE, SO)
+  - Oil price moves → Energy (XOM, CVX), Airlines (DAL, UAL), Shipping (FDX, UPS)
+  - Regulatory changes → Affected sectors and specific companies
+  
+- [ ] **Collateral Impact Mapping**: Identify partner/supplier chain effects
+  - Apple news → Suppliers (QCOM, TSM, SWKS), Competitors (GOOGL, MSFT)
+  - Tesla news → Battery suppliers (ALBM, LAC), Charging networks (CHPT, BLNK)
+  - AI breakthroughs → Chip makers (NVDA, AMD), Cloud providers (AMZN, MSFT)
+  
+- [ ] **Daily Impact Summary**: Generate end-of-day report connecting:
+  - Top news events of the day
+  - Companies most affected (with conviction scores)
+  - Expected multi-day ripple effects
+  - Correlation clusters to watch
+  
+- [ ] **Supply Chain Intelligence**: Build knowledge graph of relationships
+  - Customer/supplier relationships
+  - Partnership agreements
+  - Competitive dynamics
+  - Sector interdependencies
+  
+- [ ] **Event Magnitude Scoring**: Quantify expected price impact
+  - Historical event impact database
+  - Sector-specific multipliers
+  - Market regime adjustments
+  - Volatility scaling
+
 ## Technical Debt to Address
 
 ### Code Quality
