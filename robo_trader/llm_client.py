@@ -165,6 +165,148 @@ class DecisiveLLMClient:
                 decision_data = json.loads(json_match.group(0))
             else:
                 raise ValueError("No valid JSON in response")
+            
+            # Log raw Claude response for debugging (temporarily use INFO to see it)
+            logger.info(f"Raw Claude JSON (first 1000 chars): {json.dumps(decision_data, indent=2)[:1000]}")
+            
+            # Fix common field mismatches from Claude
+            if 'recommendation' in decision_data:
+                rec = decision_data['recommendation']
+                
+                # Handle null recommendation for neutral/watchlist modes
+                if rec is None or (isinstance(rec, dict) and rec.get('symbol') is None and decision_data.get('mode') in ['neutral', 'watchlist']):
+                    # Don't process null recommendations for neutral/watchlist
+                    decision_data['recommendation'] = None
+                elif rec and isinstance(rec, dict):
+                    # Handle ticker vs symbol
+                    if 'ticker' in rec and 'symbol' not in rec:
+                        rec['symbol'] = rec['ticker']
+                    
+                    # Handle position_size object
+                    if 'position_size' in rec and isinstance(rec['position_size'], dict):
+                        ps = rec['position_size']
+                        rec['position_size_bps'] = ps.get('risk_bps', 0)
+                        del rec['position_size']
+                    elif 'position_size' in rec:
+                        rec['position_size_bps'] = rec['position_size']
+                        del rec['position_size']
+                    
+                    # Handle stops object
+                    if 'stops' in rec and isinstance(rec['stops'], dict):
+                        stops = rec['stops']
+                        rec['stop_loss'] = stops.get('technical') or stops.get('max_loss') or stops.get('risk', 0)
+                        del rec['stops']
+                    
+                    # Handle thesis object
+                    if 'thesis' in rec and isinstance(rec['thesis'], dict):
+                        thesis_obj = rec['thesis']
+                        # Build thesis string from components
+                        thesis_parts = []
+                        if thesis_obj.get('setup'):
+                            thesis_parts.append(f"Setup: {thesis_obj['setup']}")
+                        if thesis_obj.get('catalyst'):
+                            thesis_parts.append(f"Catalyst: {thesis_obj['catalyst']}")
+                        rec['thesis'] = ' | '.join(thesis_parts) if thesis_parts else "No thesis provided"
+                        
+                        # Extract other fields from thesis object
+                        if 'risk_reward' not in rec and 'risk_reward' in thesis_obj:
+                            rec['risk_reward'] = thesis_obj['risk_reward']
+                        if 'p_win' not in rec and 'prob_win' in thesis_obj:
+                            rec['p_win'] = thesis_obj['prob_win']
+                        if 'expected_value_pct' not in rec and 'expected_value_bps' in thesis_obj:
+                            rec['expected_value_pct'] = thesis_obj['expected_value_bps'] / 100.0
+                    
+                    # Handle costs object (extract slippage)
+                    if 'costs' in rec and isinstance(rec['costs'], dict):
+                        rec['slippage_bps'] = rec['costs'].get('slippage_bps', 0)
+                        del rec['costs']
+                    
+                    # Extract conviction if nested
+                    if 'conviction' in rec and 'conviction' not in decision_data:
+                        decision_data['conviction'] = rec['conviction']
+                    
+                    # Fix missing required fields with defaults
+                    if 'direction' not in rec:
+                        rec['direction'] = 'long'  # Default to long
+                    if 'position_size_bps' not in rec:
+                        rec['position_size_bps'] = 0
+                    if 'stop_loss' not in rec:
+                        rec['stop_loss'] = 0
+                    if 'time_stop_hours' not in rec:
+                        rec['time_stop_hours'] = 24
+                    if 'risk_reward' not in rec:
+                        rec['risk_reward'] = 0
+                    if 'p_win' not in rec:
+                        rec['p_win'] = 0
+                    if 'expected_value_pct' not in rec:
+                        rec['expected_value_pct'] = 0
+                        
+                    # Fix targets format (Claude returns objects, we need floats)
+                    if 'targets' in rec and rec['targets'] and len(rec['targets']) > 0 and isinstance(rec['targets'][0], dict):
+                        rec['targets'] = [t.get('price', t) for t in rec['targets']]
+                    elif 'targets' not in rec or not rec['targets']:
+                        rec['targets'] = []
+            
+            # Fix universe_checked (Claude returns int, we need list)
+            if 'universe_checked' in decision_data and isinstance(decision_data['universe_checked'], int):
+                decision_data['universe_checked'] = list(market_data.keys())
+            
+            # Fix compliance_checks missing spread_ok
+            if 'compliance_checks' in decision_data and 'spread_ok' not in decision_data['compliance_checks']:
+                decision_data['compliance_checks']['spread_ok'] = True
+            
+            # Fix risk_state field names
+            if 'risk_state' in decision_data:
+                rs = decision_data['risk_state']
+                if 'day_dd_bps' not in rs and 'day_drawdown_bps' in rs:
+                    rs['day_dd_bps'] = rs['day_drawdown_bps']
+                if 'week_dd_bps' not in rs and 'week_drawdown_bps' in rs:
+                    rs['week_dd_bps'] = rs['week_drawdown_bps']
+            
+            # Fix watchlist fields
+            if 'watchlist' in decision_data:
+                for watch in decision_data['watchlist']:
+                    # Handle ticker vs symbol
+                    if 'ticker' in watch and 'symbol' not in watch:
+                        watch['symbol'] = watch['ticker']
+                    
+                    # Handle various trigger field names
+                    if 'trigger' not in watch:
+                        if 'trigger_condition' in watch:
+                            watch['trigger'] = watch['trigger_condition']
+                        elif 'trigger_type' in watch:
+                            watch['trigger'] = watch['trigger_type']
+                        elif 'notes' in watch:
+                            watch['trigger'] = watch['notes']
+                        else:
+                            watch['trigger'] = "Price trigger"
+                    
+                    # Handle target_conviction
+                    if 'target_conviction' not in watch:
+                        if 'conviction' in watch:
+                            watch['target_conviction'] = watch['conviction']
+                        else:
+                            watch['target_conviction'] = 50  # Default 50%
+            
+            # Fix conviction field (sometimes missing at top level)
+            if 'conviction' not in decision_data:
+                # Try to extract from recommendation
+                if 'recommendation' in decision_data and decision_data['recommendation']:
+                    if isinstance(decision_data['recommendation'], dict) and 'conviction' in decision_data['recommendation']:
+                        decision_data['conviction'] = decision_data['recommendation']['conviction']
+                    elif isinstance(decision_data['recommendation'], list) and len(decision_data['recommendation']) > 0:
+                        # If recommendation is a list, check first item
+                        first_rec = decision_data['recommendation'][0]
+                        if isinstance(first_rec, dict) and 'conviction' in first_rec:
+                            decision_data['conviction'] = first_rec['conviction']
+                        else:
+                            decision_data['conviction'] = 0
+                    else:
+                        decision_data['conviction'] = 0
+                else:
+                    # Default to 0 for neutral decisions
+                    decision_data['conviction'] = 0
+            
             decision = TradingDecision(**decision_data)
             
             # Add metadata

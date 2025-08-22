@@ -43,18 +43,17 @@ class NewsItem:
 class NewsAggregator:
     """Aggregates news from multiple sources with deduplication and filtering."""
     
-    # Major RSS feeds for financial news
+    # Major RSS feeds for financial news - Updated Aug 2025
     RSS_FEEDS = {
         "yahoo_market": "https://finance.yahoo.com/news/rssindex",
         "yahoo_top": "https://finance.yahoo.com/rss/topfinstories",
-        # Reuters feeds currently broken - commented out
-        # "reuters_business": "https://feeds.reuters.com/reuters/businessNews",
-        # "reuters_markets": "https://feeds.reuters.com/reuters/marketsNews",
-        "bloomberg": "https://feeds.bloomberg.com/markets/news.rss",
+        "investing_news": "https://www.investing.com/rss/news.rss",
+        "investing_stocks": "https://www.investing.com/rss/stock_news.rss",
+        "investing_analysis": "https://www.investing.com/rss/market_overview_analysis.rss",
         "marketwatch": "https://feeds.marketwatch.com/marketwatch/topstories/",
         "cnbc_top": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114",
-        "wsj_markets": "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
-        "seeking_alpha": "https://seekingalpha.com/market_currents.xml",
+        "benzinga": "https://feeds.benzinga.com/benzinga/news",
+        "nasdaq": "https://www.nasdaq.com/feed/rss/nasdaq-original",
     }
     
     # Symbol-specific RSS (template URLs)

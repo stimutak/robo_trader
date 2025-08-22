@@ -90,6 +90,9 @@ class AITradingSystem:
             for symbol in symbols_list:
                 self.symbol_to_type[symbol] = asset_type
         
+        # Cache for latest market data
+        self.latest_market_data = {}
+        
     async def setup(self):
         """Initialize all components."""
         logger.info("Setting up AI Trading System...")
@@ -279,6 +282,18 @@ class AITradingSystem:
                         if not bars.empty:
                             current_price = bars.iloc[-1]['close']
                             prev_close = bars.iloc[-2]['close'] if len(bars) > 1 else current_price
+                            volume = bars.iloc[-1]['volume'] if 'volume' in bars.columns else 0
+                            
+                            # Store market data for AI analysis
+                            self.latest_market_data[symbol] = {
+                                'price': current_price,
+                                'prev_close': prev_close,
+                                'volume': volume,
+                                'change_pct': ((current_price - prev_close) / prev_close * 100) if prev_close > 0 else 0,
+                                'high': bars.iloc[-1].get('high', current_price),
+                                'low': bars.iloc[-1].get('low', current_price),
+                                'timestamp': datetime.now()
+                            }
                             
                             # Save price to database for chart display
                             self.db.save_price_point(symbol, current_price)
@@ -444,11 +459,14 @@ class AITradingSystem:
                             # Have AI analyze this event
                             if self.ai_trader:
                                 try:
+                                    # Get cached market data for this symbol
+                                    market_data = self.latest_market_data.get(event.symbol, {})
+                                    
                                     # Use existing analyze_market_event method
                                     analysis = await self.ai_trader.analyze_market_event(
                                         event.symbol,
                                         f"{event.event_type.value}: {event.headline}",
-                                        event.description
+                                        market_data  # Pass actual market data
                                     )
                                     
                                     if analysis:

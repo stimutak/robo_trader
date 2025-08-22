@@ -212,7 +212,29 @@ class EventProcessor:
         # Check if news is high-impact enough
         if event.news_item.relevance_score < 0.4:
             return
+        
+        # Deduplicate similar Fed/Powell news within 30 minutes
+        title_lower = event.news_item.title.lower()
+        is_fed_news = any(keyword in title_lower for keyword in ['powell', 'fed', 'fomc', 'rate cut', 'jackson hole'])
+        
+        if is_fed_news:
+            # Check if we've recently analyzed Fed news
+            if hasattr(self, '_last_fed_analysis'):
+                time_since = datetime.now(timezone.utc) - self._last_fed_analysis
+                if time_since.total_seconds() < 1800:  # 30 minutes
+                    logger.debug(f"Skipping duplicate Fed news (analyzed {time_since.total_seconds():.0f}s ago): {event.news_item.title[:50]}")
+                    return
+            self._last_fed_analysis = datetime.now(timezone.utc)
             
+        # Rate limit API calls - max 1 per 10 seconds
+        if hasattr(self, '_last_api_call'):
+            time_since = datetime.now(timezone.utc) - self._last_api_call
+            if time_since.total_seconds() < 10:
+                wait_time = 10 - time_since.total_seconds()
+                logger.debug(f"Rate limiting: waiting {wait_time:.1f}s before API call")
+                await asyncio.sleep(wait_time)
+        self._last_api_call = datetime.now(timezone.utc)
+        
         logger.info(f"Analyzing high-impact news: {event.news_item.title[:80]}...")
         
         # Prepare context for AI

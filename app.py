@@ -1489,13 +1489,17 @@ DASHBOARD_HTML = '''
             const minute = now.getMinutes();
             const day = now.getDay();
             
-            // Market hours: 9:30 AM - 4:00 PM ET (6:30 AM - 1:00 PM PT)
-            const marketOpen = 6.5;  // 6:30 AM PT
-            const marketClose = 13;   // 1:00 PM PT
-            const currentTime = hour + minute / 60;
+            // Market hours: 9:30 AM - 4:00 PM ET
+            // Convert to ET for market hours check
+            const etOffset = now.getTimezoneOffset() === 240 ? 0 : 3; // EDT is UTC-4, EST is UTC-5
+            const etHour = hour + etOffset;
+            const etTime = etHour + minute / 60;
+            
+            const marketOpen = 9.5;   // 9:30 AM ET
+            const marketClose = 16;    // 4:00 PM ET
             
             const isWeekday = day >= 1 && day <= 5;
-            const isMarketHours = isWeekday && currentTime >= marketOpen && currentTime <= marketClose;
+            const isMarketHours = isWeekday && etTime >= marketOpen && etTime < marketClose;
             
             const marketStatusEl = document.getElementById('marketStatus');
             const liveIndicatorEl = document.getElementById('liveIndicator');
