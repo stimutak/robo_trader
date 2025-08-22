@@ -37,6 +37,7 @@ class AITradingSystem:
     def __init__(
         self,
         symbols: List[str],
+        asset_types: Optional[Dict[str, List[str]]] = None,
         use_ai: bool = True,
         news_check_interval: int = 300,  # 5 minutes
         capital: float = 100000.0
@@ -46,11 +47,13 @@ class AITradingSystem:
         
         Args:
             symbols: List of symbols to trade
+            asset_types: Optional dict mapping asset type to symbols
             use_ai: Whether to use Claude AI for analysis
             news_check_interval: Seconds between news checks
             capital: Starting capital
         """
         self.symbols = symbols
+        self.asset_types = asset_types or {"stocks": symbols}  # Default all to stocks
         self.use_ai = use_ai
         self.news_check_interval = news_check_interval
         self.capital = capital
@@ -80,6 +83,12 @@ class AITradingSystem:
             "ai_analyses": 0,
             "options_signals": 0
         }
+        
+        # Build symbol to asset type mapping for quick lookups
+        self.symbol_to_type = {}
+        for asset_type, symbols_list in self.asset_types.items():
+            for symbol in symbols_list:
+                self.symbol_to_type[symbol] = asset_type
         
     async def setup(self):
         """Initialize all components."""
@@ -149,10 +158,14 @@ class AITradingSystem:
         """Execute orders through IB."""
         try:
             # Get current price
+            # Get asset type for this symbol
+            asset_type = self.symbol_to_type.get(event.symbol, "stock")
+            
             bars = await self.ib_client.fetch_recent_bars(
                 symbol=event.symbol,
                 duration="1 D",
-                bar_size="1 min"
+                bar_size="1 min",
+                asset_type=asset_type
             )
             
             if bars.empty:
@@ -244,16 +257,24 @@ class AITradingSystem:
                 
     async def process_market_data(self):
         """Monitor market data and generate signals."""
+        logger.info("Starting market data monitoring...")
         await asyncio.sleep(5)  # Initial delay to avoid event loop conflict
         while self.is_running:
             try:
                 # Get latest prices for all symbols
                 for symbol in self.symbols:
                     try:
+                        # Get asset type for this symbol
+                        asset_type = self.symbol_to_type.get(symbol, "stock")
+                        
+                        # Adjust duration for crypto (24/7 trading)
+                        duration = "7 D" if asset_type == "crypto" else "1 D"
+                        
                         bars = await self.ib_client.fetch_recent_bars(
                             symbol=symbol,
-                            duration="1 D",
-                            bar_size="5 mins"
+                            duration=duration,
+                            bar_size="5 mins",
+                            asset_type=asset_type
                         )
                         
                         if not bars.empty:
@@ -273,12 +294,12 @@ class AITradingSystem:
                             if abs(price_change) > 0.01:  # 1% move
                                 logger.info(f"{symbol}: ${current_price:.2f} ({price_change:+.2%})")
                     except Exception as e:
-                        logger.debug(f"Could not fetch data for {symbol}: {e}")
+                        logger.warning(f"Could not fetch data for {symbol}: {e}")
                             
                 await asyncio.sleep(60)  # Check every minute
                 
             except Exception as e:
-                logger.debug(f"Market data cycle error: {e}")
+                logger.error(f"Market data cycle error: {e}")
                 await asyncio.sleep(30)
                 
     async def process_options_flow(self):
@@ -485,10 +506,14 @@ class AITradingSystem:
                     current_prices = {}
                     for symbol in self.portfolio.positions.keys():
                         try:
+                            # Get asset type for this symbol
+                            asset_type = self.symbol_to_type.get(symbol, "stock")
+                            
                             bars = await self.ib_client.fetch_recent_bars(
                                 symbol=symbol,
                                 duration="1 D",
-                                bar_size="1 min"
+                                bar_size="1 min",
+                                asset_type=asset_type
                             )
                             if not bars.empty:
                                 current_prices[symbol] = bars.iloc[-1]['close']

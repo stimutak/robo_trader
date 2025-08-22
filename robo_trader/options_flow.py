@@ -97,7 +97,7 @@ class OptionsFlowAnalyzer:
         
         try:
             # Qualify the stock contract
-            stock = self.ib_client.qualify_stock(symbol)
+            stock = await self.ib_client.qualify_stock(symbol)
             
             # Get options chain
             chains = await self.ib_client.ib.reqSecDefOptParamsAsync(

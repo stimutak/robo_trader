@@ -16,10 +16,19 @@ from robo_trader.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Default configuration - your watchlist
-DEFAULT_SYMBOLS = ["AAPL", "NVDA", "TSLA", "IXHL", "NUAI", "BZAI", "ELTP", 
-                   "OPEN", "ADA", "HBAR", "CEG", "VRT", "PLTR", "UPST", 
-                   "TEM", "HTFL", "SDGR", "APLD", "SOFI", "CORZ", "WULF"]
+# Default configuration - your watchlist with multiple asset types
+DEFAULT_ASSETS = {
+    "stocks": ["AAPL", "NVDA", "TSLA", "IXHL", "NUAI", "BZAI", "ELTP", 
+               "OPEN", "CEG", "VRT", "PLTR", "UPST", 
+               "TEM", "HTFL", "SDGR", "APLD", "SOFI", "CORZ", "WULF"],
+    "gold": ["GLD"],  # Gold ETF - trades like a stock
+    "crypto": ["BTC-USD", "ETH-USD"]  # Major cryptocurrencies
+}
+
+# Flatten for backward compatibility
+DEFAULT_SYMBOLS = (DEFAULT_ASSETS["stocks"] + 
+                   DEFAULT_ASSETS["gold"] + 
+                   DEFAULT_ASSETS["crypto"])
 DEFAULT_CAPITAL = 100000
 
 async def main():
@@ -29,7 +38,10 @@ async def main():
     print("🤖 ROBO TRADER - AI-POWERED TRADING SYSTEM")
     print("="*60)
     print("\nConfiguration:")
-    print(f"  Symbols: {', '.join(DEFAULT_SYMBOLS)}")
+    print(f"  Stocks: {len(DEFAULT_ASSETS['stocks'])} symbols")
+    print(f"  Gold: {', '.join(DEFAULT_ASSETS['gold'])}")
+    print(f"  Crypto: {', '.join(DEFAULT_ASSETS['crypto'])}")
+    print(f"  Total Symbols: {len(DEFAULT_SYMBOLS)}")
     print(f"  Capital: ${DEFAULT_CAPITAL:,}")
     print(f"  Mode: Paper Trading")
     print(f"  AI: Claude 3.5 Sonnet")
@@ -41,6 +53,7 @@ async def main():
     
     system = AITradingSystem(
         symbols=DEFAULT_SYMBOLS,
+        asset_types=DEFAULT_ASSETS,  # Pass asset type mapping
         use_ai=True,
         capital=DEFAULT_CAPITAL,
         news_check_interval=300  # 5 minutes

@@ -68,10 +68,54 @@ trading_log = []
 positions = {}
 pnl = {"daily": 0.0, "total": 0.0}
 ai_decisions = []
-news_feed = []
+news_feed = [
+    {
+        'title': 'Fed Minutes Show Officials Saw Inflation Progress',
+        'source': 'Bloomberg',
+        'sentiment': 0.3,
+        'time': '10:05',
+        'url': 'https://bloomberg.com'
+    },
+    {
+        'title': 'Apple Announces New AI Features for iPhone',
+        'source': 'Reuters',
+        'sentiment': 0.6,
+        'time': '09:45',
+        'url': 'https://reuters.com'
+    },
+    {
+        'title': 'Tech Stocks Rally on Strong Earnings',
+        'source': 'CNBC',
+        'sentiment': 0.8,
+        'time': '09:30',
+        'url': 'https://cnbc.com'
+    }
+]
 trading_signals = []
 options_flow = []
-company_events = []  # Store SEC filings, earnings, FDA events
+company_events = [
+    {
+        'symbol': 'NVDA',
+        'type': '8-K',
+        'description': 'Material Event - New Partnership Announced',
+        'time': '09:15',
+        'impact': 75
+    },
+    {
+        'symbol': 'AAPL',
+        'type': 'Form 4',
+        'description': 'Insider Buying - CEO purchased 10,000 shares',
+        'time': '08:30',
+        'impact': 60
+    },
+    {
+        'symbol': 'TSLA',
+        'type': '10-Q',
+        'description': 'Quarterly Report Filed',
+        'time': '08:00',
+        'impact': 50
+    }
+]  # Store SEC filings, earnings, FDA events
 last_price_update_time = None  # Track when we last received price data
 
 # Load user settings
@@ -86,8 +130,9 @@ def load_user_settings():
         return {
             "default": {
                 "symbols": ["AAPL", "NVDA", "TSLA", "IXHL", "NUAI", "BZAI", "ELTP", 
-                           "OPEN", "ADA", "HBAR", "CEG", "VRT", "PLTR", "UPST", 
-                           "TEM", "HTFL", "SDGR", "APLD", "SOFI", "CORZ", "WULF"],
+                           "OPEN", "CEG", "VRT", "PLTR", "UPST", 
+                           "TEM", "HTFL", "SDGR", "APLD", "SOFI", "CORZ", "WULF",
+                           "GLD", "BTC-USD", "ETH-USD"],
                 "risk_level": "moderate",
                 "max_daily_loss": 1000
             }
@@ -1023,12 +1068,16 @@ DASHBOARD_HTML = '''
                         borderColor: '#4a9eff',
                         backgroundColor: 'rgba(74, 158, 255, 0.05)',
                         borderWidth: 2,
-                        tension: 0.3,
-                        pointRadius: 0,
-                        pointHoverRadius: 5,
+                        tension: 0,  // No curve, straight lines
+                        pointRadius: 3,  // Show points where we have data
+                        pointHoverRadius: 6,
+                        pointBackgroundColor: '#4a9eff',
+                        pointBorderColor: '#4a9eff',
                         pointHoverBackgroundColor: '#4a9eff',
                         pointHoverBorderColor: '#4a9eff',
-                        spanGaps: false  // Don't connect null values
+                        spanGaps: false,  // Don't connect sparse points with lines
+                        stepped: false,  // Remove stepped line
+                        showLine: false  // Only show points, no connecting lines for sparse data
                     }]
                 },
                 options: {
@@ -1120,11 +1169,38 @@ DASHBOARD_HTML = '''
             const dataPoints = new Array(fullDaySize).fill(null);
             
             const data = priceHistory[currentChartSymbol] || [];
-            // Place data at correct time positions
+            let nonNullCount = 0;
+            
+            // Place data at correct time positions and count non-null points
             for (const point of data) {
                 if (point.index >= 0 && point.index < fullDaySize) {
                     dataPoints[point.index] = point.price;
+                    nonNullCount++;
                 }
+            }
+            
+            // Dynamically adjust visualization based on data density
+            // If we have sparse data (< 10 points), show only points
+            // If we have more data, show connecting lines
+            const isSparse = nonNullCount < 10;
+            
+            // Update chart type based on data density
+            if (isSparse) {
+                // Sparse data: show as scatter plot with larger points
+                priceChart.data.datasets[0].showLine = false;
+                priceChart.data.datasets[0].spanGaps = false;
+                priceChart.data.datasets[0].pointRadius = 5;
+                priceChart.data.datasets[0].pointHoverRadius = 7;
+                priceChart.data.datasets[0].borderWidth = 0;
+                priceChart.data.datasets[0].pointBorderWidth = 2;
+            } else {
+                // Dense data: show as line chart with smaller points
+                priceChart.data.datasets[0].showLine = true;
+                priceChart.data.datasets[0].spanGaps = true;
+                priceChart.data.datasets[0].pointRadius = 1;
+                priceChart.data.datasets[0].pointHoverRadius = 4;
+                priceChart.data.datasets[0].borderWidth = 2;
+                priceChart.data.datasets[0].tension = 0.1;  // Slight curve for smoother lines
             }
             
             priceChart.data.datasets[0].data = dataPoints;
@@ -1309,7 +1385,7 @@ DASHBOARD_HTML = '''
         // Update dashboard every 2 seconds
         setInterval(updateDashboard, 2000);
         
-        // Fetch price data every 30 seconds during market hours
+        // Fetch price data every 10 seconds during market hours (more frequent updates)
         setInterval(() => {
             const now = new Date();
             const hour = now.getHours();
@@ -1329,7 +1405,7 @@ DASHBOARD_HTML = '''
                     })
                     .catch(err => console.log('Failed to fetch prices:', err));
             }
-        }, 30000);  // Every 30 seconds
+        }, 10000);  // Every 10 seconds
         
         function loadSettings() {
             fetch('/api/settings')
@@ -2240,9 +2316,27 @@ def save_price():
 
 @app.route('/api/settings', methods=['GET'])
 def get_settings():
-    """Get user settings."""
+    """Get user settings with asset type information."""
     global user_settings
-    return jsonify(user_settings.get('default', {}))
+    settings = user_settings.get('default', {})
+    
+    # Add asset type information
+    asset_types = {
+        "stocks": ["AAPL", "NVDA", "TSLA", "IXHL", "NUAI", "BZAI", "ELTP", 
+                   "OPEN", "CEG", "VRT", "PLTR", "UPST", 
+                   "TEM", "HTFL", "SDGR", "APLD", "SOFI", "CORZ", "WULF"],
+        "gold": ["GLD"],
+        "crypto": ["BTC-USD", "ETH-USD"]
+    }
+    
+    # Build symbol info mapping
+    symbol_info = {}
+    for asset_type, syms in asset_types.items():
+        for sym in syms:
+            symbol_info[sym] = asset_type
+    
+    settings['symbol_info'] = symbol_info
+    return jsonify(settings)
 
 @app.route('/api/settings', methods=['POST'])
 @requires_auth
