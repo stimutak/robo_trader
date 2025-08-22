@@ -117,6 +117,55 @@ class TradingDatabase:
             )
         ''')
         
+        # LLM decision tracking - detailed schema-based decisions
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS llm_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                decision_id TEXT UNIQUE NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                prompt_hash TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                prompt_version TEXT NOT NULL,
+                mode TEXT NOT NULL,  -- trade, adjust, exit, neutral, watchlist
+                symbol TEXT,
+                direction TEXT,  -- long, short, flat
+                conviction INTEGER NOT NULL,
+                entry_price REAL,
+                stop_price REAL,
+                target_price REAL,
+                position_size_bps INTEGER,
+                expected_value_pct REAL,
+                risk_reward_ratio REAL,
+                p_win REAL,
+                raw_decision_json TEXT NOT NULL,
+                market_snapshot_json TEXT,
+                latency_ms INTEGER,
+                executed BOOLEAN DEFAULT FALSE,
+                execution_id TEXT,
+                actual_pnl REAL,
+                actual_outcome TEXT  -- win, loss, scratch, timeout
+            )
+        ''')
+        
+        # Calibration tracking - for Brier scores and model performance
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS calibration_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                period_days INTEGER NOT NULL,  -- 30, 60, 90
+                total_decisions INTEGER NOT NULL,
+                trade_rate REAL,  -- % that resulted in trades
+                win_rate REAL,
+                avg_conviction REAL,
+                brier_score REAL,  -- Calibration metric
+                reliability REAL,  -- Slope of reliability plot
+                resolution REAL,  -- Ability to discriminate
+                avg_ev_error REAL,  -- Average error in EV prediction
+                sharpe_ratio REAL,
+                max_drawdown_pct REAL
+            )
+        ''')
+        
         # Market regimes - track market conditions
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS market_regimes (
@@ -431,6 +480,99 @@ class TradingDatabase:
             ''', (price, minute_index, symbol, timestamp))
             self.conn.commit()
             return cursor.lastrowid
+    
+    def save_llm_decision(self, decision_data: Dict[str, Any]) -> int:
+        """Save an LLM trading decision to the database."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO llm_decisions (
+                decision_id, prompt_hash, model_id, prompt_version,
+                mode, symbol, direction, conviction,
+                entry_price, stop_price, target_price, position_size_bps,
+                expected_value_pct, risk_reward_ratio, p_win,
+                raw_decision_json, market_snapshot_json, latency_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            decision_data['decision_id'],
+            decision_data['prompt_hash'],
+            decision_data['model_id'],
+            decision_data['prompt_version'],
+            decision_data['mode'],
+            decision_data.get('symbol'),
+            decision_data.get('direction'),
+            decision_data['conviction'],
+            decision_data.get('entry_price'),
+            decision_data.get('stop_price'),
+            decision_data.get('target_price'),
+            decision_data.get('position_size_bps'),
+            decision_data.get('expected_value_pct'),
+            decision_data.get('risk_reward_ratio'),
+            decision_data.get('p_win'),
+            json.dumps(decision_data['raw_decision']),
+            json.dumps(decision_data.get('market_snapshot', {})),
+            decision_data.get('latency_ms', 0)
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+    
+    def update_llm_decision_outcome(
+        self, 
+        decision_id: str, 
+        executed: bool, 
+        execution_id: Optional[str] = None,
+        actual_pnl: Optional[float] = None,
+        actual_outcome: Optional[str] = None
+    ):
+        """Update an LLM decision with execution outcome."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            UPDATE llm_decisions 
+            SET executed = ?, execution_id = ?, actual_pnl = ?, actual_outcome = ?
+            WHERE decision_id = ?
+        ''', (executed, execution_id, actual_pnl, actual_outcome, decision_id))
+        self.conn.commit()
+    
+    def get_calibration_data(self, days: int = 30) -> List[Dict[str, Any]]:
+        """Get LLM decision data for calibration analysis."""
+        cursor = self.conn.cursor()
+        cutoff = datetime.now() - timedelta(days=days)
+        
+        cursor.execute('''
+            SELECT 
+                conviction, p_win, expected_value_pct,
+                risk_reward_ratio, actual_pnl, actual_outcome,
+                mode, direction, symbol, timestamp
+            FROM llm_decisions
+            WHERE timestamp >= ? AND executed = TRUE
+            ORDER BY timestamp DESC
+        ''', (cutoff,))
+        
+        return [dict(row) for row in cursor.fetchall()]
+    
+    def save_calibration_metrics(self, metrics: Dict[str, Any]) -> int:
+        """Save calibration metrics for model performance tracking."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO calibration_metrics (
+                period_days, total_decisions, trade_rate, win_rate,
+                avg_conviction, brier_score, reliability, resolution,
+                avg_ev_error, sharpe_ratio, max_drawdown_pct
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            metrics['period_days'],
+            metrics['total_decisions'],
+            metrics.get('trade_rate', 0),
+            metrics.get('win_rate', 0),
+            metrics.get('avg_conviction', 0),
+            metrics.get('brier_score', 0),
+            metrics.get('reliability', 0),
+            metrics.get('resolution', 0),
+            metrics.get('avg_ev_error', 0),
+            metrics.get('sharpe_ratio', 0),
+            metrics.get('max_drawdown_pct', 0)
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
     
     def get_last_trading_day_prices(self, symbol: str) -> List[Dict[str, Any]]:
         """Get the last full trading day's price data for a symbol."""

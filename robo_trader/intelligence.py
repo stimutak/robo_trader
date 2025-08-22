@@ -1,15 +1,22 @@
 """
 Intelligence module for AI-powered market analysis using Claude 3.5 Sonnet
+This module now acts as a compatibility layer for the new LLM system.
 """
 
 import os
 import json
 import re
+import hashlib
 from typing import Dict, Any, Optional, List
+from datetime import datetime
 from anthropic import AsyncAnthropic
 import logging
+import uuid
 
 from .logger import get_logger
+from .llm_client import DecisiveLLMClient
+from .schemas import MarketData, NewsEvent, TradingMode
+from .database import TradingDatabase
 
 logger = get_logger(__name__)
 
@@ -86,16 +93,27 @@ Determine:
 
 
 class ClaudeTrader:
-    """Claude 3.5 Sonnet integration for market analysis"""
+    """
+    Claude 3.5 Sonnet integration for market analysis.
+    Now uses the new DecisiveLLMClient for structured decisions.
+    """
     
     def __init__(self):
         api_key = os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY not found in environment. Please add it to .env file")
         
+        # Use new LLM client for structured decisions
+        self.llm_client = DecisiveLLMClient(api_key=api_key)
+        
+        # Keep legacy client for backward compatibility
         self.client = AsyncAnthropic(api_key=api_key)
-        self.model = "claude-3-5-sonnet-latest"  # Latest Claude 3.5 Sonnet model
-        logger.info("ClaudeTrader initialized with model: %s", self.model)
+        self.model = "claude-3-5-sonnet-latest"
+        
+        # Database for decision tracking
+        self.db = TradingDatabase()
+        
+        logger.info("ClaudeTrader initialized with new LLM system: %s", self.model)
         
     async def analyze_market_event(
         self,
@@ -106,7 +124,8 @@ class ClaudeTrader:
         historical_events: Optional[List] = None
     ) -> Dict[str, Any]:
         """
-        Analyze a market event and return trading signal
+        Analyze a market event and return trading signal.
+        Now uses the new structured LLM system.
         
         Args:
             event_text: The news or event to analyze
@@ -118,49 +137,94 @@ class ClaudeTrader:
         Returns:
             Trading signal with direction, conviction, and rationale
         """
-        # Fill in defaults for missing data
-        market_data = market_data or {}
-        
-        # Format the prompt with actual data
-        prompt = CLAUDE_TRADING_PROMPT.format(
-            event_text=event_text,
-            symbol=symbol,
-            price=market_data.get('price', 0),
-            volume=market_data.get('volume', 0),
-            avg_volume=market_data.get('avg_volume', market_data.get('volume', 0)),
-            price_change_pct=market_data.get('price_change_pct', 0),
-            rsi=market_data.get('rsi', 50),
-            support_level=market_data.get('support', 0),
-            resistance_level=market_data.get('resistance', 0)
-        )
-        
         logger.info(f"Analyzing market event for {symbol}: {event_text[:100]}...")
         
         try:
-            response = await self.client.messages.create(
-                model=self.model,
-                max_tokens=2000,
-                temperature=0.3,  # Lower temperature for consistency
-                messages=[
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ]
+            # Convert to new schema format
+            market_data_obj = {
+                symbol: MarketData(
+                    symbol=symbol,
+                    price=market_data.get('price', 100),
+                    volume=market_data.get('volume', 1000000),
+                    avg_volume=market_data.get('avg_volume', 1000000),
+                    atr=market_data.get('atr', 2.0),
+                    adv=market_data.get('adv', 10000000),
+                    spread_pct=market_data.get('spread_pct', 0.001),
+                    shortable=market_data.get('shortable', True),
+                    borrow_rate=market_data.get('borrow_rate', 0.0),
+                    rsi=market_data.get('rsi', 50),
+                    support=market_data.get('support'),
+                    resistance=market_data.get('resistance')
+                )
+            }
+            
+            # Create news event
+            news_events = [
+                NewsEvent(
+                    headline=event_text[:200],
+                    summary=event_text,
+                    source="market_event",
+                    timestamp=datetime.now(),
+                    relevance_score=0.8,
+                    sentiment_score=0.0,
+                    symbols=[symbol],
+                    event_type="news"
+                )
+            ]
+            
+            # Get structured decision from new LLM
+            decision = await self.llm_client.get_trading_decision(
+                market_data=market_data_obj,
+                news_events=news_events,
+                aggressiveness_level=1  # Default balanced
             )
             
-            # Extract text from response
-            content = response.content[0].text
+            # Save decision to database
+            decision_data = {
+                'decision_id': str(uuid.uuid4()),
+                'prompt_hash': 'legacy_' + hashlib.sha256(event_text.encode()).hexdigest()[:8],
+                'model_id': self.model,
+                'prompt_version': 'legacy_compatible',
+                'mode': decision.mode.value,
+                'symbol': symbol if decision.recommendation else None,
+                'direction': decision.recommendation.direction.value if decision.recommendation else None,
+                'conviction': decision.conviction,
+                'entry_price': decision.recommendation.entry_price if decision.recommendation else None,
+                'stop_price': decision.recommendation.stop_loss if decision.recommendation else None,
+                'target_price': decision.recommendation.targets[0] if decision.recommendation and decision.recommendation.targets else None,
+                'position_size_bps': decision.recommendation.position_size_bps if decision.recommendation else None,
+                'expected_value_pct': decision.recommendation.expected_value_pct if decision.recommendation else None,
+                'risk_reward_ratio': decision.recommendation.risk_reward if decision.recommendation else None,
+                'p_win': decision.recommendation.p_win if decision.recommendation else None,
+                'raw_decision': json.loads(decision.json()),
+                'market_snapshot': market_data
+            }
+            self.db.save_llm_decision(decision_data)
             
-            # Parse JSON from the response
-            signal = self._extract_json_from_response(content)
+            # Convert to legacy format for compatibility
+            direction = "neutral"
+            if decision.recommendation:
+                if decision.recommendation.direction.value == "long":
+                    direction = "bullish"
+                elif decision.recommendation.direction.value == "short":
+                    direction = "bearish"
             
-            # Validate signal
-            if not self._validate_signal(signal):
-                raise ValueError(f"Invalid signal format: {signal}")
+            signal = {
+                "direction": direction,
+                "conviction": decision.conviction,
+                "rationale": decision.recommendation.thesis if decision.recommendation else decision.notes,
+                "entry_price": decision.recommendation.entry_price if decision.recommendation else 0,
+                "stop_loss": decision.recommendation.stop_loss if decision.recommendation else 0,
+                "take_profit": decision.recommendation.targets[0] if decision.recommendation and decision.recommendation.targets else 0,
+                "position_size_pct": (decision.recommendation.position_size_bps / 100) if decision.recommendation else 0,
+                "key_risks": [],
+                "alternative_scenario": ""
+            }
             
-            logger.info(f"Claude analysis complete for {symbol}: {signal['direction']} "
-                       f"with {signal['conviction']}% conviction")
+            logger.info(
+                f"Claude analysis complete for {symbol}: {signal['direction']} "
+                f"with {signal['conviction']}% conviction"
+            )
             
             return signal
             

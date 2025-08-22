@@ -8,11 +8,20 @@ An AI-powered trading system that uses Claude AI to understand market events and
 Build a profitable trading bot that thinks like a master trader - focusing on **intelligence over speed**. The system analyzes market events using AI, detects institutional positioning, and adapts strategies to market conditions.
 
 ### 🚀 Key Features
-- **AI Market Analysis**: LLM integration for understanding news, earnings, Fed speeches
+- **Decisive AI Trading**: Professional quant-level prompt with forced JSON decisions
+- **AI Market Analysis**: Claude 3.5 Sonnet for understanding news, earnings, Fed speeches
 - **Event-Driven Trading**: React to catalysts before retail traders
 - **Smart Money Tracking**: Options flow and institutional footprint detection
 - **Multi-Asset Support**: Trade stocks, gold (GLD ETF), and crypto (BTC, ETH)*
-- **Adaptive Strategies**: Dynamic strategy selection based on market regime
+- **Advanced Risk Controls**: 
+  - ATR-based position sizing
+  - 0.50% per-trade risk cap
+  - 2% daily / 5% weekly drawdown limits
+  - Mandatory stop losses
+- **Liquidity Requirements**: $3M minimum ADV, 1% max spread
+- **Correlation Control**: 35% max exposure per sector/theme
+- **Expected Value Engine**: EV calculation, Kelly sizing, 1.8:1 min RR
+- **Calibration Tracking**: Brier scores, reliability metrics, decision persistence
 - **Risk-First Design**: Paper trading default with strict risk controls
 - **Profit Focused**: Target 2-5% monthly returns with <15% max drawdown
 
@@ -30,23 +39,29 @@ Historical     News/Events    Strategy         Position        IB API
 ```
 robo_trader/
 ├── robo_trader/
-│   ├── config.py              # Env-driven configuration
+│   ├── config.py              # ✅ Enhanced with 15+ new parameters
 │   ├── ibkr_client.py         # IB API wrapper for market data
 │   ├── execution.py           # Paper/live execution
-│   ├── risk.py                # Position sizing & risk management
+│   ├── risk.py                # ✅ ATR-based sizing, weekly DD limits
 │   ├── strategies.py          # Trading strategies
 │   ├── portfolio.py           # Portfolio & PnL tracking
 │   ├── logger.py              # Centralized logging
 │   ├── runner.py              # Basic runner (SMA strategy)
 │   ├── ai_runner.py           # ✅ AI-powered trading system
-│   ├── intelligence.py        # ✅ Claude 3.5 Sonnet integration
+│   ├── intelligence.py        # ✅ Claude integration (uses new LLM client)
+│   ├── llm_client.py          # ✅ NEW: Decisive LLM with forced JSON
+│   ├── schemas.py             # ✅ NEW: Pydantic decision schemas
+│   ├── market_meta.py         # ✅ NEW: Liquidity & spread checks
+│   ├── correlation.py         # ✅ NEW: Sector exposure control
+│   ├── edge.py                # ✅ NEW: EV calculation & Kelly sizing
+│   ├── calibration.py         # ✅ NEW: Brier scores & reliability
 │   ├── news.py               # ✅ RSS news aggregation (9+ feeds)
 │   ├── events.py             # ✅ Event-driven framework
 │   ├── kelly.py              # ✅ Kelly Criterion sizing
 │   ├── sentiment.py          # ✅ Sentiment analysis
 │   ├── options_flow.py       # ✅ Options flow analysis
 │   ├── company_intelligence.py # ✅ SEC filings, earnings, FDA tracking
-│   └── database.py           # ✅ SQLite persistence for trading data
+│   └── database.py           # ✅ Enhanced with decision tracking
 ├── tests/
 │   ├── test_risk.py
 │   ├── test_strategies.py
