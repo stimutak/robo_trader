@@ -721,9 +721,9 @@ DASHBOARD_HTML = '''
         <!-- Price Chart -->
         <div class="section">
             <div class="section-header">
-                <h2 class="section-title">Price Chart</h2>
+                <h2 class="section-title">Price Chart <span id="assetTypeIndicator" style="margin-left: 8px;"></span></h2>
                 <div style="display: flex; align-items: center; gap: 12px;">
-                    <span style="font-size: 11px; color: var(--text-dimmer);">Today (9:30 AM - 4:00 PM ET)</span>
+                    <span id="marketHoursLabel" style="font-size: 11px; color: var(--text-dimmer);">Today (9:30 AM - 4:00 PM ET)</span>
                     <select id="chartSymbol" class="select" style="width: 120px;" onchange="updateChartSymbol()">
                         <!-- Will be populated dynamically -->
                     </select>
@@ -904,6 +904,7 @@ DASHBOARD_HTML = '''
         let pnlHistory = [];
         let currentChartSymbol = 'AAPL';  // Default to first watchlist symbol
         let watchlistSymbols = [];
+        let symbolInfo = {};  // Store asset type info
         let currentConviction = 0;
         let currentDirection = 'neutral';
         
@@ -1146,6 +1147,31 @@ DASHBOARD_HTML = '''
         function updateChartSymbol() {
             currentChartSymbol = document.getElementById('chartSymbol').value;
             
+            // Update asset type indicator in header
+            const assetType = symbolInfo[currentChartSymbol] || 'stocks';
+            const indicator = document.getElementById('assetTypeIndicator');
+            if (indicator) {
+                if (assetType === 'gold') {
+                    indicator.textContent = '🥇';
+                    indicator.title = 'Gold';
+                } else if (assetType === 'crypto') {
+                    indicator.textContent = '₿';
+                    indicator.title = 'Cryptocurrency';
+                } else {
+                    indicator.textContent = '';
+                }
+            }
+            
+            // Update market hours label for crypto (24/7)
+            const hoursLabel = document.getElementById('marketHoursLabel');
+            if (hoursLabel) {
+                if (assetType === 'crypto') {
+                    hoursLabel.textContent = '24/7 Trading';
+                } else {
+                    hoursLabel.textContent = 'Today (9:30 AM - 4:00 PM ET)';
+                }
+            }
+            
             // Check if we have data for this symbol, if not fetch it
             if (!priceHistory[currentChartSymbol] || priceHistory[currentChartSymbol].length === 0) {
                 fetch(`/api/prices/${currentChartSymbol}`)
@@ -1289,23 +1315,32 @@ DASHBOARD_HTML = '''
                 .then(settings => {
                     watchlistSymbols = settings.symbols || [
                         "AAPL", "NVDA", "TSLA", "IXHL", "NUAI", "BZAI", "ELTP", 
-                        "OPEN", "ADA", "HBAR", "CEG", "VRT", "PLTR", "UPST", 
-                        "TEM", "HTFL", "SDGR", "APLD", "SOFI", "CORZ", "WULF"
+                        "OPEN", "CEG", "VRT", "PLTR", "UPST", 
+                        "TEM", "HTFL", "SDGR", "APLD", "SOFI", "CORZ", "WULF",
+                        "GLD", "BTC-USD", "ETH-USD"
                     ];
                     
-                    // Populate dropdown
+                    symbolInfo = settings.symbol_info || {};
+                    
+                    // Populate dropdown with asset type indicators
                     const select = document.getElementById('chartSymbol');
                     select.innerHTML = '';
                     watchlistSymbols.forEach(symbol => {
                         const option = document.createElement('option');
                         option.value = symbol;
-                        option.textContent = symbol;
+                        const assetType = symbolInfo[symbol] || 'stocks';
+                        // Show emoji in dropdown
+                        const typeEmoji = assetType === 'gold' ? '🥇 ' : assetType === 'crypto' ? '₿ ' : '';
+                        option.textContent = typeEmoji + symbol;
                         select.appendChild(option);
                     });
                     
                     // Set initial symbol
                     currentChartSymbol = watchlistSymbols[0];
                     select.value = currentChartSymbol;
+                    
+                    // Update the chart header indicators for initial symbol
+                    updateChartSymbol();
                 });
         }
         

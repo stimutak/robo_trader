@@ -9,8 +9,6 @@
       "BZAI",
       "ELTP",
       "OPEN",
-      "ADA",
-      "HBAR",
       "CEG",
       "VRT",
       "PLTR",
@@ -21,7 +19,10 @@
       "APLD",
       "SOFI",
       "CORZ",
-      "WULF"
+      "WULF",
+      "GLD",
+      "BTC-USD",
+      "ETH-USD"
     ],
     "risk_level": "aggressive",
     "max_daily_loss": 1000,
