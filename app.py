@@ -532,7 +532,7 @@ DASHBOARD_HTML = '''
             <div class="section-header">
                 <h2 class="section-title">Price Chart</h2>
                 <div style="display: flex; align-items: center; gap: 12px;">
-                    <span style="font-size: 11px; color: var(--text-dimmer);">30 min history</span>
+                    <span style="font-size: 11px; color: var(--text-dimmer);">Today (9:30 AM - 4:00 PM ET)</span>
                     <select id="chartSymbol" class="select" style="width: 120px;" onchange="updateChartSymbol()">
                         <!-- Will be populated dynamically -->
                     </select>
@@ -565,7 +565,7 @@ DASHBOARD_HTML = '''
             <div class="section">
                 <div class="section-header">
                     <h2 class="section-title">P&L History</h2>
-                    <span style="font-size: 11px; color: var(--text-dimmer);">Live updates</span>
+                    <span style="font-size: 11px; color: var(--text-dimmer);">Today (9:30 AM - 4:00 PM ET)</span>
                 </div>
                 <div class="section-content" style="height: 200px; padding: 16px; position: relative;">
                     <canvas id="pnlChart"></canvas>
@@ -852,7 +852,7 @@ DASHBOARD_HTML = '''
                                 },
                                 maxRotation: 0,
                                 autoSkip: true,
-                                maxTicksLimit: 8
+                                maxTicksLimit: 12  // Show hourly ticks for full day
                             }
                         },
                         y: {
@@ -918,13 +918,22 @@ DASHBOARD_HTML = '''
                 hour12: false 
             });
             
-            priceHistory[symbol].push({
-                time: timeStr,
-                price: price
-            });
+            // Only add new point if it's been at least 60 seconds since last point
+            // This prevents overwhelming the chart with too many data points
+            const lastPoint = priceHistory[symbol][priceHistory[symbol].length - 1];
+            if (!lastPoint || timeStr !== lastPoint.time) {
+                priceHistory[symbol].push({
+                    time: timeStr,
+                    price: price
+                });
+            } else {
+                // Update the last point's price if within same minute
+                lastPoint.price = price;
+            }
             
-            // Keep only last 30 points
-            if (priceHistory[symbol].length > 30) {
+            // Keep full day of data (390 minutes = 6.5 hours of trading)
+            // At 1-minute intervals, that's exactly 390 points for the full day
+            if (priceHistory[symbol].length > 390) {
                 priceHistory[symbol].shift();
             }
             
@@ -1275,8 +1284,8 @@ DASHBOARD_HTML = '''
                 value: pnl.total || 0
             });
             
-            // Keep last 50 points
-            if (pnlHistory.length > 50) {
+            // Keep full trading day of P&L data
+            if (pnlHistory.length > 390) {
                 pnlHistory.shift();
             }
             
