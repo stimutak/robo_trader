@@ -2189,6 +2189,20 @@ def update_options():
         return jsonify({'status': 'updated'})
     return jsonify({'error': 'Invalid data'}), 400
 
+@app.route('/api/ai_decision', methods=['POST'])
+def receive_ai_decision():
+    """Receive AI trading decision."""
+    global ai_decisions
+    data = request.json
+    if data and 'decision' in data:
+        decision = data['decision']
+        ai_decisions.append(decision)
+        # Keep only last 20 decisions
+        if len(ai_decisions) > 20:
+            ai_decisions.pop(0)
+        return jsonify({'status': 'ok'})
+    return jsonify({'error': 'Invalid data'}), 400
+
 @app.route('/api/company_event', methods=['POST'])
 def add_company_event():
     """Receive company event from AI runner."""

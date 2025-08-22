@@ -174,13 +174,12 @@ class AITradingSystem:
                 
             current_price = bars.iloc[-1]['close']
             
-            # Create order (Order expects 'side' not 'action')
+            # Create order (Order expects 'side' not 'action', and 'price' not 'limit_price')
             order = Order(
                 symbol=event.symbol,
                 side=event.action,  # Order class expects 'side' not 'action'
                 quantity=event.quantity,
-                order_type=event.order_type,
-                limit_price=event.limit_price
+                price=event.limit_price  # Order class expects 'price' not 'limit_price'
             )
             
             # Risk check
@@ -383,6 +382,16 @@ class AITradingSystem:
                                         'reasoning': analysis.get('reasoning', '')
                                     }
                                     self.db.save_ai_decision(decision_data)
+                                    
+                                    # Push AI decision to dashboard
+                                    from datetime import datetime
+                                    await self._push_ai_decision_to_dashboard({
+                                        'symbol': signal.symbol,
+                                        'action': analysis.get('direction', 'HOLD').upper(),
+                                        'confidence': analysis.get('conviction', 0),
+                                        'reason': f"Options flow: {signal.signal_type}",
+                                        'time': datetime.now().strftime('%H:%M:%S')
+                                    })
                                 
                                 # Aggressive mode: lower threshold to 50%
                                 if analysis and analysis['conviction'] >= 50:
@@ -448,6 +457,16 @@ class AITradingSystem:
                                             f"Action={analysis.get('action')}, "
                                             f"Conviction={analysis.get('conviction')}%"
                                         )
+                                        
+                                        # Push AI decision to dashboard
+                                        from datetime import datetime
+                                        await self._push_ai_decision_to_dashboard({
+                                            'symbol': event.symbol,
+                                            'action': analysis.get('direction', 'HOLD').upper(),
+                                            'confidence': analysis.get('conviction', 0),
+                                            'reason': f"{event.event_type.value}: {event.headline}",
+                                            'time': datetime.now().strftime('%H:%M:%S')
+                                        })
                                         
                                         # Execute trade if conviction meets aggressive threshold (50%)
                                         if analysis.get('conviction', 0) >= 50:
@@ -643,6 +662,22 @@ class AITradingSystem:
                         logger.debug(f"Dashboard returned status {resp.status} for price update")
         except Exception as e:
             logger.debug(f"Could not push price to dashboard: {e}")
+    
+    async def _push_ai_decision_to_dashboard(self, decision):
+        """Push AI decision to dashboard for conviction gauge."""
+        try:
+            import aiohttp
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    'http://localhost:5555/api/ai_decision',
+                    json={'decision': decision},
+                    timeout=aiohttp.ClientTimeout(total=2)
+                ) as resp:
+                    if resp.status == 200:
+                        logger.debug(f"Pushed AI decision to dashboard: {decision['symbol']} {decision['confidence']}%")
+        except Exception as e:
+            logger.debug(f"Could not push AI decision to dashboard: {e}")
     
     async def _push_options_to_dashboard(self, signals):
         """Push options flow signals to dashboard."""
