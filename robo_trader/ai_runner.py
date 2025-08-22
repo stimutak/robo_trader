@@ -26,6 +26,7 @@ from .events import EventProcessor, EventType, SignalEvent, OrderEvent
 from .kelly import KellyCalculator
 from .options_flow import OptionsFlowAnalyzer
 from .database import TradingDatabase
+from .company_intelligence import CompanyIntelligence, CompanyEvent
 
 logger = get_logger(__name__)
 
@@ -125,6 +126,10 @@ class AITradingSystem:
         # Setup options flow analyzer
         self.options_flow = OptionsFlowAnalyzer(self.ib_client)
         logger.info("✓ Options flow analyzer initialized")
+        
+        # Setup company intelligence
+        self.company_intel = CompanyIntelligence(self.symbols)
+        logger.info("✓ Company intelligence module initialized")
         
         # Setup event processor
         self.event_processor = EventProcessor(
@@ -367,6 +372,103 @@ class AITradingSystem:
                 logger.error(f"Error processing options flow: {e}")
                 await asyncio.sleep(60)
                 
+    async def process_company_events(self):
+        """Monitor company-specific events (SEC filings, earnings, FDA)."""
+        # Initialize company intelligence
+        await self.company_intel.initialize()
+        
+        while self.is_running:
+            try:
+                logger.info("Checking for company-specific events...")
+                events = await self.company_intel.fetch_all_events()
+                
+                if events:
+                    logger.info(f"Found {len(events)} company events")
+                    self.stats["company_events"] = len(events)
+                    
+                    # Send ALL events to dashboard for display
+                    for event in events:
+                        await self._push_company_event_to_dashboard(event)
+                    
+                    # Process medium and high-impact events through AI
+                    for event in events:
+                        if event.impact_score >= 50:  # Lowered to include Form 4 (60 score)
+                            if event.impact_score >= 70:
+                                logger.info(
+                                    f"🎯 HIGH IMPACT: {event.symbol} - {event.event_type.value}: "
+                                    f"{event.headline} (Score: {event.impact_score})"
+                                )
+                            else:
+                                logger.info(
+                                    f"📊 Medium Impact: {event.symbol} - {event.event_type.value}: "
+                                    f"{event.headline} (Score: {event.impact_score})"
+                                )
+                            
+                            # Have AI analyze this event
+                            if self.ai_trader:
+                                try:
+                                    # Use existing analyze_market_event method
+                                    analysis = await self.ai_trader.analyze_market_event(
+                                        event.symbol,
+                                        f"{event.event_type.value}: {event.headline}",
+                                        event.description
+                                    )
+                                    
+                                    if analysis:
+                                        logger.info(
+                                            f"AI Analysis for {event.symbol}: "
+                                            f"Action={analysis.get('action')}, "
+                                            f"Conviction={analysis.get('conviction')}%"
+                                        )
+                                        
+                                        # Execute trade if conviction is high
+                                        if analysis.get('conviction', 0) >= 75:
+                                            # Create signal event for processing
+                                            signal = SignalEvent(
+                                                symbol=event.symbol,
+                                                action=analysis['action'].upper(),
+                                                conviction=analysis['conviction'],
+                                                reason=f"{event.event_type.value}: {event.headline}"
+                                            )
+                                            
+                                            # Add to event queue for processing
+                                            self.event_processor.event_queue.append(signal)
+                                except Exception as e:
+                                    logger.warning(f"Could not analyze company event: {e}")
+                
+                # Check every 5 minutes for new filings/events
+                await asyncio.sleep(300)
+                
+            except Exception as e:
+                logger.error(f"Error processing company events: {e}")
+                await asyncio.sleep(60)
+    
+    async def _push_company_event_to_dashboard(self, event: CompanyEvent):
+        """Push company event to dashboard."""
+        try:
+            import aiohttp
+            
+            event_data = {
+                'symbol': event.symbol,
+                'type': event.event_type.value,
+                'headline': event.headline,
+                'description': event.description[:200],
+                'impact': event.impact_score,
+                'url': event.url,
+                'time': event.timestamp.strftime("%H:%M")
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    'http://localhost:5555/api/company_event',
+                    json={'event': event_data},
+                    timeout=aiohttp.ClientTimeout(total=2)
+                ) as resp:
+                    if resp.status == 200:
+                        logger.info(f"Pushed {event.event_type.value} for {event.symbol} to dashboard")
+        except Exception as e:
+            logger.warning(f"Could not push company event to dashboard: {e}")
+    
     async def save_pnl_snapshot(self):
         """Save P&L snapshot to database every 10 minutes."""
         await asyncio.sleep(10)  # Initial delay
@@ -416,6 +518,7 @@ class AITradingSystem:
             if self.use_ai:
                 tasks.append(asyncio.create_task(self.process_news_cycle()))
                 tasks.append(asyncio.create_task(self.process_options_flow()))
+                tasks.append(asyncio.create_task(self.process_company_events()))
                 
             try:
                 await asyncio.gather(*tasks)

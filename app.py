@@ -34,6 +34,7 @@ ai_decisions = []
 news_feed = []
 trading_signals = []
 options_flow = []
+company_events = []  # Store SEC filings, earnings, FDA events
 
 # Load user settings
 USER_SETTINGS_FILE = "user_settings.json"
@@ -500,6 +501,31 @@ DASHBOARD_HTML = '''
             background: var(--border-hover);
         }
         
+        /* Filter buttons */
+        .filter-btn {
+            padding: 4px 10px;
+            font-size: 11px;
+            font-weight: 500;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            color: var(--text-dimmer);
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        
+        .filter-btn:hover {
+            background: var(--surface-hover);
+            border-color: var(--accent);
+            color: var(--text);
+        }
+        
+        .filter-btn.active {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: white;
+        }
+        
         /* Positions Table */
         .table {
             width: 100%;
@@ -721,6 +747,30 @@ DASHBOARD_HTML = '''
                     </div>
                 </div>
                 
+                <!-- Company Events (SEC Filings, Earnings, FDA) -->
+                <div class="list">
+                    <div class="list-header" style="flex-direction: column; gap: 8px;">
+                        <div style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
+                            <span>Company Events</span>
+                            <span style="font-size: 10px; color: var(--accent);">SEC • EARNINGS • FDA</span>
+                        </div>
+                        <div class="event-filters" style="display: flex; gap: 6px; flex-wrap: wrap;">
+                            <button class="filter-btn active" data-filter="all" onclick="filterCompanyEvents('all')">All</button>
+                            <button class="filter-btn" data-filter="SEC" onclick="filterCompanyEvents('SEC')">SEC</button>
+                            <button class="filter-btn" data-filter="8-K" onclick="filterCompanyEvents('8-K')">8-K</button>
+                            <button class="filter-btn" data-filter="10-" onclick="filterCompanyEvents('10-Q/K')">10-Q/K</button>
+                            <button class="filter-btn" data-filter="Form 4" onclick="filterCompanyEvents('Form 4')">Form 4</button>
+                            <button class="filter-btn" data-filter="Earnings" onclick="filterCompanyEvents('Earnings')">Earnings</button>
+                            <button class="filter-btn" data-filter="FDA" onclick="filterCompanyEvents('FDA')">FDA</button>
+                        </div>
+                    </div>
+                    <div id="companyEvents" class="list-content" style="max-height: 300px;">
+                        <div class="list-item">
+                            <div class="list-item-title">Monitoring SEC filings...</div>
+                        </div>
+                    </div>
+                </div>
+                
                 <!-- Activity Log -->
                 <div class="list">
                     <div class="list-header">Activity</div>
@@ -742,6 +792,8 @@ DASHBOARD_HTML = '''
         let priceChart = null;
         let convictionGauge = null;
         let pnlChart = null;
+        let allCompanyEvents = [];  // Store all events for filtering
+        let activeEventFilter = 'all';  // Track active filter
         let priceHistory = {};
         let pnlHistory = [];
         let currentChartSymbol = 'AAPL';  // Default to first watchlist symbol
@@ -779,20 +831,39 @@ DASHBOARD_HTML = '''
         
         function initPnLChart() {
             const ctx = document.getElementById('pnlChart').getContext('2d');
+            
+            // Pre-generate full trading day labels and empty data
+            const fullDaySize = 390;
+            const labels = [];
+            const dataPoints = [];
+            
+            // Generate time labels for full trading day - ALL points need labels for chart.js
+            const startHour = 9;
+            const startMinute = 30;
+            for (let i = 0; i < fullDaySize; i++) {
+                const totalMinutes = startHour * 60 + startMinute + i;
+                const hour = Math.floor(totalMinutes / 60);
+                const minute = totalMinutes % 60;
+                // Add label for every minute (chart.js will auto-skip as needed)
+                labels.push(`${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`);
+                dataPoints.push(null);  // Start with null data
+            }
+            
             pnlChart = new Chart(ctx, {
                 type: 'line',
                 data: {
-                    labels: [],
+                    labels: labels,  // Start with full day labels
                     datasets: [{
                         label: 'P&L',
-                        data: [],
+                        data: dataPoints,  // Start with null data
                         borderColor: '#22c55e',
                         backgroundColor: 'rgba(34, 197, 94, 0.1)',
                         borderWidth: 2,
                         tension: 0.3,
                         fill: true,
                         pointRadius: 0,
-                        pointHoverRadius: 4
+                        pointHoverRadius: 4,
+                        spanGaps: false  // Don't connect null values
                     }]
                 },
                 options: {
@@ -830,12 +901,21 @@ DASHBOARD_HTML = '''
                                 color: '#5a5a5a',
                                 font: { size: 10 },
                                 maxRotation: 0,
-                                autoSkip: true,
-                                maxTicksLimit: 6
+                                autoSkip: true,  // Let Chart.js auto-skip labels
+                                maxTicksLimit: 13,  // Show about 13 ticks (every 30 mins)
+                                callback: function(value, index) {
+                                    // Only show time at 30-minute intervals
+                                    if (index % 30 === 0) {
+                                        return this.getLabelForValue(value);
+                                    }
+                                    return '';
+                                }
                             }
                         },
                         y: {
                             position: 'right',
+                            min: -120,  // Fixed initial scale
+                            max: 120,   // Will be adjusted as data comes in
                             grid: {
                                 color: 'rgba(255, 255, 255, 0.03)',
                                 drawBorder: false
@@ -855,13 +935,30 @@ DASHBOARD_HTML = '''
         
         function initChart() {
             const ctx = document.getElementById('priceChart').getContext('2d');
+            
+            // Pre-generate full trading day labels
+            const fullDaySize = 390;
+            const labels = [];
+            const dataPoints = [];
+            
+            // Generate time labels for full trading day
+            const startHour = 9;
+            const startMinute = 30;
+            for (let i = 0; i < fullDaySize; i++) {
+                const totalMinutes = startHour * 60 + startMinute + i;
+                const hour = Math.floor(totalMinutes / 60);
+                const minute = totalMinutes % 60;
+                labels.push(`${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`);
+                dataPoints.push(null);
+            }
+            
             priceChart = new Chart(ctx, {
                 type: 'line',
                 data: {
-                    labels: [],
+                    labels: labels,  // Start with full day labels
                     datasets: [{
                         label: 'Price',
-                        data: [],
+                        data: dataPoints,  // Start with null data
                         borderColor: '#4a9eff',
                         backgroundColor: 'rgba(74, 158, 255, 0.05)',
                         borderWidth: 2,
@@ -869,7 +966,8 @@ DASHBOARD_HTML = '''
                         pointRadius: 0,
                         pointHoverRadius: 5,
                         pointHoverBackgroundColor: '#4a9eff',
-                        pointHoverBorderColor: '#4a9eff'
+                        pointHoverBorderColor: '#4a9eff',
+                        spanGaps: false  // Don't connect null values
                     }]
                 },
                 options: {
@@ -911,7 +1009,7 @@ DASHBOARD_HTML = '''
                                 },
                                 maxRotation: 0,
                                 autoSkip: true,
-                                maxTicksLimit: 12  // Show hourly ticks for full day
+                                maxTicksLimit: 14  // Show hourly ticks for full trading day
                             }
                         },
                         y: {
@@ -957,12 +1055,19 @@ DASHBOARD_HTML = '''
         function updateChart() {
             if (!priceChart) return;
             
+            const fullDaySize = 390;
+            const dataPoints = new Array(fullDaySize).fill(null);
+            
             const data = priceHistory[currentChartSymbol] || [];
-            if (data.length > 0) {
-                priceChart.data.labels = data.map(d => d.time);
-                priceChart.data.datasets[0].data = data.map(d => d.price);
-                priceChart.update('none');
+            // Place data at correct time positions
+            for (const point of data) {
+                if (point.index >= 0 && point.index < fullDaySize) {
+                    dataPoints[point.index] = point.price;
+                }
             }
+            
+            priceChart.data.datasets[0].data = dataPoints;
+            priceChart.update('none');
         }
         
         function addPricePoint(symbol, price) {
@@ -977,29 +1082,54 @@ DASHBOARD_HTML = '''
                 hour12: false 
             });
             
-            // Only add new point if it's been at least 60 seconds since last point
-            // This prevents overwhelming the chart with too many data points
-            const lastPoint = priceHistory[symbol][priceHistory[symbol].length - 1];
-            if (!lastPoint || timeStr !== lastPoint.time) {
-                priceHistory[symbol].push({
-                    time: timeStr,
-                    price: price
-                });
-            } else {
-                // Update the last point's price if within same minute
-                lastPoint.price = price;
-            }
+            // Check if market is open
+            const currentHour = now.getHours();
+            const currentMinute = now.getMinutes();
+            const currentTime = currentHour * 60 + currentMinute;
+            const marketOpen = 9 * 60 + 30;  // 9:30 AM
+            const marketClose = 16 * 60;     // 4:00 PM
+            const dayOfWeek = now.getDay();
+            const isWeekday = dayOfWeek >= 1 && dayOfWeek <= 5;
+            const isMarketOpen = (currentTime >= marketOpen && currentTime <= marketClose) && isWeekday;
             
-            // Keep full day of data (390 minutes = 6.5 hours of trading)
-            // At 1-minute intervals, that's exactly 390 points for the full day
-            if (priceHistory[symbol].length > 390) {
-                priceHistory[symbol].shift();
+            if (isMarketOpen) {
+                // Calculate position in trading day
+                const minutesSinceOpen = currentTime - marketOpen;
+                
+                // Check if this is a new trading day
+                if (minutesSinceOpen === 0 || 
+                    (priceHistory[symbol].length > 0 && 
+                     priceHistory[symbol][0].index !== undefined && 
+                     minutesSinceOpen < priceHistory[symbol][priceHistory[symbol].length - 1].index)) {
+                    priceHistory[symbol] = [];  // Clear for new trading day
+                }
+                
+                // Only add new point if it's been at least 60 seconds since last point
+                const lastPoint = priceHistory[symbol][priceHistory[symbol].length - 1];
+                if (!lastPoint || timeStr !== lastPoint.time) {
+                    const newPoint = {
+                        time: timeStr,
+                        price: price,
+                        index: Math.max(0, Math.min(389, minutesSinceOpen))
+                    };
+                    priceHistory[symbol].push(newPoint);
+                    // No need to save every price point - just keep in memory
+                } else {
+                    // Update the last point's price if within same minute
+                    lastPoint.price = price;
+                }
+                
+                // Keep full day of data (390 minutes = 6.5 hours of trading)
+                if (priceHistory[symbol].length > 390) {
+                    priceHistory[symbol].shift();
+                }
+                
+                // Update chart if showing this symbol
+                if (symbol === currentChartSymbol) {
+                    updateChart();
+                }
             }
-            
-            // Update chart if showing this symbol
-            if (symbol === currentChartSymbol) {
-                updateChart();
-            }
+            // After hours - keep showing last trading day's data without adding new points
         }
         
         // Initialize chart on load
@@ -1011,6 +1141,8 @@ DASHBOARD_HTML = '''
             loadChartSymbols();
             // Load initial price data
             loadInitialPrices();
+            // Load historical P&L data
+            loadHistoricalPnL();
         });
         
         function loadChartSymbols() {
@@ -1050,6 +1182,67 @@ DASHBOARD_HTML = '''
                         updateChart();
                     });
             }, 500);  // Small delay to ensure symbols are loaded
+        }
+        
+        function loadHistoricalPnL() {
+            // Load historical P&L data from database
+            fetch('/api/pnl-history')
+                .then(r => r.json())
+                .then(data => {
+                    if (data && data.length > 0) {
+                        // Clear and reload with historical data
+                        pnlHistory = data;
+                        
+                        // Display in chart with fixed axes
+                        if (pnlChart) {
+                            const fullDaySize = 390;
+                            const labels = new Array(fullDaySize).fill('');
+                            const dataPoints = new Array(fullDaySize).fill(null);
+                            
+                            // Generate full day labels
+                            const startHour = 9;
+                            const startMinute = 30;
+                            for (let i = 0; i < fullDaySize; i++) {
+                                const totalMinutes = startHour * 60 + startMinute + i;
+                                const hour = Math.floor(totalMinutes / 60);
+                                const minute = totalMinutes % 60;
+                                if (i % 30 === 0) {
+                                    labels[i] = `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
+                                }
+                            }
+                            
+                            // Place historical data at correct positions
+                            for (const point of data) {
+                                if (point.index >= 0 && point.index < fullDaySize) {
+                                    dataPoints[point.index] = point.value;
+                                }
+                            }
+                            
+                            // Update chart
+                            pnlChart.data.labels = labels;
+                            pnlChart.data.datasets[0].data = dataPoints;
+                            
+                            // Set color based on last value
+                            const lastValue = data[data.length - 1]?.value || 0;
+                            const isPositive = lastValue >= 0;
+                            pnlChart.data.datasets[0].borderColor = isPositive ? '#22c55e' : '#ef4444';
+                            pnlChart.data.datasets[0].backgroundColor = isPositive ? 
+                                'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)';
+                            
+                            // Set fixed y-axis scale
+                            const values = data.map(p => p.value).filter(v => v !== null);
+                            const maxVal = Math.max(...values, 100);
+                            const minVal = Math.min(...values, -100);
+                            const range = Math.max(Math.abs(maxVal), Math.abs(minVal), 100);
+                            
+                            pnlChart.options.scales.y.min = -range * 1.2;
+                            pnlChart.options.scales.y.max = range * 1.2;
+                            
+                            pnlChart.update('none');
+                        }
+                    }
+                })
+                .catch(err => console.log('No historical P&L data:', err));
         }
         
         // Update dashboard every 2 seconds
@@ -1125,6 +1318,9 @@ DASHBOARD_HTML = '''
                     
                     // Update options flow
                     updateOptionsFlow(data.options_flow);
+                    
+                    // Update company events
+                    updateCompanyEvents(data.company_events);
                     
                     // Update log
                     updateLog(data.log);
@@ -1329,6 +1525,112 @@ DASHBOARD_HTML = '''
             container.innerHTML = html;
         }
         
+        function updateCompanyEvents(events) {
+            const container = document.getElementById('companyEvents');
+            
+            // Store all events globally
+            if (events && events.length > 0) {
+                allCompanyEvents = events;
+            }
+            
+            // Filter events based on active filter
+            let filteredEvents = allCompanyEvents;
+            if (activeEventFilter !== 'all') {
+                filteredEvents = allCompanyEvents.filter(event => {
+                    const eventType = event.type || '';
+                    // Special handling for different filter types
+                    if (activeEventFilter === 'SEC') {
+                        // Show all SEC filings
+                        return eventType.includes('8-K') || eventType.includes('10-') || 
+                               eventType.includes('Form 4') || eventType.includes('Insider');
+                    } else if (activeEventFilter === '10-') {
+                        return eventType.includes('10-Q') || eventType.includes('10-K');
+                    } else if (activeEventFilter === 'Form 4') {
+                        return eventType.includes('Form 4') || eventType.includes('Insider');
+                    } else if (activeEventFilter === '8-K') {
+                        return eventType.includes('8-K');
+                    }
+                    return eventType.includes(activeEventFilter);
+                });
+            }
+            
+            if (!filteredEvents || filteredEvents.length === 0) {
+                container.innerHTML = '<div class="list-item"><div class="list-item-title">No events matching filter...</div></div>';
+                return;
+            }
+            
+            let html = '';
+            for (const event of filteredEvents) {
+                // Determine icon and color based on event type
+                let icon = '📄';
+                let color = '#4a9eff';
+                
+                if (event.type && event.type.includes('8-K')) {
+                    icon = '📢';
+                    color = '#f59e0b';
+                } else if (event.type && event.type.includes('10-')) {
+                    icon = '📊';
+                    color = '#4a9eff';
+                } else if (event.type && event.type.includes('Form 4')) {
+                    icon = '👤';
+                    color = '#8b42ff';
+                } else if (event.type && event.type.includes('Earnings')) {
+                    icon = '💰';
+                    color = '#22c55e';
+                } else if (event.type && event.type.includes('FDA')) {
+                    icon = '💊';
+                    color = '#ef4444';
+                }
+                
+                const impactColor = event.impact >= 80 ? '#ef4444' :
+                                   event.impact >= 70 ? '#f59e0b' :
+                                   event.impact >= 60 ? '#4a9eff' : '#6b6b6b';
+                
+                html += `
+                    <div class="list-item" style="border-left: 2px solid ${color}; padding-left: 10px;">
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <span style="font-size: 16px;">${icon}</span>
+                            <div style="flex: 1;">
+                                <div class="list-item-title" style="display: flex; align-items: center; gap: 8px;">
+                                    <span style="font-weight: 600; color: var(--text-bright);">${event.symbol}</span>
+                                    <span style="font-size: 11px; color: ${color};">${event.type}</span>
+                                    <span style="font-size: 10px; padding: 2px 6px; background: ${impactColor}20; color: ${impactColor}; border-radius: 3px;">
+                                        ${event.impact}%
+                                    </span>
+                                </div>
+                                <div class="list-item-subtitle" style="margin-top: 4px;">
+                                    ${event.headline || event.description || 'Company event detected'}
+                                </div>
+                                ${event.url ? `<a href="${event.url}" target="_blank" style="font-size: 11px; color: var(--accent); text-decoration: none;">View Filing →</a>` : ''}
+                            </div>
+                            <div style="font-size: 11px; color: var(--text-dimmer);">
+                                ${event.time || 'Now'}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+            
+            container.innerHTML = html;
+        }
+        
+        function filterCompanyEvents(filter) {
+            // Update active filter
+            activeEventFilter = filter;
+            
+            // Update button states
+            document.querySelectorAll('.filter-btn').forEach(btn => {
+                btn.classList.remove('active');
+                if (btn.getAttribute('data-filter') === filter || 
+                    (filter === '10-' && btn.textContent === '10-Q/K')) {
+                    btn.classList.add('active');
+                }
+            });
+            
+            // Re-render events with filter
+            updateCompanyEvents();
+        }
+        
         function updatePnLHistory(pnl) {
             const now = new Date();
             const timeStr = now.toLocaleTimeString('en-US', { 
@@ -1337,27 +1639,75 @@ DASHBOARD_HTML = '''
                 hour12: false 
             });
             
-            // Add to history
-            pnlHistory.push({
-                time: timeStr,
-                value: pnl.total || 0
-            });
+            // Calculate minutes since market open (9:30 AM)
+            const currentHour = now.getHours();
+            const currentMinute = now.getMinutes();
+            const currentTime = currentHour * 60 + currentMinute;
+            const marketOpen = 9 * 60 + 30;  // 9:30 AM
+            const marketClose = 16 * 60;     // 4:00 PM
             
-            // Keep full trading day of P&L data
-            if (pnlHistory.length > 390) {
-                pnlHistory.shift();
-            }
+            // Check if market is open
+            const isMarketHours = currentTime >= marketOpen && currentTime <= marketClose;
+            const dayOfWeek = now.getDay();
+            const isWeekday = dayOfWeek >= 1 && dayOfWeek <= 5;
+            const isMarketOpen = isMarketHours && isWeekday;
             
-            // Update chart
-            if (pnlChart) {
-                pnlChart.data.labels = pnlHistory.map(p => p.time);
-                pnlChart.data.datasets[0].data = pnlHistory.map(p => p.value);
+            if (isMarketOpen) {
+                // During market hours, calculate position in trading day
+                const minutesSinceOpen = currentTime - marketOpen;
                 
-                // Update color based on P&L
+                // Check if this is a new trading day (clear history at market open)
+                if (minutesSinceOpen === 0 || (pnlHistory.length > 0 && minutesSinceOpen < pnlHistory[pnlHistory.length - 1].index)) {
+                    pnlHistory = [];  // Clear for new trading day
+                }
+                
+                // Add to history with index position
+                pnlHistory.push({
+                    time: timeStr,
+                    value: pnl.total || 0,
+                    index: Math.max(0, Math.min(389, minutesSinceOpen))  // Clamp to 0-389
+                });
+                
+                // Keep only current trading day data
+                if (pnlHistory.length > 390) {
+                    pnlHistory.shift();
+                }
+            }
+            // After hours - keep showing last trading day's data without adding new points
+            
+            // Update chart with full trading day window (390 points like price chart)
+            if (pnlChart) {
+                const fullDaySize = 390;  // Full trading day (9:30 AM - 4:00 PM)
+                
+                // Create fixed-size array for data
+                const dataPoints = new Array(fullDaySize).fill(null);
+                
+                // Place actual P&L data at correct time positions
+                for (let i = 0; i < pnlHistory.length; i++) {
+                    const dataPoint = pnlHistory[i];
+                    if (dataPoint.index !== undefined && dataPoint.index >= 0 && dataPoint.index < fullDaySize) {
+                        dataPoints[dataPoint.index] = dataPoint.value;
+                    }
+                }
+                
+                // Update only the data, labels are already set in initPnLChart
+                pnlChart.data.datasets[0].data = dataPoints;
+                
+                // Update color based on current P&L
                 const isPositive = (pnl.total || 0) >= 0;
                 pnlChart.data.datasets[0].borderColor = isPositive ? '#22c55e' : '#ef4444';
                 pnlChart.data.datasets[0].backgroundColor = isPositive ? 
                     'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)';
+                
+                // Set fixed y-axis scale to prevent zooming
+                // Start with a reasonable range and expand if needed
+                const currentMax = Math.max(...pnlHistory.map(p => p.value), 100);
+                const currentMin = Math.min(...pnlHistory.map(p => p.value), -100);
+                const range = Math.max(Math.abs(currentMax), Math.abs(currentMin), 100);
+                
+                // Set symmetric scale with some padding
+                pnlChart.options.scales.y.min = -range * 1.2;
+                pnlChart.options.scales.y.max = range * 1.2;
                 
                 pnlChart.update('none');
             }
@@ -1495,7 +1845,7 @@ def index():
 
 @app.route('/api/status')
 def get_status():
-    global trading_status, pnl, positions, ai_decisions, trading_log, news_feed, trading_signals, options_flow
+    global trading_status, pnl, positions, ai_decisions, trading_log, news_feed, trading_signals, options_flow, company_events
     
     # Get real-time database metrics
     try:
@@ -1523,6 +1873,7 @@ def get_status():
         'news_feed': news_feed[-10:],
         'trading_signals': trading_signals[-5:],
         'options_flow': options_flow[-5:],
+        'company_events': company_events[-10:],
         'log': trading_log[-20:],
         'price_data': price_data
     })
@@ -1586,61 +1937,158 @@ def update_options():
         return jsonify({'status': 'updated'})
     return jsonify({'error': 'Invalid data'}), 400
 
+@app.route('/api/company_event', methods=['POST'])
+def add_company_event():
+    """Receive company event from AI runner."""
+    global company_events
+    
+    data = request.json
+    if data and 'event' in data:
+        event = data['event']
+        # Keep only last 20 events
+        company_events.insert(0, event)
+        company_events = company_events[:20]
+        logger.info(f"Received company event: {event.get('type')} for {event.get('symbol')}")
+        return jsonify({'status': 'added'})
+    return jsonify({'error': 'Invalid data'}), 400
+
+@app.route('/api/company_events', methods=['GET'])
+def get_company_events():
+    """Get list of company events."""
+    return jsonify(company_events)
+
 @app.route('/api/prices/<symbol>')
 def get_price_history(symbol):
-    """Get historical price data for a symbol.
-    
-    Note: Returns empty array after hours since we only show real data.
-    During market hours, this would be populated from actual positions.
-    """
+    """Get historical price data for a symbol from database."""
+    from robo_trader.database import TradingDatabase
     import datetime
     
-    # During market hours, this would return actual price history
-    # For now, return empty to avoid showing fake data
-    return jsonify([])
+    db = TradingDatabase()
+    try:
+        # Check if market is open
+        now = datetime.datetime.now()
+        current_time = now.hour * 60 + now.minute
+        market_open = 9 * 60 + 30
+        market_close = 16 * 60
+        is_market_hours = current_time >= market_open and current_time <= market_close
+        is_weekday = now.weekday() < 5
+        
+        if is_market_hours and is_weekday:
+            # Get current day's prices
+            prices = db.get_current_day_prices(symbol)
+        else:
+            # Get last trading day's prices
+            prices = db.get_last_trading_day_prices(symbol)
+        
+        # Format for frontend
+        formatted = []
+        for p in prices:
+            # Convert timestamp to time string
+            ts = p['timestamp']
+            if isinstance(ts, str):
+                ts = datetime.datetime.fromisoformat(ts)
+            time_str = ts.strftime('%H:%M')
+            formatted.append({
+                'time': time_str,
+                'price': p['price'],
+                'index': p.get('minute_index', 0)
+            })
+        
+        return jsonify(formatted)
+    finally:
+        db.close()
     
     # TODO: Implement historical data storage
     # base_prices = {
-        'AAPL': 175.0,
-        'NVDA': 480.0,
-        'TSLA': 250.0,
-        'IXHL': 35.0,
-        'NUAI': 3.50,
-        'BZAI': 2.80,
-        'ELTP': 4.20,
-        'OPEN': 2.10,
-        'CEG': 215.0,
-        'VRT': 45.0,
-        'PLTR': 22.0,
-        'UPST': 48.0,
-        'TEM': 280.0,
-        'HTFL': 68.0,
-        'SDGR': 65.0,
-        'APLD': 12.0,
-        'SOFI': 7.50,
-        'CORZ': 8.20,
-        'WULF': 3.90,
-        'SPY': 450.0,
-        'QQQ': 385.0
-    }
+    #     'AAPL': 175.0,
+    #     'NVDA': 480.0,
+    #     'TSLA': 250.0,
+    #     'IXHL': 35.0,
+    #     'NUAI': 3.50,
+    #     'BZAI': 2.80,
+    #     'ELTP': 4.20,
+    #     'OPEN': 2.10,
+    #     'CEG': 215.0,
+    #     'VRT': 45.0,
+    #     'PLTR': 22.0,
+    #     'UPST': 48.0,
+    #     'TEM': 280.0,
+    #     'HTFL': 68.0,
+    #     'SDGR': 65.0,
+    #     'APLD': 12.0,
+    #     'SOFI': 7.50,
+    #     'CORZ': 8.20,
+    #     'WULF': 3.90,
+    #     'SPY': 450.0,
+    #     'QQQ': 385.0
+    # }
+    # 
+    # base_price = base_prices.get(symbol, 100.0)
+    # # prices = []
+    # current_price = base_price
+    # 
+    # # Generate 30 data points
+    # now = datetime.datetime.now()
+    # for i in range(30):
+    #     time = now - datetime.timedelta(minutes=30-i)
+    #     # Random walk
+    #     change = random.uniform(-0.5, 0.5) * 0.01 * base_price
+    #     current_price += change
+    #     prices.append({
+    #         'time': time.strftime('%H:%M'),
+    #         'price': round(current_price, 2)
+    #     })
+    # 
+    # return jsonify(prices)
+
+@app.route('/api/pnl-history')
+def get_pnl_history():
+    """Get P&L history from database."""
+    from robo_trader.database import TradingDatabase
+    import datetime
     
-    base_price = base_prices.get(symbol, 100.0)
-    prices = []
-    current_price = base_price
+    db = TradingDatabase()
+    try:
+        history = db.get_last_pnl_history()
+        
+        # Format for frontend
+        formatted = []
+        for h in history:
+            ts = h['timestamp']
+            if isinstance(ts, str):
+                ts = datetime.datetime.fromisoformat(ts)
+            
+            # Calculate minute index
+            market_open = ts.replace(hour=9, minute=30, second=0, microsecond=0)
+            minutes_since_open = int((ts - market_open).total_seconds() / 60)
+            minute_index = max(0, min(389, minutes_since_open))
+            
+            formatted.append({
+                'time': ts.strftime('%H:%M'),
+                'value': h['total_pnl'],
+                'index': minute_index
+            })
+        
+        return jsonify(formatted)
+    finally:
+        db.close()
+
+@app.route('/api/save-price', methods=['POST'])
+def save_price():
+    """Save price data to database."""
+    from robo_trader.database import TradingDatabase
     
-    # Generate 30 data points
-    now = datetime.datetime.now()
-    for i in range(30):
-        time = now - datetime.timedelta(minutes=30-i)
-        # Random walk
-        change = random.uniform(-0.5, 0.5) * 0.01 * base_price
-        current_price += change
-        prices.append({
-            'time': time.strftime('%H:%M'),
-            'price': round(current_price, 2)
-        })
-    
-    return jsonify(prices)
+    data = request.json
+    db = TradingDatabase()
+    try:
+        db.save_price_point(
+            symbol=data['symbol'],
+            price=data['price'],
+            minute_index=data.get('index')
+        )
+        return jsonify({'status': 'saved'})
+    finally:
+        db.close()
 
 @app.route('/api/settings', methods=['GET'])
 def get_settings():

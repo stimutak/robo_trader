@@ -130,12 +130,28 @@ class TradingDatabase:
             )
         ''')
         
+        # Price history - store intraday price data for charts
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS price_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                timestamp DATETIME NOT NULL,
+                price REAL NOT NULL,
+                volume INTEGER,
+                trading_day DATE NOT NULL,
+                minute_index INTEGER,  -- Minutes since market open (0-389)
+                UNIQUE(symbol, timestamp)
+            )
+        ''')
+        
         # Create indexes for better query performance
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_options_symbol ON options_flow(symbol)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_news_timestamp ON news_archive(timestamp)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_ai_timestamp ON ai_decisions(timestamp)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_price_symbol_day ON price_history(symbol, trading_day)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_price_timestamp ON price_history(timestamp)')
         
         self.conn.commit()
         
@@ -385,6 +401,121 @@ class TradingDatabase:
             'losing_trades': 0
         }
         
+    def save_price_point(self, symbol: str, price: float, timestamp: datetime = None, minute_index: int = None) -> int:
+        """Save a price point to the database."""
+        if timestamp is None:
+            timestamp = datetime.now()
+        
+        trading_day = timestamp.date()
+        
+        # Calculate minute index if not provided
+        if minute_index is None:
+            market_open = timestamp.replace(hour=9, minute=30, second=0, microsecond=0)
+            minutes_since_open = int((timestamp - market_open).total_seconds() / 60)
+            minute_index = max(0, min(389, minutes_since_open))
+        
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT OR REPLACE INTO price_history (symbol, timestamp, price, trading_day, minute_index)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (symbol, timestamp, price, trading_day, minute_index))
+            self.conn.commit()
+            return cursor.lastrowid
+        except sqlite3.IntegrityError:
+            # Update if duplicate
+            cursor.execute('''
+                UPDATE price_history 
+                SET price = ?, minute_index = ?
+                WHERE symbol = ? AND timestamp = ?
+            ''', (price, minute_index, symbol, timestamp))
+            self.conn.commit()
+            return cursor.lastrowid
+    
+    def get_last_trading_day_prices(self, symbol: str) -> List[Dict[str, Any]]:
+        """Get the last full trading day's price data for a symbol."""
+        cursor = self.conn.cursor()
+        
+        # Get the most recent trading day with data
+        cursor.execute('''
+            SELECT MAX(trading_day) as last_day 
+            FROM price_history 
+            WHERE symbol = ?
+        ''', (symbol,))
+        
+        result = cursor.fetchone()
+        if not result or not result['last_day']:
+            return []
+        
+        last_day = result['last_day']
+        
+        # Get all prices from that day
+        cursor.execute('''
+            SELECT timestamp, price, minute_index 
+            FROM price_history 
+            WHERE symbol = ? AND trading_day = ?
+            ORDER BY minute_index
+        ''', (symbol, last_day))
+        
+        return [dict(row) for row in cursor.fetchall()]
+    
+    def get_current_day_prices(self, symbol: str) -> List[Dict[str, Any]]:
+        """Get today's price data for a symbol."""
+        today = date.today()
+        cursor = self.conn.cursor()
+        
+        cursor.execute('''
+            SELECT timestamp, price, minute_index 
+            FROM price_history 
+            WHERE symbol = ? AND trading_day = ?
+            ORDER BY minute_index
+        ''', (symbol, today))
+        
+        return [dict(row) for row in cursor.fetchall()]
+    
+    def save_pnl_point(self, total_pnl: float, timestamp: datetime = None) -> int:
+        """Save a P&L data point (simplified version for chart)."""
+        if timestamp is None:
+            timestamp = datetime.now()
+        
+        # Also save as regular P&L snapshot
+        pnl_data = {
+            'total_pnl': total_pnl,
+            'daily_pnl': total_pnl,  # For now, can be refined later
+        }
+        return self.save_pnl_snapshot(pnl_data)
+    
+    def get_last_pnl_history(self, limit: int = 390) -> List[Dict[str, Any]]:
+        """Get the most recent P&L history points."""
+        cursor = self.conn.cursor()
+        
+        # Get today's P&L points first
+        today_start = datetime.now().replace(hour=9, minute=30, second=0, microsecond=0)
+        cursor.execute('''
+            SELECT timestamp, total_pnl 
+            FROM pnl_history 
+            WHERE timestamp >= ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+        ''', (today_start, limit))
+        
+        results = cursor.fetchall()
+        
+        # If no data today, get the last trading day's data
+        if not results:
+            cursor.execute('''
+                SELECT timestamp, total_pnl 
+                FROM pnl_history 
+                WHERE DATE(timestamp) = (
+                    SELECT MAX(DATE(timestamp)) 
+                    FROM pnl_history
+                )
+                ORDER BY timestamp
+            ''')
+            results = cursor.fetchall()
+        
+        return [dict(row) for row in results]
+    
     def close(self):
         """Close database connection."""
         self.conn.close()
