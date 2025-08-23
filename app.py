@@ -466,6 +466,22 @@ DASHBOARD_HTML = '''
             100% { transform: translateX(-50%); }
         }
         
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        
+        @keyframes slideUp {
+            from { 
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to { 
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
         /* Lists */
         .list {
             background: var(--surface);
@@ -1175,7 +1191,549 @@ DASHBOARD_HTML = '''
             });
         }
         
-        function selectSymbol(symbol) {
+        // Make showAIDecisionDetail globally accessible for clicks
+        window.showAIDecisionDetail = function(decision) {
+            // Create modal for AI decision details
+            const actionColor = decision.action === 'BUY' ? '#22c55e' : 
+                              decision.action === 'SELL' ? '#ef4444' : 
+                              decision.action === 'HOLD' ? '#f59e0b' : '#4a9eff';
+            
+            const confidenceColor = decision.confidence >= 80 ? '#22c55e' : 
+                                  decision.confidence >= 60 ? '#4a9eff' :
+                                  decision.confidence >= 40 ? '#f59e0b' : '#ef4444';
+            
+            const modal = document.createElement('div');
+            modal.style.cssText = `
+                position: fixed;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background: rgba(0, 0, 0, 0.7);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                z-index: 10000;
+                animation: fadeIn 0.2s;
+            `;
+            
+            const content = document.createElement('div');
+            content.style.cssText = `
+                background: var(--surface);
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                padding: 24px;
+                max-width: 600px;
+                width: 90%;
+                max-height: 80vh;
+                overflow-y: auto;
+                animation: slideUp 0.2s;
+            `;
+            
+            // Parse additional details if available
+            const watchlist = decision.watchlist || [];
+            const thesis = decision.thesis || {};
+            const targets = decision.targets || [];
+            const stops = decision.stops || {};
+            const raw_decision = decision.raw_decision || {};
+            const compliance = raw_decision.compliance_checks || {};
+            const risk_state = raw_decision.risk_state || {};
+            const recommendation = raw_decision.recommendation || {};
+            
+            // Build decision tree HTML
+            let decisionTreeHTML = '';
+            if (raw_decision && Object.keys(raw_decision).length > 0) {
+                decisionTreeHTML = `
+                <div style="margin-bottom: 24px;">
+                    <h4 style="color: var(--text-bright); font-size: 14px; margin-bottom: 16px; display: flex; align-items: center; gap: 8px;">
+                        <span style="font-size: 16px;">🌳</span> Decision Tree Analysis
+                    </h4>
+                    
+                    <!-- Step 1: Market Analysis -->
+                    <div style="
+                        background: linear-gradient(135deg, rgba(74, 158, 255, 0.1) 0%, rgba(74, 158, 255, 0.05) 100%);
+                        border: 1px solid rgba(74, 158, 255, 0.3);
+                        border-radius: 8px;
+                        padding: 14px;
+                        margin-bottom: 10px;
+                    ">
+                        <div style="font-size: 12px; font-weight: 600; color: #4a9eff; margin-bottom: 8px;">
+                            1️⃣ Market Context
+                        </div>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                            <div style="background: rgba(0,0,0,0.2); padding: 8px; border-radius: 4px;">
+                                <span style="color: var(--text-dimmer); font-size: 10px;">Trading Mode</span>
+                                <div style="color: var(--text); font-size: 12px; font-weight: 500; margin-top: 2px;">
+                                    ${raw_decision.mode || 'Analyzing'}
+                                </div>
+                            </div>
+                            <div style="background: rgba(0,0,0,0.2); padding: 8px; border-radius: 4px;">
+                                <span style="color: var(--text-dimmer); font-size: 10px;">Symbols Scanned</span>
+                                <div style="color: var(--text); font-size: 12px; font-weight: 500; margin-top: 2px;">
+                                    ${(raw_decision.universe_checked || []).length} tickers
+                                </div>
+                            </div>
+                            ${risk_state.day_dd_bps !== undefined ? `
+                            <div style="background: rgba(0,0,0,0.2); padding: 8px; border-radius: 4px;">
+                                <span style="color: var(--text-dimmer); font-size: 10px;">Daily Drawdown</span>
+                                <div style="color: ${risk_state.day_dd_bps > 100 ? '#ef4444' : '#22c55e'}; font-size: 12px; font-weight: 500; margin-top: 2px;">
+                                    ${(risk_state.day_dd_bps / 100).toFixed(2)}%
+                                </div>
+                            </div>
+                            ` : ''}
+                            ${risk_state.cash_pct !== undefined ? `
+                            <div style="background: rgba(0,0,0,0.2); padding: 8px; border-radius: 4px;">
+                                <span style="color: var(--text-dimmer); font-size: 10px;">Cash Available</span>
+                                <div style="color: var(--text); font-size: 12px; font-weight: 500; margin-top: 2px;">
+                                    ${risk_state.cash_pct.toFixed(1)}%
+                                </div>
+                            </div>
+                            ` : ''}
+                        </div>
+                    </div>
+                    
+                    <!-- Step 2: Compliance Checks -->
+                    <div style="
+                        background: linear-gradient(135deg, rgba(34, 197, 94, 0.1) 0%, rgba(34, 197, 94, 0.05) 100%);
+                        border: 1px solid rgba(34, 197, 94, 0.3);
+                        border-radius: 8px;
+                        padding: 14px;
+                        margin-bottom: 10px;
+                    ">
+                        <div style="font-size: 12px; font-weight: 600; color: #22c55e; margin-bottom: 8px;">
+                            2️⃣ Risk & Compliance
+                        </div>
+                        <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px;">
+                            ${compliance.liquidity_ok !== undefined ? `
+                            <div style="display: flex; align-items: center; gap: 6px; background: rgba(0,0,0,0.2); padding: 6px 8px; border-radius: 4px;">
+                                <span style="color: ${compliance.liquidity_ok ? '#22c55e' : '#ef4444'}; font-size: 14px;">
+                                    ${compliance.liquidity_ok ? '✓' : '✗'}
+                                </span>
+                                <span style="color: var(--text-dim); font-size: 11px;">Liquidity OK</span>
+                            </div>
+                            ` : ''}
+                            ${compliance.spread_ok !== undefined ? `
+                            <div style="display: flex; align-items: center; gap: 6px; background: rgba(0,0,0,0.2); padding: 6px 8px; border-radius: 4px;">
+                                <span style="color: ${compliance.spread_ok ? '#22c55e' : '#ef4444'}; font-size: 14px;">
+                                    ${compliance.spread_ok ? '✓' : '✗'}
+                                </span>
+                                <span style="color: var(--text-dim); font-size: 11px;">Spread OK</span>
+                            </div>
+                            ` : ''}
+                            ${compliance.borrow_ok !== undefined ? `
+                            <div style="display: flex; align-items: center; gap: 6px; background: rgba(0,0,0,0.2); padding: 6px 8px; border-radius: 4px;">
+                                <span style="color: ${compliance.borrow_ok ? '#22c55e' : '#ef4444'}; font-size: 14px;">
+                                    ${compliance.borrow_ok ? '✓' : '✗'}
+                                </span>
+                                <span style="color: var(--text-dim); font-size: 11px;">Borrow Available</span>
+                            </div>
+                            ` : ''}
+                            ${compliance.correlation_ok !== undefined ? `
+                            <div style="display: flex; align-items: center; gap: 6px; background: rgba(0,0,0,0.2); padding: 6px 8px; border-radius: 4px;">
+                                <span style="color: ${compliance.correlation_ok ? '#22c55e' : '#ef4444'}; font-size: 14px;">
+                                    ${compliance.correlation_ok ? '✓' : '✗'}
+                                </span>
+                                <span style="color: var(--text-dim); font-size: 11px;">Correlation OK</span>
+                            </div>
+                            ` : ''}
+                        </div>
+                    </div>
+                    
+                    <!-- Step 3: Trade Analysis -->
+                    ${recommendation.symbol ? `
+                    <div style="
+                        background: linear-gradient(135deg, rgba(245, 158, 11, 0.1) 0%, rgba(245, 158, 11, 0.05) 100%);
+                        border: 1px solid rgba(245, 158, 11, 0.3);
+                        border-radius: 8px;
+                        padding: 14px;
+                        margin-bottom: 10px;
+                    ">
+                        <div style="font-size: 12px; font-weight: 600; color: #f59e0b; margin-bottom: 8px;">
+                            3️⃣ Trade Setup
+                        </div>
+                        ${recommendation.thesis ? `
+                        <div style="
+                            background: rgba(0, 0, 0, 0.2);
+                            padding: 8px;
+                            border-radius: 4px;
+                            margin-bottom: 8px;
+                        ">
+                            <div style="color: var(--text-dimmer); font-size: 10px; margin-bottom: 4px;">Trade Thesis</div>
+                            <div style="color: var(--text); font-size: 11px; line-height: 1.4;">
+                                ${recommendation.thesis}
+                            </div>
+                        </div>
+                        ` : ''}
+                        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;">
+                            ${recommendation.risk_reward !== undefined ? `
+                            <div style="background: rgba(0,0,0,0.2); padding: 6px 8px; border-radius: 4px;">
+                                <span style="color: var(--text-dimmer); font-size: 10px;">R/R Ratio</span>
+                                <div style="color: ${recommendation.risk_reward >= 2 ? '#22c55e' : '#f59e0b'}; font-size: 11px; font-weight: 500;">
+                                    1:${recommendation.risk_reward.toFixed(1)}
+                                </div>
+                            </div>
+                            ` : ''}
+                            ${recommendation.p_win !== undefined ? `
+                            <div style="background: rgba(0,0,0,0.2); padding: 6px 8px; border-radius: 4px;">
+                                <span style="color: var(--text-dimmer); font-size: 10px;">Win %</span>
+                                <div style="color: var(--text); font-size: 11px; font-weight: 500;">
+                                    ${(recommendation.p_win * 100).toFixed(0)}%
+                                </div>
+                            </div>
+                            ` : ''}
+                            ${recommendation.expected_value_pct !== undefined ? `
+                            <div style="background: rgba(0,0,0,0.2); padding: 6px 8px; border-radius: 4px;">
+                                <span style="color: var(--text-dimmer); font-size: 10px;">EV</span>
+                                <div style="color: ${recommendation.expected_value_pct > 0 ? '#22c55e' : '#ef4444'}; font-size: 11px; font-weight: 500;">
+                                    ${recommendation.expected_value_pct > 0 ? '+' : ''}${recommendation.expected_value_pct.toFixed(1)}%
+                                </div>
+                            </div>
+                            ` : ''}
+                        </div>
+                    </div>
+                    ` : ''}
+                    
+                    <!-- Step 4: Final Decision -->
+                    <div style="
+                        background: linear-gradient(135deg, ${actionColor}22 0%, ${actionColor}11 100%);
+                        border: 1px solid ${actionColor}66;
+                        border-radius: 8px;
+                        padding: 14px;
+                    ">
+                        <div style="font-size: 12px; font-weight: 600; color: ${actionColor}; margin-bottom: 8px;">
+                            4️⃣ Decision Output
+                        </div>
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <div>
+                                <div style="font-size: 18px; font-weight: bold; color: ${actionColor};">
+                                    ${decision.action} ${decision.symbol}
+                                </div>
+                                <div style="color: var(--text-dim); font-size: 11px; margin-top: 2px;">
+                                    Conviction: ${decision.confidence}%
+                                </div>
+                            </div>
+                            ${raw_decision.aggressiveness_level !== undefined ? `
+                            <div style="text-align: right;">
+                                <div style="color: var(--text-dimmer); font-size: 10px; margin-bottom: 4px;">Aggression</div>
+                                <div style="display: flex; gap: 3px;">
+                                    ${[0, 1, 2, 3].map(i => `
+                                        <div style="
+                                            width: 6px;
+                                            height: 6px;
+                                            border-radius: 50%;
+                                            background: ${i <= raw_decision.aggressiveness_level ? actionColor : 'var(--border)'};
+                                        "></div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                            ` : ''}
+                        </div>
+                    </div>
+                </div>
+                `;
+            }
+            
+            content.innerHTML = `
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                    <h3 style="margin: 0; color: var(--text-bright); font-size: 18px;">
+                        ${decision.symbol} - AI Analysis
+                    </h3>
+                    <button onclick="this.closest('div[style*=fixed]').remove()" style="
+                        background: transparent;
+                        border: none;
+                        color: var(--text-dimmer);
+                        font-size: 24px;
+                        cursor: pointer;
+                        padding: 0;
+                        width: 30px;
+                        height: 30px;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                    ">×</button>
+                </div>
+                
+                ${decisionTreeHTML}
+                
+                <div style="background: ${actionColor}10; border: 1px solid ${actionColor}30; border-radius: 8px; padding: 16px; margin-bottom: 20px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                        <span style="font-size: 24px; font-weight: bold; color: ${actionColor};">
+                            ${decision.action}
+                        </span>
+                        <span style="font-size: 20px; font-weight: bold; color: ${confidenceColor};">
+                            ${decision.confidence}% Confidence
+                        </span>
+                    </div>
+                    <div style="font-size: 14px; color: var(--text); line-height: 1.6;">
+                        <strong>Reasoning:</strong> ${decision.reason}
+                    </div>
+                    ${decision.event_type ? `
+                        <div style="font-size: 12px; color: var(--text-dimmer); margin-top: 8px;">
+                            <strong>Trigger Event:</strong> ${decision.event_type}
+                        </div>
+                    ` : ''}
+                </div>
+                
+                ${thesis.setup || thesis.catalyst ? `
+                    <div style="margin-bottom: 20px;">
+                        <h4 style="color: var(--text-bright); font-size: 14px; margin-bottom: 12px;">Trading Thesis</h4>
+                        <div style="background: var(--bg-darker); padding: 12px; border-radius: 6px; font-size: 13px; color: var(--text);">
+                            ${thesis.setup ? `<div style="margin-bottom: 8px;"><strong>Setup:</strong> ${thesis.setup}</div>` : ''}
+                            ${thesis.catalyst ? `<div style="margin-bottom: 8px;"><strong>Catalyst:</strong> ${thesis.catalyst}</div>` : ''}
+                            ${thesis.risk_reward ? `<div style="margin-bottom: 8px;"><strong>Risk/Reward:</strong> ${thesis.risk_reward}</div>` : ''}
+                            ${thesis.prob_win ? `<div><strong>Win Probability:</strong> ${thesis.prob_win}%</div>` : ''}
+                        </div>
+                    </div>
+                ` : ''}
+                
+                ${decision.entry_price || targets.length > 0 || stops.technical ? `
+                    <div style="margin-bottom: 20px;">
+                        <h4 style="color: var(--text-bright); font-size: 14px; margin-bottom: 12px;">Price Levels</h4>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                            ${decision.entry_price ? `
+                                <div style="background: var(--bg-darker); padding: 12px; border-radius: 6px;">
+                                    <div style="font-size: 11px; color: var(--text-dimmer); margin-bottom: 4px;">Entry Price</div>
+                                    <div style="font-size: 16px; font-weight: 600; color: var(--text-bright);">$${decision.entry_price}</div>
+                                </div>
+                            ` : ''}
+                            ${stops.technical ? `
+                                <div style="background: var(--bg-darker); padding: 12px; border-radius: 6px;">
+                                    <div style="font-size: 11px; color: var(--text-dimmer); margin-bottom: 4px;">Stop Loss</div>
+                                    <div style="font-size: 16px; font-weight: 600; color: #ef4444;">$${stops.technical}</div>
+                                </div>
+                            ` : ''}
+                            ${targets.length > 0 ? `
+                                <div style="background: var(--bg-darker); padding: 12px; border-radius: 6px; grid-column: span 2;">
+                                    <div style="font-size: 11px; color: var(--text-dimmer); margin-bottom: 4px;">Targets</div>
+                                    <div style="font-size: 14px; color: #22c55e;">${targets.map(t => '$' + t).join(', ')}</div>
+                                </div>
+                            ` : ''}
+                        </div>
+                    </div>
+                ` : ''}
+                
+                ${watchlist.length > 0 ? `
+                    <div style="margin-bottom: 20px;">
+                        <h4 style="color: var(--text-bright); font-size: 14px; margin-bottom: 12px;">Watchlist Items</h4>
+                        <div style="display: grid; gap: 8px;">
+                            ${watchlist.map(item => `
+                                <div style="background: var(--bg-darker); padding: 12px; border-radius: 6px; font-size: 13px;">
+                                    <div style="color: var(--text-bright); margin-bottom: 4px;">
+                                        <strong>${item.symbol}</strong>
+                                        ${item.trigger_above ? ` - Above $${item.trigger_above}` : ''}
+                                        ${item.trigger_below ? ` - Below $${item.trigger_below}` : ''}
+                                    </div>
+                                    ${item.notes ? `<div style="color: var(--text-dimmer); font-size: 12px;">${item.notes}</div>` : ''}
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                ` : ''}
+                
+                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 16px;">
+                    <div style="background: var(--bg-darker); padding: 12px; border-radius: 6px; text-align: center;">
+                        <div style="font-size: 11px; color: var(--text-dimmer); margin-bottom: 4px;">Analysis Time</div>
+                        <div style="font-size: 14px; font-weight: 600; color: var(--text-bright);">${decision.time}</div>
+                    </div>
+                    <div style="background: var(--bg-darker); padding: 12px; border-radius: 6px; text-align: center;">
+                        <div style="font-size: 11px; color: var(--text-dimmer); margin-bottom: 4px;">Model</div>
+                        <div style="font-size: 14px; font-weight: 600; color: var(--text-bright);">Claude 3</div>
+                    </div>
+                    <div style="background: var(--bg-darker); padding: 12px; border-radius: 6px; text-align: center;">
+                        <div style="font-size: 11px; color: var(--text-dimmer); margin-bottom: 4px;">Latency</div>
+                        <div style="font-size: 14px; font-weight: 600; color: var(--text-bright);">${decision.latency || 'N/A'}</div>
+                    </div>
+                </div>
+                
+                <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border);">
+                    <button onclick="selectSymbol('${decision.symbol}'); this.closest('div[style*=fixed]').remove()" style="
+                        width: 100%;
+                        padding: 12px;
+                        background: ${actionColor};
+                        color: white;
+                        border: none;
+                        border-radius: 6px;
+                        font-weight: 600;
+                        cursor: pointer;
+                        transition: opacity 0.15s;
+                    " onmouseover="this.style.opacity='0.9'" onmouseout="this.style.opacity='1'">
+                        View ${decision.symbol} Chart
+                    </button>
+                </div>
+            `;
+            
+            modal.appendChild(content);
+            document.body.appendChild(modal);
+            
+            // Close on background click
+            modal.addEventListener('click', (e) => {
+                if (e.target === modal) {
+                    modal.remove();
+                }
+            });
+        }
+        
+        // Make showOptionsDetail globally accessible for clicks
+        window.showOptionsDetail = function(flow) {
+            // Create modal content
+            const isCall = flow.option_type === 'CALL';
+            const color = flow.confidence >= 80 ? '#22c55e' : 
+                         flow.confidence >= 60 ? '#4a9eff' :
+                         flow.confidence >= 40 ? '#f59e0b' : '#ef4444';
+            
+            const modal = document.createElement('div');
+            modal.style.cssText = `
+                position: fixed;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background: rgba(0, 0, 0, 0.7);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                z-index: 10000;
+                animation: fadeIn 0.2s;
+            `;
+            
+            const content = document.createElement('div');
+            content.style.cssText = `
+                background: var(--surface);
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                padding: 24px;
+                max-width: 500px;
+                width: 90%;
+                max-height: 80vh;
+                overflow-y: auto;
+                animation: slideUp 0.2s;
+            `;
+            
+            content.innerHTML = `
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                    <h3 style="margin: 0; color: var(--text-bright); font-size: 18px;">
+                        ${flow.symbol} Options Flow Detail
+                    </h3>
+                    <button onclick="this.closest('div[style*=fixed]').remove()" style="
+                        background: transparent;
+                        border: none;
+                        color: var(--text-dimmer);
+                        font-size: 24px;
+                        cursor: pointer;
+                        padding: 0;
+                        width: 30px;
+                        height: 30px;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                    ">×</button>
+                </div>
+                
+                <div style="background: ${color}10; border: 1px solid ${color}30; border-radius: 8px; padding: 16px; margin-bottom: 20px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                        <span style="font-size: 24px; font-weight: bold; color: ${color};">
+                            ${isCall ? '📈 CALL' : '📉 PUT'}
+                        </span>
+                        <span style="font-size: 20px; font-weight: bold; color: ${color};">
+                            ${flow.confidence}% Confidence
+                        </span>
+                    </div>
+                    <div style="font-size: 14px; color: var(--text); line-height: 1.6;">
+                        ${flow.interpretation || 'Unusual options activity detected'}
+                    </div>
+                </div>
+                
+                <div style="display: grid; gap: 12px;">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                        <div style="background: var(--bg-darker); padding: 12px; border-radius: 6px;">
+                            <div style="font-size: 11px; color: var(--text-dimmer); margin-bottom: 4px;">Strike Price</div>
+                            <div style="font-size: 16px; font-weight: 600; color: var(--text-bright);">$${flow.strike}</div>
+                        </div>
+                        <div style="background: var(--bg-darker); padding: 12px; border-radius: 6px;">
+                            <div style="font-size: 11px; color: var(--text-dimmer); margin-bottom: 4px;">Expiry</div>
+                            <div style="font-size: 16px; font-weight: 600; color: var(--text-bright);">${flow.expiry}</div>
+                        </div>
+                    </div>
+                    
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                        <div style="background: var(--bg-darker); padding: 12px; border-radius: 6px;">
+                            <div style="font-size: 11px; color: var(--text-dimmer); margin-bottom: 4px;">Volume</div>
+                            <div style="font-size: 16px; font-weight: 600; color: var(--text-bright);">${flow.volume?.toLocaleString() || 'N/A'}</div>
+                        </div>
+                        <div style="background: var(--bg-darker); padding: 12px; border-radius: 6px;">
+                            <div style="font-size: 11px; color: var(--text-dimmer); margin-bottom: 4px;">Open Interest</div>
+                            <div style="font-size: 16px; font-weight: 600; color: var(--text-bright);">${flow.open_interest?.toLocaleString() || 'N/A'}</div>
+                        </div>
+                    </div>
+                    
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                        <div style="background: var(--bg-darker); padding: 12px; border-radius: 6px;">
+                            <div style="font-size: 11px; color: var(--text-dimmer); margin-bottom: 4px;">Volume/OI Ratio</div>
+                            <div style="font-size: 16px; font-weight: 600; color: ${flow.volume_oi_ratio > 2 ? '#22c55e' : 'var(--text-bright)'};">
+                                ${flow.volume_oi_ratio?.toFixed(2)}x
+                            </div>
+                        </div>
+                        <div style="background: var(--bg-darker); padding: 12px; border-radius: 6px;">
+                            <div style="font-size: 11px; color: var(--text-dimmer); margin-bottom: 4px;">Premium</div>
+                            <div style="font-size: 16px; font-weight: 600; color: var(--text-bright);">
+                                $${(flow.premium / 1000).toFixed(1)}K
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div style="background: var(--bg-darker); padding: 12px; border-radius: 6px;">
+                        <div style="font-size: 11px; color: var(--text-dimmer); margin-bottom: 4px;">Signal Type</div>
+                        <div style="font-size: 16px; font-weight: 600; color: var(--text-bright);">
+                            ${flow.signal_type?.toUpperCase() || 'UNUSUAL ACTIVITY'}
+                        </div>
+                    </div>
+                    
+                    ${flow.delta ? `
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                        <div style="background: var(--bg-darker); padding: 12px; border-radius: 6px;">
+                            <div style="font-size: 11px; color: var(--text-dimmer); margin-bottom: 4px;">Delta</div>
+                            <div style="font-size: 16px; font-weight: 600; color: var(--text-bright);">${flow.delta?.toFixed(3) || 'N/A'}</div>
+                        </div>
+                        <div style="background: var(--bg-darker); padding: 12px; border-radius: 6px;">
+                            <div style="font-size: 11px; color: var(--text-dimmer); margin-bottom: 4px;">Implied Volatility</div>
+                            <div style="font-size: 16px; font-weight: 600; color: var(--text-bright);">
+                                ${flow.implied_vol ? (flow.implied_vol * 100).toFixed(1) + '%' : 'N/A'}
+                            </div>
+                        </div>
+                    </div>
+                    ` : ''}
+                    
+                    <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border);">
+                        <button onclick="selectSymbol('${flow.symbol}'); this.closest('div[style*=fixed]').remove()" style="
+                            width: 100%;
+                            padding: 12px;
+                            background: ${color};
+                            color: white;
+                            border: none;
+                            border-radius: 6px;
+                            font-weight: 600;
+                            cursor: pointer;
+                            transition: opacity 0.15s;
+                        " onmouseover="this.style.opacity='0.9'" onmouseout="this.style.opacity='1'">
+                            View ${flow.symbol} Chart
+                        </button>
+                    </div>
+                </div>
+            `;
+            
+            modal.appendChild(content);
+            document.body.appendChild(modal);
+            
+            // Close on background click
+            modal.addEventListener('click', (e) => {
+                if (e.target === modal) {
+                    modal.remove();
+                }
+            });
+        }
+        
+        // Make selectSymbol globally accessible for modals
+        window.selectSymbol = function(symbol) {
             currentChartSymbol = symbol;
             
             // Update visual selection
@@ -1204,6 +1762,21 @@ DASHBOARD_HTML = '''
                 } else {
                     indicator.textContent = '';
                 }
+            }
+            
+            // Fetch price data and update chart
+            if (!priceHistory[currentChartSymbol]) {
+                fetch(`/api/prices/${currentChartSymbol}`)
+                    .then(res => res.json())
+                    .then(prices => {
+                        priceHistory[currentChartSymbol] = prices;
+                        updateChart();
+                    })
+                    .catch(err => {
+                        console.log('Failed to fetch prices for', currentChartSymbol, err);
+                    });
+            } else {
+                updateChart();
             }
             
             // Update market hours label for crypto (24/7)
@@ -1240,38 +1813,72 @@ DASHBOARD_HTML = '''
             
             const data = priceHistory[currentChartSymbol] || [];
             let nonNullCount = 0;
+            let firstDataIndex = -1;
+            let lastDataIndex = -1;
             
             // Place data at correct time positions and count non-null points
             for (const point of data) {
                 if (point.index >= 0 && point.index < fullDaySize) {
                     dataPoints[point.index] = point.price;
                     nonNullCount++;
+                    if (firstDataIndex === -1) firstDataIndex = point.index;
+                    lastDataIndex = point.index;
                 }
             }
             
-            // Dynamically adjust visualization based on data density
-            // If we have sparse data (< 10 points), show only points
-            // If we have more data, show connecting lines
-            const isSparse = nonNullCount < 10;
-            
-            // Update chart type based on data density
-            if (isSparse) {
-                // Sparse data: show as scatter plot with larger points
-                priceChart.data.datasets[0].showLine = false;
-                priceChart.data.datasets[0].spanGaps = false;
-                priceChart.data.datasets[0].pointRadius = 5;
-                priceChart.data.datasets[0].pointHoverRadius = 7;
-                priceChart.data.datasets[0].borderWidth = 0;
-                priceChart.data.datasets[0].pointBorderWidth = 2;
-            } else {
-                // Dense data: show as line chart with smaller points
-                priceChart.data.datasets[0].showLine = true;
-                priceChart.data.datasets[0].spanGaps = true;
-                priceChart.data.datasets[0].pointRadius = 1;
-                priceChart.data.datasets[0].pointHoverRadius = 4;
-                priceChart.data.datasets[0].borderWidth = 2;
-                priceChart.data.datasets[0].tension = 0.1;  // Slight curve for smoother lines
+            // If we have data, fill in the gaps to show a continuous line for the full day
+            if (nonNullCount > 0 && firstDataIndex >= 0) {
+                // Get first and last prices
+                const firstPrice = dataPoints[firstDataIndex];
+                const lastPrice = dataPoints[lastDataIndex];
+                
+                // Fill in before market open with first price (flat line)
+                for (let i = 0; i < firstDataIndex; i++) {
+                    dataPoints[i] = firstPrice;
+                }
+                
+                // Fill in after last data point with last price (flat line)
+                for (let i = lastDataIndex + 1; i < fullDaySize; i++) {
+                    dataPoints[i] = lastPrice;
+                }
+                
+                // Interpolate gaps in between if there are any
+                let prevIndex = firstDataIndex;
+                for (let i = firstDataIndex + 1; i <= lastDataIndex; i++) {
+                    if (dataPoints[i] === null) {
+                        // Find next non-null value
+                        let nextIndex = i + 1;
+                        while (nextIndex <= lastDataIndex && dataPoints[nextIndex] === null) {
+                            nextIndex++;
+                        }
+                        
+                        if (nextIndex <= lastDataIndex) {
+                            // Linear interpolation
+                            const prevPrice = dataPoints[prevIndex];
+                            const nextPrice = dataPoints[nextIndex];
+                            const steps = nextIndex - prevIndex;
+                            
+                            for (let j = prevIndex + 1; j < nextIndex; j++) {
+                                const ratio = (j - prevIndex) / steps;
+                                dataPoints[j] = prevPrice + (nextPrice - prevPrice) * ratio;
+                            }
+                            
+                            prevIndex = nextIndex;
+                            i = nextIndex - 1; // Skip to next known point
+                        }
+                    } else {
+                        prevIndex = i;
+                    }
+                }
             }
+            
+            // Always show as a line chart for the full trading day
+            priceChart.data.datasets[0].showLine = true;
+            priceChart.data.datasets[0].spanGaps = false; // We've filled all gaps
+            priceChart.data.datasets[0].pointRadius = 0; // Hide points for cleaner look
+            priceChart.data.datasets[0].pointHoverRadius = 4;
+            priceChart.data.datasets[0].borderWidth = 2;
+            priceChart.data.datasets[0].tension = 0; // No curve for accurate representation
             
             priceChart.data.datasets[0].data = dataPoints;
             priceChart.update('none');
@@ -1693,11 +2300,15 @@ DASHBOARD_HTML = '''
                 return;
             }
             
+            // Store decisions globally for click handlers
+            window.aiDecisionsData = decisions;
+            
             let html = '';
-            for (const decision of decisions) {
+            for (let i = 0; i < decisions.length; i++) {
+                const decision = decisions[i];
                 const badge = decision.confidence >= 75 ? 'badge-blue' : 
                              decision.confidence >= 50 ? 'badge-green' : '';
-                html += `<div class="list-item">
+                html += `<div class="list-item" onclick="showAIDecisionDetail(window.aiDecisionsData[${i}])" style="cursor: pointer; transition: all 0.15s;" onmouseover="this.style.background='var(--surface-hover)'" onmouseout="this.style.background='transparent'">
                     <div class="list-item-title">${decision.symbol} - ${decision.action}</div>
                     <div class="list-item-meta">
                         <span class="badge ${badge}">${decision.confidence}%</span>
@@ -1773,10 +2384,14 @@ DASHBOARD_HTML = '''
             // Update summary
             summary.textContent = `${flows.length} signals | Bullish: ${bullishCount} | Bearish: ${bearishCount}`;
             
+            // Store flows data globally for click handlers
+            window.optionsFlowData = flows;
+            
             // Create flow visualization
             let html = '<div style="display: grid; gap: 8px;">';
             
-            for (const flow of flows.slice(0, 10)) {  // Show top 10
+            for (let i = 0; i < Math.min(flows.length, 10); i++) {  // Show top 10
+                const flow = flows[i];
                 const isCall = flow.option_type === 'CALL';
                 const color = flow.confidence >= 80 ? '#22c55e' : 
                              flow.confidence >= 60 ? '#4a9eff' :
@@ -1788,7 +2403,7 @@ DASHBOARD_HTML = '''
                                   flow.signal_type === 'high_premium' ? '💰' : '⚡';
                 
                 html += `
-                    <div style="
+                    <div onclick="showOptionsDetail(window.optionsFlowData[${i}])" style="
                         background: var(--surface);
                         border: 1px solid var(--border);
                         border-left: 3px solid ${color};

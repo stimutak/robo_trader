@@ -84,6 +84,9 @@ class AITradingSystem:
             "options_signals": 0
         }
         
+        # Cache for latest options flow data
+        self.latest_options_flow: Dict[str, List] = {}
+        
         # Build symbol to asset type mapping for quick lookups
         self.symbol_to_type = {}
         for asset_type, symbols_list in self.asset_types.items():
@@ -334,6 +337,19 @@ class AITradingSystem:
                     )
                     self.stats["options_signals"] += len(signals)
                     
+                    # Cache the options flow data by symbol
+                    for signal in signals:
+                        if signal.symbol not in self.latest_options_flow:
+                            self.latest_options_flow[signal.symbol] = []
+                        self.latest_options_flow[signal.symbol].append({
+                            'type': signal.option_type,
+                            'strike': signal.strike,
+                            'volume': signal.volume,
+                            'premium': signal.premium,
+                            'confidence': signal.confidence,
+                            'interpretation': signal.interpretation
+                        })
+                    
                     # Save options signals to database
                     if self.db:
                         for signal in signals:
@@ -374,10 +390,24 @@ class AITradingSystem:
                             
                             # Have AI analyze this options activity
                             if self.ai_trader:
-                                analysis = await self.ai_trader.analyze_event(
-                                    signal.symbol,
+                                # Get market data for the symbol
+                                market_data = self.latest_market_data.get(signal.symbol, {})
+                                
+                                # Create options data for AI
+                                options_data = [{
+                                    'type': signal.option_type,
+                                    'strike': signal.strike,
+                                    'volume': signal.volume,
+                                    'premium': signal.premium,
+                                    'confidence': signal.confidence,
+                                    'interpretation': signal.interpretation
+                                }]
+                                
+                                analysis = await self.ai_trader.analyze_market_event(
                                     options_news['title'],
-                                    options_news['summary']
+                                    signal.symbol,
+                                    market_data,
+                                    options_data=options_data
                                 )
                                 
                                 # Save AI decision to database
@@ -398,14 +428,22 @@ class AITradingSystem:
                                     }
                                     self.db.save_ai_decision(decision_data)
                                     
-                                    # Push AI decision to dashboard
+                                    # Push AI decision to dashboard with full analysis
                                     from datetime import datetime
                                     await self._push_ai_decision_to_dashboard({
                                         'symbol': signal.symbol,
                                         'action': analysis.get('direction', 'HOLD').upper(),
                                         'confidence': analysis.get('conviction', 0),
-                                        'reason': f"Options flow: {signal.signal_type}",
-                                        'time': datetime.now().strftime('%H:%M:%S')
+                                        'reason': analysis.get('analysis', f"Options flow: {signal.signal_type}"),
+                                        'time': datetime.now().strftime('%H:%M:%S'),
+                                        'event_type': 'OPTIONS_FLOW',
+                                        'latency': analysis.get('latency_ms'),
+                                        'entry_price': analysis.get('entry_price'),
+                                        'stops': analysis.get('stops', {}),
+                                        'targets': analysis.get('targets', []),
+                                        'thesis': analysis.get('thesis', {}),
+                                        'watchlist': analysis.get('watchlist', []),
+                                        'raw_decision': analysis.get('raw_decision', {})
                                     })
                                 
                                 # Aggressive mode: lower threshold to 50%
@@ -462,11 +500,15 @@ class AITradingSystem:
                                     # Get cached market data for this symbol
                                     market_data = self.latest_market_data.get(event.symbol, {})
                                     
+                                    # Get cached options flow data for this symbol
+                                    options_data = self.latest_options_flow.get(event.symbol, [])
+                                    
                                     # Use existing analyze_market_event method
                                     analysis = await self.ai_trader.analyze_market_event(
                                         f"{event.event_type.value}: {event.headline}",
                                         event.symbol,
-                                        market_data  # Pass actual market data
+                                        market_data,  # Pass actual market data
+                                        options_data=options_data  # Pass options flow data
                                     )
                                     
                                     if analysis:
@@ -476,14 +518,22 @@ class AITradingSystem:
                                             f"Conviction={analysis.get('conviction')}%"
                                         )
                                         
-                                        # Push AI decision to dashboard
+                                        # Push AI decision to dashboard with full analysis
                                         from datetime import datetime
                                         await self._push_ai_decision_to_dashboard({
                                             'symbol': event.symbol,
                                             'action': analysis.get('direction', 'HOLD').upper(),
                                             'confidence': analysis.get('conviction', 0),
-                                            'reason': f"{event.event_type.value}: {event.headline}",
-                                            'time': datetime.now().strftime('%H:%M:%S')
+                                            'reason': analysis.get('analysis', f"{event.event_type.value}: {event.headline}"),
+                                            'time': datetime.now().strftime('%H:%M:%S'),
+                                            'event_type': event.event_type.value,
+                                            'latency': analysis.get('latency_ms'),
+                                            'entry_price': analysis.get('entry_price'),
+                                            'stops': analysis.get('stops', {}),
+                                            'targets': analysis.get('targets', []),
+                                            'thesis': analysis.get('thesis', {}),
+                                            'watchlist': analysis.get('watchlist', []),
+                                            'raw_decision': analysis.get('raw_decision', {})
                                         })
                                         
                                         # Execute trade if conviction meets aggressive threshold (50%)

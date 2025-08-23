@@ -251,3 +251,8 @@ python -m robo_trader.runner --sma-fast 10 --sma-slow 20 --slippage-bps 5 --max-
 
 ---
 This document merges the original project discipline with the new intelligence-first trading approach. Paper mode and risk guardrails remain the default, but the focus shifts from speed to intelligence and profitability.
+- ### Planning & TODO Discipline
+- Maintain `PROJECT_PLAN.md` (phases, tasks, estimates) and `TODO.md` (next steps)
+- These files must be reviewed and updated at every session start and end, and on every commit
+- Track immediate tasks in TodoWrite tool
+- Document completed trades and learnings
