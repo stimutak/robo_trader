@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Optional
 
-from ib_insync import IB, Stock, util
+from ib_insync import IB, Stock, Commodity, Crypto, Future, Forex, util
 import pandas as pd
 
 
@@ -29,22 +29,52 @@ class IBKRClient:
             timeout=timeout,
         )
 
-    def qualify_stock(self, symbol: str, exchange: str = "SMART", currency: str = "USD"):
-        contract = Stock(symbol, exchange, currency)
-        qualified = self.ib.qualifyContracts(contract)
+    async def qualify_contract(self, symbol: str, asset_type: str = "stock", exchange: str = "SMART", currency: str = "USD"):
+        """Qualify any type of contract - stock, commodity, crypto, etc.
+        
+        Args:
+            symbol: Symbol/ticker (e.g., "AAPL", "BTC", "GLD", "XAUUSD")
+            asset_type: Type of asset - "stock", "crypto", "commodity", "forex"
+            exchange: Exchange (default "SMART" for stocks)
+            currency: Currency (default "USD")
+        """
+        # Create appropriate contract based on type
+        if asset_type.lower() == "stock":
+            contract = Stock(symbol, exchange, currency)
+        elif asset_type.lower() == "crypto":
+            # IB crypto format: BTC becomes BTCUSD on PAXOS exchange
+            if "-" in symbol:
+                symbol = symbol.replace("-", "")
+            contract = Crypto(symbol, "PAXOS", currency)
+        elif asset_type.lower() == "commodity":
+            # Gold spot: XAUUSD
+            contract = Commodity(symbol, exchange, currency)
+        elif asset_type.lower() == "forex":
+            # Forex pairs like EURUSD
+            contract = Forex(symbol, exchange, currency)
+        else:
+            # Default to stock for backward compatibility
+            contract = Stock(symbol, exchange, currency)
+        
+        qualified = await self.ib.qualifyContractsAsync(contract)
         if not qualified:
-            raise RuntimeError(f"Unable to qualify contract for {symbol}")
+            raise RuntimeError(f"Unable to qualify {asset_type} contract for {symbol}")
         return qualified[0]
+    
+    async def qualify_stock(self, symbol: str, exchange: str = "SMART", currency: str = "USD"):
+        """Legacy method for backward compatibility - calls qualify_contract."""
+        return await self.qualify_contract(symbol, "stock", exchange, currency)
 
-    async def fetch_recent_bars(self, symbol: str, duration: str = "2 D", bar_size: str = "5 mins"):
+    async def fetch_recent_bars(self, symbol: str, duration: str = "2 D", bar_size: str = "5 mins", asset_type: str = "stock"):
         """Fetch recent bars as a pandas DataFrame.
 
         Args:
-            symbol: Equity ticker, e.g. "AAPL".
+            symbol: Ticker/symbol, e.g. "AAPL", "BTC", "GLD", "XAUUSD".
             duration: IB duration string, e.g. "2 D", "30 D".
             bar_size: IB bar size, e.g. "1 min", "5 mins", "1 hour".
+            asset_type: Type of asset - "stock", "crypto", "commodity", "forex".
         """
-        contract = self.qualify_stock(symbol)
+        contract = await self.qualify_contract(symbol, asset_type)
         bars = await self.ib.reqHistoricalDataAsync(
             contract,
             endDateTime="",
