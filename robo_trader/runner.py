@@ -6,6 +6,7 @@ from typing import Dict, List
 import pandas as pd
 
 from .config import load_config
+from .database import TradingDatabase
 from .execution import Order, PaperExecutor
 from .ibkr_client import IBKRClient
 from .risk import Position, RiskManager
@@ -21,7 +22,7 @@ logger = get_logger(__name__)
 
 
 async def run_once(
-    override_symbols: List[str] | None = None,
+    symbols: List[str] | None = None,
     duration: str = "10 D",
     bar_size: str = "30 mins",
     sma_fast: int = 10,
@@ -29,11 +30,14 @@ async def run_once(
     slippage_bps: float = 0.0,
     max_order_notional: float | None = None,
     max_daily_notional: float | None = None,
-    default_cash_override: float | None = None,
+    default_cash: float | None = None,
 ) -> None:
     cfg = load_config()
     ib = IBKRClient(cfg.ibkr_host, cfg.ibkr_port, cfg.ibkr_client_id)
     await retry_async(lambda: ib.connect(readonly=True))
+
+    # Initialize database
+    db = TradingDatabase()
 
     # Initialize helpers
     risk = RiskManager(
@@ -46,16 +50,16 @@ async def run_once(
     )
     executor = PaperExecutor(slippage_bps=slippage_bps)
 
-    starting_cash = default_cash_override if default_cash_override is not None else cfg.default_cash
+    starting_cash = default_cash if default_cash is not None else cfg.default_cash
     portfolio = Portfolio(starting_cash)
     daily_pnl = 0.0
     positions: Dict[str, Position] = {}
     daily_executed_notional = 0.0
 
-    symbols = override_symbols if override_symbols else cfg.symbols
-    logger.info(f"Processing symbols: {symbols}")
+    symbols_to_process = symbols if symbols else cfg.symbols
+    logger.info(f"Processing symbols: {symbols_to_process}")
 
-    for symbol in symbols:
+    for symbol in symbols_to_process:
         df = await retry_async(lambda: ib.fetch_recent_bars(symbol, duration=duration, bar_size=bar_size))
         if df.empty:
             continue
@@ -68,22 +72,57 @@ async def run_once(
 
         equity = portfolio.equity({symbol: price})
 
+        # Record signal
+        if last["signal"] != 0:
+            db.record_signal(symbol, "SMA_CROSSOVER", 
+                           "BUY" if last["signal"] == 1 else "SELL",
+                           abs(last["signal"]))
+        
         if last["signal"] == 1:
             qty = risk.position_size(equity, price)
             ok, msg = risk.validate_order(symbol, qty, price, equity, daily_pnl, positions, daily_executed_notional)
             if ok and qty > 0:
                 res = executor.place_order(Order(symbol=symbol, quantity=qty, side="BUY", price=price))
                 if res.ok:
-                    positions[symbol] = Position(symbol, qty, price)
-                    portfolio.update_fill(symbol, "BUY", qty, res.fill_price or price)
+                    fill_price = res.fill_price or price
+                    positions[symbol] = Position(symbol, qty, fill_price)
+                    portfolio.update_fill(symbol, "BUY", qty, fill_price)
                     daily_executed_notional += price * qty
+                    
+                    # Record trade and update position in database
+                    db.record_trade(symbol, "BUY", qty, fill_price, 
+                                  slippage=(fill_price - price) * qty if res.fill_price else 0)
+                    db.update_position(symbol, qty, fill_price, price)
+                    
         elif last["signal"] == -1 and symbol in positions:
             pos = positions[symbol]
             res = executor.place_order(Order(symbol=symbol, quantity=pos.quantity, side="SELL", price=price))
             if res.ok:
-                portfolio.update_fill(symbol, "SELL", pos.quantity, res.fill_price or price)
+                fill_price = res.fill_price or price
+                portfolio.update_fill(symbol, "SELL", pos.quantity, fill_price)
                 daily_pnl = portfolio.realized_pnl
+                
+                # Record trade and close position in database
+                db.record_trade(symbol, "SELL", pos.quantity, fill_price,
+                              slippage=(fill_price - price) * pos.quantity if res.fill_price else 0)
+                db.update_position(symbol, 0, 0, 0)  # Close position
+                
                 del positions[symbol]
+    
+    # Update account in database
+    market_prices = {symbol: pos.entry_price for symbol, pos in positions.items()}
+    equity = portfolio.equity(market_prices)
+    unrealized = portfolio.compute_unrealized(market_prices)
+    
+    db.update_account(
+        cash=portfolio.cash,
+        equity=equity,
+        daily_pnl=daily_pnl,
+        realized_pnl=portfolio.realized_pnl,
+        unrealized_pnl=unrealized
+    )
+    
+    logger.info(f"Trading cycle complete. Equity: ${equity:,.2f}, Daily P&L: ${daily_pnl:,.2f}")
 
 
 def main() -> None:
@@ -107,15 +146,15 @@ def main() -> None:
     override_symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()] if args.symbols else None
     asyncio.run(
         run_once(
-            override_symbols,
-            args.duration,
-            args.bar_size,
-            args.sma_fast,
-            args.sma_slow,
-            args.slippage_bps,
-            args.max_order_notional,
-            args.max_daily_notional,
-            args.default_cash,
+            symbols=override_symbols,
+            duration=args.duration,
+            bar_size=args.bar_size,
+            sma_fast=args.sma_fast,
+            sma_slow=args.sma_slow,
+            slippage_bps=args.slippage_bps,
+            max_order_notional=args.max_order_notional,
+            max_daily_notional=args.max_daily_notional,
+            default_cash=args.default_cash,
         )
     )
 
