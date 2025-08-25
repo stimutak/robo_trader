@@ -169,35 +169,38 @@ def load_historical_data():
     global pnl, positions, ai_decisions, trading_signals, options_flow
     
     try:
+        # Load current positions from database
+        db_positions = db.get_positions()
+        for pos in db_positions:
+            positions[pos['symbol']] = {
+                'symbol': pos['symbol'],
+                'quantity': pos['quantity'],
+                'avg_price': pos['avg_cost'],
+                'current_price': pos.get('market_price', pos['avg_cost']),
+                'pnl': (pos.get('market_price', pos['avg_cost']) - pos['avg_cost']) * pos['quantity']
+            }
+        
         # Load today's P&L
         today_pnl = db.get_today_pnl()
         pnl['daily'] = today_pnl.get('total_pnl', 0)
         
-        # Load recent trades
-        recent_trades = db.get_recent_trades(limit=50)
+        # Load recent trades (use get_today_trades instead)
+        recent_trades = db.get_today_trades()
         for trade in recent_trades[:10]:  # Show last 10 trades
             trading_signals.append({
                 'time': trade['timestamp'],
                 'symbol': trade['symbol'],
-                'action': trade['action'],
+                'action': trade['side'],
                 'price': trade['price'],
-                'confidence': trade.get('ai_confidence', 0)
+                'confidence': 75  # Default confidence
             })
         
-        # Load recent options flow
-        recent_options = db.get_recent_options_flow(limit=20)
-        for opt in recent_options:
-            options_flow.append({
-                'symbol': opt['symbol'],
-                'type': opt['signal_type'],
-                'strike': opt['strike'],
-                'expiry': opt['expiry'],
-                'confidence': opt.get('confidence', 0)
-            })
+        # Options flow is demo data for now
+        # recent_options = db.get_recent_options_flow(limit=20)
         
-        # Load performance metrics
-        metrics = db.get_performance_metrics(days=30)
-        pnl['total'] = metrics.get('total_pnl', 0)
+        # Calculate total P&L from positions
+        total_pnl = sum(pos['pnl'] for pos in positions.values())
+        pnl['total'] = total_pnl
         
         # If after hours, load previous day's P&L
         import datetime
@@ -206,10 +209,10 @@ def load_historical_data():
         market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
         
         if now < market_open or now > market_close:
-            prev_pnl = db.get_previous_day_pnl()
-            if prev_pnl:
-                pnl['daily'] = prev_pnl.get('daily_pnl', 0)
-                pnl['total'] = prev_pnl.get('total_pnl', 0)
+            # prev_pnl = db.get_previous_day_pnl()  # Method doesn't exist yet
+            # Use today's P&L for now
+            pnl['daily'] = today_pnl.get('daily_pnl', 0)
+            pnl['total'] = total_pnl
                 
         logger.info(f"Loaded historical data: P&L ${pnl['total']:.2f}, {len(recent_trades)} trades")
         
