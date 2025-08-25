@@ -138,7 +138,7 @@ async def run_once(
                 del positions[symbol]
     
     # Update account in database
-    market_prices = {symbol: pos.entry_price for symbol, pos in positions.items()}
+    market_prices = {symbol: pos.avg_price for symbol, pos in positions.items()}
     equity = portfolio.equity(market_prices)
     unrealized = portfolio.compute_unrealized(market_prices)
     

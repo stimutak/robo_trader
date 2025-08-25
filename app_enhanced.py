@@ -2940,10 +2940,19 @@ def get_price_history(symbol):
             if isinstance(ts, str):
                 ts = datetime.datetime.fromisoformat(ts)
             time_str = ts.strftime('%H:%M')
+            
+            # Calculate minute index from 9:30 AM
+            # 9:30 AM = index 0, 9:31 AM = index 1, etc.
+            minutes_since_930 = (ts.hour * 60 + ts.minute) - (9 * 60 + 30)
+            if minutes_since_930 < 0:
+                minutes_since_930 = 0
+            elif minutes_since_930 >= 390:
+                minutes_since_930 = 389
+            
             formatted.append({
                 'time': time_str,
                 'price': p['price'],
-                'index': p.get('minute_index', 0)
+                'index': minutes_since_930
             })
         
         return jsonify(formatted)
