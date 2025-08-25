@@ -25,6 +25,7 @@ from robo_trader.config import load_config
 from robo_trader.logger import get_logger
 from robo_trader.database import TradingDatabase
 from robo_trader.ai_analyst import AIAnalyst, create_analyst
+from robo_trader.news_fetcher import fetch_rss_news
 
 logger = get_logger(__name__)
 app = Flask(__name__)
@@ -2817,6 +2818,14 @@ def get_status():
         for symbol, pos in positions.items():
             if 'current_price' in pos:
                 price_data[symbol] = pos['current_price']
+    
+    # Get real news from RSS feeds
+    try:
+        real_news = fetch_rss_news(max_items=10)
+        if real_news:
+            news_feed = real_news
+    except Exception as e:
+        logger.warning(f"Failed to fetch RSS news: {e}")
     
     # Generate AI analysis if available
     ai_analysis_data = {}
