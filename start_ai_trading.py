@@ -19,30 +19,46 @@ from robo_trader.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Top 21 liquid symbols for trading
+# Default symbols - should match dashboard settings
 DEFAULT_SYMBOLS = [
-    "SPY",   # S&P 500 ETF
-    "QQQ",   # Nasdaq 100 ETF
-    "IWM",   # Russell 2000 ETF
-    "DIA",   # Dow Jones ETF
     "AAPL",  # Apple
-    "MSFT",  # Microsoft
-    "AMZN",  # Amazon
-    "GOOGL", # Google
-    "META",  # Meta
     "NVDA",  # Nvidia
     "TSLA",  # Tesla
-    "JPM",   # JP Morgan
-    "BAC",   # Bank of America
-    "XOM",   # Exxon Mobil
-    "JNJ",   # Johnson & Johnson
-    "V",     # Visa
-    "WMT",   # Walmart
-    "PG",    # Procter & Gamble
-    "MA",    # Mastercard
-    "HD",    # Home Depot
-    "DIS",   # Disney
+    "IXHL",  # iShares Healthcare Innovation ETF
+    "NUAI",  # Nu Holdings
+    "BZAI",  # Baidu AI
+    "ELTP",  # Elite Pharma
+    "OPEN",  # Opendoor
+    "CEG",   # Constellation Energy
+    "VRT",   # Vertiv Holdings
+    "PLTR",  # Palantir
+    "UPST",  # Upstart
+    "TEM",   # Tempus AI
+    "HTFL",  # HTF Holdings  
+    "SDGR",  # Schrodinger
+    "APLD",  # Applied Digital
+    "SOFI",  # SoFi Technologies
+    "CORZ",  # Core Scientific
+    "WULF",  # TeraWulf
 ]
+
+def load_symbols_from_settings():
+    """Load symbols from user settings file if it exists."""
+    import json
+    from pathlib import Path
+    
+    settings_file = Path("user_settings.json")
+    if settings_file.exists():
+        try:
+            with open(settings_file, 'r') as f:
+                settings = json.load(f)
+                symbols = settings.get('default', {}).get('symbols', DEFAULT_SYMBOLS)
+                logger.info(f"Loaded {len(symbols)} symbols from user settings")
+                return symbols
+        except Exception as e:
+            logger.warning(f"Failed to load user settings: {e}, using defaults")
+    
+    return DEFAULT_SYMBOLS
 
 shutdown_event = asyncio.Event()
 
@@ -143,10 +159,13 @@ async def main():
     else:
         logger.info("✓ Dashboard detected at http://localhost:5555")
     
+    # Load symbols from settings or use defaults
+    symbols = load_symbols_from_settings()
+    
     # Start trading loop
     try:
         await trading_loop(
-            symbols=DEFAULT_SYMBOLS,
+            symbols=symbols,
             duration="2 D",
             bar_size="5 mins",
             sma_fast=10,

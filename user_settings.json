@@ -1,0 +1,27 @@
+{
+    "default": {
+        "symbols": [
+            "AAPL",
+            "NVDA", 
+            "TSLA",
+            "IXHL",
+            "NUAI",
+            "BZAI",
+            "ELTP",
+            "OPEN",
+            "CEG",
+            "VRT",
+            "PLTR",
+            "UPST",
+            "TEM",
+            "HTFL",
+            "SDGR",
+            "APLD",
+            "SOFI",
+            "CORZ",
+            "WULF"
+        ],
+        "risk_level": "moderate",
+        "max_daily_loss": 1000
+    }
+}
