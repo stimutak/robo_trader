@@ -283,3 +283,134 @@ class TradingDatabase:
             unrealized_pnl = cursor.fetchone()[0] or 0.0
             
             return realized_pnl, unrealized_pnl
+    
+    def get_current_day_prices(self, symbol: str) -> List[Dict]:
+        """Get today's price data for a symbol."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT open, high, low, close, volume, timestamp
+                FROM market_data
+                WHERE symbol = ? AND DATE(timestamp) = DATE('now')
+                ORDER BY timestamp
+            """, (symbol,))
+            
+            prices = []
+            for i, row in enumerate(cursor.fetchall()):
+                prices.append({
+                    'open': row[0],
+                    'high': row[1],
+                    'low': row[2],
+                    'close': row[3],
+                    'price': row[3],  # Alias for compatibility with dashboard
+                    'volume': row[4],
+                    'timestamp': row[5],
+                    'minute_index': i
+                })
+            
+            return prices
+    
+    def get_last_trading_day_prices(self, symbol: str) -> List[Dict]:
+        """Get last trading day's price data for a symbol."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            # Get the most recent trading day
+            cursor.execute("""
+                SELECT DISTINCT DATE(timestamp) as trading_day
+                FROM market_data
+                WHERE symbol = ?
+                ORDER BY trading_day DESC
+                LIMIT 1
+            """, (symbol,))
+            
+            last_day = cursor.fetchone()
+            if not last_day:
+                return []
+            
+            cursor.execute("""
+                SELECT open, high, low, close, volume, timestamp
+                FROM market_data
+                WHERE symbol = ? AND DATE(timestamp) = ?
+                ORDER BY timestamp
+            """, (symbol, last_day[0]))
+            
+            prices = []
+            for i, row in enumerate(cursor.fetchall()):
+                prices.append({
+                    'open': row[0],
+                    'high': row[1],
+                    'low': row[2],
+                    'close': row[3],
+                    'price': row[3],  # Alias for compatibility with dashboard
+                    'volume': row[4],
+                    'timestamp': row[5],
+                    'minute_index': i
+                })
+            
+            return prices
+    
+    def get_last_pnl_history(self) -> List[Dict]:
+        """Get P&L history for the last trading session."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Get account history for today
+            cursor.execute("""
+                SELECT equity, daily_pnl, realized_pnl, unrealized_pnl, timestamp
+                FROM account
+                WHERE DATE(timestamp) = DATE('now')
+                ORDER BY timestamp
+            """)
+            
+            history = []
+            for i, row in enumerate(cursor.fetchall()):
+                history.append({
+                    'equity': row[0],
+                    'daily_pnl': row[1],
+                    'total_pnl': row[1],  # For compatibility with enhanced dashboard
+                    'realized_pnl': row[2],
+                    'unrealized_pnl': row[3],
+                    'timestamp': row[4],
+                    'minute_index': i
+                })
+            
+            return history
+    
+    def get_today_pnl(self) -> Dict:
+        """Get today's P&L summary."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Get latest account info for today
+            cursor.execute("""
+                SELECT equity, daily_pnl, realized_pnl, unrealized_pnl
+                FROM account
+                WHERE DATE(timestamp) = DATE('now')
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """)
+            
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'equity': row[0],
+                    'daily_pnl': row[1],
+                    'total_pnl': row[1],  # For compatibility
+                    'realized_pnl': row[2],
+                    'unrealized_pnl': row[3]
+                }
+            
+            # Return default values if no data for today
+            return {
+                'equity': 100000,
+                'daily_pnl': 0,
+                'total_pnl': 0,
+                'realized_pnl': 0,
+                'unrealized_pnl': 0
+            }
+    
+    def close(self) -> None:
+        """Close database connection. For compatibility with enhanced dashboard."""
+        # SQLite connections are closed automatically with context manager
+        # This method exists for API compatibility
+        pass

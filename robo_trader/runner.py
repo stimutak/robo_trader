@@ -66,6 +66,34 @@ async def run_once(
         # Normalize columns
         if "close" not in df.columns and "close" in df:
             df = df.rename(columns={"close": "close"})
+        
+        # Store market data in database
+        if not df.empty:
+            logger.info(f"Fetched {len(df)} bars for {symbol}, columns: {list(df.columns)}")
+            # Store latest price data
+            if 'date' in df.columns:
+                for _, row in df.iterrows():
+                    try:
+                        # Convert pandas Timestamp to datetime
+                        timestamp = row['date']
+                        if hasattr(timestamp, 'to_pydatetime'):
+                            timestamp = timestamp.to_pydatetime()
+                        
+                        db.store_market_data(
+                            symbol=symbol,
+                            timestamp=timestamp,
+                            open_price=float(row.get('open', 0)),
+                            high=float(row.get('high', 0)),
+                            low=float(row.get('low', 0)),
+                            close=float(row.get('close', 0)),
+                            volume=int(row.get('volume', 0))
+                        )
+                    except Exception as e:
+                        logger.warning(f"Error storing market data for {symbol}: {e}")
+                logger.info(f"Stored {len(df)} price bars for {symbol}")
+            else:
+                logger.warning(f"No 'date' column in dataframe for {symbol}: {list(df.columns)}")
+        
         signals = sma_crossover_signals(pd.DataFrame({"close": df["close"]}), fast=sma_fast, slow=sma_slow)
         last = signals.iloc[-1]
         price = float(last["close"]) if "close" in last else float(df["close"].iloc[-1])
