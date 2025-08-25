@@ -28,8 +28,17 @@ class AbstractExecutor:
 class PaperExecutor(AbstractExecutor):
     """Simple in-memory simulator for order placement.
 
-    This does not model slippage or partial fills; it's intended as a safe default
+    Models symmetric slippage (in basis points) around the limit price for both
+    buy and sell orders. Does not model partial fills. Intended as a safe default
     to test logic without touching live accounts.
+    
+    Args:
+        slippage_bps: Slippage in basis points to apply symmetrically to fills.
+                      Defaults to 0.0 (no slippage).
+    
+    Attributes:
+        fills: Dictionary tracking all executed orders with timestamps and fill prices.
+        slippage_bps: Configured slippage in basis points.
     """
 
     def __init__(self, slippage_bps: float = 0.0) -> None:
