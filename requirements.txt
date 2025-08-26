@@ -10,6 +10,9 @@
  structlog>=23.0.0
  aiofiles>=23.0.0
  ta>=0.10.0
+tenacity>=8.2.0
+aiosqlite>=0.19.0
+nest-asyncio>=1.5.0
 
 # Production dependencies
 psutil>=5.9.0

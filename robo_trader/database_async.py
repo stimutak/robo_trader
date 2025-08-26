@@ -10,6 +10,7 @@ This implements Phase 1 F3: Async Database Operations
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
