@@ -10,17 +10,18 @@ This module implements:
 - Gap detection and handling
 """
 
-from datetime import datetime, timedelta, time
-from typing import List, Optional, Dict, Any, Tuple
+import statistics
+from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, time, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
-from collections import deque
-import statistics
 
 from ..config import Config
 from ..logger import get_logger
-from .pipeline import TickData, BarData
+from .pipeline import BarData, TickData
 
 
 @dataclass

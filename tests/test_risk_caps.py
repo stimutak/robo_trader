@@ -1,4 +1,4 @@
-from robo_trader.risk import RiskManager, Position
+from robo_trader.risk import Position, RiskManager
 
 
 def test_per_order_notional_cap_blocks_large_order():

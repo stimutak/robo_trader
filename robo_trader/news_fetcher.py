@@ -2,10 +2,11 @@
 News fetcher using RSS feeds - no API keys required.
 """
 
-import feedparser
-from datetime import datetime, timedelta
-from typing import List, Dict
 import logging
+from datetime import datetime, timedelta
+from typing import Dict, List
+
+import feedparser
 
 logger = logging.getLogger(__name__)
 

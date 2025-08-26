@@ -1,5 +1,5 @@
 import asyncio
-from typing import Callable, TypeVar, Awaitable
+from typing import Awaitable, Callable, TypeVar
 
 T = TypeVar("T")
 

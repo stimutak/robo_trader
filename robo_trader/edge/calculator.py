@@ -6,11 +6,12 @@ to quantify trade quality before position entry.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
-from enum import Enum
 
 from ..logger import get_logger
 

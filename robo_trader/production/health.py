@@ -6,19 +6,20 @@ and circuit breaker functionality.
 """
 
 import asyncio
-import time
-import psutil
-import logging
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any, Callable
-from enum import Enum
 import json
-from collections import deque
+import logging
 import threading
+import time
+from collections import deque
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional
 
-from ..logger import get_logger
+import psutil
+
 from ..database import TradingDatabase
+from ..logger import get_logger
 
 logger = get_logger(__name__)
 

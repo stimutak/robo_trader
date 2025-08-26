@@ -1,5 +1,5 @@
 """Core trading engine package."""
 
-from .engine import TradingEngine, EngineState, HealthStatus
+from .engine import EngineState, HealthStatus, TradingEngine
 
 __all__ = ["TradingEngine", "EngineState", "HealthStatus"]

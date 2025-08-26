@@ -1,19 +1,20 @@
 """Walk-forward optimization framework for strategy parameter tuning."""
 
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Any, Optional, Callable
+from itertools import product
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
-from itertools import product
-import json
-from pathlib import Path
 
-from ..strategies.framework import Strategy
 from ..backtest.engine import BacktestEngine
 from ..backtest.metrics import PerformanceMetrics
 from ..data.pipeline import DataPipeline
+from ..strategies.framework import Strategy
 
 logger = logging.getLogger(__name__)
 

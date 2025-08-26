@@ -12,14 +12,15 @@ This module implements:
 
 import asyncio
 import threading
-from collections import deque, defaultdict
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Callable, Any, Deque, Set
+import time
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from queue import Full, Queue
+from typing import Any, Callable, Deque, Dict, List, Optional, Set
+
 import numpy as np
 import pandas as pd
-from queue import Queue, Full
-import time
 
 from ..config import Config
 from ..logger import get_logger

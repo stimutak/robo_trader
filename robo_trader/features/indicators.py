@@ -11,11 +11,12 @@ This module implements:
 - Additional indicators for comprehensive analysis
 """
 
-from typing import Optional, Dict, Any, Union
+import warnings
 from dataclasses import dataclass
+from typing import Any, Dict, Optional, Union
+
 import numpy as np
 import pandas as pd
-import warnings
 
 # Suppress pandas warnings
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)

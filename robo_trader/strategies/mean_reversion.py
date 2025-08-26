@@ -6,13 +6,14 @@ and trades the reversion to the mean.
 """
 
 from datetime import datetime
-from typing import Dict, List, Optional, Any
-import pandas as pd
-import numpy as np
+from typing import Any, Dict, List, Optional
 
-from .framework import Strategy, Signal, SignalType
+import numpy as np
+import pandas as pd
+
 from ..features.engine import FeatureSet
 from ..logger import get_logger
+from .framework import Signal, SignalType, Strategy
 
 logger = get_logger(__name__)
 

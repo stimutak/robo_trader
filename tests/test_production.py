@@ -1,30 +1,19 @@
 """Tests for production infrastructure components."""
 
-import unittest
-from unittest.mock import Mock, patch, MagicMock
-from datetime import datetime, timedelta
 import json
 import os
 import tempfile
+import unittest
+from datetime import datetime, timedelta
+from unittest.mock import MagicMock, Mock, patch
 
-from robo_trader.production import (
-    ConfigManager,
-    ProductionConfig,
-    Environment,
-    TradingLimits,
-    FeatureFlags,
-    HealthMonitor,
-    HealthStatus,
-    ComponentStatus,
-    ComponentHealth,
-    EmergencyStopManager,
-    StopReason,
-    StopScope,
-    AlertManager,
-    AlertSeverity,
-    AlertCategory,
-    AlertRule,
-)
+from robo_trader.production import (AlertCategory, AlertManager, AlertRule,
+                                    AlertSeverity, ComponentHealth,
+                                    ComponentStatus, ConfigManager,
+                                    EmergencyStopManager, Environment,
+                                    FeatureFlags, HealthMonitor, HealthStatus,
+                                    ProductionConfig, StopReason, StopScope,
+                                    TradingLimits)
 
 
 class TestConfigManager(unittest.TestCase):

@@ -10,18 +10,19 @@ This module implements:
 """
 
 import asyncio
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any, Set, Tuple
+import threading
+from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Set, Tuple
+
 import numpy as np
 import pandas as pd
-from collections import defaultdict
-import threading
 
 from ..config import Config
+from ..data.pipeline import BarData, DataSubscriber, TickData
 from ..logger import get_logger
-from ..data.pipeline import DataSubscriber, TickData, BarData
-from .indicators import TechnicalIndicators, IndicatorConfig
+from .indicators import IndicatorConfig, TechnicalIndicators
 
 
 @dataclass

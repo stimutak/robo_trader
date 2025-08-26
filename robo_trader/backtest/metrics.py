@@ -9,9 +9,10 @@ This module provides comprehensive performance analytics including:
 """
 
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
-import pandas as pd
+from typing import Any, Dict, Optional
+
 import numpy as np
+import pandas as pd
 from scipy import stats
 
 from ..logger import get_logger

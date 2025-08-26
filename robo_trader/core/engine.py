@@ -17,14 +17,15 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from robo_trader.config import Config, TradingMode
+from robo_trader.correlation import CorrelationTracker
 from robo_trader.database import TradingDatabase
 from robo_trader.execution import AbstractExecutor, PaperExecutor
 from robo_trader.ibkr_client import IBKRClient
 from robo_trader.logger import get_logger
 from robo_trader.portfolio import Portfolio
 from robo_trader.risk import RiskManager, create_risk_manager_from_config
-from robo_trader.correlation import CorrelationTracker
-from robo_trader.strategy_manager import StrategyManager, create_default_manager
+from robo_trader.strategy_manager import (StrategyManager,
+                                          create_default_manager)
 
 logger = get_logger(__name__)
 

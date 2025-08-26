@@ -1,7 +1,5 @@
 import asyncio
 
-import asyncio
-
 from robo_trader.retry import retry_async
 
 

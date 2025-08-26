@@ -2,19 +2,17 @@
 
 import unittest
 from datetime import datetime, timedelta
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import MagicMock, Mock, patch
+
 import numpy as np
 import pandas as pd
 
-from robo_trader.backtest.optimization import (
-    WalkForwardOptimizer,
-    OptimizationWindow,
-    ParameterGrid,
-    OptimizationResult,
-    ParameterSweeper,
-    OverfittingDetector,
-)
 from robo_trader.backtest.metrics import PerformanceMetrics
+from robo_trader.backtest.optimization import (OptimizationResult,
+                                               OptimizationWindow,
+                                               OverfittingDetector,
+                                               ParameterGrid, ParameterSweeper,
+                                               WalkForwardOptimizer)
 from robo_trader.strategies.framework import Strategy
 
 

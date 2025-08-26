@@ -9,18 +9,19 @@ This module provides realistic backtesting with:
 """
 
 import asyncio
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any, Tuple
-import pandas as pd
-import numpy as np
-from collections import defaultdict
+from typing import Any, Dict, List, Optional, Tuple
 
-from ..logger import get_logger
-from ..strategies.framework import Strategy, Signal, SignalType
-from ..features.engine import FeatureEngine
+import numpy as np
+import pandas as pd
+
 from ..data.pipeline import DataPipeline
-from .metrics import calculate_metrics, PerformanceMetrics
+from ..features.engine import FeatureEngine
+from ..logger import get_logger
+from ..strategies.framework import Signal, SignalType, Strategy
+from .metrics import PerformanceMetrics, calculate_metrics
 
 logger = get_logger(__name__)
 

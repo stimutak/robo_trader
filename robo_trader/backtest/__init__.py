@@ -8,7 +8,7 @@ This package provides:
 - Transaction cost modeling
 """
 
-from .engine import BacktestEngine, BacktestConfig, BacktestResult
+from .engine import BacktestConfig, BacktestEngine, BacktestResult
 from .metrics import PerformanceMetrics, calculate_metrics
 
 __all__ = [

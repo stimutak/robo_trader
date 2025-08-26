@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 from typing import Dict, List
 
@@ -9,14 +10,11 @@ from .config import load_config
 from .database import TradingDatabase
 from .execution import Order, PaperExecutor
 from .ibkr_client import IBKRClient
-from .risk import Position, RiskManager
-from .strategies import sma_crossover_signals
 from .logger import get_logger
 from .portfolio import Portfolio
 from .retry import retry_async
-
-import argparse
-
+from .risk import Position, RiskManager
+from .strategies import sma_crossover_signals
 
 logger = get_logger(__name__)
 

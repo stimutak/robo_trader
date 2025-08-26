@@ -8,7 +8,7 @@ This package provides:
 - Trade quality scoring
 """
 
-from .calculator import EdgeCalculator, TradeEdge, EdgeMetrics
+from .calculator import EdgeCalculator, EdgeMetrics, TradeEdge
 from .gating import EdgeGatingFilter, GatingConfig
 
 __all__ = [

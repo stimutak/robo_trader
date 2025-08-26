@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 from typing import Optional
 
-from ib_insync import IB, Stock, util
-import pandas as pd
 import nest_asyncio
+import pandas as pd
+from ib_insync import IB, Stock, util
 
 # Apply nest_asyncio to allow nested event loops
 nest_asyncio.apply()

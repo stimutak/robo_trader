@@ -1,4 +1,4 @@
-from robo_trader.risk import RiskManager, Position
+from robo_trader.risk import Position, RiskManager
 
 
 def test_position_size_basic():
