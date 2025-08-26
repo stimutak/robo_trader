@@ -1,0 +1,62 @@
+# Multi-stage build for production-ready Python application
+FROM python:3.13-slim as builder
+
+# Build dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    make \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --user --no-cache-dir -r requirements.txt
+
+# Production stage
+FROM python:3.13-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for security
+RUN useradd -m -u 1000 trader && \
+    mkdir -p /app/data /app/logs && \
+    chown -R trader:trader /app
+
+# Copy Python dependencies from builder
+COPY --from=builder /root/.local /home/trader/.local
+
+# Set working directory
+WORKDIR /app
+
+# Copy application code
+COPY --chown=trader:trader . .
+
+# Switch to non-root user
+USER trader
+
+# Add local bin to PATH
+ENV PATH=/home/trader/.local/bin:$PATH
+ENV PYTHONPATH=/app:$PYTHONPATH
+
+# Environment variables
+ENV TRADING_ENV=production
+ENV LOG_LEVEL=INFO
+ENV PORT=8080
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD python -c "from robo_trader.production.health import HealthMonitor; monitor = HealthMonitor(); exit(0 if monitor.get_readiness_status() else 1)"
+
+# Expose ports
+EXPOSE 8080 5555
+
+# Default command
+CMD ["python", "start_ai_trading.py"]

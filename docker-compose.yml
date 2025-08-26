@@ -1,0 +1,97 @@
+version: '3.8'
+
+services:
+  trader:
+    build: .
+    container_name: robo_trader
+    environment:
+      - TRADING_ENV=development
+      - LOG_LEVEL=DEBUG
+      - IBKR_HOST=host.docker.internal
+      - IBKR_PORT=7497
+      - ENABLE_PAPER_TRADING=true
+      - ENABLE_LIVE_TRADING=false
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config:/app/config
+    ports:
+      - "8080:8080"  # Health/metrics endpoint
+      - "5555:5555"  # Dashboard
+    networks:
+      - trading_network
+    restart: unless-stopped
+    depends_on:
+      - postgres
+      - redis
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: trading_db
+    environment:
+      - POSTGRES_USER=trader
+      - POSTGRES_PASSWORD=trader_pass
+      - POSTGRES_DB=trading
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - trading_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: trading_cache
+    ports:
+      - "6379:6379"
+    networks:
+      - trading_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: trading_prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    volumes:
+      - ./deployment/prometheus:/etc/prometheus
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - trading_network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: trading_grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./deployment/grafana:/etc/grafana/provisioning
+    ports:
+      - "3000:3000"
+    networks:
+      - trading_network
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  trading_network:
+    driver: bridge

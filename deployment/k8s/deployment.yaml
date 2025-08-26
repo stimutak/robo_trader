@@ -1,0 +1,161 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: robo-trader
+  namespace: trading
+  labels:
+    app: robo-trader
+    version: v1
+spec:
+  replicas: 1  # Single instance for trading
+  strategy:
+    type: Recreate  # Avoid multiple traders
+  selector:
+    matchLabels:
+      app: robo-trader
+  template:
+    metadata:
+      labels:
+        app: robo-trader
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: robo-trader
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: trader
+        image: ghcr.io/stimutak/robo_trader:latest
+        imagePullPolicy: Always
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        - name: dashboard
+          containerPort: 5555
+          protocol: TCP
+        env:
+        - name: TRADING_ENV
+          valueFrom:
+            configMapKeyRef:
+              name: robo-trader-config
+              key: environment
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: robo-trader-config
+              key: log_level
+        - name: IBKR_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: robo-trader-config
+              key: ibkr_host
+        - name: IBKR_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: robo-trader-config
+              key: ibkr_port
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: robo-trader-secrets
+              key: database_url
+        - name: TRADING_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: robo-trader-secrets
+              key: api_key
+        - name: SLACK_WEBHOOK_URL
+          valueFrom:
+            secretKeyRef:
+              name: robo-trader-secrets
+              key: slack_webhook
+              optional: true
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: http
+          initialDelaySeconds: 20
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+        - name: data
+          mountPath: /app/data
+        - name: logs
+          mountPath: /app/logs
+      volumes:
+      - name: config
+        configMap:
+          name: robo-trader-config
+          items:
+          - key: production.json
+            path: environments/production.json
+      - name: data
+        persistentVolumeClaim:
+          claimName: robo-trader-data
+      - name: logs
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: robo-trader
+  namespace: trading
+  labels:
+    app: robo-trader
+spec:
+  type: ClusterIP
+  selector:
+    app: robo-trader
+  ports:
+  - name: http
+    port: 8080
+    targetPort: http
+    protocol: TCP
+  - name: dashboard
+    port: 5555
+    targetPort: dashboard
+    protocol: TCP
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: robo-trader
+  namespace: trading
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: robo-trader-data
+  namespace: trading
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard
