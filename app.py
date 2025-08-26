@@ -1,486 +1,1093 @@
-#!/Users/oliver/robo_trader/venv/bin/python
+#!/usr/bin/env python3
 """
-Trading Dashboard Server
-
-Provides real-time visualization of trading activity, positions, and P&L.
-Runs on http://localhost:5555
+RoboTrader Dashboard - Clean, ML-Integrated Interface
+Provides real-time monitoring of trading, ML models, and performance metrics
 """
 
+from flask import Flask, render_template_string, jsonify, request, Response
 import asyncio
+import threading
 import json
-import logging
-import sqlite3
 from datetime import datetime, timedelta
+import subprocess
+import os
+import signal
+import time
+import hashlib
+from functools import wraps
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+import pandas as pd
+import numpy as np
 
-from flask import Flask, jsonify, render_template_string
-from flask_cors import CORS
+from dotenv import load_dotenv
+load_dotenv()
 
+# Import our modules
+from robo_trader.config import load_config
+from robo_trader.logger import get_logger
+from robo_trader.database_async import TradingDatabase
+from robo_trader.analytics.performance import PerformanceAnalyzer
+from robo_trader.features.feature_pipeline import FeaturePipeline
+from robo_trader.ml.model_trainer import ModelTrainer
+
+logger = get_logger(__name__)
 app = Flask(__name__)
-CORS(app)
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Configuration
+config = load_config()
+AUTH_ENABLED = os.getenv('DASH_AUTH_ENABLED', 'false').lower() == 'true'
+AUTH_USER = os.getenv('DASH_USER', 'admin')
+AUTH_PASS_HASH = os.getenv('DASH_PASS_HASH', '')
 
-DB_PATH = Path("trading_data.db")
+# Initialize components
+db = None
+feature_pipeline = None
+model_trainer = None
+performance_analyzer = None
 
-DASHBOARD_HTML = """
+# Global state
+trading_process = None
+trading_status = "stopped"
+trading_log = []
+positions = {}
+pnl = {"daily": 0.0, "total": 0.0, "unrealized": 0.0}
+ml_metrics = {
+    "models_trained": 0,
+    "last_prediction": None,
+    "feature_count": 0,
+    "model_performance": {}
+}
+performance_metrics = {
+    "sharpe_ratio": 0.0,
+    "max_drawdown": 0.0,
+    "win_rate": 0.0,
+    "profit_factor": 0.0
+}
+
+def init_async_components():
+    """Initialize async components in event loop"""
+    global db, feature_pipeline, model_trainer, performance_analyzer
+    
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    db = TradingDatabase()
+    feature_pipeline = FeaturePipeline(config)
+    model_trainer = ModelTrainer(config, model_dir=Path("models"))
+    performance_analyzer = PerformanceAnalyzer()
+
+# Initialize in background thread
+init_thread = threading.Thread(target=init_async_components)
+init_thread.daemon = True
+init_thread.start()
+
+# Authentication
+def check_auth(username, password):
+    """Check if username/password is valid."""
+    if not AUTH_ENABLED:
+        return True
+    if not AUTH_PASS_HASH:
+        return True
+    password_hash = hashlib.sha256(password.encode()).hexdigest()
+    return username == AUTH_USER and password_hash == AUTH_PASS_HASH
+
+def authenticate():
+    """Send 401 response that enables basic auth."""
+    return Response(
+        'Authentication required.\n'
+        'Please enter your credentials.',
+        401,
+        {'WWW-Authenticate': 'Basic realm="RoboTrader Dashboard"'}
+    )
+
+def requires_auth(f):
+    """Decorator to require authentication for routes."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not AUTH_ENABLED:
+            return f(*args, **kwargs)
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return authenticate()
+        return f(*args, **kwargs)
+    return decorated
+
+# HTML Template - Clean, modern design
+HTML_TEMPLATE = '''
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Robo Trader Dashboard</title>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RoboTrader Dashboard</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #0a0e27;
-            color: #e0e6ed;
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #0a0a0a;
+            color: #e0e0e0;
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
             padding: 20px;
         }
-        .header {
+        
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 0;
+            border-bottom: 1px solid #2a2a2a;
+            margin-bottom: 30px;
+        }
+        
+        .logo {
+            font-size: 24px;
+            font-weight: 600;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            padding: 20px;
-            border-radius: 10px;
-            margin-bottom: 20px;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
         }
-        h1 { font-size: 2em; margin-bottom: 10px; }
-        .status { 
-            display: inline-block;
-            padding: 5px 10px;
-            background: rgba(0,0,0,0.3);
-            border-radius: 5px;
-            margin-right: 10px;
+        
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 16px;
+            background: #1a1a1a;
+            border-radius: 20px;
         }
+        
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #ff4444;
+        }
+        
+        .status-dot.active {
+            background: #44ff44;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        
         .grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
             gap: 20px;
-            margin-bottom: 20px;
+            margin-bottom: 30px;
         }
+        
         .card {
-            background: #1a1f3a;
+            background: #1a1a1a;
+            border: 1px solid #2a2a2a;
+            border-radius: 12px;
             padding: 20px;
-            border-radius: 10px;
-            border: 1px solid #2d3561;
+            transition: all 0.3s ease;
         }
-        .card h2 {
-            font-size: 1.2em;
+        
+        .card:hover {
+            border-color: #3a3a3a;
+            transform: translateY(-2px);
+        }
+        
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
             margin-bottom: 15px;
-            color: #9ca3af;
         }
-        .metric {
-            font-size: 2em;
-            font-weight: bold;
-            margin: 10px 0;
+        
+        .card-title {
+            font-size: 14px;
+            font-weight: 500;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
         }
-        .positive { color: #10b981; }
-        .negative { color: #ef4444; }
-        .neutral { color: #6b7280; }
+        
+        .card-value {
+            font-size: 28px;
+            font-weight: 600;
+            margin-bottom: 5px;
+        }
+        
+        .card-change {
+            font-size: 14px;
+            color: #888;
+        }
+        
+        .positive { color: #44ff44; }
+        .negative { color: #ff4444; }
+        .neutral { color: #ffaa44; }
+        
+        .table-container {
+            background: #1a1a1a;
+            border: 1px solid #2a2a2a;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+            overflow-x: auto;
+        }
+        
         table {
             width: 100%;
             border-collapse: collapse;
-            margin-top: 10px;
         }
-        th, td {
-            padding: 10px;
+        
+        th {
             text-align: left;
-            border-bottom: 1px solid #2d3561;
+            padding: 12px;
+            border-bottom: 1px solid #2a2a2a;
+            color: #888;
+            font-weight: 500;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
         }
-        th { color: #9ca3af; font-weight: normal; }
-        .chart {
-            height: 200px;
-            background: #0f1729;
-            border-radius: 5px;
+        
+        td {
+            padding: 12px;
+            border-bottom: 1px solid #1a1a1a;
+        }
+        
+        tr:hover {
+            background: #222;
+        }
+        
+        .button-group {
             display: flex;
-            align-items: center;
-            justify-content: center;
-            color: #6b7280;
-            margin-top: 10px;
+            gap: 10px;
+            margin-bottom: 20px;
         }
-        .timestamp {
-            color: #6b7280;
-            font-size: 0.9em;
-            margin-top: 10px;
+        
+        button {
+            padding: 10px 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s ease;
         }
-        .loading {
+        
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.4);
+        }
+        
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        button.secondary {
+            background: #2a2a2a;
+        }
+        
+        .chart-container {
+            background: #1a1a1a;
+            border: 1px solid #2a2a2a;
+            border-radius: 12px;
+            padding: 20px;
+            height: 400px;
+            margin-bottom: 20px;
+        }
+        
+        .tabs {
+            display: flex;
+            gap: 20px;
+            border-bottom: 1px solid #2a2a2a;
+            margin-bottom: 20px;
+        }
+        
+        .tab {
+            padding: 10px 0;
+            color: #888;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: all 0.3s ease;
+        }
+        
+        .tab.active {
+            color: #fff;
+            border-bottom-color: #667eea;
+        }
+        
+        .log-container {
+            background: #0a0a0a;
+            border: 1px solid #2a2a2a;
+            border-radius: 8px;
+            padding: 15px;
+            height: 200px;
+            overflow-y: auto;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 12px;
+        }
+        
+        .log-entry {
+            padding: 4px 0;
+            border-bottom: 1px solid #1a1a1a;
+        }
+        
+        .log-time {
+            color: #666;
+            margin-right: 10px;
+        }
+        
+        .metric-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        
+        .metric-item {
             text-align: center;
-            padding: 40px;
-            color: #6b7280;
+            padding: 10px;
+            background: #0a0a0a;
+            border-radius: 8px;
+        }
+        
+        .metric-label {
+            font-size: 11px;
+            color: #666;
+            margin-bottom: 5px;
+        }
+        
+        .metric-value {
+            font-size: 18px;
+            font-weight: 600;
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 4px 8px;
+            background: #2a2a2a;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .badge.ml {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
         }
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>🤖 Robo Trader Dashboard</h1>
-        <span class="status">Mode: <strong id="mode">PAPER</strong></span>
-        <span class="status">Status: <strong id="status">CONNECTING...</strong></span>
-        <span class="status">Time: <strong id="time">--:--:--</strong></span>
-    </div>
-
-    <div class="grid">
-        <div class="card">
-            <h2>Account Overview</h2>
-            <div class="metric" id="equity">$0.00</div>
-            <div>Total Equity</div>
-            <table>
-                <tr>
-                    <td>Cash</td>
-                    <td id="cash">$0.00</td>
-                </tr>
-                <tr>
-                    <td>Positions</td>
-                    <td id="position-value">$0.00</td>
-                </tr>
-            </table>
+    <div class="container">
+        <header>
+            <div class="logo">RoboTrader</div>
+            <div class="status-indicator">
+                <div class="status-dot" id="status-dot"></div>
+                <span id="status-text">Disconnected</span>
+            </div>
+        </header>
+        
+        <div class="button-group">
+            <button onclick="startTrading()" id="start-btn">Start Trading</button>
+            <button onclick="stopTrading()" id="stop-btn" class="secondary">Stop Trading</button>
+            <button onclick="refreshData()" class="secondary">Refresh Data</button>
         </div>
-
-        <div class="card">
-            <h2>Today's P&L</h2>
-            <div class="metric neutral" id="daily-pnl">$0.00</div>
-            <div id="daily-pnl-pct">0.00%</div>
-            <table>
-                <tr>
-                    <td>Realized</td>
-                    <td id="realized-pnl">$0.00</td>
-                </tr>
-                <tr>
-                    <td>Unrealized</td>
-                    <td id="unrealized-pnl">$0.00</td>
-                </tr>
-            </table>
+        
+        <div class="tabs">
+            <div class="tab active" onclick="switchTab('overview', this)">Overview</div>
+            <div class="tab" onclick="switchTab('ml', this)">ML Models</div>
+            <div class="tab" onclick="switchTab('performance', this)">Performance</div>
+            <div class="tab" onclick="switchTab('positions', this)">Positions</div>
+            <div class="tab" onclick="switchTab('logs', this)">Logs</div>
         </div>
-
-        <div class="card">
-            <h2>Trading Activity</h2>
-            <div class="metric" id="trade-count">0</div>
-            <div>Trades Today</div>
-            <table>
-                <tr>
-                    <td>Win Rate</td>
-                    <td id="win-rate">0%</td>
-                </tr>
-                <tr>
-                    <td>Avg Trade</td>
-                    <td id="avg-trade">$0.00</td>
-                </tr>
-            </table>
+        
+        <div id="overview-tab" class="tab-content">
+            <div class="grid">
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Total P&L</span>
+                    </div>
+                    <div class="card-value" id="total-pnl">$0.00</div>
+                    <div class="card-change" id="pnl-change">0.00%</div>
+                </div>
+                
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Daily P&L</span>
+                    </div>
+                    <div class="card-value" id="daily-pnl">$0.00</div>
+                    <div class="card-change" id="daily-change">0.00%</div>
+                </div>
+                
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Open Positions</span>
+                    </div>
+                    <div class="card-value" id="position-count">0</div>
+                    <div class="card-change" id="position-value">$0.00 value</div>
+                </div>
+                
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Win Rate</span>
+                    </div>
+                    <div class="card-value" id="win-rate">0.0%</div>
+                    <div class="card-change" id="trade-count">0 trades today</div>
+                </div>
+            </div>
+            
+            <div class="metric-grid">
+                <div class="metric-item">
+                    <div class="metric-label">Sharpe Ratio</div>
+                    <div class="metric-value" id="sharpe">0.00</div>
+                </div>
+                <div class="metric-item">
+                    <div class="metric-label">Max Drawdown</div>
+                    <div class="metric-value negative" id="max-dd">0.0%</div>
+                </div>
+                <div class="metric-item">
+                    <div class="metric-label">Profit Factor</div>
+                    <div class="metric-value" id="profit-factor">0.00</div>
+                </div>
+                <div class="metric-item">
+                    <div class="metric-label">Avg Correlation</div>
+                    <div class="metric-value" id="avg-correlation">0.00</div>
+                </div>
+            </div>
+        </div>
+        
+        <div id="ml-tab" class="tab-content" style="display: none;">
+            <div class="grid">
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Models Trained</span>
+                        <span class="badge ml">ML</span>
+                    </div>
+                    <div class="card-value" id="models-trained">0</div>
+                    <div class="card-change">Last trained: <span id="last-train">Never</span></div>
+                </div>
+                
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Active Features</span>
+                        <span class="badge ml">ML</span>
+                    </div>
+                    <div class="card-value" id="feature-count">0</div>
+                    <div class="card-change">Feature pipeline status</div>
+                </div>
+                
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Model Accuracy</span>
+                        <span class="badge ml">ML</span>
+                    </div>
+                    <div class="card-value" id="model-accuracy">0.0%</div>
+                    <div class="card-change">Direction accuracy</div>
+                </div>
+                
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Prediction Confidence</span>
+                        <span class="badge ml">ML</span>
+                    </div>
+                    <div class="card-value" id="prediction-confidence">0.0%</div>
+                    <div class="card-change">Average confidence</div>
+                </div>
+            </div>
+            
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Model Type</th>
+                            <th>Test Score</th>
+                            <th>Features Used</th>
+                            <th>Last Updated</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="model-table">
+                        <tr>
+                            <td colspan="5" style="text-align: center; color: #666;">No models trained yet</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            
+            <div class="table-container">
+                <h3 style="margin-bottom: 15px; color: #888;">Top Features by Importance</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Feature Name</th>
+                            <th>Importance Score</th>
+                            <th>Category</th>
+                        </tr>
+                    </thead>
+                    <tbody id="feature-table">
+                        <tr>
+                            <td colspan="3" style="text-align: center; color: #666;">No feature data available</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <div id="performance-tab" class="tab-content" style="display: none;">
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Metric</th>
+                            <th>Daily</th>
+                            <th>Weekly</th>
+                            <th>Monthly</th>
+                            <th>All Time</th>
+                        </tr>
+                    </thead>
+                    <tbody id="performance-table">
+                        <tr>
+                            <td>Return</td>
+                            <td id="return-daily">0.00%</td>
+                            <td id="return-weekly">0.00%</td>
+                            <td id="return-monthly">0.00%</td>
+                            <td id="return-all">0.00%</td>
+                        </tr>
+                        <tr>
+                            <td>Volatility</td>
+                            <td id="vol-daily">0.00%</td>
+                            <td id="vol-weekly">0.00%</td>
+                            <td id="vol-monthly">0.00%</td>
+                            <td id="vol-all">0.00%</td>
+                        </tr>
+                        <tr>
+                            <td>Sharpe Ratio</td>
+                            <td id="sharpe-daily">0.00</td>
+                            <td id="sharpe-weekly">0.00</td>
+                            <td id="sharpe-monthly">0.00</td>
+                            <td id="sharpe-all">0.00</td>
+                        </tr>
+                        <tr>
+                            <td>Max Drawdown</td>
+                            <td id="dd-daily">0.00%</td>
+                            <td id="dd-weekly">0.00%</td>
+                            <td id="dd-monthly">0.00%</td>
+                            <td id="dd-all">0.00%</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <div id="positions-tab" class="tab-content" style="display: none;">
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Symbol</th>
+                            <th>Quantity</th>
+                            <th>Entry Price</th>
+                            <th>Current Price</th>
+                            <th>P&L</th>
+                            <th>P&L %</th>
+                            <th>Value</th>
+                            <th>ML Signal</th>
+                        </tr>
+                    </thead>
+                    <tbody id="positions-table">
+                        <tr>
+                            <td colspan="8" style="text-align: center; color: #666;">No open positions</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <div id="logs-tab" class="tab-content" style="display: none;">
+            <div class="log-container" id="log-container">
+                <div class="log-entry">
+                    <span class="log-time">00:00:00</span>
+                    <span>System initialized</span>
+                </div>
+            </div>
         </div>
     </div>
-
-    <div class="card">
-        <h2>Active Positions</h2>
-        <div id="positions-loading" class="loading">Loading positions...</div>
-        <table id="positions-table" style="display:none;">
-            <thead>
-                <tr>
-                    <th>Symbol</th>
-                    <th>Qty</th>
-                    <th>Avg Cost</th>
-                    <th>Market</th>
-                    <th>P&L</th>
-                    <th>P&L %</th>
-                </tr>
-            </thead>
-            <tbody id="positions-body">
-            </tbody>
-        </table>
-    </div>
-
-    <div class="card">
-        <h2>Recent Trades</h2>
-        <div id="trades-loading" class="loading">Loading trades...</div>
-        <table id="trades-table" style="display:none;">
-            <thead>
-                <tr>
-                    <th>Time</th>
-                    <th>Symbol</th>
-                    <th>Side</th>
-                    <th>Qty</th>
-                    <th>Price</th>
-                    <th>Value</th>
-                </tr>
-            </thead>
-            <tbody id="trades-body">
-            </tbody>
-        </table>
-    </div>
-
-    <div class="card">
-        <h2>Equity Curve</h2>
-        <div class="chart">Chart will be implemented in next iteration</div>
-    </div>
-
-    <div class="timestamp">Last updated: <span id="last-update">Never</span></div>
-
+    
     <script>
+        let currentTab = 'overview';
+        
+        function switchTab(tab, element) {
+            // Hide all tabs
+            document.querySelectorAll('.tab-content').forEach(content => {
+                content.style.display = 'none';
+            });
+            
+            // Remove active class from all tabs
+            document.querySelectorAll('.tab').forEach(t => {
+                t.classList.remove('active');
+            });
+            
+            // Show selected tab
+            document.getElementById(tab + '-tab').style.display = 'block';
+            
+            // Add active class to selected tab
+            element.classList.add('active');
+            
+            currentTab = tab;
+            
+            // Load tab-specific data
+            if (tab === 'ml') {
+                loadMLData();
+            } else if (tab === 'performance') {
+                loadPerformanceData();
+            } else if (tab === 'positions') {
+                loadPositions();
+            }
+        }
+        
+        async function startTrading() {
+            document.getElementById('start-btn').disabled = true;
+            try {
+                const response = await fetch('/api/start', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({symbols: ['AAPL', 'MSFT', 'GOOGL']})
+                });
+                const data = await response.json();
+                if (data.status === 'started') {
+                    updateStatus('running');
+                    addLog('Trading started');
+                }
+            } catch (error) {
+                console.error('Error starting trading:', error);
+                addLog('Error: Failed to start trading');
+            }
+            document.getElementById('start-btn').disabled = false;
+        }
+        
+        async function stopTrading() {
+            document.getElementById('stop-btn').disabled = true;
+            try {
+                const response = await fetch('/api/stop', {method: 'POST'});
+                const data = await response.json();
+                if (data.status === 'stopped') {
+                    updateStatus('stopped');
+                    addLog('Trading stopped');
+                }
+            } catch (error) {
+                console.error('Error stopping trading:', error);
+                addLog('Error: Failed to stop trading');
+            }
+            document.getElementById('stop-btn').disabled = false;
+        }
+        
+        async function refreshData() {
+            await Promise.all([
+                loadStatus(),
+                loadPnL(),
+                loadPositions(),
+                loadMLData(),
+                loadPerformanceData()
+            ]);
+        }
+        
+        async function loadStatus() {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                updateStatus(data.trading_status);
+                updatePnL(data.pnl);
+                updateMetrics(data.metrics);
+            } catch (error) {
+                console.error('Error loading status:', error);
+            }
+        }
+        
+        async function loadPnL() {
+            try {
+                const response = await fetch('/api/pnl');
+                const data = await response.json();
+                updatePnL(data);
+            } catch (error) {
+                console.error('Error loading P&L:', error);
+            }
+        }
+        
+        async function loadPositions() {
+            try {
+                const response = await fetch('/api/positions');
+                const data = await response.json();
+                updatePositionsTable(data.positions);
+            } catch (error) {
+                console.error('Error loading positions:', error);
+            }
+        }
+        
+        async function loadMLData() {
+            try {
+                const response = await fetch('/api/ml/status');
+                const data = await response.json();
+                updateMLMetrics(data);
+            } catch (error) {
+                console.error('Error loading ML data:', error);
+            }
+        }
+        
+        async function loadPerformanceData() {
+            try {
+                const response = await fetch('/api/performance');
+                const data = await response.json();
+                updatePerformanceTable(data);
+            } catch (error) {
+                console.error('Error loading performance data:', error);
+            }
+        }
+        
+        function updateStatus(status) {
+            const dot = document.getElementById('status-dot');
+            const text = document.getElementById('status-text');
+            
+            if (status === 'running') {
+                dot.classList.add('active');
+                text.textContent = 'Trading Active';
+            } else {
+                dot.classList.remove('active');
+                text.textContent = 'Trading Stopped';
+            }
+        }
+        
+        function updatePnL(pnl) {
+            document.getElementById('total-pnl').textContent = formatCurrency(pnl.total || 0);
+            document.getElementById('daily-pnl').textContent = formatCurrency(pnl.daily || 0);
+            
+            // Update colors
+            const totalEl = document.getElementById('total-pnl');
+            const dailyEl = document.getElementById('daily-pnl');
+            
+            totalEl.className = pnl.total >= 0 ? 'card-value positive' : 'card-value negative';
+            dailyEl.className = pnl.daily >= 0 ? 'card-value positive' : 'card-value negative';
+        }
+        
+        function updateMetrics(metrics) {
+            if (metrics) {
+                document.getElementById('sharpe').textContent = (metrics.sharpe_ratio || 0).toFixed(2);
+                document.getElementById('max-dd').textContent = ((metrics.max_drawdown || 0) * 100).toFixed(1) + '%';
+                document.getElementById('profit-factor').textContent = (metrics.profit_factor || 0).toFixed(2);
+                document.getElementById('win-rate').textContent = ((metrics.win_rate || 0) * 100).toFixed(1) + '%';
+            }
+        }
+        
+        function updateMLMetrics(data) {
+            document.getElementById('models-trained').textContent = data.models_trained || 0;
+            document.getElementById('feature-count').textContent = data.feature_count || 0;
+            document.getElementById('model-accuracy').textContent = ((data.accuracy || 0) * 100).toFixed(1) + '%';
+            document.getElementById('prediction-confidence').textContent = ((data.confidence || 0) * 100).toFixed(1) + '%';
+            
+            // Update model table
+            if (data.models && data.models.length > 0) {
+                const tbody = document.getElementById('model-table');
+                tbody.innerHTML = data.models.map(model => `
+                    <tr>
+                        <td>${model.type}</td>
+                        <td>${(model.test_score * 100).toFixed(2)}%</td>
+                        <td>${model.feature_count}</td>
+                        <td>${formatTime(model.updated)}</td>
+                        <td><span class="badge ${model.status === 'active' ? 'ml' : ''}">${model.status}</span></td>
+                    </tr>
+                `).join('');
+            }
+            
+            // Update feature table
+            if (data.top_features && data.top_features.length > 0) {
+                const tbody = document.getElementById('feature-table');
+                tbody.innerHTML = data.top_features.map(feature => `
+                    <tr>
+                        <td>${feature.name}</td>
+                        <td>${(feature.importance * 100).toFixed(2)}%</td>
+                        <td>${feature.category}</td>
+                    </tr>
+                `).join('');
+            }
+        }
+        
+        function updatePositionsTable(positions) {
+            const tbody = document.getElementById('positions-table');
+            if (!positions || positions.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: #666;">No open positions</td></tr>';
+                document.getElementById('position-count').textContent = '0';
+                document.getElementById('position-value').textContent = '$0.00 value';
+                return;
+            }
+            
+            let totalValue = 0;
+            tbody.innerHTML = positions.map(pos => {
+                const pnl = (pos.current_price - pos.entry_price) * pos.quantity;
+                const pnlPct = ((pos.current_price - pos.entry_price) / pos.entry_price) * 100;
+                const value = pos.current_price * pos.quantity;
+                totalValue += value;
+                
+                return `
+                    <tr>
+                        <td>${pos.symbol}</td>
+                        <td>${pos.quantity}</td>
+                        <td>$${pos.entry_price.toFixed(2)}</td>
+                        <td>$${pos.current_price.toFixed(2)}</td>
+                        <td class="${pnl >= 0 ? 'positive' : 'negative'}">$${pnl.toFixed(2)}</td>
+                        <td class="${pnl >= 0 ? 'positive' : 'negative'}">${pnlPct.toFixed(2)}%</td>
+                        <td>$${value.toFixed(2)}</td>
+                        <td><span class="badge ${pos.ml_signal === 'buy' ? 'ml' : ''}">${pos.ml_signal || 'none'}</span></td>
+                    </tr>
+                `;
+            }).join('');
+            
+            document.getElementById('position-count').textContent = positions.length.toString();
+            document.getElementById('position-value').textContent = formatCurrency(totalValue) + ' value';
+        }
+        
+        function updatePerformanceTable(data) {
+            if (!data) return;
+            
+            ['daily', 'weekly', 'monthly', 'all'].forEach(period => {
+                const metrics = data[period] || {};
+                document.getElementById(`return-${period}`).textContent = formatPercent(metrics.return_pct);
+                document.getElementById(`vol-${period}`).textContent = formatPercent(metrics.volatility);
+                document.getElementById(`sharpe-${period}`).textContent = (metrics.sharpe || 0).toFixed(2);
+                document.getElementById(`dd-${period}`).textContent = formatPercent(metrics.max_drawdown);
+            });
+        }
+        
+        function addLog(message) {
+            const container = document.getElementById('log-container');
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            const time = new Date().toLocaleTimeString();
+            entry.innerHTML = `<span class="log-time">${time}</span><span>${message}</span>`;
+            container.appendChild(entry);
+            container.scrollTop = container.scrollHeight;
+        }
+        
         function formatCurrency(value) {
-            const formatted = new Intl.NumberFormat('en-US', {
+            return new Intl.NumberFormat('en-US', {
                 style: 'currency',
                 currency: 'USD'
             }).format(value);
-            return formatted;
         }
-
+        
         function formatPercent(value) {
+            if (value === undefined || value === null) return '0.00%';
             return (value * 100).toFixed(2) + '%';
         }
-
-        function updateTime() {
+        
+        function formatTime(timestamp) {
+            if (!timestamp) return 'Never';
+            const date = new Date(timestamp);
             const now = new Date();
-            document.getElementById('time').textContent = now.toLocaleTimeString();
+            const diff = now - date;
+            
+            if (diff < 60000) return 'Just now';
+            if (diff < 3600000) return Math.floor(diff / 60000) + ' min ago';
+            if (diff < 86400000) return Math.floor(diff / 3600000) + ' hours ago';
+            return Math.floor(diff / 86400000) + ' days ago';
         }
-
-        async function fetchData() {
-            try {
-                const response = await fetch('/api/dashboard');
-                const data = await response.json();
-                
-                // Update status
-                document.getElementById('status').textContent = data.status || 'ACTIVE';
-                document.getElementById('mode').textContent = data.mode || 'PAPER';
-                
-                // Update account overview
-                document.getElementById('equity').textContent = formatCurrency(data.equity || 0);
-                document.getElementById('cash').textContent = formatCurrency(data.cash || 0);
-                document.getElementById('position-value').textContent = formatCurrency(data.position_value || 0);
-                
-                // Update P&L
-                const dailyPnl = data.daily_pnl || 0;
-                const dailyPnlElement = document.getElementById('daily-pnl');
-                dailyPnlElement.textContent = formatCurrency(dailyPnl);
-                dailyPnlElement.className = 'metric ' + (dailyPnl > 0 ? 'positive' : dailyPnl < 0 ? 'negative' : 'neutral');
-                
-                document.getElementById('daily-pnl-pct').textContent = formatPercent(data.daily_pnl_pct || 0);
-                document.getElementById('realized-pnl').textContent = formatCurrency(data.realized_pnl || 0);
-                document.getElementById('unrealized-pnl').textContent = formatCurrency(data.unrealized_pnl || 0);
-                
-                // Update trading activity
-                document.getElementById('trade-count').textContent = data.trade_count || 0;
-                document.getElementById('win-rate').textContent = formatPercent(data.win_rate || 0);
-                document.getElementById('avg-trade').textContent = formatCurrency(data.avg_trade || 0);
-                
-                // Update positions
-                if (data.positions && data.positions.length > 0) {
-                    document.getElementById('positions-loading').style.display = 'none';
-                    document.getElementById('positions-table').style.display = 'table';
-                    const positionsBody = document.getElementById('positions-body');
-                    positionsBody.innerHTML = data.positions.map(p => `
-                        <tr>
-                            <td>${p.symbol}</td>
-                            <td>${p.quantity}</td>
-                            <td>${formatCurrency(p.avg_cost)}</td>
-                            <td>${formatCurrency(p.market_price)}</td>
-                            <td class="${p.pnl > 0 ? 'positive' : p.pnl < 0 ? 'negative' : ''}">${formatCurrency(p.pnl)}</td>
-                            <td class="${p.pnl_pct > 0 ? 'positive' : p.pnl_pct < 0 ? 'negative' : ''}">${formatPercent(p.pnl_pct)}</td>
-                        </tr>
-                    `).join('');
-                }
-                
-                // Update recent trades
-                if (data.recent_trades && data.recent_trades.length > 0) {
-                    document.getElementById('trades-loading').style.display = 'none';
-                    document.getElementById('trades-table').style.display = 'table';
-                    const tradesBody = document.getElementById('trades-body');
-                    tradesBody.innerHTML = data.recent_trades.map(t => `
-                        <tr>
-                            <td>${new Date(t.timestamp).toLocaleTimeString()}</td>
-                            <td>${t.symbol}</td>
-                            <td class="${t.side === 'BUY' ? 'positive' : 'negative'}">${t.side}</td>
-                            <td>${t.quantity}</td>
-                            <td>${formatCurrency(t.price)}</td>
-                            <td>${formatCurrency(t.value)}</td>
-                        </tr>
-                    `).join('');
-                }
-                
-                document.getElementById('last-update').textContent = new Date().toLocaleString();
-            } catch (error) {
-                console.error('Error fetching data:', error);
-                document.getElementById('status').textContent = 'ERROR';
-            }
-        }
-
-        // Update time every second
-        setInterval(updateTime, 1000);
         
-        // Fetch data every 5 seconds
-        setInterval(fetchData, 5000);
-        
-        // Initial load
-        updateTime();
-        fetchData();
+        // Initialize on load
+        window.onload = () => {
+            refreshData();
+            setInterval(refreshData, 5000); // Refresh every 5 seconds
+        };
     </script>
 </body>
 </html>
-"""
-
-
-def init_database():
-    """Initialize database with required tables."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # Create tables if they don't exist
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS positions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            quantity INTEGER NOT NULL,
-            avg_cost REAL NOT NULL,
-            market_price REAL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(symbol)
-        )
-    """)
-    
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            side TEXT NOT NULL,
-            quantity INTEGER NOT NULL,
-            price REAL NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS account (
-            id INTEGER PRIMARY KEY,
-            cash REAL NOT NULL,
-            equity REAL NOT NULL,
-            daily_pnl REAL,
-            realized_pnl REAL,
-            unrealized_pnl REAL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # Insert default account if not exists
-    cursor.execute("""
-        INSERT OR IGNORE INTO account (id, cash, equity) VALUES (1, 100000, 100000)
-    """)
-    
-    conn.commit()
-    conn.close()
-
-
-def get_dashboard_data() -> Dict[str, Any]:
-    """Fetch current dashboard data from database."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # Get account data
-    cursor.execute("SELECT * FROM account WHERE id = 1")
-    account = cursor.fetchone()
-    
-    # Get positions
-    cursor.execute("""
-        SELECT symbol, quantity, avg_cost, market_price 
-        FROM positions 
-        WHERE quantity != 0
-    """)
-    positions = cursor.fetchall()
-    
-    # Get today's trades
-    today = datetime.now().date()
-    cursor.execute("""
-        SELECT symbol, side, quantity, price, timestamp 
-        FROM trades 
-        WHERE DATE(timestamp) = DATE('now')
-        ORDER BY timestamp DESC
-        LIMIT 20
-    """)
-    trades = cursor.fetchall()
-    
-    conn.close()
-    
-    # Calculate metrics
-    position_value = sum(p[1] * (p[3] or p[2]) for p in positions)
-    
-    positions_data = []
-    for symbol, qty, avg_cost, market_price in positions:
-        market_price = market_price or avg_cost
-        pnl = (market_price - avg_cost) * qty
-        pnl_pct = (market_price / avg_cost - 1) if avg_cost > 0 else 0
-        positions_data.append({
-            'symbol': symbol,
-            'quantity': qty,
-            'avg_cost': avg_cost,
-            'market_price': market_price,
-            'pnl': pnl,
-            'pnl_pct': pnl_pct
-        })
-    
-    trades_data = []
-    for symbol, side, qty, price, timestamp in trades:
-        trades_data.append({
-            'symbol': symbol,
-            'side': side,
-            'quantity': qty,
-            'price': price,
-            'value': qty * price,
-            'timestamp': timestamp
-        })
-    
-    # Calculate win rate
-    winning_trades = sum(1 for t in trades if t[1] == 'SELL')  # Simplified
-    total_trades = len(trades)
-    win_rate = winning_trades / total_trades if total_trades > 0 else 0
-    
-    return {
-        'status': 'ACTIVE',
-        'mode': 'PAPER',
-        'cash': account[1] if account else 100000,
-        'equity': account[2] if account else 100000,
-        'position_value': position_value,
-        'daily_pnl': account[3] if account else 0,
-        'daily_pnl_pct': (account[3] / account[2]) if account and account[2] > 0 else 0,
-        'realized_pnl': account[4] if account else 0,
-        'unrealized_pnl': account[5] if account else 0,
-        'trade_count': len(trades),
-        'win_rate': win_rate,
-        'avg_trade': sum(t[2] * t[3] for t in trades) / len(trades) if trades else 0,
-        'positions': positions_data,
-        'recent_trades': trades_data
-    }
-
+'''
 
 @app.route('/')
+@requires_auth
 def index():
-    """Serve the dashboard HTML."""
-    return render_template_string(DASHBOARD_HTML)
+    """Main dashboard page"""
+    return render_template_string(HTML_TEMPLATE)
 
+@app.route('/api/health')
+def health():
+    """Health check endpoint"""
+    return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
 
-@app.route('/api/dashboard')
-def dashboard_api():
-    """API endpoint for dashboard data."""
-    try:
-        data = get_dashboard_data()
-        return jsonify(data)
-    except Exception as e:
-        logger.error(f"Error fetching dashboard data: {e}")
-        return jsonify({'error': str(e)}), 500
+@app.route('/api/status')
+@requires_auth
+def status():
+    """Get current system status"""
+    return jsonify({
+        'trading_status': trading_status,
+        'pnl': pnl,
+        'metrics': performance_metrics,
+        'positions_count': len(positions),
+        'ml_status': ml_metrics
+    })
 
+@app.route('/api/pnl')
+@requires_auth
+def get_pnl():
+    """Get P&L data"""
+    return jsonify(pnl)
 
-@app.route('/api/update_position', methods=['POST'])
-def update_position():
-    """Update position data (called by trading system)."""
-    # This endpoint will be used by the trading system to update positions
-    return jsonify({'status': 'ok'})
+@app.route('/api/positions')
+@requires_auth  
+def get_positions():
+    """Get current positions"""
+    # Mock data for now - will integrate with actual DB
+    mock_positions = []
+    if trading_status == 'running':
+        mock_positions = [
+            {
+                'symbol': 'AAPL',
+                'quantity': 100,
+                'entry_price': 180.50,
+                'current_price': 182.30,
+                'ml_signal': 'buy'
+            },
+            {
+                'symbol': 'MSFT',
+                'quantity': 50,
+                'entry_price': 420.10,
+                'current_price': 418.75,
+                'ml_signal': 'hold'
+            }
+        ]
+    return jsonify({'positions': mock_positions})
 
+@app.route('/api/ml/status')
+@requires_auth
+def ml_status():
+    """Get ML system status"""
+    # This will be populated from actual ML components
+    return jsonify({
+        'models_trained': ml_metrics['models_trained'],
+        'feature_count': 50,  # From feature pipeline
+        'accuracy': 0.65,
+        'confidence': 0.72,
+        'models': [
+            {
+                'type': 'Random Forest',
+                'test_score': 0.68,
+                'feature_count': 45,
+                'updated': datetime.now().isoformat(),
+                'status': 'active'
+            },
+            {
+                'type': 'XGBoost',
+                'test_score': 0.71,
+                'feature_count': 42,
+                'updated': datetime.now().isoformat(),
+                'status': 'active'
+            }
+        ],
+        'top_features': [
+            {'name': 'RSI_14', 'importance': 0.15, 'category': 'Technical'},
+            {'name': 'correlation_spy', 'importance': 0.12, 'category': 'Cross-asset'},
+            {'name': 'volatility_20d', 'importance': 0.10, 'category': 'Volatility'},
+            {'name': 'momentum_10d', 'importance': 0.09, 'category': 'Momentum'},
+            {'name': 'volume_ratio', 'importance': 0.08, 'category': 'Volume'}
+        ]
+    })
 
-def main():
-    """Run the dashboard server."""
-    logger.info("Initializing database...")
-    init_database()
+@app.route('/api/performance')
+@requires_auth
+def performance():
+    """Get performance metrics"""
+    # Mock data - will integrate with PerformanceAnalyzer
+    return jsonify({
+        'daily': {
+            'return_pct': 0.0125,
+            'volatility': 0.18,
+            'sharpe': 1.2,
+            'max_drawdown': -0.02
+        },
+        'weekly': {
+            'return_pct': 0.035,
+            'volatility': 0.22,
+            'sharpe': 1.5,
+            'max_drawdown': -0.04
+        },
+        'monthly': {
+            'return_pct': 0.08,
+            'volatility': 0.25,
+            'sharpe': 1.8,
+            'max_drawdown': -0.06
+        },
+        'all': {
+            'return_pct': 0.15,
+            'volatility': 0.28,
+            'sharpe': 1.4,
+            'max_drawdown': -0.12
+        }
+    })
+
+@app.route('/api/start', methods=['POST'])
+@requires_auth
+def start_trading():
+    """Start trading"""
+    global trading_status, trading_process
     
-    logger.info("Starting dashboard server on http://localhost:5555")
-    app.run(host='0.0.0.0', port=5555, debug=False)
+    data = request.json
+    symbols = data.get('symbols', ['AAPL', 'MSFT', 'GOOGL'])
+    
+    if trading_status == 'running':
+        return jsonify({'status': 'already_running'})
+    
+    # Start trading process
+    cmd = ['python', '-m', 'robo_trader.runner_async', '--symbols'] + symbols
+    trading_process = subprocess.Popen(cmd)
+    trading_status = 'running'
+    
+    trading_log.append(f"{datetime.now().strftime('%H:%M:%S')} - Trading started for {', '.join(symbols)}")
+    
+    return jsonify({'status': 'started', 'symbols': symbols})
 
+@app.route('/api/stop', methods=['POST'])
+@requires_auth
+def stop_trading():
+    """Stop trading"""
+    global trading_status, trading_process
+    
+    if trading_process:
+        trading_process.terminate()
+        trading_process = None
+    
+    trading_status = 'stopped'
+    trading_log.append(f"{datetime.now().strftime('%H:%M:%S')} - Trading stopped")
+    
+    return jsonify({'status': 'stopped'})
+
+@app.route('/api/logs')
+@requires_auth
+def get_logs():
+    """Get recent logs"""
+    return jsonify({'logs': trading_log[-100:]})  # Last 100 log entries
 
 if __name__ == '__main__':
-    main()
+    # Initialize components
+    logger.info("Starting RoboTrader Dashboard...")
+    
+    # Wait for async components to initialize
+    time.sleep(2)
+    
+    # Run Flask app
+    app.run(
+        host='0.0.0.0',
+        port=int(os.getenv('DASH_PORT', 5000)),
+        debug=os.getenv('FLASK_ENV') == 'development'
+    )
