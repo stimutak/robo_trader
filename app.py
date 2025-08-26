@@ -25,7 +25,7 @@ load_dotenv()
 # Import our modules
 from robo_trader.config import load_config
 from robo_trader.logger import get_logger
-from robo_trader.database_async import TradingDatabase
+from robo_trader.database_async import AsyncTradingDatabase
 from robo_trader.analytics.performance import PerformanceAnalyzer
 from robo_trader.features.feature_pipeline import FeaturePipeline
 from robo_trader.ml.model_trainer import ModelTrainer
@@ -50,6 +50,14 @@ trading_process = None
 trading_status = "stopped"
 trading_log = []
 positions = {}
+
+# Load default symbols at module level
+try:
+    with open('user_settings.json', 'r') as f:
+        settings = json.load(f)
+        default_symbols = settings.get('default', {}).get('symbols', ['AAPL', 'MSFT', 'GOOGL'])
+except:
+    default_symbols = ['AAPL', 'MSFT', 'GOOGL']
 pnl = {"daily": 0.0, "total": 0.0, "unrealized": 0.0}
 ml_metrics = {
     "models_trained": 0,
@@ -71,7 +79,7 @@ def init_async_components():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
-    db = TradingDatabase()
+    db = AsyncTradingDatabase()
     feature_pipeline = FeaturePipeline(config)
     model_trainer = ModelTrainer(config, model_dir=Path("models"))
     performance_analyzer = PerformanceAnalyzer()
@@ -666,7 +674,7 @@ HTML_TEMPLATE = '''
                 const response = await fetch('/api/start', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({symbols: ['AAPL', 'MSFT', 'GOOGL']})
+                    body: JSON.stringify({})  // Will use symbols from user_settings.json
                 });
                 const data = await response.json();
                 if (data.status === 'started') {
@@ -941,33 +949,90 @@ def status():
 @app.route('/api/pnl')
 @requires_auth
 def get_pnl():
-    """Get P&L data"""
-    return jsonify(pnl)
+    """Get P&L data from real database"""
+    from robo_trader.database_async import AsyncTradingDatabase
+    import asyncio
+    
+    async def fetch_pnl():
+        db = AsyncTradingDatabase()
+        await db.initialize()
+        try:
+            # Get account info from database
+            account = await db.get_account_info()
+            if account:
+                return {
+                    'daily': account.get('daily_pnl', 0),
+                    'total': account.get('realized_pnl', 0),
+                    'unrealized': account.get('unrealized_pnl', 0)
+                }
+            return pnl  # Return default if no account data
+        finally:
+            await db.close()
+    
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        real_pnl = loop.run_until_complete(fetch_pnl())
+        return jsonify(real_pnl)
+    except Exception as e:
+        logger.error(f"Error fetching real P&L: {e}")
+        return jsonify(pnl)  # Return default on error
 
 @app.route('/api/positions')
 @requires_auth  
 def get_positions():
-    """Get current positions"""
-    # Mock data for now - will integrate with actual DB
-    mock_positions = []
-    if trading_status == 'running':
-        mock_positions = [
-            {
-                'symbol': 'AAPL',
-                'quantity': 100,
-                'entry_price': 180.50,
-                'current_price': 182.30,
-                'ml_signal': 'buy'
-            },
-            {
-                'symbol': 'MSFT',
-                'quantity': 50,
-                'entry_price': 420.10,
-                'current_price': 418.75,
-                'ml_signal': 'hold'
-            }
-        ]
-    return jsonify({'positions': mock_positions})
+    """Get current positions from real database"""
+    from robo_trader.database_async import AsyncTradingDatabase
+    import asyncio
+    
+    async def fetch_positions():
+        db = AsyncTradingDatabase()
+        await db.initialize()
+        try:
+            # Get real positions from database
+            real_positions = await db.get_positions()
+            
+            # Get latest market data for each position
+            enriched_positions = []
+            for pos in real_positions:
+                # Get latest price from market data
+                market_data = await db.get_latest_market_data(pos['symbol'], limit=1)
+                current_price = market_data[0]['close'] if market_data else pos.get('market_price', pos.get('avg_cost'))
+                
+                enriched_positions.append({
+                    'symbol': pos['symbol'],
+                    'quantity': pos['quantity'],
+                    'entry_price': pos.get('avg_cost', 0),
+                    'current_price': current_price,
+                    'ml_signal': 'hold'  # Default for now, can fetch from signals table
+                })
+            
+            # If no real positions, show all symbols with 0 quantity
+            if not enriched_positions and trading_status == 'running':
+                for symbol in default_symbols:
+                    market_data = await db.get_latest_market_data(symbol, limit=1)
+                    if market_data:
+                        enriched_positions.append({
+                            'symbol': symbol,
+                            'quantity': 0,
+                            'entry_price': 0,
+                            'current_price': market_data[0]['close'],
+                            'ml_signal': 'watch'
+                        })
+            
+            return enriched_positions
+        finally:
+            await db.close()
+    
+    # Run async function
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        real_positions = loop.run_until_complete(fetch_positions())
+        return jsonify({'positions': real_positions})
+    except Exception as e:
+        logger.error(f"Error fetching real positions: {e}")
+        return jsonify({'positions': []})
 
 @app.route('/api/ml/status')
 @requires_auth
@@ -1042,14 +1107,23 @@ def start_trading():
     """Start trading"""
     global trading_status, trading_process
     
+    # Load symbols from user settings (make it global)
+    global default_symbols
+    try:
+        with open('user_settings.json', 'r') as f:
+            settings = json.load(f)
+            default_symbols = settings.get('default', {}).get('symbols', ['AAPL', 'MSFT', 'GOOGL'])
+    except:
+        default_symbols = ['AAPL', 'MSFT', 'GOOGL']
+    
     data = request.json
-    symbols = data.get('symbols', ['AAPL', 'MSFT', 'GOOGL'])
+    symbols = data.get('symbols', default_symbols)
     
     if trading_status == 'running':
         return jsonify({'status': 'already_running'})
     
-    # Start trading process
-    cmd = ['python', '-m', 'robo_trader.runner_async', '--symbols'] + symbols
+    # Start trading process with proper symbol format
+    cmd = ['python', '-m', 'robo_trader.runner_async', '--symbols', ','.join(symbols)]
     trading_process = subprocess.Popen(cmd)
     trading_status = 'running'
     
