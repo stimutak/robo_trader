@@ -16,8 +16,13 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from .analysis.correlation_integration import (
+    AsyncCorrelationManager,
+    CorrelationBasedPositionSizer,
+)
 from .clients import AsyncIBKRClient, ConnectionConfig
 from .config import load_config
+from .correlation import CorrelationTracker
 from .database_async import AsyncTradingDatabase
 from .execution import Order, PaperExecutor
 from .logger import get_logger
@@ -56,6 +61,8 @@ class AsyncRunner:
         max_daily_notional: Optional[float] = None,
         default_cash: Optional[float] = None,
         max_concurrent_symbols: int = 8,
+        use_correlation_sizing: bool = True,
+        max_correlation: float = 0.7,
     ):
         self.duration = duration
         self.bar_size = bar_size
@@ -66,6 +73,8 @@ class AsyncRunner:
         self.max_daily_notional = max_daily_notional
         self.default_cash = default_cash
         self.max_concurrent_symbols = max_concurrent_symbols
+        self.use_correlation_sizing = use_correlation_sizing
+        self.max_correlation = max_correlation
 
         # Will be initialized in setup
         self.cfg = None
@@ -78,6 +87,11 @@ class AsyncRunner:
         self.daily_pnl = 0.0
         self.daily_executed_notional = 0.0
         self.monitor = PerformanceMonitor()
+        
+        # Correlation components
+        self.correlation_tracker = None
+        self.position_sizer = None
+        self.correlation_manager = None
 
     async def setup(self):
         """Initialize all components."""
@@ -117,10 +131,31 @@ class AsyncRunner:
         )
         self.portfolio = Portfolio(starting_cash)
 
+        # Initialize correlation components if enabled
+        if self.use_correlation_sizing:
+            self.correlation_tracker = CorrelationTracker(
+                lookback_days=60,
+                correlation_threshold=self.max_correlation
+            )
+            self.position_sizer = CorrelationBasedPositionSizer(
+                correlation_tracker=self.correlation_tracker,
+                max_correlation=self.max_correlation,
+                correlation_penalty_factor=0.5,
+                max_correlated_exposure=0.3
+            )
+            self.correlation_manager = AsyncCorrelationManager(
+                correlation_tracker=self.correlation_tracker,
+                position_sizer=self.position_sizer
+            )
+            await self.correlation_manager.start(update_interval=300)
+            logger.info("Correlation-based position sizing enabled")
+
         logger.info("AsyncRunner setup complete")
 
     async def teardown(self):
         """Clean up resources."""
+        if self.correlation_manager:
+            await self.correlation_manager.stop()
         if self.client:
             await self.client.disconnect()
         if self.db:
@@ -186,6 +221,11 @@ class AsyncRunner:
                 fast=self.sma_fast,
                 slow=self.sma_slow,
             )
+        
+        # Update correlation tracker with price data if enabled
+        if self.use_correlation_sizing and self.correlation_tracker:
+            self.correlation_tracker.update_price_history(symbol, df[['close']].rename(columns={'close': symbol}))
+        
         last = signals.iloc[-1]
         price = float(last.get("close", df["close"].iloc[-1]))
 
@@ -209,6 +249,19 @@ class AsyncRunner:
 
         if signal_value == 1:  # Buy signal
             qty = self.risk.position_size(equity, price)
+            
+            # Apply correlation-based position sizing if enabled
+            if self.use_correlation_sizing and self.correlation_manager:
+                adjusted_qty, sizing_reason = await self.correlation_manager.get_adjusted_position_size(
+                    symbol=symbol,
+                    base_size=qty,
+                    current_positions=self.positions,
+                    portfolio_value=equity
+                )
+                if adjusted_qty != qty:
+                    logger.info(f"Position size adjusted for {symbol}: {qty} -> {adjusted_qty} ({sizing_reason})")
+                    qty = adjusted_qty
+            
             ok, msg = self.risk.validate_order(
                 symbol,
                 qty,
@@ -360,6 +413,20 @@ class AsyncRunner:
                 f"Processed {len(results)} symbols, "
                 f"executed {executed_count} trades"
             )
+            
+            # Log correlation metrics if enabled
+            if self.use_correlation_sizing and self.position_sizer:
+                corr_metrics = self.position_sizer.get_metrics()
+                logger.info(
+                    f"Correlation metrics: positions_reduced={corr_metrics['positions_reduced']}, "
+                    f"positions_rejected={corr_metrics['positions_rejected']}, "
+                    f"avg_correlation={corr_metrics['avg_correlation']:.3f}"
+                )
+                
+                # Log high correlation pairs
+                high_corr_pairs = self.position_sizer.get_high_correlation_pairs()
+                if high_corr_pairs:
+                    logger.warning(f"High correlation pairs: {high_corr_pairs[:3]}")
             
             # Log performance metrics
             await self.monitor.log_performance_summary()

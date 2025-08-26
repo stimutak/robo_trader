@@ -1,8 +1,9 @@
 # Multi-stage build for production-ready Python application
-FROM python:3.13-slim as builder
+FROM python:3.13-slim AS builder
 
 # Build dependencies
-RUN apt-get update && apt-get install -y \
+# hadolint ignore=DL3008
+RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     make \
@@ -21,7 +22,8 @@ RUN pip install --user --no-cache-dir -r requirements.txt
 FROM python:3.13-slim
 
 # Install runtime dependencies
-RUN apt-get update && apt-get install -y \
+# hadolint ignore=DL3008
+RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
