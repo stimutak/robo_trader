@@ -13,6 +13,7 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pytest
 import numpy as np
 import pandas as pd
 
@@ -46,11 +47,9 @@ def test_configuration():
         assert prod_config.monitoring.enable_alerts == True
         print("✓ Environment presets working")
         
-        return True
-        
     except Exception as e:
         print(f"✗ Configuration test failed: {e}")
-        return False
+        raise
 
 
 def test_risk_management():
@@ -103,13 +102,12 @@ def test_risk_management():
         should_shutdown = risk_mgr.should_emergency_shutdown()
         print(f"✓ Emergency shutdown logic: {should_shutdown} (should be False with 3 violations)")
         
-        return True
         
     except Exception as e:
         print(f"✗ Risk management test failed: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        raise
 
 
 def test_correlation_tracking():
@@ -176,13 +174,12 @@ def test_correlation_tracking():
         )
         print(f"✓ Diversification suggestions: {suggestions}")
         
-        return True
         
     except Exception as e:
         print(f"✗ Correlation tracking test failed: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        raise
 
 
 def test_structured_logging():
@@ -236,15 +233,15 @@ def test_structured_logging():
         logger.info("Test", api_key="secret123", safe_field="visible")
         print("✓ Sensitive data censoring working")
         
-        return True
         
     except Exception as e:
         print(f"✗ Logging test failed: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        raise
 
 
+@pytest.mark.asyncio
 async def test_trading_engine():
     """Test async trading engine."""
     print("\n" + "="*50)
@@ -283,13 +280,12 @@ async def test_trading_engine():
         is_open = engine._is_market_open()
         print(f"✓ Market open check: {is_open}")
         
-        return True
         
     except Exception as e:
         print(f"✗ Engine test failed: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        raise
 
 
 def test_backward_compatibility():
@@ -322,11 +318,10 @@ def test_backward_compatibility():
         logger.info("Backward compatibility test")
         print("✓ Logger backward compatibility works")
         
-        return True
         
     except Exception as e:
         print(f"✗ Backward compatibility test failed: {e}")
-        return False
+        raise
 
 
 def main():

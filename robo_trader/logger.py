@@ -13,7 +13,7 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -64,7 +64,7 @@ class LogEvent(str, Enum):
 
 def add_timestamp(logger, method_name, event_dict):
     """Add timestamp to all log entries."""
-    event_dict["timestamp"] = datetime.utcnow().isoformat()
+    event_dict["timestamp"] = datetime.now(timezone.utc).isoformat()
     return event_dict
 
 
@@ -149,7 +149,7 @@ def configure_stdlib_logging():
         class JsonFormatter(logging.Formatter):
             def format(self, record):
                 log_obj = {
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                     "level": record.levelname,
                     "logger": record.name,
                     "message": record.getMessage(),

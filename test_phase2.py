@@ -13,6 +13,7 @@ Tests all Phase 2 components:
 import asyncio
 import sys
 import os
+import pytest
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
@@ -27,7 +28,7 @@ from robo_trader.features.indicators import TechnicalIndicators, IndicatorConfig
 from robo_trader.data.validation import DataValidator, MarketHoursValidator
 
 
-class TestSubscriber(DataSubscriber):
+class MockSubscriber(DataSubscriber):
     """Test subscriber for pipeline testing."""
     
     def __init__(self):
@@ -63,6 +64,7 @@ def print_result(test_name: str, passed: bool, details: str = ""):
         print(f"        {details}")
 
 
+@pytest.mark.asyncio
 async def test_data_pipeline():
     """Test data pipeline functionality."""
     print_header("Testing Data Pipeline")
@@ -83,7 +85,7 @@ async def test_data_pipeline():
         print_result("Pipeline start", True)
         
         # Test 3: Subscribe to events
-        subscriber = TestSubscriber()
+        subscriber = MockSubscriber()
         pipeline.subscribe(subscriber)
         
         # Wait for some mock data
@@ -114,13 +116,13 @@ async def test_data_pipeline():
         # Stop pipeline
         await pipeline.stop()
         
-        return True
         
     except Exception as e:
         print_result("Data pipeline", False, str(e))
-        return False
+        raise
 
 
+@pytest.mark.asyncio
 async def test_feature_engine():
     """Test feature calculation engine."""
     print_header("Testing Feature Engine")
@@ -179,11 +181,10 @@ async def test_feature_engine():
         # Stop engine
         await engine.stop()
         
-        return True
         
     except Exception as e:
         print_result("Feature engine", False, str(e))
-        return False
+        raise
 
 
 def test_technical_indicators():
@@ -243,11 +244,10 @@ def test_technical_indicators():
         assert stoch is not None, "Stochastic calculation failed"
         print_result("Stochastic", True, f"K = {stoch['k']:.2f}, D = {stoch['d']:.2f}")
         
-        return True
         
     except Exception as e:
         print_result("Technical indicators", False, str(e))
-        return False
+        raise
 
 
 def test_data_validation():
@@ -355,11 +355,10 @@ def test_data_validation():
                     f"Validity rate: {metrics.validity_rate:.1f}%, "
                     f"Outliers: {metrics.outliers_detected}")
         
-        return True
         
     except Exception as e:
         print_result("Data validation", False, str(e))
-        return False
+        raise
 
 
 def test_bar_validation():
@@ -418,13 +417,13 @@ def test_bar_validation():
         print_result("Zero volume detection", has_warning,
                     "Correctly flagged zero volume")
         
-        return True
         
     except Exception as e:
         print_result("Bar validation", False, str(e))
-        return False
+        raise
 
 
+@pytest.mark.asyncio
 async def test_integration():
     """Test integration of all Phase 2 components."""
     print_header("Testing Phase 2 Integration")
@@ -477,11 +476,10 @@ async def test_integration():
         await pipeline.stop()
         await feature_engine.stop()
         
-        return True
         
     except Exception as e:
         print_result("Integration test", False, str(e))
-        return False
+        raise
 
 
 async def main():

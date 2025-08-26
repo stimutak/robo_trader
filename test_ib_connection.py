@@ -2,12 +2,14 @@
 """Test IB connection and fetch some data"""
 
 import asyncio
+import pytest
 from ib_insync import IB, Stock
 import nest_asyncio
 
 # Apply nest_asyncio to allow nested event loops
 nest_asyncio.apply()
 
+@pytest.mark.asyncio
 async def test_connection():
     ib = IB()
     try:
