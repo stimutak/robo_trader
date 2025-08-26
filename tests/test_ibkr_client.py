@@ -1,6 +1,6 @@
 import pandas as pd
 
-from robo_trader.ibkr_client import normalize_bars_df
+from robo_trader.clients.async_ibkr_client import normalize_bars_df
 
 
 def test_normalize_bars_df_basic():

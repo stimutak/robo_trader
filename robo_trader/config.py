@@ -202,6 +202,76 @@ class StrategyConfig(BaseModel):
         return v
 
 
+class MLConfig(BaseModel):
+    """Machine Learning configuration."""
+
+    enable_ml_features: bool = Field(
+        default=True, description="Enable ML feature generation"
+    )
+    feature_store_path: str = Field(
+        default="feature_store.db", description="Path to feature store database"
+    )
+    model_registry_path: str = Field(
+        default="model_registry", description="Path to model registry directory"
+    )
+    auto_retrain: bool = Field(
+        default=True, description="Enable automatic model retraining"
+    )
+    retrain_threshold: float = Field(
+        default=0.7, ge=0, le=1, description="Performance threshold for retraining"
+    )
+    retrain_frequency_hours: int = Field(
+        default=24, ge=1, description="Hours between retrain checks"
+    )
+    feature_importance_threshold: float = Field(
+        default=0.01, ge=0, le=1, description="Minimum feature importance to keep"
+    )
+    n_top_features: int = Field(
+        default=50, ge=10, le=200, description="Number of top features to use"
+    )
+    validation_split: float = Field(
+        default=0.2, gt=0, lt=1, description="Validation split for training"
+    )
+    enable_ensemble: bool = Field(
+        default=True, description="Enable ensemble model training"
+    )
+    hyperparameter_tuning: bool = Field(
+        default=True, description="Enable hyperparameter tuning"
+    )
+    cross_validation_folds: int = Field(
+        default=5, ge=3, le=10, description="Number of CV folds"
+    )
+
+
+class CorrelationConfig(BaseModel):
+    """Correlation analysis configuration."""
+
+    max_correlation: float = Field(
+        default=0.7, ge=0, le=1, description="Maximum allowed correlation"
+    )
+    penalty_factor: float = Field(
+        default=0.5, ge=0, le=1, description="Correlation penalty factor"
+    )
+    update_interval: int = Field(
+        default=300, ge=60, description="Correlation update interval in seconds"
+    )
+    lookback_days: int = Field(
+        default=60, ge=20, le=252, description="Days for correlation calculation"
+    )
+    min_observations: int = Field(
+        default=30, ge=10, description="Minimum observations for correlation"
+    )
+    enable_dynamic_sizing: bool = Field(
+        default=True, description="Enable correlation-based position sizing"
+    )
+    concentration_limit: float = Field(
+        default=0.3, gt=0, le=1, description="Portfolio concentration limit"
+    )
+    cluster_threshold: float = Field(
+        default=0.8, ge=0, le=1, description="Threshold for correlation clustering"
+    )
+
+
 class MonitoringConfig(BaseModel):
     """Monitoring and alerting configuration."""
 
@@ -227,6 +297,8 @@ class Config(BaseModel):
     data: DataConfig = Field(default_factory=DataConfig)
     ibkr: IBKRConfig = Field(default_factory=IBKRConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
+    ml: MLConfig = Field(default_factory=MLConfig)
+    correlation: CorrelationConfig = Field(default_factory=CorrelationConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
 
     # Runtime configuration
@@ -362,6 +434,30 @@ def load_config_from_env() -> Config:
             "breakout_volume_factor": float(
                 os.getenv("STRATEGY_BREAKOUT_VOLUME", "1.5")
             ),
+        },
+        "ml": {
+            "enable_ml_features": os.getenv("ML_ENABLE_FEATURES", "true").lower() == "true",
+            "feature_store_path": os.getenv("ML_FEATURE_STORE_PATH", "feature_store.db"),
+            "model_registry_path": os.getenv("ML_MODEL_REGISTRY_PATH", "model_registry"),
+            "auto_retrain": os.getenv("ML_AUTO_RETRAIN", "true").lower() == "true",
+            "retrain_threshold": float(os.getenv("ML_RETRAIN_THRESHOLD", "0.7")),
+            "retrain_frequency_hours": int(os.getenv("ML_RETRAIN_FREQUENCY", "24")),
+            "feature_importance_threshold": float(os.getenv("ML_FEATURE_IMPORTANCE_THRESHOLD", "0.01")),
+            "n_top_features": int(os.getenv("ML_N_TOP_FEATURES", "50")),
+            "validation_split": float(os.getenv("ML_VALIDATION_SPLIT", "0.2")),
+            "enable_ensemble": os.getenv("ML_ENABLE_ENSEMBLE", "true").lower() == "true",
+            "hyperparameter_tuning": os.getenv("ML_HYPERPARAMETER_TUNING", "true").lower() == "true",
+            "cross_validation_folds": int(os.getenv("ML_CV_FOLDS", "5")),
+        },
+        "correlation": {
+            "max_correlation": float(os.getenv("CORRELATION_MAX", "0.7")),
+            "penalty_factor": float(os.getenv("CORRELATION_PENALTY_FACTOR", "0.5")),
+            "update_interval": int(os.getenv("CORRELATION_UPDATE_INTERVAL", "300")),
+            "lookback_days": int(os.getenv("CORRELATION_LOOKBACK_DAYS", "60")),
+            "min_observations": int(os.getenv("CORRELATION_MIN_OBSERVATIONS", "30")),
+            "enable_dynamic_sizing": os.getenv("CORRELATION_DYNAMIC_SIZING", "true").lower() == "true",
+            "concentration_limit": float(os.getenv("CORRELATION_CONCENTRATION_LIMIT", "0.3")),
+            "cluster_threshold": float(os.getenv("CORRELATION_CLUSTER_THRESHOLD", "0.8")),
         },
         "monitoring": {
             "enable_alerts": os.getenv("MONITORING_ENABLE_ALERTS", "true").lower()

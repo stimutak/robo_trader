@@ -18,7 +18,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import psutil
 
-from ..database import TradingDatabase
+from ..database_async import AsyncTradingDatabase as TradingDatabase
 from ..logger import get_logger
 
 logger = get_logger(__name__)

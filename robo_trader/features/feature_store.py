@@ -97,8 +97,9 @@ class FeatureStore:
             'avg_retrieval_time_ms': []
         }
         
-        # Initialize database
-        asyncio.create_task(self._init_database())
+        # Database initialization flag
+        self._initialized = False
+        self._init_lock = asyncio.Lock()
     
     async def _init_database(self) -> None:
         """Initialize database tables."""
@@ -152,6 +153,14 @@ class FeatureStore:
             
             await db.commit()
     
+    async def ensure_initialized(self) -> None:
+        """Ensure database is initialized before use."""
+        if not self._initialized:
+            async with self._init_lock:
+                if not self._initialized:  # Double-check after acquiring lock
+                    await self._init_database()
+                    self._initialized = True
+    
     async def store_features(
         self,
         symbol: str,
@@ -159,6 +168,7 @@ class FeatureStore:
         metadata: Optional[FeatureMetadata] = None
     ) -> str:
         """Store features with versioning."""
+        await self.ensure_initialized()
         start_time = datetime.now()
         
         try:
@@ -255,6 +265,7 @@ class FeatureStore:
         version: Optional[int] = None
     ) -> Optional[Tuple[pd.DataFrame, FeatureMetadata]]:
         """Retrieve features from store."""
+        await self.ensure_initialized()
         start_time = datetime.now()
         
         try:
@@ -338,6 +349,7 @@ class FeatureStore:
         feature_names: Optional[List[str]] = None
     ) -> pd.DataFrame:
         """Get historical features for backtesting."""
+        await self.ensure_initialized()
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 query = """
@@ -379,6 +391,7 @@ class FeatureStore:
         model_name: str
     ) -> None:
         """Update feature importance scores from ML models."""
+        await self.ensure_initialized()
         try:
             timestamp = datetime.now()
             
@@ -420,6 +433,7 @@ class FeatureStore:
         model_name: Optional[str] = None
     ) -> List[Tuple[str, float]]:
         """Get top N most important features."""
+        await self.ensure_initialized()
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 if model_name:
