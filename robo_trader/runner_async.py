@@ -179,6 +179,9 @@ class AsyncRunner:
             # Prepare batch data for efficient storage
             batch_data = []
             for timestamp, row in df.iterrows():
+                # Convert pandas Timestamp to datetime for SQLite compatibility
+                if hasattr(timestamp, 'to_pydatetime'):
+                    timestamp = timestamp.to_pydatetime()
                 batch_data.append({
                     "symbol": symbol,
                     "timestamp": timestamp,
