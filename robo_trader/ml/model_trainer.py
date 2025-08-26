@@ -29,6 +29,25 @@ import xgboost as xgb
 import lightgbm as lgb
 import structlog
 
+# Neural network imports
+try:
+    import tensorflow as tf
+    from tensorflow import keras
+    from tensorflow.keras import layers, optimizers, callbacks
+    NEURAL_NETWORK_AVAILABLE = True
+except ImportError:
+    NEURAL_NETWORK_AVAILABLE = False
+    tf = None
+    keras = None
+
+# Hyperparameter tuning
+try:
+    import optuna
+    OPTUNA_AVAILABLE = True
+except ImportError:
+    OPTUNA_AVAILABLE = False
+    optuna = None
+
 from ..config import Config
 from ..features.feature_pipeline import FeaturePipeline
 
@@ -40,6 +59,7 @@ class ModelType(Enum):
     RANDOM_FOREST = "random_forest"
     XGBOOST = "xgboost"
     LIGHTGBM = "lightgbm"
+    NEURAL_NETWORK = "neural_network"
     ENSEMBLE = "ensemble"
 
 
@@ -125,8 +145,30 @@ class ModelTrainer:
             hyperparams
         )
         
-        # Hyperparameter tuning
-        if tune_hyperparams and param_grid:
+        # Special handling for neural networks
+        if model_type == ModelType.NEURAL_NETWORK:
+            # Split train set further for validation
+            val_split_idx = int(len(X_train_scaled) * 0.8)
+            X_train_nn, X_val_nn = X_train_scaled[:val_split_idx], X_train_scaled[val_split_idx:]
+            y_train_nn, y_val_nn = y_train[:val_split_idx], y_train[val_split_idx:]
+            
+            if tune_hyperparams and OPTUNA_AVAILABLE:
+                # Use Optuna for neural network hyperparameter tuning
+                best_model = await self._tune_neural_network_optuna(
+                    X_train_nn, y_train_nn,
+                    X_val_nn, y_val_nn,
+                    prediction_type
+                )
+            else:
+                # Use default hyperparameters
+                best_model = await self._train_neural_network(
+                    X_train_nn, y_train_nn,
+                    X_val_nn, y_val_nn,
+                    hyperparams or {},
+                    prediction_type
+                )
+        # Regular model training
+        elif tune_hyperparams and param_grid:
             logger.info("Starting hyperparameter tuning")
             best_model = await self._tune_hyperparameters(
                 model,
@@ -285,6 +327,22 @@ class ModelTrainer:
                 "feature_fraction": [0.7, 0.8, 0.9],
                 "bagging_fraction": [0.7, 0.8, 0.9]
             }
+            
+        elif model_type == ModelType.NEURAL_NETWORK:
+            if not NEURAL_NETWORK_AVAILABLE:
+                raise ImportError("TensorFlow/Keras not installed. Run: pip install tensorflow keras")
+            
+            # Neural network requires special handling - return placeholder
+            # Actual model will be created in train_model method
+            model = "neural_network_placeholder"
+            param_grid = {
+                "hidden_layers": [[64, 32], [128, 64], [256, 128, 64]],
+                "dropout_rate": [0.2, 0.3, 0.4],
+                "learning_rate": [0.001, 0.01, 0.1],
+                "batch_size": [32, 64, 128],
+                "epochs": [50, 100, 200]
+            }
+            
         else:
             raise ValueError(f"Unknown model type: {model_type}")
         
@@ -612,6 +670,222 @@ class ModelTrainer:
         )
         
         return metrics
+    
+    def _create_neural_network(
+        self,
+        input_shape: int,
+        hidden_layers: List[int],
+        dropout_rate: float,
+        learning_rate: float,
+        prediction_type: PredictionType
+    ):
+        """Create a neural network model.
+        
+        Args:
+            input_shape: Number of input features
+            hidden_layers: List of hidden layer sizes
+            dropout_rate: Dropout rate for regularization
+            learning_rate: Learning rate for optimizer
+            prediction_type: Type of prediction task
+            
+        Returns:
+            Compiled Keras model
+        """
+        if not NEURAL_NETWORK_AVAILABLE:
+            raise ImportError("TensorFlow/Keras not installed")
+        
+        model = keras.Sequential()
+        
+        # Input layer
+        model.add(layers.InputLayer(shape=(input_shape,)))
+        
+        # Hidden layers with dropout
+        for i, units in enumerate(hidden_layers):
+            model.add(layers.Dense(
+                units,
+                activation='relu',
+                kernel_regularizer=keras.regularizers.l2(0.001),
+                name=f'hidden_{i}'
+            ))
+            model.add(layers.BatchNormalization())
+            model.add(layers.Dropout(dropout_rate))
+        
+        # Output layer
+        if prediction_type == PredictionType.REGRESSION:
+            model.add(layers.Dense(1, activation='linear', name='output'))
+            loss = 'mse'
+            metrics = ['mae']
+        elif prediction_type == PredictionType.CLASSIFICATION:
+            model.add(layers.Dense(1, activation='sigmoid', name='output'))
+            loss = 'binary_crossentropy'
+            metrics = ['accuracy']
+        else:  # Multi-class
+            model.add(layers.Dense(3, activation='softmax', name='output'))
+            loss = 'sparse_categorical_crossentropy'
+            metrics = ['accuracy']
+        
+        # Compile model
+        optimizer = optimizers.Adam(learning_rate=learning_rate)
+        model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
+        
+        return model
+    
+    async def _train_neural_network(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+        hyperparams: Dict,
+        prediction_type: PredictionType
+    ):
+        """Train a neural network model.
+        
+        Args:
+            X_train: Training features
+            y_train: Training target
+            X_val: Validation features
+            y_val: Validation target
+            hyperparams: Hyperparameters for the model
+            prediction_type: Type of prediction task
+            
+        Returns:
+            Trained Keras model
+        """
+        # Create model
+        model = self._create_neural_network(
+            input_shape=X_train.shape[1],
+            hidden_layers=hyperparams.get('hidden_layers', [128, 64]),
+            dropout_rate=hyperparams.get('dropout_rate', 0.3),
+            learning_rate=hyperparams.get('learning_rate', 0.001),
+            prediction_type=prediction_type
+        )
+        
+        # Callbacks
+        early_stopping = callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=20,
+            restore_best_weights=True,
+            verbose=0
+        )
+        
+        reduce_lr = callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=10,
+            min_lr=1e-6,
+            verbose=0
+        )
+        
+        # Train model
+        history = model.fit(
+            X_train, y_train,
+            validation_data=(X_val, y_val),
+            epochs=hyperparams.get('epochs', 100),
+            batch_size=hyperparams.get('batch_size', 64),
+            callbacks=[early_stopping, reduce_lr],
+            verbose=0
+        )
+        
+        return model
+    
+    async def _tune_neural_network_optuna(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+        prediction_type: PredictionType,
+        n_trials: int = 20
+    ):
+        """Tune neural network hyperparameters using Optuna.
+        
+        Args:
+            X_train: Training features
+            y_train: Training target
+            X_val: Validation features
+            y_val: Validation target
+            prediction_type: Type of prediction task
+            n_trials: Number of Optuna trials
+            
+        Returns:
+            Best trained model
+        """
+        if not OPTUNA_AVAILABLE:
+            logger.warning("Optuna not available, using default hyperparameters")
+            return await self._train_neural_network(
+                X_train, y_train, X_val, y_val, {}, prediction_type
+            )
+        
+        best_model = None
+        best_score = float('-inf')
+        
+        def objective(trial):
+            # Suggest hyperparameters
+            n_layers = trial.suggest_int('n_layers', 1, 3)
+            hidden_layers = []
+            for i in range(n_layers):
+                hidden_layers.append(
+                    trial.suggest_int(f'n_units_l{i}', 32, 256, step=32)
+                )
+            
+            hyperparams = {
+                'hidden_layers': hidden_layers,
+                'dropout_rate': trial.suggest_float('dropout_rate', 0.1, 0.5),
+                'learning_rate': trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True),
+                'batch_size': trial.suggest_categorical('batch_size', [32, 64, 128]),
+                'epochs': 100  # Fixed for speed
+            }
+            
+            # Train model
+            model = self._create_neural_network(
+                input_shape=X_train.shape[1],
+                hidden_layers=hyperparams['hidden_layers'],
+                dropout_rate=hyperparams['dropout_rate'],
+                learning_rate=hyperparams['learning_rate'],
+                prediction_type=prediction_type
+            )
+            
+            # Simple training without callbacks for speed
+            history = model.fit(
+                X_train, y_train,
+                validation_data=(X_val, y_val),
+                epochs=hyperparams['epochs'],
+                batch_size=hyperparams['batch_size'],
+                callbacks=[
+                    callbacks.EarlyStopping(
+                        monitor='val_loss',
+                        patience=10,
+                        restore_best_weights=True,
+                        verbose=0
+                    )
+                ],
+                verbose=0
+            )
+            
+            # Get validation score
+            val_loss = min(history.history['val_loss'])
+            
+            # Store best model
+            nonlocal best_model, best_score
+            score = -val_loss  # Minimize loss
+            if score > best_score:
+                best_score = score
+                best_model = model
+            
+            return score
+        
+        # Run Optuna optimization
+        study = optuna.create_study(direction='maximize')
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+        
+        logger.info(
+            "Neural network hyperparameter tuning complete",
+            best_params=study.best_params,
+            best_score=best_score
+        )
+        
+        return best_model
     
     def get_performance_summary(self) -> pd.DataFrame:
         """Get summary of model performance history.

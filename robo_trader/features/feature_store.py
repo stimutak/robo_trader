@@ -116,11 +116,13 @@ class FeatureStore:
                     version INTEGER NOT NULL,
                     features TEXT NOT NULL,  -- JSON encoded features
                     metadata TEXT NOT NULL,  -- JSON encoded metadata
-                    created_at TEXT NOT NULL,
-                    INDEX idx_symbol_timestamp (symbol, timestamp),
-                    INDEX idx_version (version)
+                    created_at TEXT NOT NULL
                 )
             """)
+            
+            # Create indices
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_symbol_timestamp ON features (symbol, timestamp)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_version ON features (version)")
             
             # Create feature metadata table
             await db.execute("""

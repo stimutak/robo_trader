@@ -74,7 +74,9 @@ class MLFeatureEngine:
             returns = pd.DataFrame()
             for sym, df in price_data.items():
                 if len(df) >= 2:
-                    returns[sym] = df['close'].pct_change()
+                    # Handle both lowercase and uppercase column names
+                    close_col = 'close' if 'close' in df.columns else 'Close'
+                    returns[sym] = df[close_col].pct_change()
             
             if len(returns.columns) >= 2:
                 # Rolling correlation with market (SPY as proxy)
@@ -188,6 +190,12 @@ class MLFeatureEngine:
     ) -> MarketRegime:
         """Detect current market regime."""
         try:
+            # Handle both lowercase and uppercase column names
+            close_col = 'close' if 'close' in df.columns else 'Close'
+            high_col = 'high' if 'high' in df.columns else 'High'
+            low_col = 'low' if 'low' in df.columns else 'Low'
+            open_col = 'open' if 'open' in df.columns else 'Open'
+            volume_col = 'volume' if 'volume' in df.columns else 'Volume'
             if len(df) < 50:
                 return MarketRegime(
                     regime='unknown',
@@ -198,15 +206,15 @@ class MLFeatureEngine:
                 )
             
             # Calculate returns
-            returns = df['close'].pct_change().dropna()
+            returns = df[close_col].pct_change().dropna()
             
             # Calculate trend using linear regression
             x = np.arange(len(df.tail(20)))
-            y = df['close'].tail(20).values
+            y = df[close_col].tail(20).values
             slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
             
             # Normalize slope by price level
-            normalized_slope = slope / df['close'].mean() * 100
+            normalized_slope = slope / df[close_col].mean() * 100
             trend_strength = abs(r_value)  # R-squared as trend strength
             
             # Calculate volatility
@@ -307,6 +315,12 @@ class MLFeatureEngine:
         features = {}
         
         try:
+            # Handle both lowercase and uppercase column names
+            close_col = 'close' if 'close' in df.columns else 'Close'
+            high_col = 'high' if 'high' in df.columns else 'High'
+            low_col = 'low' if 'low' in df.columns else 'Low'
+            open_col = 'open' if 'open' in df.columns else 'Open'
+            volume_col = 'volume' if 'volume' in df.columns else 'Volume'
             if not trades or not quotes:
                 return features
             
@@ -482,11 +496,17 @@ class MLFeatureEngine:
         features = {}
         
         try:
+            # Handle both lowercase and uppercase column names
+            close_col = 'close' if 'close' in df.columns else 'Close'
+            high_col = 'high' if 'high' in df.columns else 'High'
+            low_col = 'low' if 'low' in df.columns else 'Low'
+            open_col = 'open' if 'open' in df.columns else 'Open'
+            volume_col = 'volume' if 'volume' in df.columns else 'Volume'
             if len(df) < 20:
                 return features
             
             # Put-call ratio proxy (using volatility skew if available)
-            returns = df['close'].pct_change().dropna()
+            returns = df[close_col].pct_change().dropna()
             
             # Skewness as sentiment proxy
             if len(returns) >= 20:
@@ -497,7 +517,7 @@ class MLFeatureEngine:
             if 'volume' in df.columns:
                 # Calculate correlation between volume and absolute returns
                 abs_returns = returns.abs()
-                volume_changes = df['volume'].pct_change()
+                volume_changes = df[volume_col].pct_change()
                 
                 if len(abs_returns) >= 20 and len(volume_changes) >= 20:
                     vol_ret_corr = abs_returns.tail(20).corr(volume_changes.tail(20))
@@ -505,9 +525,9 @@ class MLFeatureEngine:
                         features['volume_return_correlation'] = vol_ret_corr
                 
                 # Accumulation/Distribution line
-                clv = ((df['close'] - df['low']) - (df['high'] - df['close'])) / \
-                      (df['high'] - df['low'] + 0.0001)
-                adl = (clv * df['volume']).cumsum()
+                clv = ((df[close_col] - df[low_col]) - (df[high_col] - df[close_col])) / \
+                      (df[high_col] - df[low_col] + 0.0001)
+                adl = (clv * df[volume_col]).cumsum()
                 
                 if len(adl) >= 20:
                     # ADL trend
@@ -518,17 +538,17 @@ class MLFeatureEngine:
                     features['adl_strength'] = r_value ** 2
             
             # Price position in range
-            high_20 = df['high'].tail(20).max()
-            low_20 = df['low'].tail(20).min()
-            current_price = df['close'].iloc[-1]
+            high_20 = df[high_col].tail(20).max()
+            low_20 = df[low_col].tail(20).min()
+            current_price = df[close_col].iloc[-1]
             
             if high_20 > low_20:
                 features['price_position'] = (current_price - low_20) / (high_20 - low_20)
             
             # Momentum divergence
             if len(df) >= 40:
-                price_change_10 = (df['close'].iloc[-1] / df['close'].iloc[-10] - 1) * 100
-                price_change_20 = (df['close'].iloc[-10] / df['close'].iloc[-20] - 1) * 100
+                price_change_10 = (df[close_col].iloc[-1] / df[close_col].iloc[-10] - 1) * 100
+                price_change_20 = (df[close_col].iloc[-10] / df[close_col].iloc[-20] - 1) * 100
                 features['momentum_divergence'] = price_change_10 - price_change_20
             
         except Exception as e:
