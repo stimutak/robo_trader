@@ -33,20 +33,20 @@ async def run_once(
     default_cash: float | None = None,
 ) -> None:
     cfg = load_config()
-    ib = IBKRClient(cfg.ibkr_host, cfg.ibkr_port, cfg.ibkr_client_id)
-    await retry_async(lambda: ib.connect(readonly=True))
+    ib = IBKRClient(cfg.ibkr.host, cfg.ibkr.port, cfg.ibkr.client_id)
+    await retry_async(lambda: ib.connect(readonly=cfg.ibkr.readonly))
 
     # Initialize database
     db = TradingDatabase()
 
     # Initialize helpers
     risk = RiskManager(
-        max_daily_loss=cfg.max_daily_loss,
-        max_position_risk_pct=cfg.max_position_risk_pct,
-        max_symbol_exposure_pct=cfg.max_symbol_exposure_pct,
-        max_leverage=cfg.max_leverage,
-        max_order_notional=max_order_notional,
-        max_daily_notional=max_daily_notional,
+        max_daily_loss=cfg.risk.max_daily_loss_pct,
+        max_position_risk_pct=cfg.risk.max_position_pct,
+        max_symbol_exposure_pct=cfg.risk.max_sector_exposure_pct,
+        max_leverage=cfg.risk.max_leverage,
+        max_order_notional=max_order_notional or cfg.risk.max_order_notional,
+        max_daily_notional=max_daily_notional or cfg.risk.max_daily_notional,
     )
     executor = PaperExecutor(slippage_bps=slippage_bps)
 
@@ -168,7 +168,7 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config()
-    if cfg.trading_mode.lower() == "live" and not args.confirm_live:
+    if cfg.execution.mode == "live" and not args.confirm_live:
         raise SystemExit("Refusing to run in live mode without --confirm-live")
 
     override_symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()] if args.symbols else None
