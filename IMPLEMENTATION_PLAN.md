@@ -1,0 +1,251 @@
+# RoboTrader Production ML Platform - Implementation Plan
+
+## Project Overview
+Transform the robo_trader system into a production-grade, ML-driven trading platform achieving consistent profitability within 4 months through systematic improvements addressing critical infrastructure issues and implementing advanced ML capabilities.
+
+---
+
+## Phase 1: Foundation & Quick Wins (Weeks 1-4)
+*Fix critical infrastructure issues and implement quick performance gains*
+
+### Week 1-2: Core Infrastructure Fixes
+- [ ] **[backend][critical]** F1: Implement Async IBKR Client (24h)
+  - Replace synchronous IBKR calls with async/await pattern
+  - Add connection pooling with max 5 concurrent connections
+  - Implement exponential backoff on failures
+  - Files: `robo_trader/clients/ibkr_client.py`
+
+- [ ] **[backend][critical]** F2: Upgrade Config System to Pydantic (16h)
+  - Replace dataclass config with Pydantic models
+  - Add comprehensive validation and type safety
+  - Implement environment-specific config loading
+  - Files: `robo_trader/config/config.py`, `robo_trader/config/trading_config.py`
+
+### Week 2-3: Database & Performance
+- [ ] **[database][high]** F3: Implement Async Database Operations (20h)
+  - Convert SQLite operations to async using aiosqlite
+  - Implement connection pooling for database access
+  - Ensure no event loop blocking
+  - Files: `robo_trader/database/db_manager.py`, `robo_trader/database/models.py`
+
+### Week 3-4: Parallel Processing
+- [ ] **[backend][high]** F4: Enable Parallel Symbol Processing (18h)
+  - Dependencies: F1, F3
+  - Modify runner for concurrent symbol processing
+  - Implement shared resource management
+  - Achieve 3x throughput improvement
+  - Files: `robo_trader/core/runner.py`
+
+- [ ] **[monitoring][medium]** F5: Add Basic Performance Monitoring (12h)
+  - Dependencies: F4
+  - Implement metrics collection for latency and throughput
+  - Integrate with dashboard for real-time visibility
+  - Files: `robo_trader/monitoring/metrics.py`, `robo_trader/dashboard/app.py`
+
+**Phase 1 Success Metrics:**
+- ✅ All IBKR calls use async/await with retry logic
+- ✅ Pydantic validation prevents configuration errors
+- ✅ 3x throughput improvement measured
+- ✅ Real-time performance monitoring active
+
+---
+
+## Phase 2: ML Infrastructure & Backtesting (Weeks 5-8)
+*Build robust ML pipeline and comprehensive backtesting framework*
+
+### Week 5-6: Feature Engineering
+- [ ] **[ml][critical]** M1: Build Feature Engineering Pipeline (32h)
+  - Dependencies: F3
+  - Implement 50+ real-time features including technical indicators
+  - Build feature store with versioning capabilities
+  - Create feature correlation analysis tools
+  - Files: `robo_trader/features/feature_engine.py`, `robo_trader/features/technical_indicators.py`
+
+- [ ] **[integration][medium]** M5: Integrate Existing Correlation Module (16h)
+  - Dependencies: M1
+  - Integrate correlation analysis into trading pipeline
+  - Implement correlation-based position sizing
+  - Files: `robo_trader/analysis/correlation.py`, `robo_trader/core/runner.py`
+
+### Week 6-7: Backtesting Framework
+- [ ] **[backtesting][critical]** M2: Enhance Walk-Forward Backtesting (28h)
+  - Dependencies: M1
+  - Extend existing framework with realistic execution simulation
+  - Implement comprehensive performance metrics
+  - Add out-of-sample validation capabilities
+  - Files: `robo_trader/backtesting/walk_forward.py`, `robo_trader/backtesting/execution_simulator.py`
+
+### Week 7-8: ML Model Training
+- [ ] **[ml][high]** M3: Implement ML Model Training Pipeline (36h)
+  - Dependencies: M1, M2
+  - Create automated training for RF, XGB, and NN models
+  - Implement hyperparameter tuning and model selection
+  - Build model performance tracking system
+  - Files: `robo_trader/ml/model_trainer.py`, `robo_trader/ml/model_selector.py`
+
+- [ ] **[analytics][medium]** M4: Build Strategy Performance Analytics (24h)
+  - Dependencies: M2
+  - Implement comprehensive risk-adjusted metrics
+  - Create performance attribution analysis
+  - Files: `robo_trader/analytics/performance.py`, `robo_trader/analytics/risk_metrics.py`
+
+**Phase 2 Success Metrics:**
+- ✅ Real-time feature computation with feature store operational
+- ✅ Walk-forward optimization working with realistic simulation
+- ✅ Baseline ML models trained with validation pipeline active
+- ✅ Comprehensive performance analytics available
+
+---
+
+## Phase 3: Advanced Strategy Development (Weeks 9-12)
+*Develop sophisticated ML-driven strategies with advanced execution algorithms*
+
+### Week 9-10: ML Strategy Framework
+- [ ] **[strategy][critical]** S1: Develop ML-Driven Strategy Framework (40h)
+  - Dependencies: M3
+  - Create sophisticated strategy using ML predictions
+  - Implement regime detection and multi-timeframe analysis
+  - Build regime-aware position sizing
+  - Files: `robo_trader/strategies/ml_strategy.py`, `robo_trader/strategies/regime_detector.py`
+
+### Week 10-11: Smart Execution
+- [ ] **[execution][high]** S2: Implement Smart Execution Algorithms (32h)
+  - Dependencies: S1
+  - Build TWAP/VWAP execution algorithms
+  - Implement adaptive lot sizing and market impact minimization
+  - Files: `robo_trader/execution/smart_executor.py`, `robo_trader/execution/algorithms.py`
+
+### Week 11-12: Portfolio Management
+- [ ] **[portfolio][high]** S3: Build Multi-Strategy Portfolio Manager (36h)
+  - Dependencies: S1, S2
+  - Implement dynamic capital allocation across strategies
+  - Build risk budgeting and correlation-aware diversification
+  - Files: `robo_trader/portfolio/portfolio_manager.py`, `robo_trader/portfolio/allocation.py`
+
+### Week 9-12: Additional Strategies
+- [ ] **[strategy][medium]** S4: Implement Microstructure Strategies (28h)
+  - Dependencies: M1
+  - Build high-frequency strategies using order book dynamics
+  - Implement sub-second execution capabilities
+  - Files: `robo_trader/strategies/microstructure.py`, `robo_trader/features/orderbook.py`
+
+- [ ] **[strategy][medium]** S5: Develop Mean Reversion Strategy Suite (24h)
+  - Dependencies: M3
+  - Create statistical arbitrage and pairs trading strategies
+  - Implement ML-enhanced entry/exit timing
+  - Files: `robo_trader/strategies/mean_reversion.py`, `robo_trader/strategies/pairs_trading.py`
+
+**Phase 3 Success Metrics:**
+- ✅ ML predictions integrated with multi-timeframe analysis
+- ✅ TWAP/VWAP algorithms with market impact minimization
+- ✅ 5+ strategies operational with dynamic allocation
+- ✅ Risk budgeting active across portfolio
+
+---
+
+## Phase 4: Production Hardening & Deployment (Weeks 13-16)
+*Production deployment with comprehensive monitoring, security, and fail-safes*
+
+### Week 13-14: Advanced Risk Management
+- [ ] **[risk][critical]** P1: Implement Advanced Risk Management (32h)
+  - Dependencies: S3
+  - Build Kelly criterion position sizing
+  - Implement correlation-based limits and automated kill switches
+  - Files: `robo_trader/risk/advanced_risk.py`, `robo_trader/risk/kelly_sizing.py`
+
+### Week 14-15: Production Infrastructure
+- [ ] **[monitoring][critical]** P2: Build Production Monitoring Stack (28h)
+  - Dependencies: P1
+  - Implement real-time system monitoring with automated alerts
+  - Build comprehensive performance dashboards
+  - Files: `robo_trader/monitoring/production_monitor.py`, `robo_trader/monitoring/alerts.py`
+
+- [ ] **[deployment][high]** P3: Setup Docker Production Environment (24h)
+  - Containerize application for production deployment
+  - Setup multi-service Docker configuration with health checks
+  - Files: `Dockerfile`, `docker-compose.yml`, `deployment/docker-compose.prod.yml`
+
+### Week 15-16: Security & Final Validation
+- [ ] **[security][high]** P4: Implement Security & Compliance (20h)
+  - Dependencies: P3
+  - Build secrets management and API authentication
+  - Implement comprehensive audit trail logging
+  - Files: `robo_trader/security/auth.py`, `robo_trader/security/secrets.py`
+
+- [ ] **[devops][medium]** P5: Setup CI/CD Pipeline (16h)
+  - Dependencies: P3
+  - Create automated testing and deployment pipeline
+  - Files: `.github/workflows/deploy.yml`, `.github/workflows/docker.yml`
+
+- [ ] **[testing][critical]** P6: Production Validation & Testing (24h)
+  - Dependencies: P1, P2, P4
+  - Conduct 30-day paper trading validation
+  - Validate all risk controls and performance targets
+  - Files: `tests/test_production.py`, `tests/integration/test_live_trading.py`
+
+**Phase 4 Success Metrics:**
+- ✅ Kelly sizing and kill switches functional
+- ✅ Docker deployment with CI/CD pipeline operational
+- ✅ Paper trading validated with risk controls tested
+- ✅ Performance targets achieved for live trading
+
+---
+
+## Success Metrics & Risk Mitigation
+
+### Technical Success Metrics
+- 99.9% system uptime
+- Sub-100ms trade execution latency
+- Zero configuration errors
+- Automated risk control validation
+
+### Business Success Metrics
+- Positive Sharpe ratio > 1.5
+- Maximum drawdown < 10%
+- Monthly profitability consistency
+- Risk-adjusted returns > benchmark
+
+### Risk Mitigation Strategies
+- **Market Regime Changes**: Continuous model retraining and regime detection
+- **System Failures**: Redundant systems and automated failover
+- **Regulatory Compliance**: Comprehensive audit logging and compliance checks
+
+---
+
+## Critical Issues from GPT5 Review
+
+### Issues Being Addressed:
+1. **Config System**: Upgrading from dataclass to Pydantic with validation (Phase 1)
+2. **IBKR Client**: Converting to fully async with retry/backoff (Phase 1)
+3. **Execution**: Building state machine with realistic fills (Phase 3)
+4. **Risk Management**: Adding ATR/Kelly sizing, correlation controls, kill-switches (Phase 4)
+5. **Strategy**: Implementing ML features and regime filters (Phase 2-3)
+6. **Runner**: Parallel processing, async SQLite operations (Phase 1)
+7. **Inconsistency**: Integrating aspirational modules with main runner (Phase 2)
+
+### Quick Wins Timeline (Week 1-4):
+- Make all IBKR calls non-blocking and retryable
+- Parallelize per-symbol processing with asyncio.gather
+- Replace dataclass config with Pydantic BaseSettings
+- Implement daily loss/drawdown counters
+- Fix strategy guards and add liquidity filters
+
+---
+
+## Implementation Notes
+
+This plan addresses the critical issues identified in the GPT5 review while building toward ML-driven profitability. The phased approach ensures:
+
+1. **Quick Wins First**: Infrastructure fixes provide immediate performance improvements
+2. **Foundation Before Features**: Solid async architecture before advanced ML
+3. **Risk-First Approach**: Comprehensive risk management before live trading
+4. **Measurable Progress**: Clear success criteria for each milestone
+
+The plan leverages existing code where possible (walk-forward optimization, correlation analysis) while systematically replacing weak points with production-grade implementations.
+
+---
+
+## References
+- GPT5 Code Review: `GPT5 code review 8-28.md`
+- Current Implementation Status: See git history and existing modules
+- Target Production Date: 16 weeks from start date

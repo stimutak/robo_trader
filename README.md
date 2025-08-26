@@ -52,7 +52,9 @@ python -m robo_trader.runner
 
 ## ✨ Key Features
 
-### Phase 1 Complete (Foundation)
+### Current Implementation Status
+
+See `IMPLEMENTATION_PLAN.md` for the complete 16-week roadmap to transform this system into a production-grade ML-driven trading platform.
 - ✅ **Pydantic Configuration**: Type-safe config with validation
 - ✅ **Advanced Risk Management**: ATR sizing, portfolio heat, emergency shutdown
 - ✅ **Correlation Tracking**: Position correlation limits
@@ -291,7 +293,9 @@ pip install --force-reinstall -r requirements.txt
 
 ## 🔮 Roadmap
 
-### ✅ Phase 1: Foundation (Complete)
+### Development Roadmap
+
+See `IMPLEMENTATION_PLAN.md` for the complete development roadmap based on the GPT5 code review.
 - Pydantic configuration
 - Advanced risk management
 - Async architecture
@@ -339,5 +343,5 @@ This software is for educational purposes. Trading involves substantial risk of 
 ---
 
 **System Status**: ✅ Production-Ready Foundation
-**Version**: 1.0.0 (Phase 1 Complete)
+**Version**: 1.0.0 (See IMPLEMENTATION_PLAN.md for roadmap)
 **Last Updated**: 2025-08-25
