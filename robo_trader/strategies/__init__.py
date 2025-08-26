@@ -16,10 +16,15 @@ from .framework import (
     StrategyMetrics
 )
 
+# Import legacy function for backward compatibility
+from ..legacy_strategies import sma_crossover_signals
+
 __all__ = [
     "Strategy",
     "Signal", 
     "SignalType",
     "StrategyState",
-    "StrategyMetrics"
+    "StrategyMetrics",
+    # Legacy exports
+    "sma_crossover_signals"
 ]
