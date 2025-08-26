@@ -16,5 +16,5 @@ __all__ = [
     "TradeEdge",
     "EdgeMetrics",
     "EdgeGatingFilter",
-    "GatingConfig"
+    "GatingConfig",
 ]

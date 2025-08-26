@@ -25,5 +25,3 @@ async def retry_async(
                 raise
             await asyncio.sleep(delay)
             delay = min(delay * 2, max_delay)
-
-

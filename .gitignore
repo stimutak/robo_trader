@@ -34,6 +34,9 @@ Icon
 *.db
 *.sqlite
 *.sqlite3
+*.db-shm
+*.db-wal
+launchd_*.log
 
 # IBKR/Trading specific
 clientportal.gw/
@@ -55,6 +58,16 @@ doc/
 *.bak
 *.backup
 handoff/archive/
+
+# Process Management
+*.pid
+.dashboard.pid
+.trading.pid
+nohup.out
+
+# Test files
+test_*.py
+*_test.py
 
 # API Keys and Secrets (extra caution)
 *api_key*

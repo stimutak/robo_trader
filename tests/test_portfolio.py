@@ -15,5 +15,3 @@ def test_portfolio_pnl_and_equity():
     # Simpler assertion: realized increased and equity grew
     assert p.realized_pnl == 50
     assert eq2 > eq
-
-

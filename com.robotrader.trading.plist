@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.robotrader.trading</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/oliver/robo_trader/venv/bin/python</string>
+        <string>/Users/oliver/robo_trader/start_ai_trading.py</string>
+    </array>
+    
+    <key>WorkingDirectory</key>
+    <string>/Users/oliver/robo_trader</string>
+    
+    <key>StandardOutPath</key>
+    <string>/Users/oliver/robo_trader/launchd_trading.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>/Users/oliver/robo_trader/launchd_trading_error.log</string>
+    
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHONPATH</key>
+        <string>/Users/oliver/robo_trader</string>
+    </dict>
+    
+    <!-- Start after network is available -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>NetworkState</key>
+        <true/>
+    </dict>
+    
+    <!-- Run every day at 9:00 AM -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    
+    <!-- Restart on crash -->
+    <key>RunAtLoad</key>
+    <false/>
+    
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+</dict>
+</plist>

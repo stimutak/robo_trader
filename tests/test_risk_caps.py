@@ -27,5 +27,3 @@ def test_daily_notional_cap_blocks_when_exceeded():
         daily_executed_notional=1500,
     )
     assert not ok and "daily notional" in msg.lower()
-
-

@@ -14,14 +14,18 @@ class Order:
 
 
 class ExecutionResult:
-    def __init__(self, ok: bool, message: str, fill_price: Optional[float] = None) -> None:
+    def __init__(
+        self, ok: bool, message: str, fill_price: Optional[float] = None
+    ) -> None:
         self.ok = ok
         self.message = message
         self.fill_price = fill_price
 
 
 class AbstractExecutor:
-    def place_order(self, order: Order) -> ExecutionResult:  # pragma: no cover - interface
+    def place_order(
+        self, order: Order
+    ) -> ExecutionResult:  # pragma: no cover - interface
         raise NotImplementedError
 
 
@@ -31,11 +35,11 @@ class PaperExecutor(AbstractExecutor):
     Models symmetric slippage (in basis points) around the limit price for both
     buy and sell orders. Does not model partial fills. Intended as a safe default
     to test logic without touching live accounts.
-    
+
     Args:
         slippage_bps: Slippage in basis points to apply symmetrically to fills.
                       Defaults to 0.0 (no slippage).
-    
+
     Attributes:
         fills: Dictionary tracking all executed orders with timestamps and fill prices.
         slippage_bps: Configured slippage in basis points.
@@ -56,6 +60,9 @@ class PaperExecutor(AbstractExecutor):
         # Apply symmetric slippage in basis points
         slip = base * (self.slippage_bps / 10_000.0) if base > 0 else 0.0
         fill = base + slip if side == "BUY" else base - slip
-        self.fills[f"{order.symbol}-{len(self.fills)+1}"] = (dt.datetime.utcnow(), order, fill)
+        self.fills[f"{order.symbol}-{len(self.fills)+1}"] = (
+            dt.datetime.utcnow(),
+            order,
+            fill,
+        )
         return ExecutionResult(True, "Paper fill", fill)
-

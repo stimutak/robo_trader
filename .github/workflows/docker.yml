@@ -65,18 +65,13 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: false
+          load: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          outputs: type=docker,dest=/tmp/image.tar
-          
-      - name: Load image for scanning
-        run: |
-          docker load --input /tmp/image.tar
-          docker image ls -a
           
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master

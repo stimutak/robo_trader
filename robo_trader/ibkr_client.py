@@ -28,31 +28,33 @@ class IBKRClient:
     async def connect(self, readonly: bool = True, timeout: float = 10.0) -> None:
         if self.ib.isConnected():
             return
-        
+
         # Try connecting with incrementing client IDs
         max_retries = 20
         for attempt in range(max_retries):
             try:
                 current_id = self._original_client_id + attempt
-                
+
                 # Create a fresh IB instance for each attempt
                 if attempt > 0:
                     # Disconnect and clean up the old instance
                     if self.ib.isConnected():
                         self.ib.disconnect()
                     self.ib = IB()
-                
+
                 print(f"Attempting connection with client ID {current_id}...")
                 await asyncio.wait_for(
-                    self.ib.connectAsync(self._host, self._port, clientId=current_id, readonly=readonly),
+                    self.ib.connectAsync(
+                        self._host, self._port, clientId=current_id, readonly=readonly
+                    ),
                     timeout=timeout,
                 )
-                
+
                 # If we get here, connection succeeded
                 self._client_id = current_id
                 print(f"✓ Connected successfully with client ID {current_id}")
                 return
-                
+
             except (asyncio.TimeoutError, Exception) as e:
                 error_msg = str(e)
                 # Check if this is a client ID conflict (happens before timeout)
@@ -63,21 +65,27 @@ class IBKRClient:
                     continue
                 else:
                     # Last attempt failed
-                    raise Exception(f"Failed to connect after {max_retries} attempts. Last error: {error_msg}")
+                    raise Exception(
+                        f"Failed to connect after {max_retries} attempts. Last error: {error_msg}"
+                    )
 
     def disconnect(self) -> None:
         """Properly disconnect from IB."""
         if self.ib.isConnected():
             self.ib.disconnect()
-    
-    def qualify_stock(self, symbol: str, exchange: str = "SMART", currency: str = "USD"):
+
+    def qualify_stock(
+        self, symbol: str, exchange: str = "SMART", currency: str = "USD"
+    ):
         contract = Stock(symbol, exchange, currency)
         qualified = self.ib.qualifyContracts(contract)
         if not qualified:
             raise RuntimeError(f"Unable to qualify contract for {symbol}")
         return qualified[0]
 
-    async def fetch_recent_bars(self, symbol: str, duration: str = "2 D", bar_size: str = "5 mins"):
+    async def fetch_recent_bars(
+        self, symbol: str, duration: str = "2 D", bar_size: str = "5 mins"
+    ):
         """Fetch recent bars as a pandas DataFrame.
 
         Args:
@@ -115,7 +123,11 @@ def normalize_bars_df(df: pd.DataFrame) -> pd.DataFrame:
     data.columns = [str(c).lower() for c in data.columns]
 
     # Standard column subset if present
-    preferred_cols = [c for c in ["date", "time", "open", "high", "low", "close", "volume"] if c in data.columns]
+    preferred_cols = [
+        c
+        for c in ["date", "time", "open", "high", "low", "close", "volume"]
+        if c in data.columns
+    ]
     if preferred_cols:
         data = data[preferred_cols]
 
@@ -145,4 +157,3 @@ def normalize_bars_df(df: pd.DataFrame) -> pd.DataFrame:
             pass
 
     return data.reset_index(drop=False)
-

@@ -13,8 +13,8 @@ from .metrics import PerformanceMetrics, calculate_metrics
 
 __all__ = [
     "BacktestEngine",
-    "BacktestConfig", 
+    "BacktestConfig",
     "BacktestResult",
     "PerformanceMetrics",
-    "calculate_metrics"
+    "calculate_metrics",
 ]

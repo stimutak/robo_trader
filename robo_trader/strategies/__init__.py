@@ -8,23 +8,17 @@ This package provides:
 - Strategy combination and ensemble methods
 """
 
-from .framework import (
-    Strategy,
-    Signal,
-    SignalType,
-    StrategyState,
-    StrategyMetrics
-)
+from .framework import Strategy, Signal, SignalType, StrategyState, StrategyMetrics
 
 # Import legacy function for backward compatibility
 from ..legacy_strategies import sma_crossover_signals
 
 __all__ = [
     "Strategy",
-    "Signal", 
+    "Signal",
     "SignalType",
     "StrategyState",
     "StrategyMetrics",
     # Legacy exports
-    "sma_crossover_signals"
+    "sma_crossover_signals",
 ]

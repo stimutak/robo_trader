@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/Users/oliver/robo_trader/venv/bin/python
 """
 AI Trading System Launcher
 
