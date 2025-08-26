@@ -243,22 +243,23 @@ class TechnicalIndicators:
     # Volume-based indicators
     
     def obv(self, df: pd.DataFrame) -> Optional[float]:
-        """On-Balance Volume."""
+        """On-Balance Volume - Vectorized implementation."""
         try:
             if len(df) < 2:
                 return None
             
-            # Calculate OBV
-            obv = pd.Series(index=df.index, dtype=float)
-            obv.iloc[0] = df['volume'].iloc[0]
+            # Calculate price changes
+            price_changes = df['close'].diff()
             
-            for i in range(1, len(df)):
-                if df['close'].iloc[i] > df['close'].iloc[i-1]:
-                    obv.iloc[i] = obv.iloc[i-1] + df['volume'].iloc[i]
-                elif df['close'].iloc[i] < df['close'].iloc[i-1]:
-                    obv.iloc[i] = obv.iloc[i-1] - df['volume'].iloc[i]
-                else:
-                    obv.iloc[i] = obv.iloc[i-1]
+            volume_direction = pd.Series(0, index=df.index, dtype=int)
+            volume_direction[price_changes > 0] = 1
+            volume_direction[price_changes < 0] = -1
+            
+            # Calculate OBV as cumulative sum of directed volume
+            directed_volume = df['volume'] * volume_direction
+            directed_volume.iloc[0] = df['volume'].iloc[0]
+            
+            obv = directed_volume.cumsum()
             
             return obv.iloc[-1]
             
