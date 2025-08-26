@@ -42,6 +42,61 @@ class TradingDatabase:
                 )
             """)
             
+            # Tick data table (Phase 2)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS ticks (
+                    timestamp DATETIME NOT NULL,
+                    symbol TEXT NOT NULL,
+                    bid REAL,
+                    ask REAL,
+                    last REAL,
+                    bid_size INTEGER,
+                    ask_size INTEGER,
+                    last_size INTEGER,
+                    volume INTEGER,
+                    PRIMARY KEY (timestamp, symbol)
+                )
+            """)
+            
+            # Create index for efficient queries
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_ticks_symbol 
+                ON ticks (symbol, timestamp DESC)
+            """)
+            
+            # Features table (Phase 2)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS features (
+                    timestamp DATETIME NOT NULL,
+                    symbol TEXT NOT NULL,
+                    rsi REAL,
+                    macd_line REAL,
+                    macd_signal REAL,
+                    macd_histogram REAL,
+                    bb_upper REAL,
+                    bb_middle REAL,
+                    bb_lower REAL,
+                    atr REAL,
+                    vwap REAL,
+                    obv REAL,
+                    sma_20 REAL,
+                    sma_50 REAL,
+                    sma_200 REAL,
+                    volume_ratio REAL,
+                    spread_bps REAL,
+                    trend_strength REAL,
+                    mean_reversion_signal REAL,
+                    breakout_signal REAL,
+                    PRIMARY KEY (timestamp, symbol)
+                )
+            """)
+            
+            # Create index for efficient queries
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_features_symbol 
+                ON features (symbol, timestamp DESC)
+            """)
+            
             # Trades table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
@@ -175,6 +230,98 @@ class TradingDatabase:
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (symbol, timestamp, open_price, high, low, close, volume))
             conn.commit()
+    
+    def store_tick(self, timestamp: datetime, symbol: str, bid: float, ask: float, 
+                   last: float, bid_size: int = 0, ask_size: int = 0, 
+                   last_size: int = 0, volume: int = 0) -> None:
+        """Store tick data (Phase 2)."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO ticks 
+                (timestamp, symbol, bid, ask, last, bid_size, ask_size, last_size, volume)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (timestamp, symbol, bid, ask, last, bid_size, ask_size, last_size, volume))
+            conn.commit()
+    
+    def store_features(self, timestamp: datetime, symbol: str, features: Dict) -> None:
+        """Store calculated features (Phase 2)."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Extract features with defaults
+            cursor.execute("""
+                INSERT OR REPLACE INTO features 
+                (timestamp, symbol, rsi, macd_line, macd_signal, macd_histogram,
+                 bb_upper, bb_middle, bb_lower, atr, vwap, obv,
+                 sma_20, sma_50, sma_200, volume_ratio, spread_bps,
+                 trend_strength, mean_reversion_signal, breakout_signal)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                timestamp, symbol,
+                features.get('rsi'), features.get('macd_line'), features.get('macd_signal'),
+                features.get('macd_histogram'), features.get('bb_upper'), features.get('bb_middle'),
+                features.get('bb_lower'), features.get('atr'), features.get('vwap'),
+                features.get('obv'), features.get('sma_20'), features.get('sma_50'),
+                features.get('sma_200'), features.get('volume_ratio'), features.get('spread_bps'),
+                features.get('trend_strength'), features.get('mean_reversion_signal'),
+                features.get('breakout_signal')
+            ))
+            conn.commit()
+    
+    def get_recent_ticks(self, symbol: str, limit: int = 100) -> List[Dict]:
+        """Get recent tick data for a symbol (Phase 2)."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT timestamp, bid, ask, last, volume
+                FROM ticks
+                WHERE symbol = ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """, (symbol, limit))
+            
+            ticks = []
+            for row in cursor.fetchall():
+                ticks.append({
+                    'timestamp': row[0],
+                    'bid': row[1],
+                    'ask': row[2],
+                    'last': row[3],
+                    'volume': row[4]
+                })
+            
+            return ticks[::-1]  # Return in chronological order
+    
+    def get_latest_features(self, symbol: str) -> Optional[Dict]:
+        """Get latest features for a symbol (Phase 2)."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT timestamp, rsi, macd_line, macd_signal, bb_upper, bb_lower,
+                       atr, vwap, trend_strength, mean_reversion_signal, breakout_signal
+                FROM features
+                WHERE symbol = ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """, (symbol,))
+            
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'timestamp': row[0],
+                    'rsi': row[1],
+                    'macd_line': row[2],
+                    'macd_signal': row[3],
+                    'bb_upper': row[4],
+                    'bb_lower': row[5],
+                    'atr': row[6],
+                    'vwap': row[7],
+                    'trend_strength': row[8],
+                    'mean_reversion_signal': row[9],
+                    'breakout_signal': row[10]
+                }
+            return None
     
     def get_positions(self) -> List[Dict]:
         """Get all current positions."""

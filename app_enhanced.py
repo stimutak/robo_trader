@@ -172,12 +172,15 @@ def load_historical_data():
         # Load current positions from database
         db_positions = db.get_positions()
         for pos in db_positions:
+            current_price = pos.get('market_price', pos['avg_cost'])
+            unrealized_pnl = (current_price - pos['avg_cost']) * pos['quantity']
             positions[pos['symbol']] = {
                 'symbol': pos['symbol'],
                 'quantity': pos['quantity'],
                 'avg_price': pos['avg_cost'],
-                'current_price': pos.get('market_price', pos['avg_cost']),
-                'pnl': (pos.get('market_price', pos['avg_cost']) - pos['avg_cost']) * pos['quantity']
+                'current_price': current_price,
+                'pnl': unrealized_pnl,
+                'unrealized_pnl': unrealized_pnl  # Frontend expects this field
             }
         
         # Load today's P&L
