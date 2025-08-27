@@ -4,15 +4,15 @@ WebSocket server for real-time dashboard updates.
 
 import asyncio
 import json
-import logging
 from typing import Set, Optional, Dict, Any
 from datetime import datetime
 import websockets
 from websockets.server import WebSocketServerProtocol
 import threading
 from queue import Queue, Empty
+from robo_trader.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class WebSocketManager:
@@ -30,7 +30,10 @@ class WebSocketManager:
     async def register_client(self, websocket: WebSocketServerProtocol):
         """Register a new client connection."""
         self.clients.add(websocket)
-        logger.info(f"Client connected. Total clients: {len(self.clients)}")
+        # Log without including the websocket object itself to avoid serialization issues
+        logger.info(f"WebSocket client connected", 
+                   client_count=len(self.clients),
+                   remote_address=str(websocket.remote_address) if hasattr(websocket, 'remote_address') else None)
         
         # Send initial connection message
         await websocket.send(json.dumps({
@@ -43,10 +46,18 @@ class WebSocketManager:
         """Remove a client connection."""
         if websocket in self.clients:
             self.clients.remove(websocket)
-            logger.info(f"Client disconnected. Total clients: {len(self.clients)}")
+            # Log without including the websocket object itself to avoid serialization issues
+            logger.info(f"WebSocket client disconnected", 
+                       client_count=len(self.clients),
+                       remote_address=str(websocket.remote_address) if hasattr(websocket, 'remote_address') else None)
             
-    async def handle_client(self, websocket: WebSocketServerProtocol):
-        """Handle a client connection."""
+    async def handle_client(self, websocket: WebSocketServerProtocol, path: str = "/"):
+        """Handle a client connection.
+        
+        Args:
+            websocket: The WebSocket connection
+            path: The request path (required by websockets library)
+        """
         await self.register_client(websocket)
         try:
             # Keep connection alive and handle any incoming messages
@@ -104,6 +115,11 @@ class WebSocketManager:
     async def start_server(self):
         """Start the WebSocket server."""
         logger.info(f"Starting WebSocket server on ws://{self.host}:{self.port}")
+        
+        # Disable websockets library's own logging to prevent serialization issues
+        import logging as stdlib_logging
+        stdlib_logging.getLogger('websockets').setLevel(stdlib_logging.WARNING)
+        stdlib_logging.getLogger('websockets.server').setLevel(stdlib_logging.WARNING)
         
         # Create server and queue processor tasks
         server = await websockets.serve(

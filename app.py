@@ -4,7 +4,7 @@ RoboTrader Dashboard - Clean, ML-Integrated Interface
 Provides real-time monitoring of trading, ML models, and performance metrics
 """
 
-from flask import Flask, render_template_string, jsonify, request, Response
+from flask import Flask, render_template_string, jsonify, request, Response, send_file
 import asyncio
 import threading
 import json
@@ -129,6 +129,9 @@ HTML_TEMPLATE = '''
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>RoboTrader Dashboard</title>
+    <link rel="icon" type="image/x-icon" href="/favicon.ico?v=3">
+    <link rel="shortcut icon" type="image/x-icon" href="/favicon.ico?v=3">
+    <link rel="apple-touch-icon" href="/favicon.ico?v=3">
     <style>
         * {
             margin: 0;
@@ -421,6 +424,7 @@ HTML_TEMPLATE = '''
             <div class="tab active" onclick="switchTab('overview', this)">Overview</div>
             <div class="tab" onclick="switchTab('watchlist', this)">Watchlist</div>
             <div class="tab" onclick="switchTab('positions', this)">Positions</div>
+            <div class="tab" onclick="switchTab('trades', this)">Trade History</div>
             <div class="tab" onclick="switchTab('ml', this)">ML Models</div>
             <div class="tab" onclick="switchTab('performance', this)">Performance</div>
             <div class="tab" onclick="switchTab('logs', this)">Logs</div>
@@ -652,6 +656,74 @@ HTML_TEMPLATE = '''
             </div>
         </div>
         
+        <div id="trades-tab" class="tab-content" style="display: none;">
+            <div class="card">
+                <h3>Trade History Summary</h3>
+                <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 20px;">
+                    <div style="background: #1a1a1a; padding: 15px; border-radius: 8px;">
+                        <div style="font-size: 12px; color: #888; margin-bottom: 5px;">Total Trades</div>
+                        <div style="font-size: 20px; font-weight: bold;" id="total-trades">0</div>
+                    </div>
+                    <div style="background: #1a1a1a; padding: 15px; border-radius: 8px;">
+                        <div style="font-size: 12px; color: #888; margin-bottom: 5px;">Buy Trades</div>
+                        <div style="font-size: 20px; font-weight: bold; color: #4ade80;" id="buy-trades">0</div>
+                    </div>
+                    <div style="background: #1a1a1a; padding: 15px; border-radius: 8px;">
+                        <div style="font-size: 12px; color: #888; margin-bottom: 5px;">Sell Trades</div>
+                        <div style="font-size: 20px; font-weight: bold; color: #f87171;" id="sell-trades">0</div>
+                    </div>
+                    <div style="background: #1a1a1a; padding: 15px; border-radius: 8px;">
+                        <div style="font-size: 12px; color: #888; margin-bottom: 5px;">Total Volume</div>
+                        <div style="font-size: 20px; font-weight: bold;" id="total-volume">$0</div>
+                    </div>
+                    <div style="background: #1a1a1a; padding: 15px; border-radius: 8px;">
+                        <div style="font-size: 12px; color: #888; margin-bottom: 5px;">Total Commission</div>
+                        <div style="font-size: 20px; font-weight: bold; color: #fbbf24;" id="total-commission">$0</div>
+                    </div>
+                    <div style="background: #1a1a1a; padding: 15px; border-radius: 8px;">
+                        <div style="font-size: 12px; color: #888; margin-bottom: 5px;">Avg Trade Size</div>
+                        <div style="font-size: 20px; font-weight: bold;" id="avg-trade-size">$0</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="table-container">
+                <div style="margin-bottom: 15px;">
+                    <label style="color: #888; margin-right: 10px;">Filter by Symbol:</label>
+                    <select id="trade-symbol-filter" onchange="loadTrades()" style="background: #1a1a1a; color: #fff; border: 1px solid #2a2a2a; padding: 5px 10px; border-radius: 4px;">
+                        <option value="">All Symbols</option>
+                    </select>
+                    <label style="color: #888; margin-left: 20px; margin-right: 10px;">Days:</label>
+                    <select id="trade-days-filter" onchange="loadTrades()" style="background: #1a1a1a; color: #fff; border: 1px solid #2a2a2a; padding: 5px 10px; border-radius: 4px;">
+                        <option value="1">Last 24 Hours</option>
+                        <option value="7">Last Week</option>
+                        <option value="30" selected>Last 30 Days</option>
+                        <option value="90">Last 90 Days</option>
+                        <option value="365">Last Year</option>
+                    </select>
+                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Symbol</th>
+                            <th>Side</th>
+                            <th>Quantity</th>
+                            <th>Price</th>
+                            <th>Notional</th>
+                            <th>Commission</th>
+                            <th>Slippage</th>
+                        </tr>
+                    </thead>
+                    <tbody id="trades-table">
+                        <tr>
+                            <td colspan="8" style="text-align: center; color: #666;">Loading trades...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
         <div id="logs-tab" class="tab-content" style="display: none;">
             <div class="log-container" id="log-container">
                 <div class="log-entry">
@@ -691,6 +763,10 @@ HTML_TEMPLATE = '''
                 loadPerformanceData();
             } else if (tab === 'positions') {
                 loadPositions();
+            } else if (tab === 'watchlist') {
+                loadWatchlist();
+            } else if (tab === 'trades') {
+                loadTrades();
             }
         }
         
@@ -780,6 +856,79 @@ HTML_TEMPLATE = '''
                 updatePositionsTable(data.positions);
             } catch (error) {
                 console.error('Error loading positions:', error);
+            }
+        }
+        
+        async function loadTrades() {
+            try {
+                const symbolFilter = document.getElementById('trade-symbol-filter').value;
+                const daysFilter = document.getElementById('trade-days-filter').value;
+                
+                let url = `/api/trades?days=${daysFilter}`;
+                if (symbolFilter) {
+                    url += `&symbol=${symbolFilter}`;
+                }
+                
+                const response = await fetch(url);
+                const data = await response.json();
+                
+                // Update summary stats
+                if (data.summary) {
+                    document.getElementById('total-trades').textContent = data.summary.total_trades || 0;
+                    document.getElementById('buy-trades').textContent = data.summary.buy_trades || 0;
+                    document.getElementById('sell-trades').textContent = data.summary.sell_trades || 0;
+                    document.getElementById('total-volume').textContent = `$${(data.summary.total_volume || 0).toFixed(2)}`;
+                    document.getElementById('total-commission').textContent = `$${(data.summary.total_commission || 0).toFixed(2)}`;
+                    document.getElementById('avg-trade-size').textContent = `$${(data.summary.avg_trade_size || 0).toFixed(2)}`;
+                }
+                
+                // Update trades table
+                const tbody = document.getElementById('trades-table');
+                if (data.trades && data.trades.length > 0) {
+                    // Update symbol filter options if needed
+                    const symbols = [...new Set(data.trades.map(t => t.symbol))];
+                    updateSymbolFilter(symbols);
+                    
+                    tbody.innerHTML = data.trades.map(trade => {
+                        const time = new Date(trade.timestamp).toLocaleString();
+                        const sideColor = trade.side === 'BUY' ? '#4ade80' : '#f87171';
+                        return `
+                            <tr>
+                                <td>${time}</td>
+                                <td>${trade.symbol}</td>
+                                <td style="color: ${sideColor}; font-weight: bold;">${trade.side}</td>
+                                <td>${trade.quantity}</td>
+                                <td>$${trade.price.toFixed(2)}</td>
+                                <td>$${trade.notional.toFixed(2)}</td>
+                                <td>$${trade.commission.toFixed(2)}</td>
+                                <td>${(trade.slippage * 100).toFixed(2)}%</td>
+                            </tr>
+                        `;
+                    }).join('');
+                } else {
+                    tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: #666;">No trades found</td></tr>';
+                }
+            } catch (error) {
+                console.error('Error loading trades:', error);
+                document.getElementById('trades-table').innerHTML = 
+                    '<tr><td colspan="8" style="text-align: center; color: #f87171;">Error loading trades</td></tr>';
+            }
+        }
+        
+        function updateSymbolFilter(symbols) {
+            const filter = document.getElementById('trade-symbol-filter');
+            const currentValue = filter.value;
+            
+            // Only update if we have new symbols
+            if (symbols.length > 0 && filter.options.length <= 1) {
+                filter.innerHTML = '<option value="">All Symbols</option>';
+                symbols.sort().forEach(symbol => {
+                    const option = document.createElement('option');
+                    option.value = symbol;
+                    option.textContent = symbol;
+                    filter.appendChild(option);
+                });
+                filter.value = currentValue; // Restore previous selection
             }
         }
         
@@ -1098,6 +1247,18 @@ def index():
     """Main dashboard page"""
     return render_template_string(HTML_TEMPLATE)
 
+@app.route('/favicon.ico')
+def favicon():
+    """Serve the favicon with no-cache headers"""
+    import os
+    from flask import make_response
+    favicon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'robotrader_favicon.ico')
+    response = make_response(send_file(favicon_path, mimetype='image/x-icon'))
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
+
 @app.route('/api/health')
 def health():
     """Health check endpoint"""
@@ -1106,14 +1267,77 @@ def health():
 @app.route('/api/status')
 @requires_auth
 def status():
-    """Get current system status"""
-    return jsonify({
-        'trading_status': trading_status,
-        'pnl': pnl,
-        'metrics': performance_metrics,
-        'positions_count': len(positions),
-        'ml_status': ml_metrics
-    })
+    """Get current system status from database"""
+    from robo_trader.database_async import AsyncTradingDatabase
+    import asyncio
+    
+    async def fetch_status():
+        db = AsyncTradingDatabase()
+        await db.initialize()
+        try:
+            # Get real positions count
+            positions_data = await db.get_positions()
+            positions_count = len(positions_data)
+            
+            # Calculate real P&L from positions
+            total_cost = sum(p['quantity'] * p['avg_cost'] for p in positions_data)
+            total_value = 0
+            
+            for pos in positions_data:
+                # Get latest market data for current price
+                market_data = await db.get_latest_market_data(pos['symbol'], limit=1)
+                current_price = market_data[0]['close'] if market_data else pos['avg_cost']
+                total_value += pos['quantity'] * current_price
+            
+            unrealized_pnl = total_value - total_cost
+            pnl_pct = (unrealized_pnl / total_cost * 100) if total_cost > 0 else 0
+            
+            # Get account info
+            account = await db.get_account_info()
+            
+            real_pnl = {
+                'daily': account.get('daily_pnl', 0) if account else 0,
+                'total': account.get('realized_pnl', 0) if account else 0,
+                'unrealized': unrealized_pnl
+            }
+            
+            # Calculate basic metrics
+            run_rate = unrealized_pnl * 252 if unrealized_pnl != 0 else 0  # Annualized
+            real_metrics = {
+                'sharpe_ratio': 0.0,  # TODO: Calculate from returns
+                'win_rate': 0.0,  # TODO: Calculate from closed trades
+                'profit_factor': 0.0,  # TODO: Calculate from P&L
+                'max_drawdown': 0.0,  # TODO: Calculate from equity curve
+                'total_value': total_value,
+                'total_cost': total_cost,
+                'pnl_pct': pnl_pct,
+                'run_rate': run_rate
+            }
+            
+            return {
+                'trading_status': trading_status,
+                'pnl': real_pnl,
+                'metrics': real_metrics,
+                'positions_count': positions_count,
+                'ml_status': ml_metrics
+            }
+        finally:
+            await db.close()
+    
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return jsonify(loop.run_until_complete(fetch_status()))
+    except Exception as e:
+        logger.error(f"Error fetching status: {e}")
+        # Fallback to in-memory values
+        return jsonify({
+            'trading_status': trading_status,
+            'pnl': pnl,
+            'metrics': performance_metrics,
+            'positions_count': len(positions),
+            'ml_status': ml_metrics
+        })
 
 @app.route('/api/pnl')
 @requires_auth
@@ -1126,15 +1350,34 @@ def get_pnl():
         db = AsyncTradingDatabase()
         await db.initialize()
         try:
-            # Get account info from database
-            account = await db.get_account_info()
-            if account:
-                return {
-                    'daily': account.get('daily_pnl', 0),
-                    'total': account.get('realized_pnl', 0),
-                    'unrealized': account.get('unrealized_pnl', 0)
-                }
-            return pnl  # Return default if no account data
+            # Calculate P&L from actual positions and trades
+            positions_data = await db.get_positions()
+            
+            # Calculate total cost and current value
+            total_cost = 0
+            total_value = 0
+            
+            for pos in positions_data:
+                cost = pos['quantity'] * pos['avg_cost']
+                total_cost += cost
+                
+                # Get latest market data for current price
+                market_data = await db.get_latest_market_data(pos['symbol'], limit=1)
+                current_price = market_data[0]['close'] if market_data else pos['avg_cost']
+                value = pos['quantity'] * current_price
+                total_value += value
+            
+            # Calculate unrealized P&L
+            unrealized_pnl = total_value - total_cost if total_cost > 0 else 0
+            
+            # For daily P&L, use unrealized for now (should compare to yesterday's close)
+            daily_pnl = unrealized_pnl
+            
+            return {
+                'daily': daily_pnl,
+                'total': 0,  # Realized P&L - need to track closed positions
+                'unrealized': unrealized_pnl
+            }
         finally:
             await db.close()
     
@@ -1318,6 +1561,102 @@ def performance():
             'max_drawdown': -0.12
         }
     })
+
+@app.route('/api/trades')
+@requires_auth
+def get_trades():
+    """Get trade history from database"""
+    from robo_trader.database_async import AsyncTradingDatabase
+    import asyncio
+    
+    async def fetch_trades():
+        db = AsyncTradingDatabase()
+        await db.initialize()
+        try:
+            # Get trades with optional filtering
+            days = request.args.get('days', 30, type=int)
+            symbol = request.args.get('symbol', None)
+            
+            async with db.get_connection() as conn:
+                if symbol:
+                    query = """
+                        SELECT id, symbol, side, quantity, price, timestamp, 
+                               slippage, commission, 
+                               quantity * price as notional,
+                               CASE 
+                                   WHEN side = 'BUY' THEN -quantity * price - commission
+                                   WHEN side = 'SELL' THEN quantity * price - commission
+                                   ELSE 0
+                               END as cash_impact
+                        FROM trades 
+                        WHERE symbol = ? 
+                        AND timestamp >= datetime('now', '-' || ? || ' days')
+                        ORDER BY timestamp DESC
+                    """
+                    cursor = await conn.execute(query, (symbol, days))
+                else:
+                    query = """
+                        SELECT id, symbol, side, quantity, price, timestamp, 
+                               slippage, commission,
+                               quantity * price as notional,
+                               CASE 
+                                   WHEN side = 'BUY' THEN -quantity * price - commission
+                                   WHEN side = 'SELL' THEN quantity * price - commission
+                                   ELSE 0
+                               END as cash_impact
+                        FROM trades 
+                        WHERE timestamp >= datetime('now', '-' || ? || ' days')
+                        ORDER BY timestamp DESC
+                    """
+                    cursor = await conn.execute(query, (days,))
+                
+                trades = await cursor.fetchall()
+                
+                # Convert to list of dicts
+                trade_list = []
+                for trade in trades:
+                    trade_list.append({
+                        'id': trade[0],
+                        'symbol': trade[1],
+                        'side': trade[2],
+                        'quantity': trade[3],
+                        'price': trade[4],
+                        'timestamp': trade[5],
+                        'slippage': trade[6],
+                        'commission': trade[7],
+                        'notional': trade[8],
+                        'cash_impact': trade[9]
+                    })
+                
+                # Calculate summary statistics
+                total_trades = len(trade_list)
+                total_volume = sum(t['notional'] for t in trade_list)
+                total_commission = sum(t['commission'] for t in trade_list)
+                buy_trades = [t for t in trade_list if t['side'] == 'BUY']
+                sell_trades = [t for t in trade_list if t['side'] == 'SELL']
+                
+                return {
+                    'trades': trade_list,
+                    'summary': {
+                        'total_trades': total_trades,
+                        'buy_trades': len(buy_trades),
+                        'sell_trades': len(sell_trades),
+                        'total_volume': total_volume,
+                        'total_commission': total_commission,
+                        'avg_trade_size': total_volume / total_trades if total_trades > 0 else 0
+                    }
+                }
+        finally:
+            await db.close()
+    
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(fetch_trades())
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Error fetching trades: {e}")
+        return jsonify({'trades': [], 'summary': {}})
 
 @app.route('/api/start', methods=['POST'])
 @requires_auth
