@@ -336,7 +336,7 @@ class AsyncIBKRClient:
     async def get_positions(self) -> List[Dict[str, Any]]:
         """Get current positions."""
         async with self.pool.acquire() as ib:
-            positions = await ib.positionsAsync()
+            positions = await ib.reqPositionsAsync()
             return [
                 {
                     "symbol": pos.contract.symbol,
