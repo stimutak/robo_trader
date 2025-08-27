@@ -26,6 +26,7 @@ from .correlation import CorrelationTracker
 from .database_async import AsyncTradingDatabase
 from .execution import Order, PaperExecutor
 from .logger import get_logger
+from .market_hours import is_market_open, get_market_session, seconds_until_market_open
 from .monitoring.performance import PerformanceMonitor, Timer
 from .portfolio import Portfolio
 from .risk import Position, RiskManager
@@ -163,6 +164,12 @@ class AsyncRunner:
 
     async def fetch_and_store_data(self, symbol: str) -> Optional[pd.DataFrame]:
         """Fetch market data for a symbol and store in database."""
+        # Check if market is open before fetching data
+        if not is_market_open():
+            session = get_market_session()
+            logger.debug(f"Market is {session}, skipping data fetch for {symbol}")
+            return None
+        
         try:
             with Timer("data_fetch", self.monitor):
                 df = await self.client.fetch_recent_bars(
@@ -216,6 +223,15 @@ class AsyncRunner:
                 executed=False,
                 message="No data available",
             )
+        
+        # Send real-time price update via WebSocket
+        try:
+            from robo_trader.websocket_server import ws_manager
+            if df is not None and not df.empty:
+                latest_price = float(df['close'].iloc[-1])
+                ws_manager.send_market_update(symbol, latest_price)
+        except Exception as e:
+            logger.debug(f"Could not send WebSocket update: {e}")
 
         # Generate trading signal
         with Timer("signal_generation", self.monitor):
@@ -244,6 +260,14 @@ class AsyncRunner:
                 "BUY" if signal_value == 1 else "SELL",
                 abs(signal_value),
             )
+            
+            # Send signal update via WebSocket
+            try:
+                from robo_trader.websocket_server import ws_manager
+                signal_type = "BUY" if signal_value == 1 else "SELL"
+                ws_manager.send_signal_update(symbol, signal_type, abs(signal_value))
+            except Exception as e:
+                logger.debug(f"Could not send signal WebSocket update: {e}")
 
         # Execute trades based on signal
         executed = False
@@ -301,6 +325,13 @@ class AsyncRunner:
                     executed = True
                     quantity = qty
                     message = f"Bought {qty} shares at ${fill_price:.2f}"
+                    
+                    # Send trade update via WebSocket
+                    try:
+                        from robo_trader.websocket_server import ws_manager
+                        ws_manager.send_trade_update(symbol, "BUY", qty, fill_price)
+                    except Exception as e:
+                        logger.debug(f"Could not send trade WebSocket update: {e}")
                 else:
                     message = f"Buy order failed: {res.msg}"
             else:
@@ -398,6 +429,20 @@ class AsyncRunner:
         """Main run method - process all symbols and update account."""
         await self.setup()
         try:
+            # Check market status
+            if not is_market_open():
+                session = get_market_session()
+                seconds_to_open = seconds_until_market_open()
+                hours_to_open = seconds_to_open / 3600
+                logger.warning(
+                    f"Market is currently {session}. "
+                    f"Next market open in {hours_to_open:.1f} hours. "
+                    f"Skipping data collection for equities."
+                )
+                # Still process symbols but won't fetch new data
+            else:
+                logger.info(f"Market is open, proceeding with data collection")
+            
             symbols_to_process = symbols if symbols else self.cfg.symbols
             logger.info(
                 f"Processing {len(symbols_to_process)} symbols "
@@ -461,8 +506,99 @@ async def run_once(
         max_daily_notional=max_daily_notional,
         default_cash=default_cash,
         max_concurrent_symbols=max_concurrent,
+        use_correlation_sizing=False,  # Disabled due to bug
     )
     await runner.run(symbols)
+
+
+async def run_continuous(
+    symbols: Optional[List[str]] = None,
+    duration: str = "10 D",
+    bar_size: str = "30 mins",
+    sma_fast: int = 10,
+    sma_slow: int = 20,
+    slippage_bps: float = 0.0,
+    max_order_notional: Optional[float] = None,
+    max_daily_notional: Optional[float] = None,
+    default_cash: Optional[float] = None,
+    max_concurrent: int = 8,
+    interval_seconds: int = 300,
+) -> None:
+    """Run the trading system continuously with market hours checking."""
+    import signal
+    import pytz
+    from datetime import datetime
+    
+    # Setup signal handling for graceful shutdown
+    shutdown_flag = False
+    
+    def signal_handler(signum, frame):
+        nonlocal shutdown_flag
+        logger.info(f"Received signal {signum}, initiating shutdown...")
+        shutdown_flag = True
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    logger.info("Starting continuous trading system...")
+    logger.info("Press Ctrl+C to stop gracefully")
+    
+    while not shutdown_flag:
+        eastern = pytz.timezone('US/Eastern')
+        current_time = datetime.now(eastern)
+        
+        # Check market status but still run (data might be useful even after hours)
+        if not is_market_open():
+            session = get_market_session()
+            seconds_to_open = seconds_until_market_open()
+            
+            # During extended hours or shortly before open, run more frequently
+            if session in ["after-hours", "pre-market"] or seconds_to_open < 3600:
+                wait_time = min(interval_seconds, 300)  # Max 5 minutes
+            else:
+                # Market closed, check less frequently
+                wait_time = min(1800, seconds_to_open // 2)  # Max 30 minutes
+                logger.info(
+                    f"Market {session}. Next open in {seconds_to_open/3600:.1f} hours. "
+                    f"Waiting {wait_time/60:.1f} minutes..."
+                )
+                await asyncio.sleep(wait_time)
+                continue
+        
+        try:
+            logger.info(f"Starting trading cycle at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+            
+            # Run the trading system
+            runner = AsyncRunner(
+                duration=duration,
+                bar_size=bar_size,
+                sma_fast=sma_fast,
+                sma_slow=sma_slow,
+                slippage_bps=slippage_bps,
+                max_order_notional=max_order_notional,
+                max_daily_notional=max_daily_notional,
+                default_cash=default_cash,
+                max_concurrent_symbols=max_concurrent,
+                use_correlation_sizing=False,  # Disabled due to bug
+            )
+            
+            await runner.run(symbols)
+            
+            # Wait before next iteration
+            if not shutdown_flag and is_market_open():
+                logger.info(f"Waiting {interval_seconds/60:.1f} minutes before next iteration...")
+                await asyncio.sleep(interval_seconds)
+                
+        except asyncio.CancelledError:
+            logger.info("Trading loop cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in trading cycle: {e}")
+            if not shutdown_flag:
+                logger.info("Waiting 1 minute before retry...")
+                await asyncio.sleep(60)
+    
+    logger.info("Trading system shutdown complete")
 
 
 def main() -> None:
@@ -516,6 +652,17 @@ def main() -> None:
         default=8,
         help="Max concurrent symbol processing (default: 8)",
     )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run once and exit (default: run continuously)",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=300,
+        help="Seconds between trading cycles (default: 300 = 5 minutes)",
+    )
     args = parser.parse_args()
 
     cfg = load_config()
@@ -528,20 +675,39 @@ def main() -> None:
         else None
     )
 
-    asyncio.run(
-        run_once(
-            symbols=override_symbols,
-            duration=args.duration,
-            bar_size=args.bar_size,
-            sma_fast=args.sma_fast,
-            sma_slow=args.sma_slow,
-            slippage_bps=args.slippage_bps,
-            max_order_notional=args.max_order_notional,
-            max_daily_notional=args.max_daily_notional,
-            default_cash=args.default_cash,
-            max_concurrent=args.max_concurrent,
+    if args.once:
+        # Run once and exit (for testing/debugging)
+        asyncio.run(
+            run_once(
+                symbols=override_symbols,
+                duration=args.duration,
+                bar_size=args.bar_size,
+                sma_fast=args.sma_fast,
+                sma_slow=args.sma_slow,
+                slippage_bps=args.slippage_bps,
+                max_order_notional=args.max_order_notional,
+                max_daily_notional=args.max_daily_notional,
+                default_cash=args.default_cash,
+                max_concurrent=args.max_concurrent,
+            )
         )
-    )
+    else:
+        # Run continuously (default behavior)
+        asyncio.run(
+            run_continuous(
+                symbols=override_symbols,
+                duration=args.duration,
+                bar_size=args.bar_size,
+                sma_fast=args.sma_fast,
+                sma_slow=args.sma_slow,
+                slippage_bps=args.slippage_bps,
+                max_order_notional=args.max_order_notional,
+                max_daily_notional=args.max_daily_notional,
+                default_cash=args.default_cash,
+                max_concurrent=args.max_concurrent,
+                interval_seconds=args.interval,
+            )
+        )
 
 
 if __name__ == "__main__":

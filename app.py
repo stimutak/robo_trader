@@ -29,6 +29,7 @@ from robo_trader.database_async import AsyncTradingDatabase
 from robo_trader.analytics.performance import PerformanceAnalyzer
 from robo_trader.features.feature_pipeline import FeaturePipeline
 from robo_trader.ml.model_trainer import ModelTrainer
+from robo_trader.websocket_server import ws_manager
 
 logger = get_logger(__name__)
 app = Flask(__name__)
@@ -974,10 +975,117 @@ HTML_TEMPLATE = '''
             return Math.floor(diff / 86400000) + ' days ago';
         }
         
+        // WebSocket connection for real-time updates
+        let ws = null;
+        let reconnectInterval = null;
+        
+        function connectWebSocket() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                return; // Already connected
+            }
+            
+            ws = new WebSocket('ws://localhost:8765');
+            
+            ws.onopen = function() {
+                console.log('WebSocket connected');
+                addLog('Real-time connection established');
+                clearInterval(reconnectInterval);
+                reconnectInterval = null;
+                
+                // Subscribe to all symbols
+                ws.send(JSON.stringify({
+                    type: 'subscribe',
+                    symbols: ['*']  // Subscribe to all
+                }));
+            };
+            
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                handleRealtimeUpdate(data);
+            };
+            
+            ws.onerror = function(error) {
+                console.error('WebSocket error:', error);
+            };
+            
+            ws.onclose = function() {
+                console.log('WebSocket disconnected');
+                addLog('Real-time connection lost - reconnecting...');
+                // Try to reconnect every 5 seconds
+                if (!reconnectInterval) {
+                    reconnectInterval = setInterval(connectWebSocket, 5000);
+                }
+            };
+        }
+        
+        function handleRealtimeUpdate(data) {
+            switch(data.type) {
+                case 'market_data':
+                    updateMarketPrice(data.symbol, data.price, data.bid, data.ask, data.volume);
+                    break;
+                case 'trade':
+                    handleTradeUpdate(data);
+                    break;
+                case 'positions':
+                    updatePositionsFromWS(data.positions);
+                    break;
+                case 'signal':
+                    handleSignalUpdate(data);
+                    break;
+                case 'performance':
+                    updateMetrics(data.metrics);
+                    break;
+            }
+        }
+        
+        function updateMarketPrice(symbol, price, bid, ask, volume) {
+            // Update watchlist prices in real-time
+            const rows = document.querySelectorAll('#watchlist-tbody tr');
+            rows.forEach(row => {
+                const symbolCell = row.cells[0];
+                if (symbolCell && symbolCell.textContent === symbol) {
+                    const priceCell = row.cells[1];
+                    if (priceCell) {
+                        const oldPrice = parseFloat(priceCell.textContent.replace('$', ''));
+                        priceCell.textContent = `$${price.toFixed(2)}`;
+                        
+                        // Flash color based on price change
+                        if (oldPrice && oldPrice !== price) {
+                            priceCell.style.transition = 'background-color 0.3s';
+                            priceCell.style.backgroundColor = price > oldPrice ? '#00ff0033' : '#ff000033';
+                            setTimeout(() => {
+                                priceCell.style.backgroundColor = '';
+                            }, 300);
+                        }
+                    }
+                }
+            });
+        }
+        
+        function handleTradeUpdate(data) {
+            const msg = `${data.side} ${data.quantity} ${data.symbol} @ $${data.price.toFixed(2)}`;
+            addLog(`Trade executed: ${msg}`);
+            // Refresh positions after trade
+            loadPositions();
+            loadPnL();
+        }
+        
+        function handleSignalUpdate(data) {
+            addLog(`Signal: ${data.signal} for ${data.symbol} (strength: ${data.strength.toFixed(2)})`);
+        }
+        
+        function updatePositionsFromWS(positions) {
+            // Update positions without full refresh
+            if (currentTab === 'positions') {
+                updatePositionsTable(positions);
+            }
+        }
+        
         // Initialize on load
         window.onload = () => {
             refreshData();
-            setInterval(refreshData, 5000); // Refresh every 5 seconds
+            connectWebSocket(); // Connect to WebSocket
+            setInterval(refreshData, 5000); // Keep polling as fallback
         };
     </script>
 </body>
@@ -1265,6 +1373,10 @@ def get_logs():
 if __name__ == '__main__':
     # Initialize components
     logger.info("Starting RoboTrader Dashboard...")
+    
+    # Start WebSocket server
+    logger.info("Starting WebSocket server...")
+    ws_manager.start()
     
     # Wait for async components to initialize
     time.sleep(2)
