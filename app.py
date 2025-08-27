@@ -418,9 +418,10 @@ HTML_TEMPLATE = '''
         
         <div class="tabs">
             <div class="tab active" onclick="switchTab('overview', this)">Overview</div>
+            <div class="tab" onclick="switchTab('watchlist', this)">Watchlist</div>
+            <div class="tab" onclick="switchTab('positions', this)">Positions</div>
             <div class="tab" onclick="switchTab('ml', this)">ML Models</div>
             <div class="tab" onclick="switchTab('performance', this)">Performance</div>
-            <div class="tab" onclick="switchTab('positions', this)">Positions</div>
             <div class="tab" onclick="switchTab('logs', this)">Logs</div>
         </div>
         
@@ -602,8 +603,32 @@ HTML_TEMPLATE = '''
             </div>
         </div>
         
+        <div id="watchlist-tab" class="tab-content" style="display: none;">
+            <div class="table-container">
+                <h3>Watched Symbols</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Symbol</th>
+                            <th>Current Price</th>
+                            <th>Position</th>
+                            <th>Avg Cost</th>
+                            <th>P&L</th>
+                            <th>Notes</th>
+                        </tr>
+                    </thead>
+                    <tbody id="watchlist-table">
+                        <tr>
+                            <td colspan="6" style="text-align: center; color: #666;">Loading watchlist...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
         <div id="positions-tab" class="tab-content" style="display: none;">
             <div class="table-container">
+                <h3>Open Positions</h3>
                 <table>
                     <thead>
                         <tr>
@@ -708,6 +733,7 @@ HTML_TEMPLATE = '''
             await Promise.all([
                 loadStatus(),
                 loadPnL(),
+                loadWatchlist(),
                 loadPositions(),
                 loadMLData(),
                 loadPerformanceData()
@@ -733,6 +759,16 @@ HTML_TEMPLATE = '''
                 updatePnL(data);
             } catch (error) {
                 console.error('Error loading P&L:', error);
+            }
+        }
+        
+        async function loadWatchlist() {
+            try {
+                const response = await fetch('/api/watchlist');
+                const data = await response.json();
+                updateWatchlistTable(data.watchlist);
+            } catch (error) {
+                console.error('Error loading watchlist:', error);
             }
         }
         
@@ -831,6 +867,31 @@ HTML_TEMPLATE = '''
                     </tr>
                 `).join('');
             }
+        }
+        
+        function updateWatchlistTable(watchlist) {
+            const tbody = document.getElementById('watchlist-table');
+            if (!watchlist || watchlist.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: #666;">No symbols in watchlist</td></tr>';
+                return;
+            }
+            
+            tbody.innerHTML = watchlist.map(item => {
+                const pnl = item.quantity > 0 ? (item.current_price - item.avg_cost) * item.quantity : 0;
+                const pnlDisplay = item.quantity > 0 ? `$${pnl.toFixed(2)}` : '-';
+                const pnlClass = pnl >= 0 ? 'positive' : 'negative';
+                
+                return `
+                    <tr>
+                        <td><strong>${item.symbol}</strong></td>
+                        <td>$${item.current_price.toFixed(2)}</td>
+                        <td>${item.quantity || '-'}</td>
+                        <td>${item.avg_cost > 0 ? '$' + item.avg_cost.toFixed(2) : '-'}</td>
+                        <td class="${item.quantity > 0 ? pnlClass : ''}">${pnlDisplay}</td>
+                        <td>${item.notes || ''}</td>
+                    </tr>
+                `;
+            }).join('');
         }
         
         function updatePositionsTable(positions) {
@@ -1033,6 +1094,55 @@ def get_positions():
     except Exception as e:
         logger.error(f"Error fetching real positions: {e}")
         return jsonify({'positions': []})
+
+@app.route('/api/watchlist')
+@requires_auth
+def get_watchlist():
+    """Get watchlist with latest prices"""
+    from robo_trader.database_async import AsyncTradingDatabase
+    import asyncio
+    
+    async def fetch_watchlist():
+        db = AsyncTradingDatabase()
+        await db.initialize()
+        try:
+            # Get watchlist symbols
+            async with db.get_connection() as conn:
+                cursor = await conn.execute("SELECT symbol, notes FROM watchlist ORDER BY symbol")
+                watchlist = await cursor.fetchall()
+            
+            # Get latest prices and positions for each symbol
+            watchlist_data = []
+            for symbol, notes in watchlist:
+                # Get latest market data
+                market_data = await db.get_latest_market_data(symbol, limit=1)
+                current_price = market_data[0]['close'] if market_data else 0
+                
+                # Check if we have a position
+                positions = await db.get_positions()
+                position = next((p for p in positions if p['symbol'] == symbol), None)
+                
+                watchlist_data.append({
+                    'symbol': symbol,
+                    'current_price': current_price,
+                    'quantity': position['quantity'] if position else 0,
+                    'avg_cost': position['avg_cost'] if position else 0,
+                    'notes': notes or '',
+                    'has_position': position is not None
+                })
+            
+            return watchlist_data
+        finally:
+            await db.close()
+    
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        watchlist = loop.run_until_complete(fetch_watchlist())
+        return jsonify({'watchlist': watchlist})
+    except Exception as e:
+        logger.error(f"Error fetching watchlist: {e}")
+        return jsonify({'watchlist': []})
 
 @app.route('/api/ml/status')
 @requires_auth
