@@ -28,6 +28,14 @@ from .execution import Order, PaperExecutor
 from .logger import get_logger
 from .market_hours import is_market_open, get_market_session, seconds_until_market_open
 from .monitoring.performance import PerformanceMonitor, Timer
+
+# Import WebSocket client for real-time updates
+try:
+    from .websocket_client import ws_client
+    WEBSOCKET_ENABLED = True
+except ImportError:
+    ws_client = None
+    WEBSOCKET_ENABLED = False
 from .portfolio import Portfolio
 from .risk import Position, RiskManager
 from .strategies import sma_crossover_signals
@@ -225,16 +233,13 @@ class AsyncRunner:
             )
         
         # Send real-time price update via WebSocket
-        try:
-            from robo_trader.websocket_client import ws_client
-            if df is not None and not df.empty:
+        if WEBSOCKET_ENABLED and ws_client and df is not None and not df.empty:
+            try:
                 latest_price = float(df['close'].iloc[-1])
                 ws_client.send_market_update(symbol, latest_price)
-                logger.debug(f"Sent WebSocket update for {symbol}: ${latest_price:.2f}")
-        except ImportError as e:
-            logger.debug(f"WebSocket client not available: {e}")
-        except Exception as e:
-            logger.debug(f"Could not send WebSocket update: {e}")
+                logger.info(f"Sent WebSocket update for {symbol}: ${latest_price:.2f}")
+            except Exception as e:
+                logger.error(f"Could not send WebSocket update: {e}")
 
         # Generate trading signal
         with Timer("signal_generation", self.monitor):
@@ -265,12 +270,12 @@ class AsyncRunner:
             )
             
             # Send signal update via WebSocket
-            try:
-                from robo_trader.websocket_client import ws_client
-                signal_type = "BUY" if signal_value == 1 else "SELL"
-                ws_client.send_signal_update(symbol, signal_type, abs(signal_value))
-            except Exception as e:
-                logger.debug(f"Could not send signal WebSocket update: {e}")
+            if WEBSOCKET_ENABLED and ws_client:
+                try:
+                    signal_type = "BUY" if signal_value == 1 else "SELL"
+                    ws_client.send_signal_update(symbol, signal_type, abs(signal_value))
+                except Exception as e:
+                    logger.debug(f"Could not send signal WebSocket update: {e}")
 
         # Execute trades based on signal
         executed = False
@@ -330,11 +335,11 @@ class AsyncRunner:
                     message = f"Bought {qty} shares at ${fill_price:.2f}"
                     
                     # Send trade update via WebSocket
-                    try:
-                        from robo_trader.websocket_client import ws_client
-                        ws_client.send_trade_update(symbol, "BUY", qty, fill_price)
-                    except Exception as e:
-                        logger.debug(f"Could not send trade WebSocket update: {e}")
+                    if WEBSOCKET_ENABLED and ws_client:
+                        try:
+                            ws_client.send_trade_update(symbol, "BUY", qty, fill_price)
+                        except Exception as e:
+                            logger.debug(f"Could not send trade WebSocket update: {e}")
                 else:
                     message = f"Buy order failed: {res.msg}"
             else:

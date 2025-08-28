@@ -64,10 +64,16 @@ class WebSocketManager:
             async for message in websocket:
                 try:
                     data = json.loads(message)
-                    # Handle client messages if needed (e.g., subscribe to specific symbols)
+                    logger.debug(f"Received message from client: {data.get('type', 'unknown')}")
+                    
+                    # Handle client messages
                     if data.get("type") == "subscribe":
                         symbols = data.get("symbols", [])
                         logger.info(f"Client subscribed to symbols: {symbols}")
+                    # Broadcast messages from runner client to all other clients
+                    elif data.get("type") in ["market_data", "trade", "signal"]:
+                        logger.info(f"Broadcasting {data.get('type')} update for {data.get('symbol')}")
+                        await self.broadcast(data)
                 except json.JSONDecodeError:
                     logger.error(f"Invalid JSON received: {message}")
         except websockets.exceptions.ConnectionClosed:

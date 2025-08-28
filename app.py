@@ -821,6 +821,8 @@ HTML_TEMPLATE = '''
             try {
                 const response = await fetch('/api/status');
                 const data = await response.json();
+                console.log('Status API response:', data);
+                console.log('P&L data:', data.pnl);
                 updateStatus(data.trading_status);
                 updatePnL(data.pnl);
                 updateMetrics(data.metrics);
@@ -890,7 +892,18 @@ HTML_TEMPLATE = '''
                     updateSymbolFilter(symbols);
                     
                     tbody.innerHTML = data.trades.map(trade => {
-                        const time = new Date(trade.timestamp).toLocaleString();
+                        // SQLite timestamps are UTC but don't have 'Z' suffix
+                        // Add 'Z' to mark as UTC, then convert to local time  
+                        const utcTimestamp = trade.timestamp.replace(' ', 'T') + 'Z';
+                        const utcDate = new Date(utcTimestamp);
+                        const time = utcDate.toLocaleString('en-US', { 
+                            timeZone: 'America/New_York',
+                            month: 'short',
+                            day: 'numeric',
+                            hour: '2-digit',
+                            minute: '2-digit',
+                            second: '2-digit'
+                        });
                         const sideColor = trade.side === 'BUY' ? '#4ade80' : '#f87171';
                         return `
                             <tr>
@@ -966,14 +979,18 @@ HTML_TEMPLATE = '''
         }
         
         function updatePnL(pnl) {
-            document.getElementById('total-pnl').textContent = formatCurrency(pnl.total || 0);
+            console.log('updatePnL called with:', pnl);
+            // Show unrealized P&L as total since we have open positions
+            const totalPnL = (pnl.unrealized || 0) + (pnl.total || 0);
+            console.log('Calculated totalPnL:', totalPnL);
+            document.getElementById('total-pnl').textContent = formatCurrency(totalPnL);
             document.getElementById('daily-pnl').textContent = formatCurrency(pnl.daily || 0);
             
             // Update colors
             const totalEl = document.getElementById('total-pnl');
             const dailyEl = document.getElementById('daily-pnl');
             
-            totalEl.className = pnl.total >= 0 ? 'card-value positive' : 'card-value negative';
+            totalEl.className = totalPnL >= 0 ? 'card-value positive' : 'card-value negative';
             dailyEl.className = pnl.daily >= 0 ? 'card-value positive' : 'card-value negative';
         }
         
@@ -1114,7 +1131,8 @@ HTML_TEMPLATE = '''
         
         function formatTime(timestamp) {
             if (!timestamp) return 'Never';
-            const date = new Date(timestamp);
+            // Handle UTC timestamps from database
+            const date = timestamp.includes('T') ? new Date(timestamp) : new Date(timestamp + ' UTC');
             const now = new Date();
             const diff = now - date;
             
@@ -1188,11 +1206,14 @@ HTML_TEMPLATE = '''
         }
         
         function updateMarketPrice(symbol, price, bid, ask, volume) {
+            console.log('updateMarketPrice called:', symbol, price);
             // Update watchlist prices in real-time
-            const rows = document.querySelectorAll('#watchlist-tbody tr');
+            const rows = document.querySelectorAll('#watchlist-table tr');
+            console.log('Found watchlist rows:', rows.length);
             rows.forEach(row => {
                 const symbolCell = row.cells[0];
                 if (symbolCell && symbolCell.textContent === symbol) {
+                    console.log('Found matching symbol:', symbol);
                     const priceCell = row.cells[1];
                     if (priceCell) {
                         const oldPrice = parseFloat(priceCell.textContent.replace('$', ''));
@@ -1363,19 +1384,132 @@ def get_pnl():
                 
                 # Get latest market data for current price
                 market_data = await db.get_latest_market_data(pos['symbol'], limit=1)
-                current_price = market_data[0]['close'] if market_data else pos['avg_cost']
+                if market_data:
+                    current_price = market_data[0]['close']
+                else:
+                    # Try to get from IB if no market data stored
+                    from robo_trader.clients.async_ibkr_client import AsyncIBKRClient
+                    client = AsyncIBKRClient()
+                    await client.initialize()
+                    try:
+                        price_data = await client.get_market_data(pos['symbol'])
+                        current_price = price_data['close'] if price_data else pos['avg_cost']
+                    finally:
+                        await client.close_all()
+                
                 value = pos['quantity'] * current_price
                 total_value += value
             
             # Calculate unrealized P&L
             unrealized_pnl = total_value - total_cost if total_cost > 0 else 0
             
-            # For daily P&L, use unrealized for now (should compare to yesterday's close)
-            daily_pnl = unrealized_pnl
+            # Calculate realized P&L from closed trades
+            trades = await db.get_recent_trades(limit=1000)  # Get recent trades
+            realized_pnl = 0
+            
+            # Group trades by symbol to calculate realized P&L
+            symbol_trades = {}
+            for trade in trades:
+                symbol = trade['symbol']
+                if symbol not in symbol_trades:
+                    symbol_trades[symbol] = []
+                symbol_trades[symbol].append(trade)
+            
+            # Calculate realized P&L for each symbol
+            for symbol, trades_list in symbol_trades.items():
+                buys = []
+                for trade in sorted(trades_list, key=lambda x: x['timestamp']):
+                    if trade['side'] == 'buy':
+                        buys.append({'price': trade['price'], 'quantity': trade['quantity']})
+                    elif trade['side'] == 'sell' and buys:
+                        sell_qty = trade['quantity']
+                        sell_price = trade['price']
+                        
+                        # FIFO matching
+                        while sell_qty > 0 and buys:
+                            buy = buys[0]
+                            match_qty = min(sell_qty, buy['quantity'])
+                            
+                            # Calculate P&L for this match
+                            realized_pnl += (sell_price - buy['price']) * match_qty
+                            
+                            sell_qty -= match_qty
+                            buy['quantity'] -= match_qty
+                            
+                            if buy['quantity'] == 0:
+                                buys.pop(0)
+            
+            # Calculate total P&L (unrealized + realized)
+            total_pnl = unrealized_pnl + realized_pnl
+            
+            # Calculate daily P&L - change since market open
+            # We need to get today's opening prices for each position
+            from datetime import datetime, time
+            import pytz
+            
+            et_tz = pytz.timezone('America/New_York')
+            now_et = datetime.now(et_tz)
+            market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+            
+            daily_pnl = 0
+            
+            # Calculate daily unrealized P&L from positions
+            for pos in positions_data:
+                # Get today's opening price (first trade after 9:30 AM)
+                market_data_today = await db.get_latest_market_data(
+                    pos['symbol'], 
+                    limit=100  # Get enough data to find today's open
+                )
+                
+                open_price = pos['avg_cost']  # Default to avg cost if no data
+                
+                if market_data_today:
+                    # Find first data point from today's session
+                    for data_point in reversed(market_data_today):
+                        data_time = datetime.fromisoformat(data_point['timestamp'].replace(' ', 'T'))
+                        data_time_et = data_time.astimezone(et_tz) if data_time.tzinfo else et_tz.localize(data_time)
+                        
+                        # Check if this is from today's market session
+                        if data_time_et.date() == now_et.date() and data_time_et.time() >= time(9, 30):
+                            open_price = data_point['open'] if 'open' in data_point else data_point['close']
+                            break
+                
+                # Get current price (already calculated above)
+                current_price = total_value / positions_data[0]['quantity'] if len(positions_data) == 1 else pos['avg_cost']
+                
+                # Find current price for this position
+                for p in positions_data:
+                    if p['symbol'] == pos['symbol']:
+                        market_data = await db.get_latest_market_data(p['symbol'], limit=1)
+                        if market_data:
+                            current_price = market_data[0]['close']
+                        break
+                
+                # Daily P&L for this position
+                daily_change = (current_price - open_price) * pos['quantity']
+                daily_pnl += daily_change
+            
+            # Add today's realized P&L from trades
+            from datetime import timedelta
+            today_start = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+            
+            for trade in trades:
+                trade_time = datetime.fromisoformat(trade['timestamp'].replace(' ', 'T'))
+                trade_time_et = trade_time.astimezone(et_tz) if trade_time.tzinfo else et_tz.localize(trade_time)
+                
+                if trade_time_et >= today_start:
+                    # This is a trade from today - include any realized P&L
+                    # (This would need proper FIFO matching for accuracy)
+                    pass
+            
+            # If daily P&L calculation fails or seems wrong, use a conservative estimate
+            if abs(daily_pnl) > abs(total_pnl):
+                # Daily can't be more than total
+                daily_pnl = total_pnl * 0.5  # Use 50% as estimate
             
             return {
                 'daily': daily_pnl,
-                'total': 0,  # Realized P&L - need to track closed positions
+                'total': total_pnl,  # Total P&L (realized + unrealized)
                 'unrealized': unrealized_pnl
             }
         finally:

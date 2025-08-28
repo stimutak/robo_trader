@@ -45,10 +45,12 @@ class WebSocketClient:
     async def send_message(self, message: dict):
         """Send a message to the server."""
         if not self.connected or not self.websocket:
+            logger.debug(f"Not connected, cannot send {message.get('type', 'unknown')} message")
             return False
             
         try:
             await self.websocket.send(json.dumps(message))
+            logger.debug(f"Sent {message.get('type', 'unknown')} message for {message.get('symbol', 'N/A')}")
             return True
         except Exception as e:
             logger.debug(f"Error sending message: {e}")
