@@ -165,6 +165,10 @@ class WebSocketManager:
                           bid: Optional[float] = None, ask: Optional[float] = None,
                           volume: Optional[int] = None):
         """Queue a market data update for broadcast."""
+        if not self.thread or not self.thread.is_alive():
+            logger.debug(f"WebSocket server not running, skipping market update for {symbol}")
+            return
+            
         message = {
             "type": "market_data",
             "symbol": symbol,
@@ -180,6 +184,7 @@ class WebSocketManager:
             message["volume"] = volume
             
         self.message_queue.put(message)
+        logger.debug(f"Queued market update for {symbol} @ ${price:.2f}, queue size: {self.message_queue.qsize()}")
         
     def send_trade_update(self, symbol: str, side: str, quantity: int, 
                          price: float, status: str = "executed"):

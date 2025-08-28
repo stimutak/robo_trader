@@ -42,12 +42,15 @@ python test_features_simple.py
 1. ✅ WebSocket connection handler signature error - FIXED
 2. ✅ JSON serialization error with ServerConnection object - FIXED  
 3. ✅ Phase 1 F2: Upgrade config to Pydantic - COMPLETED
+4. ✅ WebSocket stability - Fixed with client/server separation
 
-## WebSocket Fix Notes (2025-08-27)
+## WebSocket Fix Notes (2025-08-28)
 - Fixed handler signature by adding `path` parameter
 - Fixed JSON serialization by using structlog properly
 - Disabled websockets library debug logging to prevent ServerConnection serialization
 - Set MONITORING_LOG_FORMAT=plain when running dashboard to avoid JSON issues
+- Created WebSocket client (`websocket_client.py`) for proper client/server separation
+- Runner now uses client to connect to existing server instead of direct import
 
 ## Development Guidelines
 - Always refer to IMPLEMENTATION_PLAN.md for phase objectives
