@@ -18,7 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 
 from robo_trader.config import Config, TradingMode
 from robo_trader.correlation import CorrelationTracker
-from robo_trader.database import TradingDatabase
+from robo_trader.database_async import AsyncTradingDatabase as TradingDatabase
 from robo_trader.execution import AbstractExecutor, PaperExecutor
 from robo_trader.ibkr_client import IBKRClient
 from robo_trader.logger import get_logger

@@ -1,0 +1,30 @@
+<html>
+<head><title>Test Timestamp</title></head>
+<body>
+<script>
+// Test the timestamp conversion
+const timestamp = "2025-08-28 19:03:36";
+console.log("Original:", timestamp);
+
+// Method 1: What we tried
+const utcTimestamp = timestamp.replace(' ', 'T') + 'Z';
+const date1 = new Date(utcTimestamp);
+console.log("Method 1 UTC:", utcTimestamp);
+console.log("Method 1 Date:", date1.toString());
+console.log("Method 1 Eastern:", date1.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+
+// Method 2: Direct UTC interpretation
+const [datePart, timePart] = timestamp.split(' ');
+const [year, month, day] = datePart.split('-');
+const [hour, minute, second] = timePart.split(':');
+const date2 = new Date(Date.UTC(year, month-1, day, hour, minute, second));
+console.log("Method 2 Date:", date2.toString());
+console.log("Method 2 Eastern:", date2.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+
+// Current local time for reference
+console.log("Current local time:", new Date().toString());
+console.log("Current Eastern time:", new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+</script>
+Check console for output
+</body>
+</html>
