@@ -1,20 +1,43 @@
 """
-Feature engineering package for technical indicators and market microstructure.
+Feature engineering module for RoboTrader.
+Provides technical indicators and feature calculation infrastructure.
 """
 
-from .engine import FeatureEngine, FeatureSet
-from .indicators import IndicatorConfig, TechnicalIndicators
-from .feature_store import FeatureStore, FeatureMetadata, FeatureImportance
-from .ml_features import MLFeatureEngine, MarketRegime
+from robo_trader.features.base import (
+    BaseFeatureCalculator,
+    CompositeFeatureCalculator,
+    FeatureSet,
+    FeatureMetadata,
+    FeatureValue,
+    FeatureType,
+    TimeFrame
+)
+
+from robo_trader.features.technical_indicators import (
+    MomentumIndicators,
+    TrendIndicators,
+    VolatilityIndicators,
+    VolumeIndicators
+)
+
+from robo_trader.features.feature_engine import FeatureEngine
 
 __all__ = [
-    "FeatureEngine",
-    "FeatureSet",
-    "TechnicalIndicators",
-    "IndicatorConfig",
-    "FeatureStore",
-    "FeatureMetadata",
-    "FeatureImportance",
-    "MLFeatureEngine",
-    "MarketRegime"
+    # Base classes
+    'BaseFeatureCalculator',
+    'CompositeFeatureCalculator',
+    'FeatureSet',
+    'FeatureMetadata',
+    'FeatureValue',
+    'FeatureType',
+    'TimeFrame',
+    
+    # Indicators
+    'MomentumIndicators',
+    'TrendIndicators',
+    'VolatilityIndicators',
+    'VolumeIndicators',
+    
+    # Engine
+    'FeatureEngine'
 ]

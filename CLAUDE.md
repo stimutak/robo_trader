@@ -7,7 +7,7 @@
 - Phase 3: Advanced Strategy Development
 - Phase 4: Production Hardening & Deployment
 
-**Current Status:** Phase 1 is 100% complete (5/5 tasks done) ✅ - Ready to start Phase 2
+**Current Status:** Phase 2 in progress - M1 Feature Engineering Pipeline COMPLETE ✅
 
 **Note:** The older 9-phase plan in `archived_plans/PROJECT_PLAN_9PHASE.md` is deprecated and should NOT be used. Any references to "Phase 5", "Phase 6" etc. from older commits refer to the old plan and should be ignored.
 
@@ -17,6 +17,7 @@
 - `robo_trader/runner_async.py` - Main trading system with async parallel processing
 - `app.py` - Dashboard with monitoring interface
 - `robo_trader/websocket_server.py` - WebSocket server for real-time updates
+- `robo_trader/features/` - Feature engineering pipeline (NEW - Phase 2)
 
 ## Testing Commands
 ```bash
@@ -32,6 +33,9 @@ python test_market_hours.py
 
 # Run tests
 pytest
+
+# Test feature engineering pipeline (NEW)
+python test_features_simple.py
 ```
 
 ## Current Issues to Fix
