@@ -187,18 +187,67 @@ class MLStrategy(BaseStrategy):
         
         # Check cache
         if cache_key in self.feature_cache:
-            cached_time = self.feature_cache[cache_key].index[-1]
-            if cached_time >= data.index[-1] - timedelta(minutes=1):
+            cached_time = self.feature_cache[cache_key].index[-1] if len(self.feature_cache[cache_key]) > 0 else None
+            if cached_time and cached_time >= data.index[-1] - timedelta(minutes=1):
                 return self.feature_cache[cache_key]
         
-        # Generate features
-        features = await self.feature_pipeline.calculate_features(
-            symbol,
-            data,
-            include_technical=True,
-            include_microstructure=True,
-            include_sentiment=False  # Add when available
-        )
+        # Generate features directly here for the improved model
+        # The improved model uses specific features that we need to calculate
+        features = pd.DataFrame(index=data.index)
+        
+        # Ensure column names are lowercase
+        if 'Close' in data.columns:
+            data = data.rename(columns={'Close': 'close', 'High': 'high', 'Low': 'low', 'Open': 'open', 'Volume': 'volume'})
+        
+        # Calculate the features the improved model expects
+        if 'close' in data.columns:
+            # Returns
+            features['returns'] = data['close'].pct_change()
+            features['log_returns'] = np.log(data['close'] / data['close'].shift(1))
+            
+            # Moving averages
+            for period in [5, 10, 20, 50]:
+                features[f'return_{period}d'] = data['close'].pct_change(period)
+                features[f'sma_{period}'] = data['close'].rolling(period).mean() / data['close']
+            
+            # Volatility
+            features['volatility_20'] = features['returns'].rolling(20).std()
+            features['volatility_5'] = features['returns'].rolling(5).std()
+            
+            # Volume features
+            if 'volume' in data.columns:
+                features['volume_ratio'] = data['volume'] / data['volume'].rolling(20).mean()
+                features['dollar_volume'] = data['close'] * data['volume']
+            
+            # Time features
+            features['day_of_week'] = data.index.dayofweek
+            features['month'] = data.index.month
+            
+            # Microstructure
+            if 'high' in data.columns and 'low' in data.columns:
+                features['high_low_ratio'] = data['high'] / data['low']
+                features['close_to_high'] = data['close'] / data['high']
+                features['close_to_low'] = data['close'] / data['low']
+            
+            # RSI
+            delta = data['close'].diff()
+            gain = delta.where(delta > 0, 0).rolling(14).mean()
+            loss = -delta.where(delta < 0, 0).rolling(14).mean()
+            rs = gain / loss
+            features['rsi'] = 100 - (100 / (1 + rs))
+            
+            # MACD
+            ema_12 = data['close'].ewm(span=12).mean()
+            ema_26 = data['close'].ewm(span=26).mean()
+            features['macd'] = (ema_12 - ema_26) / data['close']
+            
+            # Bollinger Bands
+            sma_20 = data['close'].rolling(20).mean()
+            std_20 = data['close'].rolling(20).std()
+            features['bb_position'] = (data['close'] - sma_20) / (2 * std_20)
+        
+        # Fill NaN values
+        features = features.ffill().fillna(0)
         
         # Cache features
         self.feature_cache[cache_key] = features
@@ -210,7 +259,7 @@ class MLStrategy(BaseStrategy):
         symbol: str,
         features: pd.DataFrame
     ) -> Dict[str, Any]:
-        """Get ML model predictions.
+        """Get ML model predictions with confidence filtering.
         
         Args:
             symbol: Trading symbol
@@ -220,7 +269,56 @@ class MLStrategy(BaseStrategy):
             Dictionary with predictions and metadata
         """
         try:
-            # Get selected model
+            # First try to use the improved model
+            improved_model = self.model_selector.available_models.get("improved_model")
+            if improved_model:
+                model_obj = improved_model['model']
+                scaler = improved_model.get('scaler')
+                feature_cols = improved_model.get('features', improved_model.get('feature_columns', []))
+                confidence_threshold = improved_model.get('confidence_threshold', 0.6)
+                
+                # Prepare features
+                if feature_cols and len(feature_cols) > 0:
+                    # Use only the features the model was trained on
+                    available_features = [f for f in feature_cols if f in features.columns]
+                    if len(available_features) > 0:
+                        X = features[available_features].iloc[-1:].fillna(0)
+                    else:
+                        X = features.iloc[-1:].fillna(0)
+                else:
+                    X = features.iloc[-1:].fillna(0)
+                
+                # Scale if scaler available
+                if scaler:
+                    X_scaled = scaler.transform(X)
+                else:
+                    X_scaled = X
+                
+                # Get prediction with probability
+                if hasattr(model_obj, 'predict_proba'):
+                    probabilities = model_obj.predict_proba(X_scaled)[0]
+                    prediction = model_obj.predict(X_scaled)[0]
+                    confidence = max(probabilities)
+                    
+                    # Apply confidence threshold
+                    if confidence < confidence_threshold:
+                        logger.info(f"Low confidence prediction for {symbol}: {confidence:.3f} < {confidence_threshold}")
+                        return {"prediction": 0, "confidence": confidence, "filtered": True}
+                    
+                    # Convert to trading signal
+                    signal = 1 if prediction == 1 else -1
+                    
+                    logger.info(f"High confidence prediction for {symbol}: signal={signal}, confidence={confidence:.3f}")
+                    
+                    return {
+                        "prediction": signal,
+                        "confidence": confidence,
+                        "agreement": confidence,  # Use confidence as agreement
+                        "model_type": "improved_model",
+                        "filtered": False
+                    }
+            
+            # Fallback to ensemble if improved model not available
             model = self.model_selector.selected_model
             if not model:
                 return {"prediction": 0, "confidence": 0}
@@ -228,7 +326,7 @@ class MLStrategy(BaseStrategy):
             # Get predictions from ensemble
             predictions = {}
             for model_type in [ModelType.RANDOM_FOREST, ModelType.XGBOOST, 
-                             ModelType.LIGHTGBM, ModelType.NEURAL_NETWORK]:
+                             ModelType.LIGHTGBM]:
                 try:
                     pred = await self.model_selector.get_prediction(
                         model_type,
@@ -260,7 +358,7 @@ class MLStrategy(BaseStrategy):
                 "confidence": np.mean(pred_confidences),
                 "agreement": agreement,
                 "ensemble_votes": predictions,
-                "feature_importance": model.get("feature_importance", {})
+                "model_type": "ensemble"
             }
             
         except Exception as e:

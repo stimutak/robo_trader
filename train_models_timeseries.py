@@ -89,9 +89,26 @@ async def main():
     models_dir = Path("trained_models")
     models_dir.mkdir(exist_ok=True)
     
-    # Fetch training data
+    # Fetch training data - expanded symbol list for better diversity
     print("\n1. Fetching training data...")
-    symbols = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL"]
+    symbols = [
+        # Major indices
+        "SPY", "QQQ", "DIA", "IWM",
+        # Tech giants
+        "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "NFLX",
+        # Financial
+        "JPM", "BAC", "GS", "WFC", "MS",
+        # Healthcare
+        "JNJ", "UNH", "PFE", "ABBV", "LLY",
+        # Energy
+        "XOM", "CVX", "COP",
+        # Consumer
+        "WMT", "HD", "DIS", "MCD", "NKE",
+        # Industrial
+        "BA", "CAT", "GE", "HON",
+        # Additional high-volume stocks
+        "AMD", "INTC", "ORCL", "CRM", "ADBE", "PYPL", "SQ", "UBER"
+    ]
     
     all_features = []
     all_targets = []
@@ -99,7 +116,7 @@ async def main():
     for symbol in symbols:
         print(f"  Processing {symbol}...")
         ticker = yf.Ticker(symbol)
-        df = ticker.history(period="2y", interval="1d")
+        df = ticker.history(period="5y", interval="1d")  # Changed from 2y to 5y
         
         if df.empty or len(df) < 100:
             continue
@@ -111,17 +128,22 @@ async def main():
         # Calculate features
         features = calculate_technical_features(df)
         
-        # Create target (next day direction)
-        df['target'] = np.where(df['returns'].shift(-1) > 0, 1, 0)
+        # Create target for significant moves (>1% up or down)
+        # 1 = >1% up, 0 = <1% down, -1 = neutral (removed later)
+        next_return = df['returns'].shift(-1)
+        df['target'] = np.where(next_return > 0.01, 1,  # >1% up
+                       np.where(next_return < -0.01, 0,  # >1% down
+                       -1))  # Neutral, will be filtered out
         
-        # Remove NaN values
-        valid_idx = ~(features.isna().any(axis=1) | df['target'].isna())
+        # Remove NaN values and neutral targets
+        valid_idx = ~(features.isna().any(axis=1) | df['target'].isna()) & (df['target'] != -1)
         features_clean = features[valid_idx]
         targets_clean = df['target'][valid_idx]
         
         # Remove last row (no target)
-        features_clean = features_clean[:-1]
-        targets_clean = targets_clean[:-1]
+        if len(features_clean) > 0 and targets_clean.iloc[-1] == -1:
+            features_clean = features_clean[:-1]
+            targets_clean = targets_clean[:-1]
         
         if len(features_clean) > 0:
             all_features.append(features_clean)
@@ -158,13 +180,14 @@ async def main():
     
     print("\n3. Training models...")
     
-    # Train Random Forest
-    print("\n  Training Random Forest...")
+    # Train Random Forest with stronger regularization
+    print("\n  Training Random Forest with regularization...")
     rf_model = RandomForestClassifier(
         n_estimators=100,
-        max_depth=10,
-        min_samples_split=20,
-        min_samples_leaf=10,
+        max_depth=5,  # Reduced from 10 to prevent overfitting
+        min_samples_split=50,  # Increased from 20
+        min_samples_leaf=25,  # Increased from 10
+        max_features='sqrt',  # Limit features per split
         random_state=42,
         n_jobs=-1
     )
@@ -192,12 +215,16 @@ async def main():
         pickle.dump(model_data, f)
     print(f"    Saved to {rf_path}")
     
-    # Train XGBoost
-    print("\n  Training XGBoost...")
+    # Train XGBoost with regularization
+    print("\n  Training XGBoost with regularization...")
     xgb_model = xgb.XGBClassifier(
         n_estimators=100,
-        max_depth=6,
-        learning_rate=0.1,
+        max_depth=3,  # Reduced from 6
+        learning_rate=0.05,  # Reduced from 0.1
+        reg_alpha=0.1,  # L1 regularization
+        reg_lambda=1.0,  # L2 regularization
+        subsample=0.8,  # Sample 80% of data
+        colsample_bytree=0.8,  # Sample 80% of features
         random_state=42,
         use_label_encoder=False,
         eval_metric='logloss'
@@ -226,12 +253,18 @@ async def main():
         pickle.dump(model_data, f)
     print(f"    Saved to {xgb_path}")
     
-    # Train LightGBM
-    print("\n  Training LightGBM...")
+    # Train LightGBM with regularization
+    print("\n  Training LightGBM with regularization...")
     lgb_model = lgb.LGBMClassifier(
         n_estimators=100,
-        max_depth=6,
-        learning_rate=0.1,
+        max_depth=3,  # Reduced from 6
+        learning_rate=0.05,  # Reduced from 0.1
+        num_leaves=31,  # Default, controls model complexity
+        min_child_samples=50,  # Minimum data in leaf
+        reg_alpha=0.1,  # L1 regularization
+        reg_lambda=1.0,  # L2 regularization
+        subsample=0.8,  # Sample 80% of data
+        colsample_bytree=0.8,  # Sample 80% of features
         random_state=42,
         verbose=-1
     )

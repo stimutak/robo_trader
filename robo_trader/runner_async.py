@@ -73,6 +73,7 @@ class AsyncRunner:
         use_correlation_sizing: bool = True,
         max_correlation: float = 0.7,
         use_ml_strategy: bool = False,
+        use_smart_execution: bool = False,
     ):
         self.duration = duration
         self.bar_size = bar_size
@@ -86,6 +87,7 @@ class AsyncRunner:
         self.use_correlation_sizing = use_correlation_sizing
         self.max_correlation = max_correlation
         self.use_ml_strategy = use_ml_strategy
+        self.use_smart_execution = use_smart_execution
 
         # Will be initialized in setup
         self.cfg = None
@@ -136,8 +138,20 @@ class AsyncRunner:
             max_daily_notional=self.max_daily_notional or self.cfg.risk.max_daily_notional,
         )
 
-        # Initialize executor
-        self.executor = PaperExecutor(slippage_bps=self.slippage_bps)
+        # Initialize executor with smart execution support
+        smart_executor = None
+        
+        if self.use_smart_execution:
+            from .smart_execution.smart_executor import SmartExecutor
+            # Pass IBKR client for real market data
+            smart_executor = SmartExecutor(self.cfg, ibkr_client=self.ib_client.ib)
+            logger.info("Smart execution enabled with real market data integration")
+        
+        self.executor = PaperExecutor(
+            slippage_bps=self.slippage_bps,
+            smart_executor=smart_executor,
+            use_smart_execution=self.use_smart_execution
+        )
 
         # Initialize portfolio
         starting_cash = (
@@ -366,97 +380,200 @@ class AsyncRunner:
         quantity = 0
 
         if signal_value == 1:  # Buy signal
-            qty = self.risk.position_size(equity, price)
-            
-            # Apply correlation-based position sizing if enabled
-            if self.use_correlation_sizing and self.correlation_manager:
-                adjusted_qty, sizing_reason = await self.correlation_manager.get_adjusted_position_size(
-                    symbol=symbol,
-                    base_size=qty,
-                    current_positions=self.positions,
-                    portfolio_value=equity
-                )
-                if adjusted_qty != qty:
-                    logger.info(f"Position size adjusted for {symbol}: {qty} -> {adjusted_qty} ({sizing_reason})")
-                    qty = adjusted_qty
-            
-            ok, msg = self.risk.validate_order(
-                symbol,
-                qty,
-                price,
-                equity,
-                self.daily_pnl,
-                self.positions,
-                self.daily_executed_notional,
-            )
-
-            if ok and qty > 0:
+            if symbol in self.positions and self.positions[symbol].quantity < 0:
+                # Cover short position first
+                pos = self.positions[symbol]
+                qty_to_cover = abs(pos.quantity)
+                
                 with Timer("order_execution", self.monitor):
                     res = self.executor.place_order(
-                        Order(symbol=symbol, quantity=qty, side="BUY", price=price)
+                        Order(symbol=symbol, quantity=qty_to_cover, side="BUY_TO_COVER", price=price)
                     )
                 if res.ok:
                     fill_price = res.fill_price or price
-                    self.positions[symbol] = Position(symbol, qty, fill_price)
-                    self.portfolio.update_fill(symbol, "BUY", qty, fill_price)
-                    self.daily_executed_notional += price * qty
-
+                    self.portfolio.update_fill(symbol, "BUY_TO_COVER", qty_to_cover, fill_price)
+                    self.daily_pnl = self.portfolio.realized_pnl
+                    
                     # Record trade in database
                     await self.db.record_trade(
                         symbol,
-                        "BUY",
-                        qty,
+                        "BUY_TO_COVER",
+                        qty_to_cover,
                         fill_price,
-                        slippage=(fill_price - price) * qty if res.fill_price else 0,
+                        slippage=(fill_price - price) * qty_to_cover if res.fill_price else 0,
                     )
-                    await self.db.update_position(symbol, qty, fill_price, price)
-
-                    await self.monitor.record_order_placed(symbol, qty)
-                    await self.monitor.record_trade_executed(symbol, "BUY", qty)
-                    executed = True
-                    quantity = qty
-                    message = f"Bought {qty} shares at ${fill_price:.2f}"
+                    await self.db.update_position(symbol, 0, 0, 0)  # Close position
                     
-                    # Send trade update via WebSocket
-                    if WEBSOCKET_ENABLED and ws_client:
-                        try:
-                            ws_client.send_trade_update(symbol, "BUY", qty, fill_price)
-                        except Exception as e:
-                            logger.debug(f"Could not send trade WebSocket update: {e}")
+                    del self.positions[symbol]
+                    await self.monitor.record_order_placed(symbol, qty_to_cover)
+                    await self.monitor.record_trade_executed(symbol, "BUY_TO_COVER", qty_to_cover)
+                    executed = True
+                    quantity = qty_to_cover
+                    message = f"Covered short: Bought {qty_to_cover} shares at ${fill_price:.2f}"
                 else:
-                    message = f"Buy order failed: {res.msg}"
-            else:
-                message = f"Buy signal rejected: {msg}"
-
-        elif signal_value == -1 and symbol in self.positions:  # Sell signal
-            pos = self.positions[symbol]
-            with Timer("order_execution", self.monitor):
-                res = self.executor.place_order(
-                    Order(symbol=symbol, quantity=pos.quantity, side="SELL", price=price)
-                )
-            if res.ok:
-                fill_price = res.fill_price or price
-                self.portfolio.update_fill(symbol, "SELL", pos.quantity, fill_price)
-                self.daily_pnl = self.portfolio.realized_pnl
-
-                # Record trade in database
-                await self.db.record_trade(
+                    message = f"Cover order failed: {res.msg}"
+                    
+            elif symbol not in self.positions:
+                # Open long position
+                qty = self.risk.position_size(equity, price)
+                
+                # Apply correlation-based position sizing if enabled
+                if self.use_correlation_sizing and self.correlation_manager:
+                    adjusted_qty, sizing_reason = await self.correlation_manager.get_adjusted_position_size(
+                        symbol=symbol,
+                        base_size=qty,
+                        current_positions=self.positions,
+                        portfolio_value=equity
+                    )
+                    if adjusted_qty != qty:
+                        logger.info(f"Position size adjusted for {symbol}: {qty} -> {adjusted_qty} ({sizing_reason})")
+                        qty = adjusted_qty
+                
+                ok, msg = self.risk.validate_order(
                     symbol,
-                    "SELL",
-                    pos.quantity,
-                    fill_price,
-                    slippage=(fill_price - price) * pos.quantity if res.fill_price else 0,
+                    qty,
+                    price,
+                    equity,
+                    self.daily_pnl,
+                    self.positions,
+                    self.daily_executed_notional,
                 )
-                await self.db.update_position(symbol, 0, 0, 0)  # Close position
 
-                del self.positions[symbol]
-                await self.monitor.record_order_placed(symbol, pos.quantity)
-                await self.monitor.record_trade_executed(symbol, "SELL", pos.quantity)
-                executed = True
-                quantity = pos.quantity
-                message = f"Sold {pos.quantity} shares at ${fill_price:.2f}"
+                if ok and qty > 0:
+                    with Timer("order_execution", self.monitor):
+                        res = self.executor.place_order(
+                            Order(symbol=symbol, quantity=qty, side="BUY", price=price)
+                        )
+                    if res.ok:
+                        fill_price = res.fill_price or price
+                        self.positions[symbol] = Position(symbol, qty, fill_price)
+                        self.portfolio.update_fill(symbol, "BUY", qty, fill_price)
+                        self.daily_executed_notional += price * qty
+
+                        # Record trade in database
+                        await self.db.record_trade(
+                            symbol,
+                            "BUY",
+                            qty,
+                            fill_price,
+                            slippage=(fill_price - price) * qty if res.fill_price else 0,
+                        )
+                        await self.db.update_position(symbol, qty, fill_price, price)
+
+                        await self.monitor.record_order_placed(symbol, qty)
+                        await self.monitor.record_trade_executed(symbol, "BUY", qty)
+                        executed = True
+                        quantity = qty
+                        message = f"Opened long: Bought {qty} shares at ${fill_price:.2f}"
+                        
+                        # Send trade update via WebSocket
+                        if WEBSOCKET_ENABLED and ws_client:
+                            try:
+                                ws_client.send_trade_update(symbol, "BUY", qty, fill_price)
+                            except Exception as e:
+                                logger.debug(f"Could not send trade WebSocket update: {e}")
+                    else:
+                        message = f"Buy order failed: {res.msg}"
+                else:
+                    message = f"Buy signal rejected: {msg}"
             else:
-                message = f"Sell order failed: {res.msg}"
+                message = "Buy signal: Already have long position"
+
+        elif signal_value == -1:  # Sell signal
+            enable_short_selling = self.cfg.execution.enable_short_selling
+            
+            if symbol in self.positions:
+                # Close long position or cover short
+                pos = self.positions[symbol]
+                
+                if pos.quantity > 0:  # Closing long position
+                    with Timer("order_execution", self.monitor):
+                        res = self.executor.place_order(
+                            Order(symbol=symbol, quantity=pos.quantity, side="SELL", price=price)
+                        )
+                    if res.ok:
+                        fill_price = res.fill_price or price
+                        self.portfolio.update_fill(symbol, "SELL", pos.quantity, fill_price)
+                        self.daily_pnl = self.portfolio.realized_pnl
+
+                        # Record trade in database
+                        await self.db.record_trade(
+                            symbol,
+                            "SELL",
+                            pos.quantity,
+                            fill_price,
+                            slippage=(fill_price - price) * pos.quantity if res.fill_price else 0,
+                        )
+                        await self.db.update_position(symbol, 0, 0, 0)  # Close position
+
+                        del self.positions[symbol]
+                        await self.monitor.record_order_placed(symbol, pos.quantity)
+                        await self.monitor.record_trade_executed(symbol, "SELL", pos.quantity)
+                        executed = True
+                        quantity = pos.quantity
+                        message = f"Closed long: Sold {pos.quantity} shares at ${fill_price:.2f}"
+                    else:
+                        message = f"Sell order failed: {res.msg}"
+                        
+            elif enable_short_selling and symbol not in self.positions:
+                # Open short position
+                qty = self.risk.position_size(equity, price)
+                
+                # Apply correlation-based position sizing if enabled
+                if self.use_correlation_sizing and self.correlation_manager:
+                    adjusted_qty, sizing_reason = await self.correlation_manager.get_adjusted_position_size(
+                        symbol=symbol,
+                        base_size=qty,
+                        current_positions=self.positions,
+                        portfolio_value=equity
+                    )
+                    if adjusted_qty != qty:
+                        logger.info(f"Short size adjusted for {symbol}: {qty} -> {adjusted_qty} ({sizing_reason})")
+                        qty = adjusted_qty
+                
+                ok, msg = self.risk.validate_order(
+                    symbol,
+                    qty,
+                    price,
+                    equity,
+                    self.daily_pnl,
+                    self.positions,
+                    self.daily_executed_notional,
+                )
+                
+                if ok and qty > 0:
+                    with Timer("order_execution", self.monitor):
+                        res = self.executor.place_order(
+                            Order(symbol=symbol, quantity=qty, side="SELL_SHORT", price=price)
+                        )
+                    if res.ok:
+                        fill_price = res.fill_price or price
+                        # Store negative quantity for short position
+                        self.positions[symbol] = Position(symbol, -qty, fill_price)
+                        self.portfolio.update_fill(symbol, "SELL_SHORT", qty, fill_price)
+                        self.daily_executed_notional += price * qty
+                        
+                        # Record trade in database
+                        await self.db.record_trade(
+                            symbol,
+                            "SELL_SHORT",
+                            qty,
+                            fill_price,
+                            slippage=(fill_price - price) * qty if res.fill_price else 0,
+                        )
+                        await self.db.update_position(symbol, -qty, fill_price, price)
+                        
+                        await self.monitor.record_order_placed(symbol, qty)
+                        await self.monitor.record_trade_executed(symbol, "SELL_SHORT", qty)
+                        executed = True
+                        quantity = qty
+                        message = f"Opened short: Sold {qty} shares at ${fill_price:.2f}"
+                    else:
+                        message = f"Short sell order failed: {res.msg}"
+                else:
+                    message = f"Short signal rejected: {msg}"
+            else:
+                message = "Sell signal: No position to close (short selling disabled)"
 
         return SymbolResult(
             symbol=symbol,
@@ -586,6 +703,7 @@ async def run_once(
     default_cash: Optional[float] = None,
     max_concurrent: int = 8,
     use_ml_strategy: bool = False,
+    use_smart_execution: bool = False,
 ) -> None:
     """Run the trading system once with parallel processing."""
     runner = AsyncRunner(
@@ -600,6 +718,7 @@ async def run_once(
         max_concurrent_symbols=max_concurrent,
         use_correlation_sizing=True,  # FIXED: Enabled M5 correlation integration
         use_ml_strategy=use_ml_strategy,
+        use_smart_execution=use_smart_execution,
     )
     await runner.run(symbols)
 
@@ -617,6 +736,7 @@ async def run_continuous(
     max_concurrent: int = 8,
     interval_seconds: int = 300,
     use_ml_strategy: bool = False,
+    use_smart_execution: bool = False,
 ) -> None:
     """Run the trading system continuously with market hours checking."""
     import signal
@@ -675,6 +795,7 @@ async def run_continuous(
                 max_concurrent_symbols=max_concurrent,
                 use_correlation_sizing=True,  # FIXED: Enabled M5 correlation integration
                 use_ml_strategy=use_ml_strategy,
+                use_smart_execution=use_smart_execution,
             )
             
             await runner.run(symbols)
@@ -763,6 +884,11 @@ def main() -> None:
         action="store_true",
         help="Use ML strategy instead of SMA crossover",
     )
+    parser.add_argument(
+        "--use-smart-execution",
+        action="store_true",
+        help="Enable smart execution algorithms (TWAP, VWAP, Iceberg)",
+    )
     args = parser.parse_args()
 
     cfg = load_config()
@@ -790,6 +916,7 @@ def main() -> None:
                 default_cash=args.default_cash,
                 max_concurrent=args.max_concurrent,
                 use_ml_strategy=args.use_ml,
+                use_smart_execution=args.use_smart_execution,
             )
         )
     else:
@@ -808,6 +935,7 @@ def main() -> None:
                 max_concurrent=args.max_concurrent,
                 interval_seconds=args.interval,
                 use_ml_strategy=args.use_ml,
+                use_smart_execution=args.use_smart_execution,
             )
         )
 

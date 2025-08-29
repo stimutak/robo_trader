@@ -50,12 +50,49 @@ class ExecutionConfig(BaseModel):
     enable_short_selling: bool = Field(
         default=False, description="Enable short selling"
     )
+    
+    # Smart Execution Parameters
+    use_smart_execution: bool = Field(
+        default=False, description="Enable smart execution algorithms"
+    )
+    default_execution_algorithm: str = Field(
+        default="adaptive", description="Default execution algorithm: market, twap, vwap, iceberg, adaptive"
+    )
+    execution_duration_minutes: int = Field(
+        default=10, ge=1, le=60, description="Default execution duration in minutes"
+    )
+    max_participation_rate: float = Field(
+        default=0.15, gt=0, le=0.3, description="Maximum participation rate of volume"
+    )
+    execution_urgency: float = Field(
+        default=0.5, ge=0, le=1, description="Execution urgency (0=patient, 1=aggressive)"
+    )
+    min_slice_size: int = Field(
+        default=100, ge=1, description="Minimum execution slice size"
+    )
+    max_slice_size: int = Field(
+        default=10000, ge=100, description="Maximum execution slice size"
+    )
+    iceberg_display_ratio: float = Field(
+        default=0.2, gt=0, le=1, description="Iceberg order display ratio"
+    )
+    market_impact_factor: float = Field(
+        default=0.1, ge=0, le=1, description="Market impact factor for cost estimation"
+    )
 
     @field_validator("account_type")
     @classmethod
     def validate_account_type(cls, v: str) -> str:
         if v != "equity":
             raise ValueError("Only equity trading is supported in main branch")
+        return v
+    
+    @field_validator("default_execution_algorithm")
+    @classmethod
+    def validate_execution_algorithm(cls, v: str) -> str:
+        allowed = ["market", "twap", "vwap", "iceberg", "adaptive", "sniper"]
+        if v not in allowed:
+            raise ValueError(f"Execution algorithm must be one of {allowed}")
         return v
 
 

@@ -54,6 +54,27 @@ class ModelSelector:
         """
         models = []
         
+        # First check for the improved model
+        improved_model_path = Path("trained_models/improved_model.pkl")
+        if improved_model_path.exists():
+            try:
+                with open(improved_model_path, "rb") as f:
+                    model_info = pickle.load(f)
+                
+                # Add as priority model
+                models.append(model_info)
+                self.available_models["improved_model"] = model_info
+                
+                logger.info(
+                    "Loaded improved model with confidence filtering",
+                    filename=improved_model_path.name,
+                    test_score=model_info.get("metrics", {}).get("test_score"),
+                    confidence_threshold=model_info.get("confidence_threshold", 0.6)
+                )
+            except Exception as e:
+                logger.error(f"Failed to load improved model: {e}")
+        
+        # Then load other models
         for model_file in self.model_dir.glob("*.pkl"):
             try:
                 with open(model_file, "rb") as f:

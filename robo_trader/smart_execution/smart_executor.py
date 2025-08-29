@@ -81,14 +81,16 @@ class ExecutionResult:
 class SmartExecutor:
     """Smart order execution with advanced algorithms."""
     
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, ibkr_client=None):
         self.config = config
         self.logger = logger.bind(component="smart_executor")
+        self.ibkr_client = ibkr_client  # IBKR client for real market data
         
         # Market data cache
         self.volume_profiles: Dict[str, pd.DataFrame] = {}
         self.spread_history: Dict[str, List[float]] = {}
         self.recent_trades: Dict[str, List[Dict]] = {}
+        self.price_cache: Dict[str, Tuple[float, datetime]] = {}  # symbol -> (price, timestamp)
         
         # Execution tracking
         self.active_plans: Dict[str, ExecutionPlan] = {}
@@ -513,13 +515,78 @@ class SmartExecutor:
             'wide_spread': False
         }
         
+        # Try to get real market data if IBKR client is available
+        if self.ibkr_client and not market_data:
+            try:
+                from ib_insync import Stock
+                
+                # Create stock contract
+                contract = Stock(symbol, 'SMART', 'USD')
+                
+                # Get market data
+                ticker = self.ibkr_client.reqMktData(contract, '', False, False)
+                await asyncio.sleep(0.2)  # Wait for data to populate
+                
+                # Get historical bars for volatility and trend analysis
+                bars = self.ibkr_client.reqHistoricalData(
+                    contract,
+                    endDateTime='',
+                    durationStr='1 D',
+                    barSizeSetting='5 mins',
+                    whatToShow='TRADES',
+                    useRTH=True
+                )
+                
+                if bars and len(bars) > 20:
+                    # Calculate volatility
+                    closes = [bar.close for bar in bars]
+                    returns = np.diff(closes) / closes[:-1]
+                    volatility = np.std(returns) * np.sqrt(252 * 78)  # Annualized 5-min volatility
+                    
+                    # Check conditions
+                    if volatility > 0.3:  # 30% annualized volatility
+                        conditions['high_volatility'] = True
+                    
+                    # Check trend (simple moving average)
+                    sma_short = np.mean(closes[-10:])
+                    sma_long = np.mean(closes[-50:]) if len(closes) >= 50 else np.mean(closes)
+                    if abs(sma_short - sma_long) / sma_long > 0.01:  # 1% difference
+                        conditions['trending'] = True
+                    
+                    # Check volume
+                    volumes = [bar.volume for bar in bars]
+                    avg_volume = np.mean(volumes)
+                    if avg_volume < 100000:  # Low volume threshold
+                        conditions['low_liquidity'] = True
+                
+                # Check spread
+                if ticker.bid and ticker.ask:
+                    spread_bps = (ticker.ask - ticker.bid) / ticker.bid * 10000
+                    if spread_bps > 10:  # More than 10 bps spread
+                        conditions['wide_spread'] = True
+                
+                # Cancel market data subscription
+                self.ibkr_client.cancelMktData(contract)
+                
+                # Store as market_data for later use
+                market_data = {
+                    'volatility': volatility if 'volatility' in locals() else 0,
+                    'volume': avg_volume if 'avg_volume' in locals() else 0,
+                    'spread_bps': spread_bps if 'spread_bps' in locals() else 0,
+                    'trending': conditions['trending']
+                }
+                
+            except Exception as e:
+                self.logger.error(f"Error analyzing market conditions for {symbol}: {e}")
+        
+        # Use provided market data if available
         if market_data:
             # Check volatility
-            if market_data.get('volatility', 0) > 0.02:
+            if market_data.get('volatility', 0) > 0.3:
                 conditions['high_volatility'] = True
             
             # Check liquidity (volume)
-            if market_data.get('volume', 0) < 1000000:
+            if market_data.get('volume', 0) < 100000:
                 conditions['low_liquidity'] = True
             
             # Check trend
@@ -560,10 +627,64 @@ class SmartExecutor:
         return min(50, total_impact * 10000)  # Cap at 50 bps
     
     async def _get_current_price(self, symbol: str) -> float:
-        """Get current price for a symbol."""
-        # In production, fetch from market data
-        # For now, return mock price
-        return 100.0
+        """Get current price for a symbol from real market data."""
+        
+        # Check cache first (valid for 1 second)
+        if symbol in self.price_cache:
+            price, timestamp = self.price_cache[symbol]
+            if (datetime.now() - timestamp).total_seconds() < 1:
+                return price
+        
+        # Get real price from IBKR if client is available
+        if self.ibkr_client:
+            try:
+                from ib_insync import Stock
+                
+                # Create stock contract
+                contract = Stock(symbol, 'SMART', 'USD')
+                
+                # Get market data
+                ticker = self.ibkr_client.reqMktData(contract, '', False, False)
+                await asyncio.sleep(0.2)  # Wait for data to populate
+                
+                # Get mid price
+                if ticker.bid and ticker.ask:
+                    price = (ticker.bid + ticker.ask) / 2
+                elif ticker.last:
+                    price = ticker.last
+                elif ticker.close:
+                    price = ticker.close
+                else:
+                    # Fallback to previous day close
+                    bars = self.ibkr_client.reqHistoricalData(
+                        contract,
+                        endDateTime='',
+                        durationStr='1 D',
+                        barSizeSetting='1 day',
+                        whatToShow='TRADES',
+                        useRTH=True
+                    )
+                    if bars:
+                        price = bars[-1].close
+                    else:
+                        self.logger.warning(f"No price data available for {symbol}, using fallback")
+                        price = 100.0
+                
+                # Cache the price
+                self.price_cache[symbol] = (price, datetime.now())
+                
+                # Cancel market data subscription
+                self.ibkr_client.cancelMktData(contract)
+                
+                return price
+                
+            except Exception as e:
+                self.logger.error(f"Error fetching price for {symbol}: {e}")
+                return 100.0
+        else:
+            # No IBKR client, return mock price
+            self.logger.debug(f"No IBKR client available, using mock price for {symbol}")
+            return 100.0
     
     def _calculate_slippage(
         self,
