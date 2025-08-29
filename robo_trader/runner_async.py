@@ -251,7 +251,12 @@ class AsyncRunner:
         
         # Update correlation tracker with price data if enabled
         if self.use_correlation_sizing and self.correlation_tracker:
-            self.correlation_tracker.update_price_history(symbol, df[['close']].rename(columns={'close': symbol}))
+            # Add price series for correlation calculation
+            self.correlation_tracker.add_price_series(
+                symbol=symbol,
+                prices=df['close'],
+                sector=None  # TODO: Add sector classification
+            )
         
         last = signals.iloc[-1]
         price = float(last.get("close", df["close"].iloc[-1]))
@@ -514,7 +519,7 @@ async def run_once(
         max_daily_notional=max_daily_notional,
         default_cash=default_cash,
         max_concurrent_symbols=max_concurrent,
-        use_correlation_sizing=False,  # Disabled due to bug
+        use_correlation_sizing=True,  # FIXED: Enabled M5 correlation integration
     )
     await runner.run(symbols)
 
@@ -587,7 +592,7 @@ async def run_continuous(
                 max_daily_notional=max_daily_notional,
                 default_cash=default_cash,
                 max_concurrent_symbols=max_concurrent,
-                use_correlation_sizing=False,  # Disabled due to bug
+                use_correlation_sizing=True,  # FIXED: Enabled M5 correlation integration
             )
             
             await runner.run(symbols)

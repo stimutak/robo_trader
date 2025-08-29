@@ -83,15 +83,15 @@ class CorrelationBasedPositionSizer:
         # Get correlations with existing positions
         position_correlations = []
         for pos_symbol, position in current_positions.items():
-            if pos_symbol != symbol and position.size != 0:
-                correlation = self.correlation_tracker.get_correlation(
+            if pos_symbol != symbol and position.quantity != 0:
+                correlation = self.correlation_tracker.get_pairwise_correlation(
                     symbol, pos_symbol
                 )
                 if correlation is not None:
                     position_correlations.append({
                         'symbol': pos_symbol,
                         'correlation': correlation,
-                        'exposure': abs(position.value) / portfolio_value
+                        'exposure': position.notional_value / portfolio_value
                     })
         
         if not position_correlations:
@@ -163,7 +163,7 @@ class CorrelationBasedPositionSizer:
         
         for i, sym1 in enumerate(position_symbols):
             for j, sym2 in enumerate(position_symbols[i+1:], i+1):
-                correlation = self.correlation_tracker.get_correlation(sym1, sym2)
+                correlation = self.correlation_tracker.get_pairwise_correlation(sym1, sym2)
                 if correlation is not None:
                     threshold_value = threshold or self.max_correlation
                     if abs(correlation) >= threshold_value:
@@ -182,7 +182,7 @@ class CorrelationBasedPositionSizer:
             }
         
         # Calculate position weights
-        total_value = sum(abs(p.value) for p in self.positions.values())
+        total_value = sum(p.notional_value for p in self.positions.values())
         if total_value == 0:
             return {
                 'herfindahl_index': 0,
@@ -192,7 +192,7 @@ class CorrelationBasedPositionSizer:
             }
         
         weights = {
-            symbol: abs(position.value) / total_value
+            symbol: position.notional_value / total_value
             for symbol, position in self.positions.items()
         }
         
@@ -255,7 +255,7 @@ class CorrelationBasedPositionSizer:
                 # Calculate average correlation with existing positions
                 correlations = []
                 for pos_symbol in position_symbols:
-                    corr = self.correlation_tracker.get_correlation(
+                    corr = self.correlation_tracker.get_pairwise_correlation(
                         candidate, pos_symbol
                     )
                     if corr is not None:
