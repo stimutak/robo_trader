@@ -245,11 +245,15 @@ class FeaturePipeline:
                 )
                 all_features.update(ml_features)
             
-            # Filter to enabled features only
-            filtered_features = {
-                k: v for k, v in all_features.items()
-                if k in self.enabled_features
-            }
+            # Filter to enabled features only (skip if no features enabled)
+            if self.enabled_features:
+                filtered_features = {
+                    k: v for k, v in all_features.items()
+                    if k in self.enabled_features
+                }
+            else:
+                # If no specific features enabled, use all
+                filtered_features = all_features
             
             # Convert to DataFrame
             features_df = pd.DataFrame([filtered_features])

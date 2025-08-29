@@ -2,12 +2,12 @@
 
 ## Project Phase Plan
 **IMPORTANT:** The authoritative phase plan is in `IMPLEMENTATION_PLAN.md`. This is the ML-focused 4-phase plan over 16 weeks:
-- Phase 1: Foundation & Quick Wins (Tasks F1-F5)
-- Phase 2: ML Infrastructure & Backtesting  
-- Phase 3: Advanced Strategy Development
-- Phase 4: Production Hardening & Deployment
+- Phase 1: Foundation & Quick Wins (Tasks F1-F5) - COMPLETE ✅
+- Phase 2: ML Infrastructure & Backtesting (Tasks M1-M5) - COMPLETE ✅
+- Phase 3: Advanced Strategy Development (Tasks S1-S5) - STARTING 🚧
+- Phase 4: Production Hardening & Deployment (Tasks P1-P6)
 
-**Current Status:** Phase 2 in progress - M1 Feature Engineering Pipeline COMPLETE ✅
+**Current Status:** Phase 2 COMPLETE ✅ - All 5 tasks done (M1-M5). Phase 3 starting.
 
 **Note:** The older 9-phase plan in `archived_plans/PROJECT_PLAN_9PHASE.md` is deprecated and should NOT be used. Any references to "Phase 5", "Phase 6" etc. from older commits refer to the old plan and should be ignored.
 
@@ -17,7 +17,10 @@
 - `robo_trader/runner_async.py` - Main trading system with async parallel processing
 - `app.py` - Dashboard with monitoring interface
 - `robo_trader/websocket_server.py` - WebSocket server for real-time updates
-- `robo_trader/features/` - Feature engineering pipeline (NEW - Phase 2)
+- `robo_trader/features/` - Feature engineering pipeline (Phase 2 - COMPLETE)
+- `robo_trader/ml/` - ML model training & selection (Phase 2 - COMPLETE)
+- `robo_trader/analytics/` - Performance analytics (Phase 2 - COMPLETE)
+- `robo_trader/backtesting/` - Walk-forward backtesting (Phase 2 - COMPLETE)
 
 ## Testing Commands
 ```bash
@@ -34,8 +37,14 @@ python test_market_hours.py
 # Run tests
 pytest
 
-# Test feature engineering pipeline (NEW)
-python test_features_simple.py
+# Test ML pipeline (Phase 2)
+python test_ml_pipeline.py
+
+# Test model training
+python test_m3_complete.py
+
+# Test performance analytics
+python test_m4_performance.py
 ```
 
 ## Current Issues to Fix

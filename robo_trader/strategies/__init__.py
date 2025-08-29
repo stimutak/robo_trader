@@ -12,6 +12,7 @@ This package provides:
 from ..legacy_strategies import sma_crossover_signals
 from .framework import (Signal, SignalType, Strategy, StrategyMetrics,
                         StrategyState)
+from .ml_strategy import MLStrategy
 
 __all__ = [
     "Strategy",
@@ -19,6 +20,7 @@ __all__ = [
     "SignalType",
     "StrategyState",
     "StrategyMetrics",
+    "MLStrategy",
     # Legacy exports
     "sma_crossover_signals",
 ]

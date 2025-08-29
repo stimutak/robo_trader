@@ -38,7 +38,7 @@ except ImportError:
     WEBSOCKET_ENABLED = False
 from .portfolio import Portfolio
 from .risk import Position, RiskManager
-from .strategies import sma_crossover_signals
+from .strategies import sma_crossover_signals, MLStrategy
 
 logger = get_logger(__name__)
 
@@ -72,6 +72,7 @@ class AsyncRunner:
         max_concurrent_symbols: int = 8,
         use_correlation_sizing: bool = True,
         max_correlation: float = 0.7,
+        use_ml_strategy: bool = False,
     ):
         self.duration = duration
         self.bar_size = bar_size
@@ -84,6 +85,7 @@ class AsyncRunner:
         self.max_concurrent_symbols = max_concurrent_symbols
         self.use_correlation_sizing = use_correlation_sizing
         self.max_correlation = max_correlation
+        self.use_ml_strategy = use_ml_strategy
 
         # Will be initialized in setup
         self.cfg = None
@@ -101,6 +103,9 @@ class AsyncRunner:
         self.correlation_tracker = None
         self.position_sizer = None
         self.correlation_manager = None
+        
+        # ML Strategy
+        self.ml_strategy = None
 
     async def setup(self):
         """Initialize all components."""
@@ -158,6 +163,47 @@ class AsyncRunner:
             )
             await self.correlation_manager.start(update_interval=300)
             logger.info("Correlation-based position sizing enabled")
+        
+        # Initialize ML strategy if enabled
+        if self.use_ml_strategy:
+            logger.info("Initializing ML strategy...")
+            from .features.feature_pipeline import FeaturePipeline
+            from .ml.model_selector import ModelSelector
+            from .ml.model_trainer import ModelTrainer
+            from pathlib import Path
+            
+            # Initialize feature pipeline
+            feature_pipeline = FeaturePipeline(self.cfg)
+            
+            # Initialize model trainer
+            model_trainer = ModelTrainer(
+                config=self.cfg,
+                model_dir=Path("trained_models")
+            )
+            
+            # Initialize model selector with trained models
+            model_selector = ModelSelector(
+                model_trainer=model_trainer,
+                model_dir=Path("trained_models")
+            )
+            
+            # Create ML strategy with proper dependencies
+            self.ml_strategy = MLStrategy(
+                model_selector=model_selector,
+                feature_pipeline=feature_pipeline,
+                confidence_threshold=0.65,
+                ensemble_agreement=0.6,
+                use_regime_filter=True,
+                position_size_method="kelly",
+                max_position_pct=0.1,
+                risk_per_trade=0.02,
+                symbols=[],  # Will be set per symbol
+                name="ML_Strategy"
+            )
+            
+            # Initialize the strategy with empty historical data (models already trained)
+            await self.ml_strategy.initialize({})
+            logger.info("ML strategy initialized successfully")
 
         logger.info("AsyncRunner setup complete")
 
@@ -243,11 +289,42 @@ class AsyncRunner:
 
         # Generate trading signal
         with Timer("signal_generation", self.monitor):
-            signals = sma_crossover_signals(
-                pd.DataFrame({"close": df["close"]}),
-                fast=self.sma_fast,
-                slow=self.sma_slow,
-            )
+            if self.use_ml_strategy and self.ml_strategy:
+                # Use ML strategy for signal generation
+                # Prepare market data in the format expected by ML strategy
+                market_data_dict = {
+                    "symbol": symbol,
+                    "data": df,
+                    "price": float(df["close"].iloc[-1]) if len(df) > 0 else 0,
+                    "portfolio_value": 100000,  # Will be replaced with actual portfolio value
+                    "atr": df["close"].rolling(14).std().iloc[-1] if len(df) > 14 else 2
+                }
+                
+                signal_obj = await self.ml_strategy.generate_signal(
+                    symbol=symbol,
+                    market_data=market_data_dict
+                )
+                
+                # Convert ML signal to format compatible with rest of code
+                if signal_obj:
+                    signal_value = 1 if signal_obj.action == "BUY" else (-1 if signal_obj.action == "SELL" else 0)
+                    confidence = signal_obj.confidence
+                else:
+                    signal_value = 0
+                    confidence = 0.5
+                    
+                signals = pd.DataFrame({
+                    "close": [df["close"].iloc[-1]],
+                    "signal": [signal_value],
+                    "confidence": [confidence]
+                })
+            else:
+                # Use traditional SMA crossover strategy
+                signals = sma_crossover_signals(
+                    pd.DataFrame({"close": df["close"]}),
+                    fast=self.sma_fast,
+                    slow=self.sma_slow,
+                )
         
         # Update correlation tracker with price data if enabled
         if self.use_correlation_sizing and self.correlation_tracker:
@@ -267,9 +344,10 @@ class AsyncRunner:
         # Record signal in database
         signal_value = int(last.get("signal", 0))
         if signal_value != 0:
+            strategy_name = "ML_ENSEMBLE" if self.use_ml_strategy else "SMA_CROSSOVER"
             await self.db.record_signal(
                 symbol,
-                "SMA_CROSSOVER",
+                strategy_name,
                 "BUY" if signal_value == 1 else "SELL",
                 abs(signal_value),
             )
@@ -507,6 +585,7 @@ async def run_once(
     max_daily_notional: Optional[float] = None,
     default_cash: Optional[float] = None,
     max_concurrent: int = 8,
+    use_ml_strategy: bool = False,
 ) -> None:
     """Run the trading system once with parallel processing."""
     runner = AsyncRunner(
@@ -520,6 +599,7 @@ async def run_once(
         default_cash=default_cash,
         max_concurrent_symbols=max_concurrent,
         use_correlation_sizing=True,  # FIXED: Enabled M5 correlation integration
+        use_ml_strategy=use_ml_strategy,
     )
     await runner.run(symbols)
 
@@ -536,6 +616,7 @@ async def run_continuous(
     default_cash: Optional[float] = None,
     max_concurrent: int = 8,
     interval_seconds: int = 300,
+    use_ml_strategy: bool = False,
 ) -> None:
     """Run the trading system continuously with market hours checking."""
     import signal
@@ -593,6 +674,7 @@ async def run_continuous(
                 default_cash=default_cash,
                 max_concurrent_symbols=max_concurrent,
                 use_correlation_sizing=True,  # FIXED: Enabled M5 correlation integration
+                use_ml_strategy=use_ml_strategy,
             )
             
             await runner.run(symbols)
@@ -676,6 +758,11 @@ def main() -> None:
         default=300,
         help="Seconds between trading cycles (default: 300 = 5 minutes)",
     )
+    parser.add_argument(
+        "--use-ml",
+        action="store_true",
+        help="Use ML strategy instead of SMA crossover",
+    )
     args = parser.parse_args()
 
     cfg = load_config()
@@ -702,6 +789,7 @@ def main() -> None:
                 max_daily_notional=args.max_daily_notional,
                 default_cash=args.default_cash,
                 max_concurrent=args.max_concurrent,
+                use_ml_strategy=args.use_ml,
             )
         )
     else:
@@ -719,6 +807,7 @@ def main() -> None:
                 default_cash=args.default_cash,
                 max_concurrent=args.max_concurrent,
                 interval_seconds=args.interval,
+                use_ml_strategy=args.use_ml,
             )
         )
 
