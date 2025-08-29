@@ -65,9 +65,11 @@ handoff/archive/
 .trading.pid
 nohup.out
 
-# Test files
-test_*.py
-*_test.py
+# Test output and coverage
+.coverage
+htmlcov/
+coverage.xml
+*.cover
 
 # API Keys and Secrets (extra caution)
 *api_key*
