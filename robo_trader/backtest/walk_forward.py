@@ -7,6 +7,8 @@ This module implements:
 - Comprehensive performance metrics
 - Out-of-sample validation
 - Monte Carlo simulation for robustness testing
+- Feature engineering integration (M1)
+- Correlation-based position sizing (M5)
 """
 
 import asyncio
@@ -21,6 +23,14 @@ from scipy import stats
 from ..logger import get_logger
 from .engine import BacktestEngine
 from .metrics import PerformanceMetrics
+from ..features import (
+    MomentumIndicators,
+    TrendIndicators,
+    VolatilityIndicators,
+    VolumeIndicators
+)
+from ..correlation import CorrelationTracker
+from ..analysis.correlation_integration import CorrelationBasedPositionSizer
 
 
 @dataclass
@@ -164,6 +174,18 @@ class WalkForwardConfig:
     
     # Execution settings
     execution_simulator: ExecutionSimulator = field(default_factory=ExecutionSimulator)
+    
+    # Feature engineering settings (M1 integration)
+    use_technical_features: bool = True
+    momentum_window: int = 14
+    trend_window: int = 20
+    volatility_window: int = 20
+    volume_window: int = 20
+    
+    # Correlation settings (M5 integration)
+    use_correlation_sizing: bool = True
+    max_correlation: float = 0.7
+    correlation_penalty_factor: float = 0.5
 
 
 class WalkForwardBacktest:
@@ -179,6 +201,77 @@ class WalkForwardBacktest:
         self.oos_results: List[Dict] = []  # Out-of-sample results
         self.parameter_stability: Dict[str, List] = {}
         
+        # Initialize feature engineering components (M1)
+        if self.config.use_technical_features:
+            self.momentum_indicators = MomentumIndicators(window_size=self.config.momentum_window)
+            self.trend_indicators = TrendIndicators()
+            self.volatility_indicators = VolatilityIndicators(window_size=self.config.volatility_window)
+            self.volume_indicators = VolumeIndicators(window_size=self.config.volume_window)
+        
+        # Initialize correlation components (M5)
+        if self.config.use_correlation_sizing:
+            self.correlation_tracker = CorrelationTracker(
+                correlation_threshold=self.config.max_correlation
+            )
+            self.position_sizer = CorrelationBasedPositionSizer(
+                correlation_tracker=self.correlation_tracker,
+                max_correlation=self.config.max_correlation,
+                correlation_penalty_factor=self.config.correlation_penalty_factor
+            )
+        else:
+            self.correlation_tracker = None
+            self.position_sizer = None
+        
+    def generate_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Generate technical features for backtesting (M1 integration).
+        
+        Args:
+            data: OHLCV DataFrame
+            
+        Returns:
+            DataFrame with features added
+        """
+        if not self.config.use_technical_features:
+            return data
+        
+        features = data.copy()
+        
+        # Generate momentum features
+        if self.momentum_indicators.validate_data(data):
+            momentum_features = self.momentum_indicators.calculate(data)
+            for name, feature in momentum_features.items():
+                features[f'momentum_{name}'] = feature.value
+        
+        # Generate trend features
+        if self.trend_indicators.validate_data(data):
+            trend_features = self.trend_indicators.calculate(data)
+            for name, feature in trend_features.items():
+                if name in ['sma_20', 'ema_20', 'macd', 'adx']:  # Key features
+                    features[f'trend_{name}'] = feature.value
+        
+        # Generate volatility features
+        if self.volatility_indicators.validate_data(data):
+            volatility_features = self.volatility_indicators.calculate(data)
+            for name, feature in volatility_features.items():
+                features[f'volatility_{name}'] = feature.value
+        
+        # Generate volume features
+        if self.volume_indicators.validate_data(data):
+            volume_features = self.volume_indicators.calculate(data)
+            for name, feature in volume_features.items():
+                features[f'volume_{name}'] = feature.value
+        
+        # Add derived features
+        if 'trend_sma_20' in features.columns:
+            features['price_to_sma'] = features['close'] / features['trend_sma_20']
+        
+        features['volume_ratio'] = features['volume'] / features['volume'].rolling(20).mean()
+        features['spread'] = (features['high'] - features['low']) / features['close']
+        features['overnight_gap'] = (features['open'] - features['close'].shift(1)) / features['close'].shift(1)
+        
+        return features
+    
     def create_windows(
         self,
         start_date: datetime,
@@ -257,9 +350,20 @@ class WalkForwardBacktest:
         positions = {}
         cash = 100000  # Starting cash
         
-        for i, row in data.iterrows():
-            # Generate signal
-            signal = engine.strategy.generate_signal(data.loc[:i], parameters)
+        # Generate features for the data (M1 integration)
+        featured_data = self.generate_features(data)
+        
+        # Update correlation tracker if enabled (M5 integration)
+        if self.correlation_tracker and 'symbol' in data.columns:
+            symbol = data['symbol'].iloc[0]
+            self.correlation_tracker.add_price_series(
+                symbol=symbol,
+                prices=data['close']
+            )
+        
+        for i, row in featured_data.iterrows():
+            # Generate signal using featured data
+            signal = engine.strategy.generate_signal(featured_data.loc[:i], parameters)
             
             if signal != 0:
                 # Get market conditions
@@ -268,8 +372,30 @@ class WalkForwardBacktest:
                 current_volume = row['volume']
                 spread = row.get('spread', row['close'] * 0.001)  # Default 10 bps
                 
-                # Calculate position size
-                position_size = int(cash * 0.02 / row['close'])  # 2% position
+                # Calculate base position size
+                base_position_size = int(cash * 0.02 / row['close'])  # 2% position
+                
+                # Apply correlation-based sizing if enabled (M5 integration)
+                if self.position_sizer and positions:
+                    # Convert positions for correlation sizer
+                    position_objects = {
+                        s: type('Position', (), {
+                            'symbol': s,
+                            'quantity': p['quantity'],
+                            'avg_price': p['entry_price'],
+                            'notional_value': p['quantity'] * p['entry_price']
+                        })() for s, p in positions.items()
+                    }
+                    
+                    position_size, sizing_reason = await self.position_sizer.calculate_position_size(
+                        symbol=data.get('symbol', 'UNKNOWN').iloc[0] if 'symbol' in data else 'UNKNOWN',
+                        base_size=base_position_size,
+                        current_positions=position_objects,
+                        portfolio_value=cash + sum(p['quantity'] * row['close'] for p in positions.values())
+                    )
+                    self.logger.debug(f"Position sizing: {base_position_size} -> {position_size} ({sizing_reason})")
+                else:
+                    position_size = base_position_size
                 
                 # Check if we can execute
                 can_exec, reason = self.execution_sim.can_execute(
@@ -499,6 +625,57 @@ class WalkForwardBacktest:
             'avg_variance': np.mean(variances),
             'parameter_impact': abs(correlation) * np.mean(variances)
         }
+    
+    async def run_multi_symbol_backtest(
+        self,
+        data: Dict[str, pd.DataFrame],
+        engine: BacktestEngine,
+        parameters: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Run backtest on multiple symbols with correlation awareness.
+        
+        Args:
+            data: Dictionary of symbol -> OHLCV DataFrame
+            engine: Backtest engine
+            parameters: Strategy parameters
+            
+        Returns:
+            Backtest results
+        """
+        self.logger.info(f"Running multi-symbol backtest for {len(data)} symbols")
+        
+        # Update correlation tracker with all symbols
+        if self.correlation_tracker:
+            for symbol, df in data.items():
+                self.correlation_tracker.add_price_series(
+                    symbol=symbol,
+                    prices=df['close']
+                )
+        
+        # Run walk-forward for primary symbol
+        primary_symbol = list(data.keys())[0]
+        primary_data = data[primary_symbol]
+        
+        # Create windows
+        windows = self.create_windows(
+            start_date=primary_data.index[0],
+            end_date=primary_data.index[-1]
+        )
+        
+        # Run windows
+        for i, window in enumerate(windows):
+            result = await self.run_single_window(
+                engine=engine,
+                train_data=primary_data.loc[window[0]:window[1]],
+                test_data=primary_data.loc[window[2]:window[3]],
+                parameters=parameters,
+                window_id=i
+            )
+            if result:
+                self.window_results.append(result)
+        
+        return self.generate_report()
     
     def generate_report(self) -> Dict[str, Any]:
         """Generate comprehensive walk-forward analysis report."""
