@@ -12,6 +12,7 @@ import asyncio
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
 
+import numpy as np
 import pandas as pd
 
 from ..config import Config
@@ -101,6 +102,115 @@ class FeaturePipeline:
                 'return_skewness', 'return_kurtosis', 'volume_return_correlation',
                 'adl_trend', 'adl_strength', 'price_position', 'momentum_divergence'
             ])
+    
+    async def calculate_features_timeseries(
+        self,
+        symbol: str,
+        price_data: pd.DataFrame,
+        cross_asset_data: Optional[Dict[str, pd.DataFrame]] = None,
+        lookback_window: int = 20
+    ) -> pd.DataFrame:
+        """Calculate features for entire time series.
+        
+        Args:
+            symbol: Stock symbol
+            price_data: Historical price data (OHLCV)
+            cross_asset_data: Optional cross-asset data for correlation features
+            lookback_window: Window for rolling calculations
+            
+        Returns:
+            DataFrame with features for each timestamp
+        """
+        if price_data is None or len(price_data) < lookback_window:
+            return pd.DataFrame()
+        
+        all_features_list = []
+        
+        # Calculate technical indicators for the entire series
+        if 'Close' in price_data.columns:
+            # Price-based features
+            price_data['returns'] = price_data['Close'].pct_change()
+            price_data['log_returns'] = np.log(price_data['Close'] / price_data['Close'].shift(1))
+            
+            # Moving averages
+            price_data['sma_20'] = price_data['Close'].rolling(20).mean()
+            price_data['sma_50'] = price_data['Close'].rolling(50).mean()
+            price_data['ema_12'] = price_data['Close'].ewm(span=12).mean()
+            price_data['ema_26'] = price_data['Close'].ewm(span=26).mean()
+            
+            # RSI
+            delta = price_data['Close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            price_data['rsi'] = 100 - (100 / (1 + rs))
+            
+            # MACD
+            price_data['macd_line'] = price_data['ema_12'] - price_data['ema_26']
+            price_data['macd_signal'] = price_data['macd_line'].ewm(span=9).mean()
+            price_data['macd_histogram'] = price_data['macd_line'] - price_data['macd_signal']
+            
+            # Bollinger Bands
+            price_data['bb_middle'] = price_data['Close'].rolling(20).mean()
+            bb_std = price_data['Close'].rolling(20).std()
+            price_data['bb_upper'] = price_data['bb_middle'] + (bb_std * 2)
+            price_data['bb_lower'] = price_data['bb_middle'] - (bb_std * 2)
+            price_data['bb_bandwidth'] = (price_data['bb_upper'] - price_data['bb_lower']) / price_data['bb_middle']
+            
+            # ATR (Average True Range)
+            if 'High' in price_data.columns and 'Low' in price_data.columns:
+                high_low = price_data['High'] - price_data['Low']
+                high_close = np.abs(price_data['High'] - price_data['Close'].shift())
+                low_close = np.abs(price_data['Low'] - price_data['Close'].shift())
+                ranges = pd.concat([high_low, high_close, low_close], axis=1)
+                true_range = ranges.max(axis=1)
+                price_data['atr'] = true_range.rolling(14).mean()
+            
+            # Volume features
+            if 'Volume' in price_data.columns:
+                price_data['volume_ratio'] = price_data['Volume'] / price_data['Volume'].rolling(20).mean()
+                price_data['obv'] = (np.sign(price_data['Close'].diff()) * price_data['Volume']).cumsum()
+            
+            # Momentum features
+            price_data['momentum_1d'] = price_data['Close'].pct_change(1)
+            price_data['momentum_5d'] = price_data['Close'].pct_change(5)
+            price_data['roc'] = price_data['Close'].pct_change(10) * 100
+            
+            # Volatility features
+            price_data['historical_volatility'] = price_data['returns'].rolling(20).std() * np.sqrt(252)
+            price_data['volatility_ratio'] = price_data['historical_volatility'] / price_data['historical_volatility'].rolling(60).mean()
+            
+            # Create feature DataFrame
+            feature_columns = [
+                'returns', 'log_returns', 'sma_20', 'sma_50', 'ema_12', 'ema_26',
+                'rsi', 'macd_line', 'macd_signal', 'macd_histogram',
+                'bb_upper', 'bb_middle', 'bb_lower', 'bb_bandwidth',
+                'momentum_1d', 'momentum_5d', 'roc',
+                'historical_volatility', 'volatility_ratio'
+            ]
+            
+            # Add volume features if available
+            if 'Volume' in price_data.columns:
+                feature_columns.extend(['volume_ratio', 'obv'])
+            
+            # Add ATR if available
+            if 'atr' in price_data.columns:
+                feature_columns.append('atr')
+            
+            # Select feature columns that exist
+            available_features = [col for col in feature_columns if col in price_data.columns]
+            features_df = price_data[available_features].copy()
+            
+            # Add symbol and timestamp
+            features_df['symbol'] = symbol
+            features_df.index.name = 'timestamp'
+            
+            # Drop NaN rows from beginning (due to rolling calculations)
+            features_df = features_df.dropna()
+            
+            return features_df
+        
+        return pd.DataFrame()
     
     async def calculate_features(
         self,

@@ -291,6 +291,13 @@ class ModelSelector:
             train_data = data.iloc[start_idx:end_idx]
             test_data = data.iloc[end_idx:test_end_idx]
             
+            # Skip if test data is empty or too small
+            if len(test_data) < 2:
+                logger.warning(
+                    f"Skipping window due to insufficient test data: {len(test_data)} samples"
+                )
+                continue
+            
             X_train = train_data[feature_columns]
             y_train = train_data[target_column]
             X_test = test_data[feature_columns]

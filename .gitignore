@@ -76,3 +76,4 @@ test_*.py
 *credentials*
 
 
+models/
