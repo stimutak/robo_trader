@@ -1,0 +1,93 @@
+{
+  "total_return": -0.1048,
+  "annual_return": -0.0619,
+  "annual_volatility": 0.3133,
+  "max_drawdown": -0.2775,
+  "max_drawdown_duration": 213,
+  "var_95": -0.0323,
+  "cvar_95": -0.0384,
+  "sharpe_ratio": -0.261,
+  "sortino_ratio": -0.029,
+  "calmar_ratio": -0.223,
+  "win_rate": 0.508,
+  "avg_win": 0.0155,
+  "avg_loss": -0.0165,
+  "win_loss_ratio": 0.94,
+  "positive_months": "4",
+  "total_months": 9,
+  "monthly_win_rate": 0.444,
+  "skewness": 0.109,
+  "kurtosis": -0.075,
+  "n_observations": 252,
+  "alpha": 0.0,
+  "beta": 0.0,
+  "information_ratio": 0.0,
+  "treynor_ratio": 0.0,
+  "up_capture": 0.0,
+  "down_capture": 0.0,
+  "strategy_name": "MLEnsemble",
+  "strategy_type": "ml_ensemble",
+  "start_date": "2024-12-21T02:01:03.783457",
+  "end_date": "2025-08-29T02:01:03.783457",
+  "n_periods": 252,
+  "trade_statistics": {
+    "total_trades": 50,
+    "avg_trade_size": 51.2,
+    "avg_holding_period": 10.04,
+    "win_rate": 0.6,
+    "avg_win": 176.77388083025596,
+    "avg_loss": -141.41405462852356,
+    "largest_win": 609.4434865535595,
+    "largest_loss": -651.0313249610874,
+    "profit_factor": 1.8750669581034722
+  },
+  "position_statistics": {
+    "avg_positions": 4.0,
+    "max_positions": "4",
+    "avg_concentration": 0.32633680260526343,
+    "max_concentration": 0.6904529457826998,
+    "turnover": 0.619297605920307
+  },
+  "rolling_metrics": {
+    "sharpe": [
+      -1.3677614225740544,
+      -0.5958405217195313,
+      -0.01731374895953315,
+      0.056041494524043424,
+      -0.04381493500354303,
+      0.006215510174947717,
+      0.11525915227199138,
+      0.42867743294138344,
+      0.2206668853498091,
+      0.2962361942004831
+    ],
+    "volatility": [
+      0.33221288313984915,
+      0.33962052073766585,
+      0.34288282700128325,
+      0.3435854262440478,
+      0.34391467530914793,
+      0.3428081412837121,
+      0.3447133885749203,
+      0.33925320737423753,
+      0.34280365997793427,
+      0.3427556133511163
+    ],
+    "drawdown": [
+      -0.14337319583299213,
+      -0.1340012195609059,
+      -0.13400121956090574,
+      -0.13400121956090577,
+      -0.12418718684219808,
+      -0.12418718684219826,
+      -0.11902016299846141,
+      -0.11902016299846147,
+      -0.11902016299846155,
+      -0.11902016299846122
+    ]
+  },
+  "metadata": {
+    "test_run": true,
+    "model_version": "1.0"
+  }
+}

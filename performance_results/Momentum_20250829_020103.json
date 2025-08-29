@@ -1,0 +1,93 @@
+{
+  "total_return": -0.2103,
+  "annual_return": -0.1568,
+  "annual_volatility": 0.3982,
+  "max_drawdown": -0.2587,
+  "max_drawdown_duration": 127,
+  "var_95": -0.043,
+  "cvar_95": -0.0541,
+  "sharpe_ratio": -0.444,
+  "sortino_ratio": -0.044,
+  "calmar_ratio": -0.606,
+  "win_rate": 0.456,
+  "avg_win": 0.0207,
+  "avg_loss": -0.0186,
+  "win_loss_ratio": 1.12,
+  "positive_months": "3",
+  "total_months": 9,
+  "monthly_win_rate": 0.333,
+  "skewness": -0.063,
+  "kurtosis": 0.196,
+  "n_observations": 252,
+  "alpha": 0.0,
+  "beta": 0.0,
+  "information_ratio": 0.0,
+  "treynor_ratio": 0.0,
+  "up_capture": 0.0,
+  "down_capture": 0.0,
+  "strategy_name": "Momentum",
+  "strategy_type": "momentum",
+  "start_date": "2024-12-21T02:01:03.699419",
+  "end_date": "2025-08-29T02:01:03.699419",
+  "n_periods": 252,
+  "trade_statistics": {
+    "total_trades": 50,
+    "avg_trade_size": 56.78,
+    "avg_holding_period": 10.76,
+    "win_rate": 0.66,
+    "avg_win": 216.49287479345475,
+    "avg_loss": -182.27650289122928,
+    "largest_win": 620.050762085834,
+    "largest_loss": -350.4720677902661,
+    "profit_factor": 2.3055680130633043
+  },
+  "position_statistics": {
+    "avg_positions": 4.0,
+    "max_positions": "4",
+    "avg_concentration": 0.3324761468884043,
+    "max_concentration": 0.7236976987470028,
+    "turnover": 0.6540221668022056
+  },
+  "rolling_metrics": {
+    "sharpe": [
+      -0.061738646213713715,
+      0.31601015259958176,
+      0.5592445194516905,
+      0.3673766207279073,
+      -0.79571651051075,
+      -0.3048083445330051,
+      -0.09581635503221304,
+      -0.4002275906856133,
+      -0.4781133501585321,
+      -0.5557059763102834
+    ],
+    "volatility": [
+      0.40128183971694475,
+      0.3987327523868916,
+      0.4001164272014247,
+      0.3981899615447809,
+      0.4130453988561969,
+      0.4041752730781424,
+      0.4082357459585205,
+      0.4094750428024007,
+      0.4075507148738339,
+      0.4105534804124123
+    ],
+    "drawdown": [
+      -0.1465211468090107,
+      -0.14652114680901132,
+      -0.14652114680901077,
+      -0.14652114680901107,
+      -0.1736002911662952,
+      -0.1736002911662955,
+      -0.17360029116629563,
+      -0.17360029116629558,
+      -0.17360029116629525,
+      -0.17844057816529274
+    ]
+  },
+  "metadata": {
+    "test_run": true,
+    "model_version": "1.0"
+  }
+}

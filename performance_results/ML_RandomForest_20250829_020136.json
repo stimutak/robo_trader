@@ -1,0 +1,36 @@
+{
+  "strategy_name": "ML_RandomForest",
+  "strategy_type": "ml_ensemble",
+  "start_date": null,
+  "end_date": null,
+  "n_periods": 0,
+  "position_statistics": {
+    "avg_positions": 4.0,
+    "max_positions": "4",
+    "avg_concentration": 0.33106512603124316,
+    "max_concentration": 0.6297253404163932,
+    "turnover": 0.6602470035545864
+  },
+  "rolling_metrics": {
+    "sharpe": [],
+    "volatility": [],
+    "drawdown": []
+  },
+  "metadata": {
+    "model_type": "RandomForest",
+    "ml_metrics": {
+      "accuracy": NaN,
+      "precision": 0,
+      "recall": 0,
+      "f1_score": 0
+    },
+    "feature_importance": {
+      "rsi": 0.15,
+      "macd": 0.12,
+      "volume_ratio": 0.1,
+      "sma_20": 0.08,
+      "atr": 0.07
+    },
+    "n_predictions": 252
+  }
+}

@@ -1,0 +1,93 @@
+{
+  "total_return": -0.0116,
+  "annual_return": 0.0382,
+  "annual_volatility": 0.3169,
+  "max_drawdown": -0.3704,
+  "max_drawdown_duration": 136,
+  "var_95": -0.0336,
+  "cvar_95": -0.0389,
+  "sharpe_ratio": 0.058,
+  "sortino_ratio": 0.006,
+  "calmar_ratio": 0.103,
+  "win_rate": 0.536,
+  "avg_win": 0.015,
+  "avg_loss": -0.017,
+  "win_loss_ratio": 0.88,
+  "positive_months": "4",
+  "total_months": 9,
+  "monthly_win_rate": 0.444,
+  "skewness": 0.131,
+  "kurtosis": 0.036,
+  "n_observations": 252,
+  "alpha": 0.0,
+  "beta": 0.0,
+  "information_ratio": 0.0,
+  "treynor_ratio": 0.0,
+  "up_capture": 0.0,
+  "down_capture": 0.0,
+  "strategy_name": "MLEnsemble",
+  "strategy_type": "ml_ensemble",
+  "start_date": "2024-12-21T02:00:26.525776",
+  "end_date": "2025-08-29T02:00:26.525776",
+  "n_periods": 252,
+  "trade_statistics": {
+    "total_trades": 50,
+    "avg_trade_size": 56.98,
+    "avg_holding_period": 9.72,
+    "win_rate": 0.58,
+    "avg_win": 188.3008549397634,
+    "avg_loss": -127.6033768504844,
+    "largest_win": 497.44672110675447,
+    "largest_loss": -332.68742643545215,
+    "profit_factor": 2.0378341105276796
+  },
+  "position_statistics": {
+    "avg_positions": 4.0,
+    "max_positions": "4",
+    "avg_concentration": 0.3424335095406122,
+    "max_concentration": 0.7149342245326442,
+    "turnover": 0.661719266896278
+  },
+  "rolling_metrics": {
+    "sharpe": [
+      0.46232346621249243,
+      0.044424115382039144,
+      1.253411558966741,
+      1.365245361773871,
+      1.4266933757886884,
+      1.6199358640438881,
+      1.5051845243112234,
+      1.8727769717547753,
+      1.8227824341217105,
+      1.7832828784159283
+    ],
+    "volatility": [
+      0.3289889023471431,
+      0.33242805874057624,
+      0.34360305446639733,
+      0.3440848730347292,
+      0.34473362368348925,
+      0.3435009331786371,
+      0.3430715765876335,
+      0.34059879162679635,
+      0.34060282065708025,
+      0.33924994644465256
+    ],
+    "drawdown": [
+      -0.11439013278355539,
+      -0.10233171675790634,
+      -0.10233171675790642,
+      -0.10233171675790642,
+      -0.10233171675790642,
+      -0.10233171675790637,
+      -0.1023317167579064,
+      -0.10233171675790628,
+      -0.10233171675790632,
+      -0.0678488277856505
+    ]
+  },
+  "metadata": {
+    "test_run": true,
+    "model_version": "1.0"
+  }
+}
