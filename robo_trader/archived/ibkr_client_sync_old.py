@@ -74,18 +74,14 @@ class IBKRClient:
         if self.ib.isConnected():
             self.ib.disconnect()
 
-    def qualify_stock(
-        self, symbol: str, exchange: str = "SMART", currency: str = "USD"
-    ):
+    def qualify_stock(self, symbol: str, exchange: str = "SMART", currency: str = "USD"):
         contract = Stock(symbol, exchange, currency)
         qualified = self.ib.qualifyContracts(contract)
         if not qualified:
             raise RuntimeError(f"Unable to qualify contract for {symbol}")
         return qualified[0]
 
-    async def fetch_recent_bars(
-        self, symbol: str, duration: str = "2 D", bar_size: str = "5 mins"
-    ):
+    async def fetch_recent_bars(self, symbol: str, duration: str = "2 D", bar_size: str = "5 mins"):
         """Fetch recent bars as a pandas DataFrame.
 
         Args:
@@ -124,9 +120,7 @@ def normalize_bars_df(df: pd.DataFrame) -> pd.DataFrame:
 
     # Standard column subset if present
     preferred_cols = [
-        c
-        for c in ["date", "time", "open", "high", "low", "close", "volume"]
-        if c in data.columns
+        c for c in ["date", "time", "open", "high", "low", "close", "volume"] if c in data.columns
     ]
     if preferred_cols:
         data = data[preferred_cols]

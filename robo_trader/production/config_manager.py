@@ -169,9 +169,9 @@ class ProductionConfig:
             "smtp_password",
             "slack_webhook_url",
         ]
-        for field in sensitive_fields:
-            if field in data:
-                data[field] = "***REDACTED***"
+        for field_name in sensitive_fields:
+            if field_name in data:
+                data[field_name] = "***REDACTED***"
         return data
 
 
@@ -250,9 +250,7 @@ class ConfigManager:
         logger.info(f"Loaded configuration for {self.environment.value} environment")
         return config
 
-    def _merge_config(
-        self, config: ProductionConfig, data: Dict[str, Any]
-    ) -> ProductionConfig:
+    def _merge_config(self, config: ProductionConfig, data: Dict[str, Any]) -> ProductionConfig:
         """Merge configuration data into config object."""
         # Update trading limits
         if "trading_limits" in data:
@@ -287,9 +285,9 @@ class ConfigManager:
             "cache_ttl_seconds",
             "request_rate_limit",
         ]
-        for field in root_fields:
-            if field in data:
-                setattr(config, field, data[field])
+        for field_name in root_fields:
+            if field_name in data:
+                setattr(config, field_name, data[field_name])
 
         return config
 
@@ -342,9 +340,7 @@ class ConfigManager:
 
         return config
 
-    def _decrypt_secrets(
-        self, config: ProductionConfig, secrets_file: Path
-    ) -> ProductionConfig:
+    def _decrypt_secrets(self, config: ProductionConfig, secrets_file: Path) -> ProductionConfig:
         """Decrypt secrets from encrypted file."""
         encryption_key = os.getenv("ENCRYPTION_KEY")
         if not encryption_key:
@@ -369,9 +365,7 @@ class ConfigManager:
 
         return config
 
-    def _parse_database_url(
-        self, config: ProductionConfig, url: str
-    ) -> ProductionConfig:
+    def _parse_database_url(self, config: ProductionConfig, url: str) -> ProductionConfig:
         """Parse database URL into configuration."""
         # Format: postgresql://user:pass@host:port/database
         if url.startswith("postgresql://"):
@@ -383,16 +377,10 @@ class ConfigManager:
 
                 config.database.db_type = "postgresql"
                 config.database.pg_username = user_pass[0] if user_pass else None
-                config.database.pg_password = (
-                    user_pass[1] if len(user_pass) > 1 else None
-                )
+                config.database.pg_password = user_pass[1] if len(user_pass) > 1 else None
                 config.database.pg_host = host_port[0]
-                config.database.pg_port = (
-                    int(host_port[1]) if len(host_port) > 1 else 5432
-                )
-                config.database.pg_database = (
-                    host_port_db[1] if len(host_port_db) > 1 else None
-                )
+                config.database.pg_port = int(host_port[1]) if len(host_port) > 1 else 5432
+                config.database.pg_database = host_port_db[1] if len(host_port_db) > 1 else None
 
         return config
 

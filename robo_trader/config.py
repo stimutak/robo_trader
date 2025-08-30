@@ -35,28 +35,23 @@ class ExecutionConfig(BaseModel):
     """Execution configuration."""
 
     mode: TradingMode = Field(default=TradingMode.PAPER, description="Trading mode")
-    account_type: str = Field(
-        default="equity", description="Account type (equity only)"
-    )
-    max_daily_trades: int = Field(
-        default=100, ge=1, le=1000, description="Maximum trades per day"
-    )
+    account_type: str = Field(default="equity", description="Account type (equity only)")
+    max_daily_trades: int = Field(default=100, ge=1, le=1000, description="Maximum trades per day")
     position_timeout_hours: int = Field(
         default=24, ge=1, le=168, description="Position timeout in hours"
     )
     order_timeout_seconds: int = Field(
         default=30, ge=5, le=300, description="Order timeout in seconds"
     )
-    enable_short_selling: bool = Field(
-        default=False, description="Enable short selling"
-    )
-    
+    enable_short_selling: bool = Field(default=False, description="Enable short selling")
+
     # Smart Execution Parameters
     use_smart_execution: bool = Field(
         default=False, description="Enable smart execution algorithms"
     )
     default_execution_algorithm: str = Field(
-        default="adaptive", description="Default execution algorithm: market, twap, vwap, iceberg, adaptive"
+        default="adaptive",
+        description="Default execution algorithm: market, twap, vwap, iceberg, adaptive",
     )
     execution_duration_minutes: int = Field(
         default=10, ge=1, le=60, description="Default execution duration in minutes"
@@ -67,12 +62,8 @@ class ExecutionConfig(BaseModel):
     execution_urgency: float = Field(
         default=0.5, ge=0, le=1, description="Execution urgency (0=patient, 1=aggressive)"
     )
-    min_slice_size: int = Field(
-        default=100, ge=1, description="Minimum execution slice size"
-    )
-    max_slice_size: int = Field(
-        default=10000, ge=100, description="Maximum execution slice size"
-    )
+    min_slice_size: int = Field(default=100, ge=1, description="Minimum execution slice size")
+    max_slice_size: int = Field(default=10000, ge=100, description="Maximum execution slice size")
     iceberg_display_ratio: float = Field(
         default=0.2, gt=0, le=1, description="Iceberg order display ratio"
     )
@@ -86,7 +77,7 @@ class ExecutionConfig(BaseModel):
         if v != "equity":
             raise ValueError("Only equity trading is supported in main branch")
         return v
-    
+
     @field_validator("default_execution_algorithm")
     @classmethod
     def validate_execution_algorithm(cls, v: str) -> str:
@@ -120,9 +111,7 @@ class RiskConfig(BaseModel):
     max_sector_exposure_pct: float = Field(
         default=0.3, gt=0, le=0.5, description="Max sector exposure"
     )
-    max_leverage: float = Field(
-        default=2.0, ge=1.0, le=4.0, description="Maximum account leverage"
-    )
+    max_leverage: float = Field(default=2.0, ge=1.0, le=4.0, description="Maximum account leverage")
     stop_loss_pct: float = Field(
         default=0.02, gt=0, le=0.1, description="Default stop loss percentage"
     )
@@ -137,15 +126,11 @@ class RiskConfig(BaseModel):
     max_daily_notional: Optional[float] = Field(
         default=100_000, ge=1000, description="Max daily trading notional"
     )
-    max_open_positions: int = Field(
-        default=20, ge=1, le=100, description="Maximum open positions"
-    )
+    max_open_positions: int = Field(default=20, ge=1, le=100, description="Maximum open positions")
     position_sizing_method: str = Field(
         default="fixed", description="Position sizing method: fixed, atr, kelly"
     )
-    use_trailing_stop: bool = Field(
-        default=False, description="Enable trailing stop losses"
-    )
+    use_trailing_stop: bool = Field(default=False, description="Enable trailing stop losses")
     trailing_stop_pct: float = Field(
         default=0.015, gt=0, le=0.1, description="Trailing stop percentage"
     )
@@ -171,9 +156,7 @@ class DataConfig(BaseModel):
     historical_days: int = Field(
         default=30, ge=1, le=365, description="Days of historical data to fetch"
     )
-    bar_size: str = Field(
-        default="5 mins", description="Default bar size for historical data"
-    )
+    bar_size: str = Field(default="5 mins", description="Default bar size for historical data")
 
     @field_validator("provider")
     @classmethod
@@ -192,9 +175,7 @@ class IBKRConfig(BaseModel):
     client_id: int = Field(default=123, ge=0, le=999, description="IBKR client ID")
     account: Optional[str] = Field(default=None, description="IBKR account number")
     readonly: bool = Field(default=True, description="Connect in read-only mode")
-    timeout: float = Field(
-        default=10.0, gt=0, description="Connection timeout in seconds"
-    )
+    timeout: float = Field(default=10.0, gt=0, description="Connection timeout in seconds")
 
     @model_validator(mode="after")
     def validate_port_for_mode(self) -> "IBKRConfig":
@@ -214,18 +195,12 @@ class StrategyConfig(BaseModel):
         default="weighted",
         description="Signal combination method: vote, weighted, priority",
     )
-    min_confidence: float = Field(
-        default=0.6, ge=0, le=1, description="Minimum signal confidence"
-    )
+    min_confidence: float = Field(default=0.6, ge=0, le=1, description="Minimum signal confidence")
     rebalance_frequency: str = Field(default="daily", description="Rebalance frequency")
 
     # Strategy-specific parameters
-    momentum_lookback: int = Field(
-        default=20, ge=5, le=100, description="Momentum lookback period"
-    )
-    mean_reversion_period: int = Field(
-        default=14, ge=5, le=50, description="Mean reversion period"
-    )
+    momentum_lookback: int = Field(default=20, ge=5, le=100, description="Momentum lookback period")
+    mean_reversion_period: int = Field(default=14, ge=5, le=50, description="Mean reversion period")
     breakout_volume_factor: float = Field(
         default=1.5, gt=1, description="Volume factor for breakouts"
     )
@@ -242,18 +217,14 @@ class StrategyConfig(BaseModel):
 class MLConfig(BaseModel):
     """Machine Learning configuration."""
 
-    enable_ml_features: bool = Field(
-        default=True, description="Enable ML feature generation"
-    )
+    enable_ml_features: bool = Field(default=True, description="Enable ML feature generation")
     feature_store_path: str = Field(
         default="feature_store.db", description="Path to feature store database"
     )
     model_registry_path: str = Field(
         default="model_registry", description="Path to model registry directory"
     )
-    auto_retrain: bool = Field(
-        default=True, description="Enable automatic model retraining"
-    )
+    auto_retrain: bool = Field(default=True, description="Enable automatic model retraining")
     retrain_threshold: float = Field(
         default=0.7, ge=0, le=1, description="Performance threshold for retraining"
     )
@@ -269,15 +240,9 @@ class MLConfig(BaseModel):
     validation_split: float = Field(
         default=0.2, gt=0, lt=1, description="Validation split for training"
     )
-    enable_ensemble: bool = Field(
-        default=True, description="Enable ensemble model training"
-    )
-    hyperparameter_tuning: bool = Field(
-        default=True, description="Enable hyperparameter tuning"
-    )
-    cross_validation_folds: int = Field(
-        default=5, ge=3, le=10, description="Number of CV folds"
-    )
+    enable_ensemble: bool = Field(default=True, description="Enable ensemble model training")
+    hyperparameter_tuning: bool = Field(default=True, description="Enable hyperparameter tuning")
+    cross_validation_folds: int = Field(default=5, ge=3, le=10, description="Number of CV folds")
 
 
 class CorrelationConfig(BaseModel):
@@ -286,9 +251,7 @@ class CorrelationConfig(BaseModel):
     max_correlation: float = Field(
         default=0.7, ge=0, le=1, description="Maximum allowed correlation"
     )
-    penalty_factor: float = Field(
-        default=0.5, ge=0, le=1, description="Correlation penalty factor"
-    )
+    penalty_factor: float = Field(default=0.5, ge=0, le=1, description="Correlation penalty factor")
     update_interval: int = Field(
         default=300, ge=60, description="Correlation update interval in seconds"
     )
@@ -315,9 +278,7 @@ class MonitoringConfig(BaseModel):
     enable_alerts: bool = Field(default=True, description="Enable alerting")
     alert_email: Optional[str] = Field(default=None, description="Alert email address")
     alert_webhook: Optional[str] = Field(default=None, description="Alert webhook URL")
-    metrics_port: int = Field(
-        default=9090, ge=1024, le=65535, description="Metrics server port"
-    )
+    metrics_port: int = Field(default=9090, ge=1024, le=65535, description="Metrics server port")
     health_check_interval: int = Field(
         default=60, ge=10, description="Health check interval in seconds"
     )
@@ -339,9 +300,7 @@ class Config(BaseModel):
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
 
     # Runtime configuration
-    symbols: List[str] = Field(
-        default=["AAPL", "MSFT", "SPY"], description="Trading symbols"
-    )
+    symbols: List[str] = Field(default=["AAPL", "MSFT", "SPY"], description="Trading symbols")
     default_cash: float = Field(
         default=100_000, gt=0, description="Starting cash for paper trading"
     )
@@ -363,9 +322,7 @@ class Config(BaseModel):
         # Ensure paper mode uses paper ports
         if self.execution.mode == TradingMode.PAPER:
             if self.ibkr.port in [7496, 4001]:  # Live ports
-                raise ValueError(
-                    "Paper mode requires paper trading port (7497 or 4002)"
-                )
+                raise ValueError("Paper mode requires paper trading port (7497 or 4002)")
 
         # Ensure production has proper monitoring
         if self.environment == Environment.PRODUCTION:
@@ -400,14 +357,9 @@ def load_config_from_env() -> Config:
             "mode": os.getenv("EXECUTION_MODE", "paper"),
             "account_type": os.getenv("EXECUTION_ACCOUNT_TYPE", "equity"),
             "max_daily_trades": int(os.getenv("EXECUTION_MAX_DAILY_TRADES", "100")),
-            "position_timeout_hours": int(
-                os.getenv("EXECUTION_POSITION_TIMEOUT", "24")
-            ),
+            "position_timeout_hours": int(os.getenv("EXECUTION_POSITION_TIMEOUT", "24")),
             "order_timeout_seconds": int(os.getenv("EXECUTION_ORDER_TIMEOUT", "30")),
-            "enable_short_selling": os.getenv(
-                "EXECUTION_SHORT_SELLING", "false"
-            ).lower()
-            == "true",
+            "enable_short_selling": os.getenv("EXECUTION_SHORT_SELLING", "false").lower() == "true",
         },
         "risk": {
             "max_position_pct": float(os.getenv("RISK_MAX_POSITION_PCT", "0.02")),
@@ -416,9 +368,7 @@ def load_config_from_env() -> Config:
             "correlation_limit": float(os.getenv("RISK_CORRELATION_LIMIT", "0.7")),
             "min_volume": int(os.getenv("RISK_MIN_VOLUME", "1000000")),
             "min_market_cap": float(os.getenv("RISK_MIN_MARKET_CAP", "1000000000")),
-            "max_sector_exposure_pct": float(
-                os.getenv("RISK_MAX_SECTOR_EXPOSURE", "0.3")
-            ),
+            "max_sector_exposure_pct": float(os.getenv("RISK_MAX_SECTOR_EXPOSURE", "0.3")),
             "max_leverage": float(os.getenv("RISK_MAX_LEVERAGE", "2.0")),
             "stop_loss_pct": float(os.getenv("RISK_STOP_LOSS_PCT", "0.02")),
             "take_profit_pct": float(os.getenv("RISK_TAKE_PROFIT_PCT", "0.05")),
@@ -434,8 +384,7 @@ def load_config_from_env() -> Config:
             ),
             "max_open_positions": int(os.getenv("RISK_MAX_OPEN_POSITIONS", "20")),
             "position_sizing_method": os.getenv("RISK_POSITION_SIZING", "fixed"),
-            "use_trailing_stop": os.getenv("RISK_USE_TRAILING_STOP", "false").lower()
-            == "true",
+            "use_trailing_stop": os.getenv("RISK_USE_TRAILING_STOP", "false").lower() == "true",
             "trailing_stop_pct": float(os.getenv("RISK_TRAILING_STOP_PCT", "0.015")),
         },
         "data": {
@@ -444,8 +393,7 @@ def load_config_from_env() -> Config:
             "feature_window": int(os.getenv("DATA_FEATURE_WINDOW", "100")),
             "tick_buffer_size": int(os.getenv("DATA_TICK_BUFFER", "10000")),
             "cache_ttl_seconds": int(os.getenv("DATA_CACHE_TTL", "300")),
-            "enable_real_time": os.getenv("DATA_ENABLE_REALTIME", "true").lower()
-            == "true",
+            "enable_real_time": os.getenv("DATA_ENABLE_REALTIME", "true").lower() == "true",
             "historical_days": int(os.getenv("DATA_HISTORICAL_DAYS", "30")),
             "bar_size": os.getenv("DATA_BAR_SIZE", "5 mins"),
         },
@@ -458,19 +406,15 @@ def load_config_from_env() -> Config:
             "timeout": float(os.getenv("IBKR_TIMEOUT", "10.0")),
         },
         "strategy": {
-            "enabled_strategies": os.getenv(
-                "STRATEGY_ENABLED", "momentum,mean_reversion"
-            ).split(","),
+            "enabled_strategies": os.getenv("STRATEGY_ENABLED", "momentum,mean_reversion").split(
+                ","
+            ),
             "combination_method": os.getenv("STRATEGY_COMBINATION", "weighted"),
             "min_confidence": float(os.getenv("STRATEGY_MIN_CONFIDENCE", "0.6")),
             "rebalance_frequency": os.getenv("STRATEGY_REBALANCE", "daily"),
             "momentum_lookback": int(os.getenv("STRATEGY_MOMENTUM_LOOKBACK", "20")),
-            "mean_reversion_period": int(
-                os.getenv("STRATEGY_MEAN_REVERSION_PERIOD", "14")
-            ),
-            "breakout_volume_factor": float(
-                os.getenv("STRATEGY_BREAKOUT_VOLUME", "1.5")
-            ),
+            "mean_reversion_period": int(os.getenv("STRATEGY_MEAN_REVERSION_PERIOD", "14")),
+            "breakout_volume_factor": float(os.getenv("STRATEGY_BREAKOUT_VOLUME", "1.5")),
         },
         "ml": {
             "enable_ml_features": os.getenv("ML_ENABLE_FEATURES", "true").lower() == "true",
@@ -479,11 +423,14 @@ def load_config_from_env() -> Config:
             "auto_retrain": os.getenv("ML_AUTO_RETRAIN", "true").lower() == "true",
             "retrain_threshold": float(os.getenv("ML_RETRAIN_THRESHOLD", "0.7")),
             "retrain_frequency_hours": int(os.getenv("ML_RETRAIN_FREQUENCY", "24")),
-            "feature_importance_threshold": float(os.getenv("ML_FEATURE_IMPORTANCE_THRESHOLD", "0.01")),
+            "feature_importance_threshold": float(
+                os.getenv("ML_FEATURE_IMPORTANCE_THRESHOLD", "0.01")
+            ),
             "n_top_features": int(os.getenv("ML_N_TOP_FEATURES", "50")),
             "validation_split": float(os.getenv("ML_VALIDATION_SPLIT", "0.2")),
             "enable_ensemble": os.getenv("ML_ENABLE_ENSEMBLE", "true").lower() == "true",
-            "hyperparameter_tuning": os.getenv("ML_HYPERPARAMETER_TUNING", "true").lower() == "true",
+            "hyperparameter_tuning": os.getenv("ML_HYPERPARAMETER_TUNING", "true").lower()
+            == "true",
             "cross_validation_folds": int(os.getenv("ML_CV_FOLDS", "5")),
         },
         "correlation": {
@@ -492,26 +439,22 @@ def load_config_from_env() -> Config:
             "update_interval": int(os.getenv("CORRELATION_UPDATE_INTERVAL", "300")),
             "lookback_days": int(os.getenv("CORRELATION_LOOKBACK_DAYS", "60")),
             "min_observations": int(os.getenv("CORRELATION_MIN_OBSERVATIONS", "30")),
-            "enable_dynamic_sizing": os.getenv("CORRELATION_DYNAMIC_SIZING", "true").lower() == "true",
+            "enable_dynamic_sizing": os.getenv("CORRELATION_DYNAMIC_SIZING", "true").lower()
+            == "true",
             "concentration_limit": float(os.getenv("CORRELATION_CONCENTRATION_LIMIT", "0.3")),
             "cluster_threshold": float(os.getenv("CORRELATION_CLUSTER_THRESHOLD", "0.8")),
         },
         "monitoring": {
-            "enable_alerts": os.getenv("MONITORING_ENABLE_ALERTS", "true").lower()
-            == "true",
+            "enable_alerts": os.getenv("MONITORING_ENABLE_ALERTS", "true").lower() == "true",
             "alert_email": os.getenv("MONITORING_ALERT_EMAIL"),
             "alert_webhook": os.getenv("MONITORING_ALERT_WEBHOOK"),
             "metrics_port": int(os.getenv("MONITORING_METRICS_PORT", "9090")),
-            "health_check_interval": int(
-                os.getenv("MONITORING_HEALTH_CHECK_INTERVAL", "60")
-            ),
+            "health_check_interval": int(os.getenv("MONITORING_HEALTH_CHECK_INTERVAL", "60")),
             "log_level": os.getenv("MONITORING_LOG_LEVEL", "INFO"),
             "log_format": os.getenv("MONITORING_LOG_FORMAT", "json"),
         },
         "symbols": [
-            s.strip()
-            for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",")
-            if s.strip()
+            s.strip() for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",") if s.strip()
         ],
         "default_cash": float(os.getenv("DEFAULT_CASH", "100000")),
     }
@@ -581,9 +524,7 @@ class LegacyConfig:
         self.ibkr_port = new_config.ibkr.port
         self.ibkr_client_id = new_config.ibkr.client_id
         self.trading_mode = new_config.execution.mode.value
-        self.max_daily_loss = (
-            new_config.risk.max_daily_loss_pct * new_config.default_cash
-        )
+        self.max_daily_loss = new_config.risk.max_daily_loss_pct * new_config.default_cash
         self.max_position_risk_pct = new_config.risk.max_position_pct
         self.max_symbol_exposure_pct = new_config.risk.max_sector_exposure_pct
         self.max_leverage = new_config.risk.max_leverage

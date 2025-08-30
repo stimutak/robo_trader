@@ -174,9 +174,7 @@ class EdgeCalculator:
 
         if risk_amount <= 0:
             logger.warning("edge_calculator.zero_risk", symbol=symbol)
-            return self._create_invalid_edge(
-                symbol, entry_price, stop_loss, take_profit
-            )
+            return self._create_invalid_edge(symbol, entry_price, stop_loss, take_profit)
 
         risk_reward_ratio = reward_amount / risk_amount
 
@@ -486,9 +484,7 @@ class EdgeCalculator:
 
         return np.clip(score, 0, 100)
 
-    def _calculate_kelly_fraction(
-        self, win_probability: float, risk_reward_ratio: float
-    ) -> float:
+    def _calculate_kelly_fraction(self, win_probability: float, risk_reward_ratio: float) -> float:
         """
         Calculate Kelly Criterion fraction for position sizing.
 
@@ -547,13 +543,9 @@ class EdgeCalculator:
             self.win_rates[symbol] = wins / len(self.trade_history[symbol])
 
             # Update average returns
-            winning_trades = [
-                t["return_pct"] for t in self.trade_history[symbol] if t["is_win"]
-            ]
+            winning_trades = [t["return_pct"] for t in self.trade_history[symbol] if t["is_win"]]
             losing_trades = [
-                abs(t["return_pct"])
-                for t in self.trade_history[symbol]
-                if not t["is_win"]
+                abs(t["return_pct"]) for t in self.trade_history[symbol] if not t["is_win"]
             ]
 
             avg_win = np.mean(winning_trades) if winning_trades else 0

@@ -59,9 +59,7 @@ class StrategyManager:
     - Track strategy performance
     """
 
-    def __init__(
-        self, combination_method: str = "weighted", correlation_threshold: float = 0.7
-    ):
+    def __init__(self, combination_method: str = "weighted", correlation_threshold: float = 0.7):
         """
         Initialize the strategy manager.
 
@@ -161,9 +159,7 @@ class StrategyManager:
 
         # Apply correlation guard
         if self._check_correlation_guard(symbol, combined):
-            logger.info(
-                f"Correlation guard triggered for {symbol}, neutralizing signal"
-            )
+            logger.info(f"Correlation guard triggered for {symbol}, neutralizing signal")
             combined.signal = SignalStrength.NEUTRAL
             combined.confidence *= 0.5
 
@@ -202,9 +198,7 @@ class StrategyManager:
                 weight_total += signal.confidence
 
             if weight_total == 0:
-                return StrategySignal(
-                    symbol, "WEIGHTED_COMBINED", SignalStrength.NEUTRAL, 0.0
-                )
+                return StrategySignal(symbol, "WEIGHTED_COMBINED", SignalStrength.NEUTRAL, 0.0)
 
             avg_signal = weighted_sum / weight_total
 
@@ -279,20 +273,15 @@ class StrategyManager:
             perf["total_return"] += return_pct
 
             logger.debug(
-                f"Recorded trade result for {strategy_name}: "
-                f"{symbol} return={return_pct:.2%}"
+                f"Recorded trade result for {strategy_name}: " f"{symbol} return={return_pct:.2%}"
             )
 
     def get_performance_summary(self) -> Dict[str, Dict]:
         """Get performance summary for all strategies."""
         summary = {}
         for name, perf in self.strategy_performance.items():
-            win_rate = (
-                perf["successful"] / perf["signals"] if perf["signals"] > 0 else 0
-            )
-            avg_return = (
-                perf["total_return"] / perf["signals"] if perf["signals"] > 0 else 0
-            )
+            win_rate = perf["successful"] / perf["signals"] if perf["signals"] > 0 else 0
+            avg_return = perf["total_return"] / perf["signals"] if perf["signals"] > 0 else 0
 
             summary[name] = {
                 "signals": perf["signals"],

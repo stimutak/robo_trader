@@ -147,12 +147,8 @@ class RiskManager:
         self.max_position_risk_pct = float(max_position_risk_pct)
         self.max_symbol_exposure_pct = float(max_symbol_exposure_pct)
         self.max_leverage = float(max_leverage)
-        self.max_order_notional = (
-            float(max_order_notional) if max_order_notional else None
-        )
-        self.max_daily_notional = (
-            float(max_daily_notional) if max_daily_notional else None
-        )
+        self.max_order_notional = float(max_order_notional) if max_order_notional else None
+        self.max_daily_notional = float(max_daily_notional) if max_daily_notional else None
         self.max_portfolio_heat = float(max_portfolio_heat)
         self.position_sizing_method = position_sizing_method
         self.atr_risk_factor = float(atr_risk_factor)
@@ -334,9 +330,7 @@ class RiskManager:
         if self.position_sizing_method == "atr" and symbol:
             return self.position_size_atr(symbol, cash_available, entry_price, **kwargs)
         elif self.position_sizing_method == "kelly" and symbol:
-            return self.position_size_kelly(
-                symbol, cash_available, entry_price, **kwargs
-            )
+            return self.position_size_kelly(symbol, cash_available, entry_price, **kwargs)
         else:
             return self.position_size_fixed(cash_available, entry_price)
 
@@ -445,9 +439,7 @@ class RiskManager:
             if other_symbol == symbol:
                 continue
 
-            correlation = self.portfolio_correlations.get(symbol, {}).get(
-                other_symbol, 0
-            )
+            correlation = self.portfolio_correlations.get(symbol, {}).get(other_symbol, 0)
             if abs(correlation) > self.correlation_limit:
                 msg = f"Correlation between {symbol} and {other_symbol} ({correlation:.2f}) exceeds limit"
                 return False, msg
@@ -554,9 +546,7 @@ class RiskManager:
             return False, "Symbol exposure exceeds limit"
 
         # Leverage check
-        existing_notional = sum(
-            pos.notional_value for pos in current_positions.values()
-        )
+        existing_notional = sum(pos.notional_value for pos in current_positions.values())
         total_after = existing_notional + order_notional
         if equity > 0 and (total_after / equity) > self.max_leverage:
             self._record_violation(RiskViolationType.LEVERAGE_LIMIT, symbol)
@@ -581,9 +571,7 @@ class RiskManager:
             return False, msg
 
         # Sector exposure check
-        is_valid, msg = self.check_sector_exposure(
-            symbol, order_notional, equity, sector
-        )
+        is_valid, msg = self.check_sector_exposure(symbol, order_notional, equity, sector)
         if not is_valid:
             self._record_violation(RiskViolationType.SECTOR_EXPOSURE_LIMIT, symbol)
             return False, msg
@@ -661,9 +649,7 @@ class RiskManager:
         if position.max_price_since_entry is None:
             position.max_price_since_entry = current_price
         else:
-            position.max_price_since_entry = max(
-                position.max_price_since_entry, current_price
-            )
+            position.max_price_since_entry = max(position.max_price_since_entry, current_price)
 
         # Calculate new stop
         if position.is_long:
@@ -726,9 +712,7 @@ class RiskManager:
 
             # Sharpe Ratio (assuming 0 risk-free rate)
             if returns_history.std() > 0:
-                sharpe_ratio = (
-                    returns_history.mean() / returns_history.std() * np.sqrt(252)
-                )
+                sharpe_ratio = returns_history.mean() / returns_history.std() * np.sqrt(252)
 
             # Sortino Ratio
             downside_returns = returns_history[returns_history < 0]

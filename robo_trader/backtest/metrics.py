@@ -299,9 +299,7 @@ def calculate_rolling_metrics(
     ).std() * np.sqrt(252)
 
     # Rolling Sharpe
-    rolling_metrics["sharpe"] = (rolling_metrics["return"] - 0.02) / rolling_metrics[
-        "volatility"
-    ]
+    rolling_metrics["sharpe"] = (rolling_metrics["return"] - 0.02) / rolling_metrics["volatility"]
 
     # Rolling max drawdown
     cumsum = returns.cumsum()
@@ -336,9 +334,7 @@ def calculate_monthly_returns(returns: pd.Series) -> pd.DataFrame:
     return monthly
 
 
-def create_performance_report(
-    metrics: PerformanceMetrics, trades: pd.DataFrame
-) -> Dict[str, Any]:
+def create_performance_report(metrics: PerformanceMetrics, trades: pd.DataFrame) -> Dict[str, Any]:
     """
     Create detailed performance report.
 

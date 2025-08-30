@@ -133,9 +133,7 @@ class EnhancedMomentumStrategy(Strategy):
             current_volume = data["volume"].iloc[-1] if "volume" in data else 0
 
             # Calculate momentum score
-            momentum_score = self._calculate_momentum_score(
-                data, feature_set, current_volume
-            )
+            momentum_score = self._calculate_momentum_score(data, feature_set, current_volume)
 
             self.momentum_scores[symbol] = momentum_score
 
@@ -255,9 +253,7 @@ class EnhancedMomentumStrategy(Strategy):
             atr = feature_set.atr if feature_set.atr else current_price * 0.02
 
             stop_loss = current_price - (atr * self.atr_multiplier)
-            take_profit = current_price + (
-                atr * self.atr_multiplier * self.risk_reward_min
-            )
+            take_profit = current_price + (atr * self.atr_multiplier * self.risk_reward_min)
 
             # Check Bollinger Bands for entry timing
             entry_quality = 1.0

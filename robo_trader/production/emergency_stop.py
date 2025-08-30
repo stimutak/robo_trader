@@ -69,9 +69,7 @@ class EmergencyStopEvent:
             "message": self.message,
             "metadata": self.metadata,
             "auto_resume": self.auto_resume,
-            "resume_after": (
-                self.resume_after.isoformat() if self.resume_after else None
-            ),
+            "resume_after": (self.resume_after.isoformat() if self.resume_after else None),
         }
 
 
@@ -142,9 +140,7 @@ class EmergencyStopManager:
                         scope=StopScope(restriction_data["scope"]),
                         target=restriction_data.get("target"),
                         reason=StopReason(restriction_data["reason"]),
-                        created_at=datetime.fromisoformat(
-                            restriction_data["created_at"]
-                        ),
+                        created_at=datetime.fromisoformat(restriction_data["created_at"]),
                         expires_at=(
                             datetime.fromisoformat(restriction_data["expires_at"])
                             if restriction_data.get("expires_at")
@@ -173,17 +169,13 @@ class EmergencyStopManager:
                         "target": r.target,
                         "reason": r.reason.value,
                         "created_at": r.created_at.isoformat(),
-                        "expires_at": (
-                            r.expires_at.isoformat() if r.expires_at else None
-                        ),
+                        "expires_at": (r.expires_at.isoformat() if r.expires_at else None),
                         "metadata": r.metadata,
                     }
                     for r in self.restrictions.values()
                     if r.is_active()
                 ],
-                "last_stop_event": (
-                    self.stop_event.to_dict() if self.stop_event else None
-                ),
+                "last_stop_event": (self.stop_event.to_dict() if self.stop_event else None),
             }
 
             state_file = Path("emergency_stop_state.json")
@@ -322,9 +314,7 @@ class EmergencyStopManager:
                 logger.warning("No IBKR client available to close positions")
                 return
 
-            logger.warning(
-                "Position closing requested - manual intervention may be required"
-            )
+            logger.warning("Position closing requested - manual intervention may be required")
 
             # In production, this would:
             # 1. Get all open positions
@@ -418,9 +408,7 @@ class EmergencyStopManager:
             reason=reason,
             created_at=datetime.now(),
             expires_at=(
-                datetime.now() + timedelta(minutes=duration_minutes)
-                if duration_minutes
-                else None
+                datetime.now() + timedelta(minutes=duration_minutes) if duration_minutes else None
             ),
         )
 

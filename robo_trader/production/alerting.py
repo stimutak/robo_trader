@@ -112,9 +112,7 @@ class AlertRule:
 class SlackNotifier:
     """Slack notification handler."""
 
-    def __init__(
-        self, webhook_url: str, channel: str = "#alerts", username: str = "TradingBot"
-    ):
+    def __init__(self, webhook_url: str, channel: str = "#alerts", username: str = "TradingBot"):
         """
         Initialize Slack notifier.
 

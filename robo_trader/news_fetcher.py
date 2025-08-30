@@ -32,11 +32,7 @@ def fetch_rss_news(max_items: int = 20) -> List[Dict]:
                     published = datetime(*entry.published_parsed[:6])
 
                 title = entry.title if hasattr(entry, "title") else "No title"
-                title = (
-                    title.replace("&apos;", "'")
-                    .replace("&quot;", '"')
-                    .replace("&amp;", "&")
-                )
+                title = title.replace("&apos;", "'").replace("&quot;", '"').replace("&amp;", "&")
 
                 news_item = {
                     "title": title[:100],

@@ -183,7 +183,11 @@ class WalkForwardOptimizer:
             Best optimization result for this window
         """
         if objective_func is None:
-            objective_func = lambda m: m.sharpe_ratio
+
+            def default_objective(m):
+                return m.sharpe_ratio
+
+            objective_func = default_objective
 
         best_result = None
         best_score = float("-inf")
@@ -216,9 +220,7 @@ class WalkForwardOptimizer:
 
                 if test_metrics is not None:
                     # Calculate overfitting score
-                    overfitting = self._calculate_overfitting(
-                        train_metrics, test_metrics
-                    )
+                    overfitting = self._calculate_overfitting(train_metrics, test_metrics)
 
                     best_result = OptimizationResult(
                         window_id=window.window_id,
@@ -424,8 +426,7 @@ class WalkForwardOptimizer:
         valid_results = [
             r
             for r in self.results
-            if r.stability_score >= min_stability
-            and r.overfitting_score <= max_overfitting
+            if r.stability_score >= min_stability and r.overfitting_score <= max_overfitting
         ]
 
         if not valid_results:
@@ -569,42 +570,32 @@ class OverfittingDetector:
 
         # Sharpe ratio degradation
         if train_metrics.sharpe_ratio != 0:
-            degradation["sharpe"] = 1 - (
-                test_metrics.sharpe_ratio / train_metrics.sharpe_ratio
-            )
+            degradation["sharpe"] = 1 - (test_metrics.sharpe_ratio / train_metrics.sharpe_ratio)
         else:
             degradation["sharpe"] = 0.0
 
         # Return degradation
         if train_metrics.total_return != 0:
-            degradation["return"] = 1 - (
-                test_metrics.total_return / train_metrics.total_return
-            )
+            degradation["return"] = 1 - (test_metrics.total_return / train_metrics.total_return)
         else:
             degradation["return"] = 0.0
 
         # Win rate degradation
         if train_metrics.win_rate != 0:
-            degradation["win_rate"] = 1 - (
-                test_metrics.win_rate / train_metrics.win_rate
-            )
+            degradation["win_rate"] = 1 - (test_metrics.win_rate / train_metrics.win_rate)
         else:
             degradation["win_rate"] = 0.0
 
         # Max drawdown increase (inverse degradation)
         if test_metrics.max_drawdown != 0:
-            degradation["drawdown"] = (
-                train_metrics.max_drawdown / test_metrics.max_drawdown
-            ) - 1
+            degradation["drawdown"] = (train_metrics.max_drawdown / test_metrics.max_drawdown) - 1
         else:
             degradation["drawdown"] = 0.0
 
         return degradation
 
     @staticmethod
-    def complexity_penalty(
-        n_parameters: int, n_samples: int, base_penalty: float = 0.01
-    ) -> float:
+    def complexity_penalty(n_parameters: int, n_samples: int, base_penalty: float = 0.01) -> float:
         """
         Calculate complexity penalty based on parameter count.
 
@@ -659,9 +650,7 @@ class OverfittingDetector:
 
         # Calculate confidence bounds
         lower_bound = np.percentile(random_sharpes, (1 - confidence_level) * 100 / 2)
-        upper_bound = np.percentile(
-            random_sharpes, 100 - (1 - confidence_level) * 100 / 2
-        )
+        upper_bound = np.percentile(random_sharpes, 100 - (1 - confidence_level) * 100 / 2)
 
         return {
             "actual_sharpe": actual_sharpe,

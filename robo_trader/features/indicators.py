@@ -331,9 +331,7 @@ class TechnicalIndicators:
 
     # Volatility indicators
 
-    def historical_volatility(
-        self, prices: pd.Series, period: int = 20
-    ) -> Optional[float]:
+    def historical_volatility(self, prices: pd.Series, period: int = 20) -> Optional[float]:
         """Historical Volatility (annualized)."""
         try:
             if len(prices) < period:
@@ -455,9 +453,7 @@ class TechnicalIndicators:
             lowest_low = df["low"].rolling(window=period).min()
 
             # Calculate Williams %R
-            williams_r = -100 * (
-                (highest_high - df["close"]) / (highest_high - lowest_low + 1e-10)
-            )
+            williams_r = -100 * ((highest_high - df["close"]) / (highest_high - lowest_low + 1e-10))
 
             return williams_r.iloc[-1] if not pd.isna(williams_r.iloc[-1]) else None
 
@@ -471,9 +467,7 @@ class TechnicalIndicators:
                 return None
 
             # Calculate ROC
-            roc = (
-                (prices.iloc[-1] - prices.iloc[-period - 1]) / prices.iloc[-period - 1]
-            ) * 100
+            roc = ((prices.iloc[-1] - prices.iloc[-period - 1]) / prices.iloc[-period - 1]) * 100
 
             return roc if not pd.isna(roc) else None
 

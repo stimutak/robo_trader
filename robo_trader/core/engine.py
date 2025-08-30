@@ -16,16 +16,15 @@ from datetime import datetime, time, timedelta
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
 
+from robo_trader.clients.async_ibkr_client import AsyncIBKRClient as IBKRClient
 from robo_trader.config import Config, TradingMode
 from robo_trader.correlation import CorrelationTracker
 from robo_trader.database import TradingDatabase
 from robo_trader.execution import AbstractExecutor, PaperExecutor
-from robo_trader.clients.async_ibkr_client import AsyncIBKRClient as IBKRClient
 from robo_trader.logger import get_logger
 from robo_trader.portfolio import Portfolio
 from robo_trader.risk import RiskManager, create_risk_manager_from_config
-from robo_trader.strategy_manager import (StrategyManager,
-                                          create_default_manager)
+from robo_trader.strategy_manager import StrategyManager, create_default_manager
 
 logger = get_logger(__name__)
 
@@ -190,9 +189,7 @@ class TradingEngine:
         """Connect to IBKR with retry logic."""
         for attempt in range(max_retries):
             try:
-                logger.info(
-                    f"Connecting to IBKR (attempt {attempt + 1}/{max_retries})..."
-                )
+                logger.info(f"Connecting to IBKR (attempt {attempt + 1}/{max_retries})...")
                 await self.ibkr_client.connect(
                     readonly=self.config.ibkr.readonly,
                     timeout=self.config.ibkr.timeout,
@@ -244,9 +241,7 @@ class TradingEngine:
                         ).status
                         == HealthStatus.UNHEALTHY
                     ):
-                        logger.error(
-                            "Critical health check failed, initiating shutdown"
-                        )
+                        logger.error("Critical health check failed, initiating shutdown")
                         await self.emergency_shutdown()
                         break
 
@@ -269,15 +264,11 @@ class TradingEngine:
 
                 # Update portfolio risk metrics
                 if self.portfolio and self.risk_manager:
-                    positions = {
-                        symbol: pos for symbol, pos in self.portfolio.positions.items()
-                    }
+                    positions = {symbol: pos for symbol, pos in self.portfolio.positions.items()}
 
                     if positions:
                         # Get current prices
-                        current_prices = await self._get_current_prices(
-                            list(positions.keys())
-                        )
+                        current_prices = await self._get_current_prices(list(positions.keys()))
 
                         # Calculate risk metrics
                         metrics = self.risk_manager.calculate_risk_metrics(
@@ -339,10 +330,7 @@ class TradingEngine:
                 current_time = now.time()
 
                 # Check for market open
-                if (
-                    current_time >= self.market_open
-                    and current_time < self.market_close
-                ):
+                if current_time >= self.market_open and current_time < self.market_close:
                     if not self._is_market_open_cached:
                         logger.info("Market opened")
                         self._is_market_open_cached = True
@@ -433,9 +421,7 @@ class TradingEngine:
         try:
             # Export portfolio
             if self.portfolio:
-                self.portfolio.export_csv(
-                    f"portfolio_{datetime.now().strftime('%Y%m%d')}.csv"
-                )
+                self.portfolio.export_csv(f"portfolio_{datetime.now().strftime('%Y%m%d')}.csv")
 
             # Log daily metrics
             logger.info(f"Daily metrics: {self.metrics}")
@@ -514,15 +500,10 @@ class TradingEngine:
         # Check market hours
         if self.config.execution.mode == TradingMode.PAPER:
             # Paper trading can run extended hours
-            return (
-                current_time >= self.premarket_open
-                and current_time <= self.aftermarket_close
-            )
+            return current_time >= self.premarket_open and current_time <= self.aftermarket_close
         else:
             # Live trading only during regular hours
-            return (
-                current_time >= self.market_open and current_time <= self.market_close
-            )
+            return current_time >= self.market_open and current_time <= self.market_close
 
     _is_market_open_cached = False
 

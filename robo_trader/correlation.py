@@ -331,11 +331,7 @@ class CorrelationTracker:
                     correlations = []
                     for s1 in symbols1:
                         for s2 in symbols2:
-                            if (
-                                s1 != s2
-                                and s1 in corr_matrix.index
-                                and s2 in corr_matrix.columns
-                            ):
+                            if s1 != s2 and s1 in corr_matrix.index and s2 in corr_matrix.columns:
                                 correlations.append(corr_matrix.loc[s1, s2])
 
                     if correlations:
@@ -393,9 +389,7 @@ class CorrelationTracker:
                         # Risk contribution from this pair
                         pair_risk = abs(correlation * weight1 * weight2)
                         symbol_risk += pair_risk
-                        total_risk += (
-                            pair_risk / 2
-                        )  # Divide by 2 to avoid double counting
+                        total_risk += pair_risk / 2  # Divide by 2 to avoid double counting
 
             contributions[symbol1] = symbol_risk
 

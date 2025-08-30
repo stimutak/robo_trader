@@ -50,9 +50,7 @@ class Portfolio:
             self.realized_pnl += realized
             remaining = pos.quantity - quantity
             if remaining > 0:
-                self.positions[symbol] = PositionSnapshot(
-                    symbol, remaining, pos.avg_price
-                )
+                self.positions[symbol] = PositionSnapshot(symbol, remaining, pos.avg_price)
             else:
                 self.positions.pop(symbol, None)
 

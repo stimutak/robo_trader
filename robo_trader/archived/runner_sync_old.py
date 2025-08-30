@@ -69,9 +69,7 @@ async def run_once(
 
         # Store market data in database
         if not df.empty:
-            logger.info(
-                f"Fetched {len(df)} bars for {symbol}, columns: {list(df.columns)}"
-            )
+            logger.info(f"Fetched {len(df)} bars for {symbol}, columns: {list(df.columns)}")
             # Store latest price data
             if "date" in df.columns:
                 for _, row in df.iterrows():
@@ -94,9 +92,7 @@ async def run_once(
                         logger.warning(f"Error storing market data for {symbol}: {e}")
                 logger.info(f"Stored {len(df)} price bars for {symbol}")
             else:
-                logger.warning(
-                    f"No 'date' column in dataframe for {symbol}: {list(df.columns)}"
-                )
+                logger.warning(f"No 'date' column in dataframe for {symbol}: {list(df.columns)}")
 
         signals = sma_crossover_signals(
             pd.DataFrame({"close": df["close"]}), fast=sma_fast, slow=sma_slow
@@ -162,9 +158,7 @@ async def run_once(
                     "SELL",
                     pos.quantity,
                     fill_price,
-                    slippage=(
-                        (fill_price - price) * pos.quantity if res.fill_price else 0
-                    ),
+                    slippage=((fill_price - price) * pos.quantity if res.fill_price else 0),
                 )
                 db.update_position(symbol, 0, 0, 0)  # Close position
 
@@ -183,15 +177,11 @@ async def run_once(
         unrealized_pnl=unrealized,
     )
 
-    logger.info(
-        f"Trading cycle complete. Equity: ${equity:,.2f}, Daily P&L: ${daily_pnl:,.2f}"
-    )
+    logger.info(f"Trading cycle complete. Equity: ${equity:,.2f}, Daily P&L: ${daily_pnl:,.2f}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Robo Trader runner (paper by default)"
-    )
+    parser = argparse.ArgumentParser(description="Robo Trader runner (paper by default)")
     parser.add_argument(
         "--symbols",
         type=str,
@@ -239,9 +229,7 @@ def main() -> None:
         raise SystemExit("Refusing to run in live mode without --confirm-live")
 
     override_symbols = (
-        [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-        if args.symbols
-        else None
+        [s.strip().upper() for s in args.symbols.split(",") if s.strip()] if args.symbols else None
     )
     asyncio.run(
         run_once(
