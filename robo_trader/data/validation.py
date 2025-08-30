@@ -221,9 +221,7 @@ class DataValidator:
         self.max_gap_seconds = 60  # Max acceptable gap
 
         # Corporate action detection
-        self.price_change_threshold = (
-            0.2  # 20% change indicates possible corporate action
-        )
+        self.price_change_threshold = 0.2  # 20% change indicates possible corporate action
 
     def validate_tick(self, tick: TickData) -> List[ValidationResult]:
         """Validate a single tick."""
@@ -383,12 +381,8 @@ class DataValidator:
 
     def _check_outliers(self, tick: TickData) -> ValidationResult:
         """Check for outliers."""
-        is_price_outlier = self.outlier_detector.is_price_outlier(
-            tick.symbol, tick.last
-        )
-        is_volume_outlier = self.outlier_detector.is_volume_outlier(
-            tick.symbol, tick.volume
-        )
+        is_price_outlier = self.outlier_detector.is_price_outlier(tick.symbol, tick.last)
+        is_volume_outlier = self.outlier_detector.is_volume_outlier(tick.symbol, tick.volume)
 
         if is_price_outlier or is_volume_outlier:
             self.metrics.outliers_detected += 1
@@ -420,9 +414,7 @@ class DataValidator:
     def _check_gap(self, tick: TickData) -> ValidationResult:
         """Check for data gaps."""
         if tick.symbol in self.last_tick_time:
-            gap_seconds = (
-                tick.timestamp - self.last_tick_time[tick.symbol]
-            ).total_seconds()
+            gap_seconds = (tick.timestamp - self.last_tick_time[tick.symbol]).total_seconds()
 
             if gap_seconds > self.max_gap_seconds:
                 self.metrics.gaps_detected += 1

@@ -193,9 +193,7 @@ def configure_stdlib_logging():
 
         formatter = JsonFormatter()
     else:
-        formatter = logging.Formatter(
-            "[%(asctime)s] %(levelname)s %(name)s: %(message)s"
-        )
+        formatter = logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s")
 
     # Configure root logger
     root = logging.getLogger()
@@ -315,9 +313,7 @@ def log_performance(
         value: Metric value
         **kwargs: Additional context
     """
-    logger.info(
-        LogEvent.PERFORMANCE_METRIC.value, metric=metric_name, value=value, **kwargs
-    )
+    logger.info(LogEvent.PERFORMANCE_METRIC.value, metric=metric_name, value=value, **kwargs)
 
 
 def log_system_event(

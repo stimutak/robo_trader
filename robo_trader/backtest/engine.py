@@ -167,9 +167,7 @@ class BacktestEngine:
         Returns:
             Backtest results
         """
-        logger.info(
-            "backtest.starting", strategy=strategy.name, symbols=strategy.symbols
-        )
+        logger.info("backtest.starting", strategy=strategy.name, symbols=strategy.symbols)
 
         # Get historical data
         historical_data = {}
@@ -221,9 +219,7 @@ class BacktestEngine:
             # Calculate features
             features = {}
             for symbol in market_data:
-                feature_set = await feature_engine.calculate_features(
-                    symbol, market_data[symbol]
-                )
+                feature_set = await feature_engine.calculate_features(symbol, market_data[symbol])
                 if feature_set:
                     features[symbol] = feature_set
 
@@ -346,9 +342,7 @@ class BacktestEngine:
                     signal.quantity = -int(available_margin / execution_price)
 
                 margin_required = (
-                    abs(signal.quantity)
-                    * execution_price
-                    * self.config.margin_requirement
+                    abs(signal.quantity) * execution_price * self.config.margin_requirement
                 )
 
                 if margin_required <= self.cash:
@@ -391,9 +385,7 @@ class BacktestEngine:
                 self.closed_positions.append(position)
                 del self.positions[symbol]
 
-    def _update_positions(
-        self, market_data: Dict[str, pd.DataFrame], timestamp: datetime
-    ) -> None:
+    def _update_positions(self, market_data: Dict[str, pd.DataFrame], timestamp: datetime) -> None:
         """Update position P&L with current prices."""
         for symbol, position in self.positions.items():
             if symbol in market_data and not market_data[symbol].empty:
@@ -472,9 +464,7 @@ class BacktestEngine:
                 execution_price=execution_price,
             )
 
-    def _update_equity(
-        self, market_data: Dict[str, pd.DataFrame], timestamp: datetime
-    ) -> None:
+    def _update_equity(self, market_data: Dict[str, pd.DataFrame], timestamp: datetime) -> None:
         """Update total equity value."""
         self.equity = self.cash
 

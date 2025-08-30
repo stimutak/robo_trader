@@ -8,9 +8,9 @@ This implements Phase 1 F3: Async Database Operations
 """
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime
-import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -340,9 +340,7 @@ class AsyncTradingDatabase:
             )
             await conn.commit()
 
-    async def batch_store_market_data(
-        self, data: List[Dict]
-    ) -> None:
+    async def batch_store_market_data(self, data: List[Dict]) -> None:
         """Store multiple market data bars in a batch for efficiency."""
         async with self.get_connection() as conn:
             await conn.executemany(
@@ -377,9 +375,7 @@ class AsyncTradingDatabase:
                 for row in rows
             ]
 
-    async def get_recent_trades(
-        self, limit: int = 100, symbol: Optional[str] = None
-    ) -> List[Dict]:
+    async def get_recent_trades(self, limit: int = 100, symbol: Optional[str] = None) -> List[Dict]:
         """Get recent trades, optionally filtered by symbol."""
         async with self.get_connection() as conn:
             if symbol:
@@ -440,9 +436,7 @@ class AsyncTradingDatabase:
                 }
             return {}
 
-    async def get_latest_market_data(
-        self, symbol: str, limit: int = 100
-    ) -> List[Dict]:
+    async def get_latest_market_data(self, symbol: str, limit: int = 100) -> List[Dict]:
         """Get latest market data for a symbol."""
         async with self.get_connection() as conn:
             cursor = await conn.execute(

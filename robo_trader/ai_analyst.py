@@ -84,9 +84,7 @@ class AIAnalyst:
             key = None
 
         if not key:
-            logger.warning(
-                f"No API key found for {self.provider}. AI analysis disabled."
-            )
+            logger.warning(f"No API key found for {self.provider}. AI analysis disabled.")
 
         return key
 
@@ -222,9 +220,7 @@ Focus on:
                 "very_bearish": MarketSentiment.VERY_BEARISH,
             }
 
-            sentiment = sentiment_map.get(
-                data.get("sentiment", "neutral"), MarketSentiment.NEUTRAL
-            )
+            sentiment = sentiment_map.get(data.get("sentiment", "neutral"), MarketSentiment.NEUTRAL)
 
             return MarketAnalysis(
                 symbol=symbol,
@@ -263,9 +259,7 @@ Focus on:
         - Guidance: {earnings_data.get('guidance', 'Not provided')}
         """
 
-        return self.analyze_market_event(
-            symbol, event_text, earnings_data.get("market_data")
-        )
+        return self.analyze_market_event(symbol, event_text, earnings_data.get("market_data"))
 
     def analyze_fed_event(self, event_description: str) -> Dict[str, MarketAnalysis]:
         """Analyze Fed announcement impact on multiple sectors."""

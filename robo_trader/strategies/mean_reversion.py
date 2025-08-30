@@ -161,9 +161,7 @@ class MeanReversionStrategy(Strategy):
 
         return signals
 
-    def _calculate_reversion_score(
-        self, data: pd.DataFrame, features: FeatureSet
-    ) -> float:
+    def _calculate_reversion_score(self, data: pd.DataFrame, features: FeatureSet) -> float:
         """
         Calculate mean reversion opportunity score.
 
@@ -189,15 +187,9 @@ class MeanReversionStrategy(Strategy):
 
                 # Enhance score if at extremes
                 if current_price <= features.bb_lower:
-                    bb_score = (
-                        -1.0
-                        - (features.bb_lower - current_price) / features.bb_lower * 0.5
-                    )
+                    bb_score = -1.0 - (features.bb_lower - current_price) / features.bb_lower * 0.5
                 elif current_price >= features.bb_upper:
-                    bb_score = (
-                        1.0
-                        + (current_price - features.bb_upper) / features.bb_upper * 0.5
-                    )
+                    bb_score = 1.0 + (current_price - features.bb_upper) / features.bb_upper * 0.5
 
                 score += bb_score * 0.4
                 weights += 0.4
@@ -211,15 +203,9 @@ class MeanReversionStrategy(Strategy):
         # RSI extremes (30% weight)
         if features.rsi is not None:
             if features.rsi <= self.rsi_oversold:
-                rsi_score = (
-                    -1.0 * (self.rsi_oversold - features.rsi) / self.rsi_oversold
-                )
+                rsi_score = -1.0 * (self.rsi_oversold - features.rsi) / self.rsi_oversold
             elif features.rsi >= self.rsi_overbought:
-                rsi_score = (
-                    1.0
-                    * (features.rsi - self.rsi_overbought)
-                    / (100 - self.rsi_overbought)
-                )
+                rsi_score = 1.0 * (features.rsi - self.rsi_overbought) / (100 - self.rsi_overbought)
             else:
                 rsi_score = (features.rsi - 50) / 50 * 0.3
 
@@ -297,9 +283,7 @@ class MeanReversionStrategy(Strategy):
             # Check if reversion target hit
             if feature_set.bb_middle:
                 entry_deviation = self.entry_deviations.get(symbol, 0)
-                current_deviation = (
-                    current_price - feature_set.bb_middle
-                ) / feature_set.bb_middle
+                current_deviation = (current_price - feature_set.bb_middle) / feature_set.bb_middle
 
                 # Long position exit conditions
                 if position.get("side") == "long":
@@ -320,9 +304,7 @@ class MeanReversionStrategy(Strategy):
                                 "reversion_score": reversion_score,
                                 "holding_period": holding_period,
                                 "profit_pct": (
-                                    current_price
-                                    / position.get("entry_price", current_price)
-                                    - 1
+                                    current_price / position.get("entry_price", current_price) - 1
                                 )
                                 * 100,
                             },
@@ -401,9 +383,7 @@ class MeanReversionStrategy(Strategy):
                 "target_mean": target_mean,
                 "entry_deviation": deviation,
                 "bb_width": (
-                    (feature_set.bb_upper - feature_set.bb_lower)
-                    if feature_set.bb_upper
-                    else None
+                    (feature_set.bb_upper - feature_set.bb_lower) if feature_set.bb_upper else None
                 ),
                 "rsi": feature_set.rsi,
             },

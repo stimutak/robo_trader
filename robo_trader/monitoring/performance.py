@@ -221,8 +221,7 @@ class PerformanceMonitor:
         system = self.get_system_metrics()
 
         success_rate = (
-            self.successful_operations
-            / (self.successful_operations + self.failed_operations)
+            self.successful_operations / (self.successful_operations + self.failed_operations)
             if (self.successful_operations + self.failed_operations) > 0
             else 1.0
         )

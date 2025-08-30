@@ -655,9 +655,7 @@ class TradingDatabase:
                     {
                         "equity": row[0],
                         "daily_pnl": row[1],
-                        "total_pnl": row[
-                            1
-                        ],  # For compatibility with enhanced dashboard
+                        "total_pnl": row[1],  # For compatibility with enhanced dashboard
                         "realized_pnl": row[2],
                         "unrealized_pnl": row[3],
                         "timestamp": row[4],

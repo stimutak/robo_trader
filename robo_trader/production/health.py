@@ -122,9 +122,7 @@ class CircuitBreakerState:
 
         if self.consecutive_failures >= self.failure_threshold:
             self.is_open = True
-            logger.warning(
-                f"Circuit breaker opened after {self.consecutive_failures} failures"
-            )
+            logger.warning(f"Circuit breaker opened after {self.consecutive_failures} failures")
 
     def should_attempt(self) -> bool:
         """Check if operation should be attempted."""
@@ -313,9 +311,7 @@ class HealthMonitor:
             )
 
         except Exception as e:
-            return ComponentHealth(
-                name="system", status=ComponentStatus.UNKNOWN, message=str(e)
-            )
+            return ComponentHealth(name="system", status=ComponentStatus.UNKNOWN, message=str(e))
 
     def _check_database_health(self) -> ComponentHealth:
         """Check database connectivity and performance."""
@@ -343,9 +339,7 @@ class HealthMonitor:
             )
 
         except Exception as e:
-            return ComponentHealth(
-                name="database", status=ComponentStatus.DOWN, message=str(e)
-            )
+            return ComponentHealth(name="database", status=ComponentStatus.DOWN, message=str(e))
 
     def _check_trading_health(self) -> ComponentHealth:
         """Check trading system health."""
@@ -369,9 +363,7 @@ class HealthMonitor:
             )
 
         except Exception as e:
-            return ComponentHealth(
-                name="trading", status=ComponentStatus.UNKNOWN, message=str(e)
-            )
+            return ComponentHealth(name="trading", status=ComponentStatus.UNKNOWN, message=str(e))
 
     def get_overall_health(self) -> HealthStatus:
         """Get overall system health status."""
@@ -413,9 +405,7 @@ class HealthMonitor:
         return {
             "status": overall.value,
             "timestamp": datetime.now().isoformat(),
-            "components": {
-                name: comp.to_dict() for name, comp in self.components.items()
-            },
+            "components": {name: comp.to_dict() for name, comp in self.components.items()},
             "metrics": latest_metrics,
             "circuit_breakers": {
                 name: {

@@ -16,12 +16,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 from ib_insync import IB, Contract, Stock, util
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +35,7 @@ def normalize_bars_df(df: pd.DataFrame) -> pd.DataFrame:
     data.columns = [str(c).lower() for c in data.columns]
     # Standard column subset if present
     preferred_cols = [
-        c
-        for c in ["date", "time", "open", "high", "low", "close", "volume"]
-        if c in data.columns
+        c for c in ["date", "time", "open", "high", "low", "close", "volume"] if c in data.columns
     ]
     if preferred_cols:
         data = data[preferred_cols]
@@ -108,7 +101,9 @@ class ConnectionPool:
                 await self.available.put(ib)
 
             self._initialized = True
-            logger.info(f"Initialized connection pool with {self.config.max_connections} connections")
+            logger.info(
+                f"Initialized connection pool with {self.config.max_connections} connections"
+            )
 
     async def _create_connection(self, client_id: int) -> IB:
         """Create a single IBKR connection with retry logic."""
@@ -228,9 +223,7 @@ class AsyncIBKRClient:
             contract = Stock(symbol, exchange, currency)
 
             # Use async version of qualifyContracts
-            qualified = await asyncio.wait_for(
-                ib.qualifyContractsAsync(contract), timeout=5.0
-            )
+            qualified = await asyncio.wait_for(ib.qualifyContractsAsync(contract), timeout=5.0)
 
             if not qualified:
                 raise RuntimeError(f"Unable to qualify contract for {symbol}")
@@ -366,9 +359,7 @@ class AsyncIBKRClient:
 
         # Standard column subset
         preferred_cols = [
-            c
-            for c in ["date", "open", "high", "low", "close", "volume"]
-            if c in data.columns
+            c for c in ["date", "open", "high", "low", "close", "volume"] if c in data.columns
         ]
         if preferred_cols:
             data = data[preferred_cols]

@@ -166,9 +166,7 @@ class Strategy(ABC):
         # Validate data
         for symbol in self.symbols:
             if symbol not in historical_data:
-                logger.warning(
-                    "strategy.missing_data", strategy=self.name, symbol=symbol
-                )
+                logger.warning("strategy.missing_data", strategy=self.name, symbol=symbol)
                 continue
 
             df = historical_data[symbol]
@@ -243,9 +241,7 @@ class Strategy(ABC):
             return validated_signals
 
         except Exception as e:
-            logger.error(
-                "strategy.signal_generation_failed", strategy=self.name, error=str(e)
-            )
+            logger.error("strategy.signal_generation_failed", strategy=self.name, error=str(e))
             return []
 
     @abstractmethod

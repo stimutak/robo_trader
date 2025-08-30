@@ -320,9 +320,7 @@ class DataPipeline:
                         return cached_data
 
             # Fetch from IBKR (mock for now)
-            self.logger.info(
-                f"Fetching historical data: {symbol} {duration} {bar_size}"
-            )
+            self.logger.info(f"Fetching historical data: {symbol} {duration} {bar_size}")
 
             # Generate mock historical data
             end_date = datetime.now()
@@ -419,9 +417,7 @@ class DataPipeline:
         """Get pipeline performance metrics."""
         return {
             **self.metrics,
-            "buffer_sizes": {
-                symbol: len(buffer) for symbol, buffer in self.tick_buffer.items()
-            },
+            "buffer_sizes": {symbol: len(buffer) for symbol, buffer in self.tick_buffer.items()},
             "cache_size": len(self.historical_cache),
             "subscribers": len(self.publisher.subscribers),
         }

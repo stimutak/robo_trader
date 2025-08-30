@@ -3,9 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 
-def sma_crossover_signals(
-    df: pd.DataFrame, fast: int = 10, slow: int = 20
-) -> pd.DataFrame:
+def sma_crossover_signals(df: pd.DataFrame, fast: int = 10, slow: int = 20) -> pd.DataFrame:
     """Compute simple SMA crossover signals.
 
     Returns DataFrame with columns: close, sma_fast, sma_slow, signal

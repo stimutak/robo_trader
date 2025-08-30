@@ -205,9 +205,7 @@ class FeatureEngine(DataSubscriber):
             )
 
             # Keep only recent data (configurable window)
-            max_rows = (
-                self.config.data.feature_window * 10
-            )  # Keep extra for longer indicators
+            max_rows = self.config.data.feature_window * 10  # Keep extra for longer indicators
             if len(self.price_data[bar.symbol]) > max_rows:
                 self.price_data[bar.symbol] = self.price_data[bar.symbol].tail(max_rows)
 
@@ -253,27 +251,17 @@ class FeatureEngine(DataSubscriber):
 
             # Calculate returns
             if len(df) >= 2:
-                features.returns_1m = (
-                    df["close"].iloc[-1] / df["close"].iloc[-2] - 1
-                ) * 100
-                features.log_returns = np.log(
-                    df["close"].iloc[-1] / df["close"].iloc[-2]
-                )
+                features.returns_1m = (df["close"].iloc[-1] / df["close"].iloc[-2] - 1) * 100
+                features.log_returns = np.log(df["close"].iloc[-1] / df["close"].iloc[-2])
 
             if len(df) >= 5:
-                features.returns_5m = (
-                    df["close"].iloc[-1] / df["close"].iloc[-5] - 1
-                ) * 100
+                features.returns_5m = (df["close"].iloc[-1] / df["close"].iloc[-5] - 1) * 100
 
             if len(df) >= 15:
-                features.returns_15m = (
-                    df["close"].iloc[-1] / df["close"].iloc[-15] - 1
-                ) * 100
+                features.returns_15m = (df["close"].iloc[-1] / df["close"].iloc[-15] - 1) * 100
 
             if len(df) >= 12:  # 1 hour = 12 * 5min bars
-                features.returns_1h = (
-                    df["close"].iloc[-1] / df["close"].iloc[-12] - 1
-                ) * 100
+                features.returns_1h = (df["close"].iloc[-1] / df["close"].iloc[-12] - 1) * 100
 
             # Calculate technical indicators
             if len(df) >= 14:  # Minimum for RSI
@@ -351,25 +339,20 @@ class FeatureEngine(DataSubscriber):
                     df["close"].iloc[-1] / df["close"].iloc[-12] - 1
                 ) * 100  # Approx 1 day
                 features.roc = (
-                    (df["close"].iloc[-1] - df["close"].iloc[-20])
-                    / df["close"].iloc[-20]
+                    (df["close"].iloc[-1] - df["close"].iloc[-20]) / df["close"].iloc[-20]
                 ) * 100
 
             # Volatility
             if len(df) >= 20:
                 returns = df["close"].pct_change().dropna()
-                features.historical_volatility = returns.tail(20).std() * np.sqrt(
-                    252
-                )  # Annualized
+                features.historical_volatility = returns.tail(20).std() * np.sqrt(252)  # Annualized
 
                 if features.atr and df["close"].iloc[-1] > 0:
                     features.volatility_ratio = features.atr / df["close"].iloc[-1]
 
             # Custom signals
             features.trend_strength = self._calculate_trend_strength(df)
-            features.mean_reversion_signal = self._calculate_mean_reversion_signal(
-                features
-            )
+            features.mean_reversion_signal = self._calculate_mean_reversion_signal(features)
             features.breakout_signal = self._calculate_breakout_signal(df, features)
 
             # Store features
@@ -383,9 +366,7 @@ class FeatureEngine(DataSubscriber):
             calc_time = (datetime.now() - start_time).total_seconds() * 1000
             self.metrics["calculation_time_ms"].append(calc_time)
             if len(self.metrics["calculation_time_ms"]) > 100:
-                self.metrics["calculation_time_ms"] = self.metrics[
-                    "calculation_time_ms"
-                ][-100:]
+                self.metrics["calculation_time_ms"] = self.metrics["calculation_time_ms"][-100:]
 
             return features
 
@@ -462,9 +443,7 @@ class FeatureEngine(DataSubscriber):
         except Exception:
             return None
 
-    def _calculate_breakout_signal(
-        self, df: pd.DataFrame, features: FeatureSet
-    ) -> Optional[float]:
+    def _calculate_breakout_signal(self, df: pd.DataFrame, features: FeatureSet) -> Optional[float]:
         """Calculate breakout signal."""
         try:
             if len(df) < 20:

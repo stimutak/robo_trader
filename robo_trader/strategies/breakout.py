@@ -187,9 +187,7 @@ class BreakoutStrategy(Strategy):
             if support_pivots:
                 self.support_levels[symbol] = max(support_pivots)
 
-    def _find_pivot_points(
-        self, data: pd.DataFrame, min_touches: int = 2
-    ) -> List[float]:
+    def _find_pivot_points(self, data: pd.DataFrame, min_touches: int = 2) -> List[float]:
         """Find price levels with multiple touches."""
         if len(data) < 50:
             return []
@@ -221,9 +219,9 @@ class BreakoutStrategy(Strategy):
                 return False
 
         # Check price range
-        high_low_range = (
-            recent_data["high"].max() - recent_data["low"].min()
-        ) / recent_data["close"].mean()
+        high_low_range = (recent_data["high"].max() - recent_data["low"].min()) / recent_data[
+            "close"
+        ].mean()
 
         # Check Bollinger Band squeeze
         squeeze = False
@@ -316,9 +314,7 @@ class BreakoutStrategy(Strategy):
             if current_price < pending["level"] * (1 - self.false_breakout_threshold):
                 # False breakout - remove pending
                 del self.pending_breakouts[symbol]
-                logger.debug(
-                    "breakout.false_breakout", symbol=symbol, level=pending["level"]
-                )
+                logger.debug("breakout.false_breakout", symbol=symbol, level=pending["level"])
                 return None
         else:  # Support breakdown
             if current_price > pending["level"] * (1 + self.false_breakout_threshold):
@@ -372,9 +368,7 @@ class BreakoutStrategy(Strategy):
             atr_change = feature_set.atr / current_price
             atr_strength = min(1.0 + atr_change * 10, 1.5)
 
-        signal_strength = min(
-            breakout_strength * volume_strength * atr_strength * 10, 1.0
-        )
+        signal_strength = min(breakout_strength * volume_strength * atr_strength * 10, 1.0)
 
         return Signal(
             timestamp=datetime.now(),
@@ -388,9 +382,7 @@ class BreakoutStrategy(Strategy):
             rationale=f"Breakout from {breakout_level:.2f}",
             metadata={
                 "breakout_level": breakout_level,
-                "breakout_type": (
-                    "resistance" if signal_type == SignalType.BUY else "support"
-                ),
+                "breakout_type": ("resistance" if signal_type == SignalType.BUY else "support"),
                 "volume_confirmed": volume_confirmed,
                 "consolidation_bars": self.consolidation_counts.get(symbol, 0),
                 "atr": feature_set.atr,

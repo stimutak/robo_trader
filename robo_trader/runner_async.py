@@ -16,29 +16,28 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from .analysis.correlation_integration import (
-    AsyncCorrelationManager,
-    CorrelationBasedPositionSizer,
-)
+from .analysis.correlation_integration import AsyncCorrelationManager, CorrelationBasedPositionSizer
 from .clients import AsyncIBKRClient, ConnectionConfig
 from .config import load_config
 from .correlation import CorrelationTracker
 from .database_async import AsyncTradingDatabase
 from .execution import Order, PaperExecutor
 from .logger import get_logger
-from .market_hours import is_market_open, get_market_session, seconds_until_market_open
+from .market_hours import get_market_session, is_market_open, seconds_until_market_open
 from .monitoring.performance import PerformanceMonitor, Timer
 
 # Import WebSocket client for real-time updates
 try:
     from .websocket_client import ws_client
+
     WEBSOCKET_ENABLED = True
 except ImportError:
     ws_client = None
     WEBSOCKET_ENABLED = False
 from .portfolio import Portfolio
 from .risk import Position, RiskManager
-from .strategies import sma_crossover_signals, MLStrategy
+from .strategies import MLStrategy, sma_crossover_signals
+from .strategies.ml_enhanced_strategy import MLEnhancedStrategy
 
 logger = get_logger(__name__)
 
@@ -73,6 +72,7 @@ class AsyncRunner:
         use_correlation_sizing: bool = True,
         max_correlation: float = 0.7,
         use_ml_strategy: bool = False,
+        use_ml_enhanced: bool = False,
         use_smart_execution: bool = False,
     ):
         self.duration = duration
@@ -87,6 +87,7 @@ class AsyncRunner:
         self.use_correlation_sizing = use_correlation_sizing
         self.max_correlation = max_correlation
         self.use_ml_strategy = use_ml_strategy
+        self.use_ml_enhanced = use_ml_enhanced
         self.use_smart_execution = use_smart_execution
 
         # Will be initialized in setup
@@ -100,14 +101,15 @@ class AsyncRunner:
         self.daily_pnl = 0.0
         self.daily_executed_notional = 0.0
         self.monitor = PerformanceMonitor()
-        
+
         # Correlation components
         self.correlation_tracker = None
         self.position_sizer = None
         self.correlation_manager = None
-        
+
         # ML Strategy
         self.ml_strategy = None
+        self.ml_enhanced_strategy = None
 
     async def setup(self):
         """Initialize all components."""
@@ -140,17 +142,18 @@ class AsyncRunner:
 
         # Initialize executor with smart execution support
         smart_executor = None
-        
+
         if self.use_smart_execution:
             from .smart_execution.smart_executor import SmartExecutor
+
             # Pass IBKR client for real market data
             smart_executor = SmartExecutor(self.cfg, ibkr_client=self.ib_client.ib)
             logger.info("Smart execution enabled with real market data integration")
-        
+
         self.executor = PaperExecutor(
             slippage_bps=self.slippage_bps,
             smart_executor=smart_executor,
-            use_smart_execution=self.use_smart_execution
+            use_smart_execution=self.use_smart_execution,
         )
 
         # Initialize portfolio
@@ -162,45 +165,48 @@ class AsyncRunner:
         # Initialize correlation components if enabled
         if self.use_correlation_sizing:
             self.correlation_tracker = CorrelationTracker(
-                lookback_days=60,
-                correlation_threshold=self.max_correlation
+                lookback_days=60, correlation_threshold=self.max_correlation
             )
             self.position_sizer = CorrelationBasedPositionSizer(
                 correlation_tracker=self.correlation_tracker,
                 max_correlation=self.max_correlation,
                 correlation_penalty_factor=0.5,
-                max_correlated_exposure=0.3
+                max_correlated_exposure=0.3,
             )
             self.correlation_manager = AsyncCorrelationManager(
-                correlation_tracker=self.correlation_tracker,
-                position_sizer=self.position_sizer
+                correlation_tracker=self.correlation_tracker, position_sizer=self.position_sizer
             )
             await self.correlation_manager.start(update_interval=300)
             logger.info("Correlation-based position sizing enabled")
-        
-        # Initialize ML strategy if enabled
-        if self.use_ml_strategy:
+
+        # Initialize ML Enhanced strategy if enabled (takes precedence)
+        if self.use_ml_enhanced:
+            logger.info("Initializing ML Enhanced strategy...")
+            # ML Enhanced uses the config directly
+            self.ml_enhanced_strategy = MLEnhancedStrategy(self.cfg)
+            # Initialize with historical data
+            await self.ml_enhanced_strategy.initialize()
+            logger.info("ML Enhanced strategy initialized successfully")
+        # Initialize regular ML strategy if enabled (and not using enhanced)
+        elif self.use_ml_strategy:
             logger.info("Initializing ML strategy...")
+            from pathlib import Path
+
             from .features.feature_pipeline import FeaturePipeline
             from .ml.model_selector import ModelSelector
             from .ml.model_trainer import ModelTrainer
-            from pathlib import Path
-            
+
             # Initialize feature pipeline
             feature_pipeline = FeaturePipeline(self.cfg)
-            
+
             # Initialize model trainer
-            model_trainer = ModelTrainer(
-                config=self.cfg,
-                model_dir=Path("trained_models")
-            )
-            
+            model_trainer = ModelTrainer(config=self.cfg, model_dir=Path("trained_models"))
+
             # Initialize model selector with trained models
             model_selector = ModelSelector(
-                model_trainer=model_trainer,
-                model_dir=Path("trained_models")
+                model_trainer=model_trainer, model_dir=Path("trained_models")
             )
-            
+
             # Create ML strategy with proper dependencies
             self.ml_strategy = MLStrategy(
                 model_selector=model_selector,
@@ -212,9 +218,9 @@ class AsyncRunner:
                 max_position_pct=0.1,
                 risk_per_trade=0.02,
                 symbols=[],  # Will be set per symbol
-                name="ML_Strategy"
+                name="ML_Strategy",
             )
-            
+
             # Initialize the strategy with empty historical data (models already trained)
             await self.ml_strategy.initialize({})
             logger.info("ML strategy initialized successfully")
@@ -237,7 +243,7 @@ class AsyncRunner:
             session = get_market_session()
             logger.debug(f"Market is {session}, skipping data fetch for {symbol}")
             return None
-        
+
         try:
             with Timer("data_fetch", self.monitor):
                 df = await self.client.fetch_recent_bars(
@@ -250,23 +256,25 @@ class AsyncRunner:
 
             # Store market data in database
             logger.info(f"Fetched {len(df)} bars for {symbol}")
-            
+
             # Prepare batch data for efficient storage
             batch_data = []
             for timestamp, row in df.iterrows():
                 # Convert pandas Timestamp to datetime for SQLite compatibility
-                if hasattr(timestamp, 'to_pydatetime'):
+                if hasattr(timestamp, "to_pydatetime"):
                     timestamp = timestamp.to_pydatetime()
-                batch_data.append({
-                    "symbol": symbol,
-                    "timestamp": timestamp,
-                    "open": float(row.get("open", 0)),
-                    "high": float(row.get("high", 0)),
-                    "low": float(row.get("low", 0)),
-                    "close": float(row.get("close", 0)),
-                    "volume": int(row.get("volume", 0)),
-                })
-            
+                batch_data.append(
+                    {
+                        "symbol": symbol,
+                        "timestamp": timestamp,
+                        "open": float(row.get("open", 0)),
+                        "high": float(row.get("high", 0)),
+                        "low": float(row.get("low", 0)),
+                        "close": float(row.get("close", 0)),
+                        "volume": int(row.get("volume", 0)),
+                    }
+                )
+
             if batch_data:
                 with Timer("database_write", self.monitor):
                     await self.db.batch_store_market_data(batch_data)
@@ -291,11 +299,11 @@ class AsyncRunner:
                 executed=False,
                 message="No data available",
             )
-        
+
         # Send real-time price update via WebSocket
         if WEBSOCKET_ENABLED and ws_client and df is not None and not df.empty:
             try:
-                latest_price = float(df['close'].iloc[-1])
+                latest_price = float(df["close"].iloc[-1])
                 ws_client.send_market_update(symbol, latest_price)
                 logger.info(f"Sent WebSocket update for {symbol}: ${latest_price:.2f}")
             except Exception as e:
@@ -303,7 +311,40 @@ class AsyncRunner:
 
         # Generate trading signal
         with Timer("signal_generation", self.monitor):
-            if self.use_ml_strategy and self.ml_strategy:
+            if self.use_ml_enhanced and self.ml_enhanced_strategy:
+                # Use ML Enhanced strategy for signal generation
+                signal_obj = await self.ml_enhanced_strategy.analyze(symbol, df)
+                
+                # Convert ML Enhanced signal to format compatible with rest of code
+                if signal_obj:
+                    signal_value = (
+                        1
+                        if signal_obj.action == "BUY"
+                        else (-1 if signal_obj.action == "SELL" else 0)
+                    )
+                    confidence = signal_obj.confidence
+                    # Extract additional features if available
+                    position_size = signal_obj.features.get("position_size", 0.02)
+                    stop_loss = signal_obj.features.get("stop_loss", 0.02)
+                    take_profit = signal_obj.features.get("take_profit", 0.05)
+                else:
+                    signal_value = 0
+                    confidence = 0.5
+                    position_size = 0.02
+                    stop_loss = 0.02
+                    take_profit = 0.05
+                    
+                signals = pd.DataFrame(
+                    {
+                        "signal": [signal_value],
+                        "confidence": [confidence],
+                        "position_size": [position_size],
+                        "stop_loss": [stop_loss],
+                        "take_profit": [take_profit],
+                    },
+                    index=[df.index[-1]] if len(df) > 0 else [pd.Timestamp.now()],
+                )
+            elif self.use_ml_strategy and self.ml_strategy:
                 # Use ML strategy for signal generation
                 # Prepare market data in the format expected by ML strategy
                 market_data_dict = {
@@ -311,27 +352,32 @@ class AsyncRunner:
                     "data": df,
                     "price": float(df["close"].iloc[-1]) if len(df) > 0 else 0,
                     "portfolio_value": 100000,  # Will be replaced with actual portfolio value
-                    "atr": df["close"].rolling(14).std().iloc[-1] if len(df) > 14 else 2
+                    "atr": df["close"].rolling(14).std().iloc[-1] if len(df) > 14 else 2,
                 }
-                
+
                 signal_obj = await self.ml_strategy.generate_signal(
-                    symbol=symbol,
-                    market_data=market_data_dict
+                    symbol=symbol, market_data=market_data_dict
                 )
-                
+
                 # Convert ML signal to format compatible with rest of code
                 if signal_obj:
-                    signal_value = 1 if signal_obj.action == "BUY" else (-1 if signal_obj.action == "SELL" else 0)
+                    signal_value = (
+                        1
+                        if signal_obj.action == "BUY"
+                        else (-1 if signal_obj.action == "SELL" else 0)
+                    )
                     confidence = signal_obj.confidence
                 else:
                     signal_value = 0
                     confidence = 0.5
-                    
-                signals = pd.DataFrame({
-                    "close": [df["close"].iloc[-1]],
-                    "signal": [signal_value],
-                    "confidence": [confidence]
-                })
+
+                signals = pd.DataFrame(
+                    {
+                        "close": [df["close"].iloc[-1]],
+                        "signal": [signal_value],
+                        "confidence": [confidence],
+                    }
+                )
             else:
                 # Use traditional SMA crossover strategy
                 signals = sma_crossover_signals(
@@ -339,16 +385,14 @@ class AsyncRunner:
                     fast=self.sma_fast,
                     slow=self.sma_slow,
                 )
-        
+
         # Update correlation tracker with price data if enabled
         if self.use_correlation_sizing and self.correlation_tracker:
             # Add price series for correlation calculation
             self.correlation_tracker.add_price_series(
-                symbol=symbol,
-                prices=df['close'],
-                sector=None  # TODO: Add sector classification
+                symbol=symbol, prices=df["close"], sector=None  # TODO: Add sector classification
             )
-        
+
         last = signals.iloc[-1]
         price = float(last.get("close", df["close"].iloc[-1]))
 
@@ -358,14 +402,18 @@ class AsyncRunner:
         # Record signal in database
         signal_value = int(last.get("signal", 0))
         if signal_value != 0:
-            strategy_name = "ML_ENSEMBLE" if self.use_ml_strategy else "SMA_CROSSOVER"
+            strategy_name = (
+                "ML_ENHANCED" if self.use_ml_enhanced 
+                else "ML_ENSEMBLE" if self.use_ml_strategy 
+                else "SMA_CROSSOVER"
+            )
             await self.db.record_signal(
                 symbol,
                 strategy_name,
                 "BUY" if signal_value == 1 else "SELL",
                 abs(signal_value),
             )
-            
+
             # Send signal update via WebSocket
             if WEBSOCKET_ENABLED and ws_client:
                 try:
@@ -384,16 +432,18 @@ class AsyncRunner:
                 # Cover short position first
                 pos = self.positions[symbol]
                 qty_to_cover = abs(pos.quantity)
-                
+
                 with Timer("order_execution", self.monitor):
                     res = self.executor.place_order(
-                        Order(symbol=symbol, quantity=qty_to_cover, side="BUY_TO_COVER", price=price)
+                        Order(
+                            symbol=symbol, quantity=qty_to_cover, side="BUY_TO_COVER", price=price
+                        )
                     )
                 if res.ok:
                     fill_price = res.fill_price or price
                     self.portfolio.update_fill(symbol, "BUY_TO_COVER", qty_to_cover, fill_price)
                     self.daily_pnl = self.portfolio.realized_pnl
-                    
+
                     # Record trade in database
                     await self.db.record_trade(
                         symbol,
@@ -403,7 +453,7 @@ class AsyncRunner:
                         slippage=(fill_price - price) * qty_to_cover if res.fill_price else 0,
                     )
                     await self.db.update_position(symbol, 0, 0, 0)  # Close position
-                    
+
                     del self.positions[symbol]
                     await self.monitor.record_order_placed(symbol, qty_to_cover)
                     await self.monitor.record_trade_executed(symbol, "BUY_TO_COVER", qty_to_cover)
@@ -412,23 +462,27 @@ class AsyncRunner:
                     message = f"Covered short: Bought {qty_to_cover} shares at ${fill_price:.2f}"
                 else:
                     message = f"Cover order failed: {res.msg}"
-                    
+
             elif symbol not in self.positions:
                 # Open long position
                 qty = self.risk.position_size(equity, price)
-                
+
                 # Apply correlation-based position sizing if enabled
                 if self.use_correlation_sizing and self.correlation_manager:
-                    adjusted_qty, sizing_reason = await self.correlation_manager.get_adjusted_position_size(
-                        symbol=symbol,
-                        base_size=qty,
-                        current_positions=self.positions,
-                        portfolio_value=equity
+                    adjusted_qty, sizing_reason = (
+                        await self.correlation_manager.get_adjusted_position_size(
+                            symbol=symbol,
+                            base_size=qty,
+                            current_positions=self.positions,
+                            portfolio_value=equity,
+                        )
                     )
                     if adjusted_qty != qty:
-                        logger.info(f"Position size adjusted for {symbol}: {qty} -> {adjusted_qty} ({sizing_reason})")
+                        logger.info(
+                            f"Position size adjusted for {symbol}: {qty} -> {adjusted_qty} ({sizing_reason})"
+                        )
                         qty = adjusted_qty
-                
+
                 ok, msg = self.risk.validate_order(
                     symbol,
                     qty,
@@ -465,7 +519,7 @@ class AsyncRunner:
                         executed = True
                         quantity = qty
                         message = f"Opened long: Bought {qty} shares at ${fill_price:.2f}"
-                        
+
                         # Send trade update via WebSocket
                         if WEBSOCKET_ENABLED and ws_client:
                             try:
@@ -481,11 +535,11 @@ class AsyncRunner:
 
         elif signal_value == -1:  # Sell signal
             enable_short_selling = self.cfg.execution.enable_short_selling
-            
+
             if symbol in self.positions:
                 # Close long position or cover short
                 pos = self.positions[symbol]
-                
+
                 if pos.quantity > 0:  # Closing long position
                     with Timer("order_execution", self.monitor):
                         res = self.executor.place_order(
@@ -514,23 +568,27 @@ class AsyncRunner:
                         message = f"Closed long: Sold {pos.quantity} shares at ${fill_price:.2f}"
                     else:
                         message = f"Sell order failed: {res.msg}"
-                        
+
             elif enable_short_selling and symbol not in self.positions:
                 # Open short position
                 qty = self.risk.position_size(equity, price)
-                
+
                 # Apply correlation-based position sizing if enabled
                 if self.use_correlation_sizing and self.correlation_manager:
-                    adjusted_qty, sizing_reason = await self.correlation_manager.get_adjusted_position_size(
-                        symbol=symbol,
-                        base_size=qty,
-                        current_positions=self.positions,
-                        portfolio_value=equity
+                    adjusted_qty, sizing_reason = (
+                        await self.correlation_manager.get_adjusted_position_size(
+                            symbol=symbol,
+                            base_size=qty,
+                            current_positions=self.positions,
+                            portfolio_value=equity,
+                        )
                     )
                     if adjusted_qty != qty:
-                        logger.info(f"Short size adjusted for {symbol}: {qty} -> {adjusted_qty} ({sizing_reason})")
+                        logger.info(
+                            f"Short size adjusted for {symbol}: {qty} -> {adjusted_qty} ({sizing_reason})"
+                        )
                         qty = adjusted_qty
-                
+
                 ok, msg = self.risk.validate_order(
                     symbol,
                     qty,
@@ -540,7 +598,7 @@ class AsyncRunner:
                     self.positions,
                     self.daily_executed_notional,
                 )
-                
+
                 if ok and qty > 0:
                     with Timer("order_execution", self.monitor):
                         res = self.executor.place_order(
@@ -552,7 +610,7 @@ class AsyncRunner:
                         self.positions[symbol] = Position(symbol, -qty, fill_price)
                         self.portfolio.update_fill(symbol, "SELL_SHORT", qty, fill_price)
                         self.daily_executed_notional += price * qty
-                        
+
                         # Record trade in database
                         await self.db.record_trade(
                             symbol,
@@ -562,7 +620,7 @@ class AsyncRunner:
                             slippage=(fill_price - price) * qty if res.fill_price else 0,
                         )
                         await self.db.update_position(symbol, -qty, fill_price, price)
-                        
+
                         await self.monitor.record_order_placed(symbol, qty)
                         await self.monitor.record_trade_executed(symbol, "SELL_SHORT", qty)
                         executed = True
@@ -650,7 +708,7 @@ class AsyncRunner:
                 # Still process symbols but won't fetch new data
             else:
                 logger.info(f"Market is open, proceeding with data collection")
-            
+
             symbols_to_process = symbols if symbols else self.cfg.symbols
             logger.info(
                 f"Processing {len(symbols_to_process)} symbols "
@@ -665,11 +723,8 @@ class AsyncRunner:
 
             # Log execution summary
             executed_count = sum(1 for r in results if r.executed)
-            logger.info(
-                f"Processed {len(results)} symbols, "
-                f"executed {executed_count} trades"
-            )
-            
+            logger.info(f"Processed {len(results)} symbols, " f"executed {executed_count} trades")
+
             # Log correlation metrics if enabled
             if self.use_correlation_sizing and self.position_sizer:
                 corr_metrics = self.position_sizer.get_metrics()
@@ -678,12 +733,12 @@ class AsyncRunner:
                     f"positions_rejected={corr_metrics['positions_rejected']}, "
                     f"avg_correlation={corr_metrics['avg_correlation']:.3f}"
                 )
-                
+
                 # Log high correlation pairs
                 high_corr_pairs = self.position_sizer.get_high_correlation_pairs()
                 if high_corr_pairs:
                     logger.warning(f"High correlation pairs: {high_corr_pairs[:3]}")
-            
+
             # Log performance metrics
             await self.monitor.log_performance_summary()
 
@@ -703,6 +758,7 @@ async def run_once(
     default_cash: Optional[float] = None,
     max_concurrent: int = 8,
     use_ml_strategy: bool = False,
+    use_ml_enhanced: bool = False,
     use_smart_execution: bool = False,
 ) -> None:
     """Run the trading system once with parallel processing."""
@@ -718,6 +774,7 @@ async def run_once(
         max_concurrent_symbols=max_concurrent,
         use_correlation_sizing=True,  # FIXED: Enabled M5 correlation integration
         use_ml_strategy=use_ml_strategy,
+        use_ml_enhanced=use_ml_enhanced,
         use_smart_execution=use_smart_execution,
     )
     await runner.run(symbols)
@@ -736,36 +793,38 @@ async def run_continuous(
     max_concurrent: int = 8,
     interval_seconds: int = 300,
     use_ml_strategy: bool = False,
+    use_ml_enhanced: bool = False,
     use_smart_execution: bool = False,
 ) -> None:
     """Run the trading system continuously with market hours checking."""
     import signal
-    import pytz
     from datetime import datetime
-    
+
+    import pytz
+
     # Setup signal handling for graceful shutdown
     shutdown_flag = False
-    
+
     def signal_handler(signum, frame):
         nonlocal shutdown_flag
         logger.info(f"Received signal {signum}, initiating shutdown...")
         shutdown_flag = True
-    
+
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
+
     logger.info("Starting continuous trading system...")
     logger.info("Press Ctrl+C to stop gracefully")
-    
+
     while not shutdown_flag:
-        eastern = pytz.timezone('US/Eastern')
+        eastern = pytz.timezone("US/Eastern")
         current_time = datetime.now(eastern)
-        
+
         # Check market status but still run (data might be useful even after hours)
         if not is_market_open():
             session = get_market_session()
             seconds_to_open = seconds_until_market_open()
-            
+
             # During extended hours or shortly before open, run more frequently
             if session in ["after-hours", "pre-market"] or seconds_to_open < 3600:
                 wait_time = min(interval_seconds, 300)  # Max 5 minutes
@@ -778,10 +837,12 @@ async def run_continuous(
                 )
                 await asyncio.sleep(wait_time)
                 continue
-        
+
         try:
-            logger.info(f"Starting trading cycle at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-            
+            logger.info(
+                f"Starting trading cycle at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+            )
+
             # Run the trading system
             runner = AsyncRunner(
                 duration=duration,
@@ -797,14 +858,14 @@ async def run_continuous(
                 use_ml_strategy=use_ml_strategy,
                 use_smart_execution=use_smart_execution,
             )
-            
+
             await runner.run(symbols)
-            
+
             # Wait before next iteration
             if not shutdown_flag and is_market_open():
                 logger.info(f"Waiting {interval_seconds/60:.1f} minutes before next iteration...")
                 await asyncio.sleep(interval_seconds)
-                
+
         except asyncio.CancelledError:
             logger.info("Trading loop cancelled")
             break
@@ -813,7 +874,7 @@ async def run_continuous(
             if not shutdown_flag:
                 logger.info("Waiting 1 minute before retry...")
                 await asyncio.sleep(60)
-    
+
     logger.info("Trading system shutdown complete")
 
 
@@ -885,6 +946,11 @@ def main() -> None:
         help="Use ML strategy instead of SMA crossover",
     )
     parser.add_argument(
+        "--use-ml-enhanced",
+        action="store_true",
+        help="Use ML Enhanced strategy with regime detection and multi-timeframe analysis",
+    )
+    parser.add_argument(
         "--use-smart-execution",
         action="store_true",
         help="Enable smart execution algorithms (TWAP, VWAP, Iceberg)",
@@ -896,9 +962,7 @@ def main() -> None:
         raise SystemExit("Refusing to run in live mode without --confirm-live")
 
     override_symbols = (
-        [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-        if args.symbols
-        else None
+        [s.strip().upper() for s in args.symbols.split(",") if s.strip()] if args.symbols else None
     )
 
     if args.once:
@@ -916,6 +980,7 @@ def main() -> None:
                 default_cash=args.default_cash,
                 max_concurrent=args.max_concurrent,
                 use_ml_strategy=args.use_ml,
+                use_ml_enhanced=args.use_ml_enhanced,
                 use_smart_execution=args.use_smart_execution,
             )
         )
@@ -935,6 +1000,7 @@ def main() -> None:
                 max_concurrent=args.max_concurrent,
                 interval_seconds=args.interval,
                 use_ml_strategy=args.use_ml,
+                use_ml_enhanced=args.use_ml_enhanced,
                 use_smart_execution=args.use_smart_execution,
             )
         )
