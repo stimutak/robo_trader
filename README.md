@@ -4,10 +4,10 @@ A production-grade algorithmic trading system with IBKR integration, featuring a
 
 ## 🚀 Current Status
 
-**Phase 2 Complete!** ML Infrastructure & Backtesting framework is fully operational.
+**Phase 3 In Progress!** Advanced Strategy Development with ML Enhanced Framework.
 - ✅ Phase 1: Foundation & Quick Wins (100% Complete)
 - ✅ Phase 2: ML Infrastructure & Backtesting (100% Complete)
-- 🚧 Phase 3: Advanced Strategy Development (Starting)
+- 🚧 Phase 3: Advanced Strategy Development (S1 Complete - ML Enhanced Strategy)
 - ⏳ Phase 4: Production Hardening & Deployment
 
 See `IMPLEMENTATION_PLAN.md` for the complete 16-week roadmap.
@@ -27,6 +27,13 @@ See `IMPLEMENTATION_PLAN.md` for the complete 16-week roadmap.
 - ✅ **Walk-Forward Backtesting**: Realistic execution simulation
 - ✅ **Performance Analytics**: Comprehensive metrics and attribution
 - ✅ **Correlation Analysis**: Risk-aware position sizing
+
+### Advanced Strategies (Phase 3 - In Progress)
+- ✅ **ML Enhanced Strategy**: Market regime detection with multi-timeframe analysis
+- ✅ **Regime Detection**: Identifies trending, volatile, ranging, and crash markets
+- ✅ **Multi-Timeframe Analysis**: Confirms signals across 1m, 5m, 15m, 1h, 1d
+- ✅ **Dynamic Position Sizing**: Adapts to market conditions and confidence
+- 🚧 **Smart Execution**: TWAP, VWAP, Iceberg algorithms (in progress)
 
 ### Risk Management
 - **Position Sizing**: Fixed, ATR-based, or Kelly Criterion
@@ -72,12 +79,18 @@ source venv/bin/activate
 # Option 1: Run async trading system with parallel processing
 python -m robo_trader.runner_async --symbols AAPL,NVDA,TSLA
 
-# Option 2: Run with dashboard (port 5555)
+# Option 2: Run with ML Enhanced Strategy (regime detection + multi-timeframe)
+python -m robo_trader.runner_async --symbols AAPL,NVDA --use-ml-enhanced
+
+# Option 3: Run with dashboard (port 5555)
 export DASH_PORT=5555
 python app.py
 
-# Option 3: Test ML pipeline
+# Option 4: Test ML pipeline
 python test_ml_pipeline.py
+
+# Option 5: Test ML Enhanced Strategy
+python test_ml_enhanced_strategy.py
 ```
 
 ## 📊 ML Capabilities
@@ -101,6 +114,25 @@ selector = ModelSelector()
 best_model = selector.select_best_model(X_train, y_train, X_test, y_test)
 # Trains RF, XGBoost, LightGBM, and Neural Networks with hyperparameter tuning
 ```
+
+### ML Enhanced Strategy (NEW!)
+```python
+# Use advanced ML strategy with regime detection
+from robo_trader.strategies.ml_enhanced_strategy import MLEnhancedStrategy
+
+strategy = MLEnhancedStrategy(config)
+await strategy.initialize()
+
+# Analyzes market regime and multi-timeframe signals
+signal = await strategy.analyze('AAPL', market_data)
+# Returns signal with dynamic position sizing and risk parameters
+```
+
+Key features:
+- **Market Regime Detection**: Identifies bull, bear, volatile, ranging, and crash markets
+- **Multi-Timeframe Analysis**: Confirms signals across 5 timeframes
+- **Dynamic Position Sizing**: Adjusts based on regime and confidence (0.5% - 5% of capital)
+- **Adaptive Risk Management**: Stop-loss and take-profit adapt to market conditions
 
 ### Performance Analytics
 ```python
