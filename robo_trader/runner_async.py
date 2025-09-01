@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -35,6 +36,10 @@ except ImportError:
     ws_client = None
     WEBSOCKET_ENABLED = False
 from .portfolio import Portfolio  # Import Portfolio class from portfolio.py file
+from .portfolio.portfolio_manager import (
+    AllocationMethod,
+    MultiStrategyPortfolioManager,
+)
 from .risk import Position, RiskManager
 from .strategies import MLStrategy, sma_crossover_signals
 from .strategies.ml_enhanced_strategy import MLEnhancedStrategy
@@ -97,6 +102,7 @@ class AsyncRunner:
         self.risk = None
         self.executor = None
         self.portfolio = None
+        self.portfolio_manager: Optional[MultiStrategyPortfolioManager] = None
         self.positions: Dict[str, Position] = {}
         self.daily_pnl = 0.0
         self.daily_executed_notional = 0.0
@@ -110,6 +116,7 @@ class AsyncRunner:
         # ML Strategy
         self.ml_strategy = None
         self.ml_enhanced_strategy = None
+        self.active_strategy_name: Optional[str] = None
 
     async def setup(self):
         """Initialize all components."""
@@ -163,6 +170,21 @@ class AsyncRunner:
         )
         self.portfolio = Portfolio(starting_cash)
 
+        # Initialize Multi-Strategy Portfolio Manager (S3)
+        try:
+            self.portfolio_manager = MultiStrategyPortfolioManager(
+                config=self.cfg,
+                risk_manager=self.risk,
+                allocation_method=AllocationMethod.ADAPTIVE,
+                rebalance_frequency="daily",
+                max_strategy_weight=0.4,
+                min_strategy_weight=0.1,
+            )
+            self.portfolio_manager.update_capital(starting_cash)
+        except Exception as e:
+            logger.warning(f"Portfolio manager initialization failed: {e}")
+            self.portfolio_manager = None
+
         # Initialize correlation components if enabled
         if self.use_correlation_sizing:
             self.correlation_tracker = CorrelationTracker(
@@ -188,6 +210,11 @@ class AsyncRunner:
             # Initialize with historical data
             await self.ml_enhanced_strategy.initialize()
             logger.info("ML Enhanced strategy initialized successfully")
+            self.active_strategy_name = "ML_Enhanced"
+            if self.portfolio_manager:
+                # Register ML Enhanced and a baseline SMA strategy for diversification
+                self.portfolio_manager.register_strategy(self.ml_enhanced_strategy, initial_weight=0.6)
+                self.portfolio_manager.register_strategy(SimpleNamespace(name="Baseline_SMA"), initial_weight=0.4)
         # Initialize regular ML strategy if enabled (and not using enhanced)
         elif self.use_ml_strategy:
             logger.info("Initializing ML strategy...")
@@ -225,6 +252,15 @@ class AsyncRunner:
             # Initialize the strategy with empty historical data (models already trained)
             await self.ml_strategy.initialize({})
             logger.info("ML strategy initialized successfully")
+            self.active_strategy_name = "ML_Strategy"
+            if self.portfolio_manager:
+                self.portfolio_manager.register_strategy(self.ml_strategy, initial_weight=0.6)
+                self.portfolio_manager.register_strategy(SimpleNamespace(name="Baseline_SMA"), initial_weight=0.4)
+        else:
+            # Fallback baseline
+            self.active_strategy_name = "Baseline_SMA"
+            if self.portfolio_manager:
+                self.portfolio_manager.register_strategy(SimpleNamespace(name="Baseline_SMA"), initial_weight=1.0)
 
         logger.info("AsyncRunner setup complete")
 
@@ -468,6 +504,12 @@ class AsyncRunner:
                 # Open long position
                 qty = self.risk.position_size(equity, price)
 
+                # Scale by portfolio manager strategy weight if available
+                if self.portfolio_manager and self.active_strategy_name:
+                    alloc = self.portfolio_manager.allocations.get(self.active_strategy_name)
+                    if alloc:
+                        qty = max(int(qty * alloc.current_weight), 0)
+
                 # Apply correlation-based position sizing if enabled
                 if self.use_correlation_sizing and self.correlation_manager:
                     adjusted_qty, sizing_reason = (
@@ -574,6 +616,12 @@ class AsyncRunner:
                 # Open short position
                 qty = self.risk.position_size(equity, price)
 
+                # Scale by portfolio manager strategy weight if available
+                if self.portfolio_manager and self.active_strategy_name:
+                    alloc = self.portfolio_manager.allocations.get(self.active_strategy_name)
+                    if alloc:
+                        qty = max(int(qty * alloc.current_weight), 0)
+
                 # Apply correlation-based position sizing if enabled
                 if self.use_correlation_sizing and self.correlation_manager:
                     adjusted_qty, sizing_reason = (
@@ -677,6 +725,18 @@ class AsyncRunner:
         market_prices = {symbol: pos.avg_price for symbol, pos in self.positions.items()}
         equity = self.portfolio.equity(market_prices)
         unrealized = self.portfolio.compute_unrealized(market_prices)
+
+        # Update portfolio manager capital and consider rebalancing
+        if self.portfolio_manager:
+            try:
+                self.portfolio_manager.update_capital(equity)
+                if await self.portfolio_manager.should_rebalance():
+                    rb = await self.portfolio_manager.rebalance()
+                    logger.info(
+                        f"Rebalanced strategies at {rb['timestamp']}: {rb['new_weights']}"
+                    )
+            except Exception as e:
+                logger.debug(f"Portfolio manager update failed: {e}")
 
         await self.db.update_account(
             cash=self.portfolio.cash,

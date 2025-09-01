@@ -33,6 +33,7 @@ See `IMPLEMENTATION_PLAN.md` for the complete 16-week roadmap.
 - ✅ **Regime Detection**: Identifies trending, volatile, ranging, and crash markets
 - ✅ **Multi-Timeframe Analysis**: Confirms signals across 1m, 5m, 15m, 1h, 1d
 - ✅ **Dynamic Position Sizing**: Adapts to market conditions and confidence
+- ✅ **Multi-Strategy Portfolio Manager (S3)**: Dynamic allocation across strategies (Equal Weight, Risk Parity, Adaptive)
 - 🚧 **Smart Execution**: TWAP, VWAP, Iceberg algorithms (in progress)
 
 ### Risk Management
@@ -164,6 +165,8 @@ robo_trader/
 │   │   └── execution_simulator.py
 │   ├── analytics/                  # Performance Analytics
 │   │   └── strategy_performance.py # Comprehensive metrics
+│   ├── portfolio/                  # Multi-Strategy Portfolio Manager (S3)
+│   │   └── portfolio_manager.py    # Allocation + metrics + rebalancing
 │   └── websocket_server.py         # Real-time updates
 ├── app.py                           # Monitoring dashboard
 ├── tests/                           # Test suites
@@ -221,6 +224,45 @@ python test_m4_performance.py
 
 # All tests
 pytest
+```
+
+### Portfolio Manager Tests (S3)
+```bash
+# Quick sanity tests for S3 Portfolio Manager
+python test_portfolio_simple.py
+python test_portfolio_manager.py
+```
+
+## 🧭 Portfolio Manager (S3) Usage
+
+```python
+from robo_trader.portfolio.portfolio_manager import (
+    AllocationMethod, MultiStrategyPortfolioManager
+)
+
+pm = MultiStrategyPortfolioManager(
+    config, risk_manager, allocation_method=AllocationMethod.ADAPTIVE,
+    rebalance_frequency="daily", max_strategy_weight=0.4, min_strategy_weight=0.1,
+)
+
+# Register strategies (objects with a .name attribute)
+pm.register_strategy(ml_enhanced_strategy, initial_weight=0.6)
+pm.register_strategy(SimpleNamespace(name="Baseline_SMA"), initial_weight=0.4)
+
+# Update capital and get weights
+pm.update_capital(1_000_000)
+weights = await pm.allocate_capital()
+
+# Periodically consider rebalancing
+if await pm.should_rebalance():
+    await pm.rebalance()
+
+# Record performance per strategy
+pm.update_strategy_performance("ML_Enhanced", return_pct=0.004,
+                               metrics={"trades": 5, "win_rate": 0.6})
+
+# Portfolio metrics
+metrics = pm.get_portfolio_metrics()
 ```
 
 ### Test Coverage
