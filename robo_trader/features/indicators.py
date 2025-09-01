@@ -161,14 +161,10 @@ class TechnicalIndicators:
             return None
 
     def bollinger_bands(
-<<<<<<< HEAD
         self,
         prices: pd.Series,
         period: Optional[int] = None,
         std_dev: Optional[float] = None,
-=======
-        self, prices: pd.Series, period: Optional[int] = None, std_dev: Optional[float] = None
->>>>>>> efficiency-improvements-reviewed
     ) -> Optional[Dict[str, float]]:
         """Bollinger Bands."""
         try:
@@ -225,14 +221,10 @@ class TechnicalIndicators:
             return None
 
     def stochastic(
-<<<<<<< HEAD
         self,
         df: pd.DataFrame,
         k_period: Optional[int] = None,
         d_period: Optional[int] = None,
-=======
-        self, df: pd.DataFrame, k_period: Optional[int] = None, d_period: Optional[int] = None
->>>>>>> efficiency-improvements-reviewed
     ) -> Optional[Dict[str, float]]:
         """Stochastic Oscillator."""
         try:
@@ -405,19 +397,12 @@ class TechnicalIndicators:
             down_move = df["low"].shift() - df["low"]
 
             pos_dm = pd.Series(
-<<<<<<< HEAD
                 np.where((up_move > down_move) & (up_move > 0), up_move, 0),
                 index=df.index,
             )
             neg_dm = pd.Series(
                 np.where((down_move > up_move) & (down_move > 0), down_move, 0),
                 index=df.index,
-=======
-                np.where((up_move > down_move) & (up_move > 0), up_move, 0), index=df.index
-            )
-            neg_dm = pd.Series(
-                np.where((down_move > up_move) & (down_move > 0), down_move, 0), index=df.index
->>>>>>> efficiency-improvements-reviewed
             )
 
             # Calculate directional indicators
@@ -529,7 +514,6 @@ class TechnicalIndicators:
             s2 = pivot - (high - low)
             s3 = low - 2 * (high - pivot)
 
-<<<<<<< HEAD
             return {
                 "pivot": pivot,
                 "r1": r1,
@@ -539,9 +523,6 @@ class TechnicalIndicators:
                 "s2": s2,
                 "s3": s3,
             }
-=======
-            return {"pivot": pivot, "r1": r1, "r2": r2, "r3": r3, "s1": s1, "s2": s2, "s3": s3}
->>>>>>> efficiency-improvements-reviewed
 
         except Exception:
             return None
