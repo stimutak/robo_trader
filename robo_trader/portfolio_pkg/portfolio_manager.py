@@ -24,6 +24,7 @@ class AllocationMethod(Enum):
     EQUAL_WEIGHT = "equal_weight"
     RISK_PARITY = "risk_parity"
     ADAPTIVE = "adaptive"
+    KELLY = "kelly"
 
 
 @dataclass
@@ -123,6 +124,8 @@ class MultiStrategyPortfolioManager:
             raw_weights = self._risk_parity_weights(names)
         elif method == AllocationMethod.ADAPTIVE:
             raw_weights = self._adaptive_weights(names)
+        elif method == AllocationMethod.KELLY:
+            raw_weights = self._kelly_weights(names)
         else:
             raw_weights = {n: 1.0 / len(names) for n in names}
 
@@ -170,6 +173,33 @@ class MultiStrategyPortfolioManager:
             # Fallback to equal weights
             return {n: 1.0 / len(names) for n in names}
         return {n: s / total for n, s in scores.items()}
+
+    def _kelly_weights(self, names: List[str]) -> Dict[str, float]:
+        """Kelly-like allocation using mean/variance ratio per strategy.
+
+        Uses w_i ∝ max(mean_return, 0) / variance as a practical approximation
+        of Kelly optimal fraction for multiple independent strategies.
+        Falls back to equal weights when insufficient data.
+        """
+        scores: Dict[str, float] = {}
+        for n in names:
+            ret = np.array(self.strategy_performance.get(n, {}).get("returns", []), dtype=float)
+            if ret.size < 10:
+                continue
+            mu = float(np.mean(ret))
+            var = float(np.var(ret))
+            if var <= 1e-8:
+                var = 1e-8
+            score = max(mu, 0.0) / var
+            scores[n] = max(score, 0.0)
+
+        if not scores:
+            return {n: 1.0 / len(names) for n in names}
+
+        total = sum(scores.values())
+        if total <= 0:
+            return {n: 1.0 / len(names) for n in names}
+        return {n: scores.get(n, 0.0) / total for n in names}
 
     def _apply_weight_constraints(self, weights: Dict[str, float]) -> Dict[str, float]:
         """Clamp weights to [min, max] and renormalize to sum to 1.0.
@@ -329,4 +359,3 @@ class MultiStrategyPortfolioManager:
             var_95=float(var_95),
             strategy_contributions=contributions,
         )
-

@@ -39,3 +39,11 @@
 - Never commit secrets. Keep credentials in `.env`; copy from `.env.example`.
 - Default to paper trading: set `EXECUTION_MODE=paper`. Confirm IBKR host/port before live runs.
 - Large logs/DBs are ignored by `.gitignore`; avoid adding artifacts to VCS.
+
+### Handoff Document Convention
+- Location: `/handoff/` directory in project root
+- Naming: `YYYY-MM-DD_HHMM_handoff.md` (24-hour format, local time)
+- Latest: Symlink `LATEST_HANDOFF.md` → most recent handoff doc
+- Archive: Keep last 5 handoffs, archive older ones to `/handoff/archive/`
+- Content: Status, running processes, next steps, blockers, session notes
+- DO NOT MAKE ENHANCED VERSIONS OF FILES

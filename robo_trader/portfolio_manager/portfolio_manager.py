@@ -272,6 +272,62 @@ class MultiStrategyPortfolioManager:
                 weights[strategy_name] = equal_weight
         
         return weights
+
+    async def _calculate_mean_variance_weights(self) -> Dict[str, float]:
+        """Mean-variance inspired weights using Sharpe-like scoring.
+
+        Approximates mean-variance optimization by setting weights ∝ μ/σ
+        over recent returns, with fallbacks to equal weight when insufficient data.
+        """
+        if not self.strategy_returns:
+            return self._calculate_equal_weights()
+
+        scores: Dict[str, float] = {}
+        for name, ret in self.strategy_returns.items():
+            if len(ret) < 20:
+                continue
+            r = np.array(ret[-60:], dtype=float)
+            mu = float(np.mean(r))
+            sigma = float(np.std(r))
+            if sigma <= 1e-8:
+                continue
+            score = max(mu, 0.0) / sigma
+            scores[name] = max(score, 0.0)
+
+        if not scores:
+            return self._calculate_equal_weights()
+
+        total = sum(scores.values())
+        weights = {name: scores.get(name, 0.0) / total for name in self.strategies.keys()}
+        return weights
+
+    async def _calculate_kelly_weights(self) -> Dict[str, float]:
+        """Kelly-optimal inspired weights using mean/variance ratio.
+
+        Uses w_i ∝ max(μ_i, 0)/σ_i^2 on recent returns as a practical, bounded
+        approximation of Kelly sizing across strategies.
+        """
+        if not self.strategy_returns:
+            return self._calculate_equal_weights()
+
+        scores: Dict[str, float] = {}
+        for name, ret in self.strategy_returns.items():
+            if len(ret) < 20:
+                continue
+            r = np.array(ret[-60:], dtype=float)
+            mu = float(np.mean(r))
+            var = float(np.var(r))
+            if var <= 1e-8:
+                continue
+            score = max(mu, 0.0) / var
+            scores[name] = max(score, 0.0)
+
+        if not scores:
+            return self._calculate_equal_weights()
+
+        total = sum(scores.values())
+        weights = {name: scores.get(name, 0.0) / total for name in self.strategies.keys()}
+        return weights
     
     def _apply_weight_constraints(self, weights: Dict[str, float]) -> Dict[str, float]:
         """Apply minimum and maximum weight constraints."""

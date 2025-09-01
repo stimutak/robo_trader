@@ -36,7 +36,7 @@ except ImportError:
     ws_client = None
     WEBSOCKET_ENABLED = False
 from .portfolio import Portfolio  # Import Portfolio class from portfolio.py file
-from .portfolio.portfolio_manager import (
+from .portfolio_pkg.portfolio_manager import (
     AllocationMethod,
     MultiStrategyPortfolioManager,
 )
