@@ -365,7 +365,7 @@ class MLEnhancedStrategy(Strategy):
 
         return resampled.dropna()
 
-    def _analyze_timeframe(self, data: pd.DataFrame) -> Optional[Signal]:
+    def _analyze_timeframe(self, data: pd.DataFrame) -> Optional[SimpleSignal]:
         """Analyze a single timeframe for signals."""
         if len(data) < 20:
             return None
@@ -388,8 +388,8 @@ class MLEnhancedStrategy(Strategy):
         return None
 
     def _combine_signals(
-        self, ml_signal: Signal, mtf_signal: MultiTimeframeSignal, regime: RegimeState
-    ) -> Optional[Signal]:
+        self, ml_signal: SimpleSignal, mtf_signal: MultiTimeframeSignal, regime: RegimeState
+    ) -> Optional[SimpleSignal]:
         """Combine ML and multi-timeframe signals with regime awareness."""
         # Check if signals agree
         if ml_signal.action != mtf_signal.combined_signal.action:
@@ -441,7 +441,7 @@ class MLEnhancedStrategy(Strategy):
 
         return final_signal
 
-    def _apply_position_sizing(self, signal: Signal, regime: RegimeState) -> Signal:
+    def _apply_position_sizing(self, signal: SimpleSignal, regime: RegimeState) -> SimpleSignal:
         """Apply dynamic position sizing based on regime and confidence."""
         # Base position size
         position_size = self.base_position_size
