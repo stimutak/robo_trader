@@ -214,33 +214,64 @@ class SmartExecutor:
 
         # Distribute quantity according to typical volume pattern
         total_volume = volume_profile["volume"].sum()
+        
+        if total_volume == 0:
+            # Fall back to TWAP if no volume
+            return await self._create_twap_plan(symbol, side, quantity, params, market_data)
 
+        # Group volume profile into larger chunks for reasonable slice sizes
+        # Instead of every 5 minutes, group into params.slice_count buckets
+        target_slices = min(params.slice_count, len(volume_profile))
+        rows_per_slice = max(1, len(volume_profile) // target_slices)
+        
         slices = []
         remaining = quantity
         current_time = datetime.now()
-
-        for idx, row in volume_profile.iterrows():
-            # Calculate proportion based on historical volume
-            volume_weight = row["volume"] / total_volume
+        
+        for i in range(0, len(volume_profile), rows_per_slice):
+            # Sum volume for this time bucket
+            bucket_volume = volume_profile.iloc[i:i+rows_per_slice]["volume"].sum()
+            volume_weight = bucket_volume / total_volume
+            
+            # Calculate slice quantity
             slice_qty = min(remaining, int(quantity * volume_weight))
-
-            if slice_qty >= params.min_slice_size:
+            
+            # For VWAP, be more flexible with min size
+            min_size = min(params.min_slice_size, quantity // (target_slices * 2))
+            
+            if slice_qty >= min_size and remaining > 0:
                 slices.append(
                     {
-                        "time": current_time + timedelta(minutes=idx * 5),  # 5-min intervals
+                        "time": current_time + timedelta(minutes=i * 5),  # 5-min intervals
                         "quantity": slice_qty,
                         "type": "LIMIT",
                         "price_offset": 0,
-                        "urgency": params.urgency
-                        * (1 + volume_weight),  # More urgent during high volume
-                        "expected_volume": row["volume"],
+                        "urgency": params.urgency * (1 + volume_weight),  # More urgent during high volume
+                        "expected_volume": bucket_volume,
                     }
                 )
                 remaining -= slice_qty
 
-        # Add remainder to last slice
-        if remaining > 0 and slices:
-            slices[-1]["quantity"] += remaining
+        # Add remainder to last slice or create slices if none were created
+        if remaining > 0:
+            if slices:
+                slices[-1]["quantity"] += remaining
+            else:
+                # If no slices were created, fall back to simple slicing
+                slice_size = quantity // max(1, params.slice_count)
+                for i in range(params.slice_count):
+                    qty = slice_size if i < params.slice_count - 1 else quantity - (slice_size * i)
+                    if qty > 0:
+                        slices.append(
+                            {
+                                "time": current_time + timedelta(minutes=i * params.duration_minutes // params.slice_count),
+                                "quantity": qty,
+                                "type": "LIMIT",
+                                "price_offset": 0,
+                                "urgency": params.urgency,
+                                "expected_volume": total_volume / params.slice_count,
+                            }
+                        )
 
         return ExecutionPlan(
             symbol=symbol,
@@ -248,7 +279,7 @@ class SmartExecutor:
             total_quantity=quantity,
             slices=slices,
             algorithm=ExecutionAlgorithm.VWAP,
-            estimated_duration=timedelta(minutes=len(slices) * 5),
+            estimated_duration=timedelta(minutes=max(1, len(slices) * 5)),
             estimated_cost=0,
             market_impact_bps=0,
         )
@@ -318,22 +349,26 @@ class SmartExecutor:
             # Use smaller slices in volatile markets
             params.slice_count = params.slice_count * 2
             params.urgency = max(0.3, params.urgency - 0.2)
-            return await self._create_twap_plan(symbol, side, quantity, params, market_data)
+            plan = await self._create_twap_plan(symbol, side, quantity, params, market_data)
 
         elif conditions.get("low_liquidity", False):
             # Use iceberg for low liquidity
             params.iceberg_display_ratio = 0.1
-            return await self._create_iceberg_plan(symbol, side, quantity, params, market_data)
+            plan = await self._create_iceberg_plan(symbol, side, quantity, params, market_data)
 
         elif conditions.get("trending", False):
             # Be more aggressive in trending markets
             params.urgency = min(1.0, params.urgency + 0.3)
             params.duration_minutes = max(10, params.duration_minutes // 2)
-            return await self._create_vwap_plan(symbol, side, quantity, params, market_data)
+            plan = await self._create_vwap_plan(symbol, side, quantity, params, market_data)
 
         else:
             # Default to VWAP in normal conditions
-            return await self._create_vwap_plan(symbol, side, quantity, params, market_data)
+            plan = await self._create_vwap_plan(symbol, side, quantity, params, market_data)
+        
+        # Override algorithm type to maintain ADAPTIVE
+        plan.algorithm = ExecutionAlgorithm.ADAPTIVE
+        return plan
 
     async def _create_market_plan(
         self, symbol: str, side: str, quantity: int, market_data: Optional[Dict[str, Any]]
@@ -360,9 +395,15 @@ class SmartExecutor:
         )
 
     async def execute_plan(
-        self, plan: ExecutionPlan, executor: Any  # The actual order executor (paper or live)
+        self, plan: ExecutionPlan, executor: Any, skip_delays: bool = False  # The actual order executor (paper or live)
     ) -> ExecutionResult:
-        """Execute a smart execution plan."""
+        """Execute a smart execution plan.
+        
+        Args:
+            plan: The execution plan to execute
+            executor: The order executor (paper or live)
+            skip_delays: If True, skip time delays between slices (for testing)
+        """
 
         start_time = datetime.now()
         fills = []
@@ -378,10 +419,11 @@ class SmartExecutor:
 
         try:
             for slice_config in plan.slices:
-                # Wait until scheduled time
-                wait_time = (slice_config["time"] - datetime.now()).total_seconds()
-                if wait_time > 0:
-                    await asyncio.sleep(wait_time)
+                # Wait until scheduled time (unless in test mode)
+                if not skip_delays:
+                    wait_time = (slice_config["time"] - datetime.now()).total_seconds()
+                    if wait_time > 0:
+                        await asyncio.sleep(wait_time)
 
                 # Adjust price based on urgency and market conditions
                 current_price = await self._get_current_price(plan.symbol)
@@ -602,9 +644,16 @@ class SmartExecutor:
 
         # Get average daily volume
         adv = market_data.get("avg_volume", 1000000)
+        
+        # Ensure duration is not zero
+        duration_seconds = max(1, duration.total_seconds())
+        
+        # Ensure ADV is not zero
+        if adv <= 0:
+            adv = 1000000  # Default to 1M shares
 
         # Calculate participation rate
-        participation = quantity / (adv * duration.total_seconds() / 86400)
+        participation = quantity / (adv * duration_seconds / 86400)
 
         # Square-root market impact model
         temporary_impact = self.impact_params["temporary_impact"] * np.sqrt(participation)

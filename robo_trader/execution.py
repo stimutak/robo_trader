@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 if TYPE_CHECKING:
     from .smart_execution.smart_executor import ExecutionAlgorithm, ExecutionParams, SmartExecutor
@@ -74,6 +74,21 @@ class PaperExecutor(AbstractExecutor):
 
         # Standard paper execution
         return self._place_simple_order(order)
+    
+    async def place_order_async(self, order: Order) -> ExecutionResult:
+        """Place order asynchronously with smart execution support."""
+        if order.quantity <= 0:
+            return ExecutionResult(False, "Quantity must be positive")
+        side = order.side.upper()
+        if side not in {"BUY", "SELL"}:
+            return ExecutionResult(False, "Side must be BUY or SELL")
+
+        # Use smart execution if enabled and available
+        if self.use_smart_execution and self.smart_executor:
+            return await self._execute_smart_order_async(order)
+
+        # Standard paper execution
+        return self._place_simple_order(order)
 
     def _place_simple_order(self, order: Order) -> ExecutionResult:
         """Place order with simple paper execution."""
@@ -92,16 +107,29 @@ class PaperExecutor(AbstractExecutor):
     def _place_smart_order(self, order: Order) -> ExecutionResult:
         """Place order using smart execution algorithms."""
         try:
-            # Run async smart execution in sync context
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            result = loop.run_until_complete(self._execute_smart_order_async(order))
-            loop.close()
-            return result
+            # Check if there's already an event loop running
+            try:
+                loop = asyncio.get_running_loop()
+                # We're already in an async context, create task
+                future = asyncio.create_task(self._execute_smart_order_async(order))
+                # For now, just use simple execution since we can't block on async
+                # TODO: Make place_order async to properly support smart execution
+                import structlog
+                logger = structlog.get_logger(__name__)
+                logger.debug("Smart execution deferred - already in async context", symbol=order.symbol)
+                return self._place_simple_order(order)
+            except RuntimeError:
+                # No event loop running, create one
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    result = loop.run_until_complete(self._execute_smart_order_async(order))
+                    return result
+                finally:
+                    loop.close()
         except Exception as e:
             # Fallback to simple execution on error
             import structlog
-
             logger = structlog.get_logger(__name__)
             logger.warning(
                 "Smart execution failed, falling back to simple", error=str(e), symbol=order.symbol
@@ -130,8 +158,9 @@ class PaperExecutor(AbstractExecutor):
             symbol=order.symbol, side=order.side, quantity=order.quantity, params=params
         )
 
-        # Execute with paper fills
-        result = await self.smart_executor.execute_plan(plan, self)
+        # Execute with paper fills (skip delays for testing)
+        # TODO: Make this configurable via parameter
+        result = await self.smart_executor.execute_plan(plan, self, skip_delays=True)
 
         # Convert to ExecutionResult
         if result.success:
@@ -159,3 +188,25 @@ class PaperExecutor(AbstractExecutor):
             return ExecutionAlgorithm.ADAPTIVE
         else:
             return ExecutionAlgorithm.ICEBERG
+    
+    async def execute_order(self, symbol: str, side: str, quantity: int, order_type: str, limit_price: float = None) -> Dict[str, Any]:
+        """Execute order for smart executor (async method for slices)."""
+        # Create an Order object
+        order = Order(symbol=symbol, quantity=quantity, side=side, price=limit_price)
+        
+        # Execute using paper fills
+        result = self._place_simple_order(order)
+        
+        # Return in the format expected by smart executor
+        if result.ok:
+            return {
+                "executed_quantity": quantity,
+                "price": result.fill_price,
+                "timestamp": dt.datetime.now()
+            }
+        else:
+            return {
+                "executed_quantity": 0,
+                "price": 0,
+                "timestamp": dt.datetime.now()
+            }

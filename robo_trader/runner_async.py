@@ -34,7 +34,7 @@ try:
 except ImportError:
     ws_client = None
     WEBSOCKET_ENABLED = False
-from .portfolio import Portfolio
+from .portfolio import Portfolio  # Import Portfolio class from portfolio.py file
 from .risk import Position, RiskManager
 from .strategies import MLStrategy, sma_crossover_signals
 from .strategies.ml_enhanced_strategy import MLEnhancedStrategy
@@ -146,8 +146,9 @@ class AsyncRunner:
         if self.use_smart_execution:
             from .smart_execution.smart_executor import SmartExecutor
 
-            # Pass IBKR client for real market data
-            smart_executor = SmartExecutor(self.cfg, ibkr_client=self.ib_client.ib)
+            # Pass IBKR client for real market data (use first connection from pool)
+            ibkr_client = self.client.pool.pool[0] if self.client.pool.pool else None
+            smart_executor = SmartExecutor(self.cfg, ibkr_client=ibkr_client)
             logger.info("Smart execution enabled with real market data integration")
 
         self.executor = PaperExecutor(
