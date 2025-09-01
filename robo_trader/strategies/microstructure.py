@@ -1,585 +1,662 @@
-"""Microstructure trading strategies for RoboTrader.
+"""
+Microstructure Trading Strategies
 
-This module implements high-frequency strategies that exploit market microstructure patterns:
-- Order book imbalance strategies
-- Spread capture strategies  
-- Liquidity provision strategies
-- Sub-second momentum strategies
+High-frequency trading strategies based on order book dynamics and microstructure analysis.
 """
 
 import asyncio
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
-
 import numpy as np
 import pandas as pd
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+import logging
 
-# Simple logger replacement
-class SimpleLogger:
-    def __init__(self, name):
-        self.name = name
-
-    def bind(self, **kwargs):
-        return self
-
-    def info(self, msg, **kwargs):
-        print(f"INFO [{self.name}]: {msg}")
-
-    def error(self, msg, **kwargs):
-        print(f"ERROR [{self.name}]: {msg}")
-
-logger = SimpleLogger(__name__)
-
-# Standalone MarketMicrostructure to avoid import issues
-@dataclass
-class MarketMicrostructure:
-    """Market microstructure data for execution decisions."""
-
-    bid: float
-    ask: float
-    bid_size: int
-    ask_size: int
-    spread: float
-    spread_bps: float
-    mid_price: float
-    imbalance: float  # (bid_size - ask_size) / (bid_size + ask_size)
-    depth: Dict[str, List[Tuple[float, int]]]  # Price levels and sizes
+from robo_trader.features.orderbook import OrderBookFeatures, OrderBookSnapshot
 
 
-class LiquidityProvider:
-    """Mock liquidity provider."""
-
-    async def get_liquidity_metrics(self, symbol: str) -> Dict[str, Any]:
-        return {
-            "avg_spread_bps": 5.0,
-            "avg_volume": 1e6,
-            "volatility": 0.02,
-            "liquidity_score": 0.7,
-        }
-
-# Minimal strategy base to avoid import issues
-class Strategy:
-    def __init__(self, name: str):
-        self.name = name
-
-    async def analyze(self, symbol: str, df: pd.DataFrame) -> Dict[str, Any]:
+class BaseStrategy:
+    """Simple base class for microstructure strategies"""
+    
+    def __init__(self):
+        pass
+    
+    def should_buy(self, symbol: str, current_price: float, market_data: Dict) -> Tuple[bool, Dict]:
+        """Determine if should buy"""
         raise NotImplementedError
-
-class SignalType(Enum):
-    BUY = "buy"
-    SELL = "sell"
-    HOLD = "hold"
-
-logger = structlog.get_logger(__name__)
-
-
-class MicrostructureSignal(Enum):
-    """Microstructure-specific signal types."""
     
-    SPREAD_CAPTURE = "spread_capture"
-    IMBALANCE_LONG = "imbalance_long"
-    IMBALANCE_SHORT = "imbalance_short"
-    LIQUIDITY_PROVIDE = "liquidity_provide"
-    MOMENTUM_MICRO = "momentum_micro"
-    MEAN_REVERT_MICRO = "mean_revert_micro"
+    def should_sell(self, symbol: str, current_price: float, market_data: Dict) -> Tuple[bool, Dict]:
+        """Determine if should sell"""
+        raise NotImplementedError
+    
+    def calculate_position_size(self, symbol: str, current_price: float, capital: float, market_data: Dict) -> int:
+        """Calculate position size"""
+        return 100
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
-class OrderBookLevel:
-    """Order book level data."""
+class MicrostructureConfig:
+    """Configuration for microstructure strategies"""
+    # Order flow imbalance thresholds
+    ofi_entry_threshold: float = 0.3
+    ofi_exit_threshold: float = 0.1
     
-    price: float
-    size: int
-    orders: int = 1
+    # Spread trading parameters
+    min_spread_bps: float = 5.0  # Minimum spread in basis points
+    max_spread_bps: float = 50.0  # Maximum spread in basis points
+    
+    # Market making parameters
+    quote_offset_bps: float = 2.0  # Offset from best bid/ask in basis points
+    max_inventory: int = 100  # Maximum inventory per symbol
+    inventory_skew_factor: float = 0.5  # Adjust quotes based on inventory
+    
+    # Tick momentum parameters
+    tick_window: int = 20  # Window for tick direction calculation
+    tick_threshold: float = 0.6  # Threshold for tick momentum signal
+    
+    # Risk parameters
+    max_position_size: int = 1000
+    stop_loss_bps: float = 20.0  # Stop loss in basis points
+    take_profit_bps: float = 10.0  # Take profit in basis points
+    
+    # Execution parameters
+    min_order_size: int = 100
+    max_order_size: int = 500
+    execution_delay_ms: int = 10  # Simulated execution delay
+    
+    # Feature calculation
+    orderbook_levels: int = 10  # Number of order book levels to analyze
+    feature_window: int = 50  # Number of snapshots for feature calculation
 
 
-@dataclass
-class OrderBookSnapshot:
-    """Complete order book snapshot."""
+class OrderFlowImbalanceStrategy(BaseStrategy):
+    """
+    Strategy based on order flow imbalance (OFI)
     
-    timestamp: datetime
-    symbol: str
-    bids: List[OrderBookLevel]
-    asks: List[OrderBookLevel]
-    last_trade_price: float
-    last_trade_size: int
+    Trades in the direction of order book pressure when imbalance is significant.
+    """
     
-    @property
-    def best_bid(self) -> Optional[OrderBookLevel]:
-        return self.bids[0] if self.bids else None
+    def __init__(self, config: Optional[MicrostructureConfig] = None):
+        super().__init__()
+        self.config = config or MicrostructureConfig()
+        self.orderbook_features = OrderBookFeatures(max_levels=self.config.orderbook_levels)
+        self.positions: Dict[str, int] = {}
+        self.entry_prices: Dict[str, float] = {}
+        
+    def should_buy(self, symbol: str, current_price: float, market_data: Dict) -> Tuple[bool, Dict]:
+        """
+        Buy when order flow imbalance indicates buying pressure
+        
+        Args:
+            symbol: Stock symbol
+            current_price: Current price
+            market_data: Market data including order book
+            
+        Returns:
+            Tuple of (should_buy, metadata)
+        """
+        # Update order book features if available
+        if 'orderbook' in market_data:
+            snapshot = self._create_orderbook_snapshot(market_data['orderbook'])
+            self.orderbook_features.add_snapshot(snapshot)
+        
+        # Calculate order flow imbalance
+        ofi = self.orderbook_features.calculate_order_flow_imbalance()
+        book_pressure = self.orderbook_features.calculate_book_pressure()
+        
+        # Check if we should buy
+        should_buy = (
+            ofi > self.config.ofi_entry_threshold and
+            book_pressure > 0.2 and
+            self.positions.get(symbol, 0) <= 0  # Not already long
+        )
+        
+        metadata = {
+            'strategy': 'order_flow_imbalance',
+            'ofi': ofi,
+            'book_pressure': book_pressure,
+            'signal_strength': ofi * book_pressure
+        }
+        
+        if should_buy:
+            self.positions[symbol] = self.config.min_order_size
+            self.entry_prices[symbol] = current_price
+            logger.info(f"OFI Buy signal for {symbol}: OFI={ofi:.3f}, Pressure={book_pressure:.3f}")
+        
+        return should_buy, metadata
     
-    @property
-    def best_ask(self) -> Optional[OrderBookLevel]:
-        return self.asks[0] if self.asks else None
+    def should_sell(self, symbol: str, current_price: float, market_data: Dict) -> Tuple[bool, Dict]:
+        """
+        Sell when order flow imbalance reverses or hits stop/target
+        
+        Args:
+            symbol: Stock symbol
+            current_price: Current price
+            market_data: Market data including order book
+            
+        Returns:
+            Tuple of (should_sell, metadata)
+        """
+        # Update order book features if available
+        if 'orderbook' in market_data:
+            snapshot = self._create_orderbook_snapshot(market_data['orderbook'])
+            self.orderbook_features.add_snapshot(snapshot)
+        
+        # Calculate order flow imbalance
+        ofi = self.orderbook_features.calculate_order_flow_imbalance()
+        book_pressure = self.orderbook_features.calculate_book_pressure()
+        
+        # Check position
+        position = self.positions.get(symbol, 0)
+        entry_price = self.entry_prices.get(symbol, current_price)
+        
+        # Calculate P&L
+        pnl_bps = ((current_price - entry_price) / entry_price) * 10000 if entry_price > 0 else 0
+        
+        # Exit conditions
+        should_sell = False
+        exit_reason = None
+        
+        if position > 0:  # Long position
+            if ofi < -self.config.ofi_exit_threshold:
+                should_sell = True
+                exit_reason = 'ofi_reversal'
+            elif pnl_bps >= self.config.take_profit_bps:
+                should_sell = True
+                exit_reason = 'take_profit'
+            elif pnl_bps <= -self.config.stop_loss_bps:
+                should_sell = True
+                exit_reason = 'stop_loss'
+        elif position < 0:  # Short position (cover)
+            if ofi > self.config.ofi_exit_threshold:
+                should_sell = True
+                exit_reason = 'ofi_reversal'
+        
+        metadata = {
+            'strategy': 'order_flow_imbalance',
+            'ofi': ofi,
+            'book_pressure': book_pressure,
+            'pnl_bps': pnl_bps,
+            'exit_reason': exit_reason
+        }
+        
+        if should_sell and position != 0:
+            logger.info(f"OFI Sell signal for {symbol}: Reason={exit_reason}, PnL={pnl_bps:.1f}bps")
+            self.positions[symbol] = 0
+            if symbol in self.entry_prices:
+                del self.entry_prices[symbol]
+        
+        return should_sell, metadata
     
-    @property
-    def spread(self) -> float:
-        if self.best_bid and self.best_ask:
-            return self.best_ask.price - self.best_bid.price
-        return 0.0
+    def calculate_position_size(self, symbol: str, current_price: float, 
+                              capital: float, market_data: Dict) -> int:
+        """Calculate position size based on order flow strength"""
+        ofi = self.orderbook_features.calculate_order_flow_imbalance()
+        
+        # Scale position size with OFI strength
+        base_size = self.config.min_order_size
+        size_multiplier = min(abs(ofi) / self.config.ofi_entry_threshold, 3.0)
+        
+        position_size = int(base_size * size_multiplier)
+        position_size = min(position_size, self.config.max_order_size)
+        
+        return position_size
     
-    @property
-    def mid_price(self) -> float:
-        if self.best_bid and self.best_ask:
-            return (self.best_bid.price + self.best_ask.price) / 2.0
-        return self.last_trade_price
-    
-    @property
-    def imbalance(self) -> float:
-        """Order book imbalance: (bid_size - ask_size) / (bid_size + ask_size)."""
-        if self.best_bid and self.best_ask:
-            bid_size = self.best_bid.size
-            ask_size = self.best_ask.size
-            total_size = bid_size + ask_size
-            if total_size > 0:
-                return (bid_size - ask_size) / total_size
-        return 0.0
+    def _create_orderbook_snapshot(self, orderbook_data: Dict) -> OrderBookSnapshot:
+        """Create OrderBookSnapshot from market data"""
+        return OrderBookSnapshot(
+            timestamp=pd.Timestamp.now(),
+            bid_prices=np.array(orderbook_data.get('bid_prices', [])),
+            bid_sizes=np.array(orderbook_data.get('bid_sizes', [])),
+            ask_prices=np.array(orderbook_data.get('ask_prices', [])),
+            ask_sizes=np.array(orderbook_data.get('ask_sizes', []))
+        )
 
 
-class OrderBookImbalanceStrategy(Strategy):
-    """Strategy that trades on order book imbalances."""
+class SpreadTradingStrategy(BaseStrategy):
+    """
+    Market making strategy that provides liquidity by quoting bid and ask prices
     
-    def __init__(
-        self,
-        name: str = "OrderBookImbalance",
-        imbalance_threshold: float = 0.3,
-        min_spread_bps: float = 2.0,
-        max_spread_bps: float = 20.0,
-        hold_time_seconds: int = 5,
-        min_book_depth: int = 1000,
-    ):
-        super().__init__(name)
-        self.imbalance_threshold = imbalance_threshold
-        self.min_spread_bps = min_spread_bps
-        self.max_spread_bps = max_spread_bps
-        self.hold_time_seconds = hold_time_seconds
-        self.min_book_depth = min_book_depth
-        
-        # State tracking
-        self.order_book_history: List[OrderBookSnapshot] = []
-        self.liquidity_provider = LiquidityProvider()
-        
-        self.logger = logger.bind(strategy=name)
+    Adjusts quotes based on inventory risk and market conditions.
+    """
     
-    async def analyze(self, symbol: str, df: pd.DataFrame) -> Dict[str, Any]:
-        """Analyze order book for imbalance opportunities."""
+    def __init__(self, config: Optional[MicrostructureConfig] = None):
+        super().__init__()
+        self.config = config or MicrostructureConfig()
+        self.orderbook_features = OrderBookFeatures(max_levels=self.config.orderbook_levels)
+        self.inventory: Dict[str, int] = {}
+        self.pending_orders: Dict[str, List[Dict]] = {}
         
-        # Get current order book snapshot
-        order_book = await self._get_order_book_snapshot(symbol)
+    def calculate_quotes(self, symbol: str, market_data: Dict) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Calculate bid and ask quotes based on market conditions and inventory
         
-        if not order_book:
-            return {"signal": SignalType.HOLD.value, "confidence": 0.0}
-        
-        # Store in history
-        self.order_book_history.append(order_book)
-        
-        # Keep only recent history (last 100 snapshots)
-        if len(self.order_book_history) > 100:
-            self.order_book_history = self.order_book_history[-100:]
-        
-        # Check basic conditions
-        if not self._check_basic_conditions(order_book):
-            return {"signal": SignalType.HOLD.value, "confidence": 0.0}
-        
-        # Calculate imbalance signal
-        imbalance = order_book.imbalance
-        
-        # Generate signal based on imbalance
-        if abs(imbalance) > self.imbalance_threshold:
-            if imbalance > 0:  # More bids than asks
-                signal = SignalType.BUY.value
-                confidence = min(abs(imbalance), 1.0)
-            else:  # More asks than bids
-                signal = SignalType.SELL.value
-                confidence = min(abs(imbalance), 1.0)
+        Args:
+            symbol: Stock symbol
+            market_data: Market data including order book
             
-            # Adjust confidence based on spread quality
-            spread_bps = (order_book.spread / order_book.mid_price) * 10000
-            if spread_bps < self.min_spread_bps:
-                confidence *= 0.5  # Reduce confidence for tight spreads
-            elif spread_bps > self.max_spread_bps:
-                confidence *= 0.3  # Reduce confidence for wide spreads
+        Returns:
+            Tuple of (bid_price, ask_price)
+        """
+        if 'orderbook' not in market_data:
+            return None, None
             
-            self.logger.info(
-                "Imbalance signal generated",
-                symbol=symbol,
-                imbalance=imbalance,
-                signal=signal,
-                confidence=confidence,
-                spread_bps=spread_bps,
-            )
-            
-            return {
-                "signal": signal,
-                "confidence": confidence,
-                "imbalance": imbalance,
-                "spread_bps": spread_bps,
-                "hold_time": self.hold_time_seconds,
-                "strategy_type": MicrostructureSignal.IMBALANCE_LONG.value if signal == SignalType.BUY.value else MicrostructureSignal.IMBALANCE_SHORT.value,
-            }
+        snapshot = self._create_orderbook_snapshot(market_data['orderbook'])
+        self.orderbook_features.add_snapshot(snapshot)
         
-        return {"signal": SignalType.HOLD.value, "confidence": 0.0}
+        # Get spread metrics
+        spread_metrics = self.orderbook_features.calculate_spread_metrics()
+        spread_bps = spread_metrics['spread_pct'] * 100
+        
+        # Check if spread is within tradeable range
+        if spread_bps < self.config.min_spread_bps or spread_bps > self.config.max_spread_bps:
+            return None, None
+        
+        # Calculate base quotes
+        micro_price = self.orderbook_features.calculate_micro_price()
+        if micro_price <= 0:
+            return None, None
+            
+        offset = micro_price * (self.config.quote_offset_bps / 10000)
+        
+        # Adjust for inventory risk
+        current_inventory = self.inventory.get(symbol, 0)
+        inventory_ratio = current_inventory / self.config.max_inventory if self.config.max_inventory > 0 else 0
+        
+        # Skew quotes based on inventory
+        inventory_adjustment = inventory_ratio * self.config.inventory_skew_factor * offset
+        
+        bid_price = micro_price - offset - inventory_adjustment
+        ask_price = micro_price + offset - inventory_adjustment
+        
+        return bid_price, ask_price
     
-    async def _get_order_book_snapshot(self, symbol: str) -> Optional[OrderBookSnapshot]:
-        """Get current order book snapshot."""
+    def should_buy(self, symbol: str, current_price: float, market_data: Dict) -> Tuple[bool, Dict]:
+        """
+        Place buy order at calculated bid price
         
-        try:
-            # In production, this would connect to real market data
-            # For now, simulate order book data
+        Args:
+            symbol: Stock symbol
+            current_price: Current price
+            market_data: Market data
             
-            # Get current price from recent data
-            current_price = 100.0  # Mock price
-            
-            # Generate realistic order book
-            spread_bps = np.random.uniform(2, 10)
-            spread = current_price * spread_bps / 10000
-            
-            # Create bid/ask levels
-            bids = []
-            asks = []
-            
-            # Generate 5 levels each side
-            for i in range(5):
-                bid_price = current_price - spread/2 - i * spread * 0.5
-                ask_price = current_price + spread/2 + i * spread * 0.5
-                
-                # Size decreases with distance from mid
-                base_size = np.random.randint(500, 2000)
-                bid_size = int(base_size * (1 - i * 0.2))
-                ask_size = int(base_size * (1 - i * 0.2))
-                
-                bids.append(OrderBookLevel(bid_price, bid_size))
-                asks.append(OrderBookLevel(ask_price, ask_size))
-            
-            return OrderBookSnapshot(
-                timestamp=datetime.now(),
-                symbol=symbol,
-                bids=bids,
-                asks=asks,
-                last_trade_price=current_price,
-                last_trade_size=100,
-            )
-            
-        except Exception as e:
-            self.logger.error("Failed to get order book", symbol=symbol, error=str(e))
-            return None
-    
-    def _check_basic_conditions(self, order_book: OrderBookSnapshot) -> bool:
-        """Check basic conditions for trading."""
+        Returns:
+            Tuple of (should_buy, metadata)
+        """
+        bid_price, _ = self.calculate_quotes(symbol, market_data)
         
-        # Must have valid bid/ask
-        if not order_book.best_bid or not order_book.best_ask:
-            return False
-        
-        # Spread must be reasonable
-        spread_bps = (order_book.spread / order_book.mid_price) * 10000
-        if spread_bps < self.min_spread_bps or spread_bps > self.max_spread_bps:
-            return False
-        
-        # Must have sufficient depth
-        total_depth = order_book.best_bid.size + order_book.best_ask.size
-        if total_depth < self.min_book_depth:
-            return False
-        
-        return True
-
-
-class SpreadCaptureStrategy(Strategy):
-    """Strategy that captures bid-ask spreads through market making."""
-    
-    def __init__(
-        self,
-        name: str = "SpreadCapture",
-        min_spread_bps: float = 3.0,
-        max_position_size: int = 1000,
-        inventory_limit: int = 5000,
-        skew_factor: float = 0.1,
-    ):
-        super().__init__(name)
-        self.min_spread_bps = min_spread_bps
-        self.max_position_size = max_position_size
-        self.inventory_limit = inventory_limit
-        self.skew_factor = skew_factor
-        
-        # Inventory tracking
-        self.current_inventory = 0
-        self.target_inventory = 0
-        
-        self.logger = logger.bind(strategy=name)
-    
-    async def analyze(self, symbol: str, df: pd.DataFrame) -> Dict[str, Any]:
-        """Analyze for spread capture opportunities."""
-        
-        # Get market microstructure data
-        microstructure = await self._get_microstructure_data(symbol)
-        
-        if not microstructure:
-            return {"signal": SignalType.HOLD.value, "confidence": 0.0}
-        
-        # Check if spread is wide enough
-        if microstructure.spread_bps < self.min_spread_bps:
-            return {"signal": SignalType.HOLD.value, "confidence": 0.0}
+        if bid_price is None:
+            return False, {}
         
         # Check inventory limits
-        if abs(self.current_inventory) > self.inventory_limit:
-            # Need to reduce inventory
-            if self.current_inventory > 0:
-                return {
-                    "signal": SignalType.SELL.value,
-                    "confidence": 0.8,
-                    "strategy_type": MicrostructureSignal.SPREAD_CAPTURE.value,
-                    "reason": "inventory_reduction",
-                }
-            else:
-                return {
-                    "signal": SignalType.BUY.value,
-                    "confidence": 0.8,
-                    "strategy_type": MicrostructureSignal.SPREAD_CAPTURE.value,
-                    "reason": "inventory_reduction",
-                }
+        current_inventory = self.inventory.get(symbol, 0)
+        if current_inventory >= self.config.max_inventory:
+            return False, {'reason': 'max_inventory'}
         
-        # Calculate optimal quotes with inventory skew
-        inventory_skew = self.current_inventory * self.skew_factor / self.inventory_limit
+        # Check if our bid would be competitive
+        if 'orderbook' in market_data:
+            best_bid = market_data['orderbook'].get('best_bid', 0)
+            if bid_price < best_bid * 0.995:  # Too far from best bid
+                return False, {'reason': 'uncompetitive_bid'}
         
-        # Adjust quotes based on inventory
-        bid_adjustment = -inventory_skew * microstructure.spread / 2
-        ask_adjustment = inventory_skew * microstructure.spread / 2
-        
-        optimal_bid = microstructure.bid + bid_adjustment
-        optimal_ask = microstructure.ask + ask_adjustment
-        
-        # Determine if we should provide liquidity
-        confidence = min(microstructure.spread_bps / 10.0, 1.0)  # Higher confidence for wider spreads
-        
-        self.logger.info(
-            "Spread capture analysis",
-            symbol=symbol,
-            spread_bps=microstructure.spread_bps,
-            inventory=self.current_inventory,
-            optimal_bid=optimal_bid,
-            optimal_ask=optimal_ask,
-            confidence=confidence,
-        )
-        
-        return {
-            "signal": MicrostructureSignal.LIQUIDITY_PROVIDE.value,
-            "confidence": confidence,
-            "optimal_bid": optimal_bid,
-            "optimal_ask": optimal_ask,
-            "position_size": min(self.max_position_size, self.inventory_limit - abs(self.current_inventory)),
-            "strategy_type": MicrostructureSignal.SPREAD_CAPTURE.value,
+        metadata = {
+            'strategy': 'spread_trading',
+            'quote_type': 'bid',
+            'bid_price': bid_price,
+            'inventory': current_inventory,
+            'spread_bps': self.orderbook_features.calculate_spread_metrics()['spread_pct'] * 100
         }
+        
+        # Update inventory (simulation)
+        self.inventory[symbol] = current_inventory + self.config.min_order_size
+        
+        return True, metadata
     
-    async def _get_microstructure_data(self, symbol: str) -> Optional[MarketMicrostructure]:
-        """Get market microstructure data."""
+    def should_sell(self, symbol: str, current_price: float, market_data: Dict) -> Tuple[bool, Dict]:
+        """
+        Place sell order at calculated ask price
         
-        try:
-            # Mock microstructure data
-            bid = 99.95
-            ask = 100.05
-            spread = ask - bid
-            mid_price = (bid + ask) / 2
-            spread_bps = (spread / mid_price) * 10000
+        Args:
+            symbol: Stock symbol
+            current_price: Current price
+            market_data: Market data
             
-            return MarketMicrostructure(
-                bid=bid,
-                ask=ask,
-                bid_size=1500,
-                ask_size=1200,
-                spread=spread,
-                spread_bps=spread_bps,
-                mid_price=mid_price,
-                imbalance=0.1,  # Slight bid imbalance
-                depth={"bids": [(99.95, 1500), (99.94, 1000)], "asks": [(100.05, 1200), (100.06, 800)]},
-            )
-            
-        except Exception as e:
-            self.logger.error("Failed to get microstructure data", symbol=symbol, error=str(e))
-            return None
+        Returns:
+            Tuple of (should_sell, metadata)
+        """
+        _, ask_price = self.calculate_quotes(symbol, market_data)
+        
+        if ask_price is None:
+            return False, {}
+        
+        # Check inventory
+        current_inventory = self.inventory.get(symbol, 0)
+        if current_inventory <= -self.config.max_inventory:
+            return False, {'reason': 'max_short_inventory'}
+        
+        # Check if our ask would be competitive
+        if 'orderbook' in market_data:
+            best_ask = market_data['orderbook'].get('best_ask', float('inf'))
+            if ask_price > best_ask * 1.005:  # Too far from best ask
+                return False, {'reason': 'uncompetitive_ask'}
+        
+        metadata = {
+            'strategy': 'spread_trading',
+            'quote_type': 'ask',
+            'ask_price': ask_price,
+            'inventory': current_inventory,
+            'spread_bps': self.orderbook_features.calculate_spread_metrics()['spread_pct'] * 100
+        }
+        
+        # Update inventory (simulation)
+        self.inventory[symbol] = current_inventory - self.config.min_order_size
+        
+        return True, metadata
     
-    def update_inventory(self, trade_quantity: int, trade_side: str) -> None:
-        """Update inventory after a trade."""
+    def calculate_position_size(self, symbol: str, current_price: float,
+                              capital: float, market_data: Dict) -> int:
+        """Calculate order size based on spread and liquidity"""
+        liquidity_metrics = self.orderbook_features.calculate_liquidity_metrics()
         
-        if trade_side.upper() == "BUY":
-            self.current_inventory += trade_quantity
-        else:
-            self.current_inventory -= trade_quantity
+        # Scale size with market depth
+        depth_ratio = min(liquidity_metrics['total_depth'] / 1000, 1.0)
+        size = int(self.config.min_order_size * (1 + depth_ratio))
         
-        self.logger.info(
-            "Inventory updated",
-            trade_quantity=trade_quantity,
-            trade_side=trade_side,
-            new_inventory=self.current_inventory,
+        return min(size, self.config.max_order_size)
+    
+    def _create_orderbook_snapshot(self, orderbook_data: Dict) -> OrderBookSnapshot:
+        """Create OrderBookSnapshot from market data"""
+        return OrderBookSnapshot(
+            timestamp=pd.Timestamp.now(),
+            bid_prices=np.array(orderbook_data.get('bid_prices', [])),
+            bid_sizes=np.array(orderbook_data.get('bid_sizes', [])),
+            ask_prices=np.array(orderbook_data.get('ask_prices', [])),
+            ask_sizes=np.array(orderbook_data.get('ask_sizes', []))
         )
 
 
-class MicroMomentumStrategy(Strategy):
-    """Sub-second momentum strategy based on tick data."""
+class TickMomentumStrategy(BaseStrategy):
+    """
+    High-frequency momentum strategy based on tick-level price movements
     
-    def __init__(
-        self,
-        name: str = "MicroMomentum",
-        lookback_ticks: int = 10,
-        momentum_threshold: float = 0.0002,  # 2 bps
-        max_hold_seconds: int = 30,
-        volume_threshold: int = 1000,
-    ):
-        super().__init__(name)
-        self.lookback_ticks = lookback_ticks
-        self.momentum_threshold = momentum_threshold
-        self.max_hold_seconds = max_hold_seconds
-        self.volume_threshold = volume_threshold
-        
-        # Tick data storage
-        self.tick_data: List[Dict[str, Any]] = []
-        
-        self.logger = logger.bind(strategy=name)
+    Detects and trades short-term momentum in tick data.
+    """
     
-    async def analyze(self, symbol: str, df: pd.DataFrame) -> Dict[str, Any]:
-        """Analyze micro momentum from tick data."""
+    def __init__(self, config: Optional[MicrostructureConfig] = None):
+        super().__init__()
+        self.config = config or MicrostructureConfig()
+        self.orderbook_features = OrderBookFeatures(max_levels=self.config.orderbook_levels)
+        self.tick_history: Dict[str, List[float]] = {}
+        self.positions: Dict[str, int] = {}
+        self.entry_times: Dict[str, datetime] = {}
         
-        # Get latest tick data
-        tick = await self._get_latest_tick(symbol)
+    def should_buy(self, symbol: str, current_price: float, market_data: Dict) -> Tuple[bool, Dict]:
+        """
+        Buy when detecting upward tick momentum
         
-        if not tick:
-            return {"signal": SignalType.HOLD.value, "confidence": 0.0}
-        
-        # Store tick data
-        self.tick_data.append(tick)
+        Args:
+            symbol: Stock symbol
+            current_price: Current price
+            market_data: Market data
+            
+        Returns:
+            Tuple of (should_buy, metadata)
+        """
+        # Update tick history
+        if symbol not in self.tick_history:
+            self.tick_history[symbol] = []
+        self.tick_history[symbol].append(current_price)
         
         # Keep only recent ticks
-        if len(self.tick_data) > self.lookback_ticks * 2:
-            self.tick_data = self.tick_data[-self.lookback_ticks * 2:]
+        if len(self.tick_history[symbol]) > self.config.tick_window:
+            self.tick_history[symbol].pop(0)
         
-        # Need sufficient history
-        if len(self.tick_data) < self.lookback_ticks:
-            return {"signal": SignalType.HOLD.value, "confidence": 0.0}
+        # Need enough history
+        if len(self.tick_history[symbol]) < self.config.tick_window:
+            return False, {'reason': 'insufficient_history'}
         
-        # Calculate micro momentum
-        recent_ticks = self.tick_data[-self.lookback_ticks:]
+        # Update order book features if available
+        if 'orderbook' in market_data:
+            snapshot = self._create_orderbook_snapshot(market_data['orderbook'])
+            self.orderbook_features.add_snapshot(snapshot)
         
-        # Price momentum
-        price_changes = []
-        volume_weighted_changes = []
+        # Calculate tick momentum
+        tick_direction = self.orderbook_features.calculate_tick_direction(self.config.tick_window)
         
-        for i in range(1, len(recent_ticks)):
-            price_change = (recent_ticks[i]["price"] - recent_ticks[i-1]["price"]) / recent_ticks[i-1]["price"]
-            volume = recent_ticks[i]["volume"]
-            
-            price_changes.append(price_change)
-            volume_weighted_changes.append(price_change * volume)
+        # Calculate price momentum
+        ticks = self.tick_history[symbol]
+        returns = [(ticks[i] - ticks[i-1]) / ticks[i-1] for i in range(1, len(ticks))]
+        momentum = np.mean(returns) * 10000  # Convert to basis points
         
-        if not price_changes:
-            return {"signal": SignalType.HOLD.value, "confidence": 0.0}
+        # Check for strong upward momentum
+        should_buy = (
+            tick_direction > self.config.tick_threshold and
+            momentum > 1.0 and  # Positive momentum in bps
+            symbol not in self.positions  # Not already in position
+        )
         
-        # Calculate momentum metrics
-        momentum = np.mean(price_changes)
-        volume_weighted_momentum = np.sum(volume_weighted_changes) / np.sum([t["volume"] for t in recent_ticks])
-        momentum_consistency = np.mean([1 if pc * momentum > 0 else 0 for pc in price_changes])
+        metadata = {
+            'strategy': 'tick_momentum',
+            'tick_direction': tick_direction,
+            'momentum_bps': momentum,
+            'signal_strength': tick_direction * abs(momentum)
+        }
         
-        # Check volume threshold
-        recent_volume = np.sum([t["volume"] for t in recent_ticks[-3:]])  # Last 3 ticks
-        if recent_volume < self.volume_threshold:
-            return {"signal": SignalType.HOLD.value, "confidence": 0.0}
+        if should_buy:
+            self.positions[symbol] = self.config.min_order_size
+            self.entry_times[symbol] = datetime.now()
+            logger.info(f"Tick momentum buy for {symbol}: Direction={tick_direction:.3f}, Momentum={momentum:.1f}bps")
         
-        # Generate signal
-        if abs(momentum) > self.momentum_threshold and momentum_consistency > 0.6:
-            signal = SignalType.BUY.value if momentum > 0 else SignalType.SELL.value
-            confidence = min(abs(momentum) / self.momentum_threshold * momentum_consistency, 1.0)
-            
-            self.logger.info(
-                "Micro momentum signal",
-                symbol=symbol,
-                momentum=momentum,
-                volume_weighted_momentum=volume_weighted_momentum,
-                consistency=momentum_consistency,
-                signal=signal,
-                confidence=confidence,
-            )
-            
-            return {
-                "signal": signal,
-                "confidence": confidence,
-                "momentum": momentum,
-                "volume_weighted_momentum": volume_weighted_momentum,
-                "consistency": momentum_consistency,
-                "hold_time": self.max_hold_seconds,
-                "strategy_type": MicrostructureSignal.MOMENTUM_MICRO.value,
-            }
-        
-        return {"signal": SignalType.HOLD.value, "confidence": 0.0}
+        return should_buy, metadata
     
-    async def _get_latest_tick(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Get latest tick data."""
+    def should_sell(self, symbol: str, current_price: float, market_data: Dict) -> Tuple[bool, Dict]:
+        """
+        Sell when momentum reverses or after holding period
         
-        try:
-            # Mock tick data
-            base_price = 100.0
-            if self.tick_data:
-                base_price = self.tick_data[-1]["price"]
+        Args:
+            symbol: Stock symbol
+            current_price: Current price
+            market_data: Market data
             
-            # Generate realistic tick
-            price_change = np.random.normal(0, 0.0001)  # Small random walk
-            new_price = base_price * (1 + price_change)
-            volume = np.random.randint(100, 1000)
-            
-            return {
-                "timestamp": datetime.now(),
-                "symbol": symbol,
-                "price": new_price,
-                "volume": volume,
-                "side": "BUY" if price_change > 0 else "SELL",
-            }
-            
-        except Exception as e:
-            self.logger.error("Failed to get tick data", symbol=symbol, error=str(e))
-            return None
+        Returns:
+            Tuple of (should_sell, metadata)
+        """
+        if symbol not in self.positions:
+            return False, {}
+        
+        # Update order book features if available
+        if 'orderbook' in market_data:
+            snapshot = self._create_orderbook_snapshot(market_data['orderbook'])
+            self.orderbook_features.add_snapshot(snapshot)
+        
+        # Calculate current momentum
+        tick_direction = self.orderbook_features.calculate_tick_direction(self.config.tick_window)
+        
+        if symbol in self.tick_history and len(self.tick_history[symbol]) >= 2:
+            ticks = self.tick_history[symbol]
+            recent_return = (ticks[-1] - ticks[-2]) / ticks[-2] * 10000
+        else:
+            recent_return = 0
+        
+        # Check holding period (high-frequency exit)
+        holding_time = (datetime.now() - self.entry_times.get(symbol, datetime.now())).total_seconds()
+        
+        # Exit conditions
+        should_sell = (
+            tick_direction < -self.config.tick_threshold * 0.5 or  # Momentum reversal
+            recent_return < -self.config.stop_loss_bps or  # Stop loss
+            recent_return > self.config.take_profit_bps or  # Take profit
+            holding_time > 60  # Max holding time of 60 seconds for HFT
+        )
+        
+        exit_reason = None
+        if tick_direction < -self.config.tick_threshold * 0.5:
+            exit_reason = 'momentum_reversal'
+        elif recent_return < -self.config.stop_loss_bps:
+            exit_reason = 'stop_loss'
+        elif recent_return > self.config.take_profit_bps:
+            exit_reason = 'take_profit'
+        elif holding_time > 60:
+            exit_reason = 'max_holding_time'
+        
+        metadata = {
+            'strategy': 'tick_momentum',
+            'tick_direction': tick_direction,
+            'recent_return_bps': recent_return,
+            'holding_time_seconds': holding_time,
+            'exit_reason': exit_reason
+        }
+        
+        if should_sell:
+            logger.info(f"Tick momentum sell for {symbol}: Reason={exit_reason}, Return={recent_return:.1f}bps")
+            del self.positions[symbol]
+            if symbol in self.entry_times:
+                del self.entry_times[symbol]
+        
+        return should_sell, metadata
+    
+    def calculate_position_size(self, symbol: str, current_price: float,
+                              capital: float, market_data: Dict) -> int:
+        """Calculate position size based on momentum strength"""
+        tick_direction = self.orderbook_features.calculate_tick_direction(self.config.tick_window)
+        
+        # Scale with momentum strength
+        strength_ratio = min(abs(tick_direction) / self.config.tick_threshold, 2.0)
+        size = int(self.config.min_order_size * strength_ratio)
+        
+        return min(size, self.config.max_order_size)
+    
+    def _create_orderbook_snapshot(self, orderbook_data: Dict) -> OrderBookSnapshot:
+        """Create OrderBookSnapshot from market data"""
+        return OrderBookSnapshot(
+            timestamp=pd.Timestamp.now(),
+            bid_prices=np.array(orderbook_data.get('bid_prices', [])),
+            bid_sizes=np.array(orderbook_data.get('bid_sizes', [])),
+            ask_prices=np.array(orderbook_data.get('ask_prices', [])),
+            ask_sizes=np.array(orderbook_data.get('ask_sizes', []))
+        )
 
 
-def create_microstructure_strategies() -> List[Strategy]:
-    """Create a suite of microstructure strategies."""
+class MicrostructureEnsembleStrategy(BaseStrategy):
+    """
+    Ensemble strategy combining multiple microstructure signals
     
-    strategies = [
-        OrderBookImbalanceStrategy(
-            name="OrderBookImbalance_Aggressive",
-            imbalance_threshold=0.2,
-            min_spread_bps=2.0,
-            max_spread_bps=15.0,
-            hold_time_seconds=3,
-        ),
-        OrderBookImbalanceStrategy(
-            name="OrderBookImbalance_Conservative", 
-            imbalance_threshold=0.4,
-            min_spread_bps=3.0,
-            max_spread_bps=10.0,
-            hold_time_seconds=10,
-        ),
-        SpreadCaptureStrategy(
-            name="SpreadCapture_Small",
-            min_spread_bps=3.0,
-            max_position_size=500,
-            inventory_limit=2500,
-        ),
-        SpreadCaptureStrategy(
-            name="SpreadCapture_Large",
-            min_spread_bps=5.0,
-            max_position_size=2000,
-            inventory_limit=10000,
-        ),
-        MicroMomentumStrategy(
-            name="MicroMomentum_Fast",
-            lookback_ticks=5,
-            momentum_threshold=0.0001,
-            max_hold_seconds=15,
-        ),
-        MicroMomentumStrategy(
-            name="MicroMomentum_Slow",
-            lookback_ticks=20,
-            momentum_threshold=0.0003,
-            max_hold_seconds=60,
-        ),
-    ]
+    Combines order flow imbalance, spread trading, and tick momentum strategies.
+    """
     
-    return strategies
+    def __init__(self, config: Optional[MicrostructureConfig] = None):
+        super().__init__()
+        self.config = config or MicrostructureConfig()
+        
+        # Initialize sub-strategies
+        self.ofi_strategy = OrderFlowImbalanceStrategy(config)
+        self.spread_strategy = SpreadTradingStrategy(config)
+        self.tick_strategy = TickMomentumStrategy(config)
+        
+        # Ensemble weights
+        self.weights = {
+            'ofi': 0.4,
+            'spread': 0.3,
+            'tick': 0.3
+        }
+        
+    def should_buy(self, symbol: str, current_price: float, market_data: Dict) -> Tuple[bool, Dict]:
+        """
+        Combine signals from all strategies
+        
+        Args:
+            symbol: Stock symbol
+            current_price: Current price
+            market_data: Market data
+            
+        Returns:
+            Tuple of (should_buy, metadata)
+        """
+        # Get signals from each strategy
+        ofi_signal, ofi_meta = self.ofi_strategy.should_buy(symbol, current_price, market_data)
+        spread_signal, spread_meta = self.spread_strategy.should_buy(symbol, current_price, market_data)
+        tick_signal, tick_meta = self.tick_strategy.should_buy(symbol, current_price, market_data)
+        
+        # Calculate weighted ensemble score
+        ensemble_score = (
+            self.weights['ofi'] * float(ofi_signal) +
+            self.weights['spread'] * float(spread_signal) +
+            self.weights['tick'] * float(tick_signal)
+        )
+        
+        # Buy if ensemble score exceeds threshold
+        should_buy = ensemble_score >= 0.5
+        
+        metadata = {
+            'strategy': 'microstructure_ensemble',
+            'ensemble_score': ensemble_score,
+            'ofi_signal': ofi_signal,
+            'spread_signal': spread_signal,
+            'tick_signal': tick_signal,
+            'sub_strategies': {
+                'ofi': ofi_meta,
+                'spread': spread_meta,
+                'tick': tick_meta
+            }
+        }
+        
+        return should_buy, metadata
+    
+    def should_sell(self, symbol: str, current_price: float, market_data: Dict) -> Tuple[bool, Dict]:
+        """
+        Combine sell signals from all strategies
+        
+        Args:
+            symbol: Stock symbol
+            current_price: Current price
+            market_data: Market data
+            
+        Returns:
+            Tuple of (should_sell, metadata)
+        """
+        # Get signals from each strategy
+        ofi_signal, ofi_meta = self.ofi_strategy.should_sell(symbol, current_price, market_data)
+        spread_signal, spread_meta = self.spread_strategy.should_sell(symbol, current_price, market_data)
+        tick_signal, tick_meta = self.tick_strategy.should_sell(symbol, current_price, market_data)
+        
+        # Calculate weighted ensemble score
+        ensemble_score = (
+            self.weights['ofi'] * float(ofi_signal) +
+            self.weights['spread'] * float(spread_signal) +
+            self.weights['tick'] * float(tick_signal)
+        )
+        
+        # Sell if ensemble score exceeds threshold
+        should_sell = ensemble_score >= 0.5
+        
+        metadata = {
+            'strategy': 'microstructure_ensemble',
+            'ensemble_score': ensemble_score,
+            'ofi_signal': ofi_signal,
+            'spread_signal': spread_signal,
+            'tick_signal': tick_signal,
+            'sub_strategies': {
+                'ofi': ofi_meta,
+                'spread': spread_meta,
+                'tick': tick_meta
+            }
+        }
+        
+        return should_sell, metadata
+    
+    def calculate_position_size(self, symbol: str, current_price: float,
+                              capital: float, market_data: Dict) -> int:
+        """Calculate position size as weighted average of sub-strategies"""
+        ofi_size = self.ofi_strategy.calculate_position_size(symbol, current_price, capital, market_data)
+        spread_size = self.spread_strategy.calculate_position_size(symbol, current_price, capital, market_data)
+        tick_size = self.tick_strategy.calculate_position_size(symbol, current_price, capital, market_data)
+        
+        weighted_size = int(
+            self.weights['ofi'] * ofi_size +
+            self.weights['spread'] * spread_size +
+            self.weights['tick'] * tick_size
+        )
+        
+        return min(weighted_size, self.config.max_order_size)
