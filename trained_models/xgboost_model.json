@@ -1,6 +1,6 @@
 {
   "model_type": "xgboost",
-  "trained_at": "2025-08-29T14:14:09.077314",
+  "trained_at": "2025-09-01T09:54:40.656998",
   "symbols": [
     "SPY",
     "QQQ",
@@ -76,5 +76,5 @@
   ],
   "train_samples": 19421,
   "test_samples": 4856,
-  "test_score": 0.5271828665568369
+  "test_score": 0.524505766062603
 }

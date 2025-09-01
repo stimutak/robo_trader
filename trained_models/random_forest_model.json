@@ -1,6 +1,6 @@
 {
   "model_type": "random_forest",
-  "trained_at": "2025-08-29T14:14:09.077087",
+  "trained_at": "2025-09-01T09:54:40.656512",
   "symbols": [
     "SPY",
     "QQQ",
@@ -76,5 +76,5 @@
   ],
   "train_samples": 19421,
   "test_samples": 4856,
-  "test_score": 0.5236820428336079
+  "test_score": 0.5253294892915981
 }
