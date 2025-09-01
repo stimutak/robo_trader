@@ -482,8 +482,8 @@ HTML_TEMPLATE = '''
                     <div>
                         <div style="font-size: 14px; color: #888; margin-bottom: 8px;">Active Positions</div>
                         <div style="font-size: 32px; font-weight: 600; color: #fff;" id="active-positions-large">5</div>
-                        <div style="font-size: 14px; color: #666; margin-top: 5px;">
-                            <span id="positions-pnl">+$1,612.30</span> unrealized
+                        <div style="font-size: 14px; color: #666; margin-top: 5px;" id="positions-value-text">
+                            Monitoring 5 symbols
                         </div>
                     </div>
                 </div>
@@ -1395,6 +1395,9 @@ HTML_TEMPLATE = '''
                 const value = pos.current_price * pos.quantity;
                 totalValue += value;
                 
+                // Add pnl to position object for later use
+                pos.pnl = pnl;
+                
                 return `
                     <tr>
                         <td>${pos.symbol}</td>
@@ -1414,10 +1417,21 @@ HTML_TEMPLATE = '''
             
             // Update portfolio summary
             document.getElementById('active-positions-large').textContent = positions.length.toString();
-            const unrealizedPnl = positions.reduce((sum, pos) => sum + pos.pnl, 0);
-            const pnlEl = document.getElementById('positions-pnl');
-            pnlEl.textContent = `${unrealizedPnl >= 0 ? '+' : ''}${formatCurrency(unrealizedPnl)}`;
-            pnlEl.style.color = unrealizedPnl >= 0 ? '#44ff44' : '#ff4444';
+            // Update position text with actual symbols or total value
+            const posTextEl = document.getElementById('positions-value-text');
+            if (posTextEl) {
+                if (positions.length === 0) {
+                    posTextEl.textContent = 'No open positions';
+                } else if (positions.length <= 4) {
+                    // Show actual symbols if 4 or fewer
+                    const symbols = positions.map(p => p.symbol).join(', ');
+                    posTextEl.textContent = symbols;
+                } else {
+                    // Show total position value for many positions
+                    const totalPositionValue = positions.reduce((sum, p) => sum + (p.current_price * p.quantity), 0);
+                    posTextEl.textContent = `${formatCurrency(totalPositionValue)} deployed`;
+                }
+            }
         }
         
         function updatePerformanceTable(data) {
@@ -2212,12 +2226,19 @@ def ml_status():
         'xgboost': {'name': 'XGBoost', 'accuracy': 0.525, 'count': 0},
         'lightgbm': {'name': 'LightGBM', 'accuracy': 0.518, 'count': 0},
         'improved': {'name': 'Improved RF', 'accuracy': 0.553, 'count': 0},
+        'high_accuracy': {'name': 'High Accuracy XGB', 'accuracy': 0.562, 'count': 0},
         'ensemble': {'name': 'Ensemble', 'accuracy': 0.485, 'count': 0}
     }
     
     latest_models = {}
     for model_file in model_files:
-        model_type = model_file.stem.split('_')[0].lower()
+        # Handle both "high_accuracy" and single word model types
+        stem_parts = model_file.stem.split('_')
+        if stem_parts[0].lower() == 'high' and len(stem_parts) > 1:
+            model_type = 'high_accuracy'
+        else:
+            model_type = stem_parts[0].lower()
+        
         if model_type in model_info:
             model_info[model_type]['count'] += 1
             if model_type not in latest_models or model_file.stat().st_mtime > latest_models[model_type]['mtime']:
