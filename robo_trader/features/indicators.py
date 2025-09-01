@@ -161,10 +161,14 @@ class TechnicalIndicators:
             return None
 
     def bollinger_bands(
+<<<<<<< HEAD
         self,
         prices: pd.Series,
         period: Optional[int] = None,
         std_dev: Optional[float] = None,
+=======
+        self, prices: pd.Series, period: Optional[int] = None, std_dev: Optional[float] = None
+>>>>>>> efficiency-improvements-reviewed
     ) -> Optional[Dict[str, float]]:
         """Bollinger Bands."""
         try:
@@ -221,10 +225,14 @@ class TechnicalIndicators:
             return None
 
     def stochastic(
+<<<<<<< HEAD
         self,
         df: pd.DataFrame,
         k_period: Optional[int] = None,
         d_period: Optional[int] = None,
+=======
+        self, df: pd.DataFrame, k_period: Optional[int] = None, d_period: Optional[int] = None
+>>>>>>> efficiency-improvements-reviewed
     ) -> Optional[Dict[str, float]]:
         """Stochastic Oscillator."""
         try:
@@ -251,22 +259,23 @@ class TechnicalIndicators:
     # Volume-based indicators
 
     def obv(self, df: pd.DataFrame) -> Optional[float]:
-        """On-Balance Volume."""
+        """On-Balance Volume - Vectorized implementation."""
         try:
             if len(df) < 2:
                 return None
 
-            # Calculate OBV
-            obv = pd.Series(index=df.index, dtype=float)
-            obv.iloc[0] = df["volume"].iloc[0]
+            # Calculate price changes
+            price_changes = df["close"].diff()
 
-            for i in range(1, len(df)):
-                if df["close"].iloc[i] > df["close"].iloc[i - 1]:
-                    obv.iloc[i] = obv.iloc[i - 1] + df["volume"].iloc[i]
-                elif df["close"].iloc[i] < df["close"].iloc[i - 1]:
-                    obv.iloc[i] = obv.iloc[i - 1] - df["volume"].iloc[i]
-                else:
-                    obv.iloc[i] = obv.iloc[i - 1]
+            volume_direction = pd.Series(0, index=df.index, dtype=int)
+            volume_direction[price_changes > 0] = 1
+            volume_direction[price_changes < 0] = -1
+
+            # Calculate OBV as cumulative sum of directed volume
+            directed_volume = df["volume"] * volume_direction
+            directed_volume.iloc[0] = df["volume"].iloc[0]
+
+            obv = directed_volume.cumsum()
 
             return obv.iloc[-1]
 
@@ -396,12 +405,19 @@ class TechnicalIndicators:
             down_move = df["low"].shift() - df["low"]
 
             pos_dm = pd.Series(
+<<<<<<< HEAD
                 np.where((up_move > down_move) & (up_move > 0), up_move, 0),
                 index=df.index,
             )
             neg_dm = pd.Series(
                 np.where((down_move > up_move) & (down_move > 0), down_move, 0),
                 index=df.index,
+=======
+                np.where((up_move > down_move) & (up_move > 0), up_move, 0), index=df.index
+            )
+            neg_dm = pd.Series(
+                np.where((down_move > up_move) & (down_move > 0), down_move, 0), index=df.index
+>>>>>>> efficiency-improvements-reviewed
             )
 
             # Calculate directional indicators
@@ -513,6 +529,7 @@ class TechnicalIndicators:
             s2 = pivot - (high - low)
             s3 = low - 2 * (high - pivot)
 
+<<<<<<< HEAD
             return {
                 "pivot": pivot,
                 "r1": r1,
@@ -522,6 +539,9 @@ class TechnicalIndicators:
                 "s2": s2,
                 "s3": s3,
             }
+=======
+            return {"pivot": pivot, "r1": r1, "r2": r2, "r3": r3, "s1": s1, "s2": s2, "s3": s3}
+>>>>>>> efficiency-improvements-reviewed
 
         except Exception:
             return None
