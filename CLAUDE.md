@@ -4,10 +4,10 @@
 **IMPORTANT:** The authoritative phase plan is in `IMPLEMENTATION_PLAN.md`. This is the ML-focused 4-phase plan over 16 weeks:
 - Phase 1: Foundation & Quick Wins (Tasks F1-F5) - COMPLETE ✅
 - Phase 2: ML Infrastructure & Backtesting (Tasks M1-M5) - COMPLETE ✅
-- Phase 3: Advanced Strategy Development (Tasks S1-S5) - STARTING 🚧
+- Phase 3: Advanced Strategy Development (Tasks S1-S5) - IN PROGRESS 🚧
 - Phase 4: Production Hardening & Deployment (Tasks P1-P6)
 
-**Current Status:** Phase 2 COMPLETE ✅ - All 5 tasks done (M1-M5). Phase 3 starting.
+**Current Status:** Phase 3 IN PROGRESS - S1-S4 COMPLETE ✅ (80%), S5 remaining.
 
 **Note:** The older 9-phase plan in `archived_plans/PROJECT_PLAN_9PHASE.md` is deprecated and should NOT be used. Any references to "Phase 5", "Phase 6" etc. from older commits refer to the old plan and should be ignored.
 
