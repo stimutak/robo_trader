@@ -391,6 +391,50 @@ HTML_TEMPLATE = '''
             font-size: 18px;
             font-weight: 600;
         }
+
+        .metric-value.negative { color: #ff4444; }
+        .metric-subtitle { font-size: 0.8em; color: #888; margin-top: 5px; }
+
+        /* Performance Summary Cards */
+        .summary-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .summary-card {
+            background: #2a2a2a;
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+            border-left: 4px solid #667eea;
+        }
+
+        .summary-card h3 {
+            margin: 0 0 10px 0;
+            font-size: 0.9em;
+            color: #ccc;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .summary-card .metric-value {
+            font-size: 2em;
+            font-weight: bold;
+            color: #44ff44;
+            margin: 10px 0;
+        }
+
+        .summary-card .metric-value.negative {
+            color: #ff4444;
+        }
+
+        .summary-card .metric-subtitle {
+            font-size: 0.8em;
+            color: #888;
+            margin-top: 5px;
+        }
         
         .badge {
             display: inline-block;
@@ -626,7 +670,32 @@ HTML_TEMPLATE = '''
         </div>
         
         <div id="performance-tab" class="tab-content" style="display: none;">
+            <!-- Performance Summary Cards -->
+            <div class="summary-cards">
+                <div class="summary-card">
+                    <h3>Total Return</h3>
+                    <div class="metric-value" id="total-return">+15.2%</div>
+                    <div class="metric-subtitle">All Time</div>
+                </div>
+                <div class="summary-card">
+                    <h3>Sharpe Ratio</h3>
+                    <div class="metric-value" id="total-sharpe">1.42</div>
+                    <div class="metric-subtitle">Risk-Adjusted</div>
+                </div>
+                <div class="summary-card">
+                    <h3>Max Drawdown</h3>
+                    <div class="metric-value negative" id="total-drawdown">-8.3%</div>
+                    <div class="metric-subtitle">Peak to Trough</div>
+                </div>
+                <div class="summary-card">
+                    <h3>Win Rate</h3>
+                    <div class="metric-value" id="win-rate">67.5%</div>
+                    <div class="metric-subtitle">Profitable Trades</div>
+                </div>
+            </div>
+
             <div class="table-container">
+                <h3>Performance Breakdown</h3>
                 <table>
                     <thead>
                         <tr>
@@ -1472,7 +1541,17 @@ HTML_TEMPLATE = '''
         
         function updatePerformanceTable(data) {
             if (!data) return;
-            
+
+            // Update summary cards
+            if (data.summary) {
+                const summary = data.summary;
+                document.getElementById('total-return').textContent = formatPercent(summary.total_return);
+                document.getElementById('total-sharpe').textContent = (summary.total_sharpe || 0).toFixed(2);
+                document.getElementById('total-drawdown').textContent = formatPercent(summary.total_drawdown);
+                document.getElementById('win-rate').textContent = formatPercent(summary.win_rate);
+            }
+
+            // Update performance table
             ['daily', 'weekly', 'monthly', 'all'].forEach(period => {
                 const metrics = data[period] || {};
                 document.getElementById(`return-${period}`).textContent = formatPercent(metrics.return_pct);
@@ -1752,6 +1831,30 @@ def favicon():
 def health():
     """Health check endpoint"""
     return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
+
+@app.route('/api/database/health')
+@requires_auth
+def database_health():
+    """Check database health and connectivity"""
+    try:
+        from sync_db_reader import SyncDatabaseReader
+        db = SyncDatabaseReader()
+
+        # Simple health check query
+        result = db._fetch_one("SELECT COUNT(*) as count FROM sqlite_master WHERE type='table'")
+        table_count = result['count'] if result else 0
+
+        return jsonify({
+            'status': 'healthy',
+            'table_count': table_count,
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e),
+            'timestamp': datetime.now().isoformat()
+        }), 500
 
 @app.route('/api/market/status')
 @requires_auth
@@ -2149,49 +2252,68 @@ def get_pnl_OLD():
         return jsonify(pnl)  # Return default on error
 
 @app.route('/api/positions')
-@requires_auth  
+@requires_auth
 def get_positions():
     """Get current positions from real database"""
     try:
         from sync_db_reader import SyncDatabaseReader
         db = SyncDatabaseReader()
         real_positions = db.get_positions()
-        
+
         # Get latest market data for each position
         enriched_positions = []
-        
+
         # Sample price variations for P&L display (simulate market movement)
         import random
         random.seed(42)  # Consistent random for same symbols
-        
+
         for pos in real_positions:
             # Get latest price from market data
-            market_data = db.get_latest_market_data(pos['symbol'], limit=1)
-            
-            if market_data:
-                current_price = market_data[0]['close']
-            else:
-                # Simulate price movement: +/- 5% from avg_cost
-                avg_cost = pos.get('avg_cost', 100)
-                random.seed(hash(pos['symbol']) % 1000)  # Consistent per symbol
-                variation = random.uniform(-0.05, 0.05)
-                current_price = avg_cost * (1 + variation)
-            
+            try:
+                market_data = db.get_latest_market_data(pos['symbol'], limit=1)
+
+                if market_data:
+                    current_price = market_data[0]['close']
+                else:
+                    # Simulate price movement: +/- 5% from avg_cost
+                    avg_cost = pos.get('avg_cost', 100)
+                    random.seed(hash(pos['symbol']) % 1000)  # Consistent per symbol
+                    variation = random.uniform(-0.05, 0.05)
+                    current_price = avg_cost * (1 + variation)
+            except Exception:
+                # Fallback to avg_cost if market data fails
+                current_price = pos.get('avg_cost', 100)
+
             # Get latest signal
-            signals = db.get_signals(hours=1)
-            pos_signals = [s for s in signals if s['symbol'] == pos['symbol']]
-            ml_signal = pos_signals[0]['signal_type'] if pos_signals else 'hold'
-            
+            try:
+                signals = db.get_signals(hours=1)
+                pos_signals = [s for s in signals if s['symbol'] == pos['symbol']]
+                ml_signal = pos_signals[0]['signal_type'] if pos_signals else 'hold'
+            except Exception:
+                ml_signal = 'hold'
+
+            # Calculate P&L
+            entry_price = pos.get('avg_cost', current_price)
+            quantity = pos['quantity']
+            market_value = current_price * quantity
+            unrealized_pnl = (current_price - entry_price) * quantity
+            unrealized_pnl_pct = (unrealized_pnl / (entry_price * abs(quantity))) * 100 if entry_price > 0 else 0
+
             enriched_positions.append({
                 'symbol': pos['symbol'],
-                'quantity': pos['quantity'],
-                'entry_price': pos.get('avg_cost', 0),
+                'quantity': quantity,
+                'entry_price': entry_price,
                 'current_price': round(current_price, 2),
+                'market_value': round(market_value, 2),
+                'unrealized_pnl': round(unrealized_pnl, 2),
+                'unrealized_pnl_pct': round(unrealized_pnl_pct, 2),
+                'side': 'long' if quantity > 0 else 'short',
+                'entry_time': pos.get('timestamp', ''),
+                'strategy': 'Unknown',
                 'ml_signal': ml_signal
             })
-        
-        if enriched_positions:
-            return jsonify({'positions': enriched_positions})
+
+        return jsonify({'positions': enriched_positions})
     except Exception as e:
         logger.error(f"Error fetching real positions: {e}")
     
@@ -2354,6 +2476,12 @@ def performance():
     """Get performance metrics"""
     # Mock data - will integrate with PerformanceAnalyzer
     return jsonify({
+        'summary': {
+            'total_return': 0.152,
+            'total_sharpe': 1.42,
+            'total_drawdown': -0.083,
+            'win_rate': 0.675
+        },
         'daily': {
             'return_pct': 0.0125,
             'volatility': 0.18,
@@ -2387,6 +2515,10 @@ def get_trades():
     try:
         from sync_db_reader import SyncDatabaseReader
         db = SyncDatabaseReader()
+
+        # Get trades with optional filtering
+        days = request.args.get('days', 30, type=int)
+        trades = db.get_trades(days=days)
         
         # Get trades with optional filtering
         days = request.args.get('days', 30, type=int)
