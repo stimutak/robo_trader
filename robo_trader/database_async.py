@@ -34,6 +34,16 @@ class AsyncTradingDatabase:
         self._available: asyncio.Queue = asyncio.Queue(maxsize=pool_size)
         self._initialized = False
         self._lock = asyncio.Lock()
+        self._closed = False
+
+    async def __aenter__(self):
+        """Async context manager entry."""
+        await self.initialize()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit."""
+        await self.close()
 
     async def initialize(self):
         """Initialize database and connection pool."""
@@ -48,6 +58,7 @@ class AsyncTradingDatabase:
             for _ in range(self.pool_size):
                 conn = await aiosqlite.connect(self.db_path)
                 await conn.execute("PRAGMA journal_mode=WAL")  # Better concurrent access
+                await conn.execute("PRAGMA busy_timeout=5000")  # Wait up to 5s on contention
                 self._pool.append(conn)
                 await self._available.put(conn)
 
@@ -58,27 +69,100 @@ class AsyncTradingDatabase:
 
     async def close(self):
         """Close all connections in the pool."""
-        for conn in self._pool:
-            await conn.close()
-        self._pool.clear()
-        self._initialized = False
-        logger.info("Closed all database connections")
+        async with self._lock:
+            if not self._initialized:
+                return
+
+            # Close all connections in the pool
+            for conn in self._pool:
+                try:
+                    # Ensure no transactions are left open
+                    if getattr(conn, "in_transaction", False):
+                        await conn.rollback()
+                    await conn.close()
+                except Exception as e:
+                    logger.debug(f"Error closing connection: {e}")
+
+            # Clear the pool and queue
+            self._pool.clear()
+
+            # Clear the available queue
+            while not self._available.empty():
+                try:
+                    self._available.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+            self._initialized = False
+            self._closed = True
+            logger.info("Closed all database connections")
+
+    async def health_check(self) -> bool:
+        """Check if database connections are healthy."""
+        if not self._initialized or self._closed:
+            return False
+
+        try:
+            async with self.get_connection() as conn:
+                await conn.execute("SELECT 1")
+                return True
+        except Exception as e:
+            logger.warning(f"Database health check failed: {e}")
+            return False
+
+    async def ensure_connection(self):
+        """Ensure database is connected and healthy."""
+        if not await self.health_check():
+            logger.info("Database unhealthy, reinitializing...")
+            await self.close()
+            self._closed = False
+            await self.initialize()
 
     @asynccontextmanager
     async def get_connection(self):
         """Get a connection from the pool."""
+        if self._closed:
+            raise RuntimeError("Database is closed")
+
         if not self._initialized:
             await self.initialize()
 
-        conn = await self._available.get()
+        conn = await asyncio.wait_for(self._available.get(), timeout=10.0)
         try:
+            # Test connection before use
+            await conn.execute("SELECT 1")
             yield conn
+        except Exception as e:
+            logger.warning(f"Connection error: {e}")
+            # Try to create a new connection to replace the bad one
+            try:
+                await conn.close()
+                new_conn = await aiosqlite.connect(self.db_path)
+                await new_conn.execute("PRAGMA journal_mode=WAL")
+                await new_conn.execute("PRAGMA busy_timeout=5000")
+                await self._available.put(new_conn)
+            except Exception as replace_error:
+                logger.error(f"Failed to replace bad connection: {replace_error}")
+                await self._available.put(conn)  # Put back the original connection
+            raise
         finally:
-            await self._available.put(conn)
+            # Ensure no transaction remains open on pooled connections
+            try:
+                if getattr(conn, "in_transaction", False):
+                    await conn.rollback()
+            except Exception as e:
+                logger.debug(f"Rollback on pooled connection failed: {e}")
+
+            # Only put back if not closed
+            if not self._closed:
+                await self._available.put(conn)
 
     async def _init_database(self) -> None:
         """Create tables if they don't exist."""
         async with aiosqlite.connect(self.db_path) as conn:
+            # Set WAL and busy timeout on the initializer connection too, to avoid rollback journal usage
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("PRAGMA busy_timeout=5000")
             # Positions table
             await conn.execute(
                 """

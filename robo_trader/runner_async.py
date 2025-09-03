@@ -133,7 +133,7 @@ class AsyncRunner:
         self.client = AsyncIBKRClient(conn_config)
         await self.client.connect()
 
-        # Initialize async database
+        # Initialize async database with context manager
         self.db = AsyncTradingDatabase()
         await self.db.initialize()
 
@@ -904,7 +904,7 @@ async def run_continuous(
                 f"Starting trading cycle at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
             )
 
-            # Run the trading system
+            # Run the trading system with proper cleanup
             runner = AsyncRunner(
                 duration=duration,
                 bar_size=bar_size,
@@ -920,7 +920,11 @@ async def run_continuous(
                 use_smart_execution=use_smart_execution,
             )
 
-            await runner.run(symbols)
+            try:
+                await runner.run(symbols)
+            finally:
+                # Ensure proper cleanup of runner resources
+                await runner.cleanup()
 
             # Wait before next iteration
             if not shutdown_flag and is_market_open():
