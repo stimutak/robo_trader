@@ -8,7 +8,7 @@ import os
 # Add the project root to the path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from robo_trader.portfolio.portfolio_manager import (
+from robo_trader.portfolio_pkg.portfolio_manager import (
     AllocationMethod,
     MultiStrategyPortfolioManager,
     StrategyAllocation,

@@ -391,9 +391,10 @@ def load_config_from_env() -> Config:
             "provider": os.getenv("DATA_PROVIDER", "IBKR"),
             "storage": os.getenv("DATA_STORAGE", "sqlite"),
             "feature_window": int(os.getenv("DATA_FEATURE_WINDOW", "100")),
-            "tick_buffer_size": int(os.getenv("DATA_TICK_BUFFER", "10000")),
-            "cache_ttl_seconds": int(os.getenv("DATA_CACHE_TTL", "300")),
-            "enable_real_time": os.getenv("DATA_ENABLE_REALTIME", "true").lower() == "true",
+            # Match DataConfig field names
+            "tick_buffer": int(os.getenv("DATA_TICK_BUFFER", "10000")),
+            "cache_ttl": int(os.getenv("DATA_CACHE_TTL", "300")),
+            "enable_realtime": os.getenv("DATA_ENABLE_REALTIME", "true").lower() == "true",
             "historical_days": int(os.getenv("DATA_HISTORICAL_DAYS", "30")),
             "bar_size": os.getenv("DATA_BAR_SIZE", "5 mins"),
         },

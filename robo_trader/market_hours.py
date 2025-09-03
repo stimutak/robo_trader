@@ -2,7 +2,7 @@
 Market hours utilities for checking if the stock market is open.
 """
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from typing import Optional, Tuple
 
 import pytz
@@ -131,13 +131,13 @@ def get_next_market_open() -> datetime:
     # Start with today at 9:30 AM
     next_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
 
-    # If it's already past 9:30 AM today, move to tomorrow
+    # If it's already past 9:30 AM today, move to next day
     if now.time() >= time(9, 30):
-        next_open = next_open.replace(day=next_open.day + 1)
+        next_open = next_open + timedelta(days=1)
 
-    # Skip weekends
+    # Skip weekends by advancing day-by-day
     while next_open.weekday() >= 5:  # Saturday = 5, Sunday = 6
-        next_open = next_open.replace(day=next_open.day + 1)
+        next_open = next_open + timedelta(days=1)
 
     return next_open
 

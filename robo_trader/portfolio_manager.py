@@ -5,7 +5,7 @@ Some tests import from `robo_trader.portfolio_manager` while others use
 API to support both import paths.
 """
 
-from .portfolio.portfolio_manager import (
+from .portfolio_manager.portfolio_manager import (
     AllocationMethod,
     StrategyAllocation,
     PortfolioMetrics,
@@ -18,4 +18,3 @@ __all__ = [
     "PortfolioMetrics",
     "MultiStrategyPortfolioManager",
 ]
-

@@ -122,6 +122,8 @@ class RiskManager:
         max_sector_exposure_pct: float = 0.3,
         max_open_positions: int = 20,
         enable_emergency_shutdown: bool = True,
+        # Backward-compat params expected by some tests
+        max_position_size: Optional[float] = None,
     ) -> None:
         """
         Initialize the risk manager with enhanced parameters.
@@ -158,6 +160,8 @@ class RiskManager:
         self.max_sector_exposure_pct = float(max_sector_exposure_pct)
         self.max_open_positions = int(max_open_positions)
         self.enable_emergency_shutdown = enable_emergency_shutdown
+        # Accept but do not strictly enforce deprecated max_position_size; retained for compatibility
+        self.max_position_size = float(max_position_size) if max_position_size else None
 
         # Risk tracking
         self.violations: List[Tuple[datetime, RiskViolationType, str]] = []
