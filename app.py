@@ -22,14 +22,16 @@ import numpy as np
 from dotenv import load_dotenv
 load_dotenv()
 
-# Import our modules
+# Import our modules - using lazy imports to avoid startup issues
 from robo_trader.config import load_config
 from robo_trader.logger import get_logger
-from robo_trader.database_async import AsyncTradingDatabase
-from robo_trader.analytics.performance import PerformanceAnalyzer
-from robo_trader.features.feature_pipeline import FeaturePipeline
-from robo_trader.ml.model_trainer import ModelTrainer
-from robo_trader.websocket_server import ws_manager
+
+# Lazy imports to avoid blocking startup
+# from robo_trader.database_async import AsyncTradingDatabase
+# from robo_trader.analytics.performance import PerformanceAnalyzer
+# from robo_trader.features.feature_pipeline import FeaturePipeline
+# from robo_trader.ml.model_trainer import ModelTrainer
+# from robo_trader.websocket_server import ws_manager
 
 logger = get_logger(__name__)
 app = Flask(__name__)
@@ -40,7 +42,7 @@ AUTH_ENABLED = os.getenv('DASH_AUTH_ENABLED', 'false').lower() == 'true'
 AUTH_USER = os.getenv('DASH_USER', 'admin')
 AUTH_PASS_HASH = os.getenv('DASH_PASS_HASH', '')
 
-# Initialize components
+# Initialize components - will be loaded lazily
 db = None
 feature_pipeline = None
 model_trainer = None
@@ -86,9 +88,12 @@ def init_async_components():
     performance_analyzer = PerformanceAnalyzer()
 
 # Initialize in background thread
-init_thread = threading.Thread(target=init_async_components)
-init_thread.daemon = True
-init_thread.start()
+if os.getenv('DASH_INIT_COMPONENTS', 'false').lower() == 'true':
+    init_thread = threading.Thread(target=init_async_components)
+    init_thread.daemon = True
+    init_thread.start()
+else:
+    logger.info('Skipping heavy async component init at startup (DASH_INIT_COMPONENTS=false)')
 
 # Authentication
 def check_auth(username, password):
@@ -1210,16 +1215,47 @@ HTML_TEMPLATE = '''
         function updateStatus(status) {
             const dot = document.getElementById('status-dot');
             const text = document.getElementById('status-text');
-            
+
             // Handle both object and string status
             const isRunning = (typeof status === 'object' && status.is_trading) || status === 'running';
-            
+
             if (isRunning) {
                 dot.classList.add('active');
                 text.textContent = 'Trading Active';
             } else {
                 dot.classList.remove('active');
                 text.textContent = 'Trading Stopped';
+            }
+
+            // Also update market status
+            updateMarketStatus();
+        }
+
+        async function updateMarketStatus() {
+            try {
+                const response = await fetch('/api/market/status');
+                const data = await response.json();
+
+                // Update status text to include market status
+                const statusText = document.getElementById('status-text');
+                const currentText = statusText.textContent;
+
+                if (data.is_open) {
+                    statusText.textContent = currentText + ' • Market Open';
+                    statusText.style.color = '#44ff44';
+                } else {
+                    statusText.textContent = currentText + ` • Market ${data.status_text}`;
+                    if (data.session === 'closed') {
+                        statusText.style.color = '#ff4444';
+                        if (data.time_until_open) {
+                            statusText.textContent += ` (Opens in ${data.time_until_open})`;
+                        }
+                    } else {
+                        statusText.style.color = '#ffaa44';
+                    }
+                }
+            } catch (error) {
+                console.error('Error fetching market status:', error);
             }
         }
         
@@ -1683,9 +1719,11 @@ HTML_TEMPLATE = '''
         window.onload = () => {
             refreshData();
             refreshStrategies();
+            updateMarketStatus(); // Load market status on startup
             connectWebSocket(); // Connect to WebSocket
             setInterval(refreshData, 5000); // Keep polling as fallback
             setInterval(refreshStrategies, 5000); // Update strategies tab
+            setInterval(updateMarketStatus, 60000); // Update market status every minute
         };
     </script>
 </body>
@@ -1714,6 +1752,34 @@ def favicon():
 def health():
     """Health check endpoint"""
     return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
+
+@app.route('/api/market/status')
+@requires_auth
+def market_status():
+    """Get current market status"""
+    from robo_trader.market_hours import is_market_open, get_market_session, get_next_market_open, seconds_until_market_open
+
+    current_time = datetime.now()
+    is_open = is_market_open()
+    session = get_market_session()
+
+    result = {
+        'is_open': is_open,
+        'session': session,
+        'current_time': current_time.isoformat(),
+        'status_text': session.replace('-', ' ').title()
+    }
+
+    if not is_open:
+        next_open = get_next_market_open()
+        seconds_until = seconds_until_market_open()
+        result.update({
+            'next_open': next_open.isoformat(),
+            'seconds_until_open': seconds_until,
+            'time_until_open': f"{seconds_until // 3600}h {(seconds_until % 3600) // 60}m"
+        })
+
+    return jsonify(result)
 
 @app.route('/api/status')
 @requires_auth
@@ -2680,17 +2746,19 @@ def get_logs():
 if __name__ == '__main__':
     # Initialize components
     logger.info("Starting RoboTrader Dashboard...")
-    
-    # Start WebSocket server
-    logger.info("Starting WebSocket server...")
-    ws_manager.start()
-    
-    # Wait for async components to initialize
-    time.sleep(2)
-    
+
+    # Temporarily disable WebSocket server to fix startup issues
+    # TODO: Fix WebSocket server initialization
+    # logger.info("Starting WebSocket server...")
+    # ws_manager.start()
+    # time.sleep(2)
+
+    logger.info(f"Dashboard starting on port {os.getenv('DASH_PORT', 5555)}")
+
     # Run Flask app
     app.run(
         host='0.0.0.0',
-        port=int(os.getenv('DASH_PORT', 5000)),
+        port=int(os.getenv('DASH_PORT', 5555)),
+        use_reloader=False,
         debug=os.getenv('FLASK_ENV') == 'development'
     )
