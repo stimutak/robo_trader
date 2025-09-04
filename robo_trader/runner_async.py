@@ -734,21 +734,53 @@ class AsyncRunner:
         tasks = [process_with_semaphore(symbol) for symbol in symbols]
         results = await asyncio.gather(*tasks, return_exceptions=False)
 
-        # Log results
+        # Log results and collect market prices
+        market_prices = {}
         for result in results:
             if isinstance(result, SymbolResult):
                 logger.info(
                     f"{result.symbol}: Signal={result.signal}, "
                     f"Price=${result.price:.2f}, {result.message}"
                 )
+                # Collect current market prices
+                if result.price > 0:
+                    market_prices[result.symbol] = result.price
             else:
                 logger.error(f"Error processing symbol: {result}")
 
+        # Update market prices for all positions
+        await self.update_position_market_prices(market_prices)
+
         return [r for r in results if isinstance(r, SymbolResult)]
+    
+    async def update_position_market_prices(self, market_prices: Dict[str, float]):
+        """Update market prices for all positions in database."""
+        try:
+            for symbol, position in self.positions.items():
+                if symbol in market_prices:
+                    current_price = market_prices[symbol]
+                    # Update position in database with current market price
+                    await self.db.update_position(
+                        symbol, 
+                        position.quantity, 
+                        position.avg_price,  # Keep avg_cost same
+                        current_price  # Update market price
+                    )
+                    logger.debug(f"Updated {symbol} market price to ${current_price:.2f}")
+        except Exception as e:
+            logger.error(f"Error updating position market prices: {e}")
 
     async def update_account_summary(self):
         """Update account summary in database."""
-        market_prices = {symbol: pos.avg_price for symbol, pos in self.positions.items()}
+        # Use actual market prices from last run
+        market_prices = {}
+        for symbol, pos in self.positions.items():
+            # Try to get latest price from database
+            latest_pos = await self.db.get_position(symbol)
+            if latest_pos and latest_pos.get('market_price'):
+                market_prices[symbol] = latest_pos['market_price']
+            else:
+                market_prices[symbol] = pos.avg_price
         equity = self.portfolio.equity(market_prices)
         unrealized = self.portfolio.compute_unrealized(market_prices)
 
