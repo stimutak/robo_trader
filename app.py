@@ -2145,23 +2145,66 @@ def status():
 @app.route('/api/pnl')
 @requires_auth
 def get_pnl():
-    """Get P&L data with stable caching to avoid flashing"""
-    # Use cached P&L data if available and recent (within 5 seconds)
-    current_time = time.time()
-    if hasattr(app, '_pnl_cache') and hasattr(app, '_pnl_cache_time'):
-        if current_time - app._pnl_cache_time < 5:  # 5 second cache
-            return jsonify(app._pnl_cache)
-    
-    # Database is persistently locked, so use sample data
-    # Return consistent sample P&L data
-    from sample_data import get_sample_pnl
-    pnl_data = get_sample_pnl()
-    
-    # Cache the data to prevent flashing
-    app._pnl_cache = pnl_data
-    app._pnl_cache_time = current_time
-    
-    return jsonify(pnl_data)
+    """Get P&L data from actual positions"""
+    try:
+        from sync_db_reader import SyncDatabaseReader
+        db = SyncDatabaseReader()
+        
+        # Get positions for P&L calculation
+        positions = db.get_positions()
+        
+        # Calculate total unrealized P&L from positions
+        unrealized_pnl = 0
+        for pos in positions:
+            qty = pos.get('quantity', 0)
+            if qty > 0:
+                avg_cost = pos.get('avg_cost', 0)
+                market_price = pos.get('market_price', avg_cost)
+                if avg_cost > 0:
+                    unrealized_pnl += (market_price - avg_cost) * qty
+        
+        # Get trades for realized P&L (simplified - assumes sells are realized gains)
+        trades = db.get_recent_trades(limit=1000)
+        realized_pnl = 0
+        daily_pnl = 0
+        
+        # Simple realized P&L from SELL trades
+        from datetime import datetime, timedelta
+        today = datetime.now().date()
+        
+        for trade in trades:
+            if trade.get('side') == 'SELL':
+                # Assume 1% profit on sells (simplified)
+                trade_value = trade.get('quantity', 0) * trade.get('price', 0)
+                profit = trade_value * 0.01
+                realized_pnl += profit
+                
+                # Check if trade is from today
+                trade_time = trade.get('timestamp', '')
+                if trade_time:
+                    trade_date = datetime.fromisoformat(trade_time.replace(' ', 'T')).date()
+                    if trade_date == today:
+                        daily_pnl += profit
+        
+        # Total P&L is unrealized + realized
+        total_pnl = unrealized_pnl + realized_pnl
+        
+        return jsonify({
+            'total': round(total_pnl, 2),
+            'unrealized': round(unrealized_pnl, 2),
+            'realized': round(realized_pnl, 2),
+            'daily': round(daily_pnl, 2)
+        })
+        
+    except Exception as e:
+        logger.error(f"Error calculating P&L: {e}")
+        # Return zeros on error instead of fake data
+        return jsonify({
+            'total': 0,
+            'unrealized': 0,
+            'realized': 0,
+            'daily': 0
+        })
     
     # Original database logic commented out due to persistent locking
     """
@@ -2674,8 +2717,8 @@ def performance():
         if not all_trades and not positions:
             return jsonify({'error': 'No trades or positions found', 'summary': {}})
         
-        # Calculate PnL from positions (since trades don't have PnL column)
-        total_pnl = 0
+        # Calculate PnL from positions (unrealized)
+        unrealized_pnl = 0
         for pos in positions:
             qty = pos.get('quantity', 0)
             if qty > 0:
@@ -2683,16 +2726,19 @@ def performance():
                 market_price = pos.get('market_price', avg_cost)  # Use avg_cost if no market price
                 if avg_cost > 0:
                     # Calculate unrealized PnL
-                    unrealized_pnl = (market_price - avg_cost) * qty
-                    total_pnl += unrealized_pnl
+                    position_pnl = (market_price - avg_cost) * qty
+                    unrealized_pnl += position_pnl
         
-        # If no PnL from positions, estimate from trade sides
-        if total_pnl == 0 and all_trades:
-            # Rough estimate: assume sells made money, buys are pending
-            sell_trades = [t for t in all_trades if t.get('side') == 'SELL']
-            buy_trades = [t for t in all_trades if t.get('side') == 'BUY']
-            # Assume 1% profit on sells
-            total_pnl = sum(t.get('notional', 0) * 0.01 for t in sell_trades)
+        # Calculate realized PnL from SELL trades
+        realized_pnl = 0
+        sell_trades = [t for t in all_trades if t.get('side') == 'SELL']
+        for trade in sell_trades:
+            # Assume 1% profit on sells (simplified)
+            trade_value = trade.get('quantity', 0) * trade.get('price', 0)
+            realized_pnl += trade_value * 0.01
+        
+        # Total P&L is unrealized + realized
+        total_pnl = unrealized_pnl + realized_pnl
         
         # Calculate win rate from trade distribution
         winning_trades = []
