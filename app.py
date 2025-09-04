@@ -2606,25 +2606,25 @@ def performance():
                 'return_pct': round(daily_pnl / estimated_capital, 4) if estimated_capital > 0 else 0,
                 'pnl': round(daily_pnl, 2),
                 'trades': len(daily_trades),
-                'volatility': 0.18,  # Placeholder
-                'sharpe': round(sharpe * 0.8, 2),  # Simplified
-                'max_drawdown': round(max_dd * 0.2, 4)  # Simplified
+                'volatility': 0,  # Not calculated yet
+                'sharpe': 0,  # Not calculated yet
+                'max_drawdown': 0  # Not calculated yet
             },
             'weekly': {
                 'return_pct': round(weekly_pnl / estimated_capital, 4) if estimated_capital > 0 else 0,
                 'pnl': round(weekly_pnl, 2),
                 'trades': len(weekly_trades),
-                'volatility': 0.22,  # Placeholder
-                'sharpe': round(sharpe * 0.9, 2),  # Simplified
-                'max_drawdown': round(max_dd * 0.4, 4)  # Simplified
+                'volatility': 0,  # Not calculated yet
+                'sharpe': 0,  # Not calculated yet
+                'max_drawdown': 0  # Not calculated yet
             },
             'monthly': {
                 'return_pct': round(monthly_pnl / estimated_capital, 4) if estimated_capital > 0 else 0,
                 'pnl': round(monthly_pnl, 2),
                 'trades': len(monthly_trades),
-                'volatility': 0.25,  # Placeholder
-                'sharpe': round(sharpe * 0.95, 2),  # Simplified
-                'max_drawdown': round(max_dd * 0.7, 4)  # Simplified
+                'volatility': 0,  # Not calculated yet
+                'sharpe': 0,  # Not calculated yet
+                'max_drawdown': 0  # Not calculated yet
             },
             'all': {
                 'return_pct': round(total_pnl / estimated_capital, 4) if estimated_capital > 0 else 0,
