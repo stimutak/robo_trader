@@ -61,6 +61,17 @@ The platform supports multiple trading strategies, including a simple SMA crosso
     python app.py
     ```
 
+## Recent Updates (2025-09-04)
+
+### Dashboard Enhancements
+*   **Market Status Indicator:** Real-time market status display in dashboard header (Regular/Pre-Market/After-Hours/Closed)
+*   **Performance Monitor Integration:** Live metrics display showing latency, throughput, and trading activity
+*   **API Endpoints:** New `/api/market-status` and `/api/performance-monitor` endpoints for real-time data
+
+### Database Recovery
+*   **Recovery Scripts:** `init_database.py` for sample data initialization, `recover_database.py` for backup recovery
+*   **Locking Resolution:** Fixed persistent SQLite locking issues that prevented trading system from running
+
 ## Development Conventions
 
 The project enforces a strict code style and quality standards using a variety of tools, as defined in the `.pre-commit-config.yaml` and `pyproject.toml` files.
