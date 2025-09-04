@@ -2630,7 +2630,7 @@ def performance():
                 'return_pct': round(total_pnl / estimated_capital, 4) if estimated_capital > 0 else 0,
                 'pnl': round(total_pnl, 2),
                 'trades': len(all_trades),
-                'volatility': round(std_return if 'std_return' in locals() else 0.28, 3),
+                'volatility': round(std_return if 'std_return' in locals() else 0, 3),
                 'sharpe': round(sharpe, 2),
                 'max_drawdown': round(max_dd, 4)
             }
