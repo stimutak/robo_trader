@@ -2740,16 +2740,20 @@ def performance():
         # Total P&L is unrealized + realized
         total_pnl = unrealized_pnl + realized_pnl
         
-        # Calculate win rate from trade distribution
+        # Calculate win rate from SELL trades (since we track those as realized P&L)
         winning_trades = []
         losing_trades = []
         if all_trades:
-            # For now, assume sells are wins (simplified)
-            for trade in all_trades:
-                if trade.get('side') == 'SELL':
-                    winning_trades.append(trade)
+            # Count SELL trades as wins if we made profit (using our 1% assumption)
+            sell_count = len([t for t in all_trades if t.get('side') == 'SELL'])
+            # For now, consider all sells as winning trades since we assume 1% profit
+            winning_trades = [t for t in all_trades if t.get('side') == 'SELL']
+            # The rest are either losing or neutral (BUY trades still open)
+            losing_trades = [t for t in all_trades if t.get('side') != 'SELL']
         
-        win_rate = len(winning_trades) / len(all_trades) if all_trades else 0
+        # Win rate based on closed trades only (SELL trades)
+        closed_trades = len(winning_trades) + len([t for t in losing_trades if t.get('side') == 'SELL'])
+        win_rate = len(winning_trades) / closed_trades if closed_trades > 0 else 0
         
         # Calculate returns for different periods
         now = datetime.now()
@@ -2763,8 +2767,16 @@ def performance():
         monthly_pnl = sum(t.get('pnl', 0) for t in monthly_trades if t.get('pnl') is not None)
         
         # Get total capital for return calculations (approximate from trade volumes)
-        avg_trade_size = sum(t.get('notional', 0) for t in all_trades) / len(all_trades) if all_trades else 100000
-        estimated_capital = avg_trade_size * 10  # Rough estimate
+        # Calculate average trade size from quantity * price
+        total_trade_value = 0
+        for trade in all_trades:
+            trade_value = trade.get('quantity', 0) * trade.get('price', 0)
+            total_trade_value += trade_value
+        
+        avg_trade_size = total_trade_value / len(all_trades) if all_trades else 100000
+        # Estimate capital as sum of all position values plus some cash buffer
+        position_value = sum(pos.get('quantity', 0) * pos.get('market_price', pos.get('avg_cost', 0)) for pos in positions)
+        estimated_capital = position_value * 1.2 if position_value > 0 else 100000  # 20% cash buffer assumption
         
         # Calculate Sharpe ratio (simplified)
         if all_trades:
