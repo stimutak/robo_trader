@@ -673,24 +673,34 @@ HTML_TEMPLATE = '''
             <!-- Performance Summary Cards -->
             <div class="summary-cards">
                 <div class="summary-card">
+                    <h3>Total P&L</h3>
+                    <div class="metric-value" id="perf-total-pnl">$0.00</div>
+                    <div class="metric-subtitle">All Time</div>
+                </div>
+                <div class="summary-card">
                     <h3>Total Return</h3>
-                    <div class="metric-value" id="total-return">+15.2%</div>
+                    <div class="metric-value" id="total-return">0.00%</div>
                     <div class="metric-subtitle">All Time</div>
                 </div>
                 <div class="summary-card">
                     <h3>Sharpe Ratio</h3>
-                    <div class="metric-value" id="total-sharpe">1.42</div>
+                    <div class="metric-value" id="total-sharpe">0.00</div>
                     <div class="metric-subtitle">Risk-Adjusted</div>
                 </div>
                 <div class="summary-card">
                     <h3>Max Drawdown</h3>
-                    <div class="metric-value negative" id="total-drawdown">-8.3%</div>
+                    <div class="metric-value negative" id="total-drawdown">0.00%</div>
                     <div class="metric-subtitle">Peak to Trough</div>
                 </div>
                 <div class="summary-card">
                     <h3>Win Rate</h3>
-                    <div class="metric-value" id="win-rate">67.5%</div>
+                    <div class="metric-value" id="win-rate">0.00%</div>
                     <div class="metric-subtitle">Profitable Trades</div>
+                </div>
+                <div class="summary-card">
+                    <h3>Total Trades</h3>
+                    <div class="metric-value" id="perf-total-trades">0</div>
+                    <div class="metric-subtitle">All Time</div>
                 </div>
             </div>
 
@@ -708,11 +718,25 @@ HTML_TEMPLATE = '''
                     </thead>
                     <tbody id="performance-table">
                         <tr>
+                            <td>P&L</td>
+                            <td id="pnl-daily">$0.00</td>
+                            <td id="pnl-weekly">$0.00</td>
+                            <td id="pnl-monthly">$0.00</td>
+                            <td id="pnl-all">$0.00</td>
+                        </tr>
+                        <tr>
                             <td>Return</td>
                             <td id="return-daily">0.00%</td>
                             <td id="return-weekly">0.00%</td>
                             <td id="return-monthly">0.00%</td>
                             <td id="return-all">0.00%</td>
+                        </tr>
+                        <tr>
+                            <td>Trades</td>
+                            <td id="trades-daily">0</td>
+                            <td id="trades-weekly">0</td>
+                            <td id="trades-monthly">0</td>
+                            <td id="trades-all">0</td>
                         </tr>
                         <tr>
                             <td>Volatility</td>
@@ -737,6 +761,79 @@ HTML_TEMPLATE = '''
                         </tr>
                     </tbody>
                 </table>
+            </div>
+
+            <!-- Equity Curve Chart -->
+            <div class="table-container">
+                <h3>Equity Curve</h3>
+                <div id="equity-chart" style="height: 200px; background: #0a0a0a; border-radius: 8px; padding: 20px; display: flex; align-items: center; justify-content: center; color: #666;">
+                    <div style="text-align: center;">
+                        <div style="font-size: 14px; margin-bottom: 10px;">📈 Equity Curve Visualization</div>
+                        <div style="font-size: 12px;">Chart will be implemented when historical data is available</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Trade Statistics -->
+            <div class="table-container">
+                <h3>Trade Statistics</h3>
+                <div class="metric-grid" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px;">
+                    <div class="metric-item">
+                        <div class="metric-label">Average Win</div>
+                        <div class="metric-value positive" id="avg-win">$0.00</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Average Loss</div>
+                        <div class="metric-value negative" id="avg-loss">$0.00</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Profit Factor</div>
+                        <div class="metric-value" id="profit-factor">0.00</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Expectancy</div>
+                        <div class="metric-value" id="expectancy">$0.00</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Largest Win</div>
+                        <div class="metric-value positive" id="largest-win">$0.00</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Largest Loss</div>
+                        <div class="metric-value negative" id="largest-loss">$0.00</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Avg Hold Time</div>
+                        <div class="metric-value" id="avg-hold-time">0h 0m</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Win Streak</div>
+                        <div class="metric-value" id="win-streak">0</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Risk Metrics -->
+            <div class="table-container">
+                <h3>Risk Metrics</h3>
+                <div class="metric-grid" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px;">
+                    <div class="metric-item">
+                        <div class="metric-label">Value at Risk (95%)</div>
+                        <div class="metric-value" id="var-95">$0.00</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Beta vs SPY</div>
+                        <div class="metric-value" id="beta">0.00</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Sortino Ratio</div>
+                        <div class="metric-value" id="sortino">0.00</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Calmar Ratio</div>
+                        <div class="metric-value" id="calmar">0.00</div>
+                    </div>
+                </div>
             </div>
         </div>
         
@@ -1276,6 +1373,7 @@ HTML_TEMPLATE = '''
             try {
                 const response = await fetch('/api/performance');
                 const data = await response.json();
+                console.log('Performance data received:', data);
                 updatePerformanceTable(data);
             } catch (error) {
                 console.error('Error loading performance data:', error);
@@ -1546,19 +1644,74 @@ HTML_TEMPLATE = '''
             // Update summary cards
             if (data.summary) {
                 const summary = data.summary;
-                document.getElementById('total-return').textContent = formatPercent(summary.total_return);
-                document.getElementById('total-sharpe').textContent = (summary.total_sharpe || 0).toFixed(2);
-                document.getElementById('total-drawdown').textContent = formatPercent(summary.total_drawdown);
-                document.getElementById('win-rate').textContent = formatPercent(summary.win_rate);
+                
+                // Total P&L with color
+                const pnlElem = document.getElementById('perf-total-pnl');
+                const pnlValue = summary.total_pnl || 0;
+                pnlElem.textContent = formatCurrency(pnlValue);
+                pnlElem.className = pnlValue >= 0 ? 'metric-value positive' : 'metric-value negative';
+                
+                // Total Return with color
+                const returnElem = document.getElementById('total-return');
+                const returnValue = summary.total_return || 0;
+                returnElem.textContent = formatPercent(returnValue);
+                returnElem.className = returnValue >= 0 ? 'metric-value positive' : 'metric-value negative';
+                
+                // Sharpe Ratio with color
+                const sharpeElem = document.getElementById('total-sharpe');
+                const sharpeValue = summary.total_sharpe || 0;
+                sharpeElem.textContent = sharpeValue.toFixed(2);
+                sharpeElem.className = sharpeValue >= 0 ? 'metric-value positive' : 'metric-value negative';
+                
+                // Drawdown (always negative if non-zero)
+                const ddElem = document.getElementById('total-drawdown');
+                const ddValue = summary.total_drawdown || 0;
+                ddElem.textContent = formatPercent(ddValue);
+                ddElem.className = ddValue < 0 ? 'metric-value negative' : 'metric-value';
+                
+                // Win Rate with color
+                const winRateElem = document.getElementById('win-rate');
+                const winRate = summary.win_rate || 0;
+                winRateElem.textContent = formatPercent(winRate);
+                winRateElem.className = winRate >= 0.5 ? 'metric-value positive' : 'metric-value';
+                
+                // Total trades (neutral)
+                document.getElementById('perf-total-trades').textContent = summary.total_trades || 0;
             }
 
             // Update performance table
             ['daily', 'weekly', 'monthly', 'all'].forEach(period => {
                 const metrics = data[period] || {};
-                document.getElementById(`return-${period}`).textContent = formatPercent(metrics.return_pct);
+                
+                // P&L with color
+                const pnlElem = document.getElementById(`pnl-${period}`);
+                const pnlValue = metrics.pnl || 0;
+                pnlElem.textContent = formatCurrency(pnlValue);
+                pnlElem.className = pnlValue >= 0 ? 'positive' : 'negative';
+                
+                // Return with color
+                const returnElem = document.getElementById(`return-${period}`);
+                const returnValue = metrics.return_pct || 0;
+                returnElem.textContent = formatPercent(returnValue);
+                returnElem.className = returnValue >= 0 ? 'positive' : 'negative';
+                
+                // Trades (neutral)
+                document.getElementById(`trades-${period}`).textContent = metrics.trades || 0;
+                
+                // Volatility (neutral)
                 document.getElementById(`vol-${period}`).textContent = formatPercent(metrics.volatility);
-                document.getElementById(`sharpe-${period}`).textContent = (metrics.sharpe || 0).toFixed(2);
-                document.getElementById(`dd-${period}`).textContent = formatPercent(metrics.max_drawdown);
+                
+                // Sharpe with color
+                const sharpeElem = document.getElementById(`sharpe-${period}`);
+                const sharpeValue = metrics.sharpe || 0;
+                sharpeElem.textContent = sharpeValue.toFixed(2);
+                sharpeElem.className = sharpeValue >= 0 ? 'positive' : 'negative';
+                
+                // Drawdown (always negative color if non-zero)
+                const ddElem = document.getElementById(`dd-${period}`);
+                const ddValue = metrics.max_drawdown || 0;
+                ddElem.textContent = formatPercent(ddValue);
+                ddElem.className = ddValue < 0 ? 'negative' : '';
             });
         }
         
