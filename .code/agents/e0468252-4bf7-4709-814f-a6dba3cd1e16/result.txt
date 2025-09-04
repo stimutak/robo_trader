@@ -1,0 +1,369 @@
+[2025-09-04T19:06:08] Code v0.2.56
+--------
+workdir: /Users/oliver/robo_trader
+model: gpt-5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: auto
+--------
+[2025-09-04T19:06:08] User instructions:
+Context: You are planning only (read-only) — do not propose large refactors that would break public surfaces unless justified with migration steps. Leverage existing modules like runner_async, ML strategy classes, features, and backtest engines to avoid duplication. Prioritize reliability, testability, and measurable improvement to live and paper trading safety.
+
+Agent: You are one of three planning agents asked to design a comprehensive, staged plan to evolve and operate the RoboTrader system in this repository. Produce a clear, pragmatic roadmap with milestones and concrete actions that a senior engineer can immediately execute. Context below is a quick orientation; you may explore the code paths listed in `files` for more detail.
+
+Repository context (Python 3.10+):
+- Purpose: Automated equities trading system with async IBKR client, correlation-aware position sizing, optional ML strategies, and a Flask dashboard.
+- Entry points:
+  - `robo_trader/runner_async.py`: Async trading loop with parallel symbol processing, correlation-based sizing, ML strategies (baseline SMA, ML, ML_Enhanced), smart execution hook, WebSocket updates, DB writes, risk limits, and monitoring timers.
+  - `app.py`: Flask dashboard (single-file app) showing P&L, positions, strategies, ML metrics, microstructure, trades; basic auth via env vars; polls API + optional WebSocket.
+- Important subsystems (selected):
+  - `robo_trader/clients/async_ibkr_client.py`: Async client with connection pooling.
+  - `robo_trader/database_async.py` and `robo_trader/database.py`: Data access.
+  - `robo_trader/monitoring/performance.py`: Timer, performance logging helpers.
+  - `robo_trader/strategies/*`: Strategies (`framework.py`, `ml_strategy.py`, `ml_enhanced_strategy.py`, `mean_reversion.py`, `momentum.py`, `microstructure.py`, `pairs_trading.py`, etc.).
+  - `robo_trader/features/*`: Feature pipeline, indicators, ML features, feature store, etc.
+  - `robo_trader/ml/*`: Model training/selection/registry; training scripts in repo root.
+  - `robo_trader/smart_execution/*`: Smart order execution algorithms.
+  - `robo_trader/portfolio_pkg/` and `portfolio_manager.py`: Portfolio orchestration; allocation layer.
+  - `robo_trader/risk.py`: Order validation, sizing, caps; market hours module.
+  - `robo_trader/websocket_client.py` and `websocket_server.py`.
+  - `robo_trader/backtest/*`: Engine, metrics, walk-forward.
+  - `tests/` and many top-level `test_*.py`: Rich pytest suite (pyproject+pytest.ini present).
+- Ops & config:
+  - `.env` with `.env.example`; Make targets: `venv`, `install`, `test`. Run trader via `python -m robo_trader.runner_async --symbols AAPL,MSFT`. Dashboard via `python app.py` (port via `DASH_PORT`, default 5555). Default mode should be paper.
+- Coding and quality:
+  - Style: `black`, `isort`, `flake8`, `bandit`, `mypy`. Async tests via `pytest-asyncio` (import mode importlib). Conventional Commits. Security: never commit secrets.
+
+What to deliver in your plan:
+1) Architecture and ownership map
+- Identify bounded contexts: data ingest, feature/ML, strategy layer, portfolio/risk, execution/IBKR, backtesting, monitoring/observability, dashboard, infra/ops.
+- List owners/roles that would maintain each (can be roles not names).
+
+2) Data & reliability
+- Define market data pathways (realtime vs historical), schema for bars/trades/signals, retention policies, vacuuming/archival, and DB locking strategies for concurrent readers/writers.
+- Propose idempotent writes, backpressure, and recovery after outages.
+
+3) Trading loop & concurrency
+- Concurrency model (task graph), limits and cancellation, timeouts/retries, health checks, graceful shutdown. How to ensure the loop respects market hours yet still runs useful tasks pre/post market.
+- Fast-paths for after-hours (skip fetch but still compute).
+
+4) Risk, sizing, correlation
+- Daily/position caps; burst and rate limits; correlation-based adjustments; Kelly or volatility scaling; short selling controls; consistency between strategy-sized and portfolio-sized orders.
+- How to test these constraints.
+
+5) Strategy lifecycle
+- Clean interface (signals, confidence, metadata). Regime detection and how ML strategies override/fallback to baselines.
+- A/B and shadow mode; rollout guardrails and metrics. Offline evaluation gates before live enablement.
+
+6) ML pipeline
+- Feature store contracts, training schedule, model registry, selection, versioning and backtesting alignment. Drift/monitoring, confidence calibration, and explainability surfaces.
+
+7) Backtesting & research
+- Single-source-of-truth engines for both backtest and live (avoid code forks). Walk-forward, parameter sweeps, and reproducibility. Define minimum performance gates (Sharpe, drawdown, PF) to promote to paper/live.
+
+8) Execution & slippage
+- Smart execution policies (TWAP/VWAP/Iceberg), slippage accounting, partial fills, retries, order state machine, and accurate P&L attribution.
+
+9) Observability & dashboard
+- Metrics, logs, tracing, and WebSocket schema. Dashboard API refactor into blueprints, pagination, and performance tweaks. Security/auth hardening and rate limits.
+
+10) Testing & QA
+- Unit/integration/e2e (for app and trading loop). Async fixtures, DB isolation, and deterministic seeds. Add regression tests for bugs mentioned in repo docs.
+
+11) Security & compliance
+- Secret handling, permissioning, code scanning, dependency pinning, SBOM, and supply-chain checks.
+
+12) Delivery & ops
+- Make targets/CICD, lint/type/security gates, artifacts, environment matrix. Rollout plan (dev → paper → live), dry-run scripts, runbooks, and handoff doc flow.
+
+Constraints and preferences to honor:
+- Python 3.10+, typed boundaries preferred; keep functions focused and side-effect aware.
+- Use `black`, `isort`, `flake8`, `bandit`, `mypy`. Tests must run with `pytest -q` or `make test`.
+- Default to paper trading `EXECUTION_MODE=paper`; IBKR host/port confirmed before any live.
+- Logs/DBs are ignored by git; never commit secrets; `.env.example` as template.
+
+Output format:
+- Phased plan with 6–10 milestones. For each milestone: goals, concrete work items (bulleted, specific), test plan, and success criteria. Keep it crisp but actionable. Include 1–2 quick wins that improve developer ergonomics early (e.g., fixtures, seedable datasets).
+
+Desired output: A pragmatic, staged roadmap with milestones, concrete tasks, tests, and success criteria. <End>
+
+Files to consider: robo_trader, app.py, robo_trader/runner_async.py, tests
+
+[Running in read-only mode - no modifications allowed]
+
+[2025-09-04T19:06:23] thinking
+
+**Structuring observability milestones**
+
+I'm looking at observability and dashboard hardening with a focus on testing, security, compliance, and delivery operations. The preference is for 6-10 milestones, including 1-2 quick wins early on. Each milestone needs a structured approach with goals, work items, a test plan, and success criteria while respecting constraints. I need to address details like the database schema for various elements while ensuring that everything is clear and concise without unnecessary tool calls. Let's outline the necessary schemas and fields for the tables.
+**Defining database strategies**
+
+I'm focused on defining a retention policy with daily partitions for vacuuming, considering WAL mode and DB locking via SQLite or later Postgres. I wonder if using a read replica would help. Since the repo likely uses SQLite, I propose enabling WAL, using short transactions, and implementing a busy timeout with an async queue for idempotent writes. For backpressure management, I’m thinking of utilizing a central asyncio.Queue that can handle backlogs by dropping non-critical metrics. Also, I'll consider recovery processes and trading loop concurrency strategies, especially with asyncio.
+**Analyzing risk and execution strategies**
+
+I'm focusing on risk and position sizing with daily caps and correlation-based adjustments using a correlation-aware sizing module. For tests, property-based testing seems heavy, so maybe I'll stick with unit tests. I'm thinking about the strategy lifecycle, including signals, confidence, and metadata, and implementing regime detection with a fallback to SMA if machine learning fails. The ML pipeline needs to establish a feature store contract, a training schedule with versioning, and ways to calibrate probabilities, along with drift detection and explainability. Lastly, I'll consider execution algorithms to manage slippage and improve PnL accuracy.
+**Enhancing observability and security measures**
+
+I'm working on observability and dashboard improvements using metrics from Prometheus, logs, and tracing. I want to modularize the Flask app by moving to blueprints while keeping public routes intact. Testing will include unit, integration, and end-to-end tests along with regression tests for known issues. In terms of security, I need to handle secrets, perform code scanning, and pin dependencies. Delivery and operations aspects will include CI, rollout plans, and runbooks. Additionally, I’ll define database locking strategies for SQLite to ensure efficient operations.
+**Planning Idempotent Writes and System Health**
+
+I'm defining idempotent writes for the orders table that includes an external ID with a unique constraint, and ensuring signals are unique by symbol, strategy, and timestamp, utilizing UPSERT. For managing backpressure, metrics will accumulate effectively. During a graceful shutdown, I need to handle signals like SIGINT/SIGTERM, cancel tasks, and flush queues. Health checks will involve periodic tasks with performance logging, which I'll integrate with Prometheus for monitoring. I'll also create an ownership map, listing roles like Data Engineering, Quant Research, and others for clear context management. Let's assemble the final plan!
+[2025-09-04T19:06:42] codex
+**Defining database strategies**
+
+I'm focused on defining a retention policy with daily partitions for vacuuming, considering WAL mode and DB locking via SQLite or later Postgres. I wonder if using a read replica would help. Since the repo likely uses SQLite, I propose enabling WAL, using short transactions, and implementing a busy timeout with an async queue for idempotent writes. For backpressure management, I’m thinking of utilizing a central asyncio.Queue that can handle backlogs by dropping non-critical metrics. Also, I'll consider recovery processes and trading loop concurrency strategies, especially with asyncio.
+[2025-09-04T19:06:42] codex
+**Analyzing risk and execution strategies**
+
+I'm focusing on risk and position sizing with daily caps and correlation-based adjustments using a correlation-aware sizing module. For tests, property-based testing seems heavy, so maybe I'll stick with unit tests. I'm thinking about the strategy lifecycle, including signals, confidence, and metadata, and implementing regime detection with a fallback to SMA if machine learning fails. The ML pipeline needs to establish a feature store contract, a training schedule with versioning, and ways to calibrate probabilities, along with drift detection and explainability. Lastly, I'll consider execution algorithms to manage slippage and improve PnL accuracy.
+[2025-09-04T19:06:42] codex
+**Enhancing observability and security measures**
+
+I'm working on observability and dashboard improvements using metrics from Prometheus, logs, and tracing. I want to modularize the Flask app by moving to blueprints while keeping public routes intact. Testing will include unit, integration, and end-to-end tests along with regression tests for known issues. In terms of security, I need to handle secrets, perform code scanning, and pin dependencies. Delivery and operations aspects will include CI, rollout plans, and runbooks. Additionally, I’ll define database locking strategies for SQLite to ensure efficient operations.
+[2025-09-04T19:06:42] codex
+**Planning Idempotent Writes and System Health**
+
+I'm defining idempotent writes for the orders table that includes an external ID with a unique constraint, and ensuring signals are unique by symbol, strategy, and timestamp, utilizing UPSERT. For managing backpressure, metrics will accumulate effectively. During a graceful shutdown, I need to handle signals like SIGINT/SIGTERM, cancel tasks, and flush queues. Health checks will involve periodic tasks with performance logging, which I'll integrate with Prometheus for monitoring. I'll also create an ownership map, listing roles like Data Engineering, Quant Research, and others for clear context management. Let's assemble the final plan!
+[2025-09-04T19:06:42] codex
+
+**Architecture & Ownership**
+
+- **Data Ingest:** Realtime IBKR, historical backfills, storage. Owner: Data Eng + Algo Eng.
+- **Features/ML:** Feature store, model training/registry, inference. Owner: Quant Research + ML Eng.
+- **Strategies:** Baseline/ML strategies, regime detection, signal API. Owner: Quant Research.
+- **Portfolio/Risk:** Sizing, correlation, limits, market hours. Owner: Algo Eng.
+- **Execution/IBKR:** Async client, order state machine, smart execution. Owner: Algo Eng.
+- **Backtesting:** Engine, metrics, walk-forward, sweeps. Owner: Quant Research.
+- **Monitoring/Obs:** Metrics, logs, tracing, alerts. Owner: SRE/Platform.
+- **Dashboard:** Flask app, WebSocket, auth, UX. Owner: Full‑stack Eng.
+- **Infra/Ops:** Make/CICD, env, SBOM, rollout/runbooks. Owner: Platform Eng.
+
+**Data & Reliability**
+
+- **Market Data Pathways:** 
+  - Realtime: IBKR stream → normalize → `bars_1m` (OHLCV, vwap, microstructure) + `trades_tick` (price, size, side, venue).
+  - Historical: IBKR historical API → same normalization → UPSERT into `bars_X` tables by timeframe.
+- **Schemas (SQL, stable keys):**
+  - `bars_{tf}`: `(symbol, ts, open, high, low, close, volume, vwap, source, ingest_ts, hash) PK (symbol, ts)`.
+  - `signals`: `(symbol, ts, strategy, side, confidence, meta_json, features_ref, model_version, regime, created_ts) PK (symbol, ts, strategy)`.
+  - `orders`: `(order_id, client_tag, symbol, side, qty, limit_price, time_in_force, status, routed_ts, filled_qty, avg_price, fees, parent_id, strategy, model_version, px_ref, corr_bucket) PK (order_id), UNIQUE (client_tag)`.
+  - `fills`: `(fill_id, order_id, ts, qty, price, venue, liquidity_flag)`; index on `order_id`.
+  - `positions`: `(symbol, ts, qty, avg_price, realized_pnl, unrealized_pnl)`; PK (symbol).
+  - `metrics`: `(ts, name, value, labels_json)`; index on `(name, ts)`.
+- **Retention/Archival:**
+  - Bars: keep intraday 90d hot, archive parquet monthly; daily bars 5y.
+  - Signals/orders/fills: hot 1y, archive after 1y. Nightly VACUUM/ANALYZE; WAL checkpoint weekly.
+- **DB Locking/Concurrency (SQLite today):**
+  - WAL mode, `busy_timeout=5000ms`, `synchronous=NORMAL`, one async writer task (single writer queue), N readers. Short transactions with UPSERTs; indexes on PKs and `(strategy, ts)`.
+  - Idempotency keys: `hash` on raw bar payload, `client_tag` on orders, composite keys for signals.
+- **Backpressure & Recovery:**
+  - Bounded queues per subsystem; when backlogged, drop non-critical metrics, keep signals/orders.
+  - On restart: rehydrate pending orders from DB + IBKR open orders; backfill bars for last N minutes; recompute latest features; re-run signals idempotently (UPSERT).
+
+**Trading Loop & Concurrency**
+
+- **Model:** Per-symbol task group: `ingest → features → signal → risk/size → execution → persist → publish`, with correlation sizing at portfolio step.
+- **Limits & Cancellation:** Global semaphore for IBKR calls; per-symbol task cancellation on shutdown signal. Timeouts per IO op; exponential backoff on IBKR transient errors.
+- **Health/Watchdogs:** Heartbeat task updates `metrics` every 5s; stalls detection on per-stage timers (`monitoring/performance.py`).
+- **Market Hours:** Pre-/post-market mode from `risk.market_hours`: skip order routing; still compute features, risk checks, and update dashboard.
+- **Graceful Shutdown:** Trap SIGINT/SIGTERM; stop new signals, cancel open child tasks, drain writer queue, cancel/replace child orders to safe state, persist checkpoint.
+
+**Risk, Sizing, Correlation**
+
+- **Caps:** Daily loss cap (hard stop), per-symbol exposure cap, portfolio gross/net exposure cap, per-order max notional/qty, rate limits on order submission.
+- **Correlation Adjust:** Use rolling correlation matrix and cluster buckets; scale target risk per symbol by cluster exposure and cross-asset beta.
+- **Sizing:** Volatility or Kelly‑fraction scaling bounded by risk caps; short selling toggle + borrow availability gate.
+- **Consistency:** Strategy emits raw desired delta; portfolio manager transforms to final order size. Enforce invariants: no size > cap, correlation scaling applied once, signed qty aligns with side.
+- **Testing:** Property tests for caps monotonicity; scenario tests for correlated names spikes; regression tests matching paper/live order deltas.
+
+**Strategy Lifecycle**
+
+- **Signal Interface:** `Signal(symbol, ts, side {long/short/flat}, confidence [0..1], meta: dict, regime: str, model_version: str|None)`.
+- **Regime Detection:** Separate regime module producing `regime` tag; ML strategies check regime and fallback to SMA/mean‑reversion under low confidence or drift.
+- **Rollout Modes:** Shadow (no trade), A/B by symbol bucket, progressive enablement with guardrails: max daily trades, min confidence, win‑rate floors.
+- **Offline Gates:** Require backtest + walk‑forward thresholds before paper; paper thresholds before live; risk signoff.
+
+**ML Pipeline**
+
+- **Feature Store Contract:** Versioned feature sets keyed by `(symbol, ts, feature_version)`, deterministic transforms mirrored in backtest/live.
+- **Training/Registry:** Scheduled training (daily/weekly) producing models with metadata: data window, features_version, target def, metrics; stored under `robo_trader/ml/registry` with JSON manifest.
+- **Selection:** Live picks latest passing model per strategy/regime using registry + thresholds; can pin versions via env.
+- **Monitoring:** Data drift (PSI/KS), target drift, performance drift; confidence calibration (Platt/Isotonic) logged; fallback on drift alarms.
+- **Explainability:** Log top feature importances per decision; expose on dashboard for audits.
+
+**Backtesting & Research**
+
+- **Single Source:** Ensure backtest engine uses same feature/strategy/risk/execution modules (no forks); inject exchange/latency/slippage simulators via strategy/execution hooks.
+- **Methods:** Walk‑forward, parameter sweeps; seedable datasets; reproducible runs with manifests.
+- **Promotion Gates:** Min Sharpe > 1.3, max DD < 10%, Profit Factor > 1.2, p‑value passing, stable across folds; paper→live requires 4 weeks stable paper KPIs.
+
+**Execution & Slippage**
+
+- **Smart Policies:** TWAP/VWAP/Iceberg with dynamic urgency by spread/vol/imbalance; child order sizing by ADV%.
+- **Order State Machine:** New → Routed → PartiallyFilled → Filled → CancelPending → Cancelled → Replaced → Rejected; retries with jitter; terminalization on market close.
+- **Partial Fills:** Track cumulative fills; recompute remaining child schedule; price protection bands; avoid self‑crossing.
+- **Slippage/PnL:** Attribute PnL to signal vs execution using arrival vs fill price; log per‑order slippage and fees.
+
+**Observability & Dashboard**
+
+- **Metrics:** Per-stage latency, success/error counts, queue depths, PnL, exposure, hit rate, Sharpe (rolling), drift stats; export Prometheus‑style or pushgateway if needed.
+- **Logs/Tracing:** Structured JSON logs with `trace_id`, symbol, strategy, order_id; span timings from `monitoring/performance.py`.
+- **WebSocket Schema:** Channels: `pnl`, `positions`, `signals`, `orders`, `metrics`; sequence numbers + replay window.
+- **Dashboard Hardening:** 
+  - Blueprint modularization inside current app structure (no route changes); pagination on heavy tables; caching for slow queries; SSE/WebSocket for live panes.
+  - Security: basic auth from env, IP allowlist option, rate limits, CSRF for POST, secure cookies.
+- **Perf:** Async endpoints where beneficial; DB indices aligned to queries.
+
+**Testing & QA**
+
+- **Unit:** Strategies, risk caps, sizing, feature transforms; ML utilities with fixed seeds.
+- **Integration:** End‑to‑end paper loop with mocked IBKR; DB writes/read consistency; order state machine with partial fills.
+- **E2E App:** Dashboard smoke via test client; WebSocket contract tests.
+- **Fixtures/Ergonomics (Quick Wins):** 
+  - Seedable mini dataset (5 symbols, 2 days, 1m bars) fixture.
+  - Async IBKR client stub with latency/jitter and failure modes.
+- **Determinism:** Global seeds; freeze time in tests; isolated temp DBs; pytest‑asyncio `importlib` mode compliance.
+
+**Security & Compliance**
+
+- **Secrets:** `.env` only; runtime validation; forbid commit via pre‑commit hook. 
+- **Permissioning:** Least‑privileged IBKR creds; paper by default; confirm host/port before live.
+- **Scanning:** `bandit`, `pip-audit`/`uv pip audit`, Dependabot/Renovate.
+- **Pinning & SBOM:** Hash‑pinned `requirements.txt`; `cyclonedx-py`/`pip-licenses` SBOM.
+- **Supply Chain:** Verify wheels (PEP 458/480 when available); vendor critical tiny deps if needed.
+
+**Delivery & Ops**
+
+- **Make/CICD:** Lint/type/security/test gates (`black`, `isort`, `flake8`, `mypy`, `bandit`, `pytest -q`). Artifacts: backtest reports, model manifests.
+- **Env Matrix:** py3.10/3.11, macOS/Linux; paper/live toggles.
+- **Rollout:** Dev (mock) → Paper (limited symbols) → Live (staged). Dry‑run scripts for pre‑market checks. 
+- **Runbooks:** Startup, halt, recovery, drift alarm, IBKR outage, market halt. 
+- **Handoff Flow:** Write `/handoff/` doc per session; maintain `LATEST_HANDOFF.md`; archive policy per convention.
+
+---
+
+**Milestone 1: Baseline Hardening & Quick Wins**
+- Goals:
+  - Improve developer ergonomics and determinism; enforce paper mode by default.
+- Work Items:
+  - Add mini seedable dataset fixture and async IBKR stub with failure modes.
+  - Enforce `EXECUTION_MODE=paper` default and guard live with explicit env/flag.
+  - Add unique idempotency keys for `signals` and `orders` in DB layer (UPSERT paths).
+  - Add global seeds and time freezer utilities for tests.
+- Test Plan:
+  - Unit tests for fixture integrity; verify paper guard blocks live without explicit opt‑in.
+- Success Criteria:
+  - New fixtures used by tests; all tests deterministic; paper default enforced.
+
+**Milestone 2: Data & DB Reliability**
+- Goals:
+  - Durable, idempotent, concurrent-safe storage with retention/archival.
+- Work Items:
+  - Enable WAL mode, `busy_timeout`, writer queue pattern in `database_async.py`.
+  - Define and document schemas for bars/signals/orders/fills; add indices.
+  - Implement backfill on startup for last N minutes; UPSERT everywhere.
+  - Nightly VACUUM/ANALYZE jobs; parquet archival script for bars.
+- Test Plan:
+  - Concurrency tests with N readers/1 writer; idempotent replays; retention job dry-runs.
+- Success Criteria:
+  - No lock timeouts in load tests; replay yields no duplicates; archival produces valid parquet.
+
+**Milestone 3: Trading Loop Concurrency & Market Hours**
+- Goals:
+  - Robust per-symbol pipelines with timeouts, backoff, and graceful shutdown.
+- Work Items:
+  - Introduce task supervisor and global IBKR semaphore; per-stage timeouts.
+  - Implement SIGINT/SIGTERM handling and drain procedure; watchdog heartbeat.
+  - After-hours fast path: compute features/signals, skip routing.
+- Test Plan:
+  - Integration test simulating timeouts/cancellations; after-hours mode skips orders.
+- Success Criteria:
+  - Clean shutdown under load; no orphan tasks; correct after‑hours behavior.
+
+**Milestone 4: Risk, Sizing, Correlation Unification**
+- Goals:
+  - Single sizing path with correlation and caps consistently applied.
+- Work Items:
+  - Strategy emits desired delta; portfolio manager applies vol/Kelly scaling and correlation adjustments.
+  - Implement daily loss/position/gross caps and per-order notional caps; short toggle.
+  - Rate limiter for order submissions.
+- Test Plan:
+  - Property tests for cap invariants; scenarios with correlated baskets and spikes.
+- Success Criteria:
+  - Orders always within caps; correlation scaling reduces exposure per design.
+
+**Milestone 5: Strategy Interface, Regime, and Rollout**
+- Goals:
+  - Stable signal contract, regime-aware ML with safe fallbacks and rollout controls.
+- Work Items:
+  - Standardize `Signal` dataclass + builders in `strategies/framework.py`.
+  - Regime detector module; ML strategies consult regime and fallback to SMA when needed.
+  - Shadow/A‑B modes with per-symbol bucketing; guardrails (trade count, min confidence).
+- Test Plan:
+  - Unit tests for regime decisions; A/B routing correctness; fallback triggers on low confidence/drift.
+- Success Criteria:
+  - Rollout modes togglable per env; safe fallback observed in simulation.
+
+**Milestone 6: ML Pipeline, Registry, and Drift**
+- Goals:
+  - Repeatable training, versioned models, calibrated confidence, drift monitoring.
+- Work Items:
+  - Model registry with manifests; selection logic and pinning via env.
+  - Calibration step integrated into inference; log calibration metrics.
+  - Drift detectors (PSI/KS) + alerts; automatic downgrade to baseline on drift.
+- Test Plan:
+  - Train on seed dataset; verify registry selection; calibration sanity tests; drift alarm simulation.
+- Success Criteria:
+  - Models loaded by version; drift triggers fallback; metrics visible in dashboard.
+
+**Milestone 7: Backtesting Parity & Research Tooling**
+- Goals:
+  - True parity between backtest and live with reproducible research.
+- Work Items:
+  - Ensure backtest uses live feature/strategy/risk paths; add execution simulator hooks.
+  - Walk‑forward utilities and param sweep harness; manifest per run (config + seeds).
+- Test Plan:
+  - Golden parity tests: same inputs → same signals; walk‑forward regression.
+- Success Criteria:
+  - Parity tests pass; promotion gates enforced automatically in CI for new strategies.
+
+**Milestone 8: Execution Engine & Slippage Accounting**
+- Goals:
+  - Robust order state machine, smart slicing, accurate PnL/slippage.
+- Work Items:
+  - Implement state machine and retries; partial fill accumulation and rescheduling.
+  - TWAP/VWAP/Iceberg policies with urgency by microstructure inputs.
+  - PnL attribution by arrival vs fill; per-order slippage logs.
+- Test Plan:
+  - Simulated partial fills; rejection/retry flows; slippage attribution unit tests.
+- Success Criteria:
+  - No stuck orders; accurate cumulative fills; slippage tracked per order.
+
+**Milestone 9: Observability & Dashboard Hardening**
+- Goals:
+  - High-signal metrics/logs and responsive, secure dashboard.
+- Work Items:
+  - Metrics export + structured logging with trace IDs; span timings integration.
+  - WebSocket channels with replay; pagination and caching on heavy endpoints.
+  - Security hardening: auth, rate limits, CSRF, IP allowlist.
+- Test Plan:
+  - Load tests on dashboard endpoints; WebSocket contract tests; auth/rate limit tests.
+- Success Criteria:
+  - P95 endpoint latency < 200ms on seed data; stable live updates; basic auth enforced.
+
+**Milestone 10: Testing, Security, and Delivery Ops**
+- Goals:
+  - Strong CI gates, supply chain safety, and clean rollout/runbooks/handoff.
+- Work Items:
+  - CI matrix with lint/type/security/tests; SBOM generation and `pip-audit`.
+  - Pre‑commit hooks; dependency pinning and update automation.
+  - Dry‑run scripts; runbooks for outages/drift; handoff doc automation per convention.
+- Test Plan:
+  - CI runs across Python versions; SBOM present; dry‑run checks pass.
+- Success Criteria:
+  - Green CI with gates; regular dependency updates; clear runbooks and handoffs.
+
+If you want, I can cross-check `runner_async.py` and key modules to tailor specific hooks (writer queue, signal dataclass, shutdown flow) and draft the initial test fixtures as a starter PR.
+[2025-09-04T19:07:58] tokens used: 14537

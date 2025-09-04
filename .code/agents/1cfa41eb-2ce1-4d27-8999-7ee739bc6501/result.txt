@@ -1,0 +1,110 @@
+Here is a comprehensive, staged plan to evolve and operate the RoboTrader system.
+
+### Architecture and Ownership Map
+
+| Bounded Context | Description | Owner/Role |
+| :--- | :--- | :--- |
+| **Data Ingest & Reliability** | Manages real-time and historical market data feeds, ensuring data quality, availability, and integrity. | Data Engineer |
+| **Feature/ML Pipeline** | Develops and maintains the feature engineering pipeline, model training, versioning, and monitoring. | ML Engineer |
+| **Strategy Layer** | Implements, tests, and manages trading strategies, including their lifecycle from research to production. | Quant Developer |
+| **Portfolio/Risk Management** | Oversees portfolio construction, risk exposure, and capital allocation across all strategies. | Risk Manager |
+| **Execution & IBKR Integration** | Manages order execution, connectivity with Interactive Brokers, and slippage monitoring. | Trading Systems Engineer |
+| **Backtesting & Research** | Provides a robust framework for strategy backtesting, research, and performance analysis. | Quant Researcher |
+| **Monitoring & Observability** | Develops and maintains the monitoring, logging, and alerting infrastructure for the trading system. | Site Reliability Engineer (SRE) |
+| **Dashboard & Visualization** | Creates and maintains the user interface for monitoring and interacting with the trading system. | Frontend Developer |
+| **Infrastructure & Operations** | Manages the deployment, scaling, and reliability of the trading infrastructure. | DevOps Engineer |
+
+---
+
+### Phased Roadmap
+
+#### Milestone 1: Foundational Enhancements & Developer Ergonomics
+
+*   **Goals**: Improve developer experience, strengthen testing foundations, and enhance observability.
+*   **Work Items**:
+    *   **Quick Win**: Create a `seeded_test_data.py` script to generate deterministic datasets for tests.
+    *   **Quick Win**: Implement a `pytest` fixture for isolated, in-memory SQLite database instances.
+    *   Refactor `app.py` into a package with Blueprints for better organization (`dashboard/`, `api/`).
+    *   Introduce structured logging (e.g., using `structlog`) across the application.
+*   **Test Plan**:
+    *   Verify that the new fixture provides a clean database for each test function.
+    *   Ensure all API endpoints in the refactored dashboard work as expected.
+*   **Success Criteria**:
+    *   Reduced boilerplate in tests.
+    *   Logs are queryable and provide clear context.
+
+#### Milestone 2: Data Reliability & Idempotency
+
+*   **Goals**: Ensure robust data handling and prevent data corruption.
+*   **Work Items**:
+    *   Implement idempotent write operations in `database_async.py` using `INSERT ... ON CONFLICT DO NOTHING`.
+    *   Define a clear schema for market data, signals, and trades with data validation.
+    *   Establish a data retention and archival policy for the SQLite database.
+*   **Test Plan**:
+    *   Write tests to verify that duplicate data insertion is handled gracefully.
+    *   Create a script to simulate database recovery from a backup.
+*   **Success Criteria**:
+    *   No data duplication or corruption under high load.
+    *   Clear and enforceable data management policies.
+
+#### Milestone 3: Advanced Risk Management
+
+*   **Goals**: Implement sophisticated risk controls to protect capital.
+*   **Work Items**:
+    *   Integrate volatility-based position sizing (e.g., using ATR).
+    *   Implement pre-trade checks for fat-finger errors and compliance with risk limits.
+    *   Add controls for short selling, including borrow availability checks.
+*   **Test Plan**:
+    *   Develop a suite of tests to simulate various risk scenarios (e.g., flash crashes, fat-finger trades).
+    *   Verify that the system halts trading when critical risk limits are breached.
+*   **Success Criteria**:
+    *   The system prevents trades that violate risk policies.
+    *   Position sizes are dynamically adjusted based on market volatility.
+
+#### Milestone 4: Strategy Lifecycle Management
+
+*   **Goals**: Streamline the process of developing, testing, and deploying new strategies.
+*   **Work Items**:
+    *   Define a formal strategy interface with clear contracts for signals and metadata.
+    *   Implement a shadow mode for new strategies to run without executing trades.
+    *   Develop a framework for A/B testing different strategies in a live environment.
+*   **Test Plan**:
+    *   Create a sample strategy and test its lifecycle from shadow mode to live deployment.
+    *   Verify that A/B testing metrics are accurately collected and reported.
+*   **Success Criteria**:
+    *   New strategies can be safely tested and deployed without manual intervention.
+    *   Clear performance data is available to compare strategies.
+
+#### Milestone 5: ML Pipeline Automation
+
+*   **Goals**: Automate the ML model lifecycle from training to deployment.
+*   **Work Items**:
+    *   Implement a feature store to ensure consistency between training and inference.
+    *   Automate model retraining and versioning using a model registry.
+    *   Set up monitoring for model drift and data quality.
+*   **Test Plan**:
+    *   Write an end-to-end test for the ML pipeline, from feature generation to model deployment.
+    *   Simulate data drift and verify that the monitoring system raises an alert.
+*   **Success Criteria**:
+    *   The ML pipeline is fully automated and requires minimal manual intervention.
+    *   Model performance is continuously monitored and maintained.
+
+#### Milestone 6: Production Hardening & CI/CD
+
+*   **Goals**: Prepare the system for production deployment with a robust CI/CD pipeline.
+*   **Work Items**:
+    *   Create a comprehensive CI/CD pipeline in `.github/workflows/` that runs linting, typing, security checks, and tests.
+    *   Implement a secure secret management solution (e.g., HashiCorp Vault or AWS Secrets Manager).
+    *   Develop a rollback plan and runbooks for handling production incidents.
+*   **Test Plan**:
+    *   Trigger the CI/CD pipeline and ensure all checks pass.
+    *   Conduct a mock incident response drill to test the runbooks.
+*   **Success Criteria**:
+    *   All code is automatically tested and validated before deployment.
+    *   The team is prepared to handle production incidents effectively.Here is a comprehensive, staged plan to evolve and operate the RoboTrader system.
+
+### **Architecture and Ownership Map**
+
+First, a conceptual map of the system's bounded contexts and the roles responsible for them. This informs the division of labor in the subsequent milestones.
+
+| Bounded Context                 | Primary Code

@@ -260,3 +260,31 @@ class WebSocketManager:
 
 # Global WebSocket manager instance
 ws_manager = WebSocketManager()
+
+
+if __name__ == "__main__":
+    """Run the WebSocket server standalone."""
+    import signal
+    import sys
+    
+    def signal_handler(sig, frame):
+        print("\nShutting down WebSocket server...")
+        ws_manager.stop()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    print(f"Starting WebSocket server on ws://localhost:8765")
+    print("Press Ctrl+C to stop")
+    
+    # Run the server
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        loop.run_until_complete(ws_manager.start_server())
+    except KeyboardInterrupt:
+        print("\nShutdown requested...")
+    finally:
+        loop.close()
+        print("WebSocket server stopped")

@@ -262,7 +262,33 @@ class AsyncRunner:
             if self.portfolio_manager:
                 self.portfolio_manager.register_strategy(SimpleNamespace(name="Baseline_SMA"), initial_weight=1.0)
 
+        # Load existing positions from database to prevent duplicate buying
+        await self.load_existing_positions()
+
         logger.info("AsyncRunner setup complete")
+
+    async def load_existing_positions(self):
+        """Load existing positions from database on startup to prevent duplicate buying."""
+        try:
+            positions_data = await self.db.get_positions()
+            for pos in positions_data:
+                if pos.get('quantity', 0) > 0:  # Only load open positions
+                    symbol = pos['symbol']
+                    quantity = pos['quantity']
+                    avg_cost = pos.get('avg_cost', pos.get('price', 0))
+                    
+                    # Create Position object and add to positions dict
+                    self.positions[symbol] = Position(symbol, quantity, avg_cost)
+                    logger.info(f"Loaded existing position: {symbol} qty={quantity} avg_cost=${avg_cost:.2f}")
+            
+            if self.positions:
+                logger.info(f"Loaded {len(self.positions)} existing positions from database: {list(self.positions.keys())}")
+            else:
+                logger.info("No existing positions found in database")
+                
+        except Exception as e:
+            logger.error(f"Failed to load existing positions from database: {e}")
+            logger.warning("Starting with empty positions - may result in duplicate trades!")
 
     async def teardown(self):
         """Clean up resources."""
@@ -805,6 +831,26 @@ class AsyncRunner:
 
         finally:
             await self.teardown()
+
+    async def cleanup(self):
+        """Clean up resources when runner is done."""
+        try:
+            # Disconnect from IB Gateway if exists
+            if hasattr(self, 'ib') and self.ib and self.ib.isConnected():
+                logger.info("Disconnecting from IB Gateway...")
+                self.ib.disconnect()
+            
+            # Close database connections
+            if hasattr(self, 'db') and self.db:
+                await self.db.close()
+                
+            # Stop WebSocket updates
+            if hasattr(self, 'ws_client'):
+                self.ws_client.stop()
+                
+            logger.info("Cleanup completed")
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
 
 
 async def run_once(

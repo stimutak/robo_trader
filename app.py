@@ -1129,7 +1129,8 @@ HTML_TEMPLATE = '''
                 loadWatchlist(),
                 loadPositions(),
                 loadMLData(),
-                loadPerformanceData()
+                loadPerformanceData(),
+                loadTrades()  // Add trades to refresh cycle
             ]);
         }
         
@@ -2516,10 +2517,6 @@ def get_trades():
         from sync_db_reader import SyncDatabaseReader
         db = SyncDatabaseReader()
 
-        # Get trades with optional filtering
-        days = request.args.get('days', 30, type=int)
-        trades = db.get_trades(days=days)
-        
         # Get trades with optional filtering
         days = request.args.get('days', 30, type=int)
         symbol = request.args.get('symbol', None)
