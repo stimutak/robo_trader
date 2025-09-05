@@ -23,15 +23,17 @@ from flask import Flask, Response, jsonify, render_template_string, request, sen
 
 load_dotenv()
 
+from robo_trader.analytics.performance import PerformanceAnalyzer  # noqa: E402
+
 # Import our modules - using lazy imports to avoid startup issues
 from robo_trader.config import load_config  # noqa: E402
-from robo_trader.logger import get_logger  # noqa: E402
 
 # Lazy imports to avoid blocking startup
 from robo_trader.database_async import AsyncTradingDatabase  # noqa: E402
-from robo_trader.analytics.performance import PerformanceAnalyzer  # noqa: E402
 from robo_trader.features.feature_pipeline import FeaturePipeline  # noqa: E402
+from robo_trader.logger import get_logger  # noqa: E402
 from robo_trader.ml.model_trainer import ModelTrainer  # noqa: E402
+
 # from robo_trader.websocket_server import ws_manager
 
 logger = get_logger(__name__)
@@ -2198,7 +2200,6 @@ def get_pnl():
         daily_pnl = 0
 
         # Simple realized P&L from SELL trades
-        from datetime import datetime, timedelta
 
         today = datetime.now().date()
 
@@ -2458,7 +2459,6 @@ def get_pnl_OLD():
                 daily_pnl += daily_change
 
             # Add today's realized P&L from trades
-            from datetime import timedelta
 
             today_start = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -2737,10 +2737,10 @@ def ml_status():
                 confidences = [p.get("confidence", 0) for p in predictions.values()]
                 avg_confidence = sum(confidences) / len(confidences) if confidences else 0
                 for pred in predictions.values():
-                    signal = pred.get("signal", 0)
-                    if signal > 0:
+                    pred_signal = pred.get("signal", 0)
+                    if pred_signal > 0:
                         bullish_count += 1
-                    elif signal < 0:
+                    elif pred_signal < 0:
                         bearish_count += 1
         except Exception as e:
             logger.debug(f"Could not load predictions: {e}")
@@ -2759,11 +2759,11 @@ def ml_status():
                 "bearish": bearish_count,
                 "neutral": active_predictions - bullish_count - bearish_count,
             },
-            "last_prediction_time": datetime.fromtimestamp(
-                predictions_file.stat().st_mtime
-            ).isoformat()
-            if predictions_file.exists()
-            else None,
+            "last_prediction_time": (
+                datetime.fromtimestamp(predictions_file.stat().st_mtime).isoformat()
+                if predictions_file.exists()
+                else None
+            ),
             "top_features": [
                 {"name": "RSI_14", "importance": 0.15, "category": "Technical"},
                 {"name": "correlation_spy", "importance": 0.12, "category": "Cross-asset"},
@@ -2780,10 +2780,6 @@ def ml_status():
 def performance():
     """Get real performance metrics from trading data"""
     try:
-        from datetime import datetime, timedelta
-
-        import numpy as np
-
         from sync_db_reader import SyncDatabaseReader
 
         db = SyncDatabaseReader()
@@ -2904,9 +2900,9 @@ def performance():
         return jsonify(
             {
                 "summary": {
-                    "total_return": round(total_pnl / estimated_capital, 4)
-                    if estimated_capital > 0
-                    else 0,
+                    "total_return": (
+                        round(total_pnl / estimated_capital, 4) if estimated_capital > 0 else 0
+                    ),
                     "total_pnl": round(total_pnl, 2),
                     "total_sharpe": round(sharpe, 2),
                     "total_drawdown": round(max_dd, 4),
@@ -2916,9 +2912,9 @@ def performance():
                     "losing_trades": len(losing_trades),
                 },
                 "daily": {
-                    "return_pct": round(daily_pnl / estimated_capital, 4)
-                    if estimated_capital > 0
-                    else 0,
+                    "return_pct": (
+                        round(daily_pnl / estimated_capital, 4) if estimated_capital > 0 else 0
+                    ),
                     "pnl": round(daily_pnl, 2),
                     "trades": len(daily_trades),
                     "volatility": 0,  # Not calculated yet
@@ -2926,9 +2922,9 @@ def performance():
                     "max_drawdown": 0,  # Not calculated yet
                 },
                 "weekly": {
-                    "return_pct": round(weekly_pnl / estimated_capital, 4)
-                    if estimated_capital > 0
-                    else 0,
+                    "return_pct": (
+                        round(weekly_pnl / estimated_capital, 4) if estimated_capital > 0 else 0
+                    ),
                     "pnl": round(weekly_pnl, 2),
                     "trades": len(weekly_trades),
                     "volatility": 0,  # Not calculated yet
@@ -2936,9 +2932,9 @@ def performance():
                     "max_drawdown": 0,  # Not calculated yet
                 },
                 "monthly": {
-                    "return_pct": round(monthly_pnl / estimated_capital, 4)
-                    if estimated_capital > 0
-                    else 0,
+                    "return_pct": (
+                        round(monthly_pnl / estimated_capital, 4) if estimated_capital > 0 else 0
+                    ),
                     "pnl": round(monthly_pnl, 2),
                     "trades": len(monthly_trades),
                     "volatility": 0,  # Not calculated yet
@@ -2946,9 +2942,9 @@ def performance():
                     "max_drawdown": 0,  # Not calculated yet
                 },
                 "all": {
-                    "return_pct": round(total_pnl / estimated_capital, 4)
-                    if estimated_capital > 0
-                    else 0,
+                    "return_pct": (
+                        round(total_pnl / estimated_capital, 4) if estimated_capital > 0 else 0
+                    ),
                     "pnl": round(total_pnl, 2),
                     "trades": len(all_trades),
                     "volatility": round(std_return if "std_return" in locals() else 0, 3),
@@ -2992,9 +2988,11 @@ def get_trades():
                         "slippage": trade.get("slippage", 0),
                         "commission": trade.get("commission", 0),
                         "notional": trade["quantity"] * trade["price"],
-                        "cash_impact": -trade["quantity"] * trade["price"]
-                        if trade["side"] == "BUY"
-                        else trade["quantity"] * trade["price"],
+                        "cash_impact": (
+                            -trade["quantity"] * trade["price"]
+                            if trade["side"] == "BUY"
+                            else trade["quantity"] * trade["price"]
+                        ),
                     }
                 )
 

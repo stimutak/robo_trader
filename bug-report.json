@@ -1,5 +1,5 @@
 {
-  "timestamp": "2025-09-05T10:46:35.367186",
+  "timestamp": "2025-09-05T10:55:26.097750",
   "total_bugs": 166,
   "by_severity": {
     "critical": 0,
@@ -1416,30 +1416,30 @@
       "description": "Import of subprocess may pose security risks"
     },
     {
-      "id": "import_security_app.py_1985",
+      "id": "import_security_app.py_1987",
       "severity": "medium",
       "category": "security",
       "title": "Potentially unsafe import: os",
       "file_path": "app.py",
-      "line_number": 1985,
+      "line_number": 1987,
       "description": "Import of os may pose security risks"
     },
     {
-      "id": "nested_loops_app.py_2373",
+      "id": "nested_loops_app.py_2374",
       "severity": "medium",
       "category": "performance",
       "title": "Deeply nested loops",
       "file_path": "app.py",
-      "line_number": 2373,
+      "line_number": 2374,
       "description": "Found 3 levels of nested loops"
     },
     {
-      "id": "nested_loops_app.py_2412",
+      "id": "nested_loops_app.py_2413",
       "severity": "medium",
       "category": "performance",
       "title": "Deeply nested loops",
       "file_path": "app.py",
-      "line_number": 2412,
+      "line_number": 2413,
       "description": "Found 3 levels of nested loops"
     },
     {
