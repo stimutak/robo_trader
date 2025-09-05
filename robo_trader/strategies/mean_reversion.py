@@ -292,7 +292,6 @@ class MeanReversionStrategy(Strategy):
                         or reversion_score > 0.5  # Becoming overbought
                         or holding_period >= self.max_holding_periods
                     ):  # Max holding time
-
                         return Signal(
                             timestamp=datetime.now(),
                             symbol=symbol,
@@ -317,7 +316,6 @@ class MeanReversionStrategy(Strategy):
                         or reversion_score < -0.5  # Becoming oversold
                         or holding_period >= self.max_holding_periods
                     ):
-
                         return Signal(
                             timestamp=datetime.now(),
                             symbol=symbol,

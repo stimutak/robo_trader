@@ -18,7 +18,7 @@ from .bug_agent import (
 
 __all__ = [
     "BugAgent",
-    "BugCategory", 
+    "BugCategory",
     "BugDetectionConfig",
     "BugReport",
     "BugSeverity",

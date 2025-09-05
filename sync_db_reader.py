@@ -9,15 +9,16 @@ Hardened for concurrent access with the async trader:
 
 import sqlite3
 import time
-from typing import Dict, List, Optional, Tuple
 from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
 
 class SyncDatabaseReader:
     """Simple sync database reader to avoid locking issues"""
-    
-    def __init__(self, db_path='trading_data.db'):
+
+    def __init__(self, db_path="trading_data.db"):
         self.db_path = db_path
-    
+
     def _make_uri(self, read_only: bool = True) -> str:
         """Build a SQLite URI for the database path."""
         if read_only:
@@ -29,7 +30,7 @@ class SyncDatabaseReader:
         conn = sqlite3.connect(
             self._make_uri(read_only=read_only),
             uri=True,
-            timeout=5.0,           # wait for busy writer up to 5s
+            timeout=5.0,  # wait for busy writer up to 5s
             isolation_level=None,  # autocommit, avoid long read txns
         )
         conn.row_factory = sqlite3.Row
@@ -65,8 +66,14 @@ class SyncDatabaseReader:
             except sqlite3.OperationalError as e:
                 last_exc = e
                 msg = str(e).lower()
-                if ("database is locked" in msg or "database table is locked" in msg or "resource busy" in msg) and attempt < retries - 1:
-                    print(f"Database locked on attempt {attempt + 1}/{retries}, retrying in {delay}s...")
+                if (
+                    "database is locked" in msg
+                    or "database table is locked" in msg
+                    or "resource busy" in msg
+                ) and attempt < retries - 1:
+                    print(
+                        f"Database locked on attempt {attempt + 1}/{retries}, retrying in {delay}s..."
+                    )
                     time.sleep(delay)
                     delay *= 2
                     continue
@@ -90,7 +97,7 @@ class SyncDatabaseReader:
     def _fetch_one(self, sql: str, params: Tuple = (), retries: int = 3) -> Optional[sqlite3.Row]:
         rows = self._fetch_all(sql, params, retries)
         return rows[0] if rows else None
-    
+
     def get_positions(self) -> List[Dict]:
         """Get all current positions"""
         try:
@@ -105,7 +112,7 @@ class SyncDatabaseReader:
         except Exception as e:
             print(f"Error getting positions: {e}")
             return []
-    
+
     def get_recent_trades(self, limit: int = 100, symbol: Optional[str] = None) -> List[Dict]:
         """Get recent trades"""
         try:
@@ -132,7 +139,7 @@ class SyncDatabaseReader:
         except Exception as e:
             print(f"Error getting trades: {e}")
             return []
-    
+
     def get_account_info(self) -> Dict:
         """Get current account information"""
         try:
@@ -145,11 +152,23 @@ class SyncDatabaseReader:
             )
             if row:
                 return dict(row)
-            return {'cash': 100000, 'equity': 100000, 'daily_pnl': 0, 'realized_pnl': 0, 'unrealized_pnl': 0}
+            return {
+                "cash": 100000,
+                "equity": 100000,
+                "daily_pnl": 0,
+                "realized_pnl": 0,
+                "unrealized_pnl": 0,
+            }
         except Exception as e:
             print(f"Error getting account: {e}")
-            return {'cash': 100000, 'equity': 100000, 'daily_pnl': 0, 'realized_pnl': 0, 'unrealized_pnl': 0}
-    
+            return {
+                "cash": 100000,
+                "equity": 100000,
+                "daily_pnl": 0,
+                "realized_pnl": 0,
+                "unrealized_pnl": 0,
+            }
+
     def get_latest_market_data(self, symbol: str, limit: int = 100) -> List[Dict]:
         """Get latest market data for a symbol"""
         try:
@@ -167,7 +186,7 @@ class SyncDatabaseReader:
         except Exception as e:
             print(f"Error getting market data: {e}")
             return []
-    
+
     def get_signals(self, hours: int = 1) -> List[Dict]:
         """Get recent signals"""
         try:

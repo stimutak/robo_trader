@@ -7,13 +7,24 @@ import unittest
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, Mock, patch
 
-from robo_trader.production import (AlertCategory, AlertManager, AlertRule,
-                                    AlertSeverity, ComponentHealth,
-                                    ComponentStatus, ConfigManager,
-                                    EmergencyStopManager, Environment,
-                                    FeatureFlags, HealthMonitor, HealthStatus,
-                                    ProductionConfig, StopReason, StopScope,
-                                    TradingLimits)
+from robo_trader.production import (
+    AlertCategory,
+    AlertManager,
+    AlertRule,
+    AlertSeverity,
+    ComponentHealth,
+    ComponentStatus,
+    ConfigManager,
+    EmergencyStopManager,
+    Environment,
+    FeatureFlags,
+    HealthMonitor,
+    HealthStatus,
+    ProductionConfig,
+    StopReason,
+    StopScope,
+    TradingLimits,
+)
 
 
 class TestConfigManager(unittest.TestCase):
@@ -113,9 +124,7 @@ class TestHealthMonitor(unittest.TestCase):
         """Test running health checks."""
         # Register a mock check
         check_func = Mock(
-            return_value=ComponentHealth(
-                name="test", status=ComponentStatus.UP, message="Healthy"
-            )
+            return_value=ComponentHealth(name="test", status=ComponentStatus.UP, message="Healthy")
         )
 
         self.monitor.register_health_check("test", check_func)
@@ -247,9 +256,7 @@ class TestEmergencyStop(unittest.TestCase):
     def test_resume_trading(self):
         """Test resuming trading after stop."""
         # Execute stop
-        self.stop_manager.emergency_stop(
-            reason=StopReason.MANUAL, scope=StopScope.ALL_TRADING
-        )
+        self.stop_manager.emergency_stop(reason=StopReason.MANUAL, scope=StopScope.ALL_TRADING)
 
         self.assertTrue(self.stop_manager.is_stopped)
 
@@ -387,15 +394,9 @@ class TestAlertManager(unittest.TestCase):
     def test_alert_statistics(self):
         """Test alert statistics generation."""
         # Create various alerts
-        self.alert_manager.create_alert(
-            AlertSeverity.INFO, AlertCategory.TRADING, "Info", "msg"
-        )
-        self.alert_manager.create_alert(
-            AlertSeverity.WARNING, AlertCategory.RISK, "Warning", "msg"
-        )
-        self.alert_manager.create_alert(
-            AlertSeverity.ERROR, AlertCategory.SYSTEM, "Error", "msg"
-        )
+        self.alert_manager.create_alert(AlertSeverity.INFO, AlertCategory.TRADING, "Info", "msg")
+        self.alert_manager.create_alert(AlertSeverity.WARNING, AlertCategory.RISK, "Warning", "msg")
+        self.alert_manager.create_alert(AlertSeverity.ERROR, AlertCategory.SYSTEM, "Error", "msg")
 
         stats = self.alert_manager.get_statistics()
 

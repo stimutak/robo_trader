@@ -1,0 +1,188 @@
+name: BugBot - Automated Bug Detection
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Run daily at 6 AM UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  bugbot:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Run BugBot scan
+      run: |
+        python scripts/bug_detector.py --scan --config production --tools mypy,bandit,flake8 --output bug-report.json
+    
+    - name: Upload bug report
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: bugbot-report
+        path: bug-report.json
+    
+    - name: Create GitHub Issue for Critical Bugs
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          try {
+            const report = JSON.parse(fs.readFileSync('bug-report.json', 'utf8'));
+            const criticalBugs = report.bugs.filter(bug => bug.severity === 'critical');
+            const highBugs = report.bugs.filter(bug => bug.severity === 'high');
+            
+            if (criticalBugs.length > 0) {
+              let issueBody = '## 🚨 Critical Bugs Detected by BugBot\n\n';
+              issueBody += `**Scan Date:** ${new Date().toISOString()}\n`;
+              issueBody += `**Total Critical Bugs:** ${criticalBugs.length}\n\n`;
+              
+              issueBody += '### Critical Issues:\n';
+              criticalBugs.forEach((bug, index) => {
+                issueBody += `${index + 1}. **${bug.file_path}:${bug.line_number || '?'}** - ${bug.title}\n`;
+                issueBody += `   - ${bug.description}\n`;
+                issueBody += `   - Category: ${bug.category}\n\n`;
+              });
+              
+              if (highBugs.length > 0) {
+                issueBody += `### High Priority Issues (${highBugs.length}):\n`;
+                highBugs.slice(0, 10).forEach((bug, index) => {
+                  issueBody += `${index + 1}. **${bug.file_path}:${bug.line_number || '?'}** - ${bug.title}\n`;
+                });
+                if (highBugs.length > 10) {
+                  issueBody += `- ... and ${highBugs.length - 10} more high priority bugs\n`;
+                }
+              }
+              
+              issueBody += '\n---\n';
+              issueBody += '**BugBot Report:** This issue was automatically created by BugBot.\n';
+              issueBody += '**Action Required:** Please review and fix critical bugs before merging.\n';
+              
+              // Check if similar issue already exists
+              const existingIssues = await github.rest.issues.listForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                labels: 'bugbot,critical'
+              });
+              
+              const hasRecentIssue = existingIssues.data.some(issue => {
+                const issueDate = new Date(issue.created_at);
+                const now = new Date();
+                const hoursDiff = (now - issueDate) / (1000 * 60 * 60);
+                return hoursDiff < 24; // Within last 24 hours
+              });
+              
+              if (!hasRecentIssue) {
+                await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: `🚨 BugBot: ${criticalBugs.length} Critical Bugs Detected`,
+                  body: issueBody,
+                  labels: ['bugbot', 'critical', 'automated']
+                });
+              }
+            }
+          } catch (error) {
+            console.log('Error processing bug report:', error);
+          }
+    
+    - name: Comment on PR with Bug Report
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          try {
+            const report = JSON.parse(fs.readFileSync('bug-report.json', 'utf8'));
+            const criticalBugs = report.bugs.filter(bug => bug.severity === 'critical');
+            const highBugs = report.bugs.filter(bug => bug.severity === 'high');
+            
+            if (criticalBugs.length > 0 || highBugs.length > 0) {
+              let comment = '## 🤖 BugBot Report\n\n';
+              comment += `**Total Bugs Found:** ${report.total_bugs}\n`;
+              comment += `**Critical:** ${criticalBugs.length} | **High:** ${highBugs.length}\n\n`;
+              
+              if (criticalBugs.length > 0) {
+                comment += '### 🚨 Critical Bugs (Must Fix)\n';
+                criticalBugs.slice(0, 5).forEach(bug => {
+                  comment += `- **${bug.file_path}:${bug.line_number || '?'}** - ${bug.title}\n`;
+                });
+                if (criticalBugs.length > 5) {
+                  comment += `- ... and ${criticalBugs.length - 5} more critical bugs\n`;
+                }
+                comment += '\n';
+              }
+              
+              if (highBugs.length > 0) {
+                comment += '### ⚠️ High Priority Bugs\n';
+                highBugs.slice(0, 5).forEach(bug => {
+                  comment += `- **${bug.file_path}:${bug.line_number || '?'}** - ${bug.title}\n`;
+                });
+                if (highBugs.length > 5) {
+                  comment += `- ... and ${highBugs.length - 5} more high priority bugs\n`;
+                }
+                comment += '\n';
+              }
+              
+              comment += '---\n';
+              comment += '**BugBot** 🤖 | [View Full Report](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID})';
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            } else {
+              const comment = '## 🤖 BugBot Report\n\n✅ **No critical or high priority bugs found!**\n\n' +
+                            `Total bugs: ${report.total_bugs} (all medium/low priority)\n\n` +
+                            '---\n' +
+                            '**BugBot** 🤖 | [View Full Report](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID})';
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            }
+          } catch (error) {
+            console.log('Error processing bug report:', error);
+          }
+    
+    - name: Fail on Critical Bugs
+      if: github.event_name == 'pull_request'
+      run: |
+        python -c "
+        import json
+        try:
+            with open('bug-report.json', 'r') as f:
+                report = json.load(f)
+            critical_count = report.get('critical_bugs', 0)
+            if critical_count > 0:
+                print(f'❌ BugBot found {critical_count} critical bugs!')
+                print('Please fix critical bugs before merging.')
+                exit(1)
+            else:
+                print('✅ BugBot: No critical bugs found')
+        except FileNotFoundError:
+            print('⚠️ BugBot: No bug report found')
+        "

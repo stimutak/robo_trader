@@ -1,48 +1,59 @@
 #!/usr/bin/env python3
 """Simple dashboard test to verify market status functionality."""
 
-from flask import Flask, jsonify
-from datetime import datetime
 import os
+from datetime import datetime
+
+from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-@app.route('/api/market/status')
+
+@app.route("/api/market/status")
 def market_status():
     """Get current market status"""
-    from robo_trader.market_hours import is_market_open, get_market_session, get_next_market_open, seconds_until_market_open
-    
+    from robo_trader.market_hours import (
+        get_market_session,
+        get_next_market_open,
+        is_market_open,
+        seconds_until_market_open,
+    )
+
     current_time = datetime.now()
     is_open = is_market_open()
     session = get_market_session()
-    
+
     result = {
-        'is_open': is_open,
-        'session': session,
-        'current_time': current_time.isoformat(),
-        'status_text': session.replace('-', ' ').title()
+        "is_open": is_open,
+        "session": session,
+        "current_time": current_time.isoformat(),
+        "status_text": session.replace("-", " ").title(),
     }
-    
+
     if not is_open:
         next_open = get_next_market_open()
         seconds_until = seconds_until_market_open()
-        result.update({
-            'next_open': next_open.isoformat(),
-            'seconds_until_open': seconds_until,
-            'time_until_open': f"{seconds_until // 3600}h {(seconds_until % 3600) // 60}m"
-        })
-    
+        result.update(
+            {
+                "next_open": next_open.isoformat(),
+                "seconds_until_open": seconds_until,
+                "time_until_open": f"{seconds_until // 3600}h {(seconds_until % 3600) // 60}m",
+            }
+        )
+
     return jsonify(result)
 
-@app.route('/api/health')
+
+@app.route("/api/health")
 def health():
     """Health check endpoint"""
-    return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
-@app.route('/')
+
+@app.route("/")
 def index():
     """Simple test page"""
-    return '''
+    return """
     <!DOCTYPE html>
     <html>
     <head>
@@ -97,13 +108,10 @@ def index():
         </script>
     </body>
     </html>
-    '''
+    """
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     print("Starting simple dashboard test...")
     print(f"Dashboard will be available at: http://localhost:{os.getenv('DASH_PORT', 5556)}")
-    app.run(
-        host='0.0.0.0',
-        port=int(os.getenv('DASH_PORT', 5556)),
-        debug=True
-    )
+    app.run(host="0.0.0.0", port=int(os.getenv("DASH_PORT", 5556)), debug=True)

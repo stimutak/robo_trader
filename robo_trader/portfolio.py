@@ -49,8 +49,11 @@ class Portfolio:
             actual_quantity = min(quantity, pos.quantity)
             if quantity > pos.quantity:
                 from .logger import get_logger
+
                 logger = get_logger(__name__)
-                logger.warning(f"Attempted to sell {quantity} shares of {symbol}, only had {pos.quantity}")
+                logger.warning(
+                    f"Attempted to sell {quantity} shares of {symbol}, only had {pos.quantity}"
+                )
 
             sell_notional = price * actual_quantity
             realized = (price - pos.avg_price) * actual_quantity

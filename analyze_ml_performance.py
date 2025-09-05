@@ -2,13 +2,15 @@
 """Analyze ML model performance and suggest improvements."""
 
 import pickle
+import warnings
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-from pathlib import Path
 import yfinance as yf
 from sklearn.metrics import classification_report, confusion_matrix
-import warnings
-warnings.filterwarnings('ignore')
+
+warnings.filterwarnings("ignore")
 
 
 def analyze_current_models():
@@ -16,37 +18,38 @@ def analyze_current_models():
     print("=" * 60)
     print("ML Model Performance Analysis")
     print("=" * 60)
-    
+
     models_dir = Path("trained_models")
-    
+
     # Load a model to analyze
     model_path = models_dir / "random_forest_model.pkl"
     if not model_path.exists():
         print("❌ No trained models found. Run: python train_models_timeseries.py")
         return
-    
-    with open(model_path, 'rb') as f:
+
+    with open(model_path, "rb") as f:
         model_data = pickle.load(f)
-    
+
     print(f"\n1. Current Model Stats:")
     print(f"   Train accuracy: {model_data['metrics']['train_score']:.4f}")
     print(f"   Test accuracy: {model_data['metrics']['test_score']:.4f}")
-    print(f"   Gap: {abs(model_data['metrics']['train_score'] - model_data['metrics']['test_score']):.4f}")
-    
+    print(
+        f"   Gap: {abs(model_data['metrics']['train_score'] - model_data['metrics']['test_score']):.4f}"
+    )
+
     # Analyze feature importance
-    model = model_data['model']
-    features = model_data['feature_columns']
-    
-    if hasattr(model, 'feature_importances_'):
-        importance = pd.DataFrame({
-            'feature': features,
-            'importance': model.feature_importances_
-        }).sort_values('importance', ascending=False)
-        
+    model = model_data["model"]
+    features = model_data["feature_columns"]
+
+    if hasattr(model, "feature_importances_"):
+        importance = pd.DataFrame(
+            {"feature": features, "importance": model.feature_importances_}
+        ).sort_values("importance", ascending=False)
+
         print(f"\n2. Top 10 Most Important Features:")
         for i, row in importance.head(10).iterrows():
             print(f"   {row['feature']:20s}: {row['importance']:.4f}")
-    
+
     return model_data
 
 
@@ -55,39 +58,41 @@ def test_different_thresholds():
     print("\n" + "=" * 60)
     print("Testing Different Prediction Thresholds")
     print("=" * 60)
-    
+
     # Fetch some test data
     ticker = yf.Ticker("SPY")
     df = ticker.history(period="1y", interval="1d")
-    df['returns'] = df['Close'].pct_change()
-    
+    df["returns"] = df["Close"].pct_change()
+
     # Analyze return distribution
-    returns = df['returns'].dropna()
-    
+    returns = df["returns"].dropna()
+
     print(f"\n1. SPY Daily Return Distribution (1 year):")
     print(f"   Mean: {returns.mean():.4f} ({returns.mean()*100:.2f}%)")
     print(f"   Std: {returns.std():.4f} ({returns.std()*100:.2f}%)")
     print(f"   Skew: {returns.skew():.4f}")
     print(f"   Kurtosis: {returns.kurtosis():.4f}")
-    
+
     # Test different thresholds
     thresholds = [0.001, 0.005, 0.01, 0.015, 0.02, 0.025, 0.03]
-    
+
     print(f"\n2. Percentage of Days Exceeding Threshold:")
     print(f"   {'Threshold':>10s} | {'Up Days':>10s} | {'Down Days':>10s} | {'Neutral':>10s}")
     print(f"   {'-'*10}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}")
-    
+
     for threshold in thresholds:
         up_days = (returns > threshold).sum()
         down_days = (returns < -threshold).sum()
         neutral = len(returns) - up_days - down_days
-        
+
         up_pct = up_days / len(returns) * 100
         down_pct = down_days / len(returns) * 100
         neutral_pct = neutral / len(returns) * 100
-        
-        print(f"   {threshold*100:>9.1f}% | {up_pct:>9.1f}% | {down_pct:>9.1f}% | {neutral_pct:>9.1f}%")
-    
+
+        print(
+            f"   {threshold*100:>9.1f}% | {up_pct:>9.1f}% | {down_pct:>9.1f}% | {neutral_pct:>9.1f}%"
+        )
+
     print(f"\n3. Recommendation:")
     print(f"   Current threshold (1%) filters out ~60% of days as neutral")
     print(f"   This makes the problem harder - fewer training examples")
@@ -99,7 +104,7 @@ def suggest_improvements():
     print("\n" + "=" * 60)
     print("Recommendations for Improving ML Accuracy")
     print("=" * 60)
-    
+
     print("\n1. IMMEDIATE FIXES (Can implement now):")
     print("   a) Change prediction threshold from 1% to 0.5%")
     print("      - More training examples (less filtering)")
@@ -111,26 +116,26 @@ def suggest_improvements():
     print("      - Day of week, month of year")
     print("      - Days to earnings, ex-dividend")
     print("      - Market regime indicators")
-    
+
     print("\n2. DATA IMPROVEMENTS:")
     print("   a) Use intraday data (5-min bars) for better patterns")
     print("   b) Add market breadth indicators (VIX, put/call ratio)")
     print("   c) Include pre/post market data")
     print("   d) Add sector rotation signals")
-    
+
     print("\n3. MODEL ARCHITECTURE:")
     print("   a) Try LSTM/GRU for sequential patterns")
     print("   b) Use ensemble with different time horizons")
     print("   c) Implement online learning (update daily)")
     print("   d) Use different models for different market regimes")
-    
+
     print("\n4. ALTERNATIVE APPROACH:")
     print("   Instead of predicting direction, predict:")
     print("   - Volatility (easier to predict)")
     print("   - Relative strength (which stock will outperform)")
     print("   - Market regime (trending vs mean-reverting)")
     print("   - Entry/exit timing (not direction)")
-    
+
     print("\n5. REALISTIC EXPECTATIONS:")
     print("   - 55-57% directional accuracy is actually good")
     print("   - Focus on risk-adjusted returns, not accuracy")
@@ -140,7 +145,7 @@ def suggest_improvements():
 
 def create_improved_training_script():
     """Create an improved training script."""
-    
+
     improved_script = '''#!/usr/bin/env python3
 """Improved ML training with better features and targets."""
 
@@ -318,10 +323,10 @@ def main():
 if __name__ == "__main__":
     main()
 '''
-    
+
     with open("train_improved_model.py", "w") as f:
         f.write(improved_script)
-    
+
     print("\n" + "=" * 60)
     print("Created Improved Training Script")
     print("=" * 60)
@@ -335,19 +340,19 @@ if __name__ == "__main__":
 
 def main():
     """Run all analyses."""
-    
+
     # Analyze current models
     model_data = analyze_current_models()
-    
+
     # Test different thresholds
     test_different_thresholds()
-    
+
     # Suggest improvements
     suggest_improvements()
-    
+
     # Create improved script
     create_improved_training_script()
-    
+
     print("\n" + "=" * 60)
     print("NEXT STEPS")
     print("=" * 60)

@@ -7,7 +7,7 @@ import asyncio
 import json
 import threading
 from datetime import datetime
-from queue import Empty, Queue, Full
+from queue import Empty, Full, Queue
 from typing import Any, Dict, Optional
 
 import websockets
@@ -143,7 +143,9 @@ class WebSocketClient:
             try:
                 self.message_queue.get_nowait()
                 self.message_queue.put_nowait(message)
-                logger.debug(f"Dropped oldest message to queue {message.get('type', 'unknown')} update")
+                logger.debug(
+                    f"Dropped oldest message to queue {message.get('type', 'unknown')} update"
+                )
             except Empty:
                 pass  # Queue was emptied by another thread
 

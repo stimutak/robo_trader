@@ -142,10 +142,7 @@ class ConnectionPool:
             await self.initialize()
 
         try:
-            connection = await asyncio.wait_for(
-                self.available.get(),
-                timeout=timeout
-            )
+            connection = await asyncio.wait_for(self.available.get(), timeout=timeout)
         except asyncio.TimeoutError:
             raise ConnectionError(f"Connection pool exhausted after {timeout}s timeout")
 

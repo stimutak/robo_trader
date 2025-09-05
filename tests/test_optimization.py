@@ -8,11 +8,14 @@ import numpy as np
 import pandas as pd
 
 from robo_trader.backtest.metrics import PerformanceMetrics
-from robo_trader.backtest.optimization import (OptimizationResult,
-                                               OptimizationWindow,
-                                               OverfittingDetector,
-                                               ParameterGrid, ParameterSweeper,
-                                               WalkForwardOptimizer)
+from robo_trader.backtest.optimization import (
+    OptimizationResult,
+    OptimizationWindow,
+    OverfittingDetector,
+    ParameterGrid,
+    ParameterSweeper,
+    WalkForwardOptimizer,
+)
 from robo_trader.strategies.framework import Strategy
 
 
@@ -150,9 +153,7 @@ class TestWalkForwardOptimizer(unittest.TestCase):
             window_id=0,
         )
 
-        param_grid = ParameterGrid(
-            parameters={"fast_period": [10], "slow_period": [50]}
-        )
+        param_grid = ParameterGrid(parameters={"fast_period": [10], "slow_period": [50]})
 
         result = self.optimizer.optimize_window(
             window=window, param_grid=param_grid, symbols=["AAPL", "GOOGL"]
@@ -177,9 +178,7 @@ class TestWalkForwardOptimizer(unittest.TestCase):
 
         self.backtest_engine.run.return_value = mock_result
 
-        param_grid = ParameterGrid(
-            parameters={"fast_period": [10, 20], "slow_period": [50]}
-        )
+        param_grid = ParameterGrid(parameters={"fast_period": [10, 20], "slow_period": [50]})
 
         results = self.optimizer.run_optimization(
             symbols=["AAPL"],
@@ -231,9 +230,7 @@ class TestWalkForwardOptimizer(unittest.TestCase):
         self.optimizer.results = results
 
         # Get best with filters
-        best = self.optimizer.get_best_parameters(
-            min_stability=0.7, max_overfitting=0.3
-        )
+        best = self.optimizer.get_best_parameters(min_stability=0.7, max_overfitting=0.3)
 
         # Should select second result (best test Sharpe with good stability)
         self.assertEqual(best["fast"], 20)
@@ -302,9 +299,7 @@ class TestOverfittingDetector(unittest.TestCase):
             total_trades=110,
         )
 
-        degradation = OverfittingDetector.calculate_degradation(
-            train_metrics, test_metrics
-        )
+        degradation = OverfittingDetector.calculate_degradation(train_metrics, test_metrics)
 
         self.assertAlmostEqual(degradation["sharpe"], 0.5, places=2)
         self.assertAlmostEqual(degradation["return"], 0.5, places=2)
@@ -313,15 +308,11 @@ class TestOverfittingDetector(unittest.TestCase):
     def test_complexity_penalty(self):
         """Test complexity penalty calculation."""
         # Low complexity
-        penalty1 = OverfittingDetector.complexity_penalty(
-            n_parameters=5, n_samples=1000
-        )
+        penalty1 = OverfittingDetector.complexity_penalty(n_parameters=5, n_samples=1000)
         self.assertLess(penalty1, 0.1)
 
         # High complexity
-        penalty2 = OverfittingDetector.complexity_penalty(
-            n_parameters=50, n_samples=100
-        )
+        penalty2 = OverfittingDetector.complexity_penalty(n_parameters=50, n_samples=100)
         self.assertGreater(penalty2, 0.5)
 
         # More parameters = higher penalty

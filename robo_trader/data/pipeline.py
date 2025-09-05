@@ -273,6 +273,7 @@ class DataPipeline:
 
             # Update metrics with market time
             import pytz
+
             market_tz = pytz.timezone("US/Eastern")
             self.metrics["ticks_received"] += 1
             self.metrics["last_tick_time"] = datetime.now(market_tz)

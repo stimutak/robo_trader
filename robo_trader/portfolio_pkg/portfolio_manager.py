@@ -8,12 +8,12 @@ Implements capital allocation across multiple strategies with support for
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Dict, Optional, List, Any
+from typing import Any, Dict, List, Optional
 
-import math
 import numpy as np
 import pandas as pd
 
@@ -97,7 +97,9 @@ class MultiStrategyPortfolioManager:
         )
         self.strategy_performance.setdefault(name, {"returns": [], "metrics": {}})
         # Update allocated capital snapshot
-        self.allocations[name].allocated_capital = self.total_capital * self.allocations[name].current_weight
+        self.allocations[name].allocated_capital = (
+            self.total_capital * self.allocations[name].current_weight
+        )
 
     def update_capital(self, total_capital: float) -> None:
         """Update total capital and refresh allocated capital snapshots."""
@@ -219,7 +221,9 @@ class MultiStrategyPortfolioManager:
             clamped = {n: float(np.clip(uniform, min_w, max_w)) for n in names}
 
         # Iteratively adjust free weights
-        fixed = {n for n, w in clamped.items() if (math.isclose(w, min_w) or math.isclose(w, max_w))}
+        fixed = {
+            n for n, w in clamped.items() if (math.isclose(w, min_w) or math.isclose(w, max_w))
+        }
         for _ in range(10):
             total_fixed = sum(clamped[n] for n in fixed)
             free = [n for n in names if n not in fixed]
@@ -240,7 +244,9 @@ class MultiStrategyPortfolioManager:
                     clamped[n] = float(np.clip(target, min_w, max_w))
 
             # Update fixed set if any free weights hit bounds
-            new_fixed = {n for n, w in clamped.items() if (math.isclose(w, min_w) or math.isclose(w, max_w))}
+            new_fixed = {
+                n for n, w in clamped.items() if (math.isclose(w, min_w) or math.isclose(w, max_w))
+            }
             if new_fixed == fixed:
                 break
             fixed = new_fixed
@@ -288,7 +294,9 @@ class MultiStrategyPortfolioManager:
         return {"timestamp": self.last_rebalance, "new_weights": dict(new_weights)}
 
     # ---- Performance Tracking ---------------------------------------------------
-    def update_strategy_performance(self, strategy_name: str, return_pct: float, metrics: Optional[Dict[str, Any]] = None) -> None:
+    def update_strategy_performance(
+        self, strategy_name: str, return_pct: float, metrics: Optional[Dict[str, Any]] = None
+    ) -> None:
         """Record performance for a strategy for use in allocation decisions."""
         if strategy_name not in self.strategy_performance:
             self.strategy_performance[strategy_name] = {"returns": [], "metrics": {}}

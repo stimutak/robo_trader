@@ -36,10 +36,7 @@ except ImportError:
     ws_client = None
     WEBSOCKET_ENABLED = False
 from .portfolio import Portfolio  # Import Portfolio class from portfolio.py file
-from .portfolio_pkg.portfolio_manager import (
-    AllocationMethod,
-    MultiStrategyPortfolioManager,
-)
+from .portfolio_pkg.portfolio_manager import AllocationMethod, MultiStrategyPortfolioManager
 from .risk import Position, RiskManager
 from .strategies import MLStrategy, sma_crossover_signals
 from .strategies.ml_enhanced_strategy import MLEnhancedStrategy
@@ -129,7 +126,9 @@ class AsyncRunner:
                 self._position_locks[symbol] = asyncio.Lock()
             return self._position_locks[symbol]
 
-    async def _update_position_atomic(self, symbol: str, quantity: int, price: float, side: str) -> bool:
+    async def _update_position_atomic(
+        self, symbol: str, quantity: int, price: float, side: str
+    ) -> bool:
         """Atomically update position with lock to prevent race conditions."""
         lock = await self._get_position_lock(symbol)
         async with lock:
@@ -151,7 +150,9 @@ class AsyncRunner:
                             new_avg = (pos.avg_price * pos.quantity + price * quantity) / total_qty
                             self.positions[symbol] = Position(symbol, total_qty, new_avg)
                         else:
-                            logger.error(f"Invalid position update: {side} on {pos.quantity} shares of {symbol}")
+                            logger.error(
+                                f"Invalid position update: {side} on {pos.quantity} shares of {symbol}"
+                            )
                             return False
                     else:
                         # New long position
@@ -168,7 +169,9 @@ class AsyncRunner:
                                 remaining = pos.quantity - quantity
                                 self.positions[symbol] = Position(symbol, remaining, pos.avg_price)
                         else:
-                            logger.error(f"Invalid position update: {side} on {pos.quantity} shares of {symbol}")
+                            logger.error(
+                                f"Invalid position update: {side} on {pos.quantity} shares of {symbol}"
+                            )
                             return False
                     elif side.upper() == "SELL_SHORT":
                         # New short position (negative quantity)
@@ -280,8 +283,12 @@ class AsyncRunner:
             self.active_strategy_name = "ML_Enhanced"
             if self.portfolio_manager:
                 # Register ML Enhanced and a baseline SMA strategy for diversification
-                self.portfolio_manager.register_strategy(self.ml_enhanced_strategy, initial_weight=0.6)
-                self.portfolio_manager.register_strategy(SimpleNamespace(name="Baseline_SMA"), initial_weight=0.4)
+                self.portfolio_manager.register_strategy(
+                    self.ml_enhanced_strategy, initial_weight=0.6
+                )
+                self.portfolio_manager.register_strategy(
+                    SimpleNamespace(name="Baseline_SMA"), initial_weight=0.4
+                )
         # Initialize regular ML strategy if enabled (and not using enhanced)
         elif self.use_ml_strategy:
             logger.info("Initializing ML strategy...")
@@ -322,12 +329,16 @@ class AsyncRunner:
             self.active_strategy_name = "ML_Strategy"
             if self.portfolio_manager:
                 self.portfolio_manager.register_strategy(self.ml_strategy, initial_weight=0.6)
-                self.portfolio_manager.register_strategy(SimpleNamespace(name="Baseline_SMA"), initial_weight=0.4)
+                self.portfolio_manager.register_strategy(
+                    SimpleNamespace(name="Baseline_SMA"), initial_weight=0.4
+                )
         else:
             # Fallback baseline
             self.active_strategy_name = "Baseline_SMA"
             if self.portfolio_manager:
-                self.portfolio_manager.register_strategy(SimpleNamespace(name="Baseline_SMA"), initial_weight=1.0)
+                self.portfolio_manager.register_strategy(
+                    SimpleNamespace(name="Baseline_SMA"), initial_weight=1.0
+                )
 
         # Load existing positions from database to prevent duplicate buying
         await self.load_existing_positions()
@@ -339,20 +350,24 @@ class AsyncRunner:
         try:
             positions_data = await self.db.get_positions()
             for pos in positions_data:
-                if pos.get('quantity', 0) > 0:  # Only load open positions
-                    symbol = pos['symbol']
-                    quantity = pos['quantity']
-                    avg_cost = pos.get('avg_cost', pos.get('price', 0))
-                    
+                if pos.get("quantity", 0) > 0:  # Only load open positions
+                    symbol = pos["symbol"]
+                    quantity = pos["quantity"]
+                    avg_cost = pos.get("avg_cost", pos.get("price", 0))
+
                     # Create Position object and add to positions dict
                     self.positions[symbol] = Position(symbol, quantity, avg_cost)
-                    logger.info(f"Loaded existing position: {symbol} qty={quantity} avg_cost=${avg_cost:.2f}")
-            
+                    logger.info(
+                        f"Loaded existing position: {symbol} qty={quantity} avg_cost=${avg_cost:.2f}"
+                    )
+
             if self.positions:
-                logger.info(f"Loaded {len(self.positions)} existing positions from database: {list(self.positions.keys())}")
+                logger.info(
+                    f"Loaded {len(self.positions)} existing positions from database: {list(self.positions.keys())}"
+                )
             else:
                 logger.info("No existing positions found in database")
-                
+
         except Exception as e:
             logger.error(f"Failed to load existing positions from database: {e}")
             logger.warning("Starting with empty positions - may result in duplicate trades!")
@@ -444,7 +459,7 @@ class AsyncRunner:
             if self.use_ml_enhanced and self.ml_enhanced_strategy:
                 # Use ML Enhanced strategy for signal generation
                 signal_obj = await self.ml_enhanced_strategy.analyze(symbol, df)
-                
+
                 # Convert ML Enhanced signal to format compatible with rest of code
                 if signal_obj:
                     signal_value = (
@@ -463,7 +478,7 @@ class AsyncRunner:
                     position_size = 0.02
                     stop_loss = 0.02
                     take_profit = 0.05
-                    
+
                 signals = pd.DataFrame(
                     {
                         "signal": [signal_value],
@@ -533,8 +548,10 @@ class AsyncRunner:
         signal_value = int(last.get("signal", 0))
         if signal_value != 0:
             strategy_name = (
-                "ML_ENHANCED" if self.use_ml_enhanced 
-                else "ML_ENSEMBLE" if self.use_ml_strategy 
+                "ML_ENHANCED"
+                if self.use_ml_enhanced
+                else "ML_ENSEMBLE"
+                if self.use_ml_strategy
                 else "SMA_CROSSOVER"
             )
             await self.db.record_signal(
@@ -572,7 +589,9 @@ class AsyncRunner:
                 if res.ok:
                     fill_price = res.fill_price or price
                     # Use atomic position update to prevent race conditions
-                    success = await self._update_position_atomic(symbol, qty_to_cover, fill_price, "BUY_TO_COVER")
+                    success = await self._update_position_atomic(
+                        symbol, qty_to_cover, fill_price, "BUY_TO_COVER"
+                    )
                     if success:
                         self.daily_pnl = self.portfolio.realized_pnl
 
@@ -587,10 +606,14 @@ class AsyncRunner:
                         await self.db.update_position(symbol, 0, 0, 0)  # Close position
 
                         await self.monitor.record_order_placed(symbol, qty_to_cover)
-                        await self.monitor.record_trade_executed(symbol, "BUY_TO_COVER", qty_to_cover)
+                        await self.monitor.record_trade_executed(
+                            symbol, "BUY_TO_COVER", qty_to_cover
+                        )
                         executed = True
                         quantity = qty_to_cover
-                        message = f"Covered short: Bought {qty_to_cover} shares at ${fill_price:.2f}"
+                        message = (
+                            f"Covered short: Bought {qty_to_cover} shares at ${fill_price:.2f}"
+                        )
                     else:
                         logger.error(f"Failed to update position for {symbol} BUY_TO_COVER order")
                         message = f"Cover order failed: atomic update error"
@@ -609,13 +632,14 @@ class AsyncRunner:
 
                 # Apply correlation-based position sizing if enabled
                 if self.use_correlation_sizing and self.correlation_manager:
-                    adjusted_qty, sizing_reason = (
-                        await self.correlation_manager.get_adjusted_position_size(
-                            symbol=symbol,
-                            base_size=qty,
-                            current_positions=self.positions,
-                            portfolio_value=equity,
-                        )
+                    (
+                        adjusted_qty,
+                        sizing_reason,
+                    ) = await self.correlation_manager.get_adjusted_position_size(
+                        symbol=symbol,
+                        base_size=qty,
+                        current_positions=self.positions,
+                        portfolio_value=equity,
                     )
                     if adjusted_qty != qty:
                         logger.info(
@@ -692,7 +716,9 @@ class AsyncRunner:
                     if res.ok:
                         fill_price = res.fill_price or price
                         # Use atomic position update to prevent race conditions
-                        success = await self._update_position_atomic(symbol, pos.quantity, fill_price, "SELL")
+                        success = await self._update_position_atomic(
+                            symbol, pos.quantity, fill_price, "SELL"
+                        )
                         if success:
                             self.daily_pnl = self.portfolio.realized_pnl
 
@@ -702,7 +728,9 @@ class AsyncRunner:
                                 "SELL",
                                 pos.quantity,
                                 fill_price,
-                                slippage=(fill_price - price) * pos.quantity if res.fill_price else 0,
+                                slippage=(fill_price - price) * pos.quantity
+                                if res.fill_price
+                                else 0,
                             )
                             await self.db.update_position(symbol, 0, 0, 0)  # Close position
 
@@ -710,7 +738,9 @@ class AsyncRunner:
                             await self.monitor.record_trade_executed(symbol, "SELL", pos.quantity)
                             executed = True
                             quantity = pos.quantity
-                            message = f"Closed long: Sold {pos.quantity} shares at ${fill_price:.2f}"
+                            message = (
+                                f"Closed long: Sold {pos.quantity} shares at ${fill_price:.2f}"
+                            )
                         else:
                             logger.error(f"Failed to update position for {symbol} SELL order")
                             message = f"Sell order failed: atomic update error"
@@ -729,13 +759,14 @@ class AsyncRunner:
 
                 # Apply correlation-based position sizing if enabled
                 if self.use_correlation_sizing and self.correlation_manager:
-                    adjusted_qty, sizing_reason = (
-                        await self.correlation_manager.get_adjusted_position_size(
-                            symbol=symbol,
-                            base_size=qty,
-                            current_positions=self.positions,
-                            portfolio_value=equity,
-                        )
+                    (
+                        adjusted_qty,
+                        sizing_reason,
+                    ) = await self.correlation_manager.get_adjusted_position_size(
+                        symbol=symbol,
+                        base_size=qty,
+                        current_positions=self.positions,
+                        portfolio_value=equity,
                     )
                     if adjusted_qty != qty:
                         logger.info(
@@ -761,7 +792,9 @@ class AsyncRunner:
                     if res.ok:
                         fill_price = res.fill_price or price
                         # Use atomic position update to prevent race conditions
-                        success = await self._update_position_atomic(symbol, qty, fill_price, "SELL_SHORT")
+                        success = await self._update_position_atomic(
+                            symbol, qty, fill_price, "SELL_SHORT"
+                        )
                         if success:
                             self.daily_executed_notional += price * qty
 
@@ -834,7 +867,7 @@ class AsyncRunner:
         await self.update_position_market_prices(market_prices)
 
         return [r for r in results if isinstance(r, SymbolResult)]
-    
+
     async def update_position_market_prices(self, market_prices: Dict[str, float]):
         """Update market prices for all positions in database."""
         try:
@@ -843,10 +876,10 @@ class AsyncRunner:
                     current_price = market_prices[symbol]
                     # Update position in database with current market price
                     await self.db.update_position(
-                        symbol, 
-                        position.quantity, 
+                        symbol,
+                        position.quantity,
                         position.avg_price,  # Keep avg_cost same
-                        current_price  # Update market price
+                        current_price,  # Update market price
                     )
                     logger.debug(f"Updated {symbol} market price to ${current_price:.2f}")
         except Exception as e:
@@ -859,8 +892,8 @@ class AsyncRunner:
         for symbol, pos in self.positions.items():
             # Try to get latest price from database
             latest_pos = await self.db.get_position(symbol)
-            if latest_pos and latest_pos.get('market_price'):
-                market_prices[symbol] = latest_pos['market_price']
+            if latest_pos and latest_pos.get("market_price"):
+                market_prices[symbol] = latest_pos["market_price"]
             else:
                 market_prices[symbol] = pos.avg_price
         equity = self.portfolio.equity(market_prices)
@@ -872,9 +905,7 @@ class AsyncRunner:
                 self.portfolio_manager.update_capital(equity)
                 if await self.portfolio_manager.should_rebalance():
                     rb = await self.portfolio_manager.rebalance()
-                    logger.info(
-                        f"Rebalanced strategies at {rb['timestamp']}: {rb['new_weights']}"
-                    )
+                    logger.info(f"Rebalanced strategies at {rb['timestamp']}: {rb['new_weights']}")
             except Exception as e:
                 logger.debug(f"Portfolio manager update failed: {e}")
 
@@ -950,18 +981,18 @@ class AsyncRunner:
         """Clean up resources when runner is done."""
         try:
             # Disconnect from IB Gateway if exists
-            if hasattr(self, 'ib') and self.ib and self.ib.isConnected():
+            if hasattr(self, "ib") and self.ib and self.ib.isConnected():
                 logger.info("Disconnecting from IB Gateway...")
                 self.ib.disconnect()
-            
+
             # Close database connections
-            if hasattr(self, 'db') and self.db:
+            if hasattr(self, "db") and self.db:
                 await self.db.close()
-                
+
             # Stop WebSocket updates
-            if hasattr(self, 'ws_client'):
+            if hasattr(self, "ws_client"):
                 self.ws_client.stop()
-                
+
             logger.info("Cleanup completed")
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")

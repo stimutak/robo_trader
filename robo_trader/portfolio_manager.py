@@ -7,9 +7,9 @@ API to support both import paths.
 
 from .portfolio_manager.portfolio_manager import (
     AllocationMethod,
-    StrategyAllocation,
-    PortfolioMetrics,
     MultiStrategyPortfolioManager,
+    PortfolioMetrics,
+    StrategyAllocation,
 )
 
 __all__ = [

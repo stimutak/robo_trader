@@ -1,19 +1,19 @@
 """Test that all required imports work correctly across platforms."""
 
-import sys
 import platform
+import sys
 
 
 def test_core_imports():
     """Test core package imports."""
     import robo_trader
+    from robo_trader.clients.async_ibkr_client import AsyncIBKRClient
     from robo_trader.config import load_config
     from robo_trader.database_async import AsyncTradingDatabase
     from robo_trader.execution import PaperExecutor
-    from robo_trader.clients.async_ibkr_client import AsyncIBKRClient
+    from robo_trader.legacy_strategies import sma_crossover_signals
     from robo_trader.portfolio import Portfolio
     from robo_trader.risk import RiskManager
-    from robo_trader.legacy_strategies import sma_crossover_signals
 
 
 def test_async_imports():
@@ -31,10 +31,11 @@ def test_monitoring_imports():
 def test_third_party_imports():
     """Test third-party library imports."""
     import asyncio
+
     import aiosqlite
     import nest_asyncio
-    import pandas
     import numpy
+    import pandas
     import pydantic
     import tenacity
     from ib_insync import IB

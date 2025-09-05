@@ -394,18 +394,17 @@ class WalkForwardBacktest:
                         for s, p in positions.items()
                     }
 
-                    position_size, sizing_reason = (
-                        await self.position_sizer.calculate_position_size(
-                            symbol=(
-                                data.get("symbol", "UNKNOWN").iloc[0]
-                                if "symbol" in data
-                                else "UNKNOWN"
-                            ),
-                            base_size=base_position_size,
-                            current_positions=position_objects,
-                            portfolio_value=cash
-                            + sum(p["quantity"] * row["close"] for p in positions.values()),
-                        )
+                    (
+                        position_size,
+                        sizing_reason,
+                    ) = await self.position_sizer.calculate_position_size(
+                        symbol=(
+                            data.get("symbol", "UNKNOWN").iloc[0] if "symbol" in data else "UNKNOWN"
+                        ),
+                        base_size=base_position_size,
+                        current_positions=position_objects,
+                        portfolio_value=cash
+                        + sum(p["quantity"] * row["close"] for p in positions.values()),
                     )
                     self.logger.debug(
                         f"Position sizing: {base_position_size} -> {position_size} ({sizing_reason})"

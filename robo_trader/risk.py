@@ -380,15 +380,20 @@ class RiskManager:
                 # Validate stop-loss is reasonable (not more than 10% away)
                 max_stop_distance = current_price * 0.10
                 if abs(current_price - pos.stop_loss) > max_stop_distance:
-                    logger.error(f"Stop-loss too far from current price for {symbol}: current={current_price:.2f}, stop={pos.stop_loss:.2f}")
+                    logger.error(
+                        f"Stop-loss too far from current price for {symbol}: current={current_price:.2f}, stop={pos.stop_loss:.2f}"
+                    )
                     risk_per_share = current_price * 0.02  # Fall back to default
                 else:
                     risk_per_share = abs(current_price - pos.stop_loss)
 
                     # Check if stop should have been triggered
-                    if ((pos.quantity > 0 and current_price <= pos.stop_loss) or
-                            (pos.quantity < 0 and current_price >= pos.stop_loss)):
-                        logger.critical(f"Stop-loss not triggered for {symbol}! Current: {current_price:.2f}, Stop: {pos.stop_loss:.2f}")
+                    if (pos.quantity > 0 and current_price <= pos.stop_loss) or (
+                        pos.quantity < 0 and current_price >= pos.stop_loss
+                    ):
+                        logger.critical(
+                            f"Stop-loss not triggered for {symbol}! Current: {current_price:.2f}, Stop: {pos.stop_loss:.2f}"
+                        )
                         # Could trigger emergency action here
 
             elif pos.atr:

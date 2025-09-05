@@ -4,22 +4,23 @@ RoboTrader Dashboard - Clean, ML-Integrated Interface
 Provides real-time monitoring of trading, ML models, and performance metrics
 """
 
-from flask import Flask, render_template_string, jsonify, request, Response, send_file
 import asyncio
-import threading
+import hashlib
 import json
-from datetime import datetime, timedelta
-import subprocess
 import os
 import signal
+import subprocess
+import threading
 import time
-import hashlib
+from datetime import datetime, timedelta
 from functools import wraps
 from pathlib import Path
-import pandas as pd
-import numpy as np
 
+import numpy as np
+import pandas as pd
 from dotenv import load_dotenv
+from flask import Flask, Response, jsonify, render_template_string, request, send_file
+
 load_dotenv()
 
 # Import our modules - using lazy imports to avoid startup issues
@@ -38,9 +39,9 @@ app = Flask(__name__)
 
 # Configuration
 config = load_config()
-AUTH_ENABLED = os.getenv('DASH_AUTH_ENABLED', 'false').lower() == 'true'
-AUTH_USER = os.getenv('DASH_USER', 'admin')
-AUTH_PASS_HASH = os.getenv('DASH_PASS_HASH', '')
+AUTH_ENABLED = os.getenv("DASH_AUTH_ENABLED", "false").lower() == "true"
+AUTH_USER = os.getenv("DASH_USER", "admin")
+AUTH_PASS_HASH = os.getenv("DASH_PASS_HASH", "")
 
 # Initialize components - will be loaded lazily
 db = None
@@ -56,44 +57,47 @@ positions = {}
 
 # Load default symbols at module level
 try:
-    with open('user_settings.json', 'r') as f:
+    with open("user_settings.json", "r") as f:
         settings = json.load(f)
-        default_symbols = settings.get('default', {}).get('symbols', ['AAPL', 'MSFT', 'GOOGL'])
+        default_symbols = settings.get("default", {}).get("symbols", ["AAPL", "MSFT", "GOOGL"])
 except:
-    default_symbols = ['AAPL', 'MSFT', 'GOOGL']
+    default_symbols = ["AAPL", "MSFT", "GOOGL"]
 pnl = {"daily": 0.0, "total": 0.0, "unrealized": 0.0}
 ml_metrics = {
     "models_trained": 0,
     "last_prediction": None,
     "feature_count": 0,
-    "model_performance": {}
+    "model_performance": {},
 }
 performance_metrics = {
     "sharpe_ratio": 0.0,
     "max_drawdown": 0.0,
     "win_rate": 0.0,
-    "profit_factor": 0.0
+    "profit_factor": 0.0,
 }
+
 
 def init_async_components():
     """Initialize async components in event loop"""
     global db, feature_pipeline, model_trainer, performance_analyzer
-    
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    
+
     db = AsyncTradingDatabase()
     feature_pipeline = FeaturePipeline(config)
     model_trainer = ModelTrainer(config, model_dir=Path("models"))
     performance_analyzer = PerformanceAnalyzer()
 
+
 # Initialize in background thread
-if os.getenv('DASH_INIT_COMPONENTS', 'false').lower() == 'true':
+if os.getenv("DASH_INIT_COMPONENTS", "false").lower() == "true":
     init_thread = threading.Thread(target=init_async_components)
     init_thread.daemon = True
     init_thread.start()
 else:
-    logger.info('Skipping heavy async component init at startup (DASH_INIT_COMPONENTS=false)')
+    logger.info("Skipping heavy async component init at startup (DASH_INIT_COMPONENTS=false)")
+
 
 # Authentication
 def check_auth(username, password):
@@ -105,17 +109,19 @@ def check_auth(username, password):
     password_hash = hashlib.sha256(password.encode()).hexdigest()
     return username == AUTH_USER and password_hash == AUTH_PASS_HASH
 
+
 def authenticate():
     """Send 401 response that enables basic auth."""
     return Response(
-        'Authentication required.\n'
-        'Please enter your credentials.',
+        "Authentication required.\n" "Please enter your credentials.",
         401,
-        {'WWW-Authenticate': 'Basic realm="RoboTrader Dashboard"'}
+        {"WWW-Authenticate": 'Basic realm="RoboTrader Dashboard"'},
     )
+
 
 def requires_auth(f):
     """Decorator to require authentication for routes."""
+
     @wraps(f)
     def decorated(*args, **kwargs):
         if not AUTH_ENABLED:
@@ -124,10 +130,12 @@ def requires_auth(f):
         if not auth or not check_auth(auth.username, auth.password):
             return authenticate()
         return f(*args, **kwargs)
+
     return decorated
 
+
 # HTML Template - Clean, modern design
-HTML_TEMPLATE = '''
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1961,116 +1969,135 @@ HTML_TEMPLATE = '''
     </script>
 </body>
 </html>
-'''
+"""
 
-@app.route('/')
+
+@app.route("/")
 @requires_auth
 def index():
     """Main dashboard page"""
     return render_template_string(HTML_TEMPLATE)
 
-@app.route('/favicon.ico')
+
+@app.route("/favicon.ico")
 def favicon():
     """Serve the favicon with no-cache headers"""
     import os
+
     from flask import make_response
-    favicon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'robotrader_favicon.ico')
-    response = make_response(send_file(favicon_path, mimetype='image/x-icon'))
-    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-    response.headers['Pragma'] = 'no-cache'
-    response.headers['Expires'] = '0'
+
+    favicon_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "robotrader_favicon.ico"
+    )
+    response = make_response(send_file(favicon_path, mimetype="image/x-icon"))
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
     return response
 
-@app.route('/api/health')
+
+@app.route("/api/health")
 def health():
     """Health check endpoint"""
-    return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
-@app.route('/api/database/health')
+
+@app.route("/api/database/health")
 @requires_auth
 def database_health():
     """Check database health and connectivity"""
     try:
         from sync_db_reader import SyncDatabaseReader
+
         db = SyncDatabaseReader()
 
         # Simple health check query
         result = db._fetch_one("SELECT COUNT(*) as count FROM sqlite_master WHERE type='table'")
-        table_count = result['count'] if result else 0
+        table_count = result["count"] if result else 0
 
-        return jsonify({
-            'status': 'healthy',
-            'table_count': table_count,
-            'timestamp': datetime.now().isoformat()
-        })
+        return jsonify(
+            {
+                "status": "healthy",
+                "table_count": table_count,
+                "timestamp": datetime.now().isoformat(),
+            }
+        )
     except Exception as e:
-        return jsonify({
-            'status': 'unhealthy',
-            'error': str(e),
-            'timestamp': datetime.now().isoformat()
-        }), 500
+        return (
+            jsonify(
+                {"status": "unhealthy", "error": str(e), "timestamp": datetime.now().isoformat()}
+            ),
+            500,
+        )
 
-@app.route('/api/market/status')
+
+@app.route("/api/market/status")
 @requires_auth
 def market_status():
     """Get current market status"""
-    from robo_trader.market_hours import is_market_open, get_market_session, get_next_market_open, seconds_until_market_open
+    from robo_trader.market_hours import (
+        get_market_session,
+        get_next_market_open,
+        is_market_open,
+        seconds_until_market_open,
+    )
 
     current_time = datetime.now()
     is_open = is_market_open()
     session = get_market_session()
 
     result = {
-        'is_open': is_open,
-        'session': session,
-        'current_time': current_time.isoformat(),
-        'status_text': session.replace('-', ' ').title()
+        "is_open": is_open,
+        "session": session,
+        "current_time": current_time.isoformat(),
+        "status_text": session.replace("-", " ").title(),
     }
 
     if not is_open:
         next_open = get_next_market_open()
         seconds_until = seconds_until_market_open()
-        result.update({
-            'next_open': next_open.isoformat(),
-            'seconds_until_open': seconds_until,
-            'time_until_open': f"{seconds_until // 3600}h {(seconds_until % 3600) // 60}m"
-        })
+        result.update(
+            {
+                "next_open": next_open.isoformat(),
+                "seconds_until_open": seconds_until,
+                "time_until_open": f"{seconds_until // 3600}h {(seconds_until % 3600) // 60}m",
+            }
+        )
 
     return jsonify(result)
 
-@app.route('/api/status')
+
+@app.route("/api/status")
 @requires_auth
 def status():
     """Get current system status from database"""
     # Return status with sample data for display
-    return jsonify({
-        'trading_status': {
-            'is_trading': trading_status == 'running',
-            'connected': True,
-            'mode': 'paper',
-            'session_start': datetime.now().isoformat(),
-            'positions_count': 5
-        },
-        'pnl': {
-            'daily': 523.45,
-            'total': 2847.30,
-            'unrealized': 1612.30
-        },
-        'metrics': {
-            'sharpe_ratio': 1.42,
-            'win_rate': 0.625,
-            'profit_factor': 1.85,
-            'max_drawdown': -0.082
-        },
-        'positions_count': 5,
-        'ml_status': {
-            'models_trained': 3,
-            'last_prediction': datetime.now().isoformat(),
-            'feature_count': 24,
-            'model_performance': {'accuracy': 0.72}
+    return jsonify(
+        {
+            "trading_status": {
+                "is_trading": trading_status == "running",
+                "connected": True,
+                "mode": "paper",
+                "session_start": datetime.now().isoformat(),
+                "positions_count": 5,
+            },
+            "pnl": {"daily": 523.45, "total": 2847.30, "unrealized": 1612.30},
+            "metrics": {
+                "sharpe_ratio": 1.42,
+                "win_rate": 0.625,
+                "profit_factor": 1.85,
+                "max_drawdown": -0.082,
+            },
+            "positions_count": 5,
+            "ml_status": {
+                "models_trained": 3,
+                "last_prediction": datetime.now().isoformat(),
+                "feature_count": 24,
+                "model_performance": {"accuracy": 0.72},
+            },
         }
-    })
-    
+    )
+
     # Original async database code (disabled due to locking)
     """
     async def fetch_status():
@@ -2142,70 +2169,70 @@ def status():
         })
     """
 
-@app.route('/api/pnl')
+
+@app.route("/api/pnl")
 @requires_auth
 def get_pnl():
     """Get P&L data from actual positions"""
     try:
         from sync_db_reader import SyncDatabaseReader
+
         db = SyncDatabaseReader()
-        
+
         # Get positions for P&L calculation
         positions = db.get_positions()
-        
+
         # Calculate total unrealized P&L from positions
         unrealized_pnl = 0
         for pos in positions:
-            qty = pos.get('quantity', 0)
+            qty = pos.get("quantity", 0)
             if qty > 0:
-                avg_cost = pos.get('avg_cost', 0)
-                market_price = pos.get('market_price', avg_cost)
+                avg_cost = pos.get("avg_cost", 0)
+                market_price = pos.get("market_price", avg_cost)
                 if avg_cost > 0:
                     unrealized_pnl += (market_price - avg_cost) * qty
-        
+
         # Get trades for realized P&L (simplified - assumes sells are realized gains)
         trades = db.get_recent_trades(limit=1000)
         realized_pnl = 0
         daily_pnl = 0
-        
+
         # Simple realized P&L from SELL trades
         from datetime import datetime, timedelta
+
         today = datetime.now().date()
-        
+
         for trade in trades:
-            if trade.get('side') == 'SELL':
+            if trade.get("side") == "SELL":
                 # Assume 1% profit on sells (simplified)
-                trade_value = trade.get('quantity', 0) * trade.get('price', 0)
+                trade_value = trade.get("quantity", 0) * trade.get("price", 0)
                 profit = trade_value * 0.01
                 realized_pnl += profit
-                
+
                 # Check if trade is from today
-                trade_time = trade.get('timestamp', '')
+                trade_time = trade.get("timestamp", "")
                 if trade_time:
-                    trade_date = datetime.fromisoformat(trade_time.replace(' ', 'T')).date()
+                    trade_date = datetime.fromisoformat(trade_time.replace(" ", "T")).date()
                     if trade_date == today:
                         daily_pnl += profit
-        
+
         # Total P&L is unrealized + realized
         total_pnl = unrealized_pnl + realized_pnl
-        
-        return jsonify({
-            'total': round(total_pnl, 2),
-            'unrealized': round(unrealized_pnl, 2),
-            'realized': round(realized_pnl, 2),
-            'daily': round(daily_pnl, 2)
-        })
-        
+
+        return jsonify(
+            {
+                "total": round(total_pnl, 2),
+                "unrealized": round(unrealized_pnl, 2),
+                "realized": round(realized_pnl, 2),
+                "daily": round(daily_pnl, 2),
+            }
+        )
+
     except Exception as e:
         logger.error(f"Error calculating P&L: {e}")
         # Return zeros on error instead of fake data
-        return jsonify({
-            'total': 0,
-            'unrealized': 0,
-            'realized': 0,
-            'daily': 0
-        })
-    
+        return jsonify({"total": 0, "unrealized": 0, "realized": 0, "daily": 0})
+
     # Original database logic commented out due to persistent locking
     """
     try:
@@ -2284,161 +2311,183 @@ def get_pnl():
     return jsonify(sample_pnl)
     """
 
-@app.route('/api/pnl_OLD')
+
+@app.route("/api/pnl_OLD")
 @requires_auth
 def get_pnl_OLD():
     """OLD Get P&L data from real database"""
-    from robo_trader.database_async import AsyncTradingDatabase
     import asyncio
-    
+
+    from robo_trader.database_async import AsyncTradingDatabase
+
     async def fetch_pnl():
         db = AsyncTradingDatabase()
         await db.initialize()
         try:
             # Calculate P&L from actual positions and trades
             positions_data = await db.get_positions()
-            
+
             # Calculate total cost and current value
             total_cost = 0
             total_value = 0
-            
+
             for pos in positions_data:
-                cost = pos['quantity'] * pos['avg_cost']
+                cost = pos["quantity"] * pos["avg_cost"]
                 total_cost += cost
-                
+
                 # Get latest market data for current price
-                market_data = await db.get_latest_market_data(pos['symbol'], limit=1)
+                market_data = await db.get_latest_market_data(pos["symbol"], limit=1)
                 if market_data:
-                    current_price = market_data[0]['close']
+                    current_price = market_data[0]["close"]
                 else:
                     # Try to get from IB if no market data stored
                     from robo_trader.clients.async_ibkr_client import AsyncIBKRClient
+
                     client = AsyncIBKRClient()
                     await client.initialize()
                     try:
-                        price_data = await client.get_market_data(pos['symbol'])
-                        current_price = price_data['close'] if price_data else pos['avg_cost']
+                        price_data = await client.get_market_data(pos["symbol"])
+                        current_price = price_data["close"] if price_data else pos["avg_cost"]
                     finally:
                         await client.close_all()
-                
-                value = pos['quantity'] * current_price
+
+                value = pos["quantity"] * current_price
                 total_value += value
-            
+
             # Calculate unrealized P&L
             unrealized_pnl = total_value - total_cost if total_cost > 0 else 0
-            
+
             # Calculate realized P&L from closed trades
             trades = await db.get_recent_trades(limit=1000)  # Get recent trades
             realized_pnl = 0
-            
+
             # Group trades by symbol to calculate realized P&L
             symbol_trades = {}
             for trade in trades:
-                symbol = trade['symbol']
+                symbol = trade["symbol"]
                 if symbol not in symbol_trades:
                     symbol_trades[symbol] = []
                 symbol_trades[symbol].append(trade)
-            
+
             # Calculate realized P&L for each symbol
             for symbol, trades_list in symbol_trades.items():
                 buys = []
-                for trade in sorted(trades_list, key=lambda x: x['timestamp']):
-                    if trade['side'] == 'buy':
-                        buys.append({'price': trade['price'], 'quantity': trade['quantity']})
-                    elif trade['side'] == 'sell' and buys:
-                        sell_qty = trade['quantity']
-                        sell_price = trade['price']
-                        
+                for trade in sorted(trades_list, key=lambda x: x["timestamp"]):
+                    if trade["side"] == "buy":
+                        buys.append({"price": trade["price"], "quantity": trade["quantity"]})
+                    elif trade["side"] == "sell" and buys:
+                        sell_qty = trade["quantity"]
+                        sell_price = trade["price"]
+
                         # FIFO matching
                         while sell_qty > 0 and buys:
                             buy = buys[0]
-                            match_qty = min(sell_qty, buy['quantity'])
-                            
+                            match_qty = min(sell_qty, buy["quantity"])
+
                             # Calculate P&L for this match
-                            realized_pnl += (sell_price - buy['price']) * match_qty
-                            
+                            realized_pnl += (sell_price - buy["price"]) * match_qty
+
                             sell_qty -= match_qty
-                            buy['quantity'] -= match_qty
-                            
-                            if buy['quantity'] == 0:
+                            buy["quantity"] -= match_qty
+
+                            if buy["quantity"] == 0:
                                 buys.pop(0)
-            
+
             # Calculate total P&L (unrealized + realized)
             total_pnl = unrealized_pnl + realized_pnl
-            
+
             # Calculate daily P&L - change since market open
             # We need to get today's opening prices for each position
             from datetime import datetime, time
+
             import pytz
-            
-            et_tz = pytz.timezone('America/New_York')
+
+            et_tz = pytz.timezone("America/New_York")
             now_et = datetime.now(et_tz)
             market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-            
+
             daily_pnl = 0
-            
+
             # Calculate daily unrealized P&L from positions
             for pos in positions_data:
                 # Get today's opening price (first trade after 9:30 AM)
                 market_data_today = await db.get_latest_market_data(
-                    pos['symbol'], 
-                    limit=100  # Get enough data to find today's open
+                    pos["symbol"], limit=100  # Get enough data to find today's open
                 )
-                
-                open_price = pos['avg_cost']  # Default to avg cost if no data
-                
+
+                open_price = pos["avg_cost"]  # Default to avg cost if no data
+
                 if market_data_today:
                     # Find first data point from today's session
                     for data_point in reversed(market_data_today):
-                        data_time = datetime.fromisoformat(data_point['timestamp'].replace(' ', 'T'))
-                        data_time_et = data_time.astimezone(et_tz) if data_time.tzinfo else et_tz.localize(data_time)
-                        
+                        data_time = datetime.fromisoformat(
+                            data_point["timestamp"].replace(" ", "T")
+                        )
+                        data_time_et = (
+                            data_time.astimezone(et_tz)
+                            if data_time.tzinfo
+                            else et_tz.localize(data_time)
+                        )
+
                         # Check if this is from today's market session
-                        if data_time_et.date() == now_et.date() and data_time_et.time() >= time(9, 30):
-                            open_price = data_point['open'] if 'open' in data_point else data_point['close']
+                        if data_time_et.date() == now_et.date() and data_time_et.time() >= time(
+                            9, 30
+                        ):
+                            open_price = (
+                                data_point["open"] if "open" in data_point else data_point["close"]
+                            )
                             break
-                
+
                 # Get current price (already calculated above)
-                current_price = total_value / positions_data[0]['quantity'] if len(positions_data) == 1 else pos['avg_cost']
-                
+                current_price = (
+                    total_value / positions_data[0]["quantity"]
+                    if len(positions_data) == 1
+                    else pos["avg_cost"]
+                )
+
                 # Find current price for this position
                 for p in positions_data:
-                    if p['symbol'] == pos['symbol']:
-                        market_data = await db.get_latest_market_data(p['symbol'], limit=1)
+                    if p["symbol"] == pos["symbol"]:
+                        market_data = await db.get_latest_market_data(p["symbol"], limit=1)
                         if market_data:
-                            current_price = market_data[0]['close']
+                            current_price = market_data[0]["close"]
                         break
-                
+
                 # Daily P&L for this position
-                daily_change = (current_price - open_price) * pos['quantity']
+                daily_change = (current_price - open_price) * pos["quantity"]
                 daily_pnl += daily_change
-            
+
             # Add today's realized P&L from trades
             from datetime import timedelta
+
             today_start = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
-            
+
             for trade in trades:
-                trade_time = datetime.fromisoformat(trade['timestamp'].replace(' ', 'T'))
-                trade_time_et = trade_time.astimezone(et_tz) if trade_time.tzinfo else et_tz.localize(trade_time)
-                
+                trade_time = datetime.fromisoformat(trade["timestamp"].replace(" ", "T"))
+                trade_time_et = (
+                    trade_time.astimezone(et_tz)
+                    if trade_time.tzinfo
+                    else et_tz.localize(trade_time)
+                )
+
                 if trade_time_et >= today_start:
                     # This is a trade from today - include any realized P&L
                     # (This would need proper FIFO matching for accuracy)
                     pass
-            
+
             # If daily P&L calculation fails or seems wrong, use a conservative estimate
             if abs(daily_pnl) > abs(total_pnl):
                 # Daily can't be more than total
                 daily_pnl = total_pnl * 0.5  # Use 50% as estimate
-            
+
             return {
-                'daily': daily_pnl,
-                'total': total_pnl,  # Total P&L (realized + unrealized)
-                'unrealized': unrealized_pnl
+                "daily": daily_pnl,
+                "total": total_pnl,  # Total P&L (realized + unrealized)
+                "unrealized": unrealized_pnl,
             }
         finally:
             await db.close()
-    
+
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -2448,12 +2497,14 @@ def get_pnl_OLD():
         logger.error(f"Error fetching real P&L: {e}")
         return jsonify(pnl)  # Return default on error
 
-@app.route('/api/positions')
+
+@app.route("/api/positions")
 @requires_auth
 def get_positions():
     """Get current positions from real database"""
     try:
         from sync_db_reader import SyncDatabaseReader
+
         db = SyncDatabaseReader()
         real_positions = db.get_positions()
 
@@ -2462,82 +2513,90 @@ def get_positions():
 
         # Sample price variations for P&L display (simulate market movement)
         import random
+
         random.seed(42)  # Consistent random for same symbols
 
         for pos in real_positions:
             # Get latest price from market data
             try:
-                market_data = db.get_latest_market_data(pos['symbol'], limit=1)
+                market_data = db.get_latest_market_data(pos["symbol"], limit=1)
 
                 if market_data:
-                    current_price = market_data[0]['close']
+                    current_price = market_data[0]["close"]
                 else:
                     # Simulate price movement: +/- 5% from avg_cost
-                    avg_cost = pos.get('avg_cost', 100)
-                    random.seed(hash(pos['symbol']) % 1000)  # Consistent per symbol
+                    avg_cost = pos.get("avg_cost", 100)
+                    random.seed(hash(pos["symbol"]) % 1000)  # Consistent per symbol
                     variation = random.uniform(-0.05, 0.05)
                     current_price = avg_cost * (1 + variation)
             except Exception:
                 # Fallback to avg_cost if market data fails
-                current_price = pos.get('avg_cost', 100)
+                current_price = pos.get("avg_cost", 100)
 
             # Get latest signal
             try:
                 signals = db.get_signals(hours=1)
-                pos_signals = [s for s in signals if s['symbol'] == pos['symbol']]
-                ml_signal = pos_signals[0]['signal_type'] if pos_signals else 'hold'
+                pos_signals = [s for s in signals if s["symbol"] == pos["symbol"]]
+                ml_signal = pos_signals[0]["signal_type"] if pos_signals else "hold"
             except Exception:
-                ml_signal = 'hold'
+                ml_signal = "hold"
 
             # Calculate P&L
-            entry_price = pos.get('avg_cost', current_price)
-            quantity = pos['quantity']
+            entry_price = pos.get("avg_cost", current_price)
+            quantity = pos["quantity"]
             market_value = current_price * quantity
             unrealized_pnl = (current_price - entry_price) * quantity
-            unrealized_pnl_pct = (unrealized_pnl / (entry_price * abs(quantity))) * 100 if entry_price > 0 else 0
+            unrealized_pnl_pct = (
+                (unrealized_pnl / (entry_price * abs(quantity))) * 100 if entry_price > 0 else 0
+            )
 
-            enriched_positions.append({
-                'symbol': pos['symbol'],
-                'quantity': quantity,
-                'entry_price': entry_price,
-                'current_price': round(current_price, 2),
-                'market_value': round(market_value, 2),
-                'unrealized_pnl': round(unrealized_pnl, 2),
-                'unrealized_pnl_pct': round(unrealized_pnl_pct, 2),
-                'side': 'long' if quantity > 0 else 'short',
-                'entry_time': pos.get('timestamp', ''),
-                'strategy': 'Unknown',
-                'ml_signal': ml_signal
-            })
+            enriched_positions.append(
+                {
+                    "symbol": pos["symbol"],
+                    "quantity": quantity,
+                    "entry_price": entry_price,
+                    "current_price": round(current_price, 2),
+                    "market_value": round(market_value, 2),
+                    "unrealized_pnl": round(unrealized_pnl, 2),
+                    "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
+                    "side": "long" if quantity > 0 else "short",
+                    "entry_time": pos.get("timestamp", ""),
+                    "strategy": "Unknown",
+                    "ml_signal": ml_signal,
+                }
+            )
 
-        return jsonify({'positions': enriched_positions})
+        return jsonify({"positions": enriched_positions})
     except Exception as e:
         logger.error(f"Error fetching real positions: {e}")
-    
+
     # Return sample data if database is locked
     from sample_data import get_sample_positions
-    return jsonify({'positions': get_sample_positions()})
 
-@app.route('/api/watchlist')
+    return jsonify({"positions": get_sample_positions()})
+
+
+@app.route("/api/watchlist")
 @requires_auth
 def get_watchlist():
     """Get watchlist with latest prices - optimized for speed"""
     # Return cached watchlist if available and recent (within 3 seconds)
     current_time = time.time()
-    if hasattr(app, '_watchlist_cache') and hasattr(app, '_watchlist_cache_time'):
+    if hasattr(app, "_watchlist_cache") and hasattr(app, "_watchlist_cache_time"):
         if current_time - app._watchlist_cache_time < 3:  # 3 second cache
-            return jsonify({'watchlist': app._watchlist_cache})
-    
+            return jsonify({"watchlist": app._watchlist_cache})
+
     # Use sample data immediately to avoid slow database queries
     from sample_data import get_sample_watchlist
+
     watchlist_data = get_sample_watchlist()
-    
+
     # Cache the result
     app._watchlist_cache = watchlist_data
     app._watchlist_cache_time = current_time
-    
-    return jsonify({'watchlist': watchlist_data})
-    
+
+    return jsonify({"watchlist": watchlist_data})
+
     # Original database logic (disabled due to slow performance with locked DB)
     """
     # Define the watchlist symbols
@@ -2590,197 +2649,237 @@ def get_watchlist():
     return jsonify({'watchlist': get_sample_watchlist()})
     """
 
-@app.route('/api/ml/status')
+
+@app.route("/api/ml/status")
 @requires_auth
 def ml_status():
     """Get ML system status"""
     # Count actual model files from both directories
     from pathlib import Path
-    models_dir = Path('models')
-    trained_models_dir = Path('trained_models')
-    
+
+    models_dir = Path("models")
+    trained_models_dir = Path("trained_models")
+
     model_files = []
     if models_dir.exists():
-        model_files.extend(list(models_dir.glob('*.pkl')))
+        model_files.extend(list(models_dir.glob("*.pkl")))
     if trained_models_dir.exists():
-        model_files.extend(list(trained_models_dir.glob('*.pkl')))
-    
+        model_files.extend(list(trained_models_dir.glob("*.pkl")))
+
     # Group models by type and track latest
     model_info = {
-        'random_forest': {'name': 'Random Forest', 'accuracy': 0.525, 'count': 0},
-        'xgboost': {'name': 'XGBoost', 'accuracy': 0.525, 'count': 0},
-        'lightgbm': {'name': 'LightGBM', 'accuracy': 0.518, 'count': 0},
-        'improved': {'name': 'Improved RF', 'accuracy': 0.553, 'count': 0},
-        'high_accuracy': {'name': 'High Accuracy XGB', 'accuracy': 0.562, 'count': 0},
-        'ensemble': {'name': 'Ensemble', 'accuracy': 0.485, 'count': 0}
+        "random_forest": {"name": "Random Forest", "accuracy": 0.525, "count": 0},
+        "xgboost": {"name": "XGBoost", "accuracy": 0.525, "count": 0},
+        "lightgbm": {"name": "LightGBM", "accuracy": 0.518, "count": 0},
+        "improved": {"name": "Improved RF", "accuracy": 0.553, "count": 0},
+        "high_accuracy": {"name": "High Accuracy XGB", "accuracy": 0.562, "count": 0},
+        "ensemble": {"name": "Ensemble", "accuracy": 0.485, "count": 0},
     }
-    
+
     latest_models = {}
     for model_file in model_files:
         # Handle both "high_accuracy" and single word model types
-        stem_parts = model_file.stem.split('_')
-        if stem_parts[0].lower() == 'high' and len(stem_parts) > 1:
-            model_type = 'high_accuracy'
+        stem_parts = model_file.stem.split("_")
+        if stem_parts[0].lower() == "high" and len(stem_parts) > 1:
+            model_type = "high_accuracy"
         else:
             model_type = stem_parts[0].lower()
-        
+
         if model_type in model_info:
-            model_info[model_type]['count'] += 1
-            if model_type not in latest_models or model_file.stat().st_mtime > latest_models[model_type]['mtime']:
+            model_info[model_type]["count"] += 1
+            if (
+                model_type not in latest_models
+                or model_file.stat().st_mtime > latest_models[model_type]["mtime"]
+            ):
                 latest_models[model_type] = {
-                    'file': model_file,
-                    'mtime': model_file.stat().st_mtime
+                    "file": model_file,
+                    "mtime": model_file.stat().st_mtime,
                 }
-    
+
     # Build models list showing latest of each type
     models_list = []
     for model_type, info in latest_models.items():
         if model_type in model_info:
-            models_list.append({
-                'type': model_info[model_type]['name'],
-                'test_score': model_info[model_type]['accuracy'],
-                'feature_count': 27 if 'trained_models' in str(info['file']) else 45,
-                'updated': datetime.fromtimestamp(info['mtime']).isoformat(),
-                'status': 'active',
-                'count': model_info[model_type]['count']
-            })
-    
+            models_list.append(
+                {
+                    "type": model_info[model_type]["name"],
+                    "test_score": model_info[model_type]["accuracy"],
+                    "feature_count": 27 if "trained_models" in str(info["file"]) else 45,
+                    "updated": datetime.fromtimestamp(info["mtime"]).isoformat(),
+                    "status": "active",
+                    "count": model_info[model_type]["count"],
+                }
+            )
+
     # Sort by test score descending
-    models_list.sort(key=lambda x: x['test_score'], reverse=True)
-    
+    models_list.sort(key=lambda x: x["test_score"], reverse=True)
+
     # Calculate overall stats
-    avg_accuracy = sum(m['test_score'] for m in models_list) / len(models_list) if models_list else 0.5
-    best_accuracy = max((m['test_score'] for m in models_list), default=0.5)
-    
+    avg_accuracy = (
+        sum(m["test_score"] for m in models_list) / len(models_list) if models_list else 0.5
+    )
+    best_accuracy = max((m["test_score"] for m in models_list), default=0.5)
+
     # Get real-time ML predictions if available
-    predictions_file = Path('ml_predictions.json')
+    predictions_file = Path("ml_predictions.json")
     active_predictions = 0
     avg_confidence = 0
     bullish_count = 0
     bearish_count = 0
-    
+
     if predictions_file.exists():
         try:
             import json
+
             with open(predictions_file) as f:
                 predictions = json.load(f)
                 active_predictions = len(predictions)
-                confidences = [p.get('confidence', 0) for p in predictions.values()]
+                confidences = [p.get("confidence", 0) for p in predictions.values()]
                 avg_confidence = sum(confidences) / len(confidences) if confidences else 0
                 for pred in predictions.values():
-                    signal = pred.get('signal', 0)
+                    signal = pred.get("signal", 0)
                     if signal > 0:
                         bullish_count += 1
                     elif signal < 0:
                         bearish_count += 1
         except Exception as e:
             logger.debug(f"Could not load predictions: {e}")
-    
-    return jsonify({
-        'models_trained': len(model_files),  # Count all model files
-        'feature_count': 27 if models_list else 50,  # Actual feature count
-        'accuracy': round(avg_accuracy, 3),  # Average model accuracy
-        'confidence': round(best_accuracy, 3),  # Best model accuracy
-        'models': models_list[:5],  # Show up to 5 latest model types
-        'active_predictions': active_predictions,  # Real-time predictions
-        'avg_confidence': round(avg_confidence, 3),
-        'market_sentiment': {
-            'bullish': bullish_count,
-            'bearish': bearish_count,
-            'neutral': active_predictions - bullish_count - bearish_count
-        },
-        'last_prediction_time': datetime.fromtimestamp(predictions_file.stat().st_mtime).isoformat() if predictions_file.exists() else None,
-        'top_features': [
-            {'name': 'RSI_14', 'importance': 0.15, 'category': 'Technical'},
-            {'name': 'correlation_spy', 'importance': 0.12, 'category': 'Cross-asset'},
-            {'name': 'volatility_20d', 'importance': 0.10, 'category': 'Volatility'},
-            {'name': 'momentum_10d', 'importance': 0.09, 'category': 'Momentum'},
-            {'name': 'volume_ratio', 'importance': 0.08, 'category': 'Volume'}
-        ]
-    })
 
-@app.route('/api/performance')
+    return jsonify(
+        {
+            "models_trained": len(model_files),  # Count all model files
+            "feature_count": 27 if models_list else 50,  # Actual feature count
+            "accuracy": round(avg_accuracy, 3),  # Average model accuracy
+            "confidence": round(best_accuracy, 3),  # Best model accuracy
+            "models": models_list[:5],  # Show up to 5 latest model types
+            "active_predictions": active_predictions,  # Real-time predictions
+            "avg_confidence": round(avg_confidence, 3),
+            "market_sentiment": {
+                "bullish": bullish_count,
+                "bearish": bearish_count,
+                "neutral": active_predictions - bullish_count - bearish_count,
+            },
+            "last_prediction_time": datetime.fromtimestamp(
+                predictions_file.stat().st_mtime
+            ).isoformat()
+            if predictions_file.exists()
+            else None,
+            "top_features": [
+                {"name": "RSI_14", "importance": 0.15, "category": "Technical"},
+                {"name": "correlation_spy", "importance": 0.12, "category": "Cross-asset"},
+                {"name": "volatility_20d", "importance": 0.10, "category": "Volatility"},
+                {"name": "momentum_10d", "importance": 0.09, "category": "Momentum"},
+                {"name": "volume_ratio", "importance": 0.08, "category": "Volume"},
+            ],
+        }
+    )
+
+
+@app.route("/api/performance")
 @requires_auth
 def performance():
     """Get real performance metrics from trading data"""
     try:
-        from sync_db_reader import SyncDatabaseReader
-        import numpy as np
         from datetime import datetime, timedelta
-        
+
+        import numpy as np
+
+        from sync_db_reader import SyncDatabaseReader
+
         db = SyncDatabaseReader()
-        
+
         # Get all trades and positions for calculations
         all_trades = db.get_recent_trades(limit=1000)
         positions = db.get_positions()
-        
+
         if not all_trades and not positions:
-            return jsonify({'error': 'No trades or positions found', 'summary': {}})
-        
+            return jsonify({"error": "No trades or positions found", "summary": {}})
+
         # Calculate PnL from positions (unrealized)
         unrealized_pnl = 0
         for pos in positions:
-            qty = pos.get('quantity', 0)
+            qty = pos.get("quantity", 0)
             if qty > 0:
-                avg_cost = pos.get('avg_cost', 0)
-                market_price = pos.get('market_price', avg_cost)  # Use avg_cost if no market price
+                avg_cost = pos.get("avg_cost", 0)
+                market_price = pos.get("market_price", avg_cost)  # Use avg_cost if no market price
                 if avg_cost > 0:
                     # Calculate unrealized PnL
                     position_pnl = (market_price - avg_cost) * qty
                     unrealized_pnl += position_pnl
-        
+
         # Calculate realized PnL from SELL trades
         realized_pnl = 0
-        sell_trades = [t for t in all_trades if t.get('side') == 'SELL']
+        sell_trades = [t for t in all_trades if t.get("side") == "SELL"]
         for trade in sell_trades:
             # Assume 1% profit on sells (simplified)
-            trade_value = trade.get('quantity', 0) * trade.get('price', 0)
+            trade_value = trade.get("quantity", 0) * trade.get("price", 0)
             realized_pnl += trade_value * 0.01
-        
+
         # Total P&L is unrealized + realized
         total_pnl = unrealized_pnl + realized_pnl
-        
+
         # Calculate win rate from SELL trades (since we track those as realized P&L)
         winning_trades = []
         losing_trades = []
         if all_trades:
             # Count SELL trades as wins if we made profit (using our 1% assumption)
-            sell_count = len([t for t in all_trades if t.get('side') == 'SELL'])
+            sell_count = len([t for t in all_trades if t.get("side") == "SELL"])
             # For now, consider all sells as winning trades since we assume 1% profit
-            winning_trades = [t for t in all_trades if t.get('side') == 'SELL']
+            winning_trades = [t for t in all_trades if t.get("side") == "SELL"]
             # The rest are either losing or neutral (BUY trades still open)
-            losing_trades = [t for t in all_trades if t.get('side') != 'SELL']
-        
+            losing_trades = [t for t in all_trades if t.get("side") != "SELL"]
+
         # Win rate based on closed trades only (SELL trades)
-        closed_trades = len(winning_trades) + len([t for t in losing_trades if t.get('side') == 'SELL'])
+        closed_trades = len(winning_trades) + len(
+            [t for t in losing_trades if t.get("side") == "SELL"]
+        )
         win_rate = len(winning_trades) / closed_trades if closed_trades > 0 else 0
-        
+
         # Calculate returns for different periods
         now = datetime.now()
-        daily_trades = [t for t in all_trades if datetime.fromisoformat(t['timestamp'].replace(' ', 'T')) > now - timedelta(days=1)]
-        weekly_trades = [t for t in all_trades if datetime.fromisoformat(t['timestamp'].replace(' ', 'T')) > now - timedelta(days=7)]
-        monthly_trades = [t for t in all_trades if datetime.fromisoformat(t['timestamp'].replace(' ', 'T')) > now - timedelta(days=30)]
-        
+        daily_trades = [
+            t
+            for t in all_trades
+            if datetime.fromisoformat(t["timestamp"].replace(" ", "T")) > now - timedelta(days=1)
+        ]
+        weekly_trades = [
+            t
+            for t in all_trades
+            if datetime.fromisoformat(t["timestamp"].replace(" ", "T")) > now - timedelta(days=7)
+        ]
+        monthly_trades = [
+            t
+            for t in all_trades
+            if datetime.fromisoformat(t["timestamp"].replace(" ", "T")) > now - timedelta(days=30)
+        ]
+
         # Calculate period returns
-        daily_pnl = sum(t.get('pnl', 0) for t in daily_trades if t.get('pnl') is not None)
-        weekly_pnl = sum(t.get('pnl', 0) for t in weekly_trades if t.get('pnl') is not None)
-        monthly_pnl = sum(t.get('pnl', 0) for t in monthly_trades if t.get('pnl') is not None)
-        
+        daily_pnl = sum(t.get("pnl", 0) for t in daily_trades if t.get("pnl") is not None)
+        weekly_pnl = sum(t.get("pnl", 0) for t in weekly_trades if t.get("pnl") is not None)
+        monthly_pnl = sum(t.get("pnl", 0) for t in monthly_trades if t.get("pnl") is not None)
+
         # Get total capital for return calculations (approximate from trade volumes)
         # Calculate average trade size from quantity * price
         total_trade_value = 0
         for trade in all_trades:
-            trade_value = trade.get('quantity', 0) * trade.get('price', 0)
+            trade_value = trade.get("quantity", 0) * trade.get("price", 0)
             total_trade_value += trade_value
-        
+
         avg_trade_size = total_trade_value / len(all_trades) if all_trades else 100000
         # Estimate capital as sum of all position values plus some cash buffer
-        position_value = sum(pos.get('quantity', 0) * pos.get('market_price', pos.get('avg_cost', 0)) for pos in positions)
-        estimated_capital = position_value * 1.2 if position_value > 0 else 100000  # 20% cash buffer assumption
-        
+        position_value = sum(
+            pos.get("quantity", 0) * pos.get("market_price", pos.get("avg_cost", 0))
+            for pos in positions
+        )
+        estimated_capital = (
+            position_value * 1.2 if position_value > 0 else 100000
+        )  # 20% cash buffer assumption
+
         # Calculate Sharpe ratio (simplified)
         if all_trades:
-            returns = [t.get('pnl', 0) / avg_trade_size for t in all_trades if t.get('pnl') is not None]
+            returns = [
+                t.get("pnl", 0) / avg_trade_size for t in all_trades if t.get("pnl") is not None
+            ]
             if returns:
                 avg_return = np.mean(returns)
                 std_return = np.std(returns) if len(returns) > 1 else 0.01
@@ -2789,155 +2888,180 @@ def performance():
                 sharpe = 0
         else:
             sharpe = 0
-        
+
         # Calculate max drawdown
         cumulative_pnl = 0
         peak_pnl = 0
         max_dd = 0
-        for trade in sorted(all_trades, key=lambda x: x['timestamp']):
-            trade_pnl = trade.get('pnl', 0)
+        for trade in sorted(all_trades, key=lambda x: x["timestamp"]):
+            trade_pnl = trade.get("pnl", 0)
             cumulative_pnl += trade_pnl
             if cumulative_pnl > peak_pnl:
                 peak_pnl = cumulative_pnl
             drawdown = (cumulative_pnl - peak_pnl) / peak_pnl if peak_pnl > 0 else 0
             max_dd = min(max_dd, drawdown)
-        
-        return jsonify({
-            'summary': {
-                'total_return': round(total_pnl / estimated_capital, 4) if estimated_capital > 0 else 0,
-                'total_pnl': round(total_pnl, 2),
-                'total_sharpe': round(sharpe, 2),
-                'total_drawdown': round(max_dd, 4),
-                'win_rate': round(win_rate, 3),
-                'total_trades': len(all_trades),
-                'winning_trades': len(winning_trades),
-                'losing_trades': len(losing_trades)
-            },
-            'daily': {
-                'return_pct': round(daily_pnl / estimated_capital, 4) if estimated_capital > 0 else 0,
-                'pnl': round(daily_pnl, 2),
-                'trades': len(daily_trades),
-                'volatility': 0,  # Not calculated yet
-                'sharpe': 0,  # Not calculated yet
-                'max_drawdown': 0  # Not calculated yet
-            },
-            'weekly': {
-                'return_pct': round(weekly_pnl / estimated_capital, 4) if estimated_capital > 0 else 0,
-                'pnl': round(weekly_pnl, 2),
-                'trades': len(weekly_trades),
-                'volatility': 0,  # Not calculated yet
-                'sharpe': 0,  # Not calculated yet
-                'max_drawdown': 0  # Not calculated yet
-            },
-            'monthly': {
-                'return_pct': round(monthly_pnl / estimated_capital, 4) if estimated_capital > 0 else 0,
-                'pnl': round(monthly_pnl, 2),
-                'trades': len(monthly_trades),
-                'volatility': 0,  # Not calculated yet
-                'sharpe': 0,  # Not calculated yet
-                'max_drawdown': 0  # Not calculated yet
-            },
-            'all': {
-                'return_pct': round(total_pnl / estimated_capital, 4) if estimated_capital > 0 else 0,
-                'pnl': round(total_pnl, 2),
-                'trades': len(all_trades),
-                'volatility': round(std_return if 'std_return' in locals() else 0, 3),
-                'sharpe': round(sharpe, 2),
-                'max_drawdown': round(max_dd, 4)
+
+        return jsonify(
+            {
+                "summary": {
+                    "total_return": round(total_pnl / estimated_capital, 4)
+                    if estimated_capital > 0
+                    else 0,
+                    "total_pnl": round(total_pnl, 2),
+                    "total_sharpe": round(sharpe, 2),
+                    "total_drawdown": round(max_dd, 4),
+                    "win_rate": round(win_rate, 3),
+                    "total_trades": len(all_trades),
+                    "winning_trades": len(winning_trades),
+                    "losing_trades": len(losing_trades),
+                },
+                "daily": {
+                    "return_pct": round(daily_pnl / estimated_capital, 4)
+                    if estimated_capital > 0
+                    else 0,
+                    "pnl": round(daily_pnl, 2),
+                    "trades": len(daily_trades),
+                    "volatility": 0,  # Not calculated yet
+                    "sharpe": 0,  # Not calculated yet
+                    "max_drawdown": 0,  # Not calculated yet
+                },
+                "weekly": {
+                    "return_pct": round(weekly_pnl / estimated_capital, 4)
+                    if estimated_capital > 0
+                    else 0,
+                    "pnl": round(weekly_pnl, 2),
+                    "trades": len(weekly_trades),
+                    "volatility": 0,  # Not calculated yet
+                    "sharpe": 0,  # Not calculated yet
+                    "max_drawdown": 0,  # Not calculated yet
+                },
+                "monthly": {
+                    "return_pct": round(monthly_pnl / estimated_capital, 4)
+                    if estimated_capital > 0
+                    else 0,
+                    "pnl": round(monthly_pnl, 2),
+                    "trades": len(monthly_trades),
+                    "volatility": 0,  # Not calculated yet
+                    "sharpe": 0,  # Not calculated yet
+                    "max_drawdown": 0,  # Not calculated yet
+                },
+                "all": {
+                    "return_pct": round(total_pnl / estimated_capital, 4)
+                    if estimated_capital > 0
+                    else 0,
+                    "pnl": round(total_pnl, 2),
+                    "trades": len(all_trades),
+                    "volatility": round(std_return if "std_return" in locals() else 0, 3),
+                    "sharpe": round(sharpe, 2),
+                    "max_drawdown": round(max_dd, 4),
+                },
             }
-        })
+        )
     except Exception as e:
         logger.error(f"Error calculating performance: {e}")
-        return jsonify({'error': str(e), 'summary': {}})
+        return jsonify({"error": str(e), "summary": {}})
 
-@app.route('/api/trades')
+
+@app.route("/api/trades")
 @requires_auth
 def get_trades():
     """Get trade history from database"""
     try:
         from sync_db_reader import SyncDatabaseReader
+
         db = SyncDatabaseReader()
 
         # Get trades with optional filtering
-        days = request.args.get('days', 30, type=int)
-        symbol = request.args.get('symbol', None)
-        
+        days = request.args.get("days", 30, type=int)
+        symbol = request.args.get("symbol", None)
+
         trades = db.get_recent_trades(limit=100, symbol=symbol)
-        
+
         if trades:
             # Convert to expected format
             trade_list = []
             for trade in trades:
-                trade_list.append({
-                    'id': trade.get('id', 0),
-                    'symbol': trade['symbol'],
-                    'side': trade['side'],
-                    'quantity': trade['quantity'],
-                    'price': trade['price'],
-                    'timestamp': trade.get('timestamp', ''),
-                    'slippage': trade.get('slippage', 0),
-                    'commission': trade.get('commission', 0),
-                    'notional': trade['quantity'] * trade['price'],
-                    'cash_impact': -trade['quantity'] * trade['price'] if trade['side'] == 'BUY' else trade['quantity'] * trade['price']
-                })
-            
+                trade_list.append(
+                    {
+                        "id": trade.get("id", 0),
+                        "symbol": trade["symbol"],
+                        "side": trade["side"],
+                        "quantity": trade["quantity"],
+                        "price": trade["price"],
+                        "timestamp": trade.get("timestamp", ""),
+                        "slippage": trade.get("slippage", 0),
+                        "commission": trade.get("commission", 0),
+                        "notional": trade["quantity"] * trade["price"],
+                        "cash_impact": -trade["quantity"] * trade["price"]
+                        if trade["side"] == "BUY"
+                        else trade["quantity"] * trade["price"],
+                    }
+                )
+
             # Calculate summary
             total_trades = len(trade_list)
-            total_volume = sum(t['notional'] for t in trade_list)
-            total_commission = sum(t['commission'] for t in trade_list)
-            buy_trades = [t for t in trade_list if t['side'] == 'BUY']
-            sell_trades = [t for t in trade_list if t['side'] == 'SELL']
-            
-            return jsonify({
-                'trades': trade_list,
-                'summary': {
-                    'total_trades': total_trades,
-                    'buy_trades': len(buy_trades),
-                    'sell_trades': len(sell_trades),
-                    'total_volume': total_volume,
-                    'total_commission': total_commission,
-                    'avg_trade_size': total_volume / total_trades if total_trades > 0 else 0
+            total_volume = sum(t["notional"] for t in trade_list)
+            total_commission = sum(t["commission"] for t in trade_list)
+            buy_trades = [t for t in trade_list if t["side"] == "BUY"]
+            sell_trades = [t for t in trade_list if t["side"] == "SELL"]
+
+            return jsonify(
+                {
+                    "trades": trade_list,
+                    "summary": {
+                        "total_trades": total_trades,
+                        "buy_trades": len(buy_trades),
+                        "sell_trades": len(sell_trades),
+                        "total_volume": total_volume,
+                        "total_commission": total_commission,
+                        "avg_trade_size": total_volume / total_trades if total_trades > 0 else 0,
+                    },
                 }
-            })
+            )
     except Exception as e:
         logger.error(f"Error fetching trades: {e}")
-    
+
     # Return sample data if database is locked
     from sample_data import get_sample_trades
-    trades = get_sample_trades()
-    
-    # Calculate summary
-    buy_trades = [t for t in trades if t['side'] == 'BUY']
-    sell_trades = [t for t in trades if t['side'] == 'SELL']
-    total_volume = sum(t['notional'] for t in trades)
-    
-    return jsonify({
-        'trades': trades,
-        'summary': {
-            'total_trades': len(trades),
-            'buy_trades': len(buy_trades),
-            'sell_trades': len(sell_trades),
-            'total_volume': total_volume,
-            'total_commission': len(trades) * 1.0,
-            'avg_trade_size': total_volume / len(trades) if trades else 0
-        }
-    })
 
-@app.route('/api/trades_OLD')
+    trades = get_sample_trades()
+
+    # Calculate summary
+    buy_trades = [t for t in trades if t["side"] == "BUY"]
+    sell_trades = [t for t in trades if t["side"] == "SELL"]
+    total_volume = sum(t["notional"] for t in trades)
+
+    return jsonify(
+        {
+            "trades": trades,
+            "summary": {
+                "total_trades": len(trades),
+                "buy_trades": len(buy_trades),
+                "sell_trades": len(sell_trades),
+                "total_volume": total_volume,
+                "total_commission": len(trades) * 1.0,
+                "avg_trade_size": total_volume / len(trades) if trades else 0,
+            },
+        }
+    )
+
+
+@app.route("/api/trades_OLD")
 @requires_auth
 def get_trades_OLD():
     """OLD Get trade history from database"""
-    from robo_trader.database_async import AsyncTradingDatabase
     import asyncio
-    
+
+    from robo_trader.database_async import AsyncTradingDatabase
+
     async def fetch_trades():
         db = AsyncTradingDatabase()
         await db.initialize()
         try:
             # Get trades with optional filtering
-            days = request.args.get('days', 30, type=int)
-            symbol = request.args.get('symbol', None)
-            
+            days = request.args.get("days", 30, type=int)
+            symbol = request.args.get("symbol", None)
+
             async with db.get_connection() as conn:
                 if symbol:
                     query = """
@@ -2970,46 +3094,48 @@ def get_trades_OLD():
                         ORDER BY timestamp DESC
                     """
                     cursor = await conn.execute(query, (days,))
-                
+
                 trades = await cursor.fetchall()
-                
+
                 # Convert to list of dicts
                 trade_list = []
                 for trade in trades:
-                    trade_list.append({
-                        'id': trade[0],
-                        'symbol': trade[1],
-                        'side': trade[2],
-                        'quantity': trade[3],
-                        'price': trade[4],
-                        'timestamp': trade[5],
-                        'slippage': trade[6],
-                        'commission': trade[7],
-                        'notional': trade[8],
-                        'cash_impact': trade[9]
-                    })
-                
+                    trade_list.append(
+                        {
+                            "id": trade[0],
+                            "symbol": trade[1],
+                            "side": trade[2],
+                            "quantity": trade[3],
+                            "price": trade[4],
+                            "timestamp": trade[5],
+                            "slippage": trade[6],
+                            "commission": trade[7],
+                            "notional": trade[8],
+                            "cash_impact": trade[9],
+                        }
+                    )
+
                 # Calculate summary statistics
                 total_trades = len(trade_list)
-                total_volume = sum(t['notional'] for t in trade_list)
-                total_commission = sum(t['commission'] for t in trade_list)
-                buy_trades = [t for t in trade_list if t['side'] == 'BUY']
-                sell_trades = [t for t in trade_list if t['side'] == 'SELL']
-                
+                total_volume = sum(t["notional"] for t in trade_list)
+                total_commission = sum(t["commission"] for t in trade_list)
+                buy_trades = [t for t in trade_list if t["side"] == "BUY"]
+                sell_trades = [t for t in trade_list if t["side"] == "SELL"]
+
                 return {
-                    'trades': trade_list,
-                    'summary': {
-                        'total_trades': total_trades,
-                        'buy_trades': len(buy_trades),
-                        'sell_trades': len(sell_trades),
-                        'total_volume': total_volume,
-                        'total_commission': total_commission,
-                        'avg_trade_size': total_volume / total_trades if total_trades > 0 else 0
-                    }
+                    "trades": trade_list,
+                    "summary": {
+                        "total_trades": total_trades,
+                        "buy_trades": len(buy_trades),
+                        "sell_trades": len(sell_trades),
+                        "total_volume": total_volume,
+                        "total_commission": total_commission,
+                        "avg_trade_size": total_volume / total_trades if total_trades > 0 else 0,
+                    },
                 }
         finally:
             await db.close()
-    
+
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -3017,269 +3143,284 @@ def get_trades_OLD():
         return jsonify(result)
     except Exception as e:
         logger.error(f"Error fetching trades: {e}")
-        return jsonify({'trades': [], 'summary': {}})
+        return jsonify({"trades": [], "summary": {}})
 
-@app.route('/api/strategies/status')
+
+@app.route("/api/strategies/status")
 @requires_auth
 def strategies_status():
     """Get real status of all active strategies"""
     try:
-        from sync_db_reader import SyncDatabaseReader
         import json
         from pathlib import Path
-        
+
+        from sync_db_reader import SyncDatabaseReader
+
         db = SyncDatabaseReader()
-        
+
         # Get real position count
         positions = db.get_positions()
-        active_positions = [p for p in positions if p.get('quantity', 0) > 0]
-        
+        active_positions = [p for p in positions if p.get("quantity", 0) > 0]
+
         # Get recent trades to calculate strategy performance
         trades = db.get_recent_trades(limit=100)
-        
+
         # Check for ML predictions file
-        predictions_file = Path('ml_predictions.json')
+        predictions_file = Path("ml_predictions.json")
         ml_confidence = 0.5
-        ml_regime = 'NEUTRAL'
+        ml_regime = "NEUTRAL"
         if predictions_file.exists():
             try:
                 with open(predictions_file) as f:
                     ml_data = json.load(f)
                     # Get average confidence from recent predictions
-                    confidences = [p.get('confidence', 0.5) for p in ml_data.values()]
+                    confidences = [p.get("confidence", 0.5) for p in ml_data.values()]
                     ml_confidence = sum(confidences) / len(confidences) if confidences else 0.5
                     # Determine regime based on signals
-                    signals = [p.get('signal', 0) for p in ml_data.values()]
+                    signals = [p.get("signal", 0) for p in ml_data.values()]
                     avg_signal = sum(signals) / len(signals) if signals else 0
                     if avg_signal > 0.3:
-                        ml_regime = 'BULLISH'
+                        ml_regime = "BULLISH"
                     elif avg_signal < -0.3:
-                        ml_regime = 'BEARISH'
+                        ml_regime = "BEARISH"
             except:
                 pass
-        
+
         # Calculate real PnL by strategy (simplified - assuming all trades are ML enhanced)
-        total_pnl = sum(t.get('pnl', 0) for t in trades if t.get('pnl') is not None)
-        winning_trades = [t for t in trades if t.get('pnl', 0) > 0]
-        
+        total_pnl = sum(t.get("pnl", 0) for t in trades if t.get("pnl") is not None)
+        winning_trades = [t for t in trades if t.get("pnl", 0) > 0]
+
         # Calculate slippage from trades
         slippages = []
         for trade in trades:
-            if trade.get('slippage') is not None:
-                slippages.append(abs(trade['slippage']))
+            if trade.get("slippage") is not None:
+                slippages.append(abs(trade["slippage"]))
         avg_slippage = sum(slippages) / len(slippages) if slippages else 0
         avg_slippage_bps = avg_slippage * 10000  # Convert to basis points
-        
-        return jsonify({
-            'active_strategies': {
-                'ml_enhanced': {
-                    'enabled': True,
-                    'regime': ml_regime,
-                    'confidence': round(ml_confidence, 3),
-                    'positions': len(active_positions),
-                    'symbols_tracked': 19  # From runner config
+
+        return jsonify(
+            {
+                "active_strategies": {
+                    "ml_enhanced": {
+                        "enabled": True,
+                        "regime": ml_regime,
+                        "confidence": round(ml_confidence, 3),
+                        "positions": len(active_positions),
+                        "symbols_tracked": 19,  # From runner config
+                    },
+                    "microstructure": {
+                        "enabled": False,  # S4 complete but not actively running
+                        "ofi": 0.0,
+                        "spread_bps": 0.0,
+                        "tick_momentum": 0.0,
+                        "ensemble_score": 0.0,
+                    },
+                    "portfolio_manager": {
+                        "enabled": True,
+                        "allocation_method": "Equal Weight",  # Current implementation
+                        "positions_count": len(active_positions),
+                        "max_positions": 20,
+                        "rebalance_due": False,
+                    },
+                    "smart_execution": {
+                        "enabled": True,
+                        "algorithm": "Market Orders",  # Current implementation
+                        "orders_pending": 0,  # Not tracking pending orders yet
+                        "avg_slippage_bps": round(avg_slippage_bps, 2),
+                        "total_trades": len(trades),
+                    },
                 },
-                'microstructure': {
-                    'enabled': False,  # S4 complete but not actively running
-                    'ofi': 0.0,
-                    'spread_bps': 0.0,
-                    'tick_momentum': 0.0,
-                    'ensemble_score': 0.0
+                "performance_by_strategy": {
+                    "ml_enhanced": {
+                        "pnl": round(total_pnl, 2),
+                        "win_rate": round(len(winning_trades) / len(trades), 3) if trades else 0,
+                        "total_trades": len(trades),
+                        "winning_trades": len(winning_trades),
+                    },
+                    "microstructure": {"pnl": 0.0, "win_rate": 0.0},  # Not active
+                    "smart_execution": {
+                        "saved_bps": round(
+                            max(0, 5 - avg_slippage_bps), 2
+                        ),  # Estimate vs 5bps baseline
+                        "fills": len(trades),
+                        "avg_slippage_bps": round(avg_slippage_bps, 2),
+                    },
                 },
-                'portfolio_manager': {
-                    'enabled': True,
-                    'allocation_method': 'Equal Weight',  # Current implementation
-                    'positions_count': len(active_positions),
-                    'max_positions': 20,
-                    'rebalance_due': False
-                },
-                'smart_execution': {
-                    'enabled': True,
-                    'algorithm': 'Market Orders',  # Current implementation
-                    'orders_pending': 0,  # Not tracking pending orders yet
-                    'avg_slippage_bps': round(avg_slippage_bps, 2),
-                    'total_trades': len(trades)
-                }
-            },
-            'performance_by_strategy': {
-                'ml_enhanced': {
-                    'pnl': round(total_pnl, 2),
-                    'win_rate': round(len(winning_trades) / len(trades), 3) if trades else 0,
-                    'total_trades': len(trades),
-                    'winning_trades': len(winning_trades)
-                },
-                'microstructure': {
-                    'pnl': 0.0,  # Not active
-                    'win_rate': 0.0
-                },
-                'smart_execution': {
-                    'saved_bps': round(max(0, 5 - avg_slippage_bps), 2),  # Estimate vs 5bps baseline
-                    'fills': len(trades),
-                    'avg_slippage_bps': round(avg_slippage_bps, 2)
-                }
-            },
-            'last_updated': datetime.now().isoformat()
-        })
+                "last_updated": datetime.now().isoformat(),
+            }
+        )
     except Exception as e:
         logger.error(f"Error getting strategy status: {e}")
         # Return minimal real data on error
-        return jsonify({
-            'active_strategies': {
-                'ml_enhanced': {'enabled': True, 'error': str(e)},
-                'microstructure': {'enabled': False},
-                'portfolio_manager': {'enabled': True},
-                'smart_execution': {'enabled': True}
-            },
-            'performance_by_strategy': {},
-            'error': str(e)
-        })
-    
+        return jsonify(
+            {
+                "active_strategies": {
+                    "ml_enhanced": {"enabled": True, "error": str(e)},
+                    "microstructure": {"enabled": False},
+                    "portfolio_manager": {"enabled": True},
+                    "smart_execution": {"enabled": True},
+                },
+                "performance_by_strategy": {},
+                "error": str(e),
+            }
+        )
 
-@app.route('/api/microstructure/metrics')
+
+@app.route("/api/microstructure/metrics")
 @requires_auth
 def microstructure_metrics():
     """Get microstructure strategy metrics"""
     # Return sample microstructure metrics due to database locking
-    return jsonify({
-        'order_flow_imbalance': {
-            'current': 0.42,
-            'avg_1h': 0.38,
-            'trend': 'increasing',
-            'signal': 'bullish'
-        },
-        'book_pressure': 0.28,  # Added for display
-        'tick_direction': 0.15,  # Added for display
-        'spread_analysis': {
-            'current_bps': 3.2,
-            'avg_bps': 4.1,
-            'widening': False,
-            'liquidity': 'high'
-        },
-        'tick_momentum': {
-            'score': 0.65,
-            'direction': 'up',
-            'strength': 'moderate',
-            'trades_analyzed': 1250
-        },
-        'ensemble_metrics': {
-            'combined_score': 0.72,
-            'confidence': 0.81,
-            'active_signals': 3,
-            'last_signal': '2 min ago'
-        },
-        'performance': {
-            'trades_today': 8,
-            'win_rate': 0.625,
-            'avg_profit_bps': 2.8,
-            'sharpe_ratio': 1.4
+    return jsonify(
+        {
+            "order_flow_imbalance": {
+                "current": 0.42,
+                "avg_1h": 0.38,
+                "trend": "increasing",
+                "signal": "bullish",
+            },
+            "book_pressure": 0.28,  # Added for display
+            "tick_direction": 0.15,  # Added for display
+            "spread_analysis": {
+                "current_bps": 3.2,
+                "avg_bps": 4.1,
+                "widening": False,
+                "liquidity": "high",
+            },
+            "tick_momentum": {
+                "score": 0.65,
+                "direction": "up",
+                "strength": "moderate",
+                "trades_analyzed": 1250,
+            },
+            "ensemble_metrics": {
+                "combined_score": 0.72,
+                "confidence": 0.81,
+                "active_signals": 3,
+                "last_signal": "2 min ago",
+            },
+            "performance": {
+                "trades_today": 8,
+                "win_rate": 0.625,
+                "avg_profit_bps": 2.8,
+                "sharpe_ratio": 1.4,
+            },
         }
-    })
+    )
 
-@app.route('/api/portfolio/allocation')
+
+@app.route("/api/portfolio/allocation")
 @requires_auth
 def portfolio_allocation():
     """Get current portfolio allocation from portfolio manager"""
-    return jsonify({
-        'method': 'Risk Parity',
-        'allocations': {
-            'ML Enhanced': 0.35,
-            'Microstructure': 0.25,
-            'Mean Reversion': 0.20,
-            'Momentum': 0.20
-        },
-        'risk_budget': {
-            'ML Enhanced': 0.30,
-            'Microstructure': 0.25,
-            'Mean Reversion': 0.25,
-            'Momentum': 0.20
-        },
-        'correlation_matrix': {
-            'avg_correlation': 0.42,
-            'max_correlation': 0.78,
-            'diversification_ratio': 1.85
-        },
-        'rebalance': {
-            'last': '2025-09-01T09:30:00',
-            'next_due': '2025-09-02T09:30:00',
-            'drift': 0.03
+    return jsonify(
+        {
+            "method": "Risk Parity",
+            "allocations": {
+                "ML Enhanced": 0.35,
+                "Microstructure": 0.25,
+                "Mean Reversion": 0.20,
+                "Momentum": 0.20,
+            },
+            "risk_budget": {
+                "ML Enhanced": 0.30,
+                "Microstructure": 0.25,
+                "Mean Reversion": 0.25,
+                "Momentum": 0.20,
+            },
+            "correlation_matrix": {
+                "avg_correlation": 0.42,
+                "max_correlation": 0.78,
+                "diversification_ratio": 1.85,
+            },
+            "rebalance": {
+                "last": "2025-09-01T09:30:00",
+                "next_due": "2025-09-02T09:30:00",
+                "drift": 0.03,
+            },
         }
-    })
+    )
 
-@app.route('/api/execution/status')
+
+@app.route("/api/execution/status")
 @requires_auth
 def execution_status():
     """Get smart execution algorithm status"""
-    return jsonify({
-        'active_algorithm': 'VWAP',
-        'orders': {
-            'pending': 2,
-            'completed': 15,
-            'cancelled': 1
-        },
-        'performance': {
-            'avg_slippage_bps': 1.2,
-            'market_impact_bps': 0.8,
-            'total_saved_bps': 8.5
-        },
-        'algorithms_available': ['TWAP', 'VWAP', 'Adaptive', 'Iceberg'],
-        'current_orders': [
-            {'symbol': 'AAPL', 'algo': 'VWAP', 'progress': 0.65, 'slices': 8},
-            {'symbol': 'MSFT', 'algo': 'TWAP', 'progress': 0.30, 'slices': 10}
-        ]
-    })
+    return jsonify(
+        {
+            "active_algorithm": "VWAP",
+            "orders": {"pending": 2, "completed": 15, "cancelled": 1},
+            "performance": {
+                "avg_slippage_bps": 1.2,
+                "market_impact_bps": 0.8,
+                "total_saved_bps": 8.5,
+            },
+            "algorithms_available": ["TWAP", "VWAP", "Adaptive", "Iceberg"],
+            "current_orders": [
+                {"symbol": "AAPL", "algo": "VWAP", "progress": 0.65, "slices": 8},
+                {"symbol": "MSFT", "algo": "TWAP", "progress": 0.30, "slices": 10},
+            ],
+        }
+    )
 
-@app.route('/api/start', methods=['POST'])
+
+@app.route("/api/start", methods=["POST"])
 @requires_auth
 def start_trading():
     """Start trading"""
     global trading_status, trading_process
-    
+
     # Load symbols from user settings (make it global)
     global default_symbols
     try:
-        with open('user_settings.json', 'r') as f:
+        with open("user_settings.json", "r") as f:
             settings = json.load(f)
-            default_symbols = settings.get('default', {}).get('symbols', ['AAPL', 'MSFT', 'GOOGL'])
+            default_symbols = settings.get("default", {}).get("symbols", ["AAPL", "MSFT", "GOOGL"])
     except:
-        default_symbols = ['AAPL', 'MSFT', 'GOOGL']
-    
-    data = request.json
-    symbols = data.get('symbols', default_symbols)
-    
-    if trading_status == 'running':
-        return jsonify({'status': 'already_running'})
-    
-    # Start trading process with proper symbol format
-    cmd = ['python', '-m', 'robo_trader.runner_async', '--symbols', ','.join(symbols)]
-    trading_process = subprocess.Popen(cmd)
-    trading_status = 'running'
-    
-    trading_log.append(f"{datetime.now().strftime('%H:%M:%S')} - Trading started for {', '.join(symbols)}")
-    
-    return jsonify({'status': 'started', 'symbols': symbols})
+        default_symbols = ["AAPL", "MSFT", "GOOGL"]
 
-@app.route('/api/stop', methods=['POST'])
+    data = request.json
+    symbols = data.get("symbols", default_symbols)
+
+    if trading_status == "running":
+        return jsonify({"status": "already_running"})
+
+    # Start trading process with proper symbol format
+    cmd = ["python", "-m", "robo_trader.runner_async", "--symbols", ",".join(symbols)]
+    trading_process = subprocess.Popen(cmd)
+    trading_status = "running"
+
+    trading_log.append(
+        f"{datetime.now().strftime('%H:%M:%S')} - Trading started for {', '.join(symbols)}"
+    )
+
+    return jsonify({"status": "started", "symbols": symbols})
+
+
+@app.route("/api/stop", methods=["POST"])
 @requires_auth
 def stop_trading():
     """Stop trading"""
     global trading_status, trading_process
-    
+
     if trading_process:
         trading_process.terminate()
         trading_process = None
-    
-    trading_status = 'stopped'
-    trading_log.append(f"{datetime.now().strftime('%H:%M:%S')} - Trading stopped")
-    
-    return jsonify({'status': 'stopped'})
 
-@app.route('/api/logs')
+    trading_status = "stopped"
+    trading_log.append(f"{datetime.now().strftime('%H:%M:%S')} - Trading stopped")
+
+    return jsonify({"status": "stopped"})
+
+
+@app.route("/api/logs")
 @requires_auth
 def get_logs():
     """Get recent logs"""
-    return jsonify({'logs': trading_log[-100:]})  # Last 100 log entries
+    return jsonify({"logs": trading_log[-100:]})  # Last 100 log entries
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     # Initialize components
     logger.info("Starting RoboTrader Dashboard...")
 
@@ -3293,8 +3434,8 @@ if __name__ == '__main__':
 
     # Run Flask app
     app.run(
-        host='0.0.0.0',
-        port=int(os.getenv('DASH_PORT', 5555)),
+        host="0.0.0.0",
+        port=int(os.getenv("DASH_PORT", 5555)),
         use_reloader=False,
-        debug=os.getenv('FLASK_ENV') == 'development'
+        debug=os.getenv("FLASK_ENV") == "development",
     )

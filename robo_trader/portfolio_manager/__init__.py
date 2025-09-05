@@ -9,7 +9,7 @@ from .portfolio_manager import (
 
 __all__ = [
     "AllocationMethod",
-    "MultiStrategyPortfolioManager", 
+    "MultiStrategyPortfolioManager",
     "PortfolioMetrics",
     "StrategyAllocation",
 ]

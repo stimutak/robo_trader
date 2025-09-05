@@ -86,4 +86,20 @@ run:
 run-venv:
 	. .venv/bin/activate && python -m robo_trader.runner_async --symbols AAPL,NVDA,TSLA
 
+# Run BugBot
+bugbot:
+	./scripts/run_bugbot.sh
+
+# Run BugBot with specific config
+bugbot-dev:
+	python3 scripts/bug_detector.py --scan --config development --output bug-report-dev.json
+
+# Run BugBot with production config
+bugbot-prod:
+	python3 scripts/bug_detector.py --scan --config production --tools mypy,bandit,flake8 --output bug-report-prod.json
+
+# Run BugBot in watch mode
+bugbot-watch:
+	python3 scripts/bug_detector.py --watch --config development
+
 

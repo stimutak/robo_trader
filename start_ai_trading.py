@@ -14,8 +14,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List
 
-from robo_trader.runner import run_once
 from robo_trader.logger import get_logger
+from robo_trader.runner import run_once
 
 logger = get_logger(__name__)
 
@@ -29,12 +29,12 @@ DEFAULT_SYMBOLS = [
     "BZAI",  # Baidu AI
     "ELTP",  # Elite Pharma
     "OPEN",  # Opendoor
-    "CEG",   # Constellation Energy
-    "VRT",   # Vertiv Holdings
+    "CEG",  # Constellation Energy
+    "VRT",  # Vertiv Holdings
     "PLTR",  # Palantir
     "UPST",  # Upstart
-    "TEM",   # Tempus AI
-    "HTFL",  # HTF Holdings  
+    "TEM",  # Tempus AI
+    "HTFL",  # HTF Holdings
     "SDGR",  # Schrodinger
     "APLD",  # Applied Digital
     "SOFI",  # SoFi Technologies
@@ -42,23 +42,25 @@ DEFAULT_SYMBOLS = [
     "WULF",  # TeraWulf
 ]
 
+
 def load_symbols_from_settings():
     """Load symbols from user settings file if it exists."""
     import json
     from pathlib import Path
-    
+
     settings_file = Path("user_settings.json")
     if settings_file.exists():
         try:
-            with open(settings_file, 'r') as f:
+            with open(settings_file, "r") as f:
                 settings = json.load(f)
-                symbols = settings.get('default', {}).get('symbols', DEFAULT_SYMBOLS)
+                symbols = settings.get("default", {}).get("symbols", DEFAULT_SYMBOLS)
                 logger.info(f"Loaded {len(symbols)} symbols from user settings")
                 return symbols
         except Exception as e:
             logger.warning(f"Failed to load user settings: {e}, using defaults")
-    
+
     return DEFAULT_SYMBOLS
+
 
 shutdown_event = asyncio.Event()
 
@@ -81,7 +83,7 @@ async def trading_loop(
 ):
     """
     Main trading loop that continuously monitors and trades symbols.
-    
+
     Args:
         symbols: List of symbols to trade
         duration: Historical data duration
@@ -95,15 +97,15 @@ async def trading_loop(
     logger.info(f"Starting AI trading system with {len(symbols)} symbols")
     logger.info(f"Symbols: {', '.join(symbols)}")
     logger.info(f"Configuration: SMA {sma_fast}/{sma_slow}, Max Order: ${max_order_notional:,.0f}")
-    
+
     iteration = 0
     while not shutdown_event.is_set():
         iteration += 1
         start_time = datetime.now()
-        
+
         try:
             logger.info(f"=== Trading Iteration {iteration} starting at {start_time} ===")
-            
+
             # Run trading logic for all symbols
             await run_once(
                 symbols=symbols,
@@ -115,17 +117,17 @@ async def trading_loop(
                 max_order_notional=max_order_notional,
                 slippage_bps=slippage_bps,
             )
-            
+
             elapsed = (datetime.now() - start_time).total_seconds()
             logger.info(f"Iteration {iteration} completed in {elapsed:.1f} seconds")
-            
+
         except Exception as e:
             logger.error(f"Error in trading iteration {iteration}: {e}", exc_info=True)
-        
+
         # Wait before next iteration (5 minutes default)
         wait_time = 300  # 5 minutes
         logger.info(f"Waiting {wait_time} seconds before next iteration...")
-        
+
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=wait_time)
             break  # Shutdown requested
@@ -138,7 +140,7 @@ async def main():
     # Set up signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
+
     logger.info("=" * 60)
     logger.info("🤖 Robo Trader AI System Starting")
     logger.info("=" * 60)
@@ -146,22 +148,23 @@ async def main():
     logger.info("Dashboard: http://localhost:5555")
     logger.info("Press Ctrl+C to stop")
     logger.info("=" * 60)
-    
+
     # Check if dashboard is running
     import socket
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    dashboard_running = sock.connect_ex(('localhost', 5555)) == 0
+    dashboard_running = sock.connect_ex(("localhost", 5555)) == 0
     sock.close()
-    
+
     if not dashboard_running:
         logger.warning("Dashboard not detected at http://localhost:5555")
         logger.warning("Start the dashboard with: python app.py")
     else:
         logger.info("✓ Dashboard detected at http://localhost:5555")
-    
+
     # Load symbols from settings or use defaults
     symbols = load_symbols_from_settings()
-    
+
     # Start trading loop
     try:
         await trading_loop(
@@ -186,12 +189,9 @@ if __name__ == "__main__":
     # Configure logging
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler('ai_trading.log'),
-            logging.StreamHandler(sys.stdout)
-        ]
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[logging.FileHandler("ai_trading.log"), logging.StreamHandler(sys.stdout)],
     )
-    
+
     # Run the async main function
     asyncio.run(main())

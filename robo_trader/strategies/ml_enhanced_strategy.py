@@ -30,6 +30,7 @@ logger = structlog.get_logger(__name__)
 @dataclass
 class SimpleSignal:
     """Simple signal for internal use."""
+
     symbol: str
     action: str
     confidence: float
@@ -66,17 +67,20 @@ class MLEnhancedStrategy(Strategy):
         # Initialize base Strategy with required parameters
         super().__init__(
             name="MLEnhancedStrategy",
-            symbols=config.symbols if hasattr(config, 'symbols') else [],
+            symbols=config.symbols if hasattr(config, "symbols") else [],
             lookback_period=100,
             min_data_points=50,
             position_sizing="dynamic",
             max_positions=10,
-            enable_shorts=config.execution.enable_short_selling if hasattr(config, 'execution') else False,
-            config={"config": config}
+            enable_shorts=config.execution.enable_short_selling
+            if hasattr(config, "execution")
+            else False,
+            config={"config": config},
         )
 
         # ML components
         from ..ml.model_trainer import ModelTrainer
+
         self.feature_pipeline = FeaturePipeline(config)
         model_trainer = ModelTrainer(config, feature_pipeline=self.feature_pipeline)
         self.model_selector = ModelSelector(model_trainer)
@@ -141,7 +145,7 @@ class MLEnhancedStrategy(Strategy):
         else:
             # Initialize without historical data for testing
             await self._initialize({})
-    
+
     async def _initialize(self, historical_data: Dict[str, pd.DataFrame]) -> None:
         """Initialize strategy components."""
         await self.feature_pipeline.start()
@@ -252,7 +256,10 @@ class MLEnhancedStrategy(Strategy):
             features=latest_features,
             market_conditions={
                 "volatility": (
-                    80.0 if self.current_regime and self.current_regime.volatility_regime == MarketRegime.HIGH_VOL else 50.0
+                    80.0
+                    if self.current_regime
+                    and self.current_regime.volatility_regime == MarketRegime.HIGH_VOL
+                    else 50.0
                 )
             },
         )
@@ -384,7 +391,9 @@ class MLEnhancedStrategy(Strategy):
         if current_price > sma_fast > sma_slow:
             return SimpleSignal(symbol="", action="BUY", confidence=0.6, features={"trend": "up"})
         elif current_price < sma_fast < sma_slow:
-            return SimpleSignal(symbol="", action="SELL", confidence=0.6, features={"trend": "down"})
+            return SimpleSignal(
+                symbol="", action="SELL", confidence=0.6, features={"trend": "down"}
+            )
 
         return None
 
@@ -498,7 +507,10 @@ class MLEnhancedStrategy(Strategy):
             return self.base_confidence_threshold * 0.9
 
         # Higher threshold in volatile regimes
-        if self.current_regime.volatility_regime in [MarketRegime.HIGH_VOL, MarketRegime.EXTREME_VOL]:
+        if self.current_regime.volatility_regime in [
+            MarketRegime.HIGH_VOL,
+            MarketRegime.EXTREME_VOL,
+        ]:
             return self.base_confidence_threshold * 1.1
 
         return self.base_confidence_threshold
@@ -521,11 +533,12 @@ class MLEnhancedStrategy(Strategy):
     ) -> List[Signal]:
         """
         Generate signals for all symbols.
-        
+
         This implements the abstract method from Strategy base class.
         """
-        from .framework import Signal as FrameworkSignal, SignalType
-        
+        from .framework import Signal as FrameworkSignal
+        from .framework import SignalType
+
         signals = []
         for symbol in self.symbols:
             if symbol in market_data:
@@ -540,7 +553,7 @@ class MLEnhancedStrategy(Strategy):
                         signal_type=signal_type,
                         strength=signal.confidence,
                         rationale=f"ML Enhanced: {signal.features}",
-                        metadata=signal.features
+                        metadata=signal.features,
                     )
                     signals.append(framework_signal)
         return signals
@@ -567,7 +580,10 @@ class MLEnhancedStrategy(Strategy):
             metrics["avg_timeframe_alignment"] = avg_alignment
 
         # Add model metrics if available
-        if hasattr(self.model_selector, 'performance_history') and self.model_selector.performance_history:
+        if (
+            hasattr(self.model_selector, "performance_history")
+            and self.model_selector.performance_history
+        ):
             recent_accuracy = np.mean(
                 [p["accuracy"] for p in self.model_selector.performance_history[-10:]]
             )
