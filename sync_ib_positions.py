@@ -57,9 +57,9 @@ async def sync_positions():
                     symbol=pos["symbol"],
                     quantity=pos["quantity"],
                     avg_cost=pos["avg_cost"],
-                    market_price=pos.get("market_value", 0) / pos["quantity"]
-                    if pos["quantity"]
-                    else 0,
+                    market_price=(
+                        pos.get("market_value", 0) / pos["quantity"] if pos["quantity"] else 0
+                    ),
                 )
             logger.info(f"Synced {len(ib_positions)} positions to database")
 

@@ -21,7 +21,11 @@ sys.path.insert(0, str(project_root))
 
 # Import after path modification
 from robo_trader.bug_detection import BugAgent, BugDetectionConfig, BugSeverity  # noqa: E402
-from robo_trader.bug_detection.config import DEFAULT_CONFIG, DEVELOPMENT_CONFIG, PRODUCTION_CONFIG  # noqa: E402
+from robo_trader.bug_detection.config import (  # noqa: E402
+    DEFAULT_CONFIG,
+    DEVELOPMENT_CONFIG,
+    PRODUCTION_CONFIG,
+)
 from robo_trader.bug_detection.static_tools import StaticAnalysisManager  # noqa: E402
 
 

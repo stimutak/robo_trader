@@ -4,7 +4,7 @@ Comprehensive test for M3: ML Model Training Pipeline.
 
 This test demonstrates all M3 components:
 1. Random Forest training
-2. XGBoost training  
+2. XGBoost training
 3. LightGBM training
 4. Neural Network training (if TensorFlow available)
 5. Ensemble model training

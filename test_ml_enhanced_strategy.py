@@ -178,9 +178,11 @@ async def test_ml_enhanced_strategy():
         mock_regime = RegimeState(
             timestamp=datetime.now(),
             trend_regime=regime_type,
-            volatility_regime=MarketRegime.NEUTRAL
-            if regime_type not in [MarketRegime.HIGH_VOL, MarketRegime.EXTREME_VOL]
-            else regime_type,
+            volatility_regime=(
+                MarketRegime.NEUTRAL
+                if regime_type not in [MarketRegime.HIGH_VOL, MarketRegime.EXTREME_VOL]
+                else regime_type
+            ),
             confidence=0.8,
             indicators={"sma_20": 0.5, "rsi": 50},
             transition_probability=0.1,
@@ -260,9 +262,9 @@ async def test_position_sizing():
         regime = RegimeState(
             timestamp=datetime.now(),
             trend_regime=scenario["regime"],
-            volatility_regime=MarketRegime.HIGH_VOL
-            if scenario["volatility"] > 70
-            else MarketRegime.NEUTRAL,
+            volatility_regime=(
+                MarketRegime.HIGH_VOL if scenario["volatility"] > 70 else MarketRegime.NEUTRAL
+            ),
             confidence=0.8,
             indicators={"volatility": scenario["volatility"]},
             transition_probability=0.1,
