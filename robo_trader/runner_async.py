@@ -544,8 +544,9 @@ class AsyncRunner:
         # Get current equity
         equity = self.portfolio.equity({symbol: price for symbol in self.positions})
 
-        # Record signal in database
+        # Record signal in database with strength reflecting model confidence if available
         signal_value = int(last.get("signal", 0))
+        signal_strength = float(last.get("confidence", 1.0)) if "confidence" in last else 1.0
         if signal_value != 0:
             strategy_name = (
                 "ML_ENHANCED"
@@ -556,14 +557,16 @@ class AsyncRunner:
                 symbol,
                 strategy_name,
                 "BUY" if signal_value == 1 else "SELL",
-                abs(signal_value),
+                max(0.0, min(1.0, float(signal_strength))),
             )
 
             # Send signal update via WebSocket
             if WEBSOCKET_ENABLED and ws_client:
                 try:
                     signal_type = "BUY" if signal_value == 1 else "SELL"
-                    ws_client.send_signal_update(symbol, signal_type, abs(signal_value))
+                    ws_client.send_signal_update(
+                        symbol, signal_type, max(0.0, min(1.0, float(signal_strength)))
+                    )
                 except Exception as e:
                     logger.debug(f"Could not send signal WebSocket update: {e}")
 
