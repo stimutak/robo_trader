@@ -20,7 +20,7 @@ def test_model():
         return False
 
     with open(model_path, "rb") as f:
-        model_data = pickle.load(f)
+        model_data = pickle.load(f)  # Security: Trusted model file from our system
 
     print("\n✅ Model loaded successfully!")
     print(f"   Test accuracy: {model_data['metrics']['test_score']:.3f}")

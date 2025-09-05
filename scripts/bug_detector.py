@@ -19,10 +19,10 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-# Import after path modification - flake8: noqa: E402
-from robo_trader.bug_detection import BugAgent, BugDetectionConfig, BugSeverity
-from robo_trader.bug_detection.config import DEFAULT_CONFIG, DEVELOPMENT_CONFIG, PRODUCTION_CONFIG
-from robo_trader.bug_detection.static_tools import StaticAnalysisManager
+# Import after path modification
+from robo_trader.bug_detection import BugAgent, BugDetectionConfig, BugSeverity  # noqa: E402
+from robo_trader.bug_detection.config import DEFAULT_CONFIG, DEVELOPMENT_CONFIG, PRODUCTION_CONFIG  # noqa: E402
+from robo_trader.bug_detection.static_tools import StaticAnalysisManager  # noqa: E402
 
 
 async def run_scan(

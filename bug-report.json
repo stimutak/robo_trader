@@ -1,9 +1,9 @@
 {
-  "timestamp": "2025-09-05T10:27:56.756486",
-  "total_bugs": 177,
+  "timestamp": "2025-09-05T10:46:35.367186",
+  "total_bugs": 166,
   "by_severity": {
     "critical": 0,
-    "high": 16,
+    "high": 5,
     "medium": 161,
     "low": 0,
     "info": 0
@@ -11,9 +11,9 @@
   "by_category": {
     "syntax": 0,
     "type": 0,
-    "logic": 3,
+    "logic": 0,
     "performance": 133,
-    "security": 40,
+    "security": 32,
     "trading": 0,
     "risk": 0,
     "data": 1,
@@ -26,19 +26,15 @@
       11
     ],
     [
-      "robo_trader/ml/model_registry.py",
-      8
-    ],
-    [
       "robo_trader/data/pipeline.py",
       8
     ],
     [
-      "app.py",
-      8
+      "robo_trader/core/engine.py",
+      6
     ],
     [
-      "robo_trader/core/engine.py",
+      "robo_trader/ml/model_registry.py",
       6
     ],
     [
@@ -60,27 +56,31 @@
     [
       "robo_trader/bug_detection/static_tools.py",
       5
+    ],
+    [
+      "test_phase3.py",
+      5
     ]
   ],
   "critical_bugs": 0,
-  "high_priority_bugs": 16,
+  "high_priority_bugs": 5,
   "bugs": [
     {
-      "id": "async_no_await_runner_async.py_125",
+      "id": "async_no_await_runner_async.py_122",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_get_position_lock' has no await",
       "file_path": "robo_trader/runner_async.py",
-      "line_number": 125,
+      "line_number": 122,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_execution.py_192",
+      "id": "async_no_await_execution.py_196",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'execute_order' has no await",
       "file_path": "robo_trader/execution.py",
-      "line_number": 192,
+      "line_number": 196,
       "description": "Async function should use await or be made synchronous"
     },
     {
@@ -165,12 +165,12 @@
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_database_monitor.py_141",
+      "id": "async_no_await_database_monitor.py_144",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_test_database_access' has no await",
       "file_path": "robo_trader/database_monitor.py",
-      "line_number": 141,
+      "line_number": 144,
       "description": "Async function should use await or be made synchronous"
     },
     {
@@ -192,57 +192,57 @@
       "description": "Found 5 levels of nested loops"
     },
     {
-      "id": "async_no_await_portfolio_manager.py_186",
+      "id": "async_no_await_portfolio_manager.py_183",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_calculate_risk_parity_weights' has no await",
       "file_path": "robo_trader/portfolio_manager/portfolio_manager.py",
-      "line_number": 186,
+      "line_number": 183,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_portfolio_manager.py_224",
+      "id": "async_no_await_portfolio_manager.py_221",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_calculate_adaptive_weights' has no await",
       "file_path": "robo_trader/portfolio_manager/portfolio_manager.py",
-      "line_number": 224,
+      "line_number": 221,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_portfolio_manager.py_276",
+      "id": "async_no_await_portfolio_manager.py_271",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_calculate_mean_variance_weights' has no await",
       "file_path": "robo_trader/portfolio_manager/portfolio_manager.py",
-      "line_number": 276,
+      "line_number": 271,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_portfolio_manager.py_304",
+      "id": "async_no_await_portfolio_manager.py_299",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_calculate_kelly_weights' has no await",
       "file_path": "robo_trader/portfolio_manager/portfolio_manager.py",
-      "line_number": 304,
+      "line_number": 299,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_portfolio_manager.py_363",
+      "id": "async_no_await_portfolio_manager.py_356",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'should_rebalance' has no await",
       "file_path": "robo_trader/portfolio_manager/portfolio_manager.py",
-      "line_number": 363,
+      "line_number": 356,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_async_ibkr_client.py_169",
+      "id": "async_no_await_async_ibkr_client.py_166",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'close_all' has no await",
       "file_path": "robo_trader/clients/async_ibkr_client.py",
-      "line_number": 169,
+      "line_number": 166,
       "description": "Async function should use await or be made synchronous"
     },
     {
@@ -363,30 +363,30 @@
       "description": "Found 3 levels of nested loops"
     },
     {
-      "id": "async_no_await_pairs_trading.py_160",
+      "id": "async_no_await_pairs_trading.py_163",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_test_pair_relationship' has no await",
       "file_path": "robo_trader/strategies/pairs_trading.py",
-      "line_number": 160,
+      "line_number": 163,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_pairs_trading.py_281",
+      "id": "async_no_await_pairs_trading.py_284",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_evaluate_pair_signal' has no await",
       "file_path": "robo_trader/strategies/pairs_trading.py",
-      "line_number": 281,
+      "line_number": 284,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_pairs_trading.py_448",
+      "id": "async_no_await_pairs_trading.py_456",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'calculate_arbitrage_scores' has no await",
       "file_path": "robo_trader/strategies/pairs_trading.py",
-      "line_number": 448,
+      "line_number": 456,
       "description": "Async function should use await or be made synchronous"
     },
     {
@@ -426,12 +426,12 @@
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_ml_enhanced_strategy.py_302",
+      "id": "async_no_await_ml_enhanced_strategy.py_309",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_analyze_multi_timeframe' has no await",
       "file_path": "robo_trader/strategies/ml_enhanced_strategy.py",
-      "line_number": 302,
+      "line_number": 309,
       "description": "Async function should use await or be made synchronous"
     },
     {
@@ -570,30 +570,30 @@
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_smart_executor.py_287",
+      "id": "async_no_await_smart_executor.py_291",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_create_iceberg_plan' has no await",
       "file_path": "robo_trader/smart_execution/smart_executor.py",
-      "line_number": 287,
+      "line_number": 291,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_smart_executor.py_373",
+      "id": "async_no_await_smart_executor.py_377",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_create_market_plan' has no await",
       "file_path": "robo_trader/smart_execution/smart_executor.py",
-      "line_number": 373,
+      "line_number": 377,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_smart_executor.py_512",
+      "id": "async_no_await_smart_executor.py_519",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_get_volume_profile' has no await",
       "file_path": "robo_trader/smart_execution/smart_executor.py",
-      "line_number": 512,
+      "line_number": 519,
       "description": "Async function should use await or be made synchronous"
     },
     {
@@ -624,12 +624,12 @@
       "description": "Found 4 levels of nested loops"
     },
     {
-      "id": "async_no_await_walk_forward.py_562",
+      "id": "async_no_await_walk_forward.py_561",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'run_monte_carlo_validation' has no await",
       "file_path": "robo_trader/backtest/walk_forward.py",
-      "line_number": 562,
+      "line_number": 561,
       "description": "Async function should use await or be made synchronous"
     },
     {
@@ -678,58 +678,40 @@
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_model_registry.py_253",
+      "id": "async_no_await_model_registry.py_254",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'get_deployed_model' has no await",
       "file_path": "robo_trader/ml/model_registry.py",
-      "line_number": 253,
+      "line_number": 254,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_model_registry.py_325",
+      "id": "async_no_await_model_registry.py_326",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'start_ab_test' has no await",
       "file_path": "robo_trader/ml/model_registry.py",
-      "line_number": 325,
+      "line_number": 326,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_model_registry.py_385",
+      "id": "async_no_await_model_registry.py_386",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'get_ab_test_model' has no await",
       "file_path": "robo_trader/ml/model_registry.py",
-      "line_number": 385,
+      "line_number": 386,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_model_registry.py_444",
+      "id": "async_no_await_model_registry.py_445",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'record_ab_test_metric' has no await",
       "file_path": "robo_trader/ml/model_registry.py",
-      "line_number": 444,
+      "line_number": 445,
       "description": "Async function should use await or be made synchronous"
-    },
-    {
-      "id": "security_model_registry.py_222",
-      "severity": "high",
-      "category": "security",
-      "title": "Use of pickle.loads()",
-      "file_path": "robo_trader/ml/model_registry.py",
-      "line_number": 222,
-      "description": "Security risk: Use of pickle.loads()"
-    },
-    {
-      "id": "security_model_registry.py_434",
-      "severity": "high",
-      "category": "security",
-      "title": "Use of pickle.loads()",
-      "file_path": "robo_trader/ml/model_registry.py",
-      "line_number": 434,
-      "description": "Security risk: Use of pickle.loads()"
     },
     {
       "id": "async_no_await_model_selector.py_49",
@@ -739,24 +721,6 @@
       "file_path": "robo_trader/ml/model_selector.py",
       "line_number": 49,
       "description": "Async function should use await or be made synchronous"
-    },
-    {
-      "id": "security_model_selector.py_63",
-      "severity": "high",
-      "category": "security",
-      "title": "Use of pickle.loads()",
-      "file_path": "robo_trader/ml/model_selector.py",
-      "line_number": 63,
-      "description": "Security risk: Use of pickle.loads()"
-    },
-    {
-      "id": "security_model_selector.py_83",
-      "severity": "high",
-      "category": "security",
-      "title": "Use of pickle.loads()",
-      "file_path": "robo_trader/ml/model_selector.py",
-      "line_number": 83,
-      "description": "Security risk: Use of pickle.loads()"
     },
     {
       "id": "import_security_config_manager.py_10",
@@ -885,57 +849,57 @@
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_pipeline.py_319",
+      "id": "async_no_await_pipeline.py_320",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'get_historical_data' has no await",
       "file_path": "robo_trader/data/pipeline.py",
-      "line_number": 319,
+      "line_number": 320,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_pipeline.py_442",
+      "id": "async_no_await_pipeline.py_443",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'on_tick' has no await",
       "file_path": "robo_trader/data/pipeline.py",
-      "line_number": 442,
+      "line_number": 443,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_pipeline.py_449",
+      "id": "async_no_await_pipeline.py_450",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'on_bar' has no await",
       "file_path": "robo_trader/data/pipeline.py",
-      "line_number": 449,
+      "line_number": 450,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_portfolio_manager.py_109",
+      "id": "async_no_await_portfolio_manager.py_111",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'allocate_capital' has no await",
       "file_path": "robo_trader/portfolio_pkg/portfolio_manager.py",
-      "line_number": 109,
+      "line_number": 111,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_portfolio_manager.py_255",
+      "id": "async_no_await_portfolio_manager.py_261",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'should_rebalance' has no await",
       "file_path": "robo_trader/portfolio_pkg/portfolio_manager.py",
-      "line_number": 255,
+      "line_number": 261,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "nested_loops_portfolio_manager.py_223",
+      "id": "nested_loops_portfolio_manager.py_227",
       "severity": "medium",
       "category": "performance",
       "title": "Deeply nested loops",
       "file_path": "robo_trader/portfolio_pkg/portfolio_manager.py",
-      "line_number": 223,
+      "line_number": 227,
       "description": "Found 3 levels of nested loops"
     },
     {
@@ -1032,10 +996,10 @@
       "id": "security_bug_agent.py_339",
       "severity": "high",
       "category": "security",
-      "title": "Use of pickle.loads()",
+      "title": "Use of pickle.loads() - dangerous for untrusted data",
       "file_path": "robo_trader/bug_detection/bug_agent.py",
       "line_number": 339,
-      "description": "Security risk: Use of pickle.loads()"
+      "description": "Security risk: Use of pickle.loads() - dangerous for untrusted data"
     },
     {
       "id": "import_security_static_tools.py_7",
@@ -1047,39 +1011,39 @@
       "description": "Import of subprocess may pose security risks"
     },
     {
-      "id": "async_no_await_static_tools.py_42",
+      "id": "async_no_await_static_tools.py_43",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_analyze_file' has no await",
       "file_path": "robo_trader/bug_detection/static_tools.py",
-      "line_number": 42,
+      "line_number": 43,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_static_tools.py_53",
+      "id": "async_no_await_static_tools.py_54",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_analyze_file' has no await",
       "file_path": "robo_trader/bug_detection/static_tools.py",
-      "line_number": 53,
+      "line_number": 54,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_static_tools.py_128",
+      "id": "async_no_await_static_tools.py_132",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_analyze_file' has no await",
       "file_path": "robo_trader/bug_detection/static_tools.py",
-      "line_number": 128,
+      "line_number": 132,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_static_tools.py_198",
+      "id": "async_no_await_static_tools.py_199",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_analyze_file' has no await",
       "file_path": "robo_trader/bug_detection/static_tools.py",
-      "line_number": 198,
+      "line_number": 199,
       "description": "Async function should use await or be made synchronous"
     },
     {
@@ -1119,273 +1083,264 @@
       "description": "Import of os may pose security risks"
     },
     {
-      "id": "import_security_test_production.py_194",
+      "id": "import_security_test_production.py_203",
       "severity": "medium",
       "category": "security",
       "title": "Potentially unsafe import: os",
       "file_path": "tests/test_production.py",
-      "line_number": 194,
+      "line_number": 203,
       "description": "Import of os may pose security risks"
     },
     {
-      "id": "import_security_test_production.py_202",
+      "id": "import_security_test_production.py_211",
       "severity": "medium",
       "category": "security",
       "title": "Potentially unsafe import: os",
       "file_path": "tests/test_production.py",
-      "line_number": 202,
+      "line_number": 211,
       "description": "Import of os may pose security risks"
     },
     {
-      "id": "security_test_production.py_90",
+      "id": "security_test_production.py_101",
       "severity": "high",
       "category": "security",
       "title": "Hardcoded API key",
       "file_path": "tests/test_production.py",
-      "line_number": 90,
+      "line_number": 101,
       "description": "Security risk: Hardcoded API key"
     },
     {
-      "id": "async_no_await_train_models_timeseries.py_83",
+      "id": "async_no_await_train_models_timeseries.py_86",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'main' has no await",
       "file_path": "train_models_timeseries.py",
-      "line_number": 83,
+      "line_number": 86,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_test_m4_performance.py_76",
+      "id": "async_no_await_test_m4_performance.py_80",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'test_performance_analyzer' has no await",
       "file_path": "test_m4_performance.py",
-      "line_number": 76,
+      "line_number": 80,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_test_m4_performance.py_124",
+      "id": "async_no_await_test_m4_performance.py_128",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'test_performance_attribution' has no await",
       "file_path": "test_m4_performance.py",
-      "line_number": 124,
+      "line_number": 128,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_test_m4_performance.py_316",
+      "id": "async_no_await_test_m4_performance.py_320",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'test_rolling_analysis' has no await",
       "file_path": "test_m4_performance.py",
-      "line_number": 316,
+      "line_number": 320,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "import_security_simple_recover.py_5",
+      "id": "import_security_simple_recover.py_4",
       "severity": "medium",
       "category": "security",
       "title": "Potentially unsafe import: os",
       "file_path": "simple_recover.py",
-      "line_number": 5,
+      "line_number": 4,
       "description": "Import of os may pose security risks"
     },
     {
-      "id": "async_no_await_test_s3_portfolio_manager.py_42",
+      "id": "async_no_await_test_s3_portfolio_manager.py_43",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'test_portfolio_initialization' has no await",
       "file_path": "test_s3_portfolio_manager.py",
-      "line_number": 42,
+      "line_number": 43,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_test_s3_portfolio_manager.py_74",
+      "id": "async_no_await_test_s3_portfolio_manager.py_75",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'test_strategy_registration' has no await",
       "file_path": "test_s3_portfolio_manager.py",
-      "line_number": 74,
+      "line_number": 75,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_test_s3_portfolio_manager.py_216",
+      "id": "async_no_await_test_s3_portfolio_manager.py_218",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'test_performance_metrics' has no await",
       "file_path": "test_s3_portfolio_manager.py",
-      "line_number": 216,
+      "line_number": 218,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "nested_loops_test_s3_portfolio_manager.py_129",
+      "id": "nested_loops_test_s3_portfolio_manager.py_128",
       "severity": "medium",
       "category": "performance",
       "title": "Deeply nested loops",
       "file_path": "test_s3_portfolio_manager.py",
-      "line_number": 129,
+      "line_number": 128,
       "description": "Found 5 levels of nested loops"
     },
     {
-      "id": "nested_loops_check_pnl.py_69",
+      "id": "nested_loops_check_pnl.py_72",
       "severity": "medium",
       "category": "performance",
       "title": "Deeply nested loops",
       "file_path": "check_pnl.py",
-      "line_number": 69,
+      "line_number": 72,
       "description": "Found 3 levels of nested loops"
     },
     {
-      "id": "async_no_await_test_s1_ml_strategy.py_246",
+      "id": "async_no_await_test_s1_ml_strategy.py_235",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'test_position_sizing' has no await",
       "file_path": "test_s1_ml_strategy.py",
-      "line_number": 246,
+      "line_number": 235,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "import_security_test_portfolio_simple.py_6",
+      "id": "import_security_test_portfolio_simple.py_5",
       "severity": "medium",
       "category": "security",
       "title": "Potentially unsafe import: os",
       "file_path": "test_portfolio_simple.py",
-      "line_number": 6,
+      "line_number": 5,
       "description": "Import of os may pose security risks"
     },
     {
-      "id": "security_analyze_ml_performance.py_29",
-      "severity": "high",
-      "category": "security",
-      "title": "Use of pickle.loads()",
-      "file_path": "analyze_ml_performance.py",
-      "line_number": 29,
-      "description": "Security risk: Use of pickle.loads()"
-    },
-    {
-      "id": "async_no_await_test_features.py_83",
+      "id": "async_no_await_test_features.py_86",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'test_individual_indicators' has no await",
       "file_path": "test_features.py",
-      "line_number": 83,
+      "line_number": 86,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "import_security_test_phase2.py_15",
+      "id": "import_security_test_phase2.py_14",
       "severity": "medium",
       "category": "security",
       "title": "Potentially unsafe import: os",
       "file_path": "test_phase2.py",
-      "line_number": 15,
-      "description": "Import of os may pose security risks"
-    },
-    {
-      "id": "async_no_await_test_phase2.py_41",
-      "severity": "medium",
-      "category": "performance",
-      "title": "Async function 'on_tick' has no await",
-      "file_path": "test_phase2.py",
-      "line_number": 41,
-      "description": "Async function should use await or be made synchronous"
-    },
-    {
-      "id": "async_no_await_test_phase2.py_46",
-      "severity": "medium",
-      "category": "performance",
-      "title": "Async function 'on_bar' has no await",
-      "file_path": "test_phase2.py",
-      "line_number": 46,
-      "description": "Async function should use await or be made synchronous"
-    },
-    {
-      "id": "async_no_await_train_models.py_29",
-      "severity": "medium",
-      "category": "performance",
-      "title": "Async function 'fetch_training_data' has no await",
-      "file_path": "train_models.py",
-      "line_number": 29,
-      "description": "Async function should use await or be made synchronous"
-    },
-    {
-      "id": "async_no_await_train_models.py_216",
-      "severity": "medium",
-      "category": "performance",
-      "title": "Async function 'validate_models' has no await",
-      "file_path": "train_models.py",
-      "line_number": 216,
-      "description": "Async function should use await or be made synchronous"
-    },
-    {
-      "id": "async_no_await_test_s2_smart_execution.py_186",
-      "severity": "medium",
-      "category": "performance",
-      "title": "Async function 'test_market_impact_model' has no await",
-      "file_path": "test_s2_smart_execution.py",
-      "line_number": 186,
-      "description": "Async function should use await or be made synchronous"
-    },
-    {
-      "id": "async_no_await_test_s2_smart_execution.py_292",
-      "severity": "medium",
-      "category": "performance",
-      "title": "Async function 'test_algorithm_selection' has no await",
-      "file_path": "test_s2_smart_execution.py",
-      "line_number": 292,
-      "description": "Async function should use await or be made synchronous"
-    },
-    {
-      "id": "async_no_await_test_s2_smart_execution.py_258",
-      "severity": "medium",
-      "category": "performance",
-      "title": "Async function 'execute_order' has no await",
-      "file_path": "test_s2_smart_execution.py",
-      "line_number": 258,
-      "description": "Async function should use await or be made synchronous"
-    },
-    {
-      "id": "import_security_test_phase3.py_14",
-      "severity": "medium",
-      "category": "security",
-      "title": "Potentially unsafe import: os",
-      "file_path": "test_phase3.py",
       "line_number": 14,
       "description": "Import of os may pose security risks"
     },
     {
-      "id": "async_no_await_test_phase3.py_89",
+      "id": "async_no_await_test_phase2.py_42",
+      "severity": "medium",
+      "category": "performance",
+      "title": "Async function 'on_tick' has no await",
+      "file_path": "test_phase2.py",
+      "line_number": 42,
+      "description": "Async function should use await or be made synchronous"
+    },
+    {
+      "id": "async_no_await_test_phase2.py_47",
+      "severity": "medium",
+      "category": "performance",
+      "title": "Async function 'on_bar' has no await",
+      "file_path": "test_phase2.py",
+      "line_number": 47,
+      "description": "Async function should use await or be made synchronous"
+    },
+    {
+      "id": "async_no_await_train_models.py_32",
+      "severity": "medium",
+      "category": "performance",
+      "title": "Async function 'fetch_training_data' has no await",
+      "file_path": "train_models.py",
+      "line_number": 32,
+      "description": "Async function should use await or be made synchronous"
+    },
+    {
+      "id": "async_no_await_train_models.py_209",
+      "severity": "medium",
+      "category": "performance",
+      "title": "Async function 'validate_models' has no await",
+      "file_path": "train_models.py",
+      "line_number": 209,
+      "description": "Async function should use await or be made synchronous"
+    },
+    {
+      "id": "async_no_await_test_s2_smart_execution.py_165",
+      "severity": "medium",
+      "category": "performance",
+      "title": "Async function 'test_market_impact_model' has no await",
+      "file_path": "test_s2_smart_execution.py",
+      "line_number": 165,
+      "description": "Async function should use await or be made synchronous"
+    },
+    {
+      "id": "async_no_await_test_s2_smart_execution.py_262",
+      "severity": "medium",
+      "category": "performance",
+      "title": "Async function 'test_algorithm_selection' has no await",
+      "file_path": "test_s2_smart_execution.py",
+      "line_number": 262,
+      "description": "Async function should use await or be made synchronous"
+    },
+    {
+      "id": "async_no_await_test_s2_smart_execution.py_232",
+      "severity": "medium",
+      "category": "performance",
+      "title": "Async function 'execute_order' has no await",
+      "file_path": "test_s2_smart_execution.py",
+      "line_number": 232,
+      "description": "Async function should use await or be made synchronous"
+    },
+    {
+      "id": "import_security_test_phase3.py_13",
+      "severity": "medium",
+      "category": "security",
+      "title": "Potentially unsafe import: os",
+      "file_path": "test_phase3.py",
+      "line_number": 13,
+      "description": "Import of os may pose security risks"
+    },
+    {
+      "id": "async_no_await_test_phase3.py_93",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_initialize' has no await",
       "file_path": "test_phase3.py",
-      "line_number": 89,
+      "line_number": 93,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_test_phase3.py_92",
+      "id": "async_no_await_test_phase3.py_96",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_generate_signals' has no await",
       "file_path": "test_phase3.py",
-      "line_number": 92,
+      "line_number": 96,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_test_phase3.py_296",
+      "id": "async_no_await_test_phase3.py_279",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_initialize' has no await",
       "file_path": "test_phase3.py",
-      "line_number": 296,
+      "line_number": 279,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_test_phase3.py_299",
+      "id": "async_no_await_test_phase3.py_282",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_generate_signals' has no await",
       "file_path": "test_phase3.py",
-      "line_number": 299,
+      "line_number": 282,
       "description": "Async function should use await or be made synchronous"
     },
     {
@@ -1398,40 +1353,22 @@
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "nested_loops_test_s3_complete.py_135",
+      "id": "nested_loops_test_s3_complete.py_132",
       "severity": "medium",
       "category": "performance",
       "title": "Deeply nested loops",
       "file_path": "test_s3_complete.py",
-      "line_number": 135,
+      "line_number": 132,
       "description": "Found 4 levels of nested loops"
     },
     {
-      "id": "security_test_ml_now.py_21",
-      "severity": "high",
-      "category": "security",
-      "title": "Use of pickle.loads()",
-      "file_path": "test_ml_now.py",
-      "line_number": 21,
-      "description": "Security risk: Use of pickle.loads()"
-    },
-    {
-      "id": "import_security_recover_database.py_88",
+      "id": "import_security_recover_database.py_95",
       "severity": "medium",
       "category": "security",
       "title": "Potentially unsafe import: os",
       "file_path": "recover_database.py",
-      "line_number": 88,
+      "line_number": 95,
       "description": "Import of os may pose security risks"
-    },
-    {
-      "id": "security_test_ml_simple.py_21",
-      "severity": "high",
-      "category": "security",
-      "title": "Use of pickle.loads()",
-      "file_path": "test_ml_simple.py",
-      "line_number": 21,
-      "description": "Security risk: Use of pickle.loads()"
     },
     {
       "id": "async_no_await_test_ml_pipeline.py_37",
@@ -1452,13 +1389,22 @@
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_test_ml_pipeline.py_194",
+      "id": "async_no_await_test_ml_pipeline.py_196",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'test_walk_forward_backtest' has no await",
       "file_path": "test_ml_pipeline.py",
-      "line_number": 194,
+      "line_number": 196,
       "description": "Async function should use await or be made synchronous"
+    },
+    {
+      "id": "import_security_app.py_10",
+      "severity": "medium",
+      "category": "security",
+      "title": "Potentially unsafe import: os",
+      "file_path": "app.py",
+      "line_number": 10,
+      "description": "Import of os may pose security risks"
     },
     {
       "id": "import_security_app.py_12",
@@ -1470,66 +1416,30 @@
       "description": "Import of subprocess may pose security risks"
     },
     {
-      "id": "import_security_app.py_13",
+      "id": "import_security_app.py_1985",
       "severity": "medium",
       "category": "security",
       "title": "Potentially unsafe import: os",
       "file_path": "app.py",
-      "line_number": 13,
+      "line_number": 1985,
       "description": "Import of os may pose security risks"
     },
     {
-      "id": "import_security_app.py_1975",
-      "severity": "medium",
-      "category": "security",
-      "title": "Potentially unsafe import: os",
-      "file_path": "app.py",
-      "line_number": 1975,
-      "description": "Import of os may pose security risks"
-    },
-    {
-      "id": "bare_except_app.py_62",
-      "severity": "high",
-      "category": "logic",
-      "title": "Bare except clause",
-      "file_path": "app.py",
-      "line_number": 62,
-      "description": "Bare except clause catches all exceptions, including system exits"
-    },
-    {
-      "id": "bare_except_app.py_3243",
-      "severity": "high",
-      "category": "logic",
-      "title": "Bare except clause",
-      "file_path": "app.py",
-      "line_number": 3243,
-      "description": "Bare except clause catches all exceptions, including system exits"
-    },
-    {
-      "id": "bare_except_app.py_3058",
-      "severity": "high",
-      "category": "logic",
-      "title": "Bare except clause",
-      "file_path": "app.py",
-      "line_number": 3058,
-      "description": "Bare except clause catches all exceptions, including system exits"
-    },
-    {
-      "id": "nested_loops_app.py_2343",
+      "id": "nested_loops_app.py_2373",
       "severity": "medium",
       "category": "performance",
       "title": "Deeply nested loops",
       "file_path": "app.py",
-      "line_number": 2343,
+      "line_number": 2373,
       "description": "Found 3 levels of nested loops"
     },
     {
-      "id": "nested_loops_app.py_2381",
+      "id": "nested_loops_app.py_2412",
       "severity": "medium",
       "category": "performance",
       "title": "Deeply nested loops",
       "file_path": "app.py",
-      "line_number": 2381,
+      "line_number": 2412,
       "description": "Found 3 levels of nested loops"
     },
     {
@@ -1542,40 +1452,31 @@
       "description": "Import of os may pose security risks"
     },
     {
-      "id": "async_no_await_test_phase1.py_245",
+      "id": "async_no_await_test_phase1.py_223",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'test_trading_engine' has no await",
       "file_path": "test_phase1.py",
-      "line_number": 245,
+      "line_number": 223,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "security_test_phase1.py_233",
+      "id": "security_test_phase1.py_211",
       "severity": "high",
       "category": "security",
       "title": "Hardcoded API key",
       "file_path": "test_phase1.py",
-      "line_number": 233,
+      "line_number": 211,
       "description": "Security risk: Hardcoded API key"
     },
     {
-      "id": "async_no_await_test_improvements.py_138",
+      "id": "async_no_await_test_improvements.py_140",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'test_integration' has no await",
       "file_path": "test_improvements.py",
-      "line_number": 138,
+      "line_number": 140,
       "description": "Async function should use await or be made synchronous"
-    },
-    {
-      "id": "security_test_improvements.py_90",
-      "severity": "high",
-      "category": "security",
-      "title": "Use of pickle.loads()",
-      "file_path": "test_improvements.py",
-      "line_number": 90,
-      "description": "Security risk: Use of pickle.loads()"
     },
     {
       "id": "import_security_check_db_locks.py_10",
@@ -1587,39 +1488,39 @@
       "description": "Import of os may pose security risks"
     },
     {
-      "id": "import_security_check_db_locks.py_11",
+      "id": "import_security_check_db_locks.py_12",
       "severity": "medium",
       "category": "security",
       "title": "Potentially unsafe import: subprocess",
       "file_path": "check_db_locks.py",
-      "line_number": 11,
+      "line_number": 12,
       "description": "Import of subprocess may pose security risks"
     },
     {
-      "id": "nested_loops_test_obv_performance.py_81",
+      "id": "nested_loops_test_obv_performance.py_93",
       "severity": "medium",
       "category": "performance",
       "title": "Deeply nested loops",
       "file_path": "test_obv_performance.py",
-      "line_number": 81,
+      "line_number": 93,
       "description": "Found 3 levels of nested loops"
     },
     {
-      "id": "async_no_await_test_ml_enhanced_strategy.py_210",
+      "id": "async_no_await_test_ml_enhanced_strategy.py_222",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'test_position_sizing' has no await",
       "file_path": "test_ml_enhanced_strategy.py",
-      "line_number": 210,
+      "line_number": 222,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "import_security_test_dashboard_simple.py_6",
+      "id": "import_security_test_dashboard_simple.py_4",
       "severity": "medium",
       "category": "security",
       "title": "Potentially unsafe import: os",
       "file_path": "test_dashboard_simple.py",
-      "line_number": 6,
+      "line_number": 4,
       "description": "Import of os may pose security risks"
     },
     {
@@ -1632,21 +1533,21 @@
       "description": "Flask debug mode should be environment-aware in production"
     },
     {
-      "id": "async_no_await_test_portfolio_manager.py_24",
+      "id": "async_no_await_test_portfolio_manager.py_25",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'analyze' has no await",
       "file_path": "test_portfolio_manager.py",
-      "line_number": 24,
+      "line_number": 25,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "nested_loops_test_portfolio_manager.py_109",
+      "id": "nested_loops_test_portfolio_manager.py_115",
       "severity": "medium",
       "category": "performance",
       "title": "Deeply nested loops",
       "file_path": "test_portfolio_manager.py",
-      "line_number": 109,
+      "line_number": 115,
       "description": "Found 4 levels of nested loops"
     },
     {

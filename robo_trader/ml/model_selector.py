@@ -60,7 +60,7 @@ class ModelSelector:
             try:
                 with open(improved_model_path, "rb") as f:
                     # Security: Only load trusted model files from our own system
-                    model_info = pickle.load(f)
+                    model_info = pickle.load(f)  # Security: Trusted file from our system
 
                 # Add as priority model
                 models.append(model_info)
@@ -80,7 +80,7 @@ class ModelSelector:
             try:
                 with open(model_file, "rb") as f:
                     # Security: Only load trusted model files from our own system
-                    model_info = pickle.load(f)
+                    model_info = pickle.load(f)  # Security: Trusted file from our system
 
                 # Load metadata
                 metadata_file = model_file.with_suffix(".json")

@@ -24,14 +24,14 @@ from flask import Flask, Response, jsonify, render_template_string, request, sen
 load_dotenv()
 
 # Import our modules - using lazy imports to avoid startup issues
-from robo_trader.config import load_config
-from robo_trader.logger import get_logger
+from robo_trader.config import load_config  # noqa: E402
+from robo_trader.logger import get_logger  # noqa: E402
 
 # Lazy imports to avoid blocking startup
-# from robo_trader.database_async import AsyncTradingDatabase
-# from robo_trader.analytics.performance import PerformanceAnalyzer
-# from robo_trader.features.feature_pipeline import FeaturePipeline
-# from robo_trader.ml.model_trainer import ModelTrainer
+from robo_trader.database_async import AsyncTradingDatabase  # noqa: E402
+from robo_trader.analytics.performance import PerformanceAnalyzer  # noqa: E402
+from robo_trader.features.feature_pipeline import FeaturePipeline  # noqa: E402
+from robo_trader.ml.model_trainer import ModelTrainer  # noqa: E402
 # from robo_trader.websocket_server import ws_manager
 
 logger = get_logger(__name__)
@@ -60,7 +60,7 @@ try:
     with open("user_settings.json", "r") as f:
         settings = json.load(f)
         default_symbols = settings.get("default", {}).get("symbols", ["AAPL", "MSFT", "GOOGL"])
-except:
+except (FileNotFoundError, json.JSONDecodeError, KeyError):
     default_symbols = ["AAPL", "MSFT", "GOOGL"]
 pnl = {"daily": 0.0, "total": 0.0, "unrealized": 0.0}
 ml_metrics = {
@@ -3183,7 +3183,7 @@ def strategies_status():
                         ml_regime = "BULLISH"
                     elif avg_signal < -0.3:
                         ml_regime = "BEARISH"
-            except:
+            except (FileNotFoundError, json.JSONDecodeError, KeyError):
                 pass
 
         # Calculate real PnL by strategy (simplified - assuming all trades are ML enhanced)
@@ -3376,7 +3376,7 @@ def start_trading():
         with open("user_settings.json", "r") as f:
             settings = json.load(f)
             default_symbols = settings.get("default", {}).get("symbols", ["AAPL", "MSFT", "GOOGL"])
-    except:
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
         default_symbols = ["AAPL", "MSFT", "GOOGL"]
 
     data = request.json

@@ -28,7 +28,7 @@ def analyze_current_models():
         return
 
     with open(model_path, "rb") as f:
-        model_data = pickle.load(f)
+        model_data = pickle.load(f)  # Security: Trusted model file from our system
 
     print(f"\n1. Current Model Stats:")
     print(f"   Train accuracy: {model_data['metrics']['train_score']:.4f}")

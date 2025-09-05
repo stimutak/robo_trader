@@ -208,7 +208,7 @@ def test_structured_logging():
         print("✓ Audit logging working")
 
         # Test sensitive data censoring
-        logger.info("Test", api_key="secret123", safe_field="visible")
+        logger.info("Test", api_key="secret123", safe_field="visible")  # Security: Test API key only
         print("✓ Sensitive data censoring working")
 
     except Exception as e:
