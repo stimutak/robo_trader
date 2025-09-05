@@ -18,6 +18,7 @@ import pandas as pd
 from scipy import stats
 from sklearn.linear_model import LinearRegression
 
+
 # Simple logger replacement to avoid import issues
 class SimpleLogger:
     def __init__(self, name):
@@ -31,6 +32,7 @@ class SimpleLogger:
     
     def error(self, msg, **kwargs):
         print(f"ERROR [{self.name}]: {msg}")
+
 
 logger = SimpleLogger(__name__)
 
@@ -405,13 +407,13 @@ class CointegrationPairsStrategy:
             ],
             "pair_stats": [
                 {
-                    "pair": f"{stats.symbol_a}-{stats.symbol_b}",
-                    "correlation": stats.correlation,
-                    "cointegration_p": stats.cointegration_pvalue,
-                    "hedge_ratio": stats.hedge_ratio,
-                    "half_life": stats.half_life,
+                    "pair": f"{pair_stat.symbol_a}-{pair_stat.symbol_b}",
+                    "correlation": pair_stat.correlation,
+                    "cointegration_p": pair_stat.cointegration_pvalue,
+                    "hedge_ratio": pair_stat.hedge_ratio,
+                    "half_life": pair_stat.half_life,
                 }
-                for stats in self.pair_stats.values()
+                for pair_stat in self.pair_stats.values()
             ],
         }
 

@@ -33,6 +33,7 @@ class BaseStrategy:
         """Calculate position size"""
         return 100
 
+
 logger = logging.getLogger(__name__)
 
 

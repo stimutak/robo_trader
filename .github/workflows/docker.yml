@@ -93,19 +93,24 @@ jobs:
           
       - name: Test container startup
         run: |
+          # Test the locally built image
           docker run -d --name test-container \
             -e TRADING_ENV=testing \
             -e ENABLE_PAPER_TRADING=true \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
           
-          # Wait for container to be healthy
-          timeout 60 sh -c 'until docker exec test-container python -c "import sys; sys.exit(0)"; do sleep 2; done'
+          # Wait for container to start
+          sleep 10
+          
+          # Test basic Python functionality
+          docker exec test-container python -c "import sys; print('Python working:', sys.version)"
           
           # Check logs
           docker logs test-container
           
-          # Stop container
+          # Stop and remove container
           docker stop test-container
+          docker rm test-container
           
       - name: Push Docker image
         if: github.event_name != 'pull_request' && success()

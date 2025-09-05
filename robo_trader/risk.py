@@ -387,7 +387,7 @@ class RiskManager:
 
                     # Check if stop should have been triggered
                     if ((pos.quantity > 0 and current_price <= pos.stop_loss) or
-                        (pos.quantity < 0 and current_price >= pos.stop_loss)):
+                            (pos.quantity < 0 and current_price >= pos.stop_loss)):
                         logger.critical(f"Stop-loss not triggered for {symbol}! Current: {current_price:.2f}, Stop: {pos.stop_loss:.2f}")
                         # Could trigger emergency action here
 

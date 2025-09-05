@@ -8,7 +8,7 @@ import json
 import threading
 from datetime import datetime
 from queue import Empty, Queue, Full
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import websockets
 
