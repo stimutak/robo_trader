@@ -108,6 +108,10 @@ class AsyncRunner:
         self.daily_executed_notional = 0.0
         self.monitor = PerformanceMonitor()
 
+        # Position locks to prevent race conditions
+        self._position_locks: Dict[str, asyncio.Lock] = {}
+        self._position_lock_manager = asyncio.Lock()
+
         # Correlation components
         self.correlation_tracker = None
         self.position_sizer = None
@@ -117,6 +121,69 @@ class AsyncRunner:
         self.ml_strategy = None
         self.ml_enhanced_strategy = None
         self.active_strategy_name: Optional[str] = None
+
+    async def _get_position_lock(self, symbol: str) -> asyncio.Lock:
+        """Get or create a lock for a specific symbol."""
+        async with self._position_lock_manager:
+            if symbol not in self._position_locks:
+                self._position_locks[symbol] = asyncio.Lock()
+            return self._position_locks[symbol]
+
+    async def _update_position_atomic(self, symbol: str, quantity: int, price: float, side: str) -> bool:
+        """Atomically update position with lock to prevent race conditions."""
+        lock = await self._get_position_lock(symbol)
+        async with lock:
+            try:
+                if side.upper() in ["BUY", "BUY_TO_COVER"]:
+                    if symbol in self.positions:
+                        # Update existing position
+                        pos = self.positions[symbol]
+                        if side.upper() == "BUY_TO_COVER" and pos.quantity < 0:
+                            # Covering short position
+                            new_qty = pos.quantity + quantity
+                            if new_qty == 0:
+                                del self.positions[symbol]
+                            else:
+                                self.positions[symbol] = Position(symbol, new_qty, pos.avg_price)
+                        elif side.upper() == "BUY" and pos.quantity >= 0:
+                            # Adding to long position
+                            total_qty = pos.quantity + quantity
+                            new_avg = (pos.avg_price * pos.quantity + price * quantity) / total_qty
+                            self.positions[symbol] = Position(symbol, total_qty, new_avg)
+                        else:
+                            logger.error(f"Invalid position update: {side} on {pos.quantity} shares of {symbol}")
+                            return False
+                    else:
+                        # New long position
+                        self.positions[symbol] = Position(symbol, quantity, price)
+
+                elif side.upper() in ["SELL", "SELL_SHORT"]:
+                    if symbol in self.positions:
+                        pos = self.positions[symbol]
+                        if side.upper() == "SELL" and pos.quantity > 0:
+                            # Selling long position
+                            if quantity >= pos.quantity:
+                                del self.positions[symbol]
+                            else:
+                                remaining = pos.quantity - quantity
+                                self.positions[symbol] = Position(symbol, remaining, pos.avg_price)
+                        else:
+                            logger.error(f"Invalid position update: {side} on {pos.quantity} shares of {symbol}")
+                            return False
+                    elif side.upper() == "SELL_SHORT":
+                        # New short position (negative quantity)
+                        self.positions[symbol] = Position(symbol, -quantity, price)
+                    else:
+                        logger.error(f"Cannot {side} {symbol}: no existing position")
+                        return False
+
+                # Update portfolio
+                self.portfolio.update_fill(symbol, side, quantity, price)
+                return True
+
+            except Exception as e:
+                logger.error(f"Error updating position for {symbol}: {e}")
+                return False
 
     async def setup(self):
         """Initialize all components."""
@@ -504,20 +571,23 @@ class AsyncRunner:
                     )
                 if res.ok:
                     fill_price = res.fill_price or price
-                    self.portfolio.update_fill(symbol, "BUY_TO_COVER", qty_to_cover, fill_price)
-                    self.daily_pnl = self.portfolio.realized_pnl
+                    # Use atomic position update to prevent race conditions
+                    success = await self._update_position_atomic(symbol, qty_to_cover, fill_price, "BUY_TO_COVER")
+                    if success:
+                        self.daily_pnl = self.portfolio.realized_pnl
 
-                    # Record trade in database
-                    await self.db.record_trade(
-                        symbol,
-                        "BUY_TO_COVER",
-                        qty_to_cover,
-                        fill_price,
-                        slippage=(fill_price - price) * qty_to_cover if res.fill_price else 0,
-                    )
-                    await self.db.update_position(symbol, 0, 0, 0)  # Close position
-
-                    del self.positions[symbol]
+                        # Record trade in database
+                        await self.db.record_trade(
+                            symbol,
+                            "BUY_TO_COVER",
+                            qty_to_cover,
+                            fill_price,
+                            slippage=(fill_price - price) * qty_to_cover if res.fill_price else 0,
+                        )
+                        await self.db.update_position(symbol, 0, 0, 0)  # Close position
+                    else:
+                        logger.error(f"Failed to update position for {symbol} BUY_TO_COVER order")
+                        continue
                     await self.monitor.record_order_placed(symbol, qty_to_cover)
                     await self.monitor.record_trade_executed(symbol, "BUY_TO_COVER", qty_to_cover)
                     executed = True
@@ -569,9 +639,13 @@ class AsyncRunner:
                         )
                     if res.ok:
                         fill_price = res.fill_price or price
-                        self.positions[symbol] = Position(symbol, qty, fill_price)
-                        self.portfolio.update_fill(symbol, "BUY", qty, fill_price)
-                        self.daily_executed_notional += price * qty
+                        # Use atomic position update to prevent race conditions
+                        success = await self._update_position_atomic(symbol, qty, fill_price, "BUY")
+                        if success:
+                            self.daily_executed_notional += price * qty
+                        else:
+                            logger.error(f"Failed to update position for {symbol} BUY order")
+                            continue
 
                         # Record trade in database
                         await self.db.record_trade(
@@ -616,20 +690,23 @@ class AsyncRunner:
                         )
                     if res.ok:
                         fill_price = res.fill_price or price
-                        self.portfolio.update_fill(symbol, "SELL", pos.quantity, fill_price)
-                        self.daily_pnl = self.portfolio.realized_pnl
+                        # Use atomic position update to prevent race conditions
+                        success = await self._update_position_atomic(symbol, pos.quantity, fill_price, "SELL")
+                        if success:
+                            self.daily_pnl = self.portfolio.realized_pnl
 
-                        # Record trade in database
-                        await self.db.record_trade(
-                            symbol,
-                            "SELL",
-                            pos.quantity,
-                            fill_price,
-                            slippage=(fill_price - price) * pos.quantity if res.fill_price else 0,
-                        )
-                        await self.db.update_position(symbol, 0, 0, 0)  # Close position
-
-                        del self.positions[symbol]
+                            # Record trade in database
+                            await self.db.record_trade(
+                                symbol,
+                                "SELL",
+                                pos.quantity,
+                                fill_price,
+                                slippage=(fill_price - price) * pos.quantity if res.fill_price else 0,
+                            )
+                            await self.db.update_position(symbol, 0, 0, 0)  # Close position
+                        else:
+                            logger.error(f"Failed to update position for {symbol} SELL order")
+                            continue
                         await self.monitor.record_order_placed(symbol, pos.quantity)
                         await self.monitor.record_trade_executed(symbol, "SELL", pos.quantity)
                         executed = True
@@ -681,10 +758,13 @@ class AsyncRunner:
                         )
                     if res.ok:
                         fill_price = res.fill_price or price
-                        # Store negative quantity for short position
-                        self.positions[symbol] = Position(symbol, -qty, fill_price)
-                        self.portfolio.update_fill(symbol, "SELL_SHORT", qty, fill_price)
-                        self.daily_executed_notional += price * qty
+                        # Use atomic position update to prevent race conditions
+                        success = await self._update_position_atomic(symbol, qty, fill_price, "SELL_SHORT")
+                        if success:
+                            self.daily_executed_notional += price * qty
+                        else:
+                            logger.error(f"Failed to update position for {symbol} SELL_SHORT order")
+                            continue
 
                         # Record trade in database
                         await self.db.record_trade(

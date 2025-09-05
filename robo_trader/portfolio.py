@@ -44,11 +44,19 @@ class Portfolio:
             if pos is None:
                 # Short selling not supported in this minimal model
                 return
-            sell_notional = price * quantity
-            realized = (price - pos.avg_price) * min(quantity, pos.quantity)
+
+            # Ensure we don't sell more than we have
+            actual_quantity = min(quantity, pos.quantity)
+            if quantity > pos.quantity:
+                from .logger import get_logger
+                logger = get_logger(__name__)
+                logger.warning(f"Attempted to sell {quantity} shares of {symbol}, only had {pos.quantity}")
+
+            sell_notional = price * actual_quantity
+            realized = (price - pos.avg_price) * actual_quantity
             self.cash += sell_notional
             self.realized_pnl += realized
-            remaining = pos.quantity - quantity
+            remaining = pos.quantity - actual_quantity
             if remaining > 0:
                 self.positions[symbol] = PositionSnapshot(symbol, remaining, pos.avg_price)
             else:

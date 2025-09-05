@@ -136,12 +136,19 @@ class ConnectionPool:
         return await connect_with_retry()
 
     @asynccontextmanager
-    async def acquire(self):
-        """Acquire a connection from the pool."""
+    async def acquire(self, timeout: float = 30.0):
+        """Acquire a connection from the pool with timeout."""
         if not self._initialized:
             await self.initialize()
 
-        connection = await self.available.get()
+        try:
+            connection = await asyncio.wait_for(
+                self.available.get(),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            raise ConnectionError(f"Connection pool exhausted after {timeout}s timeout")
+
         try:
             # Verify connection is still alive
             if not connection.isConnected():

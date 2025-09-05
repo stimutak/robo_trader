@@ -20,11 +20,12 @@ logger = get_logger(__name__)
 class WebSocketClient:
     """Client for sending updates to the WebSocket server."""
 
-    def __init__(self, uri: str = "ws://localhost:8765"):
+    def __init__(self, uri: str = "ws://localhost:8765", max_queue_size: int = 1000):
         self.uri = uri
         self.websocket = None
         self.connected = False
-        self.message_queue = Queue()
+        self.message_queue = Queue(maxsize=max_queue_size)
+        self.max_queue_size = max_queue_size
         self.thread = None
         self.loop = None
 
@@ -116,7 +117,7 @@ class WebSocketClient:
         ask: Optional[float] = None,
         volume: Optional[int] = None,
     ):
-        """Queue a market data update."""
+        """Queue a market data update with overflow protection."""
         message = {
             "type": "market_data",
             "symbol": symbol,
@@ -131,7 +132,20 @@ class WebSocketClient:
         if volume is not None:
             message["volume"] = volume
 
-        self.message_queue.put(message)
+        self._queue_message_safe(message)
+
+    def _queue_message_safe(self, message: dict):
+        """Safely queue a message with overflow protection."""
+        try:
+            self.message_queue.put_nowait(message)
+        except Full:
+            # Drop oldest message to make room
+            try:
+                self.message_queue.get_nowait()
+                self.message_queue.put_nowait(message)
+                logger.debug(f"Dropped oldest message to queue {message.get('type', 'unknown')} update")
+            except Empty:
+                pass  # Queue was emptied by another thread
 
     def send_trade_update(
         self, symbol: str, side: str, quantity: int, price: float, status: str = "executed"
@@ -147,7 +161,7 @@ class WebSocketClient:
             "timestamp": datetime.now().isoformat(),
         }
 
-        self.message_queue.put(message)
+        self._queue_message_safe(message)
 
     def send_signal_update(
         self, symbol: str, signal: str, strength: float, reason: Optional[str] = None
@@ -164,7 +178,7 @@ class WebSocketClient:
         if reason:
             message["reason"] = reason
 
-        self.message_queue.put(message)
+        self._queue_message_safe(message)
 
 
 # Global client instance for runner_async to use

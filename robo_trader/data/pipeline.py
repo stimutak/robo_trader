@@ -271,18 +271,30 @@ class DataPipeline:
             # Publish to subscribers
             await self.publisher.publish_tick(tick)
 
-            # Update metrics
+            # Update metrics with market time
+            import pytz
+            market_tz = pytz.timezone("US/Eastern")
             self.metrics["ticks_received"] += 1
-            self.metrics["last_tick_time"] = datetime.now()
+            self.metrics["last_tick_time"] = datetime.now(market_tz)
 
     async def _monitor_data_quality(self) -> None:
         """Monitor data quality and detect issues."""
+        import pytz
+
         while self.running:
             try:
-                # Check for data gaps
-                now = datetime.now()
+                # Check for data gaps using market time
+                market_tz = pytz.timezone("US/Eastern")
+                now = datetime.now(market_tz)
+
                 if self.metrics["last_tick_time"]:
-                    gap = (now - self.metrics["last_tick_time"]).total_seconds()
+                    # Ensure both timestamps are timezone-aware
+                    if self.metrics["last_tick_time"].tzinfo is None:
+                        last_tick = market_tz.localize(self.metrics["last_tick_time"])
+                    else:
+                        last_tick = self.metrics["last_tick_time"].astimezone(market_tz)
+
+                    gap = (now - last_tick).total_seconds()
                     if gap > 5 and self.streaming_enabled:  # 5 second gap
                         self.metrics["data_gaps"] += 1
                         self.logger.warning(f"Data gap detected: {gap:.1f} seconds")

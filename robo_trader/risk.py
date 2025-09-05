@@ -234,7 +234,8 @@ class RiskManager:
 
         # Ensure we can afford the position
         max_shares_affordable = int(cash_available / entry_price)
-        final_size = min(int(position_size), max_shares_affordable)
+        # Round to nearest share instead of truncating
+        final_size = min(round(position_size), max_shares_affordable)
 
         logger.debug(
             f"ATR position sizing for {symbol}: "
@@ -258,7 +259,9 @@ class RiskManager:
         if entry_price <= 0 or cash_available <= 0:
             return 0
         notional = cash_available * self.max_position_risk_pct
-        return max(int(notional // entry_price), 0)
+        # Round to nearest share instead of truncating to avoid systematic under-allocation
+        shares = round(notional / entry_price)
+        return max(shares, 0)
 
     def position_size_kelly(
         self,
@@ -310,7 +313,9 @@ class RiskManager:
             return 0
 
         notional = cash_available * position_pct
-        return max(int(notional // entry_price), 0)
+        # Round to nearest share instead of truncating
+        shares = round(notional / entry_price)
+        return max(shares, 0)
 
     def position_size(
         self,
@@ -373,7 +378,20 @@ class RiskManager:
 
             # Calculate position risk based on stop loss or ATR
             if pos.stop_loss:
-                risk_per_share = abs(current_price - pos.stop_loss)
+                # Validate stop-loss is reasonable (not more than 10% away)
+                max_stop_distance = current_price * 0.10
+                if abs(current_price - pos.stop_loss) > max_stop_distance:
+                    logger.error(f"Stop-loss too far from current price for {symbol}: current={current_price:.2f}, stop={pos.stop_loss:.2f}")
+                    risk_per_share = current_price * 0.02  # Fall back to default
+                else:
+                    risk_per_share = abs(current_price - pos.stop_loss)
+
+                    # Check if stop should have been triggered
+                    if ((pos.quantity > 0 and current_price <= pos.stop_loss) or
+                        (pos.quantity < 0 and current_price >= pos.stop_loss)):
+                        logger.critical(f"Stop-loss not triggered for {symbol}! Current: {current_price:.2f}, Stop: {pos.stop_loss:.2f}")
+                        # Could trigger emergency action here
+
             elif pos.atr:
                 risk_per_share = pos.atr * self.atr_risk_factor
             else:

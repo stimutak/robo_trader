@@ -313,13 +313,15 @@ class DataValidator:
         )
 
     def _validate_tick_prices(self, tick: TickData) -> ValidationResult:
-        """Validate tick price relationships."""
-        # Bid should be less than or equal to ask
-        if tick.bid > tick.ask:
+        """Validate tick price relationships with epsilon tolerance."""
+        EPSILON = 1e-6  # Tolerance for floating-point comparison
+
+        # Bid should be less than or equal to ask (with tolerance)
+        if tick.bid > tick.ask + EPSILON:
             return ValidationResult(
                 is_valid=False,
                 check_name="price_validation",
-                message=f"Inverted market: bid ({tick.bid}) > ask ({tick.ask})",
+                message=f"Inverted market: bid ({tick.bid:.6f}) > ask ({tick.ask:.6f})",
                 severity="error",
             )
 
@@ -354,8 +356,9 @@ class DataValidator:
                 data={"spread_bps": spread_bps},
             )
 
-        # Check for zero spread (locked market)
-        if spread_bps == 0:
+        # Check for zero spread (locked market) with epsilon tolerance
+        EPSILON = 1e-6
+        if abs(spread_bps) < EPSILON:
             return ValidationResult(
                 is_valid=True,
                 check_name="spread_validation",

@@ -381,6 +381,9 @@ ls trained_models/
 
 ## 📚 Documentation
 
+- CRITICAL_BUG_FIXES_SUMMARY.md: Summary of recent critical fixes
+- tests/test_critical_bug_fixes.py: Regression suite for critical fixes
+
 - `IMPLEMENTATION_PLAN.md`: Complete development roadmap
 - `handoff/LATEST_HANDOFF.md`: Latest session notes
 - `CLAUDE.md`: Project guidelines
