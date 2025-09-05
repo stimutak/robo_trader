@@ -7,7 +7,7 @@ import asyncio
 import json
 import threading
 from datetime import datetime
-from queue import Empty, Queue
+from queue import Empty, Queue, Full
 from typing import Optional
 
 import websockets

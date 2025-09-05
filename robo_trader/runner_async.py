@@ -570,31 +570,32 @@ class AsyncRunner:
                         )
                     )
                 if res.ok:
-                    fill_price = res.fill_price or price
-                    # Use atomic position update to prevent race conditions
-                    success = await self._update_position_atomic(symbol, qty_to_cover, fill_price, "BUY_TO_COVER")
-                    if success:
-                        self.daily_pnl = self.portfolio.realized_pnl
+                        fill_price = res.fill_price or price
+                        # Use atomic position update to prevent race conditions
+                        success = await self._update_position_atomic(symbol, qty_to_cover, fill_price, "BUY_TO_COVER")
+                        if success:
+                            self.daily_pnl = self.portfolio.realized_pnl
 
-                        # Record trade in database
-                        await self.db.record_trade(
-                            symbol,
-                            "BUY_TO_COVER",
-                            qty_to_cover,
-                            fill_price,
-                            slippage=(fill_price - price) * qty_to_cover if res.fill_price else 0,
-                        )
-                        await self.db.update_position(symbol, 0, 0, 0)  # Close position
-                    else:
-                        logger.error(f"Failed to update position for {symbol} BUY_TO_COVER order")
-                        continue
-                    await self.monitor.record_order_placed(symbol, qty_to_cover)
-                    await self.monitor.record_trade_executed(symbol, "BUY_TO_COVER", qty_to_cover)
-                    executed = True
-                    quantity = qty_to_cover
-                    message = f"Covered short: Bought {qty_to_cover} shares at ${fill_price:.2f}"
+                            # Record trade in database
+                            await self.db.record_trade(
+                                symbol,
+                                "BUY_TO_COVER",
+                                qty_to_cover,
+                                fill_price,
+                                slippage=(fill_price - price) * qty_to_cover if res.fill_price else 0,
+                            )
+                            await self.db.update_position(symbol, 0, 0, 0)  # Close position
+
+                            await self.monitor.record_order_placed(symbol, qty_to_cover)
+                            await self.monitor.record_trade_executed(symbol, "BUY_TO_COVER", qty_to_cover)
+                            executed = True
+                            quantity = qty_to_cover
+                            message = f"Covered short: Bought {qty_to_cover} shares at ${fill_price:.2f}"
+                        else:
+                            logger.error(f"Failed to update position for {symbol} BUY_TO_COVER order")
+                            message = f"Cover order failed: atomic update error"
                 else:
-                    message = f"Cover order failed: {res.msg}"
+                        message = f"Cover order failed: {res.msg}"
 
             elif symbol not in self.positions:
                 # Open long position
@@ -643,32 +644,32 @@ class AsyncRunner:
                         success = await self._update_position_atomic(symbol, qty, fill_price, "BUY")
                         if success:
                             self.daily_executed_notional += price * qty
+
+                            # Record trade in database
+                            await self.db.record_trade(
+                                symbol,
+                                "BUY",
+                                qty,
+                                fill_price,
+                                slippage=(fill_price - price) * qty if res.fill_price else 0,
+                            )
+                            await self.db.update_position(symbol, qty, fill_price, price)
+
+                            await self.monitor.record_order_placed(symbol, qty)
+                            await self.monitor.record_trade_executed(symbol, "BUY", qty)
+                            executed = True
+                            quantity = qty
+                            message = f"Opened long: Bought {qty} shares at ${fill_price:.2f}"
+
+                            # Send trade update via WebSocket
+                            if WEBSOCKET_ENABLED and ws_client:
+                                try:
+                                    ws_client.send_trade_update(symbol, "BUY", qty, fill_price)
+                                except Exception as e:
+                                    logger.debug(f"Could not send trade WebSocket update: {e}")
                         else:
                             logger.error(f"Failed to update position for {symbol} BUY order")
-                            continue
-
-                        # Record trade in database
-                        await self.db.record_trade(
-                            symbol,
-                            "BUY",
-                            qty,
-                            fill_price,
-                            slippage=(fill_price - price) * qty if res.fill_price else 0,
-                        )
-                        await self.db.update_position(symbol, qty, fill_price, price)
-
-                        await self.monitor.record_order_placed(symbol, qty)
-                        await self.monitor.record_trade_executed(symbol, "BUY", qty)
-                        executed = True
-                        quantity = qty
-                        message = f"Opened long: Bought {qty} shares at ${fill_price:.2f}"
-
-                        # Send trade update via WebSocket
-                        if WEBSOCKET_ENABLED and ws_client:
-                            try:
-                                ws_client.send_trade_update(symbol, "BUY", qty, fill_price)
-                            except Exception as e:
-                                logger.debug(f"Could not send trade WebSocket update: {e}")
+                            message = f"Buy order failed: atomic update error"
                     else:
                         message = f"Buy order failed: {res.msg}"
                 else:
@@ -704,14 +705,15 @@ class AsyncRunner:
                                 slippage=(fill_price - price) * pos.quantity if res.fill_price else 0,
                             )
                             await self.db.update_position(symbol, 0, 0, 0)  # Close position
+
+                            await self.monitor.record_order_placed(symbol, pos.quantity)
+                            await self.monitor.record_trade_executed(symbol, "SELL", pos.quantity)
+                            executed = True
+                            quantity = pos.quantity
+                            message = f"Closed long: Sold {pos.quantity} shares at ${fill_price:.2f}"
                         else:
                             logger.error(f"Failed to update position for {symbol} SELL order")
-                            continue
-                        await self.monitor.record_order_placed(symbol, pos.quantity)
-                        await self.monitor.record_trade_executed(symbol, "SELL", pos.quantity)
-                        executed = True
-                        quantity = pos.quantity
-                        message = f"Closed long: Sold {pos.quantity} shares at ${fill_price:.2f}"
+                            message = f"Sell order failed: atomic update error"
                     else:
                         message = f"Sell order failed: {res.msg}"
 
@@ -762,25 +764,25 @@ class AsyncRunner:
                         success = await self._update_position_atomic(symbol, qty, fill_price, "SELL_SHORT")
                         if success:
                             self.daily_executed_notional += price * qty
+
+                            # Record trade in database
+                            await self.db.record_trade(
+                                symbol,
+                                "SELL_SHORT",
+                                qty,
+                                fill_price,
+                                slippage=(fill_price - price) * qty if res.fill_price else 0,
+                            )
+                            await self.db.update_position(symbol, -qty, fill_price, price)
+
+                            await self.monitor.record_order_placed(symbol, qty)
+                            await self.monitor.record_trade_executed(symbol, "SELL_SHORT", qty)
+                            executed = True
+                            quantity = qty
+                            message = f"Opened short: Sold {qty} shares at ${fill_price:.2f}"
                         else:
                             logger.error(f"Failed to update position for {symbol} SELL_SHORT order")
-                            continue
-
-                        # Record trade in database
-                        await self.db.record_trade(
-                            symbol,
-                            "SELL_SHORT",
-                            qty,
-                            fill_price,
-                            slippage=(fill_price - price) * qty if res.fill_price else 0,
-                        )
-                        await self.db.update_position(symbol, -qty, fill_price, price)
-
-                        await self.monitor.record_order_placed(symbol, qty)
-                        await self.monitor.record_trade_executed(symbol, "SELL_SHORT", qty)
-                        executed = True
-                        quantity = qty
-                        message = f"Opened short: Sold {qty} shares at ${fill_price:.2f}"
+                            message = f"Short sell order failed: atomic update error"
                     else:
                         message = f"Short sell order failed: {res.msg}"
                 else:
