@@ -31,3 +31,12 @@ psycopg2-binary>=2.9.0
 gunicorn>=21.0.0
 prometheus-client>=0.19.0
 
+# Bug detection dependencies
+watchdog>=6.0.0
+mypy>=1.17.0
+bandit>=1.8.0
+flake8>=7.3.0
+
+# Web framework
+flask>=3.0.0
+
