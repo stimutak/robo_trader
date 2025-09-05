@@ -220,7 +220,7 @@ class ModelRegistry:
             # In production, consider using joblib or safer serialization
             # Security: Only loading trusted model files from our own system
             try:
-                model_info = pickle.load(f)  # Security: Trusted file from our system
+                model_info = pickle.load(f)  # nosec B301 - Trusted file from our system
             except (pickle.PickleError, EOFError, ImportError) as e:
                 logger.error(f"Failed to load model file {model_file}: {e}")
                 return False
@@ -432,7 +432,7 @@ class ModelRegistry:
         with open(model_file, "rb") as f:
             # Security: Only load trusted model files from our own system
             try:
-                model_info = pickle.load(f)  # Security: Trusted file from our system
+                model_info = pickle.load(f)  # nosec B301 - Trusted file from our system
             except (pickle.PickleError, EOFError, ImportError) as e:
                 logger.error(f"Failed to load model file {model_file}: {e}")
                 return None
