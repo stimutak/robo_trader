@@ -1315,6 +1315,24 @@ HTML_TEMPLATE = """
                     const symbols = [...new Set(data.trades.map(t => t.symbol))];
                     updateSymbolFilter(symbols);
                     
+                    // Update 'trades today' counter from returned trades
+                    try {
+                        const today = new Date();
+                        const todayDateStr = today.toDateString();
+                        const tradesToday = data.trades.filter(t => {
+                            if (!t.timestamp) return false;
+                            const utcTimestamp = t.timestamp.replace(' ', 'T') + 'Z';
+                            const d = new Date(utcTimestamp);
+                            return d.toDateString() === todayDateStr;
+                        }).length;
+                        const tc = document.getElementById('trade-count');
+                        if (tc) {
+                            tc.textContent = `${tradesToday} trade${tradesToday === 1 ? '' : 's'} today`;
+                        }
+                    } catch (e) {
+                        console.debug('Could not update trades-today counter:', e);
+                    }
+
                     tbody.innerHTML = data.trades.map(trade => {
                         // SQLite timestamps are UTC but don't have 'Z' suffix
                         // Add 'Z' to mark as UTC, then convert to local time  
@@ -2971,7 +2989,7 @@ def get_trades():
         days = request.args.get("days", 30, type=int)
         symbol = request.args.get("symbol", None)
 
-        trades = db.get_recent_trades(limit=100, symbol=symbol)
+        trades = db.get_recent_trades(limit=1000, symbol=symbol, days=days)
 
         if trades:
             # Convert to expected format
@@ -2988,11 +3006,12 @@ def get_trades():
                         "slippage": trade.get("slippage", 0),
                         "commission": trade.get("commission", 0),
                         "notional": trade["quantity"] * trade["price"],
+                        # Include all four sides (BUY, SELL, SELL_SHORT, BUY_TO_COVER)
                         "cash_impact": (
                             -trade["quantity"] * trade["price"]
-                            if trade["side"] == "BUY"
+                            if trade["side"] in ("BUY", "BUY_TO_COVER")
                             else trade["quantity"] * trade["price"]
-                        ),
+                        )
                     }
                 )
 
@@ -3000,8 +3019,9 @@ def get_trades():
             total_trades = len(trade_list)
             total_volume = sum(t["notional"] for t in trade_list)
             total_commission = sum(t["commission"] for t in trade_list)
-            buy_trades = [t for t in trade_list if t["side"] == "BUY"]
-            sell_trades = [t for t in trade_list if t["side"] == "SELL"]
+            # Count by high-level direction for summary
+            buy_trades = [t for t in trade_list if t["side"] in ("BUY", "BUY_TO_COVER")]
+            sell_trades = [t for t in trade_list if t["side"] in ("SELL", "SELL_SHORT")]
 
             return jsonify(
                 {
