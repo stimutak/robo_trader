@@ -33,7 +33,7 @@ jobs:
         python scripts/bug_detector.py --scan --config production --tools mypy,bandit,flake8 --output bug-report.json
     
     - name: Upload bug report
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       if: always()
       with:
         name: bug-report
