@@ -570,32 +570,32 @@ class AsyncRunner:
                         )
                     )
                 if res.ok:
-                        fill_price = res.fill_price or price
-                        # Use atomic position update to prevent race conditions
-                        success = await self._update_position_atomic(symbol, qty_to_cover, fill_price, "BUY_TO_COVER")
-                        if success:
-                            self.daily_pnl = self.portfolio.realized_pnl
+                    fill_price = res.fill_price or price
+                    # Use atomic position update to prevent race conditions
+                    success = await self._update_position_atomic(symbol, qty_to_cover, fill_price, "BUY_TO_COVER")
+                    if success:
+                        self.daily_pnl = self.portfolio.realized_pnl
 
-                            # Record trade in database
-                            await self.db.record_trade(
-                                symbol,
-                                "BUY_TO_COVER",
-                                qty_to_cover,
-                                fill_price,
-                                slippage=(fill_price - price) * qty_to_cover if res.fill_price else 0,
-                            )
-                            await self.db.update_position(symbol, 0, 0, 0)  # Close position
+                        # Record trade in database
+                        await self.db.record_trade(
+                            symbol,
+                            "BUY_TO_COVER",
+                            qty_to_cover,
+                            fill_price,
+                            slippage=(fill_price - price) * qty_to_cover if res.fill_price else 0,
+                        )
+                        await self.db.update_position(symbol, 0, 0, 0)  # Close position
 
-                            await self.monitor.record_order_placed(symbol, qty_to_cover)
-                            await self.monitor.record_trade_executed(symbol, "BUY_TO_COVER", qty_to_cover)
-                            executed = True
-                            quantity = qty_to_cover
-                            message = f"Covered short: Bought {qty_to_cover} shares at ${fill_price:.2f}"
-                        else:
-                            logger.error(f"Failed to update position for {symbol} BUY_TO_COVER order")
-                            message = f"Cover order failed: atomic update error"
+                        await self.monitor.record_order_placed(symbol, qty_to_cover)
+                        await self.monitor.record_trade_executed(symbol, "BUY_TO_COVER", qty_to_cover)
+                        executed = True
+                        quantity = qty_to_cover
+                        message = f"Covered short: Bought {qty_to_cover} shares at ${fill_price:.2f}"
+                    else:
+                        logger.error(f"Failed to update position for {symbol} BUY_TO_COVER order")
+                        message = f"Cover order failed: atomic update error"
                 else:
-                        message = f"Cover order failed: {res.msg}"
+                    message = f"Cover order failed: {res.msg}"
 
             elif symbol not in self.positions:
                 # Open long position

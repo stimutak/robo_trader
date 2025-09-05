@@ -67,7 +67,6 @@ class Position:
         """Check if position is long."""
         return self.quantity > 0
 
-    @property
     def unrealized_pnl(self, current_price: float) -> float:
         """Calculate unrealized P&L."""
         if self.is_long:
@@ -590,13 +589,13 @@ class RiskManager:
         is_valid, msg = self.check_correlation_limit(symbol, current_positions)
         if not is_valid:
             self._record_violation(RiskViolationType.CORRELATION_LIMIT, symbol)
-            return False, msg
+            return False, msg or "Correlation limit exceeded"
 
         # Sector exposure check
         is_valid, msg = self.check_sector_exposure(symbol, order_notional, equity, sector)
         if not is_valid:
             self._record_violation(RiskViolationType.SECTOR_EXPOSURE_LIMIT, symbol)
-            return False, msg
+            return False, msg or "Sector exposure limit exceeded"
 
         # Portfolio heat check
         if current_prices:

@@ -216,7 +216,13 @@ class ModelRegistry:
             return False
 
         with open(model_file, "rb") as f:
-            model_info = pickle.load(f)
+            # Security: Only load trusted model files from our own system
+            # In production, consider using joblib or safer serialization
+            try:
+                model_info = pickle.load(f)
+            except (pickle.PickleError, EOFError, ImportError) as e:
+                logger.error(f"Failed to load model file {model_file}: {e}")
+                return False
 
         # Update deployment status
         deployment = {
@@ -423,7 +429,12 @@ class ModelRegistry:
         model_file = self.registry_dir / model_name / version / "model.pkl"
 
         with open(model_file, "rb") as f:
-            model_info = pickle.load(f)
+            # Security: Only load trusted model files from our own system
+            try:
+                model_info = pickle.load(f)
+            except (pickle.PickleError, EOFError, ImportError) as e:
+                logger.error(f"Failed to load model file {model_file}: {e}")
+                return None
 
         model_info["ab_test"] = test_name
         model_info["ab_variant"] = "B" if use_model_b else "A"

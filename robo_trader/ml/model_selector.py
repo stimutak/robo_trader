@@ -59,6 +59,7 @@ class ModelSelector:
         if improved_model_path.exists():
             try:
                 with open(improved_model_path, "rb") as f:
+                    # Security: Only load trusted model files from our own system
                     model_info = pickle.load(f)
 
                 # Add as priority model
@@ -78,6 +79,7 @@ class ModelSelector:
         for model_file in self.model_dir.glob("*.pkl"):
             try:
                 with open(model_file, "rb") as f:
+                    # Security: Only load trusted model files from our own system
                     model_info = pickle.load(f)
 
                 # Load metadata

@@ -183,8 +183,8 @@ class SlackNotifier:
                         }
                     )
 
-            # Send to Slack
-            response = requests.post(self.webhook_url, json=payload)
+            # Send to Slack with timeout
+            response = requests.post(self.webhook_url, json=payload, timeout=30)
             response.raise_for_status()
 
             logger.debug(f"Slack alert sent: {alert.title}")

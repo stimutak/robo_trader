@@ -24,7 +24,7 @@ class WebSocketClient:
         self.uri = uri
         self.websocket = None
         self.connected = False
-        self.message_queue = Queue(maxsize=max_queue_size)
+        self.message_queue: Queue[Dict[str, Any]] = Queue(maxsize=max_queue_size)
         self.max_queue_size = max_queue_size
         self.thread = None
         self.loop = None

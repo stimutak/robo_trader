@@ -1,0 +1,15 @@
+[bandit]
+# Bandit configuration for RoboTrader
+# Skip certain tests in development environment
+
+# Skip Flask debug test in development
+skips = B201
+
+# Exclude test files and development utilities
+exclude_dirs = tests,test_,*_test.py
+
+# Set confidence level
+confidence = HIGH
+
+# Set severity level  
+severity = MEDIUM

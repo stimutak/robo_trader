@@ -24,7 +24,7 @@ class WebSocketManager:
         self.host = host
         self.port = port
         self.clients: Set[WebSocketServerProtocol] = set()
-        self.message_queue = Queue()
+        self.message_queue: Queue[Dict[str, Any]] = Queue()
         self.server = None
         self.loop = None
         self.thread = None

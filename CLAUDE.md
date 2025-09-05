@@ -22,29 +22,35 @@
 - `robo_trader/analytics/` - Performance analytics (Phase 2 - COMPLETE)
 - `robo_trader/backtesting/` - Walk-forward backtesting (Phase 2 - COMPLETE)
 
+## IMPORTANT: Python Command on macOS
+**ALWAYS USE `python3` NOT `python` - THIS SYSTEM USES macOS WITH NO `python` COMMAND**
+
 ## Testing Commands
 ```bash
-# Run trading system
-python -m robo_trader.runner_async --symbols AAPL,NVDA,TSLA,IXHL,NUAI,BZAI,ELTP,OPEN,CEG,VRT,PLTR,UPST,TEM,HTFL,SDGR,APLD,SOFI,CORZ,WULF
+# Start WebSocket server (REQUIRED FIRST)
+python3 -m robo_trader.websocket_server
 
 # Run dashboard
 export DASH_PORT=5555
-python app.py
+python3 app.py
+
+# Run trading system
+python3 -m robo_trader.runner_async --symbols AAPL,NVDA,TSLA,IXHL,NUAI,BZAI,ELTP,OPEN,CEG,VRT,PLTR,UPST,TEM,HTFL,SDGR,APLD,SOFI,CORZ,WULF
 
 # Check market hours
-python test_market_hours.py
+python3 test_market_hours.py
 
 # Run tests
 pytest
 
 # Test ML pipeline (Phase 2)
-python test_ml_pipeline.py
+python3 test_ml_pipeline.py
 
 # Test model training
-python test_m3_complete.py
+python3 test_m3_complete.py
 
 # Test performance analytics
-python test_m4_performance.py
+python3 test_m4_performance.py
 ```
 
 ## Current Issues to Fix

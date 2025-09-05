@@ -1,0 +1,109 @@
+name: Bug Detection
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  bug-detection:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install mypy bandit flake8
+    
+    - name: Run bug detection scan
+      run: |
+        python scripts/bug_detector.py --scan --config production --tools mypy,bandit,flake8 --output bug-report.json
+    
+    - name: Upload bug report
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: bug-report
+        path: bug-report.json
+    
+    - name: Comment on PR with critical bugs
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          try {
+            const report = JSON.parse(fs.readFileSync('bug-report.json', 'utf8'));
+            const criticalBugs = report.bugs.filter(bug => bug.severity === 'critical');
+            const highBugs = report.bugs.filter(bug => bug.severity === 'high');
+            
+            if (criticalBugs.length > 0 || highBugs.length > 0) {
+              let comment = '## 🐛 Bug Detection Report\n\n';
+              
+              if (criticalBugs.length > 0) {
+                comment += `### 🚨 Critical Bugs (${criticalBugs.length})\n`;
+                criticalBugs.slice(0, 5).forEach(bug => {
+                  comment += `- **${bug.file_path}:${bug.line_number || '?'}** - ${bug.title}\n`;
+                  comment += `  ${bug.description}\n`;
+                });
+                if (criticalBugs.length > 5) {
+                  comment += `- ... and ${criticalBugs.length - 5} more critical bugs\n`;
+                }
+                comment += '\n';
+              }
+              
+              if (highBugs.length > 0) {
+                comment += `### ⚠️ High Priority Bugs (${highBugs.length})\n`;
+                highBugs.slice(0, 5).forEach(bug => {
+                  comment += `- **${bug.file_path}:${bug.line_number || '?'}** - ${bug.title}\n`;
+                });
+                if (highBugs.length > 5) {
+                  comment += `- ... and ${highBugs.length - 5} more high priority bugs\n`;
+                }
+                comment += '\n';
+              }
+              
+              comment += `\n**Total bugs found:** ${report.total_bugs}\n`;
+              comment += `\n📊 [View full report](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID})`;
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            }
+          } catch (error) {
+            console.log('No bug report found or error reading report:', error);
+          }
+    
+    - name: Fail on critical bugs
+      if: github.event_name == 'pull_request'
+      run: |
+        python -c "
+        import json
+        try:
+            with open('bug-report.json', 'r') as f:
+                report = json.load(f)
+            critical_count = report.get('critical_bugs', 0)
+            if critical_count > 0:
+                print(f'❌ Found {critical_count} critical bugs!')
+                exit(1)
+            else:
+                print('✅ No critical bugs found')
+        except FileNotFoundError:
+            print('⚠️ No bug report found')
+        "
