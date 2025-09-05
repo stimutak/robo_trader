@@ -550,9 +550,7 @@ class AsyncRunner:
             strategy_name = (
                 "ML_ENHANCED"
                 if self.use_ml_enhanced
-                else "ML_ENSEMBLE"
-                if self.use_ml_strategy
-                else "SMA_CROSSOVER"
+                else "ML_ENSEMBLE" if self.use_ml_strategy else "SMA_CROSSOVER"
             )
             await self.db.record_signal(
                 symbol,
@@ -728,9 +726,9 @@ class AsyncRunner:
                                 "SELL",
                                 pos.quantity,
                                 fill_price,
-                                slippage=(fill_price - price) * pos.quantity
-                                if res.fill_price
-                                else 0,
+                                slippage=(
+                                    (fill_price - price) * pos.quantity if res.fill_price else 0
+                                ),
                             )
                             await self.db.update_position(symbol, 0, 0, 0)  # Close position
 

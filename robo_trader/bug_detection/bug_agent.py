@@ -334,9 +334,21 @@ class StaticAnalyzer:
         # Always check these patterns (these are regex patterns, not actual function calls)
         dangerous_patterns.extend(
             [
-                (r"os\.system\s*\(", "Use of os.system()", BugSeverity.HIGH),  # Security: Regex pattern for detection
-                (r"subprocess\.call\s*\(", "Use of subprocess.call()", BugSeverity.HIGH),  # Security: Regex pattern for detection
-                (r"pickle\.loads\s*\(", "Use of pickle.loads() - dangerous for untrusted data", BugSeverity.HIGH),  # Security: Regex pattern for detection
+                (
+                    r"os\.system\s*\(",
+                    "Use of os.system()",
+                    BugSeverity.HIGH,
+                ),  # Security: Regex pattern for detection
+                (
+                    r"subprocess\.call\s*\(",
+                    "Use of subprocess.call()",
+                    BugSeverity.HIGH,
+                ),  # Security: Regex pattern for detection
+                (
+                    r"pickle\.loads\s*\(",
+                    "Use of pickle.loads() - dangerous for untrusted data",
+                    BugSeverity.HIGH,
+                ),  # Security: Regex pattern for detection
                 (r'password\s*=\s*["\'][^"\']+["\']', "Hardcoded password", BugSeverity.HIGH),
                 (r'api_key\s*=\s*["\'][^"\']+["\']', "Hardcoded API key", BugSeverity.HIGH),
             ]

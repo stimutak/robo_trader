@@ -72,9 +72,9 @@ class MLEnhancedStrategy(Strategy):
             min_data_points=50,
             position_sizing="dynamic",
             max_positions=10,
-            enable_shorts=config.execution.enable_short_selling
-            if hasattr(config, "execution")
-            else False,
+            enable_shorts=(
+                config.execution.enable_short_selling if hasattr(config, "execution") else False
+            ),
             config={"config": config},
         )
 
