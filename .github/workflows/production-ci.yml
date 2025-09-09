@@ -1,0 +1,240 @@
+name: Production CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, production ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main, production ]
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly security scan on Mondays
+
+jobs:
+  # Security scanning
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Run Trivy security scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        severity: 'CRITICAL,HIGH'
+    
+    - name: Upload Trivy results to GitHub Security
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-results.sarif'
+    
+    - name: Check for hardcoded secrets
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: ./
+        base: main
+        head: HEAD
+
+  # Comprehensive testing
+  test-suite:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+        test-type: ["unit", "integration", "performance"]
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -r requirements-dev.txt
+        pip install -r requirements-prod.txt
+        pip install -e .
+    
+    - name: Run unit tests
+      if: matrix.test-type == 'unit'
+      run: |
+        pytest tests/unit/ -v --cov=robo_trader --cov-report=xml --cov-report=html
+    
+    - name: Run integration tests
+      if: matrix.test-type == 'integration'
+      run: |
+        pytest tests/integration/ -v --cov=robo_trader --cov-append
+    
+    - name: Run performance tests
+      if: matrix.test-type == 'performance'
+      run: |
+        pytest tests/performance/ -v --benchmark-only
+    
+    - name: Upload coverage reports
+      if: matrix.test-type == 'unit' && matrix.python-version == '3.11'
+      uses: codecov/codecov-action@v4
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+
+  # Code quality checks
+  code-quality:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+    
+    - name: Install quality tools
+      run: |
+        python -m pip install --upgrade pip
+        pip install black isort flake8 mypy pylint bandit safety
+    
+    - name: Format check with black
+      run: black --check --diff robo_trader/
+    
+    - name: Import sort check
+      run: isort --check-only --diff robo_trader/
+    
+    - name: Lint with flake8
+      run: flake8 robo_trader/ --count --statistics
+    
+    - name: Type check with mypy
+      run: mypy robo_trader/ --ignore-missing-imports
+    
+    - name: Security check with bandit
+      run: bandit -r robo_trader/ -ll
+    
+    - name: Check dependencies for vulnerabilities
+      run: safety check --json
+
+  # Docker build and scan
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: [security-scan, test-suite, code-quality]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ secrets.DOCKER_USERNAME }}/robo-trader
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha,prefix={{branch}}-
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    
+    - name: Scan Docker image
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ secrets.DOCKER_USERNAME }}/robo-trader:${{ steps.meta.outputs.version }}
+        format: 'sarif'
+        output: 'docker-scan-results.sarif'
+    
+    - name: Upload Docker scan results
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'docker-scan-results.sarif'
+
+  # Deploy to staging
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: staging
+      url: https://staging.robo-trader.com
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Deploy to staging
+      run: |
+        echo "Deploying to staging environment..."
+        # Add actual deployment commands here
+        # kubectl apply -f deployment/k8s/staging/
+        # or docker-compose -f deployment/docker-compose.staging.yml up -d
+    
+    - name: Run smoke tests
+      run: |
+        echo "Running smoke tests on staging..."
+        # Add smoke test commands
+        # pytest tests/smoke/ --base-url=https://staging.robo-trader.com
+
+  # Deploy to production (manual approval required)
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: production
+      url: https://robo-trader.com
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Deploy to production
+      run: |
+        echo "Deploying to production environment..."
+        # Add actual production deployment commands
+        # kubectl apply -f deployment/k8s/production/
+    
+    - name: Run production health checks
+      run: |
+        echo "Running production health checks..."
+        # Add health check commands
+        # curl -f https://robo-trader.com/health || exit 1
+    
+    - name: Create release notes
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        draft: false
+        prerelease: false

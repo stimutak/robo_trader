@@ -130,6 +130,13 @@ python -m robo_trader.runner
 - Predicting markets or guaranteeing returns.
 - Building UI or web services unless explicitly requested.
 
+### Handoff Document Convention
+- Location: `/handoff/` directory in project root
+- Naming: `YYYY-MM-DD_HHMM_handoff.md` (24-hour format, local time)
+- Latest: Symlink `LATEST_HANDOFF.md` → most recent handoff doc
+- Archive: Keep last 5 handoffs, archive older ones to `/handoff/archive/`
+- Content: Status, running processes, next steps, blockers, session notes
+
 ---
 This ruleset adapts the relevant ALWAYS/NEVER, testing discipline, security checklist, and workflow guidance from the provided CLAUDE.md while grounding them in this Python/IBKR trading context. Use these rules to guide all automated edits and assistance in this repository.
 

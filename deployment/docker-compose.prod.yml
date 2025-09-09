@@ -1,0 +1,221 @@
+version: '3.8'
+
+services:
+  # WebSocket server with production settings
+  websocket:
+    image: robo_trader:latest
+    container_name: robo_trader_websocket_prod
+    command: python3 -m robo_trader.websocket_server
+    ports:
+      - "8765:8765"
+    environment:
+      - WEBSOCKET_PORT=8765
+      - LOG_LEVEL=WARNING
+      - PYTHONOPTIMIZE=2
+    volumes:
+      - /var/robo_trader/data:/app/data
+      - /var/robo_trader/logs:/app/logs
+    networks:
+      - robo_trader_network
+    restart: always
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import asyncio, websockets; asyncio.run(websockets.connect('ws://localhost:8765'))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # Dashboard with production settings
+  dashboard:
+    image: robo_trader:latest
+    container_name: robo_trader_dashboard_prod
+    command: gunicorn --workers 4 --bind 0.0.0.0:5555 --timeout 120 app:server
+    ports:
+      - "5555:5555"
+    environment:
+      - DASH_PORT=5555
+      - WEBSOCKET_URL=ws://websocket:8765
+      - LOG_LEVEL=WARNING
+      - MONITORING_LOG_FORMAT=json
+      - DASH_ENV=production
+      - PYTHONOPTIMIZE=2
+    volumes:
+      - /var/robo_trader/data:/app/data:ro
+      - /var/robo_trader/logs:/app/logs
+    depends_on:
+      websocket:
+        condition: service_healthy
+    networks:
+      - robo_trader_network
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5555/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # Main trading runner with production settings
+  trader:
+    image: robo_trader:latest
+    container_name: robo_trader_main_prod
+    command: python3 -m robo_trader.runner_async --symbols ${TRADING_SYMBOLS}
+    environment:
+      - TRADING_MODE=live
+      - IBKR_HOST=${IBKR_HOST}
+      - IBKR_PORT=${IBKR_PORT:-4001}  # Live trading port
+      - IBKR_CLIENT_ID=${IBKR_CLIENT_ID:-1}
+      - LOG_LEVEL=WARNING
+      - WEBSOCKET_URL=ws://websocket:8765
+      - STRATEGY_ENABLED_STRATEGIES=${STRATEGY_ENABLED_STRATEGIES}
+      - RISK_MAX_POSITION_SIZE=${RISK_MAX_POSITION_SIZE}
+      - RISK_STOP_LOSS_PERCENT=${RISK_STOP_LOSS_PERCENT}
+      - RISK_MAX_DAILY_LOSS=${RISK_MAX_DAILY_LOSS:-5000}
+      - RISK_MAX_DRAWDOWN=${RISK_MAX_DRAWDOWN:-0.10}
+      - PYTHONOPTIMIZE=2
+    volumes:
+      - /var/robo_trader/data:/app/data
+      - /var/robo_trader/logs:/app/logs
+      - /var/robo_trader/config:/app/config:ro
+      - /var/robo_trader/secrets:/app/secrets:ro
+    depends_on:
+      websocket:
+        condition: service_healthy
+      dashboard:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - robo_trader_network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
+
+  # Redis for production caching
+  redis:
+    image: redis:7-alpine
+    container_name: robo_trader_redis_prod
+    command: redis-server --maxmemory 2gb --maxmemory-policy allkeys-lru --save 60 1 --save 300 10
+    ports:
+      - "127.0.0.1:6379:6379"  # Only bind to localhost
+    volumes:
+      - /var/robo_trader/redis:/data
+    networks:
+      - robo_trader_network
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # Nginx reverse proxy for production
+  nginx:
+    image: nginx:alpine
+    container_name: robo_trader_nginx_prod
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - /var/robo_trader/ssl:/etc/nginx/ssl:ro
+      - /var/robo_trader/static:/usr/share/nginx/html:ro
+    depends_on:
+      - dashboard
+    networks:
+      - robo_trader_network
+    restart: always
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: robo_trader_prometheus_prod
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - /var/robo_trader/prometheus:/prometheus
+    networks:
+      - robo_trader_network
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: robo_trader_grafana_prod
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_INSTALL_PLUGINS=redis-datasource
+    volumes:
+      - /var/robo_trader/grafana:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      - prometheus
+    networks:
+      - robo_trader_network
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  robo_trader_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  redis_data:
+  prometheus_data:
+  grafana_data:

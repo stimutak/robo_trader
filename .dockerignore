@@ -1,0 +1,117 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.env
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments
+bin/
+include/
+lib/
+lib64/
+share/
+pyvenv.cfg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Git
+.git/
+.gitignore
+.github/
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Project specific
+data/*.db
+data/*.sqlite
+data/*.csv
+logs/*.log
+logs/*.txt
+handoff/
+archived_plans/
+test_*.py
+tests/
+docs/
+*.md
+!README.md
+!requirements.txt
+
+# Secrets and configs
+secrets/
+*.key
+*.pem
+*.crt
+config/*.secret
+config/*.key
+
+# Cache and temp
+.cache/
+temp/
+tmp/
+*.tmp
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Model files (large)
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+models/
+
+# Backups
+*.bak
+*.backup
+*~
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+
+# OS files
+Thumbs.db
+desktop.ini
+
+# Node (if dashboard has JS components)
+node_modules/
+package-lock.json
+yarn.lock
+
+# Monitoring/metrics
+prometheus/
+grafana/
+*.rrd

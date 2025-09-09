@@ -1,97 +1,108 @@
 version: '3.8'
 
 services:
-  trader:
+  # WebSocket server for real-time updates
+  websocket:
     build: .
-    container_name: robo_trader
+    container_name: robo_trader_websocket
+    command: python3 -m robo_trader.websocket_server
+    ports:
+      - "8765:8765"
     environment:
-      - TRADING_ENV=development
-      - LOG_LEVEL=DEBUG
-      - IBKR_HOST=host.docker.internal
-      - IBKR_PORT=7497
-      - ENABLE_PAPER_TRADING=true
-      - ENABLE_LIVE_TRADING=false
+      - WEBSOCKET_PORT=8765
+      - LOG_LEVEL=INFO
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
-      - ./config:/app/config
-    ports:
-      - "8080:8080"  # Health/metrics endpoint
-      - "5555:5555"  # Dashboard
     networks:
-      - trading_network
+      - robo_trader_network
     restart: unless-stopped
-    depends_on:
-      - postgres
-      - redis
-
-  postgres:
-    image: postgres:16-alpine
-    container_name: trading_db
-    environment:
-      - POSTGRES_USER=trader
-      - POSTGRES_PASSWORD=trader_pass
-      - POSTGRES_DB=trading
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
-    networks:
-      - trading_network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U trader"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      test: ["CMD", "python3", "-c", "import asyncio, websockets; asyncio.run(websockets.connect('ws://localhost:8765'))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
+  # Dashboard web application
+  dashboard:
+    build: .
+    container_name: robo_trader_dashboard
+    command: python3 app.py
+    ports:
+      - "5555:5555"
+    environment:
+      - DASH_PORT=5555
+      - WEBSOCKET_URL=ws://websocket:8765
+      - LOG_LEVEL=INFO
+      - MONITORING_LOG_FORMAT=plain
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - websocket
+    networks:
+      - robo_trader_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5555/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Main trading runner
+  robo-trader:
+    build: .
+    container_name: robo_trader_main
+    command: python3 -m robo_trader.runner_async --symbols ${TRADING_SYMBOLS:-AAPL,NVDA,TSLA}
+    environment:
+      - TRADING_MODE=${TRADING_MODE:-paper}
+      - IBKR_HOST=${IBKR_HOST:-127.0.0.1}
+      - IBKR_PORT=${IBKR_PORT:-7497}
+      - IBKR_CLIENT_ID=${IBKR_CLIENT_ID:-1}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - WEBSOCKET_URL=ws://websocket:8765
+      - STRATEGY_ENABLED_STRATEGIES=${STRATEGY_ENABLED_STRATEGIES:-momentum,mean_reversion}
+      - RISK_MAX_POSITION_SIZE=${RISK_MAX_POSITION_SIZE:-10000}
+      - RISK_STOP_LOSS_PERCENT=${RISK_STOP_LOSS_PERCENT:-0.02}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config:/app/config:ro
+    depends_on:
+      - websocket
+      - dashboard
+    networks:
+      - robo_trader_network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+
+  # Redis for caching and session management (optional)
   redis:
     image: redis:7-alpine
-    container_name: trading_cache
+    container_name: robo_trader_redis
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
     networks:
-      - trading_network
+      - robo_trader_network
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: trading_prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-    volumes:
-      - ./deployment/prometheus:/etc/prometheus
-      - prometheus_data:/prometheus
-    ports:
-      - "9090:9090"
-    networks:
-      - trading_network
-
-  grafana:
-    image: grafana/grafana:latest
-    container_name: trading_grafana
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_USERS_ALLOW_SIGN_UP=false
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./deployment/grafana:/etc/grafana/provisioning
-    ports:
-      - "3000:3000"
-    networks:
-      - trading_network
-    depends_on:
-      - prometheus
-
-volumes:
-  postgres_data:
-  prometheus_data:
-  grafana_data:
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
 networks:
-  trading_network:
+  robo_trader_network:
     driver: bridge
+
+volumes:
+  redis_data:

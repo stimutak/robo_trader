@@ -1,0 +1,85 @@
+# Production requirements for RoboTrader
+
+# Core dependencies (from requirements.txt)
+-r requirements.txt
+
+# Production-specific packages
+
+# Database
+psycopg2-binary==2.9.9
+asyncpg==0.29.0
+redis==5.0.1
+hiredis==2.2.3
+
+# Monitoring & Metrics
+prometheus-client==0.19.0
+statsd==4.0.1
+datadog==0.47.0
+
+# Performance & Caching
+ujson==5.9.0
+orjson==3.9.10
+msgpack==1.0.7
+cachetools==5.3.2
+diskcache==5.6.3
+
+# Security
+cryptography==41.0.7
+PyJWT==2.8.0
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
+
+# HTTP & Networking
+httpx==0.25.2
+aiohttp[speedups]==3.9.1
+uvloop==0.19.0
+
+# Process Management
+supervisor==4.2.5
+gunicorn==21.2.0
+uvicorn[standard]==0.24.0
+
+# Logging & Tracing
+python-json-logger==2.0.7
+opentelemetry-api==1.22.0
+opentelemetry-sdk==1.22.0
+opentelemetry-instrumentation==0.43b0
+
+# Health Checks
+py-healthcheck==2.0.0
+aiohttp-healthcheck==2.0.0
+
+# System Monitoring
+psutil==5.9.6
+py-cpuinfo==9.0.0
+
+# Error Tracking
+sentry-sdk==1.39.1
+rollbar==0.16.3
+
+# Rate Limiting
+aioredis==2.0.1
+aioratelimiter==1.1.0
+
+# Production web server
+gevent==23.9.1
+eventlet==0.33.3
+
+# Configuration Management
+python-dotenv==1.0.0
+pydantic-settings==2.1.0
+
+# Testing in production (smoke tests)
+pytest-asyncio==0.21.1
+pytest-timeout==2.2.0
+pytest-xdist==3.5.0
+
+# Documentation
+mkdocs==1.5.3
+mkdocs-material==9.5.3
+
+# Code Quality (for production checks)
+black==23.12.1
+mypy==1.7.1
+bandit==1.7.5
+safety==3.0.1

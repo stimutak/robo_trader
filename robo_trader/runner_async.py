@@ -41,7 +41,17 @@ from .risk import Position, RiskManager
 from .strategies import MLStrategy, sma_crossover_signals
 from .strategies.ml_enhanced_strategy import MLEnhancedStrategy
 
+# Import mean reversion strategies if available
 logger = get_logger(__name__)
+
+try:
+    from .strategies.mean_reversion import MeanReversionStrategy
+    from .strategies.pairs_trading import CointegrationPairsStrategy, StatisticalArbitrageStrategy
+
+    MEAN_REVERSION_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Mean reversion strategies not available: {e}")
+    MEAN_REVERSION_AVAILABLE = False
 
 
 @dataclass
@@ -118,6 +128,12 @@ class AsyncRunner:
         self.ml_strategy = None
         self.ml_enhanced_strategy = None
         self.active_strategy_name: Optional[str] = None
+
+        # Mean reversion strategies
+        self.mean_reversion_strategy = None
+        self.pairs_strategy = None
+        self.stat_arb_strategy = None
+        self.market_data_cache = {}  # Cache for pairs/stat arb analysis
 
     async def _get_position_lock(self, symbol: str) -> asyncio.Lock:
         """Get or create a lock for a specific symbol."""
@@ -340,6 +356,44 @@ class AsyncRunner:
                     SimpleNamespace(name="Baseline_SMA"), initial_weight=1.0
                 )
 
+        # Initialize mean reversion strategies if available and enabled
+        if MEAN_REVERSION_AVAILABLE and "mean_reversion" in self.cfg.strategy.enabled_strategies:
+            logger.info("Initializing mean reversion strategies...")
+            try:
+                # Initialize mean reversion strategy
+                self.mean_reversion_strategy = MeanReversionStrategy(
+                    symbols=self.cfg.symbols,
+                    use_ml_enhancement=True,
+                )
+
+                # Initialize pairs trading if we have enough symbols
+                if len(self.cfg.symbols) >= 2:
+                    self.pairs_strategy = CointegrationPairsStrategy(
+                        lookback_days=60,
+                        use_ml_enhancement=True,
+                    )
+                    logger.info("Pairs trading strategy initialized")
+
+                # Initialize statistical arbitrage
+                if len(self.cfg.symbols) >= 5:
+                    self.stat_arb_strategy = StatisticalArbitrageStrategy(
+                        universe_size=min(len(self.cfg.symbols), 20),
+                        max_positions=min(len(self.cfg.symbols) // 2, 10),
+                        use_ml_ranking=True,
+                    )
+                    logger.info("Statistical arbitrage strategy initialized")
+
+                logger.info("Mean reversion strategies initialized successfully")
+
+                # Register with portfolio manager if available
+                if self.portfolio_manager and self.mean_reversion_strategy:
+                    self.portfolio_manager.register_strategy(
+                        self.mean_reversion_strategy, initial_weight=0.2
+                    )
+
+            except Exception as e:
+                logger.error(f"Failed to initialize mean reversion strategies: {e}")
+
         # Load existing positions from database to prevent duplicate buying
         await self.load_existing_positions()
 
@@ -445,6 +499,9 @@ class AsyncRunner:
                 message="No data available",
             )
 
+        # Cache market data for pairs/stat arb analysis
+        self.market_data_cache[symbol] = df
+
         # Send real-time price update via WebSocket
         if WEBSOCKET_ENABLED and ws_client and df is not None and not df.empty:
             try:
@@ -531,6 +588,63 @@ class AsyncRunner:
                     slow=self.sma_slow,
                 )
 
+        # Generate mean reversion signals if enabled
+        if MEAN_REVERSION_AVAILABLE and self.mean_reversion_strategy:
+            try:
+                from .features.engine import FeatureSet
+
+                # Create basic feature set (can be enhanced)
+                feature_set = FeatureSet()
+                if len(df) >= 20:
+                    # Calculate basic features
+                    feature_set.bb_upper = (
+                        df["close"].rolling(20).mean().iloc[-1]
+                        + 2 * df["close"].rolling(20).std().iloc[-1]
+                    )
+                    feature_set.bb_middle = df["close"].rolling(20).mean().iloc[-1]
+                    feature_set.bb_lower = (
+                        df["close"].rolling(20).mean().iloc[-1]
+                        - 2 * df["close"].rolling(20).std().iloc[-1]
+                    )
+                    feature_set.atr = (
+                        df["close"].rolling(14).std().iloc[-1]
+                        if len(df) >= 14
+                        else df["close"].iloc[-1] * 0.02
+                    )
+
+                    # Simple RSI calculation
+                    delta = df["close"].diff()
+                    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+                    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+                    rs = gain / loss
+                    feature_set.rsi = (
+                        100 - (100 / (1 + rs.iloc[-1])) if not pd.isna(rs.iloc[-1]) else 50
+                    )
+
+                # Generate mean reversion signals
+                mean_rev_signals = await self.mean_reversion_strategy._generate_signals(
+                    {symbol: df}, {symbol: feature_set}
+                )
+
+                # Log mean reversion signals
+                if mean_rev_signals:
+                    for mr_signal in mean_rev_signals:
+                        logger.info(
+                            "mean_reversion_signal",
+                            symbol=symbol,
+                            signal_type=mr_signal.signal_type.value,
+                            strength=mr_signal.strength,
+                            reversion_score=mr_signal.metadata.get("reversion_score", 0),
+                        )
+
+                        # Override signal if mean reversion is stronger
+                        if mr_signal.strength > 0.7:
+                            signal_value = 1 if mr_signal.signal_type.value == "BUY" else -1
+                            signals.iloc[-1]["signal"] = signal_value
+
+            except Exception as e:
+                logger.error(f"Mean reversion signal generation error for {symbol}: {e}")
+
         # Update correlation tracker with price data if enabled
         if self.use_correlation_sizing and self.correlation_tracker:
             # Add price series for correlation calculation
@@ -550,7 +664,9 @@ class AsyncRunner:
             strategy_name = (
                 "ML_ENHANCED"
                 if self.use_ml_enhanced
-                else "ML_ENSEMBLE" if self.use_ml_strategy else "SMA_CROSSOVER"
+                else "ML_ENSEMBLE"
+                if self.use_ml_strategy
+                else "SMA_CROSSOVER"
             )
             await self.db.record_signal(
                 symbol,
@@ -947,6 +1063,78 @@ class AsyncRunner:
 
             # Process symbols in parallel
             results = await self.run_parallel(symbols_to_process)
+
+            # Run pairs trading analysis if enabled
+            if (
+                MEAN_REVERSION_AVAILABLE
+                and self.pairs_strategy
+                and len(self.market_data_cache) >= 2
+            ):
+                try:
+                    logger.info("Running pairs trading analysis...")
+
+                    # Find pairs if not already done
+                    if (
+                        not hasattr(self.pairs_strategy, "pair_stats")
+                        or not self.pairs_strategy.pair_stats
+                    ):
+                        pairs = await self.pairs_strategy.find_pairs(
+                            list(self.market_data_cache.keys()), self.market_data_cache
+                        )
+                        logger.info(f"Found {len(pairs)} cointegrated pairs")
+
+                    # Analyze existing pairs
+                    if self.pairs_strategy.pair_stats:
+                        current_prices = {
+                            s: self.market_data_cache[s]["close"].iloc[-1]
+                            for s in self.market_data_cache
+                            if len(self.market_data_cache[s]) > 0
+                        }
+
+                        pairs_signals = await self.pairs_strategy.analyze_pairs(
+                            list(self.pairs_strategy.pair_stats.keys()), current_prices
+                        )
+
+                        for signal in pairs_signals:
+                            logger.info(
+                                "pairs_signal",
+                                pair=signal.get("pair"),
+                                signal_type=signal.get("signal"),
+                                z_score=signal.get("z_score"),
+                                confidence=signal.get("confidence"),
+                            )
+
+                            # Update pairs positions
+                            if signal.get("signal") != "hold":
+                                self.pairs_strategy.update_position(signal.get("pair"), signal)
+
+                except Exception as e:
+                    logger.error(f"Pairs trading analysis error: {e}")
+
+            # Run statistical arbitrage analysis if enabled
+            if (
+                MEAN_REVERSION_AVAILABLE
+                and self.stat_arb_strategy
+                and len(self.market_data_cache) >= 5
+            ):
+                try:
+                    logger.info("Running statistical arbitrage analysis...")
+
+                    arb_scores = await self.stat_arb_strategy.calculate_arbitrage_scores(
+                        list(self.market_data_cache.keys()), self.market_data_cache
+                    )
+
+                    if arb_scores:
+                        weights = self.stat_arb_strategy.generate_portfolio_weights(arb_scores)
+                        logger.info(
+                            "stat_arb_portfolio",
+                            num_opportunities=len(arb_scores),
+                            selected_symbols=list(weights.keys()),
+                            weights={k: f"{v:.2%}" for k, v in weights.items()},
+                        )
+
+                except Exception as e:
+                    logger.error(f"Statistical arbitrage analysis error: {e}")
 
             # Update account summary
             await self.update_account_summary()

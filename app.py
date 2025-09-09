@@ -38,6 +38,7 @@ from robo_trader.ml.model_trainer import ModelTrainer  # noqa: E402
 
 logger = get_logger(__name__)
 app = Flask(__name__)
+server = app  # For Gunicorn compatibility
 
 # Configuration
 config = load_config()
@@ -1998,9 +1999,15 @@ def favicon():
     return response
 
 
-@app.route("/api/health")
+@app.route("/health")
 def health():
-    """Health check endpoint"""
+    """Health check endpoint for Docker health checks"""
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
+
+
+@app.route("/api/health")
+def api_health():
+    """Health check endpoint for API monitoring"""
     return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
 

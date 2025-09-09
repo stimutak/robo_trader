@@ -6,13 +6,17 @@ and trades the reversion to the mean.
 """
 
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import joblib
 import numpy as np
 import pandas as pd
 
 from ..features.engine import FeatureSet
 from ..logger import get_logger
+from ..ml.model_registry import ModelRegistry
+from ..ml.model_selector import ModelSelector
 from .framework import Signal, SignalType, Strategy
 
 logger = get_logger(__name__)
@@ -50,6 +54,10 @@ class MeanReversionStrategy(Strategy):
         # Risk
         max_deviation_entry: float = 3.0,  # Max std devs for entry
         stop_loss_multiplier: float = 1.5,
+        # ML Enhancement
+        use_ml_enhancement: bool = True,
+        ml_confidence_threshold: float = 0.6,
+        ml_model_path: Optional[str] = None,
         **kwargs,
     ):
         """
@@ -102,17 +110,33 @@ class MeanReversionStrategy(Strategy):
         self.entry_deviations: Dict[str, float] = {}
         self.holding_periods: Dict[str, int] = {}
 
+        # ML Enhancement
+        self.use_ml_enhancement = use_ml_enhancement
+        self.ml_confidence_threshold = ml_confidence_threshold
+        self.ml_model = None
+        self.model_registry = ModelRegistry()
+        self.model_selector = ModelSelector()
+
+        # Load ML model if specified
+        if use_ml_enhancement and ml_model_path:
+            self._load_ml_model(ml_model_path)
+
     async def _initialize(self, historical_data: Dict[str, pd.DataFrame]) -> None:
         """Initialize strategy with historical data."""
         logger.info(
             "mean_reversion.initializing",
             symbols=len(historical_data),
             bb_period=self.bb_period,
+            ml_enabled=self.use_ml_enhancement,
         )
 
         for symbol in historical_data:
             self.reversion_scores[symbol] = 0.0
             self.holding_periods[symbol] = 0
+
+        # Train ML model if needed and no pre-trained model
+        if self.use_ml_enhancement and self.ml_model is None:
+            await self._train_ml_model(historical_data)
 
     async def _generate_signals(
         self, market_data: Dict[str, pd.DataFrame], features: Dict[str, FeatureSet]
@@ -140,13 +164,21 @@ class MeanReversionStrategy(Strategy):
             reversion_score = self._calculate_reversion_score(data, feature_set)
             self.reversion_scores[symbol] = reversion_score
 
-            # Generate signal
-            signal = self._evaluate_reversion_signal(
-                symbol=symbol,
-                reversion_score=reversion_score,
-                feature_set=feature_set,
-                data=data,
-            )
+            # Generate signal with ML enhancement
+            if self.use_ml_enhancement and self.ml_model:
+                signal = await self._evaluate_ml_enhanced_signal(
+                    symbol=symbol,
+                    reversion_score=reversion_score,
+                    feature_set=feature_set,
+                    data=data,
+                )
+            else:
+                signal = self._evaluate_reversion_signal(
+                    symbol=symbol,
+                    reversion_score=reversion_score,
+                    feature_set=feature_set,
+                    data=data,
+                )
 
             if signal:
                 signals.append(signal)
@@ -401,3 +433,171 @@ class MeanReversionStrategy(Strategy):
                 position["side"] = "long"
             else:
                 position["side"] = "short"
+
+    def _load_ml_model(self, model_path: str) -> None:
+        """Load pre-trained ML model."""
+        try:
+            path = Path(model_path)
+            if path.exists():
+                self.ml_model = joblib.load(path)
+                logger.info("mean_reversion.ml_model_loaded", path=model_path)
+            else:
+                logger.warning("mean_reversion.ml_model_not_found", path=model_path)
+        except Exception as e:
+            logger.error("mean_reversion.ml_model_load_error", error=str(e))
+            self.ml_model = None
+
+    async def _train_ml_model(self, historical_data: Dict[str, pd.DataFrame]) -> None:
+        """Train ML model for mean reversion prediction."""
+        try:
+            # Prepare training data
+            X_train = []
+            y_train = []
+
+            for symbol, data in historical_data.items():
+                if len(data) < self.lookback_period:
+                    continue
+
+                # Extract features for ML training
+                features = self._extract_ml_features(data)
+                labels = self._generate_ml_labels(data)
+
+                if features and labels:
+                    X_train.extend(features)
+                    y_train.extend(labels)
+
+            if len(X_train) > 100:  # Minimum samples for training
+                # Use model selector to find best model
+                import numpy as np
+
+                X_train = np.array(X_train)
+                y_train = np.array(y_train)
+
+                # Train ensemble model
+                from sklearn.ensemble import RandomForestClassifier
+
+                self.ml_model = RandomForestClassifier(
+                    n_estimators=100, max_depth=10, random_state=42
+                )
+                self.ml_model.fit(X_train, y_train)
+
+                logger.info(
+                    "mean_reversion.ml_model_trained",
+                    samples=len(X_train),
+                    features=X_train.shape[1],
+                )
+        except Exception as e:
+            logger.error("mean_reversion.ml_training_error", error=str(e))
+            self.ml_model = None
+
+    def _extract_ml_features(self, data: pd.DataFrame) -> List[List[float]]:
+        """Extract ML features from price data."""
+        features = []
+
+        if len(data) < self.lookback_period:
+            return features
+
+        # Calculate rolling features
+        for i in range(self.lookback_period, len(data)):
+            window = data.iloc[i - self.lookback_period : i]
+
+            # Price-based features
+            returns = window["close"].pct_change().dropna()
+
+            feature_vector = [
+                # Statistical moments
+                returns.mean(),
+                returns.std(),
+                returns.skew(),
+                returns.kurtosis(),
+                # Price levels
+                (window["close"].iloc[-1] - window["close"].mean()) / window["close"].std(),
+                (window["high"].iloc[-1] - window["low"].iloc[-1]) / window["close"].iloc[-1],
+                # Volume features
+                window["volume"].iloc[-1] / window["volume"].mean() if "volume" in window else 1.0,
+                # Trend features
+                (window["close"].iloc[-1] / window["close"].iloc[0]) - 1,
+                (window["close"].iloc[-1] / window["close"].iloc[-5]) - 1
+                if len(window) >= 5
+                else 0,
+            ]
+
+            features.append(feature_vector)
+
+        return features
+
+    def _generate_ml_labels(self, data: pd.DataFrame, forward_periods: int = 5) -> List[int]:
+        """Generate labels for ML training (1 for successful reversion, 0 otherwise)."""
+        labels = []
+
+        if len(data) < self.lookback_period + forward_periods:
+            return labels
+
+        for i in range(self.lookback_period, len(data) - forward_periods):
+            # Check if price reverts to mean in next N periods
+            current_price = data["close"].iloc[i]
+            mean_price = data["close"].iloc[i - self.bb_period : i].mean()
+            future_prices = data["close"].iloc[i + 1 : i + forward_periods + 1]
+
+            # Label as 1 if price reverts toward mean
+            if current_price > mean_price:
+                # Price above mean, check if it goes down
+                reverted = any(price <= mean_price for price in future_prices)
+            else:
+                # Price below mean, check if it goes up
+                reverted = any(price >= mean_price for price in future_prices)
+
+            labels.append(1 if reverted else 0)
+
+        return labels
+
+    async def _evaluate_ml_enhanced_signal(
+        self,
+        symbol: str,
+        reversion_score: float,
+        feature_set: FeatureSet,
+        data: pd.DataFrame,
+    ) -> Optional[Signal]:
+        """Evaluate signal with ML enhancement."""
+        # Get base signal
+        base_signal = self._evaluate_reversion_signal(symbol, reversion_score, feature_set, data)
+
+        if not base_signal or not self.ml_model:
+            return base_signal
+
+        try:
+            # Extract current features
+            current_features = self._extract_ml_features(data)
+            if not current_features:
+                return base_signal
+
+            # Get ML prediction
+            import numpy as np
+
+            X = np.array([current_features[-1]])
+            ml_probability = self.ml_model.predict_proba(X)[0, 1]
+
+            # Enhance signal with ML confidence
+            if ml_probability >= self.ml_confidence_threshold:
+                # Boost signal strength
+                base_signal.strength = min(base_signal.strength * (1 + ml_probability * 0.5), 1.0)
+                base_signal.metadata["ml_confidence"] = ml_probability
+                base_signal.metadata["ml_enhanced"] = True
+
+                logger.debug(
+                    "mean_reversion.ml_enhancement",
+                    symbol=symbol,
+                    ml_confidence=ml_probability,
+                    enhanced_strength=base_signal.strength,
+                )
+            elif ml_probability < 0.3:
+                # ML suggests avoiding trade
+                logger.debug(
+                    "mean_reversion.ml_rejection", symbol=symbol, ml_confidence=ml_probability
+                )
+                return None
+
+        except Exception as e:
+            logger.error("mean_reversion.ml_evaluation_error", error=str(e))
+
+        return base_signal
