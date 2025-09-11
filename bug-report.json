@@ -1,5 +1,5 @@
 {
-  "timestamp": "2025-09-11T00:16:06.822930",
+  "timestamp": "2025-09-11T10:45:27.746640",
   "total_bugs": 188,
   "by_severity": {
     "critical": 0,
@@ -75,12 +75,12 @@
       "description": "Import of os may pose security risks"
     },
     {
-      "id": "async_no_await_runner_async.py_150",
+      "id": "async_no_await_runner_async.py_160",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_get_position_lock' has no await",
       "file_path": "robo_trader/runner_async.py",
-      "line_number": 150,
+      "line_number": 160,
       "description": "Async function should use await or be made synchronous"
     },
     {
@@ -1614,30 +1614,30 @@
       "description": "Import of subprocess may pose security risks"
     },
     {
-      "id": "import_security_app.py_1988",
+      "id": "import_security_app.py_2324",
       "severity": "medium",
       "category": "security",
       "title": "Potentially unsafe import: os",
       "file_path": "app.py",
-      "line_number": 1988,
+      "line_number": 2324,
       "description": "Import of os may pose security risks"
     },
     {
-      "id": "nested_loops_app.py_2381",
+      "id": "nested_loops_app.py_2717",
       "severity": "medium",
       "category": "performance",
       "title": "Deeply nested loops",
       "file_path": "app.py",
-      "line_number": 2381,
+      "line_number": 2717,
       "description": "Found 3 levels of nested loops"
     },
     {
-      "id": "nested_loops_app.py_2420",
+      "id": "nested_loops_app.py_2756",
       "severity": "medium",
       "category": "performance",
       "title": "Deeply nested loops",
       "file_path": "app.py",
-      "line_number": 2420,
+      "line_number": 2756,
       "description": "Found 3 levels of nested loops"
     },
     {

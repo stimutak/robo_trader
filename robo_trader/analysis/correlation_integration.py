@@ -17,7 +17,7 @@ import pandas as pd
 
 from ..correlation import CorrelationTracker
 from ..logger import get_logger
-from ..risk import Position
+from ..risk_manager import Position
 
 
 class CorrelationBasedPositionSizer:

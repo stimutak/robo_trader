@@ -1,0 +1,16 @@
+{
+  "positions": {
+    "AAPL": {
+      "quantity": 100,
+      "avg_price": 150,
+      "value": 15200,
+      "entry_time": "2025-09-11 10:13:20.229606"
+    }
+  },
+  "daily_pnl": 0.0,
+  "total_pnl": 0.0,
+  "current_capital": 100000,
+  "kill_switch_triggered": false,
+  "kelly_trades": [],
+  "timestamp": "2025-09-11T10:13:20.229768"
+}

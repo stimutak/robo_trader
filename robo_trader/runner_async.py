@@ -39,7 +39,8 @@ except ImportError:
     WEBSOCKET_ENABLED = False
 from .portfolio import Portfolio  # Import Portfolio class from portfolio.py file
 from .portfolio_pkg.portfolio_manager import AllocationMethod, MultiStrategyPortfolioManager
-from .risk import Position, RiskManager
+from .risk.advanced_risk import AdvancedRiskManager, risk_monitor_task
+from .risk_manager import Position, RiskManager
 from .strategies import MLStrategy, sma_crossover_signals
 from .strategies.ml_enhanced_strategy import MLEnhancedStrategy
 
@@ -88,6 +89,7 @@ class AsyncRunner:
         use_ml_strategy: bool = False,
         use_ml_enhanced: bool = None,  # Auto-detect if None
         use_smart_execution: bool = None,  # Auto-detect if None
+        use_advanced_risk: bool = None,  # Auto-detect if None
     ):
         self.duration = duration
         self.bar_size = bar_size
@@ -114,11 +116,19 @@ class AsyncRunner:
         else:
             self.use_smart_execution = use_smart_execution
 
+        # Auto-detect advanced risk management if not explicitly set
+        if use_advanced_risk is None:
+            self.use_advanced_risk = os.getenv("ADVANCED_RISK_ENABLED", "true").lower() == "true"
+        else:
+            self.use_advanced_risk = use_advanced_risk
+
         # Will be initialized in setup
         self.cfg = None
         self.client = None
         self.db = None
         self.risk = None
+        self.advanced_risk = None  # Advanced risk manager with Kelly sizing
+        self.risk_monitor_task = None  # Background risk monitoring task
         self.executor = None
         self.portfolio = None
         self.portfolio_manager: Optional[MultiStrategyPortfolioManager] = None
@@ -210,6 +220,11 @@ class AsyncRunner:
 
                 # Update portfolio
                 self.portfolio.update_fill(symbol, side, quantity, price)
+
+                # Update advanced risk manager if enabled
+                if self.use_advanced_risk and self.advanced_risk:
+                    self.advanced_risk.update_position(symbol, quantity, price, side)
+
                 return True
 
             except Exception as e:
@@ -248,6 +263,29 @@ class AsyncRunner:
             max_order_notional=self.max_order_notional or self.cfg.risk.max_order_notional,
             max_daily_notional=self.max_daily_notional or self.cfg.risk.max_daily_notional,
         )
+
+        # Initialize advanced risk manager with Kelly sizing and kill switches
+        if self.use_advanced_risk:
+            logger.info("Initializing advanced risk management with Kelly sizing and kill switches")
+            self.advanced_risk = AdvancedRiskManager(
+                config={
+                    "starting_capital": self.default_cash
+                    if self.default_cash is not None
+                    else self.cfg.default_cash,
+                    "max_position_pct": 0.1,
+                    "max_risk_per_trade": 0.02,
+                },
+                enable_kelly=True,
+                enable_correlation_limits=True,
+                enable_kill_switch=True,
+            )
+            # Start background risk monitoring task
+            self.risk_monitor_task = asyncio.create_task(
+                risk_monitor_task(self.advanced_risk, interval=60)
+            )
+            logger.info(
+                "Advanced risk management initialized with Kelly criterion and kill switches"
+            )
 
         # Initialize executor with smart execution support
         smart_executor = None
@@ -334,7 +372,6 @@ class AsyncRunner:
         # Initialize regular ML strategy if enabled (and not using enhanced)
         elif self.use_ml_strategy:
             logger.info("Initializing ML strategy...")
-            from pathlib import Path
 
             from .features.feature_pipeline import FeaturePipeline
             from .ml.model_selector import ModelSelector
@@ -529,13 +566,20 @@ class AsyncRunner:
         self.market_data_cache[symbol] = df
 
         # Send real-time price update via WebSocket
-        if WEBSOCKET_ENABLED and ws_client and df is not None and not df.empty:
-            try:
-                latest_price = float(df["close"].iloc[-1])
-                ws_client.send_market_update(symbol, latest_price)
-                logger.info(f"Sent WebSocket update for {symbol}: ${latest_price:.2f}")
-            except Exception as e:
-                logger.error(f"Could not send WebSocket update: {e}")
+        latest_price = None
+        if df is not None and not df.empty:
+            latest_price = float(df["close"].iloc[-1])
+
+            if WEBSOCKET_ENABLED and ws_client:
+                try:
+                    ws_client.send_market_update(symbol, latest_price)
+                    logger.info(f"Sent WebSocket update for {symbol}: ${latest_price:.2f}")
+                except Exception as e:
+                    logger.error(f"Could not send WebSocket update: {e}")
+
+            # Update advanced risk manager with latest prices
+            if self.use_advanced_risk and self.advanced_risk and latest_price:
+                self.advanced_risk.update_market_prices({symbol: latest_price})
 
         # Generate trading signal
         with Timer("signal_generation", self.monitor):
@@ -762,7 +806,42 @@ class AsyncRunner:
 
             elif symbol not in self.positions:
                 # Open long position
-                qty = self.risk.position_size(equity, price)
+                # Use advanced risk manager with Kelly sizing if enabled
+                if self.use_advanced_risk and self.advanced_risk:
+                    # Get ATR for stop loss calculation (if available)
+                    atr = df["atr"].iloc[-1] if "atr" in df.columns else None
+
+                    # Calculate position size using Kelly criterion
+                    sizing_result = await self.advanced_risk.calculate_position_size(
+                        symbol=symbol,
+                        signal_strength=abs(signal_value),  # Use signal strength from strategy
+                        current_price=price,
+                        atr=atr,
+                    )
+
+                    if sizing_result["blocked"]:
+                        logger.warning(
+                            f"Trade blocked by kill switch for {symbol}: {sizing_result['block_reason']}"
+                        )
+                        executed = False
+                        message = f"Blocked: {sizing_result['block_reason']}"
+                        return SymbolResult(symbol, signal_value, price, 0, executed, message, df)
+
+                    qty = sizing_result["position_size"]
+
+                    # Log Kelly metrics
+                    if "kelly_metrics" in sizing_result:
+                        km = sizing_result["kelly_metrics"]
+                        logger.info(
+                            f"Kelly metrics for {symbol}: Win rate={km['win_rate']:.2%}, Edge={km['edge']:.3f}, Kelly fraction={sizing_result['kelly_fraction']:.3f}"
+                        )
+
+                    # Log any warnings
+                    for warning in sizing_result.get("warnings", []):
+                        logger.warning(f"Risk warning for {symbol}: {warning}")
+                else:
+                    # Fallback to standard position sizing
+                    qty = self.risk.position_size(equity, price)
 
                 # Scale by portfolio manager strategy weight if available
                 if self.portfolio_manager and self.active_strategy_name:
@@ -1192,6 +1271,21 @@ class AsyncRunner:
     async def cleanup(self):
         """Clean up resources when runner is done."""
         try:
+            # Cancel risk monitor task if running
+            if self.risk_monitor_task and not self.risk_monitor_task.done():
+                self.risk_monitor_task.cancel()
+                try:
+                    await self.risk_monitor_task
+                except asyncio.CancelledError:
+                    pass
+
+            # Save advanced risk manager state
+            if self.use_advanced_risk and self.advanced_risk:
+                state_file = Path("data/risk_state.json")
+                state_file.parent.mkdir(exist_ok=True)
+                self.advanced_risk.save_state(state_file)
+                logger.info("Advanced risk manager state saved")
+
             # Disconnect from IB Gateway if exists
             if hasattr(self, "ib") and self.ib and self.ib.isConnected():
                 logger.info("Disconnecting from IB Gateway...")

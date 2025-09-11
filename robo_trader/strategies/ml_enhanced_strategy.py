@@ -149,7 +149,7 @@ class MLEnhancedStrategy(Strategy):
     async def _initialize(self, historical_data: Dict[str, pd.DataFrame]) -> None:
         """Initialize strategy components."""
         await self.feature_pipeline.start()
-        self.model_selector.load_available_models()
+        await self.model_selector.load_available_models()
 
         if not self.model_selector.available_models:
             logger.warning("No ML models available")

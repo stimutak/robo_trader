@@ -18,7 +18,7 @@ import pandas as pd
 import structlog
 
 from ..config import Config
-from ..risk import Position
+from ..risk_manager import Position
 
 logger = structlog.get_logger(__name__)
 

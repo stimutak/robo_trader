@@ -956,6 +956,109 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
             </div>
+            
+            <!-- Advanced Risk Management -->
+            <div class="table-container">
+                <h3 style="color: #ff6b6b;">🛡️ Advanced Risk Management</h3>
+                
+                <!-- Kelly Sizing Section -->
+                <div style="margin-bottom: 20px;">
+                    <h4 style="color: #888; font-size: 14px; margin-bottom: 10px;">Kelly Criterion Position Sizing</h4>
+                    <div class="metric-grid" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px;">
+                        <div class="metric-item">
+                            <div class="metric-label">Portfolio Kelly</div>
+                            <div class="metric-value" id="portfolio-kelly">5.8%</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Avg Win Rate</div>
+                            <div class="metric-value positive" id="avg-win-rate">55%</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Portfolio Edge</div>
+                            <div class="metric-value positive" id="portfolio-edge">0.025</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Using Half-Kelly</div>
+                            <div class="metric-value" style="color: #4CAF50;" id="kelly-mode">✓ Yes</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Kill Switches Section -->
+                <div style="margin-bottom: 20px;">
+                    <h4 style="color: #888; font-size: 14px; margin-bottom: 10px;">Kill Switch Status</h4>
+                    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px;">
+                        <div style="background: #1a1a2e; padding: 15px; border-radius: 4px;">
+                            <div style="display: flex; justify-content: space-between; align-items: center;">
+                                <span style="color: #666;">Kill Switch</span>
+                                <span id="kill-switch-status" style="color: #4CAF50; font-weight: bold;">ACTIVE ✓</span>
+                            </div>
+                            <div style="margin-top: 10px; font-size: 12px;">
+                                <div style="display: flex; justify-content: space-between; margin: 5px 0;">
+                                    <span style="color: #666;">Daily Loss:</span>
+                                    <span id="daily-loss-status">1.2% / 5.0%</span>
+                                </div>
+                                <div style="display: flex; justify-content: space-between; margin: 5px 0;">
+                                    <span style="color: #666;">Consecutive Losses:</span>
+                                    <span id="consecutive-losses">1 / 5</span>
+                                </div>
+                                <div style="display: flex; justify-content: space-between; margin: 5px 0;">
+                                    <span style="color: #666;">Max Drawdown:</span>
+                                    <span id="max-dd-status">2.5% / 10.0%</span>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div style="background: #1a1a2e; padding: 15px; border-radius: 4px;">
+                            <div style="display: flex; justify-content: space-between; align-items: center;">
+                                <span style="color: #666;">Correlation Limits</span>
+                                <span id="correlation-status" style="color: #4CAF50; font-weight: bold;">OK</span>
+                            </div>
+                            <div style="margin-top: 10px; font-size: 12px;">
+                                <div style="display: flex; justify-content: space-between; margin: 5px 0;">
+                                    <span style="color: #666;">Max Correlation:</span>
+                                    <span>0.70</span>
+                                </div>
+                                <div style="display: flex; justify-content: space-between; margin: 5px 0;">
+                                    <span style="color: #666;">High Correlations:</span>
+                                    <span id="high-corr-count" style="color: #FFA500;">2 pairs</span>
+                                </div>
+                                <div style="display: flex; justify-content: space-between; margin: 5px 0;">
+                                    <span style="color: #666;">Corr. Exposure:</span>
+                                    <span id="corr-exposure">18% / 30%</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Risk Metrics -->
+                <div>
+                    <h4 style="color: #888; font-size: 14px; margin-bottom: 10px;">Risk Metrics</h4>
+                    <div class="metric-grid" style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 15px;">
+                        <div class="metric-item">
+                            <div class="metric-label">Leverage</div>
+                            <div class="metric-value" id="leverage">0.45x</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">VaR (95%)</div>
+                            <div class="metric-value negative" id="var-95">-$2,500</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Exposure</div>
+                            <div class="metric-value" id="total-exposure">$45,000</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Risk Sharpe</div>
+                            <div class="metric-value positive" id="risk-sharpe">1.8</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Risk Level</div>
+                            <div class="metric-value" style="color: #4CAF50;" id="risk-level">LOW</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
         
         <div id="watchlist-tab" class="tab-content" style="display: none;">
@@ -2118,6 +2221,73 @@ HTML_TEMPLATE = """
                     const data = await execResp.json();
                     document.getElementById('exec-filled').textContent = data.orders.completed;
                     document.getElementById('exec-saved').textContent = `${data.performance.total_saved_bps.toFixed(1)} bps`;
+                }
+                
+                // Get risk management status
+                const riskResp = await fetch('/api/risk/status');
+                if (riskResp.ok) {
+                    const data = await execResp.json();
+                    
+                    // Update Kelly sizing
+                    if (data.kelly_sizing) {
+                        document.getElementById('portfolio-kelly').textContent = `${(data.kelly_sizing.portfolio_kelly * 100).toFixed(1)}%`;
+                        
+                        // Calculate average win rate
+                        const positions = Object.values(data.kelly_sizing.current_positions);
+                        if (positions.length > 0) {
+                            const avgWinRate = positions.reduce((sum, p) => sum + p.win_rate, 0) / positions.length;
+                            document.getElementById('avg-win-rate').textContent = `${(avgWinRate * 100).toFixed(0)}%`;
+                            
+                            const avgEdge = positions.reduce((sum, p) => sum + p.edge, 0) / positions.length;
+                            document.getElementById('portfolio-edge').textContent = avgEdge.toFixed(3);
+                        }
+                    }
+                    
+                    // Update kill switches
+                    if (data.kill_switches) {
+                        const ks = data.kill_switches;
+                        document.getElementById('kill-switch-status').textContent = ks.active ? 'TRIGGERED ⚠️' : 'ACTIVE ✓';
+                        document.getElementById('kill-switch-status').style.color = ks.active ? '#ff6b6b' : '#4CAF50';
+                        
+                        document.getElementById('daily-loss-status').textContent = 
+                            `${(ks.limits.daily_loss.current * 100).toFixed(1)}% / ${(ks.limits.daily_loss.limit * 100).toFixed(0)}%`;
+                        document.getElementById('consecutive-losses').textContent = 
+                            `${ks.limits.consecutive_losses.current} / ${ks.limits.consecutive_losses.limit}`;
+                        document.getElementById('max-dd-status').textContent = 
+                            `${(ks.limits.max_drawdown.current * 100).toFixed(1)}% / ${(ks.limits.max_drawdown.limit * 100).toFixed(0)}%`;
+                    }
+                    
+                    // Update correlation limits
+                    if (data.correlation_limits) {
+                        const cl = data.correlation_limits;
+                        document.getElementById('high-corr-count').textContent = `${cl.high_correlations.length} pairs`;
+                        document.getElementById('correlation-status').textContent = 
+                            cl.high_correlations.length > 3 ? 'WARNING' : 'OK';
+                        document.getElementById('correlation-status').style.color = 
+                            cl.high_correlations.length > 3 ? '#FFA500' : '#4CAF50';
+                    }
+                    
+                    // Update risk metrics
+                    if (data.risk_metrics) {
+                        const rm = data.risk_metrics;
+                        document.getElementById('leverage').textContent = `${rm.leverage.toFixed(2)}x`;
+                        document.getElementById('var-95').textContent = formatCurrency(rm.var_95);
+                        document.getElementById('total-exposure').textContent = formatCurrency(rm.total_exposure);
+                        document.getElementById('risk-sharpe').textContent = rm.sharpe_ratio.toFixed(2);
+                        
+                        // Determine risk level
+                        let riskLevel = 'LOW';
+                        let riskColor = '#4CAF50';
+                        if (rm.leverage > 1.5 || Math.abs(rm.max_drawdown) > 0.08) {
+                            riskLevel = 'HIGH';
+                            riskColor = '#ff6b6b';
+                        } else if (rm.leverage > 1.0 || Math.abs(rm.max_drawdown) > 0.05) {
+                            riskLevel = 'MEDIUM';
+                            riskColor = '#FFA500';
+                        }
+                        document.getElementById('risk-level').textContent = riskLevel;
+                        document.getElementById('risk-level').style.color = riskColor;
+                    }
                 }
                 
             } catch (error) {
@@ -3541,10 +3711,105 @@ def execution_status():
             "algorithm_performance": {
                 "twap": {"slippage": 1.1, "success_rate": 0.95},
                 "vwap": {"slippage": 1.3, "success_rate": 0.93},
-                "iceberg": {"detection_rate": 0.02, "success_rate": 0.97}
-            }
+                "iceberg": {"detection_rate": 0.02, "success_rate": 0.97},
+            },
         }
     )
+
+
+@app.route("/api/risk/status")
+@requires_auth
+def get_risk_status():
+    """Get advanced risk management status"""
+    # Check if advanced risk manager is running
+    advanced_risk_enabled = os.getenv("ADVANCED_RISK_ENABLED", "true").lower() == "true"
+
+    if not advanced_risk_enabled:
+        return jsonify({"enabled": False, "message": "Advanced risk management not enabled"})
+
+    # Mock data for now - would connect to actual risk manager
+    return jsonify(
+        {
+            "enabled": True,
+            "kelly_sizing": {
+                "enabled": True,
+                "current_positions": {
+                    "AAPL": {"kelly_fraction": 0.025, "win_rate": 0.58, "edge": 0.032},
+                    "NVDA": {"kelly_fraction": 0.018, "win_rate": 0.55, "edge": 0.024},
+                    "TSLA": {"kelly_fraction": 0.015, "win_rate": 0.52, "edge": 0.018},
+                },
+                "portfolio_kelly": 0.058,
+            },
+            "kill_switches": {
+                "active": False,
+                "triggered_count": 0,
+                "last_trigger": None,
+                "limits": {
+                    "daily_loss": {"limit": 0.05, "current": 0.012},
+                    "consecutive_losses": {"limit": 5, "current": 1},
+                    "max_drawdown": {"limit": 0.10, "current": 0.025},
+                    "position_loss": {"limit": 0.02, "per_position": True},
+                },
+            },
+            "correlation_limits": {
+                "max_correlation": 0.7,
+                "max_correlated_exposure": 0.3,
+                "high_correlations": [
+                    {"pair": ["AAPL", "MSFT"], "correlation": 0.82},
+                    {"pair": ["NVDA", "AMD"], "correlation": 0.75},
+                ],
+            },
+            "risk_metrics": {
+                "total_exposure": 45000,
+                "leverage": 0.45,
+                "var_95": -2500,
+                "sharpe_ratio": 1.8,
+                "max_drawdown": 0.025,
+            },
+        }
+    )
+
+
+@app.route("/api/risk/kelly/<symbol>")
+@requires_auth
+def get_kelly_parameters(symbol):
+    """Get Kelly parameters for a specific symbol"""
+    # Mock data - would calculate from actual trade history
+    return jsonify(
+        {
+            "symbol": symbol,
+            "kelly_fraction": 0.022,
+            "half_kelly": 0.011,
+            "quarter_kelly": 0.0055,
+            "win_rate": 0.56,
+            "avg_win": 0.035,
+            "avg_loss": 0.022,
+            "edge": 0.0196,
+            "odds": 1.59,
+            "trade_count": 45,
+            "recommended_position_size": 2200,  # In dollars
+            "confidence_level": 0.85,
+        }
+    )
+
+
+@app.route("/api/risk/kill-switch", methods=["POST"])
+@requires_auth
+def control_kill_switch():
+    """Control kill switch (reset after trigger)"""
+    action = request.json.get("action", "status")
+
+    if action == "reset":
+        # Would reset actual kill switch
+        return jsonify(
+            {"success": True, "message": "Kill switch reset successfully", "status": "active"}
+        )
+    elif action == "disable":
+        # Would disable kill switch temporarily
+        return jsonify({"success": True, "message": "Kill switch disabled", "status": "disabled"})
+    else:
+        # Return current status
+        return jsonify({"active": False, "triggered": False, "can_trade": True})
 
 
 @app.route("/api/start", methods=["POST"])
@@ -3569,7 +3834,7 @@ def start_trading():
         return jsonify({"status": "already_running"})
 
     # Start trading process with proper symbol format
-    cmd = ["python", "-m", "robo_trader.runner_async", "--symbols", ",".join(symbols)]
+    cmd = ["python3", "-m", "robo_trader.runner_async", "--symbols", ",".join(symbols)]
     trading_process = subprocess.Popen(cmd)
     trading_status = "running"
 
