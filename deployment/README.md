@@ -113,6 +113,24 @@ curl http://localhost:8080/health
    - Production deployment on tags
    - Includes rollback capability
 
+### GitHub Actions Secrets & Variables
+
+Configure these in GitHub → Settings → Secrets and variables → Actions:
+
+- Secrets (recommended):
+  - `DOCKER_USERNAME` / `DOCKER_PASSWORD` – for Docker Hub pushes in `production-ci.yml`.
+  - `CODECOV_TOKEN` – only if repository is private or Codecov requires it.
+  - `SLACK_WEBHOOK` – to enable Slack notifications in `deploy.yml`.
+  - Any other third-party tokens needed by your custom steps.
+
+- Variables (non-sensitive toggles):
+  - `ENVIRONMENT=ci` (optional), `LOG_LEVEL=INFO`, etc.
+
+Notes:
+- CI runs with `EXECUTION_MODE=paper` to prevent live trading.
+- Workflows copy `.env.example` to `.env` for safe defaults; never store real creds in the repo.
+- If tests require provider keys, define them as Secrets and reference `${{ secrets.NAME }}` in workflows.
+
 ### Deployment Flow
 
 ```mermaid

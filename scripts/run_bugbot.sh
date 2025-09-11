@@ -15,7 +15,12 @@ fi
 
 # Run BugBot scan
 echo "🔍 Running bug scan..."
-python3 scripts/bug_detector.py --scan --config production --output bug-report.json
+# Use venv if it exists, otherwise use system python3
+if [ -f "venv/bin/python" ]; then
+    venv/bin/python scripts/bug_detector.py --scan --config production --output bug-report.json
+else
+    python3 scripts/bug_detector.py --scan --config production --output bug-report.json
+fi
 
 # Check results
 if [ -f "bug-report.json" ]; then
@@ -23,9 +28,15 @@ if [ -f "bug-report.json" ]; then
     echo "=================="
     
     # Extract summary from JSON
-    critical_count=$(python3 -c "import json; data=json.load(open('bug-report.json')); print(data.get('critical_bugs', 0))")
-    high_count=$(python3 -c "import json; data=json.load(open('bug-report.json')); print(data.get('high_priority_bugs', 0))")
-    total_count=$(python3 -c "import json; data=json.load(open('bug-report.json')); print(data.get('total_bugs', 0))")
+    # Use venv python if available
+    PYTHON_CMD="python3"
+    if [ -f "venv/bin/python" ]; then
+        PYTHON_CMD="venv/bin/python"
+    fi
+    
+    critical_count=$($PYTHON_CMD -c "import json; data=json.load(open('bug-report.json')); print(data.get('critical_bugs', 0))")
+    high_count=$($PYTHON_CMD -c "import json; data=json.load(open('bug-report.json')); print(data.get('high_priority_bugs', 0))")
+    total_count=$($PYTHON_CMD -c "import json; data=json.load(open('bug-report.json')); print(data.get('total_bugs', 0))")
     
     echo "Total bugs: $total_count"
     echo "Critical bugs: $critical_count"
@@ -37,7 +48,7 @@ if [ -f "bug-report.json" ]; then
         echo "Please fix critical bugs before committing."
         echo ""
         echo "Top critical bugs:"
-        python3 -c "
+        $PYTHON_CMD -c "
 import json
 data = json.load(open('bug-report.json'))
 critical_bugs = [b for b in data['bugs'] if b['severity'] == 'critical']
@@ -50,7 +61,7 @@ for i, bug in enumerate(critical_bugs[:5], 1):
         echo "⚠️  High priority bugs found. Consider fixing them."
         echo ""
         echo "Top high priority bugs:"
-        python3 -c "
+        $PYTHON_CMD -c "
 import json
 data = json.load(open('bug-report.json'))
 high_bugs = [b for b in data['bugs'] if b['severity'] == 'high']

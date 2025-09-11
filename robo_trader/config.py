@@ -189,7 +189,8 @@ class StrategyConfig(BaseModel):
     """Strategy configuration."""
 
     enabled_strategies: List[str] = Field(
-        default=["momentum", "mean_reversion"], description="List of enabled strategies"
+        default=["momentum", "mean_reversion", "ml_enhanced", "microstructure", "pairs_trading"],
+        description="List of enabled strategies",
     )
     combination_method: str = Field(
         default="weighted",

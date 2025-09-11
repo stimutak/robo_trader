@@ -438,6 +438,27 @@ class AsyncTradingDatabase:
             await conn.commit()
             logger.debug(f"Stored {len(data)} market data bars")
 
+    async def get_position(self, symbol: str) -> Optional[Dict]:
+        """Get position for a specific symbol."""
+        async with self.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT symbol, quantity, avg_cost, market_price 
+                FROM positions 
+                WHERE symbol = ? AND quantity != 0
+            """,
+                (symbol,),
+            )
+            row = await cursor.fetchone()
+            if row:
+                return {
+                    "symbol": row[0],
+                    "quantity": row[1],
+                    "avg_cost": row[2],
+                    "market_price": row[3],
+                }
+            return None
+
     async def get_positions(self) -> List[Dict]:
         """Get all current positions."""
         async with self.get_connection() as conn:

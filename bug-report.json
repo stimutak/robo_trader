@@ -1,10 +1,10 @@
 {
-  "timestamp": "2025-09-09T13:49:54.271713",
-  "total_bugs": 186,
+  "timestamp": "2025-09-11T00:16:06.822930",
+  "total_bugs": 188,
   "by_severity": {
     "critical": 0,
     "high": 6,
-    "medium": 180,
+    "medium": 182,
     "low": 0,
     "info": 0
   },
@@ -12,8 +12,8 @@
     "syntax": 0,
     "type": 0,
     "logic": 0,
-    "performance": 148,
-    "security": 37,
+    "performance": 149,
+    "security": 38,
     "trading": 0,
     "risk": 0,
     "data": 1,
@@ -50,15 +50,15 @@
       5
     ],
     [
+      "robo_trader/strategies/pairs_trading.py",
+      5
+    ],
+    [
       "robo_trader/smart_execution/algorithms.py",
       5
     ],
     [
       "robo_trader/monitoring/alerts.py",
-      5
-    ],
-    [
-      "robo_trader/monitoring/performance.py",
       5
     ]
   ],
@@ -66,12 +66,21 @@
   "high_priority_bugs": 6,
   "bugs": [
     {
-      "id": "async_no_await_runner_async.py_138",
+      "id": "import_security_runner_async.py_14",
+      "severity": "medium",
+      "category": "security",
+      "title": "Potentially unsafe import: os",
+      "file_path": "robo_trader/runner_async.py",
+      "line_number": 14,
+      "description": "Import of os may pose security risks"
+    },
+    {
+      "id": "async_no_await_runner_async.py_150",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_get_position_lock' has no await",
       "file_path": "robo_trader/runner_async.py",
-      "line_number": 138,
+      "line_number": 150,
       "description": "Async function should use await or be made synchronous"
     },
     {
@@ -390,21 +399,30 @@
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_pairs_trading.py_737",
-      "severity": "medium",
-      "category": "performance",
-      "title": "Async function '_ml_rank_opportunities' has no await",
-      "file_path": "robo_trader/strategies/pairs_trading.py",
-      "line_number": 737,
-      "description": "Async function should use await or be made synchronous"
-    },
-    {
-      "id": "async_no_await_pairs_trading.py_954",
+      "id": "async_no_await_pairs_trading.py_455",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_evaluate_pair_with_ml' has no await",
       "file_path": "robo_trader/strategies/pairs_trading.py",
-      "line_number": 954,
+      "line_number": 455,
+      "description": "Async function should use await or be made synchronous"
+    },
+    {
+      "id": "async_no_await_pairs_trading.py_763",
+      "severity": "medium",
+      "category": "performance",
+      "title": "Async function '_ml_rank_opportunities' has no await",
+      "file_path": "robo_trader/strategies/pairs_trading.py",
+      "line_number": 763,
+      "description": "Async function should use await or be made synchronous"
+    },
+    {
+      "id": "async_no_await_pairs_trading.py_980",
+      "severity": "medium",
+      "category": "performance",
+      "title": "Async function '_evaluate_pair_with_ml' has no await",
+      "file_path": "robo_trader/strategies/pairs_trading.py",
+      "line_number": 980,
       "description": "Async function should use await or be made synchronous"
     },
     {
@@ -453,21 +471,21 @@
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_mean_reversion.py_450",
+      "id": "async_no_await_mean_reversion.py_451",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_train_ml_model' has no await",
       "file_path": "robo_trader/strategies/mean_reversion.py",
-      "line_number": 450,
+      "line_number": 451,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_mean_reversion.py_554",
+      "id": "async_no_await_mean_reversion.py_555",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_evaluate_ml_enhanced_signal' has no await",
       "file_path": "robo_trader/strategies/mean_reversion.py",
-      "line_number": 554,
+      "line_number": 555,
       "description": "Async function should use await or be made synchronous"
     },
     {

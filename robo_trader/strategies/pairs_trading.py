@@ -452,6 +452,32 @@ class CointegrationPairsStrategy:
             ],
         }
 
+    async def _evaluate_pair_with_ml(
+        self, pair_stats: PairStats, prices_a: pd.Series, prices_b: pd.Series
+    ) -> float:
+        """
+        Evaluate pair quality using ML models.
+        Base implementation returns default confidence.
+        Override in subclasses for ML enhancement.
+        """
+        # Default implementation without ML - just return a base confidence score
+        # based on statistical metrics
+        confidence = 0.5
+
+        # Boost confidence based on cointegration strength
+        if pair_stats.cointegration_pvalue < 0.01:
+            confidence += 0.2
+        elif pair_stats.cointegration_pvalue < 0.05:
+            confidence += 0.1
+
+        # Boost confidence based on half-life (prefer shorter half-lives)
+        if pair_stats.half_life < 10:
+            confidence += 0.2
+        elif pair_stats.half_life < 20:
+            confidence += 0.1
+
+        return min(confidence, 1.0)
+
 
 class StatisticalArbitrageStrategy:
     """ML-enhanced statistical arbitrage strategy."""

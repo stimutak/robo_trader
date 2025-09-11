@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
@@ -84,8 +86,8 @@ class AsyncRunner:
         use_correlation_sizing: bool = True,
         max_correlation: float = 0.7,
         use_ml_strategy: bool = False,
-        use_ml_enhanced: bool = False,
-        use_smart_execution: bool = False,
+        use_ml_enhanced: bool = None,  # Auto-detect if None
+        use_smart_execution: bool = None,  # Auto-detect if None
     ):
         self.duration = duration
         self.bar_size = bar_size
@@ -99,8 +101,18 @@ class AsyncRunner:
         self.use_correlation_sizing = use_correlation_sizing
         self.max_correlation = max_correlation
         self.use_ml_strategy = use_ml_strategy
-        self.use_ml_enhanced = use_ml_enhanced
-        self.use_smart_execution = use_smart_execution
+        # Auto-detect ML enhanced if not explicitly set
+        if use_ml_enhanced is None:
+            self.use_ml_enhanced = os.getenv("ML_ENHANCED_ENABLED", "true").lower() == "true"
+        else:
+            self.use_ml_enhanced = use_ml_enhanced
+        # Auto-detect smart execution if not explicitly set
+        if use_smart_execution is None:
+            self.use_smart_execution = (
+                os.getenv("SMART_EXECUTION_ENABLED", "true").lower() == "true"
+            )
+        else:
+            self.use_smart_execution = use_smart_execution
 
         # Will be initialized in setup
         self.cfg = None
@@ -209,10 +221,14 @@ class AsyncRunner:
         self.cfg = load_config()
 
         # Create async IBKR client with connection pooling
+        import random
+
+        # Use random client ID to avoid conflicts with existing connections
+        random_client_id = random.randint(100, 999)
         conn_config = ConnectionConfig(
             host=self.cfg.ibkr.host,
             port=self.cfg.ibkr.port,
-            client_id=self.cfg.ibkr.client_id,
+            client_id=random_client_id,  # Use random ID instead of config
             readonly=self.cfg.ibkr.readonly,
             max_connections=min(5, self.max_concurrent_symbols),
         )
@@ -236,13 +252,14 @@ class AsyncRunner:
         # Initialize executor with smart execution support
         smart_executor = None
 
+        # Auto-enable smart execution for large orders or if explicitly enabled
         if self.use_smart_execution:
             from .smart_execution.smart_executor import SmartExecutor
 
             # Pass IBKR client for real market data (use first connection from pool)
             ibkr_client = self.client.pool.pool[0] if self.client.pool.pool else None
             smart_executor = SmartExecutor(self.cfg, ibkr_client=ibkr_client)
-            logger.info("Smart execution enabled with real market data integration")
+            logger.info("Smart execution enabled with TWAP/VWAP/Iceberg algorithms")
 
         self.executor = PaperExecutor(
             slippage_bps=self.slippage_bps,
@@ -288,15 +305,24 @@ class AsyncRunner:
             await self.correlation_manager.start(update_interval=300)
             logger.info("Correlation-based position sizing enabled")
 
-        # Initialize ML Enhanced strategy if enabled (takes precedence)
-        if self.use_ml_enhanced:
-            logger.info("Initializing ML Enhanced strategy...")
-            # ML Enhanced uses the config directly
-            self.ml_enhanced_strategy = MLEnhancedStrategy(self.cfg)
-            # Initialize with historical data
-            await self.ml_enhanced_strategy.initialize()
-            logger.info("ML Enhanced strategy initialized successfully")
-            self.active_strategy_name = "ML_Enhanced"
+        # Initialize ML Enhanced strategy if enabled or models exist
+        if self.use_ml_enhanced or "ml_enhanced" in self.cfg.strategy.enabled_strategies:
+            # Check if ML models exist
+            models_dir = Path("models")
+            has_models = models_dir.exists() and any(models_dir.glob("*.pkl"))
+
+            if has_models or self.use_ml_enhanced:
+                logger.info("Initializing ML Enhanced strategy...")
+                # ML Enhanced uses the config directly
+                self.ml_enhanced_strategy = MLEnhancedStrategy(self.cfg)
+                # Initialize with historical data
+                await self.ml_enhanced_strategy.initialize()
+                logger.info("ML Enhanced strategy initialized successfully")
+                self.active_strategy_name = "ML_Enhanced"
+            else:
+                logger.info(
+                    "ML Enhanced enabled but no models found - will use fallback strategies"
+                )
             if self.portfolio_manager:
                 # Register ML Enhanced and a baseline SMA strategy for diversification
                 self.portfolio_manager.register_strategy(
@@ -594,7 +620,7 @@ class AsyncRunner:
                 from .features.engine import FeatureSet
 
                 # Create basic feature set (can be enhanced)
-                feature_set = FeatureSet()
+                feature_set = FeatureSet(timestamp=pd.Timestamp.now(tz="UTC"), symbol=symbol)
                 if len(df) >= 20:
                     # Calculate basic features
                     feature_set.bb_upper = (

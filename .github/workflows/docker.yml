@@ -21,6 +21,8 @@ env:
 jobs:
   docker-build:
     runs-on: ubuntu-latest
+    env:
+      EXECUTION_MODE: paper
     
     steps:
       - name: Checkout code
@@ -64,6 +66,7 @@ jobs:
         run: |
           # Run container
           docker run -d --name test-container \
+            -e EXECUTION_MODE=paper \
             -e ENVIRONMENT=test \
             -e LOG_LEVEL=DEBUG \
             robotrader:test \

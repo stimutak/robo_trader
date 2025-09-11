@@ -1,0 +1,39 @@
+{
+  "name": "RoboTrader Dev",
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "context": ".."
+  },
+  "remoteUser": "trader",
+  "workspaceFolder": "/app",
+  "runArgs": [
+    "--env", "EXECUTION_MODE=paper",
+    "--env", "PYTHONUNBUFFERED=1"
+  ],
+  "forwardPorts": [5555, 8765, 9090],
+  "portsAttributes": {
+    "5555": { "label": "Dash UI" },
+    "8765": { "label": "WebSocket" },
+    "9090": { "label": "Metrics" }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-python.black-formatter",
+        "charliermarsh.ruff",
+        "ms-azuretools.vscode-docker"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.analysis.typeCheckingMode": "basic",
+        "editor.formatOnSave": true,
+        "python.formatting.provider": "black"
+      }
+    }
+  },
+  "postCreateCommand": "bash -lc 'if [ ! -f .env ]; then cp .env.example .env; fi && pip install -r requirements-dev.txt && pip install -e .'",
+  "postStartCommand": "bash -lc 'pytest -q || true'"
+}
+

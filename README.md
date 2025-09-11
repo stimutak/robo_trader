@@ -390,6 +390,10 @@ ls trained_models/
 - `performance_results/`: Strategy metrics
 - `trained_models/`: Saved ML models
 
+### Cloud Dev & CI
+- Codespaces setup: `docs/codespaces.md`
+- External agent integration: `docs/codex_cloud_integration.md`
+
 ## 🤝 Contributing
 
 1. Fork the repository

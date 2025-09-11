@@ -115,7 +115,8 @@ class MeanReversionStrategy(Strategy):
         self.ml_confidence_threshold = ml_confidence_threshold
         self.ml_model = None
         self.model_registry = ModelRegistry()
-        self.model_selector = ModelSelector()
+        # ModelSelector requires model_trainer, initialize as None for now
+        self.model_selector = None  # Will be initialized if ML is enabled
 
         # Load ML model if specified
         if use_ml_enhancement and ml_model_path:
