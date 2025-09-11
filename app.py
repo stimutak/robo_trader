@@ -185,6 +185,40 @@ HTML_TEMPLATE = """
             -webkit-text-fill-color: transparent;
         }
         
+        /* Regime Detection Colors */
+        .regime-bull { color: #00ff00; }
+        .regime-bear { color: #ff0000; }
+        .regime-volatile { color: #ff00ff; }
+        .regime-ranging { color: #ffff00; }
+        .regime-crash { 
+            color: #ff0000; 
+            animation: blink 1s infinite; 
+        }
+        @keyframes blink { 
+            0% { opacity: 1; } 
+            50% { opacity: 0.3; } 
+            100% { opacity: 1; } 
+        }
+        
+        /* Portfolio Allocation */
+        .allocation-bar {
+            height: 30px;
+            background: #1a1a1a;
+            border-radius: 4px;
+            overflow: hidden;
+            display: flex;
+            margin: 10px 0;
+        }
+        .allocation-segment {
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #fff;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        
         .status-indicator {
             display: flex;
             align-items: center;
@@ -604,6 +638,39 @@ HTML_TEMPLATE = """
         </div>
         
         <div id="ml-tab" class="tab-content" style="display: none;">
+            <!-- Market Regime Detection Section -->
+            <div class="table-container" style="margin-bottom: 30px; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);">
+                <h3 style="color: #00ff00; margin-bottom: 20px;">🌡️ Market Regime Detection</h3>
+                <div style="text-align: center; padding: 20px;">
+                    <div id="regime-indicator" style="font-size: 32px; font-weight: bold; margin: 10px 0;">
+                        <span id="regime-name" class="regime-bull">BULL MARKET</span>
+                    </div>
+                    <div style="font-size: 16px; color: #888;">Confidence: <span id="regime-confidence" style="color: #0ff;">75%</span></div>
+                    <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-top: 20px;">
+                        <div style="text-align: center;">
+                            <div style="color: #666; font-size: 12px;">1min</div>
+                            <div id="regime-1m" class="regime-bull" style="font-weight: bold;">BULL</div>
+                        </div>
+                        <div style="text-align: center;">
+                            <div style="color: #666; font-size: 12px;">5min</div>
+                            <div id="regime-5m" class="regime-bull" style="font-weight: bold;">BULL</div>
+                        </div>
+                        <div style="text-align: center;">
+                            <div style="color: #666; font-size: 12px;">15min</div>
+                            <div id="regime-15m" class="regime-ranging" style="font-weight: bold;">RANGING</div>
+                        </div>
+                        <div style="text-align: center;">
+                            <div style="color: #666; font-size: 12px;">1hour</div>
+                            <div id="regime-1h" class="regime-bull" style="font-weight: bold;">BULL</div>
+                        </div>
+                        <div style="text-align: center;">
+                            <div style="color: #666; font-size: 12px;">Daily</div>
+                            <div id="regime-1d" class="regime-bull" style="font-weight: bold;">BULL</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
             <div class="grid">
                 <div class="card">
                     <div class="card-header">
@@ -846,6 +913,49 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
             </div>
+            
+            <!-- Execution Analytics -->
+            <div class="table-container">
+                <h3 style="color: #00ff00;">⚡ Execution Analytics</h3>
+                <div class="metric-grid" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px;">
+                    <div class="metric-item">
+                        <div class="metric-label">Avg Slippage</div>
+                        <div class="metric-value" id="exec-slippage">0.0 bps</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Market Impact</div>
+                        <div class="metric-value" id="exec-impact">0.0 bps</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Fill Rate</div>
+                        <div class="metric-value" id="exec-fill-rate">100%</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Avg Fill Time</div>
+                        <div class="metric-value" id="exec-fill-time">0.0s</div>
+                    </div>
+                </div>
+                <div style="margin-top: 15px;">
+                    <h4 style="color: #888; font-size: 14px; margin-bottom: 10px;">Algorithm Performance</h4>
+                    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;">
+                        <div style="background: #1a1a2e; padding: 10px; border-radius: 4px;">
+                            <div style="color: #4CAF50;">TWAP</div>
+                            <div style="font-size: 12px; color: #666;">Slippage: <span id="twap-perf-slip">0.0</span> bps</div>
+                            <div style="font-size: 12px; color: #666;">Success: <span id="twap-perf-success">100%</span></div>
+                        </div>
+                        <div style="background: #1a1a2e; padding: 10px; border-radius: 4px;">
+                            <div style="color: #2196F3;">VWAP</div>
+                            <div style="font-size: 12px; color: #666;">Slippage: <span id="vwap-perf-slip">0.0</span> bps</div>
+                            <div style="font-size: 12px; color: #666;">Success: <span id="vwap-perf-success">100%</span></div>
+                        </div>
+                        <div style="background: #1a1a2e; padding: 10px; border-radius: 4px;">
+                            <div style="color: #FF9800;">Iceberg</div>
+                            <div style="font-size: 12px; color: #666;">Detection: <span id="iceberg-perf-detect">0%</span></div>
+                            <div style="font-size: 12px; color: #666;">Success: <span id="iceberg-perf-success">100%</span></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
         
         <div id="watchlist-tab" class="tab-content" style="display: none;">
@@ -897,6 +1007,62 @@ HTML_TEMPLATE = """
         </div>
         
         <div id="strategies-tab" class="tab-content" style="display: none;">
+            <!-- Portfolio Allocation Section -->
+            <div class="table-container" style="margin-bottom: 30px;">
+                <h3 style="color: #00ff00; margin-bottom: 15px;">📊 Portfolio Allocation</h3>
+                <div class="allocation-bar" id="portfolio-allocation-bar">
+                    <div class="allocation-segment" style="width: 30%; background: #4CAF50;">Momentum 30%</div>
+                    <div class="allocation-segment" style="width: 25%; background: #2196F3;">Mean Rev 25%</div>
+                    <div class="allocation-segment" style="width: 20%; background: #FF9800;">ML Enhanced 20%</div>
+                    <div class="allocation-segment" style="width: 15%; background: #9C27B0;">Microstructure 15%</div>
+                    <div class="allocation-segment" style="width: 10%; background: #F44336;">Pairs 10%</div>
+                </div>
+                <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-top: 15px;">
+                    <div style="text-align: center;">
+                        <div style="color: #4CAF50; font-weight: bold;">Momentum</div>
+                        <div id="alloc-momentum">30%</div>
+                    </div>
+                    <div style="text-align: center;">
+                        <div style="color: #2196F3; font-weight: bold;">Mean Reversion</div>
+                        <div id="alloc-mean-rev">25%</div>
+                    </div>
+                    <div style="text-align: center;">
+                        <div style="color: #FF9800; font-weight: bold;">ML Enhanced</div>
+                        <div id="alloc-ml">20%</div>
+                    </div>
+                    <div style="text-align: center;">
+                        <div style="color: #9C27B0; font-weight: bold;">Microstructure</div>
+                        <div id="alloc-micro">15%</div>
+                    </div>
+                    <div style="text-align: center;">
+                        <div style="color: #F44336; font-weight: bold;">Pairs Trading</div>
+                        <div id="alloc-pairs">10%</div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Smart Execution Status -->
+            <div class="table-container" style="margin-bottom: 30px;">
+                <h3 style="color: #00ff00; margin-bottom: 15px;">⚡ Smart Execution Status</h3>
+                <div id="execution-status" style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px;">
+                    <div style="background: #1a1a2e; padding: 15px; border-radius: 8px; border: 1px solid #333;">
+                        <div style="color: #888; font-size: 12px;">TWAP Orders</div>
+                        <div style="font-size: 24px; color: #4CAF50; font-weight: bold;" id="twap-count">0</div>
+                        <div style="color: #666; font-size: 11px;">Avg Slippage: <span id="twap-slippage">0.0</span> bps</div>
+                    </div>
+                    <div style="background: #1a1a2e; padding: 15px; border-radius: 8px; border: 1px solid #333;">
+                        <div style="color: #888; font-size: 12px;">VWAP Orders</div>
+                        <div style="font-size: 24px; color: #2196F3; font-weight: bold;" id="vwap-count">0</div>
+                        <div style="color: #666; font-size: 11px;">Avg Slippage: <span id="vwap-slippage">0.0</span> bps</div>
+                    </div>
+                    <div style="background: #1a1a2e; padding: 15px; border-radius: 8px; border: 1px solid #333;">
+                        <div style="color: #888; font-size: 12px;">Iceberg Orders</div>
+                        <div style="font-size: 24px; color: #FF9800; font-weight: bold;" id="iceberg-count">0</div>
+                        <div style="color: #666; font-size: 11px;">Hidden Liquidity: <span id="iceberg-hidden">0%</span></div>
+                    </div>
+                </div>
+            </div>
+            
             <div class="grid">
                 <!-- ML Enhanced Strategy Card -->
                 <div class="card">
@@ -3365,6 +3531,18 @@ def execution_status():
                 {"symbol": "AAPL", "algo": "VWAP", "progress": 0.65, "slices": 8},
                 {"symbol": "MSFT", "algo": "TWAP", "progress": 0.30, "slices": 10},
             ],
+            # Enhanced metrics for dashboard integration
+            "algorithms_used": {"twap": 5, "vwap": 8, "iceberg": 2},
+            "avg_slippage": 1.2,
+            "market_impact": 0.8,
+            "fill_rate": 0.98,
+            "avg_fill_time": 2.3,
+            "executions_today": 15,
+            "algorithm_performance": {
+                "twap": {"slippage": 1.1, "success_rate": 0.95},
+                "vwap": {"slippage": 1.3, "success_rate": 0.93},
+                "iceberg": {"detection_rate": 0.02, "success_rate": 0.97}
+            }
         }
     )
 
