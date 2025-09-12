@@ -71,37 +71,37 @@ def index():
         <h1>RoboTrader Market Status Test</h1>
         <div id="market-status" class="status">Loading...</div>
         <button onclick="updateStatus()">Refresh Status</button>
-        
+
         <script>
             async function updateStatus() {
                 try {
                     const response = await fetch('/api/market/status');
                     const data = await response.json();
-                    
+
                     const statusDiv = document.getElementById('market-status');
                     statusDiv.className = 'status ' + (data.is_open ? 'open' : (data.session === 'closed' ? 'closed' : 'extended'));
-                    
+
                     let html = `
                         <h3>Market Status: ${data.status_text}</h3>
                         <p><strong>Current Time:</strong> ${new Date(data.current_time).toLocaleString()}</p>
                         <p><strong>Session:</strong> ${data.session}</p>
                         <p><strong>Market Open:</strong> ${data.is_open ? 'Yes' : 'No'}</p>
                     `;
-                    
+
                     if (!data.is_open && data.time_until_open) {
                         html += `
                             <p><strong>Next Open:</strong> ${new Date(data.next_open).toLocaleString()}</p>
                             <p><strong>Time Until Open:</strong> ${data.time_until_open}</p>
                         `;
                     }
-                    
+
                     statusDiv.innerHTML = html;
                 } catch (error) {
                     console.error('Error:', error);
                     document.getElementById('market-status').innerHTML = '<p>Error loading market status</p>';
                 }
             }
-            
+
             // Load on startup and refresh every minute
             updateStatus();
             setInterval(updateStatus, 60000);
@@ -114,4 +114,15 @@ def index():
 if __name__ == "__main__":
     print("Starting simple dashboard test...")
     print(f"Dashboard will be available at: http://localhost:{os.getenv('DASH_PORT', 5556)}")
-    app.run(host="0.0.0.0", port=int(os.getenv("DASH_PORT", 5556)), debug=True)
+
+    # Never allow debug mode in production
+    environment = os.getenv("ENVIRONMENT", "development")
+    debug_mode = False  # Default to False for safety
+    if environment == "development":
+        debug_mode = os.getenv("DEBUG", "false").lower() == "true"
+    elif environment in ["staging", "production"]:
+        debug_mode = False  # Force disable in non-dev environments
+        if os.getenv("DEBUG", "").lower() == "true":
+            print("⚠️  WARNING: Debug mode requested but disabled in production/staging")
+
+    app.run(host="0.0.0.0", port=int(os.getenv("DASH_PORT", 5556)), debug=debug_mode)

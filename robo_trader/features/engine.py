@@ -409,7 +409,8 @@ class FeatureEngine(DataSubscriber):
 
             return adx.iloc[-1] if not pd.isna(adx.iloc[-1]) else None
 
-        except Exception:
+        except (ValueError, AttributeError, KeyError, IndexError) as e:
+            self.logger.debug(f"Failed to calculate trend strength: {e}")
             return None
 
     def _calculate_mean_reversion_signal(self, features: FeatureSet) -> Optional[float]:
@@ -440,7 +441,8 @@ class FeatureEngine(DataSubscriber):
 
             return signal
 
-        except Exception:
+        except (ValueError, AttributeError, KeyError, IndexError) as e:
+            self.logger.debug(f"Failed to calculate mean reversion signal: {e}")
             return None
 
     def _calculate_breakout_signal(self, df: pd.DataFrame, features: FeatureSet) -> Optional[float]:
@@ -472,7 +474,8 @@ class FeatureEngine(DataSubscriber):
 
             return signal
 
-        except Exception:
+        except (ValueError, AttributeError, KeyError, IndexError) as e:
+            self.logger.debug(f"Failed to calculate breakout signal: {e}")
             return None
 
     def get_features(self, symbol: str) -> Optional[FeatureSet]:

@@ -1,10 +1,10 @@
 {
-  "timestamp": "2025-09-12T07:27:56.086898",
-  "total_bugs": 188,
+  "timestamp": "2025-09-12T07:41:55.076920",
+  "total_bugs": 191,
   "by_severity": {
     "critical": 0,
     "high": 6,
-    "medium": 182,
+    "medium": 185,
     "low": 0,
     "info": 0
   },
@@ -12,8 +12,8 @@
     "syntax": 0,
     "type": 0,
     "logic": 0,
-    "performance": 149,
-    "security": 38,
+    "performance": 153,
+    "security": 37,
     "trading": 0,
     "risk": 0,
     "data": 1,
@@ -183,6 +183,42 @@
       "description": "Async function should use await or be made synchronous"
     },
     {
+      "id": "async_no_await_stop_loss_monitor.py_148",
+      "severity": "medium",
+      "category": "performance",
+      "title": "Async function 'add_stop_loss' has no await",
+      "file_path": "robo_trader/stop_loss_monitor.py",
+      "line_number": 148,
+      "description": "Async function should use await or be made synchronous"
+    },
+    {
+      "id": "async_no_await_stop_loss_monitor.py_247",
+      "severity": "medium",
+      "category": "performance",
+      "title": "Async function '_update_trailing_stop' has no await",
+      "file_path": "robo_trader/stop_loss_monitor.py",
+      "line_number": 247,
+      "description": "Async function should use await or be made synchronous"
+    },
+    {
+      "id": "async_no_await_stop_loss_monitor.py_295",
+      "severity": "medium",
+      "category": "performance",
+      "title": "Async function 'check_stops' has no await",
+      "file_path": "robo_trader/stop_loss_monitor.py",
+      "line_number": 295,
+      "description": "Async function should use await or be made synchronous"
+    },
+    {
+      "id": "async_no_await_stop_loss_monitor.py_469",
+      "severity": "medium",
+      "category": "performance",
+      "title": "Async function 'start_monitoring' has no await",
+      "file_path": "robo_trader/stop_loss_monitor.py",
+      "line_number": 469,
+      "description": "Async function should use await or be made synchronous"
+    },
+    {
       "id": "nested_loops_correlation.py_325",
       "severity": "medium",
       "category": "performance",
@@ -246,12 +282,12 @@
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_async_ibkr_client.py_166",
+      "id": "async_no_await_async_ibkr_client.py_168",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'close_all' has no await",
       "file_path": "robo_trader/clients/async_ibkr_client.py",
-      "line_number": 166,
+      "line_number": 168,
       "description": "Async function should use await or be made synchronous"
     },
     {
@@ -1720,15 +1756,6 @@
       "file_path": "test_dashboard_simple.py",
       "line_number": 4,
       "description": "Import of os may pose security risks"
-    },
-    {
-      "id": "flask_debug_test_dashboard_simple.py",
-      "severity": "medium",
-      "category": "security",
-      "title": "Flask debug mode without environment check",
-      "file_path": "test_dashboard_simple.py",
-      "line_number": null,
-      "description": "Flask debug mode should be environment-aware in production"
     },
     {
       "id": "async_no_await_test_portfolio_manager.py_25",

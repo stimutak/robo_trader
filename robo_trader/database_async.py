@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Tuple
 
 import aiosqlite
 
+from robo_trader.database_validator import DatabaseValidator, ValidationError
 from robo_trader.logger import get_logger
 
 logger = get_logger(__name__)
@@ -199,7 +200,7 @@ class AsyncTradingDatabase:
             # Create index for efficient queries
             await conn.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_ticks_symbol 
+                CREATE INDEX IF NOT EXISTS idx_ticks_symbol
                 ON ticks (symbol, timestamp DESC)
             """
             )
@@ -236,7 +237,7 @@ class AsyncTradingDatabase:
             # Create index for efficient queries
             await conn.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_features_symbol 
+                CREATE INDEX IF NOT EXISTS idx_features_symbol
                 ON features (symbol, timestamp DESC)
             """
             )
@@ -307,7 +308,7 @@ class AsyncTradingDatabase:
             # Insert default account if not exists
             await conn.execute(
                 """
-                INSERT OR IGNORE INTO account (id, cash, equity) 
+                INSERT OR IGNORE INTO account (id, cash, equity)
                 VALUES (1, 100000, 100000)
             """
             )
@@ -322,6 +323,19 @@ class AsyncTradingDatabase:
         market_price: Optional[float] = None,
     ) -> None:
         """Update or insert a position asynchronously."""
+        # Validate inputs
+        try:
+            symbol = DatabaseValidator.validate_symbol(symbol)
+            quantity = DatabaseValidator.validate_quantity(quantity, allow_negative=True)
+            avg_cost = DatabaseValidator.validate_price(avg_cost, field_name="avg_cost")
+            if market_price is not None:
+                market_price = DatabaseValidator.validate_price(
+                    market_price, field_name="market_price"
+                )
+        except ValidationError as e:
+            logger.error(f"Position update validation failed: {e}")
+            raise
+
         async with self.get_connection() as conn:
             if quantity == 0:
                 # Close position
@@ -348,7 +362,23 @@ class AsyncTradingDatabase:
         slippage: float = 0.0,
         commission: float = 0.0,
     ) -> None:
-        """Record a trade execution asynchronously."""
+        """Record a trade asynchronously."""
+        # Validate inputs
+        try:
+            symbol = DatabaseValidator.validate_symbol(symbol)
+            side = DatabaseValidator.validate_order_side(side)
+            quantity = DatabaseValidator.validate_quantity(quantity)
+            price = DatabaseValidator.validate_price(price)
+            slippage = DatabaseValidator._validate_numeric(
+                slippage, "slippage", min_val=0, max_val=1000
+            )
+            commission = DatabaseValidator._validate_numeric(
+                commission, "commission", min_val=0, max_val=1000
+            )
+        except ValidationError as e:
+            logger.error(f"Trade record validation failed: {e}")
+            raise
+
         async with self.get_connection() as conn:
             await conn.execute(
                 """
@@ -368,12 +398,31 @@ class AsyncTradingDatabase:
         realized_pnl: float = 0.0,
         unrealized_pnl: float = 0.0,
     ) -> None:
-        """Update account information asynchronously."""
+        """Update account values asynchronously."""
+        # Validate inputs
+        try:
+            account_data = {
+                "cash": cash,
+                "equity": equity,
+                "daily_pnl": daily_pnl,
+                "realized_pnl": realized_pnl,
+                "unrealized_pnl": unrealized_pnl,
+            }
+            validated_data = DatabaseValidator.validate_account_data(account_data)
+            cash = validated_data.get("cash", cash)
+            equity = validated_data.get("equity", equity)
+            daily_pnl = validated_data.get("daily_pnl", daily_pnl)
+            realized_pnl = validated_data.get("realized_pnl", realized_pnl)
+            unrealized_pnl = validated_data.get("unrealized_pnl", unrealized_pnl)
+        except ValidationError as e:
+            logger.error(f"Account update validation failed: {e}")
+            raise
+
         async with self.get_connection() as conn:
             await conn.execute(
                 """
-                UPDATE account 
-                SET cash = ?, equity = ?, daily_pnl = ?, 
+                UPDATE account
+                SET cash = ?, equity = ?, daily_pnl = ?,
                     realized_pnl = ?, unrealized_pnl = ?, timestamp = CURRENT_TIMESTAMP
                 WHERE id = 1
             """,
@@ -416,7 +465,7 @@ class AsyncTradingDatabase:
         async with self.get_connection() as conn:
             await conn.execute(
                 """
-                INSERT OR REPLACE INTO market_data 
+                INSERT OR REPLACE INTO market_data
                 (symbol, timestamp, open, high, low, close, volume)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
@@ -429,7 +478,7 @@ class AsyncTradingDatabase:
         async with self.get_connection() as conn:
             await conn.executemany(
                 """
-                INSERT OR REPLACE INTO market_data 
+                INSERT OR REPLACE INTO market_data
                 (symbol, timestamp, open, high, low, close, volume)
                 VALUES (:symbol, :timestamp, :open, :high, :low, :close, :volume)
             """,
@@ -443,8 +492,8 @@ class AsyncTradingDatabase:
         async with self.get_connection() as conn:
             cursor = await conn.execute(
                 """
-                SELECT symbol, quantity, avg_cost, market_price 
-                FROM positions 
+                SELECT symbol, quantity, avg_cost, market_price
+                FROM positions
                 WHERE symbol = ? AND quantity != 0
             """,
                 (symbol,),
@@ -464,8 +513,8 @@ class AsyncTradingDatabase:
         async with self.get_connection() as conn:
             cursor = await conn.execute(
                 """
-                SELECT symbol, quantity, avg_cost, market_price 
-                FROM positions 
+                SELECT symbol, quantity, avg_cost, market_price
+                FROM positions
                 WHERE quantity != 0
             """
             )

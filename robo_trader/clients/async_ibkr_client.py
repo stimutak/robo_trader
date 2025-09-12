@@ -53,14 +53,16 @@ def normalize_bars_df(df: pd.DataFrame) -> pd.DataFrame:
         try:
             data["date"] = pd.to_datetime(data["date"], errors="coerce")
             data = data.sort_values("date")
-        except Exception:
-            pass
+        except (ValueError, AttributeError, KeyError) as e:
+            logger.warning(f"Failed to process date column in market data: {e}")
+            # Continue without date sorting - data may still be usable
     elif "time" in data.columns:
         try:
             data["time"] = pd.to_datetime(data["time"], errors="coerce")
             data = data.sort_values("time")
-        except Exception:
-            pass
+        except (ValueError, AttributeError, KeyError) as e:
+            logger.warning(f"Failed to process time column in market data: {e}")
+            # Continue without time sorting - data may still be usable
     return data.reset_index(drop=False)
 
 
@@ -382,8 +384,9 @@ class AsyncIBKRClient:
             try:
                 data["date"] = pd.to_datetime(data["date"], errors="coerce")
                 data = data.set_index("date").sort_index()
-            except Exception:
-                pass
+            except (ValueError, AttributeError, KeyError) as e:
+                self.logger.warning(f"Failed to process date index in market data: {e}")
+                # Continue without date indexing - data may still be usable
 
         return data
 

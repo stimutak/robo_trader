@@ -400,9 +400,11 @@ def load_config_from_env() -> Config:
             "bar_size": os.getenv("DATA_BAR_SIZE", "5 mins"),
         },
         "ibkr": {
-            "host": os.getenv("IBKR_HOST", "127.0.0.1"),
-            "port": int(os.getenv("IBKR_PORT", "7497")),
-            "client_id": int(os.getenv("IBKR_CLIENT_ID", "123")),
+            "host": os.getenv("IBKR_HOST"),  # REQUIRED - no default
+            "port": int(os.getenv("IBKR_PORT")) if os.getenv("IBKR_PORT") else None,  # REQUIRED
+            "client_id": int(os.getenv("IBKR_CLIENT_ID"))
+            if os.getenv("IBKR_CLIENT_ID")
+            else None,  # REQUIRED
             "account": os.getenv("IBKR_ACCOUNT"),
             "readonly": os.getenv("IBKR_READONLY", "true").lower() == "true",
             "timeout": float(os.getenv("IBKR_TIMEOUT", "10.0")),
@@ -460,6 +462,23 @@ def load_config_from_env() -> Config:
         ],
         "default_cash": float(os.getenv("DEFAULT_CASH", "100000")),
     }
+
+    # Validate critical IBKR connection parameters
+    if not config_dict["ibkr"]["host"]:
+        raise ValueError(
+            "IBKR_HOST environment variable is required. "
+            "Set it to your IB Gateway/TWS host address."
+        )
+    if config_dict["ibkr"]["port"] is None:
+        raise ValueError(
+            "IBKR_PORT environment variable is required. "
+            "Use 7497 for paper trading or 7496 for live trading."
+        )
+    if config_dict["ibkr"]["client_id"] is None:
+        raise ValueError(
+            "IBKR_CLIENT_ID environment variable is required. "
+            "Set it to a unique integer ID for this client."
+        )
 
     return Config(**config_dict)
 
