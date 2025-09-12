@@ -2226,7 +2226,7 @@ HTML_TEMPLATE = """
                 // Get risk management status
                 const riskResp = await fetch('/api/risk/status');
                 if (riskResp.ok) {
-                    const data = await execResp.json();
+                    const data = await riskResp.json();
                     
                     // Update Kelly sizing
                     if (data.kelly_sizing) {
@@ -2646,13 +2646,12 @@ def get_pnl():
             logger.info("Using cached P&L data due to database error")
             return jsonify(app._pnl_cache)
     
-    # Return sample data only if no cache available
-    from sample_data import get_sample_pnl
-    sample_pnl = get_sample_pnl()
-    # Cache even sample data to prevent flashing
-    app._pnl_cache = sample_pnl
+    # Return zeros if no cache available
+    zero_pnl = {"total": 0, "unrealized": 0, "realized": 0, "daily": 0}
+    # Cache zeros to prevent flashing
+    app._pnl_cache = zero_pnl
     app._pnl_cache_time = current_time
-    return jsonify(sample_pnl)
+    return jsonify(zero_pnl)
     """
 
 
@@ -2913,10 +2912,8 @@ def get_positions():
     except Exception as e:
         logger.error(f"Error fetching real positions: {e}")
 
-    # Return sample data if database is locked
-    from sample_data import get_sample_positions
-
-    return jsonify({"positions": get_sample_positions()})
+    # Return empty positions if database is locked
+    return jsonify({"positions": []})
 
 
 @app.route("/api/watchlist")
@@ -2929,14 +2926,85 @@ def get_watchlist():
         if current_time - app._watchlist_cache_time < 3:  # 3 second cache
             return jsonify({"watchlist": app._watchlist_cache})
 
-    # Use sample data immediately to avoid slow database queries
-    from sample_data import get_sample_watchlist
+    # Define the watchlist symbols
+    watchlist_symbols = [
+        "AAPL",
+        "NVDA",
+        "TSLA",
+        "IXHL",
+        "NUAI",
+        "BZAI",
+        "ELTP",
+        "OPEN",
+        "CEG",
+        "VRT",
+        "PLTR",
+        "UPST",
+        "TEM",
+        "HTFL",
+        "SDGR",
+        "APLD",
+        "SOFI",
+        "CORZ",
+        "WULF",
+    ]
 
-    watchlist_data = get_sample_watchlist()
+    watchlist_data = []
 
-    # Cache the result
-    app._watchlist_cache = watchlist_data
-    app._watchlist_cache_time = current_time
+    try:
+        from sync_db_reader import SyncDatabaseReader
+
+        db = SyncDatabaseReader()
+
+        # Get all positions
+        positions = db.get_positions()
+        position_map = {p["symbol"]: p for p in positions}
+
+        # Get latest prices and positions for each symbol
+        for symbol in watchlist_symbols:
+            # Get latest market data
+            market_data = db.get_latest_market_data(symbol, limit=1)
+            current_price = market_data[0]["close"] if market_data else 0
+
+            # Check if we have a position
+            position = position_map.get(symbol)
+
+            # Calculate P&L if we have a position
+            pnl = 0
+            if position and current_price > 0:
+                pnl = (current_price - position["avg_cost"]) * position["quantity"]
+
+            watchlist_data.append(
+                {
+                    "symbol": symbol,
+                    "current_price": current_price,
+                    "quantity": position["quantity"] if position else 0,
+                    "avg_cost": position["avg_cost"] if position else 0,
+                    "pnl": pnl,
+                    "notes": "Active" if position else "Watching",
+                    "has_position": position is not None,
+                }
+            )
+
+        # Cache the result
+        app._watchlist_cache = watchlist_data
+        app._watchlist_cache_time = current_time
+
+    except Exception as e:
+        logger.error(f"Error fetching watchlist: {e}")
+        # If error, return minimal watchlist with just symbols
+        watchlist_data = [
+            {
+                "symbol": s,
+                "current_price": 0,
+                "quantity": 0,
+                "avg_cost": 0,
+                "pnl": 0,
+                "notes": "Watching",
+                "has_position": False,
+            }
+            for s in watchlist_symbols
+        ]
 
     return jsonify({"watchlist": watchlist_data})
 
@@ -2987,9 +3055,8 @@ def get_watchlist():
     except Exception as e:
         logger.error(f"Error fetching watchlist: {e}")
     
-    # Return sample data if database is locked
-    from sample_data import get_sample_watchlist
-    return jsonify({'watchlist': get_sample_watchlist()})
+    # Return empty watchlist if database is locked
+    return jsonify({'watchlist': []})
     """
 
 
@@ -3362,10 +3429,8 @@ def get_trades():
     except Exception as e:
         logger.error(f"Error fetching trades: {e}")
 
-    # Return sample data if database is locked
-    from sample_data import get_sample_trades
-
-    trades = get_sample_trades()
+    # Return empty trades if database is locked
+    trades = []
 
     # Calculate summary
     buy_trades = [t for t in trades if t["side"] == "BUY"]
@@ -3610,41 +3675,101 @@ def strategies_status():
 @app.route("/api/microstructure/metrics")
 @requires_auth
 def microstructure_metrics():
-    """Get microstructure strategy metrics"""
-    # Return sample microstructure metrics due to database locking
+    """Get microstructure strategy metrics from real data"""
+    try:
+        # Try to get real microstructure data from database or state files
+        from sync_db_reader import SyncDatabaseReader
+
+        db = SyncDatabaseReader()
+
+        # Get recent trades for microstructure analysis
+        recent_trades = db.get_recent_trades(limit=100)
+
+        # Calculate real metrics if we have trades
+        if recent_trades:
+            trades_today = len(
+                [
+                    t
+                    for t in recent_trades
+                    if t.get("timestamp", "").startswith(datetime.now().strftime("%Y-%m-%d"))
+                ]
+            )
+            winning_trades = [t for t in recent_trades if t.get("pnl", 0) > 0]
+            win_rate = len(winning_trades) / len(recent_trades) if recent_trades else 0
+
+            return jsonify(
+                {
+                    "order_flow_imbalance": {
+                        "current": 0,
+                        "avg_1h": 0,
+                        "trend": "neutral",
+                        "signal": "neutral",
+                    },
+                    "book_pressure": 0,
+                    "tick_direction": 0,
+                    "spread_analysis": {
+                        "current_bps": 0,
+                        "avg_bps": 0,
+                        "widening": False,
+                        "liquidity": "unknown",
+                    },
+                    "tick_momentum": {
+                        "score": 0,
+                        "direction": "neutral",
+                        "strength": "none",
+                        "trades_analyzed": len(recent_trades),
+                    },
+                    "ensemble_metrics": {
+                        "combined_score": 0,
+                        "confidence": 0,
+                        "active_signals": 0,
+                        "last_signal": "N/A",
+                    },
+                    "performance": {
+                        "trades_today": trades_today,
+                        "win_rate": round(win_rate, 3),
+                        "avg_profit_bps": 0,
+                        "sharpe_ratio": 0,
+                    },
+                }
+            )
+    except Exception as e:
+        logger.error(f"Error getting microstructure metrics: {e}")
+
+    # Return zeros if error
     return jsonify(
         {
             "order_flow_imbalance": {
-                "current": 0.42,
-                "avg_1h": 0.38,
-                "trend": "increasing",
-                "signal": "bullish",
+                "current": 0,
+                "avg_1h": 0,
+                "trend": "neutral",
+                "signal": "neutral",
             },
-            "book_pressure": 0.28,  # Added for display
-            "tick_direction": 0.15,  # Added for display
+            "book_pressure": 0,
+            "tick_direction": 0,
             "spread_analysis": {
-                "current_bps": 3.2,
-                "avg_bps": 4.1,
+                "current_bps": 0,
+                "avg_bps": 0,
                 "widening": False,
-                "liquidity": "high",
+                "liquidity": "unknown",
             },
             "tick_momentum": {
-                "score": 0.65,
-                "direction": "up",
-                "strength": "moderate",
-                "trades_analyzed": 1250,
+                "score": 0,
+                "direction": "neutral",
+                "strength": "none",
+                "trades_analyzed": 0,
             },
             "ensemble_metrics": {
-                "combined_score": 0.72,
-                "confidence": 0.81,
-                "active_signals": 3,
-                "last_signal": "2 min ago",
+                "combined_score": 0,
+                "confidence": 0,
+                "active_signals": 0,
+                "last_signal": "N/A",
             },
             "performance": {
-                "trades_today": 8,
-                "win_rate": 0.625,
-                "avg_profit_bps": 2.8,
-                "sharpe_ratio": 1.4,
+                "trades_today": 0,
+                "win_rate": 0,
+                "avg_profit_bps": 0,
+                "sharpe_ratio": 0,
             },
         }
     )
@@ -3720,77 +3845,251 @@ def execution_status():
 @app.route("/api/risk/status")
 @requires_auth
 def get_risk_status():
-    """Get advanced risk management status"""
+    """Get advanced risk management status from actual risk state"""
     # Check if advanced risk manager is running
     advanced_risk_enabled = os.getenv("ADVANCED_RISK_ENABLED", "true").lower() == "true"
 
     if not advanced_risk_enabled:
         return jsonify({"enabled": False, "message": "Advanced risk management not enabled"})
 
-    # Mock data for now - would connect to actual risk manager
-    return jsonify(
-        {
-            "enabled": True,
-            "kelly_sizing": {
+    try:
+        # Load risk state from file
+        risk_state_file = Path("data/risk_state.json")
+        risk_state = {}
+        if risk_state_file.exists():
+            with open(risk_state_file) as f:
+                risk_state = json.load(f)
+
+        # Get real data from database
+        from sync_db_reader import SyncDatabaseReader
+
+        db = SyncDatabaseReader()
+
+        # Get positions and calculate exposure
+        positions = db.get_positions()
+        active_positions = {p["symbol"]: p for p in positions if p.get("quantity", 0) > 0}
+        total_exposure = sum(
+            abs(p.get("quantity", 0) * p.get("current_price", 0)) for p in active_positions.values()
+        )
+
+        # Get recent trades for Kelly calculation
+        trades = db.get_recent_trades(limit=100)
+
+        # Calculate win rate and consecutive losses
+        winning_trades = [t for t in trades if t.get("pnl", 0) > 0]
+        win_rate = len(winning_trades) / len(trades) if trades else 0.5
+
+        # Count consecutive losses
+        consecutive_losses = 0
+        for trade in reversed(trades):
+            if trade.get("pnl", 0) < 0:
+                consecutive_losses += 1
+            else:
+                break
+
+        # Calculate daily loss
+        today_trades = [
+            t
+            for t in trades
+            if t.get("timestamp")
+            and datetime.fromisoformat(t["timestamp"]).date() == datetime.now().date()
+        ]
+        daily_pnl = sum(t.get("pnl", 0) for t in today_trades)
+        daily_loss_pct = (
+            abs(daily_pnl / risk_state.get("current_capital", 100000)) if daily_pnl < 0 else 0
+        )
+
+        # Calculate max drawdown from trades
+        cumulative_pnl = 0
+        peak_pnl = 0
+        max_drawdown = 0
+        for trade in trades:
+            cumulative_pnl += trade.get("pnl", 0)
+            peak_pnl = max(peak_pnl, cumulative_pnl)
+            drawdown = (
+                (peak_pnl - cumulative_pnl) / risk_state.get("current_capital", 100000)
+                if peak_pnl > 0
+                else 0
+            )
+            max_drawdown = max(max_drawdown, drawdown)
+
+        # Calculate Kelly fractions for top positions
+        kelly_positions = {}
+        for symbol in list(active_positions.keys())[:5]:  # Top 5 positions
+            symbol_trades = [t for t in trades if t.get("symbol") == symbol]
+            symbol_wins = [t for t in symbol_trades if t.get("pnl", 0) > 0]
+            symbol_win_rate = len(symbol_wins) / len(symbol_trades) if symbol_trades else 0.5
+
+            # Simple Kelly estimation
+            if symbol_wins and symbol_trades:
+                avg_win = sum(t["pnl"] for t in symbol_wins) / len(symbol_wins)
+                losses = [t for t in symbol_trades if t.get("pnl", 0) <= 0]
+                avg_loss = (
+                    abs(sum(t["pnl"] for t in losses) / len(losses)) if losses else avg_win * 0.5
+                )
+                edge = symbol_win_rate * avg_win - (1 - symbol_win_rate) * avg_loss
+                kelly_fraction = min(0.25, max(0, (edge / avg_win) if avg_win > 0 else 0))
+            else:
+                kelly_fraction = 0.02
+                edge = 0
+
+            kelly_positions[symbol] = {
+                "kelly_fraction": round(kelly_fraction, 4),
+                "win_rate": round(symbol_win_rate, 2),
+                "edge": round(edge / risk_state.get("current_capital", 100000), 4),
+            }
+
+        # Calculate portfolio Kelly
+        portfolio_kelly = (
+            sum(p["kelly_fraction"] for p in kelly_positions.values()) / len(kelly_positions)
+            if kelly_positions
+            else 0.02
+        )
+
+        return jsonify(
+            {
                 "enabled": True,
-                "current_positions": {
-                    "AAPL": {"kelly_fraction": 0.025, "win_rate": 0.58, "edge": 0.032},
-                    "NVDA": {"kelly_fraction": 0.018, "win_rate": 0.55, "edge": 0.024},
-                    "TSLA": {"kelly_fraction": 0.015, "win_rate": 0.52, "edge": 0.018},
+                "kelly_sizing": {
+                    "enabled": True,
+                    "current_positions": kelly_positions,
+                    "portfolio_kelly": round(portfolio_kelly, 4),
                 },
-                "portfolio_kelly": 0.058,
-            },
-            "kill_switches": {
-                "active": False,
-                "triggered_count": 0,
-                "last_trigger": None,
-                "limits": {
-                    "daily_loss": {"limit": 0.05, "current": 0.012},
-                    "consecutive_losses": {"limit": 5, "current": 1},
-                    "max_drawdown": {"limit": 0.10, "current": 0.025},
-                    "position_loss": {"limit": 0.02, "per_position": True},
+                "kill_switches": {
+                    "active": risk_state.get("kill_switch_triggered", False),
+                    "triggered_count": 0,  # Would need to track this
+                    "last_trigger": None,
+                    "limits": {
+                        "daily_loss": {"limit": 0.05, "current": round(daily_loss_pct, 4)},
+                        "consecutive_losses": {"limit": 5, "current": consecutive_losses},
+                        "max_drawdown": {"limit": 0.10, "current": round(max_drawdown, 4)},
+                        "position_loss": {"limit": 0.02, "per_position": True},
+                    },
                 },
-            },
-            "correlation_limits": {
-                "max_correlation": 0.7,
-                "max_correlated_exposure": 0.3,
-                "high_correlations": [
-                    {"pair": ["AAPL", "MSFT"], "correlation": 0.82},
-                    {"pair": ["NVDA", "AMD"], "correlation": 0.75},
-                ],
-            },
-            "risk_metrics": {
-                "total_exposure": 45000,
-                "leverage": 0.45,
-                "var_95": -2500,
-                "sharpe_ratio": 1.8,
-                "max_drawdown": 0.025,
-            },
-        }
-    )
+                "correlation_limits": {
+                    "max_correlation": 0.7,
+                    "max_correlated_exposure": 0.3,
+                    "high_correlations": [],  # Would need correlation matrix calculation
+                },
+                "risk_metrics": {
+                    "total_exposure": round(total_exposure, 2),
+                    "leverage": round(
+                        total_exposure / risk_state.get("current_capital", 100000), 2
+                    ),
+                    "var_95": 0,  # Would need historical returns
+                    "sharpe_ratio": 0,  # Would need returns and volatility
+                    "max_drawdown": round(max_drawdown, 4),
+                    "current_capital": risk_state.get("current_capital", 100000),
+                    "total_pnl": risk_state.get("total_pnl", 0),
+                    "daily_pnl": round(daily_pnl, 2),
+                },
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error getting risk status: {e}")
+        return jsonify(
+            {
+                "enabled": True,
+                "error": str(e),
+                "kelly_sizing": {"enabled": True, "current_positions": {}, "portfolio_kelly": 0},
+                "kill_switches": {"active": False, "limits": {}},
+                "correlation_limits": {},
+                "risk_metrics": {},
+            }
+        )
 
 
 @app.route("/api/risk/kelly/<symbol>")
 @requires_auth
 def get_kelly_parameters(symbol):
-    """Get Kelly parameters for a specific symbol"""
-    # Mock data - would calculate from actual trade history
-    return jsonify(
-        {
-            "symbol": symbol,
-            "kelly_fraction": 0.022,
-            "half_kelly": 0.011,
-            "quarter_kelly": 0.0055,
-            "win_rate": 0.56,
-            "avg_win": 0.035,
-            "avg_loss": 0.022,
-            "edge": 0.0196,
-            "odds": 1.59,
-            "trade_count": 45,
-            "recommended_position_size": 2200,  # In dollars
-            "confidence_level": 0.85,
-        }
-    )
+    """Get Kelly parameters for a specific symbol from actual trade history"""
+    try:
+        from sync_db_reader import SyncDatabaseReader
+
+        db = SyncDatabaseReader()
+
+        # Get trades for this symbol
+        all_trades = db.get_recent_trades(limit=200)
+        symbol_trades = [t for t in all_trades if t.get("symbol") == symbol]
+
+        if not symbol_trades:
+            # Return conservative defaults if no trade history
+            return jsonify(
+                {
+                    "symbol": symbol,
+                    "kelly_fraction": 0.01,
+                    "half_kelly": 0.005,
+                    "quarter_kelly": 0.0025,
+                    "win_rate": 0.5,
+                    "avg_win": 0,
+                    "avg_loss": 0,
+                    "edge": 0,
+                    "odds": 0,
+                    "trade_count": 0,
+                    "recommended_position_size": 1000,
+                    "confidence_level": 0.0,
+                }
+            )
+
+        # Calculate win/loss statistics
+        wins = [t for t in symbol_trades if t.get("pnl", 0) > 0]
+        losses = [t for t in symbol_trades if t.get("pnl", 0) <= 0]
+
+        win_rate = len(wins) / len(symbol_trades)
+        avg_win = sum(t["pnl"] for t in wins) / len(wins) if wins else 0
+        avg_loss = abs(sum(t["pnl"] for t in losses) / len(losses)) if losses else 0
+
+        # Calculate Kelly fraction
+        if avg_loss > 0 and avg_win > 0:
+            odds = avg_win / avg_loss
+            kelly = (win_rate * odds - (1 - win_rate)) / odds
+            kelly = max(0, min(0.25, kelly))  # Cap at 25%
+        else:
+            kelly = 0.01  # Conservative default
+
+        # Calculate edge
+        edge = win_rate * avg_win - (1 - win_rate) * avg_loss
+
+        # Load current capital from risk state
+        risk_state_file = Path("data/risk_state.json")
+        current_capital = 100000  # Default
+        if risk_state_file.exists():
+            with open(risk_state_file) as f:
+                risk_state = json.load(f)
+                current_capital = risk_state.get("current_capital", 100000)
+
+        # Calculate recommended position size
+        recommended_size = current_capital * kelly * 0.5  # Half Kelly
+
+        return jsonify(
+            {
+                "symbol": symbol,
+                "kelly_fraction": round(kelly, 4),
+                "half_kelly": round(kelly * 0.5, 4),
+                "quarter_kelly": round(kelly * 0.25, 4),
+                "win_rate": round(win_rate, 3),
+                "avg_win": round(avg_win, 2),
+                "avg_loss": round(avg_loss, 2),
+                "edge": round(edge, 2),
+                "odds": round(odds if avg_loss > 0 else 0, 2),
+                "trade_count": len(symbol_trades),
+                "recommended_position_size": round(recommended_size, 0),
+                "confidence_level": min(
+                    0.95, len(symbol_trades) / 30
+                ),  # Higher confidence with more trades
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error calculating Kelly for {symbol}: {e}")
+        return jsonify(
+            {
+                "symbol": symbol,
+                "error": str(e),
+                "kelly_fraction": 0.01,
+                "half_kelly": 0.005,
+                "quarter_kelly": 0.0025,
+                "trade_count": 0,
+            }
+        )
 
 
 @app.route("/api/risk/kill-switch", methods=["POST"])

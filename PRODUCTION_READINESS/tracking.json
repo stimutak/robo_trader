@@ -1,0 +1,360 @@
+{
+  "metadata": {
+    "version": "1.0.0",
+    "created": "2025-01-11",
+    "last_updated": "2025-01-11",
+    "production_readiness_score": 5,
+    "status": "NOT_READY_FOR_PRODUCTION",
+    "trading_mode_allowed": "PAPER_ONLY"
+  },
+  "phases": {
+    "phase_0": {
+      "name": "Immediate Blockers",
+      "status": "NOT_STARTED",
+      "priority": "CRITICAL",
+      "estimated_days": 3,
+      "tasks": {
+        "task_0_1": {
+          "id": "TASK_0.1",
+          "title": "Remove ALL Hardcoded Connection Parameters",
+          "status": "NOT_STARTED",
+          "assignee": null,
+          "started": null,
+          "completed": null,
+          "files_affected": [
+            "robo_trader/config.py",
+            "robo_trader/clients/async_ibkr_client.py"
+          ],
+          "tests_required": [
+            "test_config_no_defaults",
+            "test_config_validation"
+          ],
+          "verification": {
+            "automated_check": "grep for 127.0.0.1, localhost, 7497",
+            "manual_review": false
+          }
+        },
+        "task_0_2": {
+          "id": "TASK_0.2",
+          "title": "Add SQL Input Validation Layer",
+          "status": "NOT_STARTED",
+          "assignee": null,
+          "started": null,
+          "completed": null,
+          "files_affected": [
+            "robo_trader/database_validator.py",
+            "robo_trader/database_async.py"
+          ],
+          "tests_required": [
+            "test_sql_injection_prevention",
+            "test_input_validation"
+          ],
+          "verification": {
+            "automated_check": "run SQL injection test suite",
+            "manual_review": true
+          }
+        },
+        "task_0_3": {
+          "id": "TASK_0.3",
+          "title": "Fix ALL Exception Handling",
+          "status": "NOT_STARTED",
+          "assignee": null,
+          "started": null,
+          "completed": null,
+          "files_affected": [
+            "robo_trader/clients/async_ibkr_client.py",
+            "robo_trader/features/engine.py",
+            "robo_trader/execution.py"
+          ],
+          "tests_required": [
+            "test_exception_handling",
+            "test_error_recovery"
+          ],
+          "verification": {
+            "automated_check": "grep for 'except:' and 'except Exception: pass'",
+            "manual_review": true
+          }
+        },
+        "task_0_4": {
+          "id": "TASK_0.4",
+          "title": "Disable Debug Mode in Production",
+          "status": "NOT_STARTED",
+          "assignee": null,
+          "started": null,
+          "completed": null,
+          "files_affected": [
+            "test_dashboard_simple.py",
+            "app.py"
+          ],
+          "tests_required": [
+            "test_debug_mode_disabled_in_prod"
+          ],
+          "verification": {
+            "automated_check": "grep for debug=True",
+            "manual_review": false
+          }
+        }
+      }
+    },
+    "phase_1": {
+      "name": "Critical Safety",
+      "status": "NOT_STARTED",
+      "priority": "CRITICAL",
+      "estimated_days": 7,
+      "tasks": {
+        "task_1_1": {
+          "id": "TASK_1.1",
+          "title": "Implement Active Stop-Loss Monitoring",
+          "status": "NOT_STARTED",
+          "assignee": null,
+          "started": null,
+          "completed": null,
+          "files_affected": [
+            "robo_trader/stop_loss_monitor.py",
+            "robo_trader/runner_async.py"
+          ],
+          "tests_required": [
+            "test_stop_loss_triggers",
+            "test_stop_loss_execution",
+            "test_stop_loss_failure_handling"
+          ],
+          "verification": {
+            "automated_check": "integration test with price movements",
+            "manual_review": true
+          }
+        },
+        "task_1_2": {
+          "id": "TASK_1.2",
+          "title": "Integrate Kill Switch at ALL Entry Points",
+          "status": "NOT_STARTED",
+          "assignee": null,
+          "started": null,
+          "completed": null,
+          "files_affected": [
+            "robo_trader/runner_async.py",
+            "robo_trader/execution.py",
+            "robo_trader/smart_execution/smart_executor.py"
+          ],
+          "tests_required": [
+            "test_kill_switch_blocks_orders",
+            "test_kill_switch_coverage"
+          ],
+          "verification": {
+            "automated_check": "verify kill_switch check in all order paths",
+            "manual_review": true
+          }
+        },
+        "task_1_3": {
+          "id": "TASK_1.3",
+          "title": "Fix Position Update Race Conditions",
+          "status": "NOT_STARTED",
+          "assignee": null,
+          "started": null,
+          "completed": null,
+          "files_affected": [
+            "robo_trader/database_async.py",
+            "robo_trader/runner_async.py"
+          ],
+          "tests_required": [
+            "test_concurrent_position_updates",
+            "test_atomic_transactions"
+          ],
+          "verification": {
+            "automated_check": "concurrent stress test",
+            "manual_review": true
+          }
+        }
+      }
+    },
+    "phase_2": {
+      "name": "High Priority",
+      "status": "NOT_STARTED",
+      "priority": "HIGH",
+      "estimated_days": 14,
+      "tasks": {
+        "task_2_1": {
+          "id": "TASK_2.1",
+          "title": "Implement Market Data Validation",
+          "status": "NOT_STARTED",
+          "assignee": null,
+          "started": null,
+          "completed": null,
+          "files_affected": [
+            "robo_trader/data_validator.py"
+          ],
+          "tests_required": [
+            "test_stale_data_detection",
+            "test_outlier_detection",
+            "test_data_corruption_handling"
+          ],
+          "verification": {
+            "automated_check": "data validation test suite",
+            "manual_review": false
+          }
+        },
+        "task_2_2": {
+          "id": "TASK_2.2",
+          "title": "Implement Realistic Slippage Model",
+          "status": "NOT_STARTED",
+          "assignee": null,
+          "started": null,
+          "completed": null,
+          "files_affected": [
+            "robo_trader/execution.py"
+          ],
+          "tests_required": [
+            "test_slippage_calculation",
+            "test_market_impact"
+          ],
+          "verification": {
+            "automated_check": "slippage model tests",
+            "manual_review": true
+          }
+        },
+        "task_2_3": {
+          "id": "TASK_2.3",
+          "title": "Add Circuit Breaker Recovery",
+          "status": "NOT_STARTED",
+          "assignee": null,
+          "started": null,
+          "completed": null,
+          "files_affected": [
+            "robo_trader/circuit_breaker.py"
+          ],
+          "tests_required": [
+            "test_circuit_breaker_triggers",
+            "test_automatic_recovery",
+            "test_half_open_state"
+          ],
+          "verification": {
+            "automated_check": "circuit breaker state machine tests",
+            "manual_review": true
+          }
+        }
+      }
+    },
+    "phase_3": {
+      "name": "Medium Priority",
+      "status": "NOT_STARTED",
+      "priority": "MEDIUM",
+      "estimated_days": 30,
+      "tasks": {
+        "task_3_1": {
+          "id": "TASK_3.1",
+          "title": "Performance Optimization",
+          "status": "NOT_STARTED",
+          "assignee": null,
+          "started": null,
+          "completed": null,
+          "subtasks": [
+            "Increase DB connection pool",
+            "Add Redis caching",
+            "Cache correlation matrix",
+            "Batch order processing"
+          ]
+        },
+        "task_3_2": {
+          "id": "TASK_3.2",
+          "title": "Comprehensive Logging",
+          "status": "NOT_STARTED",
+          "assignee": null,
+          "started": null,
+          "completed": null,
+          "subtasks": [
+            "Structured logging format",
+            "Trace IDs",
+            "Log aggregation",
+            "Audit trail"
+          ]
+        },
+        "task_3_3": {
+          "id": "TASK_3.3",
+          "title": "Integration Testing Suite",
+          "status": "NOT_STARTED",
+          "assignee": null,
+          "started": null,
+          "completed": null,
+          "subtasks": [
+            "Risk scenario tests",
+            "Circuit breaker recovery tests",
+            "Concurrent trading tests",
+            "Data corruption recovery tests"
+          ]
+        },
+        "task_3_4": {
+          "id": "TASK_3.4",
+          "title": "Create Emergency Runbooks",
+          "status": "NOT_STARTED",
+          "assignee": null,
+          "started": null,
+          "completed": null,
+          "subtasks": [
+            "Kill switch triggered runbook",
+            "Database corruption runbook",
+            "API connection loss runbook",
+            "Position reconciliation runbook"
+          ]
+        }
+      }
+    }
+  },
+  "go_live_criteria": {
+    "phase_0_complete": false,
+    "phase_1_complete": false,
+    "phase_2_complete": false,
+    "phase_3_complete": false,
+    "paper_trading_days": 0,
+    "paper_trading_required": 7,
+    "risk_signoff": false,
+    "emergency_procedures_documented": false,
+    "capital_limit_set": false,
+    "monitoring_enabled": false,
+    "rollback_tested": false
+  },
+  "safety_check_results": {
+    "last_run": null,
+    "critical_issues": null,
+    "high_issues": null,
+    "medium_issues": null,
+    "low_issues": null,
+    "readiness_score": 5
+  },
+  "blockers": [
+    {
+      "id": "B001",
+      "description": "Hardcoded connection parameters in config.py",
+      "severity": "CRITICAL",
+      "task_ref": "TASK_0.1"
+    },
+    {
+      "id": "B002",
+      "description": "No SQL input validation layer",
+      "severity": "CRITICAL",
+      "task_ref": "TASK_0.2"
+    },
+    {
+      "id": "B003",
+      "description": "Bare exception handlers throughout codebase",
+      "severity": "CRITICAL",
+      "task_ref": "TASK_0.3"
+    },
+    {
+      "id": "B004",
+      "description": "Stop-loss not actively monitored",
+      "severity": "CRITICAL",
+      "task_ref": "TASK_1.1"
+    },
+    {
+      "id": "B005",
+      "description": "Kill switch not integrated in all paths",
+      "severity": "CRITICAL",
+      "task_ref": "TASK_1.2"
+    }
+  ],
+  "notes": [
+    "System is currently in paper trading only mode",
+    "Do not attempt live trading until all Phase 0 and Phase 1 tasks complete",
+    "Run safety_check.py after each task completion",
+    "Update this tracking document after each change"
+  ]
+}

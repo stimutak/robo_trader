@@ -1,8 +1,17 @@
 # Robo Trader - ML-Driven Production Trading Platform
 
+> ## ⚠️ CRITICAL: SYSTEM NOT READY FOR LIVE TRADING ⚠️
+> **This system has critical safety issues that MUST be resolved before any live trading.**  
+> **See [PRODUCTION_READINESS_PLAN.md](PRODUCTION_READINESS_PLAN.md) for the mandatory action plan.**  
+> **Current Production Readiness Score: 5/10 - PAPER TRADING ONLY**
+>
+> All developers MUST follow the production readiness plan until completion.
+
 A production-grade algorithmic trading system with IBKR integration, featuring advanced ML infrastructure, async architecture, and comprehensive risk management. Paper trading by default with strict capital preservation controls.
 
 ## 🚀 Current Status
+
+**⛔ SAFETY FIRST: Production readiness issues being addressed - see [PRODUCTION_READINESS_PLAN.md](PRODUCTION_READINESS_PLAN.md)**
 
 **Phase 3 In Progress!** Advanced Strategy Development with ML Enhanced Framework.
 - ✅ Phase 1: Foundation & Quick Wins (100% Complete)

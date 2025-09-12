@@ -1,5 +1,5 @@
 {
-  "timestamp": "2025-09-11T10:45:27.746640",
+  "timestamp": "2025-09-12T07:27:56.086898",
   "total_bugs": 188,
   "by_severity": {
     "critical": 0,
@@ -1623,21 +1623,21 @@
       "description": "Import of os may pose security risks"
     },
     {
-      "id": "nested_loops_app.py_2717",
+      "id": "nested_loops_app.py_2716",
       "severity": "medium",
       "category": "performance",
       "title": "Deeply nested loops",
       "file_path": "app.py",
-      "line_number": 2717,
+      "line_number": 2716,
       "description": "Found 3 levels of nested loops"
     },
     {
-      "id": "nested_loops_app.py_2756",
+      "id": "nested_loops_app.py_2755",
       "severity": "medium",
       "category": "performance",
       "title": "Deeply nested loops",
       "file_path": "app.py",
-      "line_number": 2756,
+      "line_number": 2755,
       "description": "Found 3 levels of nested loops"
     },
     {
