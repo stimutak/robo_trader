@@ -1,10 +1,10 @@
 {
-  "timestamp": "2025-09-12T07:41:55.076920",
-  "total_bugs": 191,
+  "timestamp": "2025-09-12T07:59:31.019228",
+  "total_bugs": 196,
   "by_severity": {
     "critical": 0,
-    "high": 6,
-    "medium": 185,
+    "high": 7,
+    "medium": 189,
     "low": 0,
     "info": 0
   },
@@ -12,8 +12,8 @@
     "syntax": 0,
     "type": 0,
     "logic": 0,
-    "performance": 153,
-    "security": 37,
+    "performance": 155,
+    "security": 40,
     "trading": 0,
     "risk": 0,
     "data": 1,
@@ -63,7 +63,7 @@
     ]
   ],
   "critical_bugs": 0,
-  "high_priority_bugs": 6,
+  "high_priority_bugs": 7,
   "bugs": [
     {
       "id": "import_security_runner_async.py_14",
@@ -75,21 +75,39 @@
       "description": "Import of os may pose security risks"
     },
     {
-      "id": "async_no_await_runner_async.py_160",
+      "id": "async_no_await_runner_async.py_167",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_get_position_lock' has no await",
       "file_path": "robo_trader/runner_async.py",
-      "line_number": 160,
+      "line_number": 167,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_execution.py_196",
+      "id": "async_no_await_runner_async.py_1407",
+      "severity": "medium",
+      "category": "performance",
+      "title": "Async function 'cancel_all_orders' has no await",
+      "file_path": "robo_trader/runner_async.py",
+      "line_number": 1407,
+      "description": "Async function should use await or be made synchronous"
+    },
+    {
+      "id": "import_security_execution.py_7",
+      "severity": "medium",
+      "category": "security",
+      "title": "Potentially unsafe import: os",
+      "file_path": "robo_trader/execution.py",
+      "line_number": 7,
+      "description": "Import of os may pose security risks"
+    },
+    {
+      "id": "async_no_await_execution.py_219",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'execute_order' has no await",
       "file_path": "robo_trader/execution.py",
-      "line_number": 196,
+      "line_number": 219,
       "description": "Async function should use await or be made synchronous"
     },
     {
@@ -183,39 +201,39 @@
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_stop_loss_monitor.py_148",
+      "id": "async_no_await_stop_loss_monitor.py_152",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'add_stop_loss' has no await",
       "file_path": "robo_trader/stop_loss_monitor.py",
-      "line_number": 148,
+      "line_number": 152,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_stop_loss_monitor.py_247",
+      "id": "async_no_await_stop_loss_monitor.py_251",
       "severity": "medium",
       "category": "performance",
       "title": "Async function '_update_trailing_stop' has no await",
       "file_path": "robo_trader/stop_loss_monitor.py",
-      "line_number": 247,
+      "line_number": 251,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_stop_loss_monitor.py_295",
+      "id": "async_no_await_stop_loss_monitor.py_299",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'check_stops' has no await",
       "file_path": "robo_trader/stop_loss_monitor.py",
-      "line_number": 295,
+      "line_number": 299,
       "description": "Async function should use await or be made synchronous"
     },
     {
-      "id": "async_no_await_stop_loss_monitor.py_469",
+      "id": "async_no_await_stop_loss_monitor.py_479",
       "severity": "medium",
       "category": "performance",
       "title": "Async function 'start_monitoring' has no await",
       "file_path": "robo_trader/stop_loss_monitor.py",
-      "line_number": 469,
+      "line_number": 479,
       "description": "Async function should use await or be made synchronous"
     },
     {
@@ -1713,6 +1731,24 @@
       "description": "Async function should use await or be made synchronous"
     },
     {
+      "id": "import_security_test_safety_features.py_16",
+      "severity": "medium",
+      "category": "security",
+      "title": "Potentially unsafe import: os",
+      "file_path": "test_safety_features.py",
+      "line_number": 16,
+      "description": "Import of os may pose security risks"
+    },
+    {
+      "id": "async_no_await_test_safety_features.py_205",
+      "severity": "medium",
+      "category": "performance",
+      "title": "Async function 'emergency_callback' has no await",
+      "file_path": "test_safety_features.py",
+      "line_number": 205,
+      "description": "Async function should use await or be made synchronous"
+    },
+    {
       "id": "import_security_check_db_locks.py_10",
       "severity": "medium",
       "category": "security",
@@ -1774,6 +1810,15 @@
       "file_path": "test_portfolio_manager.py",
       "line_number": 115,
       "description": "Found 4 levels of nested loops"
+    },
+    {
+      "id": "config_password_bug-report.json",
+      "severity": "high",
+      "category": "security",
+      "title": "Potential hardcoded password in config",
+      "file_path": "bug-report.json",
+      "line_number": null,
+      "description": "Configuration file may contain hardcoded passwords"
     },
     {
       "id": "data_error_handling_database_sync_old.py",

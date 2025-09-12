@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
@@ -41,6 +42,7 @@ from .portfolio import Portfolio  # Import Portfolio class from portfolio.py fil
 from .portfolio_pkg.portfolio_manager import AllocationMethod, MultiStrategyPortfolioManager
 from .risk.advanced_risk import AdvancedRiskManager, risk_monitor_task
 from .risk_manager import Position, RiskManager
+from .stop_loss_monitor import StopLossMonitor, StopType
 from .strategies import MLStrategy, sma_crossover_signals
 from .strategies.ml_enhanced_strategy import MLEnhancedStrategy
 
@@ -148,6 +150,11 @@ class AsyncRunner:
 
         # ML Strategy
         self.ml_strategy = None
+
+        # Stop-loss monitoring
+        self.stop_loss_monitor = None
+        self.enable_stop_loss = True  # Always enabled for safety
+        self.stop_loss_percent = 0.02  # Default 2% stop-loss
         self.ml_enhanced_strategy = None
         self.active_strategy_name: Optional[str] = None
 
@@ -304,6 +311,26 @@ class AsyncRunner:
             smart_executor=smart_executor,
             use_smart_execution=self.use_smart_execution,
         )
+
+        # Initialize stop-loss monitor (CRITICAL SAFETY COMPONENT)
+        if self.enable_stop_loss:
+
+            async def emergency_shutdown_callback(reason: str):
+                """Emergency shutdown on stop-loss failure."""
+                logger.critical(f"EMERGENCY SHUTDOWN: {reason}")
+                self.running = False
+                if self.advanced_risk and hasattr(self.advanced_risk, "kill_switch"):
+                    self.advanced_risk.kill_switch.trigger(reason)
+                # Cancel all active orders
+                await self.cancel_all_orders()
+
+            self.stop_loss_monitor = StopLossMonitor(
+                executor=self.executor,
+                risk_manager=self.risk,
+                emergency_shutdown_callback=emergency_shutdown_callback,
+            )
+            await self.stop_loss_monitor.start_monitoring()
+            logger.info(f"Stop-loss monitoring enabled with {self.stop_loss_percent:.1%} threshold")
 
         # Initialize portfolio
         starting_cash = (
@@ -581,6 +608,10 @@ class AsyncRunner:
             if self.use_advanced_risk and self.advanced_risk and latest_price:
                 self.advanced_risk.update_market_prices({symbol: latest_price})
 
+            # Update stop-loss monitor with latest price
+            if self.stop_loss_monitor and latest_price:
+                await self.stop_loss_monitor.update_price(symbol, latest_price)
+
         # Generate trading signal
         with Timer("signal_generation", self.monitor):
             if self.use_ml_enhanced and self.ml_enhanced_strategy:
@@ -764,6 +795,23 @@ class AsyncRunner:
                 pos = self.positions[symbol]
                 qty_to_cover = abs(pos.quantity)
 
+                # Check kill switch before order execution
+                if self.advanced_risk and hasattr(self.advanced_risk, "kill_switch"):
+                    if self.advanced_risk.kill_switch.triggered:
+                        logger.error(
+                            f"KILL SWITCH ACTIVE - Order blocked for {symbol} BUY_TO_COVER"
+                        )
+                        message = f"Kill switch active - trading halted"
+                        return SymbolResult(
+                            symbol=symbol,
+                            signal=0,  # No signal computed when kill switch active
+                            price=price,
+                            quantity=0,
+                            executed=False,
+                            message=message,
+                            data=df,
+                        )
+
                 with Timer("order_execution", self.monitor):
                     res = self.executor.place_order(
                         Order(
@@ -771,6 +819,9 @@ class AsyncRunner:
                         )
                     )
                 if res.ok:
+                    # Cancel stop-loss when covering short position
+                    if self.stop_loss_monitor:
+                        self.stop_loss_monitor.cancel_stop(symbol)
                     fill_price = res.fill_price or price
                     # Use atomic position update to prevent race conditions
                     success = await self._update_position_atomic(
@@ -877,6 +928,21 @@ class AsyncRunner:
                 )
 
                 if ok and qty > 0:
+                    # Check kill switch before order execution
+                    if self.advanced_risk and hasattr(self.advanced_risk, "kill_switch"):
+                        if self.advanced_risk.kill_switch.triggered:
+                            logger.error(f"KILL SWITCH ACTIVE - Order blocked for {symbol} BUY")
+                            message = f"Kill switch active - trading halted"
+                            return SymbolResult(
+                                symbol=symbol,
+                                signal=0,  # No signal computed when kill switch active
+                                price=price,
+                                quantity=0,
+                                executed=False,
+                                message=message,
+                                data=df,
+                            )
+
                     with Timer("order_execution", self.monitor):
                         res = self.executor.place_order(
                             Order(symbol=symbol, quantity=qty, side="BUY", price=price)
@@ -904,6 +970,28 @@ class AsyncRunner:
                             quantity = qty
                             message = f"Opened long: Bought {qty} shares at ${fill_price:.2f}"
 
+                            # Add stop-loss order for the new position
+                            if self.stop_loss_monitor and self.enable_stop_loss:
+                                try:
+                                    # Create position object for stop-loss
+                                    new_position = Position(
+                                        symbol=symbol,
+                                        quantity=qty,
+                                        avg_price=fill_price,
+                                        entry_time=datetime.now(),
+                                    )
+                                    await self.stop_loss_monitor.add_stop_loss(
+                                        symbol=symbol,
+                                        position=new_position,
+                                        stop_percent=self.stop_loss_percent,
+                                        stop_type=StopType.FIXED,
+                                    )
+                                    logger.info(
+                                        f"Stop-loss order added for {symbol} at {self.stop_loss_percent:.1%}"
+                                    )
+                                except Exception as e:
+                                    logger.error(f"Failed to add stop-loss for {symbol}: {e}")
+
                             # Send trade update via WebSocket
                             if WEBSOCKET_ENABLED and ws_client:
                                 try:
@@ -928,11 +1016,29 @@ class AsyncRunner:
                 pos = self.positions[symbol]
 
                 if pos.quantity > 0:  # Closing long position
+                    # Check kill switch before order execution
+                    if self.advanced_risk and hasattr(self.advanced_risk, "kill_switch"):
+                        if self.advanced_risk.kill_switch.triggered:
+                            logger.error(f"KILL SWITCH ACTIVE - Order blocked for {symbol} SELL")
+                            message = f"Kill switch active - trading halted"
+                            return SymbolResult(
+                                symbol=symbol,
+                                signal=0,  # No signal computed when kill switch active
+                                price=price,
+                                quantity=0,
+                                executed=False,
+                                message=message,
+                                data=df,
+                            )
+
                     with Timer("order_execution", self.monitor):
                         res = self.executor.place_order(
                             Order(symbol=symbol, quantity=pos.quantity, side="SELL", price=price)
                         )
                     if res.ok:
+                        # Cancel stop-loss when closing position
+                        if self.stop_loss_monitor:
+                            self.stop_loss_monitor.cancel_stop(symbol)
                         fill_price = res.fill_price or price
                         # Use atomic position update to prevent race conditions
                         success = await self._update_position_atomic(
@@ -1004,11 +1110,50 @@ class AsyncRunner:
                 )
 
                 if ok and qty > 0:
+                    # Check kill switch before order execution
+                    if self.advanced_risk and hasattr(self.advanced_risk, "kill_switch"):
+                        if self.advanced_risk.kill_switch.triggered:
+                            logger.error(
+                                f"KILL SWITCH ACTIVE - Order blocked for {symbol} SELL_SHORT"
+                            )
+                            message = f"Kill switch active - trading halted"
+                            return SymbolResult(
+                                symbol=symbol,
+                                signal=0,  # No signal computed when kill switch active
+                                price=price,
+                                quantity=0,
+                                executed=False,
+                                message=message,
+                                data=df,
+                            )
+
                     with Timer("order_execution", self.monitor):
                         res = self.executor.place_order(
                             Order(symbol=symbol, quantity=qty, side="SELL_SHORT", price=price)
                         )
                     if res.ok:
+                        fill_price = res.fill_price or price
+                        # Add stop-loss for short position
+                        if self.stop_loss_monitor and self.enable_stop_loss:
+                            try:
+                                # Create position object for stop-loss (negative quantity for short)
+                                short_position = Position(
+                                    symbol=symbol,
+                                    quantity=-qty,  # Negative for short
+                                    avg_price=fill_price,
+                                    entry_time=datetime.now(),
+                                )
+                                await self.stop_loss_monitor.add_stop_loss(
+                                    symbol=symbol,
+                                    position=short_position,
+                                    stop_percent=self.stop_loss_percent,
+                                    stop_type=StopType.FIXED,
+                                )
+                                logger.info(
+                                    f"Stop-loss order added for SHORT {symbol} at {self.stop_loss_percent:.1%}"
+                                )
+                            except Exception as e:
+                                logger.error(f"Failed to add stop-loss for short {symbol}: {e}")
                         fill_price = res.fill_price or price
                         # Use atomic position update to prevent race conditions
                         success = await self._update_position_atomic(
@@ -1268,6 +1413,27 @@ class AsyncRunner:
         finally:
             await self.teardown()
 
+    async def cancel_all_orders(self):
+        """Cancel all pending orders - used for emergency shutdown."""
+        try:
+            cancelled_count = 0
+
+            # Cancel stop-loss orders
+            if self.stop_loss_monitor:
+                cancelled_count += self.stop_loss_monitor.cancel_all_stops()
+
+            # In a real system, would also cancel any pending broker orders
+            # For paper trading, we just log the action
+            logger.warning(f"Emergency shutdown: Cancelled {cancelled_count} orders")
+
+            # Clear any pending executions
+            self.positions.clear()
+
+            return cancelled_count
+        except Exception as e:
+            logger.error(f"Error cancelling orders: {e}")
+            return 0
+
     async def cleanup(self):
         """Clean up resources when runner is done."""
         try:
@@ -1278,6 +1444,17 @@ class AsyncRunner:
                     await self.risk_monitor_task
                 except asyncio.CancelledError:
                     pass
+
+            # Stop and cleanup stop-loss monitor
+            if self.stop_loss_monitor:
+                logger.info("Stopping stop-loss monitor...")
+                await self.stop_loss_monitor.stop_monitoring()
+                metrics = self.stop_loss_monitor.get_metrics()
+                logger.info(
+                    f"Stop-loss metrics - Triggered: {metrics.triggered_today}, "
+                    f"Executed: {metrics.executed_today}, Failed: {metrics.failed_today}, "
+                    f"Prevented loss: ${metrics.total_prevented_loss:.2f}"
+                )
 
             # Save advanced risk manager state
             if self.use_advanced_risk and self.advanced_risk:

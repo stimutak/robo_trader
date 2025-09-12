@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 if TYPE_CHECKING:
     from .smart_execution.smart_executor import ExecutionAlgorithm, ExecutionParams, SmartExecutor
+
+from robo_trader.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -65,8 +70,15 @@ class PaperExecutor(AbstractExecutor):
         if order.quantity <= 0:
             return ExecutionResult(False, "Quantity must be positive")
         side = order.side.upper()
-        if side not in {"BUY", "SELL"}:
-            return ExecutionResult(False, "Side must be BUY or SELL")
+        if side not in {"BUY", "SELL", "BUY_TO_COVER", "SELL_SHORT"}:
+            return ExecutionResult(False, "Side must be BUY, SELL, BUY_TO_COVER, or SELL_SHORT")
+
+        # CRITICAL: Check kill switch as secondary safety layer
+        # This is a fallback in case the primary check in runner fails
+        kill_switch_file = "data/kill_switch.lock"
+        if os.path.exists(kill_switch_file):
+            logger.error(f"KILL SWITCH ACTIVE (executor level) - Order blocked for {order.symbol}")
+            return ExecutionResult(False, "Kill switch active - all trading halted")
 
         # Use smart execution if enabled and available
         if self.use_smart_execution and self.smart_executor:
@@ -80,8 +92,15 @@ class PaperExecutor(AbstractExecutor):
         if order.quantity <= 0:
             return ExecutionResult(False, "Quantity must be positive")
         side = order.side.upper()
-        if side not in {"BUY", "SELL"}:
-            return ExecutionResult(False, "Side must be BUY or SELL")
+        if side not in {"BUY", "SELL", "BUY_TO_COVER", "SELL_SHORT"}:
+            return ExecutionResult(False, "Side must be BUY, SELL, BUY_TO_COVER, or SELL_SHORT")
+
+        # CRITICAL: Check kill switch as secondary safety layer
+        # This is a fallback in case the primary check in runner fails
+        kill_switch_file = "data/kill_switch.lock"
+        if os.path.exists(kill_switch_file):
+            logger.error(f"KILL SWITCH ACTIVE (executor level) - Order blocked for {order.symbol}")
+            return ExecutionResult(False, "Kill switch active - all trading halted")
 
         # Use smart execution if enabled and available
         if self.use_smart_execution and self.smart_executor:
@@ -96,7 +115,11 @@ class PaperExecutor(AbstractExecutor):
         base = order.price if order.price is not None else 0.0
         # Apply symmetric slippage in basis points
         slip = base * (self.slippage_bps / 10_000.0) if base > 0 else 0.0
-        fill = base + slip if order.side.upper() == "BUY" else base - slip
+        # Handle all order sides including short selling
+        if order.side.upper() in {"BUY", "BUY_TO_COVER"}:
+            fill = base + slip
+        else:  # SELL or SELL_SHORT
+            fill = base - slip
         self.fills[f"{order.symbol}-{len(self.fills)+1}"] = (
             dt.datetime.utcnow(),
             order,
