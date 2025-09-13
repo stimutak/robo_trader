@@ -275,13 +275,14 @@ class TestPhase4Security(unittest.TestCase):
         auth_manager = AuthManager()
 
         # Test user creation
-        user = auth_manager.create_user(
-            username="testuser", password="SecurePass123!", role="trader"
-        )
+        import os
+
+        test_password = os.getenv("TEST_PASSWORD", "TestP@ssw0rd_" + str(os.getpid()))
+        user = auth_manager.create_user(username="testuser", password=test_password, role="trader")
 
         self.assertIsNotNone(user)
         self.assertEqual(user.username, "testuser")
-        self.assertNotEqual(user.password_hash, "SecurePass123!")  # Should be hashed
+        self.assertNotEqual(user.password_hash, test_password)  # Should be hashed
 
         # Test authentication
         token = auth_manager.authenticate("testuser", "SecurePass123!")

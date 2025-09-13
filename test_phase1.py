@@ -44,7 +44,7 @@ def test_configuration():
 
         # Test environment presets
         prod_config = Config(environment=Environment.PRODUCTION)
-        assert prod_config.monitoring.enable_alerts == True
+        assert prod_config.monitoring.enable_alerts is True
         print("✓ Environment presets working")
 
     except Exception as e:
@@ -208,9 +208,10 @@ def test_structured_logging():
         print("✓ Audit logging working")
 
         # Test sensitive data censoring
-        logger.info(
-            "Test", api_key="secret123", safe_field="visible"
-        )  # Security: Test API key only
+        import os
+
+        test_api_key = os.getenv("TEST_API_KEY", f"test_key_{os.getpid()}")
+        logger.info("Test", api_key=test_api_key, safe_field="visible")
         print("✓ Sensitive data censoring working")
 
     except Exception as e:

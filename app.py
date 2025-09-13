@@ -2477,11 +2477,69 @@ def status():
             
             # Calculate basic metrics
             run_rate = unrealized_pnl * 252 if unrealized_pnl != 0 else 0  # Annualized
+            
+            # Get trades to calculate win rate and profit factor
+            trades = await db.get_trades(limit=100)
+            
+            # Calculate win rate
+            winning_trades = [t for t in trades if t.get('pnl', 0) > 0]
+            losing_trades = [t for t in trades if t.get('pnl', 0) < 0]
+            win_rate = len(winning_trades) / len(trades) if trades else 0.0
+            
+            # Calculate profit factor
+            gross_profit = sum(t.get('pnl', 0) for t in winning_trades)
+            gross_loss = abs(sum(t.get('pnl', 0) for t in losing_trades))
+            profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0.0
+            
+            # Calculate Sharpe ratio from returns
+            if trades and len(trades) >= 2:
+                returns = []
+                sorted_trades = sorted(trades, key=lambda x: x.get('timestamp', ''))
+                for i in range(1, len(sorted_trades)):
+                    if sorted_trades[i-1].get('pnl') and sorted_trades[i].get('pnl'):
+                        prev_val = sorted_trades[i-1]['pnl']
+                        curr_val = sorted_trades[i]['pnl']
+                        if prev_val != 0:
+                            returns.append((curr_val - prev_val) / abs(prev_val))
+                
+                if returns:
+                    import numpy as np
+                    returns_array = np.array(returns)
+                    avg_return = np.mean(returns_array)
+                    std_return = np.std(returns_array)
+                    sharpe_ratio = (avg_return * np.sqrt(252) / std_return) if std_return > 0 else 0.0
+                else:
+                    sharpe_ratio = 0.0
+            else:
+                sharpe_ratio = 0.0
+            
+            # Calculate max drawdown
+            if trades:
+                equity_curve = []
+                cumulative_pnl = 0
+                for trade in sorted(trades, key=lambda x: x.get('timestamp', '')):
+                    cumulative_pnl += trade.get('pnl', 0)
+                    equity_curve.append(cumulative_pnl)
+                
+                if equity_curve:
+                    peak = equity_curve[0]
+                    max_drawdown = 0
+                    for value in equity_curve:
+                        if value > peak:
+                            peak = value
+                        drawdown = (value - peak) / peak if peak != 0 else 0
+                        if drawdown < max_drawdown:
+                            max_drawdown = drawdown
+                else:
+                    max_drawdown = 0.0
+            else:
+                max_drawdown = 0.0
+            
             real_metrics = {
-                'sharpe_ratio': 0.0,  # TODO: Calculate from returns
-                'win_rate': 0.0,  # TODO: Calculate from closed trades
-                'profit_factor': 0.0,  # TODO: Calculate from P&L
-                'max_drawdown': 0.0,  # TODO: Calculate from equity curve
+                'sharpe_ratio': round(sharpe_ratio, 2),
+                'win_rate': round(win_rate, 3),
+                'profit_factor': round(profit_factor, 2),
+                'max_drawdown': round(max_drawdown, 3),
                 'total_value': total_value,
                 'total_cost': total_cost,
                 'pnl_pct': pnl_pct,

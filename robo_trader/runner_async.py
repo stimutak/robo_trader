@@ -162,7 +162,141 @@ class AsyncRunner:
         self.mean_reversion_strategy = None
         self.pairs_strategy = None
         self.stat_arb_strategy = None
-        self.market_data_cache = {}  # Cache for pairs/stat arb analysis
+        # Cache for pairs/stat arb analysis with size limit
+        from collections import OrderedDict
+
+        self.market_data_cache = OrderedDict()  # LRU-style cache
+        self.max_cache_size = 100  # Maximum number of symbols to cache
+
+        # Symbol to sector mapping (can be enhanced with external data source)
+        self.symbol_sectors = {
+            # Technology
+            "AAPL": "Technology",
+            "MSFT": "Technology",
+            "GOOGL": "Technology",
+            "META": "Technology",
+            "NVDA": "Technology",
+            "AMD": "Technology",
+            "INTC": "Technology",
+            "CSCO": "Technology",
+            "ORCL": "Technology",
+            "PLTR": "Technology",
+            "UPST": "Technology",
+            "SOFI": "Technology",
+            # Financials
+            "JPM": "Financials",
+            "BAC": "Financials",
+            "WFC": "Financials",
+            "GS": "Financials",
+            "MS": "Financials",
+            "C": "Financials",
+            "AXP": "Financials",
+            "V": "Financials",
+            "MA": "Financials",
+            # Healthcare
+            "JNJ": "Healthcare",
+            "PFE": "Healthcare",
+            "UNH": "Healthcare",
+            "CVS": "Healthcare",
+            "ABBV": "Healthcare",
+            "MRK": "Healthcare",
+            "TMO": "Healthcare",
+            "ABT": "Healthcare",
+            "LLY": "Healthcare",
+            # Energy
+            "XOM": "Energy",
+            "CVX": "Energy",
+            "COP": "Energy",
+            "SLB": "Energy",
+            "EOG": "Energy",
+            "PXD": "Energy",
+            "CEG": "Energy",
+            "VRT": "Energy",
+            # Consumer
+            "AMZN": "Consumer",
+            "TSLA": "Consumer",
+            "WMT": "Consumer",
+            "HD": "Consumer",
+            "NKE": "Consumer",
+            "MCD": "Consumer",
+            "SBUX": "Consumer",
+            "TGT": "Consumer",
+            "COST": "Consumer",
+            # Industrials
+            "BA": "Industrials",
+            "CAT": "Industrials",
+            "GE": "Industrials",
+            "LMT": "Industrials",
+            "UPS": "Industrials",
+            "RTX": "Industrials",
+            "HON": "Industrials",
+            "DE": "Industrials",
+            "MMM": "Industrials",
+            # Communications
+            "DIS": "Communications",
+            "NFLX": "Communications",
+            "CMCSA": "Communications",
+            "T": "Communications",
+            "VZ": "Communications",
+            "TMUS": "Communications",
+            # Materials
+            "LIN": "Materials",
+            "APD": "Materials",
+            "SHW": "Materials",
+            "ECL": "Materials",
+            "DD": "Materials",
+            "NEM": "Materials",
+            # Real Estate
+            "PLD": "Real Estate",
+            "AMT": "Real Estate",
+            "CCI": "Real Estate",
+            "EQIX": "Real Estate",
+            "PSA": "Real Estate",
+            "SPG": "Real Estate",
+            "OPEN": "Real Estate",
+            # Utilities
+            "NEE": "Utilities",
+            "SO": "Utilities",
+            "DUK": "Utilities",
+            "D": "Utilities",
+            "AEP": "Utilities",
+            "EXC": "Utilities",
+            # Crypto/Blockchain
+            "CORZ": "Crypto",
+            "WULF": "Crypto",
+            "RIOT": "Crypto",
+            "MARA": "Crypto",
+            "HUT": "Crypto",
+            "BTBT": "Crypto",
+            # AI/ML Companies
+            "IXHL": "AI/Tech",
+            "NUAI": "AI/Tech",
+            "BZAI": "AI/Tech",
+            "ELTP": "AI/Tech",
+            "SDGR": "AI/Tech",
+            "APLD": "AI/Tech",
+            # Biotech
+            "HTFL": "Biotech",
+            "TEM": "Biotech",
+            # ETFs
+            "SPY": "ETF",
+            "QQQ": "ETF",
+            "IWM": "ETF",
+            "DIA": "ETF",
+            "VTI": "ETF",
+            "VOO": "ETF",
+        }
+
+    def _get_symbol_sector(self, symbol: str) -> str:
+        """Get sector classification for a symbol.
+
+        Args:
+            symbol: Stock symbol
+
+        Returns:
+            Sector name or 'Unknown' if not found
+        """
+        return self.symbol_sectors.get(symbol, "Unknown")
 
     async def _get_position_lock(self, symbol: str) -> asyncio.Lock:
         """Get or create a lock for a specific symbol."""
@@ -575,6 +709,14 @@ class AsyncRunner:
             logger.error(f"Failed to fetch data for {symbol}: {e}")
             return None
 
+    def _manage_cache_size(self):
+        """Ensure cache doesn't exceed max size (LRU eviction)."""
+        while len(self.market_data_cache) > self.max_cache_size:
+            # Remove oldest item (first item in OrderedDict)
+            oldest_symbol = next(iter(self.market_data_cache))
+            del self.market_data_cache[oldest_symbol]
+            logger.debug(f"Evicted {oldest_symbol} from market data cache")
+
     async def process_symbol(self, symbol: str) -> SymbolResult:
         """Process a single symbol - fetch data, generate signal, execute if needed."""
         # Fetch and store market data
@@ -589,8 +731,11 @@ class AsyncRunner:
                 message="No data available",
             )
 
-        # Cache market data for pairs/stat arb analysis
+        # Cache market data for pairs/stat arb analysis with LRU eviction
+        if symbol in self.market_data_cache:
+            self.market_data_cache.move_to_end(symbol)
         self.market_data_cache[symbol] = df
+        self._manage_cache_size()
 
         # Send real-time price update via WebSocket
         latest_price = None
@@ -748,9 +893,10 @@ class AsyncRunner:
 
         # Update correlation tracker with price data if enabled
         if self.use_correlation_sizing and self.correlation_tracker:
-            # Add price series for correlation calculation
+            # Add price series for correlation calculation with sector classification
+            sector = self._get_symbol_sector(symbol)
             self.correlation_tracker.add_price_series(
-                symbol=symbol, prices=df["close"], sector=None  # TODO: Add sector classification
+                symbol=symbol, prices=df["close"], sector=sector
             )
 
         last = signals.iloc[-1]

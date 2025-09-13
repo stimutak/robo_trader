@@ -77,3 +77,6 @@ coverage.xml
 *token*
 *credentials*
 
+# Bug detection reports
+bug-report.json
+

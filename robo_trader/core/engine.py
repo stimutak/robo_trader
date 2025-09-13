@@ -20,7 +20,7 @@ from robo_trader.clients.async_ibkr_client import AsyncIBKRClient as IBKRClient
 from robo_trader.config import Config, TradingMode
 from robo_trader.correlation import CorrelationTracker
 from robo_trader.database import TradingDatabase
-from robo_trader.execution import AbstractExecutor, PaperExecutor
+from robo_trader.execution import AbstractExecutor, LiveExecutor, PaperExecutor
 from robo_trader.logger import get_logger
 from robo_trader.portfolio import Portfolio
 from robo_trader.risk_manager import RiskManager, create_risk_manager_from_config
@@ -153,10 +153,22 @@ class TradingEngine:
 
             # Initialize executor
             if self.config.execution.mode == TradingMode.PAPER:
-                self.executor = PaperExecutor()
+                self.executor = PaperExecutor(
+                    slippage_bps=self.config.execution.slippage_bps,
+                    use_smart_execution=self.config.execution.use_smart_execution,
+                    skip_execution_delays=self.config.execution.skip_execution_delays
+                    if hasattr(self.config.execution, "skip_execution_delays")
+                    else True,
+                )
             else:
-                # TODO: Implement live executor
-                raise NotImplementedError("Live trading not yet implemented")
+                # Live trading executor
+                self.executor = LiveExecutor(
+                    ibkr_client=self.ibkr_client,
+                    use_smart_execution=self.config.execution.use_smart_execution,
+                    skip_execution_delays=self.config.execution.skip_execution_delays
+                    if hasattr(self.config.execution, "skip_execution_delays")
+                    else False,
+                )
 
             # Initialize portfolio
             self.portfolio = Portfolio(self.config.default_cash)
@@ -353,10 +365,50 @@ class TradingEngine:
 
     async def _data_streaming_loop(self) -> None:
         """Stream real-time market data."""
+        subscribed_symbols = set()
+
         while self.state == EngineState.RUNNING:
             try:
-                # TODO: Implement real-time data streaming
-                await asyncio.sleep(1)
+                # Subscribe to real-time data for active symbols
+                active_symbols = (
+                    self.strategy_manager.get_active_symbols() if self.strategy_manager else []
+                )
+
+                # Subscribe to new symbols
+                for symbol in active_symbols:
+                    if symbol not in subscribed_symbols:
+                        try:
+                            await self.ibkr_client.subscribe_market_data(symbol)
+                            subscribed_symbols.add(symbol)
+                            logger.info(f"Subscribed to real-time data for {symbol}")
+                        except Exception as e:
+                            logger.error(f"Failed to subscribe to {symbol}: {e}")
+
+                # Unsubscribe from removed symbols
+                for symbol in list(subscribed_symbols):
+                    if symbol not in active_symbols:
+                        try:
+                            await self.ibkr_client.unsubscribe_market_data(symbol)
+                            subscribed_symbols.remove(symbol)
+                            logger.info(f"Unsubscribed from {symbol}")
+                        except Exception as e:
+                            logger.error(f"Failed to unsubscribe from {symbol}: {e}")
+
+                # Process incoming market data
+                if self.ibkr_client and self.ibkr_client.is_connected():
+                    market_data = await self.ibkr_client.get_market_data_updates(timeout=1.0)
+                    for symbol, data in market_data.items():
+                        if self.database:
+                            await self.database.store_market_data(
+                                symbol=symbol,
+                                timestamp=data.get("timestamp"),
+                                price=data.get("last"),
+                                volume=data.get("volume"),
+                                bid=data.get("bid"),
+                                ask=data.get("ask"),
+                            )
+
+                await asyncio.sleep(0.1)  # Small delay to prevent CPU spinning
 
             except Exception as e:
                 logger.error(f"Data streaming error: {e}")
@@ -383,8 +435,9 @@ class TradingEngine:
 
             # Store market data
             if self.database:
-                # TODO: Store market data
-                pass
+                await self.database.store_bars(
+                    symbol=symbol, bars=bars, timeframe=self.config.data.bar_size
+                )
 
             # Update correlation tracker
             if self.correlation_tracker and len(bars) > 0:
@@ -397,7 +450,50 @@ class TradingEngine:
             signal = self.strategy_manager.evaluate_symbol(symbol, bars)
 
             # Execute trades based on signals
-            # TODO: Implement trade execution logic
+            if signal and signal.strength != 0:
+                # Check risk limits
+                if self.risk_manager:
+                    position_size = self.risk_manager.calculate_position_size(
+                        symbol=symbol,
+                        signal_strength=abs(signal.strength),
+                        current_price=bars["close"].iloc[-1],
+                    )
+
+                    if position_size > 0:
+                        # Create order
+                        from robo_trader.execution import Order
+
+                        side = "BUY" if signal.strength > 0 else "SELL"
+                        order = Order(
+                            symbol=symbol,
+                            quantity=int(position_size),
+                            side=side,
+                            price=None,  # Market order
+                        )
+
+                        # Execute order
+                        if self.executor:
+                            if hasattr(self.executor, "place_order_async"):
+                                result = await self.executor.place_order_async(order)
+                            else:
+                                result = self.executor.place_order(order)
+
+                            if result.ok:
+                                logger.info(
+                                    f"Order executed: {side} {position_size} {symbol} @ {result.fill_price}"
+                                )
+                                self.metrics["trades_executed"] += 1
+
+                                # Update portfolio
+                                if self.portfolio:
+                                    self.portfolio.update_position(
+                                        symbol=symbol,
+                                        quantity=position_size if side == "BUY" else -position_size,
+                                        price=result.fill_price,
+                                    )
+                            else:
+                                logger.warning(f"Order failed: {result.message}")
+                                self.metrics["trade_errors"] += 1
 
         except Exception as e:
             logger.error(f"Error processing {symbol}: {e}")
@@ -408,8 +504,22 @@ class TradingEngine:
         prices = {}
         for symbol in symbols:
             try:
-                # TODO: Implement real-time price fetching
-                prices[symbol] = 0.0
+                # Fetch real-time price from IBKR
+                if self.ibkr_client and self.ibkr_client.is_connected():
+                    ticker = await self.ibkr_client.get_ticker(symbol)
+                    if ticker and ticker.get("last"):
+                        prices[symbol] = ticker["last"]
+                    else:
+                        # Fallback to recent bars
+                        bars = await self.ibkr_client.fetch_recent_bars(
+                            symbol, duration="1 D", bar_size="1 min"
+                        )
+                        if not bars.empty:
+                            prices[symbol] = bars["close"].iloc[-1]
+                        else:
+                            prices[symbol] = 0.0
+                else:
+                    prices[symbol] = 0.0
             except Exception as e:
                 logger.error(f"Error fetching price for {symbol}: {e}")
         return prices
@@ -450,7 +560,8 @@ class TradingEngine:
         # Check database
         if self.database:
             try:
-                # TODO: Implement database health check
+                # Test database connection
+                await self.database.execute_query("SELECT 1")
                 self.health_checks["database"] = HealthCheck(
                     "database", HealthStatus.HEALTHY, "Database operational"
                 )
@@ -477,7 +588,57 @@ class TradingEngine:
                     )
 
         # Check system resources
-        # TODO: Implement resource checks (memory, CPU, disk)
+        try:
+            import psutil
+
+            # Check CPU usage
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            if cpu_percent > 90:
+                self.health_checks["cpu"] = HealthCheck(
+                    "cpu", HealthStatus.UNHEALTHY, f"CPU usage critical: {cpu_percent}%"
+                )
+            elif cpu_percent > 70:
+                self.health_checks["cpu"] = HealthCheck(
+                    "cpu", HealthStatus.DEGRADED, f"CPU usage high: {cpu_percent}%"
+                )
+            else:
+                self.health_checks["cpu"] = HealthCheck(
+                    "cpu", HealthStatus.HEALTHY, f"CPU usage normal: {cpu_percent}%"
+                )
+
+            # Check memory usage
+            memory = psutil.virtual_memory()
+            if memory.percent > 90:
+                self.health_checks["memory"] = HealthCheck(
+                    "memory", HealthStatus.UNHEALTHY, f"Memory usage critical: {memory.percent}%"
+                )
+            elif memory.percent > 80:
+                self.health_checks["memory"] = HealthCheck(
+                    "memory", HealthStatus.DEGRADED, f"Memory usage high: {memory.percent}%"
+                )
+            else:
+                self.health_checks["memory"] = HealthCheck(
+                    "memory", HealthStatus.HEALTHY, f"Memory usage normal: {memory.percent}%"
+                )
+
+            # Check disk usage
+            disk = psutil.disk_usage("/")
+            if disk.percent > 95:
+                self.health_checks["disk"] = HealthCheck(
+                    "disk", HealthStatus.UNHEALTHY, f"Disk usage critical: {disk.percent}%"
+                )
+            elif disk.percent > 85:
+                self.health_checks["disk"] = HealthCheck(
+                    "disk", HealthStatus.DEGRADED, f"Disk usage high: {disk.percent}%"
+                )
+            else:
+                self.health_checks["disk"] = HealthCheck(
+                    "disk", HealthStatus.HEALTHY, f"Disk usage normal: {disk.percent}%"
+                )
+        except ImportError:
+            logger.warning("psutil not installed, skipping resource checks")
+        except Exception as e:
+            logger.error(f"Resource check error: {e}")
 
         self.last_health_check = datetime.now()
 

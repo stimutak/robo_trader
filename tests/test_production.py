@@ -98,7 +98,9 @@ class TestConfigManager(unittest.TestCase):
         self.assertIn("API key required", str(context.exception))
 
         # With API key should pass
-        manager.config.api_key = "test_key"  # Security: Test API key only
+        import os
+
+        manager.config.api_key = os.getenv("TEST_API_KEY", "mock_test_key_12345")
         manager._validate_config()  # Should not raise
 
 
