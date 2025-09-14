@@ -113,28 +113,38 @@ class SyncDatabaseReader:
             print(f"Error getting positions: {e}")
             return []
 
-    def get_recent_trades(self, limit: int = 100, symbol: Optional[str] = None) -> List[Dict]:
-        """Get recent trades"""
+    def get_recent_trades(
+        self, limit: int = 100, symbol: Optional[str] = None, days: Optional[int] = None
+    ) -> List[Dict]:
+        """Get recent trades, optionally filtered by symbol and recent days.
+
+        Args:
+            limit: Maximum number of rows to return ordered by timestamp DESC
+            symbol: If provided, only return trades for this symbol
+            days: If provided, include only trades with timestamp within the past N days
+        """
         try:
+            # Build WHERE clauses dynamically
+            where_clauses = []
+            params: Tuple = ()
+
             if symbol:
-                rows = self._fetch_all(
-                    """
-                    SELECT * FROM trades
-                    WHERE symbol = ?
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                    """,
-                    (symbol, limit),
-                )
-            else:
-                rows = self._fetch_all(
-                    """
-                    SELECT * FROM trades
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                )
+                where_clauses.append("symbol = ?")
+                params += (symbol,)
+
+            if days is not None:
+                where_clauses.append("timestamp >= datetime('now', '-' || ? || ' days')")
+                params += (days,)
+
+            where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+            sql = (
+                "SELECT * FROM trades" + where_sql + " ORDER BY timestamp DESC LIMIT ?"
+            )
+
+            params += (limit,)
+
+            rows = self._fetch_all(sql, params)
             return [dict(row) for row in rows]
         except Exception as e:
             print(f"Error getting trades: {e}")
