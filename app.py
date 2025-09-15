@@ -396,7 +396,7 @@ HTML_TEMPLATE = """
             border: 1px solid #2a2a2a;
             border-radius: 8px;
             padding: 15px;
-            height: 200px;
+            height: 600px;
             overflow-y: auto;
             font-family: 'Monaco', 'Menlo', monospace;
             font-size: 12px;
@@ -405,6 +405,24 @@ HTML_TEMPLATE = """
         .log-entry {
             padding: 4px 0;
             border-bottom: 1px solid #1a1a1a;
+        }
+        
+        .log-entry.signal-log {
+            background: rgba(34, 197, 94, 0.1);
+            border-left: 3px solid #22c55e;
+            padding-left: 12px;
+        }
+        
+        .log-entry.trade-log {
+            background: rgba(59, 130, 246, 0.1);
+            border-left: 3px solid #3b82f6;
+            padding-left: 12px;
+        }
+        
+        .log-entry.performance-log {
+            background: rgba(168, 85, 247, 0.1);
+            border-left: 3px solid #a855f7;
+            padding-left: 12px;
         }
         
         .log-time {
@@ -1649,6 +1667,129 @@ HTML_TEMPLATE = """
             }
         }
         
+        // Store loaded logs to enable incremental updates without disrupting scroll
+        let loadedLogCount = 0;
+
+        async function loadLogs() {
+            try {
+                const response = await fetch('/api/logs');
+                const data = await response.json();
+                
+                const container = document.getElementById('log-container');
+                if (!container || !data.logs || data.logs.length === 0) return;
+                
+                // Remove spam and duplicate messages  
+                const deduplicatedLogs = [];
+                let lastLogMessage = '';
+                const seenEvents = new Set();
+                
+                data.logs.forEach(log => {
+                    // Extract the message part without timestamp for comparison
+                    const timeMatch = log.match(/^(\d{2}:\d{2}:\d{2})/);
+                    let message = log;
+                    if (timeMatch) {
+                        const separatorIndex = log.indexOf(' - ', timeMatch[0].length);
+                        if (separatorIndex !== -1) {
+                            message = log.substring(separatorIndex + 3);
+                        } else {
+                            message = log.substring(timeMatch[0].length).replace(/^[\s:-]+/, '');
+                        }
+                    }
+                    
+                    // Trim whitespace for better comparison
+                    message = message.trim();
+                    
+                    // Filter out spam events completely
+                    if (message.startsWith('{') && message.includes('"event":')) {
+                        try {
+                            const jsonMatch = message.match(/"event":\s*"([^"]+)"/);
+                            if (jsonMatch) {
+                                const eventType = jsonMatch[1];
+                                
+                                // Filter out spam events completely
+                                if (eventType === "Found valid pair" || 
+                                    eventType === "Fetched" ||
+                                    eventType === "Sent WebSocket update") {
+                                    return; // Skip these spam events entirely
+                                }
+                                
+                                // For other JSON events, limit to one per event type
+                                if (seenEvents.has(eventType)) {
+                                    return; // Skip duplicate event types
+                                }
+                                seenEvents.add(eventType);
+                            }
+                        } catch (e) {
+                            // If JSON parsing fails, use original logic
+                        }
+                    }
+                    
+                    // Only add if it's different from the last message (for non-JSON logs)
+                    if (message !== lastLogMessage) {
+                        deduplicatedLogs.push(log);
+                        lastLogMessage = message;
+                    }
+                });
+                
+                // Only update if there are new logs beyond what we've already loaded
+                if (deduplicatedLogs.length <= loadedLogCount) return;
+                
+                // Check if user is at bottom BEFORE any DOM changes
+                const isAtBottom = Math.abs(container.scrollHeight - container.clientHeight - container.scrollTop) < 50;
+                
+                // Only add the new logs, NEVER rebuild entire container
+                const newLogs = deduplicatedLogs.slice(loadedLogCount);
+                
+                newLogs.forEach(log => {
+                    // Extract time from log if it starts with HH:MM:SS format
+                    const timeMatch = log.match(/^(\d{2}:\d{2}:\d{2})/);
+                    const time = timeMatch ? timeMatch[1] : '';
+                    
+                    // Handle both " - " and ": " after time
+                    let message = log;
+                    if (timeMatch) {
+                        // Skip past time and separator (either " - " or ": ")
+                        const separatorIndex = log.indexOf(' - ', time.length);
+                        if (separatorIndex !== -1) {
+                            message = log.substring(separatorIndex + 3);
+                        } else {
+                            message = log.substring(time.length).replace(/^[\s:-]+/, '');
+                        }
+                    }
+                    
+                    // Add CSS classes for different types of messages
+                    let cssClass = 'log-entry';
+                    if (message.includes('Signal=') || message.includes('signal')) {
+                        cssClass += ' signal-log';
+                    } else if (message.includes('Trading cycle') || message.includes('executed') || message.includes('trades')) {
+                        cssClass += ' trade-log';
+                    } else if (message.includes('Performance') || message.includes('P&L')) {
+                        cssClass += ' performance-log';
+                    }
+                    
+                    // Create and append new log element
+                    const logDiv = document.createElement('div');
+                    logDiv.className = cssClass;
+                    logDiv.innerHTML = `
+                        <span class="log-time">${time}</span>
+                        <span>${message}</span>
+                    `;
+                    container.appendChild(logDiv);
+                });
+                
+                // Update loaded count
+                loadedLogCount = deduplicatedLogs.length;
+                
+                // ONLY auto-scroll if user was already at bottom - NEVER disrupt manual positioning
+                if (isAtBottom) {
+                    container.scrollTop = container.scrollHeight;
+                }
+                
+            } catch (error) {
+                console.error('Error loading logs:', error);
+            }
+        }
+        
         async function loadPerformanceData() {
             try {
                 const response = await fetch('/api/performance');
@@ -2002,7 +2143,7 @@ HTML_TEMPLATE = """
             const time = new Date().toLocaleTimeString();
             entry.innerHTML = `<span class="log-time">${time}</span><span>${message}</span>`;
             container.appendChild(entry);
-            container.scrollTop = container.scrollHeight;
+            // Disabled auto-scroll to allow manual reading
         }
         
         function formatCurrency(value) {
@@ -2299,10 +2440,12 @@ HTML_TEMPLATE = """
         window.onload = () => {
             refreshData();
             refreshStrategies();
+            loadLogs(); // Load logs immediately on startup
             updateMarketStatus(); // Load market status on startup
             connectWebSocket(); // Connect to WebSocket
             setInterval(refreshData, 5000); // Keep polling as fallback
             setInterval(refreshStrategies, 5000); // Update strategies tab
+            setInterval(loadLogs, 2000); // Update logs every 2 seconds
             setInterval(updateMarketStatus, 60000); // Update market status every minute
         };
     </script>
@@ -2412,16 +2555,44 @@ def market_status():
     return jsonify(result)
 
 
+def check_ibkr_connection():
+    """Check if IBKR is actually connected."""
+    try:
+        from ib_insync import IB
+
+        ib = IB()
+
+        # Try to connect to TWS/Gateway
+        # TWS uses port 7497 for paper, 7496 for live
+        # Gateway uses port 4002 for paper, 4001 for live
+        for port in [7497, 4002, 7496, 4001]:
+            try:
+                ib.connect("127.0.0.1", port, clientId=999, readonly=True)
+                if ib.isConnected():
+                    ib.disconnect()
+                    return True
+            except Exception:
+                continue
+        return False
+    except ImportError:
+        return False
+    except Exception:
+        return False
+
+
 @app.route("/api/status")
 @requires_auth
 def status():
     """Get current system status from database"""
+    # Check real IBKR connection
+    is_connected = check_ibkr_connection()
+
     # Return status with sample data for display
     return jsonify(
         {
             "trading_status": {
                 "is_trading": trading_status == "running",
-                "connected": True,
+                "connected": is_connected,
                 "mode": "paper",
                 "session_start": datetime.now().isoformat(),
                 "positions_count": 5,
@@ -4221,8 +4392,50 @@ def stop_trading():
 @app.route("/api/logs")
 @requires_auth
 def get_logs():
-    """Get recent logs"""
-    return jsonify({"logs": trading_log[-100:]})  # Last 100 log entries
+    """Get recent logs from log file"""
+    logs = []
+    log_file = "robo_trader.log"
+
+    try:
+        # Read last 100 lines from log file
+        with open(log_file, "r") as f:
+            # Get last 100 lines efficiently
+            lines = f.readlines()
+            recent_lines = lines[-100:] if len(lines) > 100 else lines
+
+            for line in recent_lines:
+                try:
+                    # Parse JSON log entry
+                    log_entry = json.loads(line)
+                    timestamp = (
+                        log_entry.get("timestamp", "").split("T")[1].split(".")[0]
+                        if "timestamp" in log_entry
+                        else ""
+                    )
+                    message = log_entry.get("message", "")
+
+                    # Extract event from nested JSON if present
+                    if '{"event":' in message:
+                        try:
+                            nested = json.loads(message)
+                            event_msg = nested.get("event", message)
+                        except Exception:
+                            event_msg = message
+                    else:
+                        event_msg = message
+
+                    # Format log entry for display
+                    if timestamp and event_msg:
+                        logs.append(f"{timestamp} - {event_msg}")
+                except json.JSONDecodeError:
+                    # Handle non-JSON log lines
+                    logs.append(line.strip())
+    except FileNotFoundError:
+        logs.append("Log file not found")
+    except Exception as e:
+        logs.append(f"Error reading logs: {str(e)}")
+
+    return jsonify({"logs": logs[-100:]})  # Last 100 log entries
 
 
 if __name__ == "__main__":

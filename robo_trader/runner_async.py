@@ -1481,11 +1481,21 @@ class AsyncRunner:
 
                     # Analyze existing pairs
                     if self.pairs_strategy.pair_stats:
+                        # Build current prices dict for ALL symbols in market_data_cache
                         current_prices = {
                             s: self.market_data_cache[s]["close"].iloc[-1]
                             for s in self.market_data_cache
                             if len(self.market_data_cache[s]) > 0
                         }
+
+                        # Log current prices to debug
+                        logger.info(
+                            f"Current prices dict has {len(current_prices)} symbols: {list(current_prices.keys())[:10]}"
+                        )
+                        if len(current_prices) == 0:
+                            logger.warning(
+                                "Current prices dict is empty - market_data_cache may not be populated"
+                            )
 
                         pairs_signals = await self.pairs_strategy.analyze_pairs(
                             list(self.pairs_strategy.pair_stats.keys()), current_prices
@@ -1500,9 +1510,159 @@ class AsyncRunner:
                                 confidence=signal.get("confidence"),
                             )
 
-                            # Update pairs positions
+                            # Execute pairs trades
                             if signal.get("signal") != "hold":
-                                self.pairs_strategy.update_position(signal.get("pair"), signal)
+                                # Check if we already have a position in either symbol of the pair
+                                pair = signal.get("pair")
+                                signal_type = signal.get("signal")
+
+                                if pair and len(pair) == 2:
+                                    symbol_a, symbol_b = pair[0], pair[1]
+                                    # Skip if we already have significant positions in these symbols
+                                    has_position_a = (
+                                        symbol_a in self.positions
+                                        and self.positions[symbol_a].quantity > 100
+                                    )
+                                    has_position_b = (
+                                        symbol_b in self.positions
+                                        and self.positions[symbol_b].quantity > 100
+                                    )
+
+                                    if has_position_a or has_position_b:
+                                        logger.info(
+                                            f"Skipping pairs trade for {symbol_a}-{symbol_b}: already have positions"
+                                        )
+                                        continue
+
+                                    # Update internal position tracking
+                                    self.pairs_strategy.update_position(pair, signal)
+
+                                    # Get current prices - fallback to market_data_cache if not in current_prices
+                                    price_a = current_prices.get(symbol_a, 0)
+                                    price_b = current_prices.get(symbol_b, 0)
+
+                                    # If prices not found, try to get from market_data_cache directly
+                                    if (
+                                        price_a == 0
+                                        and symbol_a in self.market_data_cache
+                                        and len(self.market_data_cache[symbol_a]) > 0
+                                    ):
+                                        price_a = self.market_data_cache[symbol_a]["close"].iloc[-1]
+                                    if (
+                                        price_b == 0
+                                        and symbol_b in self.market_data_cache
+                                        and len(self.market_data_cache[symbol_b]) > 0
+                                    ):
+                                        price_b = self.market_data_cache[symbol_b]["close"].iloc[-1]
+
+                                    logger.info(
+                                        f"Pairs trade setup: {symbol_a}=${price_a:.2f}, {symbol_b}=${price_b:.2f}"
+                                    )
+
+                                    if price_a > 0 and price_b > 0:
+                                        # Calculate position sizes (simplified - equal dollar amounts)
+                                        # Calculate total portfolio value from positions
+                                        equity = self.portfolio.equity(current_prices)
+                                        pair_allocation = min(
+                                            10000, equity * 0.02
+                                        )  # Max 2% per leg
+                                        qty_a = int(pair_allocation / price_a)
+                                        qty_b = int(pair_allocation / price_b)
+
+                                        # Execute based on signal type
+                                        if (
+                                            signal_type == "long_a_short_b"
+                                            and qty_a > 0
+                                            and qty_b > 0
+                                        ):
+                                            # Buy symbol_a
+                                            order_a = Order(
+                                                symbol=symbol_a,
+                                                quantity=qty_a,
+                                                side="BUY",
+                                                price=price_a,
+                                            )
+                                            res_a = self.executor.place_order(order_a)
+                                            if res_a.ok:
+                                                await self.db.record_trade(
+                                                    symbol_a,
+                                                    "BUY",
+                                                    qty_a,
+                                                    res_a.fill_price or price_a,
+                                                    0,
+                                                )
+                                                logger.info(
+                                                    f"Pairs trade: Bought {qty_a} {symbol_a} at ${price_a:.2f}"
+                                                )
+
+                                            # Short symbol_b (if shorting enabled, otherwise skip)
+                                            if self.cfg.execution.enable_short_selling:
+                                                order_b = Order(
+                                                    symbol=symbol_b,
+                                                    quantity=qty_b,
+                                                    side="SELL",
+                                                    price=price_b,
+                                                )
+                                                res_b = self.executor.place_order(order_b)
+                                                if res_b.ok:
+                                                    await self.db.record_trade(
+                                                        symbol_b,
+                                                        "SELL",
+                                                        qty_b,
+                                                        res_b.fill_price or price_b,
+                                                        0,
+                                                    )
+                                                    logger.info(
+                                                        f"Pairs trade: Shorted {qty_b} {symbol_b} at ${price_b:.2f}"
+                                                    )
+
+                                        elif (
+                                            signal_type == "long_b_short_a"
+                                            and qty_a > 0
+                                            and qty_b > 0
+                                        ):
+                                            # Buy symbol_b
+                                            order_b = Order(
+                                                symbol=symbol_b,
+                                                quantity=qty_b,
+                                                side="BUY",
+                                                price=price_b,
+                                            )
+                                            res_b = self.executor.place_order(order_b)
+                                            if res_b.ok:
+                                                await self.db.record_trade(
+                                                    symbol_b,
+                                                    "BUY",
+                                                    qty_b,
+                                                    res_b.fill_price or price_b,
+                                                    0,
+                                                )
+                                                logger.info(
+                                                    f"Pairs trade: Bought {qty_b} {symbol_b} at ${price_b:.2f}"
+                                                )
+                                                if hasattr(self, "trades_executed"):
+                                                    self.trades_executed += 1
+
+                                            # Short symbol_a (if shorting enabled, otherwise skip)
+                                            if self.cfg.execution.enable_short_selling:
+                                                order_a = Order(
+                                                    symbol=symbol_a,
+                                                    quantity=qty_a,
+                                                    side="SELL",
+                                                    price=price_a,
+                                                )
+                                                res_a = self.executor.place_order(order_a)
+                                                if res_a.ok:
+                                                    await self.db.record_trade(
+                                                        symbol_a,
+                                                        "SELL",
+                                                        qty_a,
+                                                        res_a.fill_price or price_a,
+                                                        0,
+                                                    )
+                                                    logger.info(
+                                                        f"Pairs trade: Shorted {qty_a} {symbol_a} at ${price_a:.2f}"
+                                                    )
 
                 except Exception as e:
                     logger.error(f"Pairs trading analysis error: {e}")

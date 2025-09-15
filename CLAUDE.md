@@ -26,13 +26,29 @@
 **ALWAYS USE `python3` NOT `python` - THIS SYSTEM USES macOS WITH NO `python` COMMAND**
 
 ## Testing Commands
+
+# KILL ALL PROCESSES (run this first to prevent duplicates)
+```bash
+pkill -9 -f "runner_async" && pkill -9 -f "app.py" && pkill -9 -f "websocket_server"
+```
+
+# START SYSTEM (clean start)
 ```bash
 # Start WebSocket server (REQUIRED FIRST)
-python3 -m robo_trader.websocket_server
+python3 -m robo_trader.websocket_server &
 
-# Run dashboard
+# Start trading runner with logging
+export LOG_FILE=/Users/oliver/robo_trader/robo_trader.log
+python3 -m robo_trader.runner_async --symbols AAPL,NVDA,TSLA,IXHL,NUAI,BZAI,ELTP,OPEN,CEG,VRT,PLTR,UPST,TEM,HTFL,SDGR,APLD,SOFI,CORZ,WULF,QQQ,QLD,BBIO,IMRX,CRGY &
+
+# Start dashboard on port 5555 (ALWAYS USE PORT 5555)
 export DASH_PORT=5555
-python3 app.py
+python3 app.py &
+```
+
+# RESTART DASHBOARD ONLY (when code changes)
+```bash
+pkill -9 -f "app.py" && sleep 2 && export DASH_PORT=5555 && python3 app.py &
 
 # Run trading system
 python3 -m robo_trader.runner_async --symbols AAPL,NVDA,TSLA,IXHL,NUAI,BZAI,ELTP,OPEN,CEG,VRT,PLTR,UPST,TEM,HTFL,SDGR,APLD,SOFI,CORZ,WULF
