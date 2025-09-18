@@ -16,7 +16,11 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 from ib_insync import IB, Contract, Stock, util
+from ib_insync.util import patchAsyncio
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+# Enable nested event loops for ib_insync (this is the official way)
+patchAsyncio()
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +79,7 @@ class ConnectionConfig:
     client_id: int = 1
     readonly: bool = True
     timeout: float = 10.0
-    max_connections: int = 5
+    max_connections: int = 1  # TWS only supports one connection per client ID
     retry_attempts: int = 3
     retry_max_wait: float = 30.0
 
@@ -118,14 +122,14 @@ class ConnectionPool:
         async def connect_with_retry():
             ib = IB()
             try:
-                await asyncio.wait_for(
-                    ib.connectAsync(
-                        self.config.host,
-                        self.config.port,
-                        clientId=client_id,
-                        readonly=self.config.readonly,
-                    ),
-                    timeout=self.config.timeout,
+                # Use sync connect with nested event loops enabled via patchAsyncio()
+                # This works because patchAsyncio() allows nested event loops
+                ib.connect(
+                    self.config.host,
+                    self.config.port,
+                    clientId=client_id,
+                    timeout=10,
+                    readonly=self.config.readonly,
                 )
                 logger.debug(f"Connected with client ID {client_id}")
                 return ib

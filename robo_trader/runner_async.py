@@ -376,20 +376,70 @@ class AsyncRunner:
         """Initialize all components."""
         self.cfg = load_config()
 
+        # CRITICAL PRE-FLIGHT CHECK: Test IBKR connection before proceeding
+        # This prevents the system from starting without a working connection
+        logger.info("=" * 60)
+        logger.info("PERFORMING IBKR PRE-FLIGHT CONNECTION CHECK")
+        logger.info("=" * 60)
+
+        # Test if TWS/IB Gateway is running
+        import socket
+        import sys
+
+        def test_port_open(host="127.0.0.1", port=7497, timeout=5):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                result = sock.connect_ex((host, port))
+                sock.close()
+                return result == 0
+            except Exception as e:
+                logger.error(f"Port test failed: {e}")
+                return False
+
+        port = self.cfg.ibkr.port
+        if not test_port_open(port=port):
+            logger.error(f"❌ IBKR PRE-FLIGHT CHECK FAILED")
+            logger.error(f"Port {port} is not open - TWS/IB Gateway not running")
+            logger.error("Please ensure TWS or IB Gateway is running and configured properly:")
+            logger.error("1. Start TWS/IB Gateway")
+            logger.error("2. Enable API connections in Global Configuration")
+            logger.error("3. Set correct port (7497 for paper, 7496 for live)")
+            logger.error("4. Allow connections from localhost")
+            logger.error("REFUSING TO START WITHOUT IBKR CONNECTION")
+            sys.exit(1)
+
+        logger.info(f"✓ Port {port} is open - TWS/IB Gateway detected")
+
         # Create async IBKR client with connection pooling
         import random
 
-        # Use random client ID to avoid conflicts with existing connections
-        random_client_id = random.randint(100, 999)
+        # Use client ID range that we've verified works
+        random_client_id = random.randint(10, 99)
         conn_config = ConnectionConfig(
             host=self.cfg.ibkr.host,
             port=self.cfg.ibkr.port,
             client_id=random_client_id,  # Use random ID instead of config
             readonly=self.cfg.ibkr.readonly,
-            max_connections=min(5, self.max_concurrent_symbols),
+            max_connections=1,  # Use single connection to avoid overwhelming TWS
         )
         self.client = AsyncIBKRClient(conn_config)
-        await self.client.connect()
+
+        # Try to connect with timeout
+        try:
+            await asyncio.wait_for(self.client.connect(), timeout=30)
+            logger.info("✓ IBKR connection established successfully")
+            logger.info(f"✓ Connected with client ID {random_client_id}")
+            logger.info("=" * 60)
+        except asyncio.TimeoutError:
+            logger.error("❌ IBKR CONNECTION TIMEOUT")
+            logger.error("Failed to connect to IBKR after 30 seconds")
+            logger.error("Check TWS API configuration and try again")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"❌ IBKR CONNECTION FAILED: {e}")
+            logger.error("Cannot proceed without IBKR connection")
+            sys.exit(1)
 
         # Initialize async database with context manager
         self.db = AsyncTradingDatabase()
