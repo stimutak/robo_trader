@@ -31,9 +31,9 @@ def is_market_open(dt: Optional[datetime] = None) -> bool:
     if dt.weekday() >= 5:  # Saturday or Sunday
         return False
 
-    # Check time (9:30 AM - 4:00 PM Eastern)
+    # Check time (9:30 AM - 4:30 PM Eastern)
     market_open = time(9, 30)
-    market_close = time(16, 0)
+    market_close = time(16, 30)
     current_time = dt.time()
 
     return market_open <= current_time < market_close
@@ -69,8 +69,8 @@ def is_extended_hours(dt: Optional[datetime] = None) -> bool:
     pre_market_start = time(4, 0)
     pre_market_end = time(9, 30)
 
-    # After-hours: 4:00 PM - 8:00 PM
-    after_hours_start = time(16, 0)
+    # After-hours: 4:30 PM - 8:00 PM
+    after_hours_start = time(16, 30)
     after_hours_end = time(20, 0)
 
     return (
@@ -105,7 +105,7 @@ def get_market_session(dt: Optional[datetime] = None) -> str:
     # Define market hours
     pre_market_start = time(4, 0)
     regular_start = time(9, 30)
-    regular_end = time(16, 0)
+    regular_end = time(16, 30)
     after_hours_end = time(20, 0)
 
     if pre_market_start <= current_time < regular_start:

@@ -2584,6 +2584,18 @@ def check_ibkr_connection():
 @requires_auth
 def status():
     """Get current system status from database"""
+    global trading_status, trading_process
+
+    # Check if trading process is actually running
+    if trading_process and trading_process.poll() is not None:
+        # Process has terminated, update status
+        trading_status = "stopped"
+        trading_process = None
+
+    # If no process reference but status is running, reset it
+    if trading_process is None and trading_status == "running":
+        trading_status = "stopped"
+
     # Check real IBKR connection
     is_connected = check_ibkr_connection()
 

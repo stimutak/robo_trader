@@ -397,10 +397,27 @@ class AsyncRunner:
                 logger.error(f"Port test failed: {e}")
                 return False
 
-        port = self.cfg.ibkr.port
-        if not test_port_open(port=port):
+        # Check for Gateway ports first, then TWS ports
+        ports_to_check = [
+            (4002, "IB Gateway (Paper)"),
+            (4001, "IB Gateway (Live)"),
+            (7497, "TWS (Paper)"),
+            (7496, "TWS (Live)"),
+            (self.cfg.ibkr.port, "Configured"),  # Also check configured port
+        ]
+
+        port_found = False
+        port = self.cfg.ibkr.port  # Default to configured port
+        for check_port, name in ports_to_check:
+            if test_port_open(port=check_port):
+                logger.info(f"✓ Port {check_port} is open - {name} detected")
+                port_found = True
+                port = check_port  # Use the detected port
+                break
+
+        if not port_found:
             logger.error(f"❌ IBKR PRE-FLIGHT CHECK FAILED")
-            logger.error(f"Port {port} is not open - TWS/IB Gateway not running")
+            logger.error(f"Port {self.cfg.ibkr.port} is not open - TWS/IB Gateway not running")
             logger.error("Please ensure TWS or IB Gateway is running and configured properly:")
             logger.error("1. Start TWS/IB Gateway")
             logger.error("2. Enable API connections in Global Configuration")
@@ -414,12 +431,14 @@ class AsyncRunner:
         # Create async IBKR client with connection pooling
         import random
 
-        # Use client ID range that we've verified works
-        random_client_id = random.randint(10, 99)
+        # Use wider client ID range to avoid conflicts with stuck connections
+        random_client_id = random.randint(10, 200)
+        logger.info(f"Using client ID {random_client_id} for this session")
         conn_config = ConnectionConfig(
             host=self.cfg.ibkr.host,
-            port=self.cfg.ibkr.port,
-            client_id=random_client_id,  # Use random ID instead of config
+            # Use the detected open port to avoid mismatches between TWS/Gateway
+            port=port,
+            client_id=random_client_id,  # Use random ID to avoid conflicts
             readonly=self.cfg.ibkr.readonly,
             max_connections=1,  # Use single connection to avoid overwhelming TWS
         )

@@ -19,7 +19,7 @@ from ib_insync import IB, Contract, Stock, util
 from ib_insync.util import patchAsyncio
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-# Enable nested event loops for ib_insync (this is the official way)
+# Enable nested event loops - REQUIRED for ib_insync to work in async context
 patchAsyncio()
 
 logger = logging.getLogger(__name__)
@@ -75,13 +75,14 @@ class ConnectionConfig:
     """Configuration for IBKR connection."""
 
     host: str = "127.0.0.1"
-    port: int = 7497
+    port: int = 7497  # Will auto-detect: 7497 (TWS), 4001 (Gateway Paper), 4002 (Gateway Live)
     client_id: int = 1
     readonly: bool = True
     timeout: float = 10.0
-    max_connections: int = 1  # TWS only supports one connection per client ID
-    retry_attempts: int = 3
-    retry_max_wait: float = 30.0
+    max_connections: int = 1  # TWS/Gateway only supports one connection per client ID
+    retry_attempts: int = 1  # Reduced to avoid stuck connections
+    retry_max_wait: float = 10.0
+    auto_detect_port: bool = True  # Auto-detect TWS vs Gateway
 
 
 class ConnectionPool:
@@ -94,6 +95,36 @@ class ConnectionPool:
         self.semaphore = asyncio.Semaphore(config.max_connections)
         self._initialized = False
         self._lock = asyncio.Lock()
+        self._detect_port_if_needed()
+
+    def _detect_port_if_needed(self):
+        """Auto-detect whether TWS or IB Gateway is running."""
+        if not self.config.auto_detect_port:
+            return
+
+        import socket
+
+        # Check ports in order of preference
+        ports_to_check = [
+            (4002, "IB Gateway (Paper)"),
+            (4001, "IB Gateway (Live)"),
+            (7497, "TWS (Paper)"),
+            (7496, "TWS (Live)"),
+        ]
+
+        for port, name in ports_to_check:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            try:
+                result = sock.connect_ex((self.config.host, port))
+                if result == 0:
+                    logger.info(f"Auto-detected {name} on port {port}")
+                    self.config.port = port
+                    break
+            except:
+                pass
+            finally:
+                sock.close()
 
     async def initialize(self):
         """Initialize the connection pool."""
@@ -122,21 +153,26 @@ class ConnectionPool:
         async def connect_with_retry():
             ib = IB()
             try:
-                # Use sync connect with nested event loops enabled via patchAsyncio()
-                # This works because patchAsyncio() allows nested event loops
+                # Use SYNC connect with patchAsyncio() enabled
+                logger.info(f"Attempting connection with client ID {client_id} (timeout=20s)...")
                 ib.connect(
                     self.config.host,
                     self.config.port,
                     clientId=client_id,
-                    timeout=10,
+                    timeout=20,  # Increased timeout for fresh TWS/Gateway connections
                     readonly=self.config.readonly,
                 )
-                logger.debug(f"Connected with client ID {client_id}")
+                logger.info(f"✓ Successfully connected with client ID {client_id}")
                 return ib
             except Exception as e:
-                if ib.isConnected():
-                    ib.disconnect()
                 logger.warning(f"Connection attempt failed for client ID {client_id}: {e}")
+                # Always try to disconnect to clean up resources
+                try:
+                    if ib and hasattr(ib, "disconnect"):
+                        ib.disconnect()
+                        logger.debug(f"Cleaned up failed connection for client ID {client_id}")
+                except:
+                    pass  # Ignore cleanup errors
                 raise
 
         return await connect_with_retry()
@@ -403,7 +439,7 @@ class AsyncIBKRClient:
         if weekday >= 5:
             return False
 
-        # Check time (9:30 AM - 4:00 PM ET)
+        # Check time (9:30 AM - 4:30 PM ET)
         # This is a simplified check - production should use exchange calendars
         hour = now.hour
         minute = now.minute
@@ -411,7 +447,7 @@ class AsyncIBKRClient:
 
         # Convert to ET (assuming system is in ET or adjust accordingly)
         market_open = 9 * 60 + 30  # 9:30 AM
-        market_close = 16 * 60  # 4:00 PM
+        market_close = 16 * 60 + 30  # 4:30 PM
 
         return market_open <= time_minutes < market_close
 

@@ -78,7 +78,7 @@ class DailyPerformanceLogger:
     def get_market_hours_status(self) -> str:
         """Determine if we're in market hours"""
         now = datetime.now()
-        # Rough market hours check (9:30 AM - 4:00 PM ET)
+        # Rough market hours check (9:30 AM - 4:30 PM ET)
         if 9 <= now.hour < 16:
             return "MARKET_OPEN"
         elif 16 <= now.hour < 20:

@@ -86,6 +86,12 @@ run:
 run-venv:
 	. .venv/bin/activate && python -m robo_trader.runner_async --symbols AAPL,NVDA,TSLA
 
+# Restart all services (per CLAUDE.md)
+.PHONY: restart
+restart:
+	chmod +x scripts/restart_all.sh
+	./scripts/restart_all.sh
+
 # Run BugBot
 bugbot:
 	./scripts/run_bugbot.sh
@@ -101,5 +107,4 @@ bugbot-prod:
 # Run BugBot in watch mode
 bugbot-watch:
 	python3 scripts/bug_detector.py --watch --config development
-
 

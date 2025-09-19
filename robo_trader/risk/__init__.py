@@ -2,6 +2,10 @@
 Risk management modules for RoboTrader
 """
 
+from ..portfolio import PositionSnapshot as Position
+
+# Import legacy classes from other modules for backward compatibility
+from ..risk_manager import RiskManager
 from .advanced_risk import (
     AdvancedRiskManager,
     CorrelationLimiter,
@@ -22,4 +26,6 @@ __all__ = [
     "RiskLevel",
     "RiskMetrics",
     "risk_monitor_task",
+    "RiskManager",
+    "Position",
 ]
