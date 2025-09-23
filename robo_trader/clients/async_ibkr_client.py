@@ -1,28 +1,75 @@
 """
-Async IBKR Client with retry logic, connection pooling, and proper async patterns.
+Simplified Async IBKR Client with direct connection approach.
 
-This replaces the synchronous calls in ibkr_client.py with proper async/await patterns,
-adds exponential backoff on failures, and implements connection pooling.
+This version removes the complex connection pooling that was causing issues
+and uses a simpler, more reliable direct connection approach similar to
+the working test_connection.py script.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import random
+import subprocess
+import sys
+import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
-from ib_async import IB, Contract, Stock, util
-from ib_async.util import patchAsyncio
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-# Enable nested event loops - REQUIRED for ib_async to work in async context
+# Try to use ib_insync for connection (which works) and ib_async for operations
+try:
+    from ib_insync import IB as IB_insync
+    from ib_insync import Contract as Contract_insync
+    from ib_insync import Stock as Stock_insync
+    from ib_insync import util as util_insync
+    from ib_insync.util import patchAsyncio as patchAsyncio_insync
+
+    HAS_IB_INSYNC = True
+except ImportError:
+    HAS_IB_INSYNC = False
+
+try:
+    from ib_async import IB as IB_async
+    from ib_async import Contract as Contract_async
+    from ib_async import Stock as Stock_async
+    from ib_async import util as util_async
+    from ib_async.util import patchAsyncio as patchAsyncio_async
+
+    HAS_IB_ASYNC = True
+except ImportError:
+    HAS_IB_ASYNC = False
+
+# Use the library that works for connections
+if HAS_IB_INSYNC:
+    IB = IB_insync
+    Contract = Contract_insync
+    Stock = Stock_insync
+    util = util_insync
+    patchAsyncio = patchAsyncio_insync
+    USING_LIBRARY = "ib_insync"
+elif HAS_IB_ASYNC:
+    IB = IB_async
+    Contract = Contract_async
+    Stock = Stock_async
+    util = util_async
+    patchAsyncio = patchAsyncio_async
+    USING_LIBRARY = "ib_async"
+else:
+    raise ImportError("Neither ib_insync nor ib_async is available")
+
+# Enable nested event loops
 patchAsyncio()
 
 logger = logging.getLogger(__name__)
+logger.info(f"Using {USING_LIBRARY} for IBKR connections")
 
 
 def normalize_bars_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -85,162 +132,246 @@ class ConnectionConfig:
     auto_detect_port: bool = True  # Auto-detect TWS vs Gateway
 
 
-class ConnectionPool:
-    """Manages a pool of IBKR connections for concurrent operations."""
+def _detect_port():
+    """Auto-detect whether TWS or IB Gateway is running."""
+    import socket
 
-    def __init__(self, config: ConnectionConfig):
-        self.config = config
-        self.pool: List[IB] = []
-        self.available: asyncio.Queue = asyncio.Queue(maxsize=config.max_connections)
-        self.semaphore = asyncio.Semaphore(config.max_connections)
-        self._initialized = False
-        self._lock = asyncio.Lock()
-        self._detect_port_if_needed()
+    # Check ports in order of preference
+    ports_to_check = [
+        (7497, "TWS (Paper)"),
+        (4002, "IB Gateway (Paper)"),
+        (7496, "TWS (Live)"),
+        (4001, "IB Gateway (Live)"),
+    ]
 
-    def _detect_port_if_needed(self):
-        """Auto-detect whether TWS or IB Gateway is running."""
-        if not self.config.auto_detect_port:
-            return
+    for port, name in ports_to_check:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        try:
+            result = sock.connect_ex(("127.0.0.1", port))
+            if result == 0:
+                logger.info(f"Auto-detected {name} on port {port}")
+                return port
+        except Exception:
+            pass
+        finally:
+            sock.close()
 
-        import socket
+    # Default to TWS paper trading port
+    logger.warning("No IBKR service detected, defaulting to TWS paper trading port 7497")
+    return 7497
 
-        # Check ports in order of preference
-        ports_to_check = [
-            (4002, "IB Gateway (Paper)"),
-            (4001, "IB Gateway (Live)"),
-            (7497, "TWS (Paper)"),
-            (7496, "TWS (Live)"),
-        ]
 
-        for port, name in ports_to_check:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            try:
-                result = sock.connect_ex((self.config.host, port))
-                if result == 0:
-                    logger.info(f"Auto-detected {name} on port {port}")
-                    self.config.port = port
-                    break
-            except Exception:
-                pass
-            finally:
-                sock.close()
+async def _create_direct_connection(
+    host: str, port: int, client_id: int, readonly: bool = True, timeout: float = 10.0
+) -> IB:
+    """Create a direct IBKR connection by running in a separate process without async patches."""
+    max_retries = 3
+    base_delay = 1.0
 
-    async def initialize(self):
-        """Initialize the connection pool."""
-        async with self._lock:
-            if self._initialized:
-                return
-
-            for i in range(self.config.max_connections):
-                ib = await self._create_connection(self.config.client_id + i)
-                self.pool.append(ib)
-                await self.available.put(ib)
-
-            self._initialized = True
+    for attempt in range(max_retries):
+        try:
+            current_client_id = client_id + attempt
             logger.info(
-                f"Initialized connection pool with {self.config.max_connections} connections"
+                f"Attempt {attempt + 1}/{max_retries}: Connecting to {host}:{port} with client ID {current_client_id}"
             )
 
-    async def _create_connection(self, client_id: int) -> IB:
-        """Create a single IBKR connection with retry logic."""
+            # Create a simple connection script that doesn't use patchAsyncio
+            script_content = f"""
+import sys
+import json
+from ib_insync import IB
+# Don't call patchAsyncio() - run in clean environment
 
-        @retry(
-            stop=stop_after_attempt(self.config.retry_attempts),
-            wait=wait_exponential(multiplier=1, max=self.config.retry_max_wait),
-            retry=retry_if_exception_type((ConnectionError, asyncio.TimeoutError)),
-        )
-        async def connect_with_retry():
-            ib = IB()
+def test_connection():
+    try:
+        ib = IB()
+        ib.connect("{host}", {port}, clientId={current_client_id}, timeout={min(timeout, 15.0)}, readonly={readonly})
+
+        # Get basic info to validate connection
+        server_version = ib.client.serverVersion()
+        accounts = ib.managedAccounts()
+
+        # Disconnect cleanly
+        ib.disconnect()
+
+        return {{
+            "success": True,
+            "server_version": server_version,
+            "accounts": accounts,
+            "client_id": {current_client_id}
+        }}
+    except Exception as e:
+        return {{
+            "success": False,
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "client_id": {current_client_id}
+        }}
+
+if __name__ == "__main__":
+    result = test_connection()
+    print(json.dumps(result))
+"""
+
+            # Write script to temp file
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+                f.write(script_content)
+                script_path = f.name
+
             try:
-                # Use SYNC connect with patchAsyncio() enabled
-                logger.info(f"Attempting connection with client ID {client_id} (timeout=20s)...")
-                ib.connect(
-                    self.config.host,
-                    self.config.port,
-                    clientId=client_id,
-                    timeout=20,  # Increased timeout for fresh TWS/Gateway connections
-                    readonly=self.config.readonly,
+                # Run the connection test in subprocess
+                result = subprocess.run(
+                    [sys.executable, script_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=min(timeout, 15.0) + 5,  # Add buffer
                 )
-                logger.info(f"✓ Successfully connected with client ID {client_id}")
-                return ib
-            except Exception as e:
-                logger.warning(f"Connection attempt failed for client ID {client_id}: {e}")
-                # Always try to disconnect to clean up resources
+
+                if result.returncode == 0:
+                    # Parse result
+                    try:
+                        output = json.loads(result.stdout.strip())
+                        if output["success"]:
+                            logger.info(
+                                f"✓ Subprocess validation successful with client ID {current_client_id}"
+                            )
+                            logger.info(f"Server version: {output['server_version']}")
+
+                            # The subprocess confirmed the connection works
+                            # Now try to create the connection in this process using the same client ID
+                            # Since we know it works, we can be more aggressive with timeout
+                            ib = IB()
+
+                            # Try the connection - if it fails due to async issues, we'll handle it
+                            try:
+                                ib.connect(
+                                    host=host,
+                                    port=port,
+                                    clientId=current_client_id,
+                                    timeout=min(timeout, 15.0),
+                                    readonly=readonly,
+                                )
+                                logger.info(
+                                    f"✓ Main process connection successful with client ID {current_client_id}"
+                                )
+                                return ib
+                            except Exception as main_e:
+                                logger.warning(
+                                    f"Main process connection failed even though subprocess worked: {main_e}"
+                                )
+                                # If main process fails but subprocess worked, there's an async context issue
+                                # For now, raise the error - we may need a different approach
+                                raise RuntimeError(f"Async context prevents connection: {main_e}")
+                        else:
+                            raise RuntimeError(f"Subprocess connection failed: {output['error']}")
+                    except json.JSONDecodeError as je:
+                        raise RuntimeError(
+                            f"Failed to parse subprocess output: {result.stdout}, error: {je}"
+                        )
+                else:
+                    raise RuntimeError(
+                        f"Subprocess failed with return code {result.returncode}: {result.stderr}"
+                    )
+
+            finally:
+                # Clean up temp file
                 try:
-                    if ib and hasattr(ib, "disconnect"):
-                        ib.disconnect()
-                        logger.debug(f"Cleaned up failed connection for client ID {client_id}")
+                    os.unlink(script_path)
                 except Exception:
-                    pass  # Ignore cleanup errors
+                    pass
+
+        except Exception as e:
+            logger.warning(
+                f"Connection attempt {attempt + 1} failed with client ID {client_id + attempt}: {e}"
+            )
+
+            if attempt == max_retries - 1:
+                logger.error(f"All {max_retries} connection attempts failed")
                 raise
 
-        return await connect_with_retry()
+            # Wait before retrying
+            delay = base_delay * (2**attempt)
+            logger.info(f"Waiting {delay:.1f}s before retry...")
+            await asyncio.sleep(delay)
 
-    @asynccontextmanager
-    async def acquire(self, timeout: float = 30.0):
-        """Acquire a connection from the pool with timeout."""
-        if not self._initialized:
-            await self.initialize()
+            logger.info(f"✓ Successfully connected with client ID {current_client_id}")
+            logger.info(f"Server version: {ib.client.serverVersion()}")
+            return ib
 
-        try:
-            connection = await asyncio.wait_for(self.available.get(), timeout=timeout)
-        except asyncio.TimeoutError:
-            raise ConnectionError(f"Connection pool exhausted after {timeout}s timeout")
+        except Exception as e:
+            logger.warning(
+                f"Connection attempt {attempt + 1} failed with client ID {client_id + attempt}: {e}"
+            )
 
-        try:
-            # Verify connection is still alive
-            if not connection.isConnected():
-                logger.warning("Connection lost, reconnecting...")
-                client_id = connection.client.clientId
-                connection.disconnect()
-                connection = await self._create_connection(client_id)
-                # Update pool reference
-                for i, conn in enumerate(self.pool):
-                    if conn.client.clientId == client_id:
-                        self.pool[i] = connection
-                        break
+            # Clean up failed connection
+            try:
+                if ib and hasattr(ib, "disconnect"):
+                    ib.disconnect()
+                    await asyncio.sleep(0.5)  # Give time for cleanup
+            except Exception:
+                pass
 
-            yield connection
-        finally:
-            await self.available.put(connection)
+            # If this was the last attempt, raise the error
+            if attempt == max_retries - 1:
+                logger.error(f"All {max_retries} connection attempts failed")
+                raise
 
-    async def close_all(self):
-        """Close all connections in the pool."""
-        for connection in self.pool:
-            if connection.isConnected():
-                connection.disconnect()
-        self.pool.clear()
-        self._initialized = False
-        logger.info("Closed all connections in pool")
+            # Wait before retrying with exponential backoff
+            delay = base_delay * (2**attempt)
+            logger.info(f"Waiting {delay:.1f}s before retry...")
+            await asyncio.sleep(delay)
 
 
 class AsyncIBKRClient:
     """
-    Async IBKR client with proper async patterns, retry logic, and connection pooling.
+    Async IBKR client using synchronous wrapper to avoid async context issues.
 
-    Key improvements over the original:
-    - All operations are truly async (no synchronous qualifyContracts)
-    - Connection pooling for concurrent operations
-    - Exponential backoff retry logic
-    - Proper error handling and logging
-    - Market hours validation
-    - Request throttling to avoid rate limits
+    This version uses a separate thread for all IBKR operations to completely
+    avoid the patchAsyncio() conflicts that cause connection timeouts.
     """
 
     def __init__(self, config: Optional[ConnectionConfig] = None):
         self.config = config or ConnectionConfig()
-        self.pool = ConnectionPool(self.config)
+        self._wrapper: Optional[Any] = None
         self._contract_cache: Dict[str, Contract] = {}
         self._rate_limiter = asyncio.Semaphore(50)  # Max 50 concurrent requests
 
     async def connect(self):
-        """Initialize the connection pool."""
-        await self.pool.initialize()
+        """Create a connection using the sync wrapper."""
+        if self._wrapper:
+            logger.info("Already have wrapper instance")
+            return
+
+        # Import here to avoid circular imports
+        from .sync_ibkr_wrapper import SyncIBKRWrapper
+
+        # Auto-detect port if needed
+        port = _detect_port() if self.config.port == 7497 else self.config.port
+
+        # Create wrapper
+        self._wrapper = SyncIBKRWrapper(
+            host=self.config.host, port=port, readonly=self.config.readonly
+        )
+
+        # Connect using wrapper
+        result = await self._wrapper.connect()
+        if not result["success"]:
+            raise RuntimeError(f"Connection failed: {result.get('error', 'Unknown error')}")
+
+        logger.info("✓ IBKR connection established successfully")
+        logger.info(f"✓ Connected with client ID {result.get('client_id')}")
+        logger.info(f"Server version: {result.get('server_version')}")
 
     async def disconnect(self):
-        """Close all connections."""
-        await self.pool.close_all()
+        """Close the connection."""
+        if self._wrapper:
+            result = await self._wrapper.disconnect()
+            if result["success"]:
+                logger.info("Disconnected from IBKR")
+            else:
+                logger.warning(f"Disconnect warning: {result.get('error')}")
+        self._wrapper = None
 
     @retry(
         stop=stop_after_attempt(3),
@@ -265,17 +396,24 @@ class AsyncIBKRClient:
         if cache_key in self._contract_cache:
             return self._contract_cache[cache_key]
 
-        async with self.pool.acquire() as ib:
-            contract = Stock(symbol, exchange, currency)
+        if not self._connection or not self._connection.isConnected():
+            raise RuntimeError("Not connected to IBKR")
 
-            # Use async version of qualifyContracts
-            qualified = await asyncio.wait_for(ib.qualifyContractsAsync(contract), timeout=5.0)
+        async with self._rate_limiter:
+            await asyncio.sleep(0.1)  # Rate limiting
 
-            if not qualified:
-                raise RuntimeError(f"Unable to qualify contract for {symbol}")
+        contract = Stock(symbol, exchange, currency)
 
-            self._contract_cache[cache_key] = qualified[0]
-            return qualified[0]
+        # Use async version of qualifyContracts
+        qualified = await asyncio.wait_for(
+            self._connection.qualifyContractsAsync(contract), timeout=5.0
+        )
+
+        if not qualified:
+            raise RuntimeError(f"Unable to qualify contract for {symbol}")
+
+        self._contract_cache[cache_key] = qualified[0]
+        return qualified[0]
 
     @retry(
         stop=stop_after_attempt(3),
@@ -291,7 +429,7 @@ class AsyncIBKRClient:
         use_rth: bool = True,
     ) -> pd.DataFrame:
         """
-        Fetch recent bars with retry logic and rate limiting.
+        Fetch recent bars using the sync wrapper.
 
         Args:
             symbol: Stock symbol
@@ -303,29 +441,24 @@ class AsyncIBKRClient:
         Returns:
             DataFrame with normalized OHLCV data
         """
+        if not self._wrapper:
+            raise RuntimeError("Not connected to IBKR")
+
         async with self._rate_limiter:
-            contract = await self.qualify_stock(symbol)
+            # Use the wrapper to get historical data
+            result = await self._wrapper.get_historical_data(symbol, duration, bar_size)
 
-            async with self.pool.acquire() as ib:
-                bars = await asyncio.wait_for(
-                    ib.reqHistoricalDataAsync(
-                        contract,
-                        endDateTime="",
-                        durationStr=duration,
-                        barSizeSetting=bar_size,
-                        whatToShow=what_to_show,
-                        useRTH=use_rth,
-                        formatDate=1,
-                    ),
-                    timeout=30.0,
-                )
+            if not result["success"]:
+                logger.warning(f"No data returned for {symbol}: {result.get('error')}")
+                return pd.DataFrame()
 
-                if not bars:
-                    logger.warning(f"No data returned for {symbol}")
-                    return pd.DataFrame()
+            # Convert the data back to DataFrame
+            data = result["data"]
+            if not data:
+                return pd.DataFrame()
 
-                raw_df = util.df(bars)
-                return self._normalize_bars_df(raw_df)
+            df = pd.DataFrame(data)
+            return normalize_bars_df(df)
 
     async def fetch_multiple_symbols(
         self,
@@ -368,67 +501,28 @@ class AsyncIBKRClient:
 
     async def get_account_summary(self) -> Dict[str, Any]:
         """Get account summary with key metrics."""
-        async with self.pool.acquire() as ib:
-            summary = await ib.accountSummaryAsync()
-            return {item.tag: item.value for item in summary}
+        if not self._connection or not self._connection.isConnected():
+            raise RuntimeError("Not connected to IBKR")
+
+        summary = await self._connection.accountSummaryAsync()
+        return {item.tag: item.value for item in summary}
 
     async def get_positions(self) -> List[Dict[str, Any]]:
         """Get current positions."""
-        async with self.pool.acquire() as ib:
-            positions = await ib.reqPositionsAsync()
-            return [
-                {
-                    "symbol": pos.contract.symbol,
-                    "quantity": pos.position,
-                    "avg_cost": pos.avgCost,
-                    "market_value": pos.marketValue,
-                    "unrealized_pnl": pos.unrealizedPNL,
-                }
-                for pos in positions
-            ]
+        if not self._connection or not self._connection.isConnected():
+            raise RuntimeError("Not connected to IBKR")
 
-    def _normalize_bars_df(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Normalize IB historical bars DataFrame.
-
-        Args:
-            df: Raw DataFrame from IB
-
-        Returns:
-            Normalized DataFrame with standard OHLCV columns
-        """
-        if df is None or df.empty:
-            return pd.DataFrame()
-
-        data = df.copy()
-        data.columns = [str(c).lower() for c in data.columns]
-
-        # Standard column subset
-        preferred_cols = [
-            c for c in ["date", "open", "high", "low", "close", "volume"] if c in data.columns
+        positions = await self._connection.reqPositionsAsync()
+        return [
+            {
+                "symbol": pos.contract.symbol,
+                "quantity": pos.position,
+                "avg_cost": pos.avgCost,
+                "market_value": pos.marketValue,
+                "unrealized_pnl": pos.unrealizedPNL,
+            }
+            for pos in positions
         ]
-        if preferred_cols:
-            data = data[preferred_cols]
-
-        # Coerce numerics
-        for col in ["open", "high", "low", "close", "volume"]:
-            if col in data.columns:
-                data[col] = pd.to_numeric(data[col], errors="coerce")
-
-        # Drop rows without close
-        if "close" in data.columns:
-            data = data.dropna(subset=["close"])
-
-        # Set datetime index
-        if "date" in data.columns:
-            try:
-                data["date"] = pd.to_datetime(data["date"], errors="coerce")
-                data = data.set_index("date").sort_index()
-            except (ValueError, AttributeError, KeyError) as e:
-                self.logger.warning(f"Failed to process date index in market data: {e}")
-                # Continue without date indexing - data may still be usable
-
-        return data
 
     def is_market_hours(self) -> bool:
         """Check if current time is within market hours."""

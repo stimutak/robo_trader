@@ -431,8 +431,9 @@ class AsyncRunner:
         # Create async IBKR client with connection pooling
         import random
 
-        # Use wider client ID range to avoid conflicts with stuck connections
-        random_client_id = random.randint(10, 200)
+        # Use higher client ID range (900-1000) to avoid conflicts with stuck connections
+        # We know 999 works, so use that range
+        random_client_id = random.randint(900, 1000)
         logger.info(f"Using client ID {random_client_id} for this session")
         conn_config = ConnectionConfig(
             host=self.cfg.ibkr.host,
@@ -504,8 +505,8 @@ class AsyncRunner:
         if self.use_smart_execution:
             from .smart_execution.smart_executor import SmartExecutor
 
-            # Pass IBKR client for real market data (use first connection from pool)
-            ibkr_client = self.client.pool.pool[0] if self.client.pool.pool else None
+            # Pass IBKR client for real market data (use direct connection)
+            ibkr_client = self.client._connection if self.client._connection else None
             smart_executor = SmartExecutor(self.cfg, ibkr_client=ibkr_client)
             logger.info("Smart execution enabled with TWAP/VWAP/Iceberg algorithms")
 
@@ -1838,7 +1839,12 @@ class AsyncRunner:
                 self.advanced_risk.save_state(state_file)
                 logger.info("Advanced risk manager state saved")
 
-            # Disconnect from IB Gateway if exists
+            # Disconnect from IBKR client if exists
+            if hasattr(self, "client") and self.client:
+                logger.info("Disconnecting from IBKR...")
+                await self.client.disconnect()
+
+            # Legacy IB Gateway disconnect (for backward compatibility)
             if hasattr(self, "ib") and self.ib and self.ib.isConnected():
                 logger.info("Disconnecting from IB Gateway...")
                 self.ib.disconnect()

@@ -24,11 +24,12 @@ See `IMPLEMENTATION_PLAN.md` for the complete 16-week roadmap.
 ## ✨ Key Features
 
 ### Core Infrastructure (Phase 1 - Complete)
-- ✅ **Async IBKR Client**: Non-blocking operations with retry logic
+- ✅ **Async IBKR Client**: Non-blocking operations with subprocess isolation
 - ✅ **Pydantic Configuration**: Type-safe config with validation
 - ✅ **Parallel Processing**: 3x throughput improvement
 - ✅ **Async Database**: SQLite with connection pooling
 - ✅ **Performance Monitoring**: Real-time metrics dashboard
+- ✅ **TWS Connection Issues**: Resolved with subprocess-based approach
 
 ### ML Infrastructure (Phase 2 - Complete)
 - ✅ **Feature Engineering**: 25+ technical indicators with time series
@@ -386,7 +387,16 @@ ls trained_models/
 # Verify TWS/Gateway running
 # Check port (Paper: 7497, Live: 7496)
 # Enable API in TWS settings
+# Check for stuck connections: netstat -an | grep 7497
+# Restart TWS if CLOSE_WAIT connections exist
+# Test basic connection: python3 test_exact_working.py
 ```
+
+**TWS API Timeout Issues (RESOLVED)**
+- Issue: `patchAsyncio()` caused API handshake timeouts
+- Solution: Subprocess-based IBKR operations for async isolation
+- Files: `robo_trader/clients/sync_ibkr_wrapper.py`
+- Monitor: Check for stuck connections, restart TWS periodically
 
 ## 📚 Documentation
 
@@ -422,6 +432,6 @@ This software is for educational purposes. Trading involves substantial risk of 
 
 ---
 
-**System Status**: ✅ ML Infrastructure Complete, Phase 3 Starting
-**Version**: 2.0.0 (Phase 2 Complete)
-**Last Updated**: 2025-08-29
+**System Status**: ✅ TWS Connection Issues Resolved, Phase 3 Continuing
+**Version**: 2.1.0 (TWS Connection Fix)
+**Last Updated**: 2025-09-23

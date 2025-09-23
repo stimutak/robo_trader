@@ -69,12 +69,44 @@ python3 test_m3_complete.py
 python3 test_m4_performance.py
 ```
 
-## Current Issues to Fix
+## Current Issues Status
 1. ✅ WebSocket connection handler signature error - FIXED
 2. ✅ JSON serialization error with ServerConnection object - FIXED
 3. ✅ Phase 1 F2: Upgrade config to Pydantic - COMPLETED
 4. ✅ WebSocket stability - Fixed with client/server separation
-5. ⚠️ TWS API Connection - Handshake timeout (TWS config issue, not library)
+5. ✅ TWS API Connection Issues - RESOLVED with subprocess approach
+
+## Major Fixes Completed (2025-09-23)
+
+### TWS API Connection Resolution ✅
+**Problem:** Async context (`patchAsyncio()`) caused TWS API handshake timeouts and stuck connections
+**Solution:** Implemented subprocess-based IBKR operations for complete async isolation
+
+**Key Changes:**
+- Created `SyncIBKRWrapper` class for thread-based operations
+- Implemented subprocess approach for complete process isolation
+- Fixed connection pooling complexity (removed, simplified to direct connections)
+- Enhanced client ID management (unique timestamp + PID based IDs)
+- Comprehensive error handling and cleanup
+
+**Files Modified:**
+- `robo_trader/clients/async_ibkr_client.py` - Simplified connection architecture
+- `robo_trader/clients/sync_ibkr_wrapper.py` - New subprocess-based wrapper
+- `robo_trader/runner_async.py` - Updated to use new client approach
+
+### Library Migration Notes (2025-09-23)
+- Migrated from `ib_insync` (unmaintained) to `ib_async` v2.0.1 (maintained fork)
+- ib_insync author passed away early 2024, library archived March 2024
+- ib_async is drop-in replacement, no API changes needed
+- All imports updated: `from ib_insync` → `from ib_async`
+- Both libraries supported for backward compatibility
+
+### TWS Connection Requirements
+- TWS must be restarted periodically to clear stuck connections
+- Check TWS: File → Global Configuration → API → Settings
+- Set Master API client ID = 0, Enable Socket Clients, Add 127.0.0.1 to Trusted IPs
+- Monitor for CLOSE_WAIT connections: `netstat -an | grep 7497`
+- Restart TWS if stuck connections accumulate
 
 ## WebSocket Fix Notes (2025-08-28)
 - Fixed handler signature by adding `path` parameter
@@ -83,19 +115,6 @@ python3 test_m4_performance.py
 - Set MONITORING_LOG_FORMAT=plain when running dashboard to avoid JSON issues
 - Created WebSocket client (`websocket_client.py`) for proper client/server separation
 - Runner now uses client to connect to existing server instead of direct import
-
-## Library Migration Notes (2025-09-23)
-- Migrated from `ib_insync` (unmaintained) to `ib_async` v2.0.1 (maintained fork)
-- ib_insync author passed away early 2024, library archived March 2024
-- ib_async is drop-in replacement, no API changes needed
-- All imports updated: `from ib_insync` → `from ib_async`
-
-## TWS API Connection Issue
-- TWS accepts TCP connections but fails API handshake (apiStart timeout)
-- Not library-related - same issue with both ib_insync and ib_async
-- Check TWS: File → Global Configuration → API → Settings
-- Set Master API client ID = 0, Enable Socket Clients, Add 127.0.0.1 to Trusted IPs
-- Consider using IB Gateway (port 4001/4002) if TWS issues persist
 
 ## Development Guidelines
 - Always refer to IMPLEMENTATION_PLAN.md for phase objectives

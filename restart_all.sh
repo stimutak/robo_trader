@@ -1,0 +1,1 @@
+scripts/restart_all.sh
