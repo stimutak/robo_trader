@@ -8,7 +8,7 @@ import asyncio
 import sys
 import time
 
-from ib_insync import IB, Stock
+from ib_async import IB, Stock
 
 
 async def verify_connection():

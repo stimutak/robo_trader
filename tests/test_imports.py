@@ -38,7 +38,7 @@ def test_third_party_imports():
     import pandas
     import pydantic
     import tenacity
-    from ib_insync import IB
+    from ib_async import IB
 
 
 def test_platform_info():

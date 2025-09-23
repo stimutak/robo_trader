@@ -8,7 +8,7 @@ import asyncio
 import sys
 import time
 
-from ib_insync import IB
+from ib_async import IB
 
 
 async def diagnose_auth_issue():
@@ -70,7 +70,7 @@ async def diagnose_auth_issue():
 
             # Test market data access
             print("\n🔄 Testing market data access...")
-            from ib_insync import Stock
+            from ib_async import Stock
 
             contract = Stock("AAPL", "SMART", "USD")
 

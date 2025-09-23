@@ -7,7 +7,7 @@ import asyncio
 import socket
 import time
 
-from ib_insync import IB
+from ib_async import IB
 
 
 def test_socket_connection():

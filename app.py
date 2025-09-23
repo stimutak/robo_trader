@@ -1685,14 +1685,14 @@ HTML_TEMPLATE = """
                 
                 data.logs.forEach(log => {
                     // Extract the message part without timestamp for comparison
-                    const timeMatch = log.match(/^(\d{2}:\d{2}:\d{2})/);
+                    const timeMatch = log.match(/^(\\d{2}:\\d{2}:\\d{2})/);
                     let message = log;
                     if (timeMatch) {
                         const separatorIndex = log.indexOf(' - ', timeMatch[0].length);
                         if (separatorIndex !== -1) {
                             message = log.substring(separatorIndex + 3);
                         } else {
-                            message = log.substring(timeMatch[0].length).replace(/^[\s:-]+/, '');
+                            message = log.substring(timeMatch[0].length).replace(/^[\\s:-]+/, '');
                         }
                     }
                     
@@ -1702,7 +1702,7 @@ HTML_TEMPLATE = """
                     // Filter out spam events completely
                     if (message.startsWith('{') && message.includes('"event":')) {
                         try {
-                            const jsonMatch = message.match(/"event":\s*"([^"]+)"/);
+                            const jsonMatch = message.match(/"event":\\s*"([^"]+)"/);
                             if (jsonMatch) {
                                 const eventType = jsonMatch[1];
                                 
@@ -1742,7 +1742,7 @@ HTML_TEMPLATE = """
                 
                 newLogs.forEach(log => {
                     // Extract time from log if it starts with HH:MM:SS format
-                    const timeMatch = log.match(/^(\d{2}:\d{2}:\d{2})/);
+                    const timeMatch = log.match(/^(\\d{2}:\\d{2}:\\d{2})/);
                     const time = timeMatch ? timeMatch[1] : '';
                     
                     // Handle both " - " and ": " after time
@@ -1753,7 +1753,7 @@ HTML_TEMPLATE = """
                         if (separatorIndex !== -1) {
                             message = log.substring(separatorIndex + 3);
                         } else {
-                            message = log.substring(time.length).replace(/^[\s:-]+/, '');
+                            message = log.substring(time.length).replace(/^[\\s:-]+/, '');
                         }
                     }
                     
@@ -2558,7 +2558,7 @@ def market_status():
 def check_ibkr_connection():
     """Check if IBKR is actually connected."""
     try:
-        from ib_insync import IB
+        from ib_async import IB
 
         ib = IB()
 

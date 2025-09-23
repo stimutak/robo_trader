@@ -17,8 +17,8 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 try:
-    from ib_insync import IB, util
-    from ib_insync.contract import Stock
+    from ib_async import IB, util
+    from ib_async.contract import Stock
 except ImportError:
     print("ERROR: ib_insync not installed. Run: pip3 install ib_insync")
     sys.exit(1)

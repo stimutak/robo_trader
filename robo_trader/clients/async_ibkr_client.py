@@ -15,11 +15,11 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
-from ib_insync import IB, Contract, Stock, util
-from ib_insync.util import patchAsyncio
+from ib_async import IB, Contract, Stock, util
+from ib_async.util import patchAsyncio
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-# Enable nested event loops - REQUIRED for ib_insync to work in async context
+# Enable nested event loops - REQUIRED for ib_async to work in async context
 patchAsyncio()
 
 logger = logging.getLogger(__name__)
@@ -121,7 +121,7 @@ class ConnectionPool:
                     logger.info(f"Auto-detected {name} on port {port}")
                     self.config.port = port
                     break
-            except:
+            except Exception:
                 pass
             finally:
                 sock.close()
@@ -171,7 +171,7 @@ class ConnectionPool:
                     if ib and hasattr(ib, "disconnect"):
                         ib.disconnect()
                         logger.debug(f"Cleaned up failed connection for client ID {client_id}")
-                except:
+                except Exception:
                     pass  # Ignore cleanup errors
                 raise
 

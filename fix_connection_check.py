@@ -8,7 +8,7 @@ Adds proper connection checking to prevent "Trading Active" without IBKR.
 def check_ibkr_connection():
     """Check if IBKR is actually connected."""
     try:
-        from ib_insync import IB
+        from ib_async import IB
 
         ib = IB()
 

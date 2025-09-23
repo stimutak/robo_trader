@@ -559,7 +559,7 @@ class SmartExecutor:
         # Try to get real market data if IBKR client is available
         if self.ibkr_client and not market_data:
             try:
-                from ib_insync import Stock
+                from ib_async import Stock
 
                 # Create stock contract
                 contract = Stock(symbol, "SMART", "USD")
@@ -682,7 +682,7 @@ class SmartExecutor:
         # Get real price from IBKR if client is available
         if self.ibkr_client:
             try:
-                from ib_insync import Stock
+                from ib_async import Stock
 
                 # Create stock contract
                 contract = Stock(symbol, "SMART", "USD")
