@@ -19,7 +19,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
-from ib_insync import IB, Contract, Stock, util
+from ib_async import IB, Contract, Stock, util
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ class SyncIBKRWrapper:
             script_content = f"""
 import sys
 import json
-from ib_insync import IB
+from ib_async import IB
 # Don't call patchAsyncio() - run in clean environment
 
 def test_and_keep_connection():

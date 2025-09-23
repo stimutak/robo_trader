@@ -14,7 +14,7 @@ def test_subprocess_connection():
     script_content = """
 import sys
 import json
-from ib_insync import IB
+from ib_async import IB
 # Don't call patchAsyncio() - run in clean environment
 
 def test_connection():

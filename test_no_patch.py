@@ -4,7 +4,7 @@
 import asyncio
 import sys
 
-from ib_insync import IB
+from ib_async import IB
 
 # DON'T import patchAsyncio
 

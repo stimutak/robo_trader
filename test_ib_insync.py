@@ -4,8 +4,8 @@
 import asyncio
 import sys
 
-from ib_insync import IB
-from ib_insync.util import patchAsyncio
+from ib_async import IB
+from ib_async.util import patchAsyncio
 
 # Enable nested event loops
 patchAsyncio()

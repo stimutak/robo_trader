@@ -17,7 +17,7 @@ async def test_runner_with_subprocess():
         return f"""
 import sys
 import json
-from ib_insync import IB
+from ib_async import IB
 import pandas as pd
 
 def fetch_data():
@@ -28,7 +28,7 @@ def fetch_data():
         ib.connect("127.0.0.1", 7497, clientId=client_id, timeout=15, readonly=True)
         
         # Get contract
-        from ib_insync import Stock
+        from ib_async import Stock
         contract = Stock("{symbol}", "SMART", "USD")
         qualified = ib.qualifyContracts(contract)
         

@@ -10,7 +10,7 @@ script_content = """
 import sys
 import json
 import traceback
-from ib_insync import IB
+from ib_async import IB
 
 def test_connection():
     try:
