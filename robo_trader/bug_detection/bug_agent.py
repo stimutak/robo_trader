@@ -30,6 +30,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from ..logger import get_logger
+from ..utils.market_time import get_market_time
 
 logger = get_logger(__name__)
 
@@ -476,7 +477,7 @@ class RuntimeMonitor:
                                 code_snippet=line.strip(),
                                 metadata={
                                     "pattern": pattern,
-                                    "timestamp": datetime.now().isoformat(),
+                                    "timestamp": get_market_time().isoformat(),
                                 },
                             )
                         )
@@ -696,7 +697,7 @@ class BugAgent:
     def generate_report(self) -> Dict[str, Any]:
         """Generate a comprehensive bug report."""
         if not self.bugs:
-            return {"message": "No bugs found", "timestamp": datetime.now().isoformat()}
+            return {"message": "No bugs found", "timestamp": get_market_time().isoformat()}
 
         # Group bugs by severity
         by_severity = {}
@@ -716,7 +717,7 @@ class BugAgent:
         top_files = sorted(file_bug_counts.items(), key=lambda x: x[1], reverse=True)[:10]
 
         return {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": get_market_time().isoformat(),
             "total_bugs": len(self.bugs),
             "by_severity": by_severity,
             "by_category": by_category,

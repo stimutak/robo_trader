@@ -16,6 +16,7 @@ import pandas as pd
 import structlog
 
 from ..ml.model_selector import ModelSelector
+from ..utils.market_time import get_market_time
 from .performance import PerformanceAnalyzer
 
 logger = structlog.get_logger(__name__)
@@ -348,7 +349,7 @@ class StrategyPerformanceTracker:
 
         report = {
             "strategy": strategy_name,
-            "generated_at": datetime.now().isoformat(),
+            "generated_at": get_market_time().isoformat(),
             "summary": {
                 "total_return": performance.get("total_return"),
                 "annual_return": performance.get("annual_return"),
@@ -467,7 +468,7 @@ class StrategyPerformanceTracker:
 
         try:
             await self.database.save_performance_metrics(
-                strategy=strategy_name, metrics=performance, timestamp=datetime.now()
+                strategy=strategy_name, metrics=performance, timestamp=get_market_time()
             )
             logger.info(f"Saved performance for {strategy_name} to database")
         except Exception as e:
@@ -480,7 +481,7 @@ class StrategyPerformanceTracker:
             strategy_name: Strategy name
             performance: Performance results
         """
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = get_market_time().strftime("%Y%m%d_%H%M%S")
         filename = self.results_dir / f"{strategy_name}_{timestamp}.json"
 
         with open(filename, "w") as f:

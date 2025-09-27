@@ -15,6 +15,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Import timezone-aware market time utilities
+from ..utils.market_time import get_market_time
+
 # Handle optional dependencies gracefully
 try:
     import numpy as np
@@ -49,7 +52,7 @@ class RiskMetrics:
     correlation_risk: float
     concentration_risk: float
     liquidity_risk: float
-    timestamp: datetime = field(default_factory=datetime.now)
+    timestamp: datetime = field(default_factory=get_market_time)
 
 
 @dataclass
@@ -100,7 +103,7 @@ class KellySizer:
                 "symbol": symbol,
                 "pnl": pnl,
                 "pnl_pct": pnl / entry_price if entry_price != 0 else 0,
-                "timestamp": datetime.now(),
+                "timestamp": get_market_time(),
             }
         )
 
@@ -230,7 +233,7 @@ class CorrelationLimiter:
 
         # Calculate correlation matrix
         self.correlation_matrix = returns.corr()
-        self.last_correlation_update = datetime.now()
+        self.last_correlation_update = get_market_time()
 
         return self.correlation_matrix
 
@@ -364,7 +367,7 @@ class KillSwitch:
     def trigger(self, reason: str, details: str = "") -> None:
         """Trigger the kill switch."""
         self.triggered = True
-        self.trigger_time = datetime.now()
+        self.trigger_time = get_market_time()
         self.trigger_reason = f"{reason}: {details}" if details else reason
 
         # Log critical event
@@ -376,7 +379,7 @@ class KillSwitch:
             return
 
         if self.trigger_time:
-            elapsed = datetime.now() - self.trigger_time
+            elapsed = get_market_time() - self.trigger_time
             if elapsed > timedelta(minutes=self.cooldown_minutes):
                 self.triggered = False
                 self.trigger_time = None
@@ -539,7 +542,7 @@ class AdvancedRiskManager:
                         "quantity": total_qty,
                         "avg_price": new_avg,
                         "value": total_qty * price,
-                        "entry_time": pos.get("entry_time", datetime.now()),
+                        "entry_time": pos.get("entry_time", get_market_time()),
                     }
                 else:
                     del self.positions[symbol]
@@ -549,12 +552,12 @@ class AdvancedRiskManager:
                     "quantity": quantity,
                     "avg_price": price,
                     "value": quantity * price,
-                    "entry_time": datetime.now(),
+                    "entry_time": get_market_time(),
                 }
 
                 # Track for kill switch
                 if self.kill_switch:
-                    self.kill_switch.position_entry[symbol] = (price, datetime.now())
+                    self.kill_switch.position_entry[symbol] = (price, get_market_time())
 
         elif side.upper() in ["SELL", "SELL_SHORT"]:
             if symbol in self.positions:
@@ -737,7 +740,7 @@ class AdvancedRiskManager:
             "current_capital": self.current_capital,
             "kill_switch_triggered": self.kill_switch.triggered if self.kill_switch else False,
             "kelly_trades": list(self.kelly_sizer.trade_history) if self.kelly_sizer else [],
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": get_market_time().isoformat(),
         }
 
         with open(filepath, "w") as f:

@@ -1077,8 +1077,105 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
             </div>
+
+            <!-- Safety Monitoring Section -->
+            <div class="table-container" style="margin-top: 20px;">
+                <h3 style="color: #ffa500;">🚨 Safety Monitoring</h3>
+
+                <!-- Circuit Breakers -->
+                <div style="margin-bottom: 20px;">
+                    <h4 style="color: #fff;">Circuit Breakers</h4>
+                    <div class="metrics-grid" id="circuit-breakers">
+                        <div class="metric-item">
+                            <div class="metric-label">API Circuit</div>
+                            <div class="metric-value positive" id="api-circuit">CLOSED</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Data Circuit</div>
+                            <div class="metric-value positive" id="data-circuit">CLOSED</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Trading Circuit</div>
+                            <div class="metric-value positive" id="trading-circuit">CLOSED</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Open Breakers</div>
+                            <div class="metric-value" id="open-breakers">0</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Order Management -->
+                <div style="margin-bottom: 20px;">
+                    <h4 style="color: #fff;">Order Management</h4>
+                    <div class="metrics-grid" id="order-management">
+                        <div class="metric-item">
+                            <div class="metric-label">Active Orders</div>
+                            <div class="metric-value" id="active-orders">0</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Fill Rate</div>
+                            <div class="metric-value positive" id="fill-rate">0%</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Failed Orders</div>
+                            <div class="metric-value" id="failed-orders">0</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Retry Count</div>
+                            <div class="metric-value" id="retry-count">0</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Data Validation -->
+                <div style="margin-bottom: 20px;">
+                    <h4 style="color: #fff;">Data Validation</h4>
+                    <div class="metrics-grid" id="data-validation">
+                        <div class="metric-item">
+                            <div class="metric-label">Pass Rate</div>
+                            <div class="metric-value positive" id="data-pass-rate">100%</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Stale Data</div>
+                            <div class="metric-value" id="stale-data">0</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Wide Spreads</div>
+                            <div class="metric-value" id="wide-spreads">0</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Anomalies</div>
+                            <div class="metric-value" id="anomalies">0</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Safety Thresholds -->
+                <div style="margin-bottom: 20px;">
+                    <h4 style="color: #fff;">Safety Thresholds</h4>
+                    <div class="metrics-grid" id="safety-thresholds">
+                        <div class="metric-item">
+                            <div class="metric-label">Max Positions</div>
+                            <div class="metric-value" id="max-positions">5</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Stop Loss</div>
+                            <div class="metric-value negative" id="stop-loss">2.0%</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Take Profit</div>
+                            <div class="metric-value positive" id="take-profit">3.0%</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Max Daily Trades</div>
+                            <div class="metric-value" id="max-daily">100</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
-        
+
         <div id="watchlist-tab" class="tab-content" style="display: none;">
             <div class="table-container">
                 <h3>Watched Symbols</h3>
@@ -2059,6 +2156,129 @@ HTML_TEMPLATE = """
             }
         }
         
+        async function updateSafetyMonitoring() {
+            try {
+                // Fetch circuit breakers
+                const breakersResponse = await fetch('/api/safety/circuit-breakers');
+                const breakers = await breakersResponse.json();
+                updateCircuitBreakers(breakers);
+
+                // Fetch order manager
+                const ordersResponse = await fetch('/api/safety/order-manager');
+                const orders = await ordersResponse.json();
+                updateOrderManager(orders);
+
+                // Fetch data validator
+                const validatorResponse = await fetch('/api/safety/data-validator');
+                const validator = await validatorResponse.json();
+                updateDataValidator(validator);
+
+                // Fetch safety thresholds
+                const thresholdsResponse = await fetch('/api/safety/thresholds');
+                const thresholds = await thresholdsResponse.json();
+                updateSafetyThresholds(thresholds);
+            } catch (error) {
+                console.error('Error updating safety monitoring:', error);
+            }
+        }
+
+        function updateCircuitBreakers(breakers) {
+            const container = document.getElementById('circuit-breakers-content');
+            if (!container || !breakers) return;
+
+            let html = '';
+            for (const [name, stats] of Object.entries(breakers)) {
+                const stateClass = stats.state === 'closed' ? 'success' :
+                                 stats.state === 'open' ? 'danger' : 'warning';
+                const stateIcon = stats.state === 'closed' ? '✓' :
+                                stats.state === 'open' ? '✗' : '⚠';
+
+                html += `
+                    <div class="circuit-breaker-item">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                            <strong>${name}</strong>
+                            <span class="badge badge-${stateClass}">${stateIcon} ${stats.state.toUpperCase()}</span>
+                        </div>
+                        <div style="font-size: 0.9em; color: #999;">
+                            Calls: ${stats.total_calls} |
+                            Failed: ${stats.failed_calls} |
+                            Success Rate: ${((stats.successful_calls / Math.max(stats.total_calls, 1)) * 100).toFixed(1)}%
+                        </div>
+                    </div>
+                `;
+            }
+
+            container.innerHTML = html || '<div style="color: #666;">No circuit breakers active</div>';
+        }
+
+        function updateOrderManager(data) {
+            if (!data) return;
+
+            // Update stats
+            document.getElementById('total-orders').textContent = data.total_orders || 0;
+            document.getElementById('active-orders').textContent = data.active_orders || 0;
+            document.getElementById('fill-rate').textContent = ((data.fill_rate || 0)).toFixed(1) + '%';
+            document.getElementById('error-rate').textContent = ((data.error_rate || 0)).toFixed(1) + '%';
+
+            // Update recent orders table
+            const tbody = document.getElementById('recent-orders-body');
+            if (!tbody) return;
+
+            if (data.recent_orders && data.recent_orders.length > 0) {
+                let html = '';
+                data.recent_orders.forEach(order => {
+                    const statusClass = order.status === 'filled' ? 'success' :
+                                      order.status === 'error' || order.status === 'rejected' ? 'danger' :
+                                      order.status === 'partial_fill' ? 'warning' : 'info';
+
+                    html += `
+                        <tr>
+                            <td>${order.symbol}</td>
+                            <td><span class="badge badge-${statusClass}">${order.status}</span></td>
+                            <td>${order.fill_percentage.toFixed(1)}%</td>
+                            <td>${order.retry_count}</td>
+                        </tr>
+                    `;
+                });
+                tbody.innerHTML = html;
+            } else {
+                tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: #666;">No recent orders</td></tr>';
+            }
+        }
+
+        function updateDataValidator(data) {
+            if (!data) return;
+
+            // Update validation stats
+            document.getElementById('total-validations').textContent = data.total_validations || 0;
+            document.getElementById('pass-rate').textContent = ((data.pass_rate || 0)).toFixed(1) + '%';
+            document.getElementById('failed-stale').textContent = data.failed_stale || 0;
+            document.getElementById('failed-spread').textContent = data.failed_spread || 0;
+        }
+
+        function updateSafetyThresholds(thresholds) {
+            const container = document.getElementById('safety-thresholds-content');
+            if (!container || !thresholds) return;
+
+            let html = '<div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;">';
+
+            for (const [key, value] of Object.entries(thresholds)) {
+                // Format the key for display
+                const displayKey = key.replace(/_/g, ' ').toLowerCase()
+                    .replace(/\\b\\w/g, l => l.toUpperCase());
+
+                html += `
+                    <div style="padding: 8px; background: #2a2a2a; border-radius: 4px;">
+                        <div style="font-size: 0.85em; color: #999;">${displayKey}</div>
+                        <div style="font-size: 1.1em; font-weight: bold;">${value}</div>
+                    </div>
+                `;
+            }
+
+            html += '</div>';
+            container.innerHTML = html;
+        }
+
         function updatePerformanceTable(data) {
             if (!data) return;
 
@@ -2440,11 +2660,13 @@ HTML_TEMPLATE = """
         window.onload = () => {
             refreshData();
             refreshStrategies();
+            updateSafetyMonitoring(); // Load safety monitoring on startup
             loadLogs(); // Load logs immediately on startup
             updateMarketStatus(); // Load market status on startup
             connectWebSocket(); // Connect to WebSocket
             setInterval(refreshData, 5000); // Keep polling as fallback
             setInterval(refreshStrategies, 5000); // Update strategies tab
+            setInterval(updateSafetyMonitoring, 10000); // Update safety monitoring every 10 seconds
             setInterval(loadLogs, 2000); // Update logs every 2 seconds
             setInterval(updateMarketStatus, 60000); // Update market status every minute
         };
@@ -4346,6 +4568,123 @@ def control_kill_switch():
     else:
         # Return current status
         return jsonify({"active": False, "triggered": False, "can_trade": True})
+
+
+@app.route("/api/safety/circuit-breakers")
+@requires_auth
+def get_circuit_breakers():
+    """Get circuit breaker status for all components"""
+    try:
+        from robo_trader.circuit_breaker import circuit_manager
+
+        all_stats = circuit_manager.get_all_statistics()
+        open_breakers = circuit_manager.get_open_breakers()
+
+        return jsonify(
+            {
+                "breakers": all_stats,
+                "open_count": len(open_breakers),
+                "open_breakers": open_breakers,
+                "any_open": circuit_manager.is_any_open(),
+            }
+        )
+    except ImportError:
+        return jsonify(
+            {
+                "breakers": {},
+                "open_count": 0,
+                "open_breakers": [],
+                "any_open": False,
+                "error": "Circuit breaker module not available",
+            }
+        )
+
+
+@app.route("/api/safety/order-manager")
+@requires_auth
+def get_order_manager_status():
+    """Get order management statistics"""
+    try:
+        # Try to get from runner if available
+        if hasattr(app, "order_manager"):
+            stats = app.order_manager.get_statistics()
+            active_orders = app.order_manager.get_active_orders()
+            return jsonify(
+                {
+                    "statistics": stats,
+                    "active_orders": [
+                        {
+                            "id": order.id[:8],
+                            "symbol": order.symbol,
+                            "side": order.side,
+                            "status": order.status.value,
+                            "filled": f"{order.fill_percentage:.1f}%",
+                        }
+                        for order in active_orders
+                    ],
+                }
+            )
+        else:
+            # Return mock data for demonstration
+            return jsonify(
+                {
+                    "statistics": {
+                        "total_orders": 0,
+                        "active_orders": 0,
+                        "successful_fills": 0,
+                        "failed_orders": 0,
+                        "fill_rate": 0.0,
+                        "error_rate": 0.0,
+                    },
+                    "active_orders": [],
+                }
+            )
+    except Exception as e:
+        return jsonify({"error": str(e), "statistics": {}, "active_orders": []})
+
+
+@app.route("/api/safety/data-validator")
+@requires_auth
+def get_data_validator_status():
+    """Get data validation statistics"""
+    try:
+        # Try to get from runner if available
+        if hasattr(app, "data_validator"):
+            stats = app.data_validator.get_statistics()
+            return jsonify(stats)
+        else:
+            # Return mock data for demonstration
+            return jsonify(
+                {
+                    "total_validations": 0,
+                    "passed": 0,
+                    "failed_stale": 0,
+                    "failed_spread": 0,
+                    "failed_price": 0,
+                    "failed_volume": 0,
+                    "failed_anomaly": 0,
+                    "pass_rate": 100.0,
+                }
+            )
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+@app.route("/api/safety/thresholds")
+@requires_auth
+def get_safety_thresholds():
+    """Get all safety thresholds from environment"""
+    thresholds = {
+        "max_open_positions": os.getenv("MAX_OPEN_POSITIONS", "5"),
+        "max_orders_per_minute": os.getenv("MAX_ORDERS_PER_MINUTE", "10"),
+        "stop_loss_percent": os.getenv("STOP_LOSS_PERCENT", "2.0"),
+        "take_profit_percent": os.getenv("TAKE_PROFIT_PERCENT", "3.0"),
+        "data_staleness_seconds": os.getenv("DATA_STALENESS_SECONDS", "60"),
+        "circuit_breaker_threshold": os.getenv("CIRCUIT_BREAKER_THRESHOLD", "5"),
+        "circuit_breaker_timeout": os.getenv("CIRCUIT_BREAKER_TIMEOUT", "300"),
+        "max_daily_trades": os.getenv("MAX_DAILY_TRADES", "100"),
+    }
+    return jsonify(thresholds)
 
 
 @app.route("/api/start", methods=["POST"])

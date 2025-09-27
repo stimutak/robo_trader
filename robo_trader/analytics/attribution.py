@@ -11,6 +11,8 @@ import numpy as np
 import pandas as pd
 import structlog
 
+from ..utils.market_time import get_market_time
+
 logger = structlog.get_logger(__name__)
 
 
@@ -521,7 +523,7 @@ class AttributionAnalyzer:
                 "information_ratio": information_ratio,
             },
             "attribution_analyses": compiled_attributions,
-            "generated_at": datetime.now().isoformat(),
+            "generated_at": get_market_time().isoformat(),
         }
 
         return report
