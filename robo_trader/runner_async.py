@@ -29,6 +29,7 @@ from .execution import Order, PaperExecutor
 from .logger import get_logger
 from .market_hours import get_market_session, is_market_open, seconds_until_market_open
 from .monitoring.performance import PerformanceMonitor, Timer
+from .monitoring.production_monitor import ProductionMonitor
 
 # Import WebSocket client for real-time updates
 try:
@@ -139,6 +140,12 @@ class AsyncRunner:
         self.daily_pnl = 0.0
         self.daily_executed_notional = 0.0
         self.monitor = PerformanceMonitor()
+
+        # Production monitoring (Phase 4 P2)
+        self.production_monitor = None
+        self.enable_production_monitoring = (
+            os.getenv("PRODUCTION_MONITORING", "true").lower() == "true"
+        )
 
         # Position locks to prevent race conditions
         self._position_locks: Dict[str, asyncio.Lock] = {}
@@ -658,6 +665,53 @@ class AsyncRunner:
             except Exception as e:
                 logger.error(f"Failed to initialize mean reversion strategies: {e}")
 
+        # Initialize Production Monitoring (Phase 4 P2)
+        if self.enable_production_monitoring:
+            import json
+            from pathlib import Path
+
+            # Load monitoring config
+            config_path = Path("config/monitoring_config.json")
+            monitoring_config = {}
+            if config_path.exists():
+                with open(config_path) as f:
+                    monitoring_config = json.load(f)
+
+            # Initialize ProductionMonitor
+            self.production_monitor = ProductionMonitor(
+                config=monitoring_config.get("monitoring", {}),
+                log_dir=Path(
+                    monitoring_config.get("monitoring", {}).get("log_dir", "logs/monitoring")
+                ),
+                enable_alerts=monitoring_config.get("monitoring", {}).get("enable_alerts", True),
+                enable_health_checks=monitoring_config.get("monitoring", {}).get(
+                    "enable_health_checks", True
+                ),
+            )
+
+            # Load alert configurations if available
+            if "alerts" in monitoring_config:
+                from .monitoring.production_monitor import Alert, AlertSeverity, MetricType
+
+                for alert_name, alert_config in monitoring_config["alerts"].items():
+                    alert = Alert(
+                        name=alert_name,
+                        metric_type=MetricType(alert_config["metric_type"]),
+                        threshold=alert_config["threshold"],
+                        comparison=alert_config["comparison"],
+                        severity=AlertSeverity(alert_config["severity"]),
+                        cooldown_minutes=alert_config.get("cooldown_minutes", 5),
+                        message_template=alert_config.get("message_template", ""),
+                        active=alert_config.get("active", True),
+                    )
+                    self.production_monitor.alert_manager.add_alert(alert)
+
+            # Start monitoring
+            await self.production_monitor.start(
+                interval=monitoring_config.get("monitoring", {}).get("interval", 60)
+            )
+            logger.info("Production monitoring started with health checks and alerts")
+
         # Load existing positions from database to prevent duplicate buying
         await self.load_existing_positions()
 
@@ -692,6 +746,8 @@ class AsyncRunner:
 
     async def teardown(self):
         """Clean up resources."""
+        if self.production_monitor:
+            await self.production_monitor.stop()
         if self.correlation_manager:
             await self.correlation_manager.stop()
         if self.conn_mgr:
@@ -708,10 +764,18 @@ class AsyncRunner:
             return None
 
         try:
+            start_time = asyncio.get_event_loop().time()
             with Timer("data_fetch", self.monitor):
                 # Use ConnectionManager to fetch historical bars
                 df = await self.conn_mgr.fetch_historical_bars(
                     symbol=symbol, duration=self.duration, bar_size=self.bar_size
+                )
+
+            # Record API call metrics to ProductionMonitor (Phase 4 P2)
+            if self.production_monitor:
+                latency_ms = (asyncio.get_event_loop().time() - start_time) * 1000
+                self.production_monitor.record_api_call(
+                    "fetch_historical_bars", df is not None and not df.empty, latency_ms
                 )
 
             if df.empty:
@@ -1031,6 +1095,14 @@ class AsyncRunner:
                         await self.monitor.record_trade_executed(
                             symbol, "BUY_TO_COVER", qty_to_cover
                         )
+
+                        # Record metrics to ProductionMonitor (Phase 4 P2)
+                        if self.production_monitor:
+                            latency_ms = 10  # Simulated latency for paper trading
+                            self.production_monitor.record_order(symbol, True, latency_ms)
+                            pnl = (pos.avg_cost - fill_price) * qty_to_cover  # Short position PnL
+                            self.production_monitor.record_trade(symbol, pnl, True)
+
                         executed = True
                         quantity = qty_to_cover
                         message = (
@@ -1153,6 +1225,14 @@ class AsyncRunner:
 
                             await self.monitor.record_order_placed(symbol, qty)
                             await self.monitor.record_trade_executed(symbol, "BUY", qty)
+
+                            # Record metrics to ProductionMonitor (Phase 4 P2)
+                            if self.production_monitor:
+                                latency_ms = 10  # Simulated latency for paper trading
+                                self.production_monitor.record_order(symbol, True, latency_ms)
+                                # No PnL yet for opening position
+                                self.production_monitor.record_trade(symbol, 0, True)
+
                             executed = True
                             quantity = qty
                             message = f"Opened long: Bought {qty} shares at ${fill_price:.2f}"
@@ -1248,6 +1328,16 @@ class AsyncRunner:
 
                             await self.monitor.record_order_placed(symbol, pos.quantity)
                             await self.monitor.record_trade_executed(symbol, "SELL", pos.quantity)
+
+                            # Record metrics to ProductionMonitor (Phase 4 P2)
+                            if self.production_monitor:
+                                latency_ms = 10  # Simulated latency for paper trading
+                                self.production_monitor.record_order(symbol, True, latency_ms)
+                                pnl = (
+                                    fill_price - pos.avg_cost
+                                ) * pos.quantity  # Long position PnL
+                                self.production_monitor.record_trade(symbol, pnl, pnl > 0)
+
                             executed = True
                             quantity = pos.quantity
                             message = (

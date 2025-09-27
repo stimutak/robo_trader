@@ -423,8 +423,8 @@ class AlertManager:
                 alert.triggered_count += 1
                 triggered.append(alert)
 
-                # Send notifications
-                self._send_alert(alert, value)
+                # Send notifications (fire and forget)
+                asyncio.create_task(self._send_alert(alert, value))
 
         return triggered
 

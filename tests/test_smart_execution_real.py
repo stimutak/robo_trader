@@ -48,21 +48,21 @@ async def test_real_market_data():
     for symbol in symbols:
         # Create VWAP execution plan
         params = ExecutionParams(
-                algorithm=ExecutionAlgorithm.VWAP,
-                duration_minutes=30,
-                slice_count=10,
-                max_participation=0.1,
-            )
+            algorithm=ExecutionAlgorithm.VWAP,
+            duration_minutes=30,
+            slice_count=10,
+            max_participation=0.1,
+        )
 
-            plan = await smart_executor.create_execution_plan(
-                symbol=symbol, side="BUY", quantity=1000, params=params
-            )
+        plan = await smart_executor.create_execution_plan(
+            symbol=symbol, side="BUY", quantity=1000, params=params
+        )
 
-            print(f"\n   {symbol} VWAP Plan:")
-            print(f"     Algorithm: {plan.algorithm.value}")
-            print(f"     Slices: {len(plan.slices)}")
-            print(f"     Duration: {plan.estimated_duration}")
-            print(f"     Market Impact: {plan.market_impact_bps:.1f} bps")
+        print(f"\n   {symbol} VWAP Plan:")
+        print(f"     Algorithm: {plan.algorithm.value}")
+        print(f"     Slices: {len(plan.slices)}")
+        print(f"     Duration: {plan.estimated_duration}")
+        print(f"     Market Impact: {plan.market_impact_bps:.1f} bps")
 
         print("\n4. Testing adaptive execution:")
         # Test adaptive algorithm which chooses based on market conditions

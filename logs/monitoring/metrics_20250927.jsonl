@@ -1,0 +1,2 @@
+{"timestamp": "2025-09-27T13:44:27.113828", "metrics": {"success_rate": 0.5, "error_rate": 0.5, "latency": 20.4, "pnl": 37.5, "cpu_usage": 7.1, "memory_usage": 49.8}}
+{"timestamp": "2025-09-27T13:44:32.222763", "metrics": {"success_rate": 0.5, "error_rate": 0.5, "cpu_usage": 0.0, "memory_usage": 50.5}}

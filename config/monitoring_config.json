@@ -1,0 +1,166 @@
+{
+  "monitoring": {
+    "enabled": true,
+    "interval": 60,
+    "retention_hours": 24,
+    "aggregation_interval": 60,
+    "enable_alerts": true,
+    "enable_health_checks": true,
+    "log_dir": "logs/monitoring"
+  },
+  "alerts": {
+    "high_cpu": {
+      "metric_type": "cpu_usage",
+      "threshold": 85,
+      "comparison": "gt",
+      "severity": "warning",
+      "cooldown_minutes": 5,
+      "message_template": "CPU usage is {value:.1f}%",
+      "active": true
+    },
+    "critical_cpu": {
+      "metric_type": "cpu_usage",
+      "threshold": 95,
+      "comparison": "gt",
+      "severity": "critical",
+      "cooldown_minutes": 5,
+      "message_template": "CRITICAL: CPU usage is {value:.1f}%",
+      "active": true
+    },
+    "high_memory": {
+      "metric_type": "memory_usage",
+      "threshold": 85,
+      "comparison": "gt",
+      "severity": "warning",
+      "cooldown_minutes": 5,
+      "message_template": "Memory usage is {value:.1f}%",
+      "active": true
+    },
+    "critical_memory": {
+      "metric_type": "memory_usage",
+      "threshold": 95,
+      "comparison": "gt",
+      "severity": "critical",
+      "cooldown_minutes": 5,
+      "message_template": "CRITICAL: Memory usage is {value:.1f}%",
+      "active": true
+    },
+    "high_error_rate": {
+      "metric_type": "error_rate",
+      "threshold": 0.05,
+      "comparison": "gt",
+      "severity": "error",
+      "cooldown_minutes": 10,
+      "message_template": "Error rate is {value:.2%}",
+      "active": true
+    },
+    "low_success_rate": {
+      "metric_type": "success_rate",
+      "threshold": 0.90,
+      "comparison": "lt",
+      "severity": "warning",
+      "cooldown_minutes": 10,
+      "message_template": "Success rate dropped to {value:.2%}",
+      "active": true
+    },
+    "critical_success_rate": {
+      "metric_type": "success_rate",
+      "threshold": 0.75,
+      "comparison": "lt",
+      "severity": "critical",
+      "cooldown_minutes": 5,
+      "message_template": "CRITICAL: Success rate is only {value:.2%}",
+      "active": true
+    },
+    "high_latency": {
+      "metric_type": "latency",
+      "threshold": 1000,
+      "comparison": "gt",
+      "severity": "warning",
+      "cooldown_minutes": 5,
+      "message_template": "High latency detected: {value:.1f}ms",
+      "active": true
+    },
+    "extreme_latency": {
+      "metric_type": "latency",
+      "threshold": 5000,
+      "comparison": "gt",
+      "severity": "critical",
+      "cooldown_minutes": 2,
+      "message_template": "CRITICAL: Extreme latency: {value:.1f}ms",
+      "active": true
+    },
+    "negative_pnl": {
+      "metric_type": "pnl",
+      "threshold": -1000,
+      "comparison": "lt",
+      "severity": "warning",
+      "cooldown_minutes": 30,
+      "message_template": "Negative P&L: ${value:.2f}",
+      "active": true
+    },
+    "large_loss": {
+      "metric_type": "pnl",
+      "threshold": -5000,
+      "comparison": "lt",
+      "severity": "critical",
+      "cooldown_minutes": 15,
+      "message_template": "CRITICAL: Large loss detected: ${value:.2f}",
+      "active": true
+    }
+  },
+  "health_thresholds": {
+    "warning": {
+      "cpu_percent": 70,
+      "memory_percent": 80,
+      "disk_usage_percent": 85,
+      "open_connections": 100
+    },
+    "critical": {
+      "cpu_percent": 90,
+      "memory_percent": 95,
+      "disk_usage_percent": 95,
+      "open_connections": 200
+    }
+  },
+  "notification_channels": {
+    "channels": [
+      {
+        "name": "webhook_primary",
+        "type": "webhook",
+        "enabled": false,
+        "rate_limit": 20,
+        "config": {
+          "url": "https://your-webhook-url.com/alerts",
+          "headers": {
+            "Authorization": "Bearer YOUR_TOKEN"
+          }
+        }
+      },
+      {
+        "name": "slack_trading",
+        "type": "slack",
+        "enabled": false,
+        "rate_limit": 30,
+        "config": {
+          "webhook_url": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+        }
+      },
+      {
+        "name": "email_critical",
+        "type": "email",
+        "enabled": false,
+        "rate_limit": 5,
+        "config": {
+          "host": "smtp.gmail.com",
+          "port": 587,
+          "use_tls": true,
+          "username": "your-email@gmail.com",
+          "password": "your-app-password",
+          "from": "your-email@gmail.com",
+          "to": "alerts@your-domain.com"
+        }
+      }
+    ]
+  }
+}

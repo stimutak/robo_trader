@@ -399,15 +399,15 @@ class TradingEngine:
                 # Placeholder to maintain structure without deprecated client
                 market_data = {}
                 for symbol, data in market_data.items():
-                        if self.database:
-                            await self.database.store_market_data(
-                                symbol=symbol,
-                                timestamp=data.get("timestamp"),
-                                price=data.get("last"),
-                                volume=data.get("volume"),
-                                bid=data.get("bid"),
-                                ask=data.get("ask"),
-                            )
+                    if self.database:
+                        await self.database.store_market_data(
+                            symbol=symbol,
+                            timestamp=data.get("timestamp"),
+                            price=data.get("last"),
+                            volume=data.get("volume"),
+                            bid=data.get("bid"),
+                            ask=data.get("ask"),
+                        )
 
                 await asyncio.sleep(0.1)  # Small delay to prevent CPU spinning
 
@@ -427,6 +427,7 @@ class TradingEngine:
             # Fetch market data
             # Fetch bars via a one-shot context
             from robo_trader.connection_manager import IBKRClient as _IBKRClient
+
             async with _IBKRClient() as c:
                 bars = await c.fetch_historical_bars(
                     symbol,
@@ -514,10 +515,10 @@ class TradingEngine:
                     if md and md.get("last"):
                         prices[symbol] = md["last"]
                     else:
-                        bars = await c.fetch_historical_bars(symbol, duration="1 D", bar_size="1 min")
+                        bars = await c.fetch_historical_bars(
+                            symbol, duration="1 D", bar_size="1 min"
+                        )
                         prices[symbol] = bars["close"].iloc[-1] if not bars.empty else 0.0
-                else:
-                    prices[symbol] = 0.0
             except Exception as e:
                 logger.error(f"Error fetching price for {symbol}: {e}")
         return prices
