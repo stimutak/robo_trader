@@ -2925,15 +2925,11 @@ def get_pnl_OLD():
                     current_price = market_data[0]["close"]
                 else:
                     # Try to get from IB if no market data stored
-                    from robo_trader.clients.async_ibkr_client import AsyncIBKRClient
+                    from robo_trader.connection_manager import IBKRClient
 
-                    client = AsyncIBKRClient()
-                    await client.initialize()
-                    try:
+                    async with IBKRClient() as client:
                         price_data = await client.get_market_data(pos["symbol"])
-                        current_price = price_data["close"] if price_data else pos["avg_cost"]
-                    finally:
-                        await client.close_all()
+                        current_price = price_data.get("last") if price_data else pos["avg_cost"]
 
                 value = pos["quantity"] * current_price
                 total_value += value

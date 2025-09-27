@@ -7,8 +7,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from robo_trader.clients.async_ibkr_client import AsyncIBKRClient, ConnectionConfig
 from robo_trader.config import load_config
+from robo_trader.connection_manager import ConnectionManager
 from robo_trader.execution import PaperExecutor
 from robo_trader.smart_execution.smart_executor import (
     ExecutionAlgorithm,
@@ -25,33 +25,29 @@ async def test_real_market_data():
 
     config = load_config()
 
-    # Initialize IBKR client with ConnectionConfig
-    conn_config = ConnectionConfig()
-    ibkr_client = AsyncIBKRClient(conn_config)
-    await ibkr_client.connect()
+    # Initialize IBKR connection via ConnectionManager
+    mgr = ConnectionManager()
+    ib = await mgr.connect()
+    # Initialize smart executor with IBKR client
+    smart_executor = SmartExecutor(config, ibkr_client=ib)
 
-    # Get an IB connection from the pool
-    async with ibkr_client.pool.acquire() as ib:
-        # Initialize smart executor with IBKR client
-        smart_executor = SmartExecutor(config, ibkr_client=ib)
+    # Test symbols
+    symbols = ["AAPL", "NVDA", "TSLA"]
 
-        # Test symbols
-        symbols = ["AAPL", "NVDA", "TSLA"]
+    print("\n1. Testing real price fetching:")
+    for symbol in symbols:
+        price = await smart_executor._get_current_price(symbol)
+        print(f"   {symbol}: ${price:.2f}")
 
-        print("\n1. Testing real price fetching:")
-        for symbol in symbols:
-            price = await smart_executor._get_current_price(symbol)
-            print(f"   {symbol}: ${price:.2f}")
+    print("\n2. Testing market condition analysis:")
+    for symbol in symbols:
+        conditions = await smart_executor._analyze_market_conditions(symbol, None)
+        print(f"   {symbol}: {conditions}")
 
-        print("\n2. Testing market condition analysis:")
-        for symbol in symbols:
-            conditions = await smart_executor._analyze_market_conditions(symbol, None)
-            print(f"   {symbol}: {conditions}")
-
-        print("\n3. Creating execution plans with real data:")
-        for symbol in symbols:
-            # Create VWAP execution plan
-            params = ExecutionParams(
+    print("\n3. Creating execution plans with real data:")
+    for symbol in symbols:
+        # Create VWAP execution plan
+        params = ExecutionParams(
                 algorithm=ExecutionAlgorithm.VWAP,
                 duration_minutes=30,
                 slice_count=10,
@@ -112,7 +108,7 @@ async def test_real_market_data():
             print(f"     {order.symbol} {order.side} {order.quantity}: {algo.value}")
 
     # Cleanup
-    await ibkr_client.disconnect()
+    await mgr.disconnect()
 
     print("\n" + "=" * 60)
     print("✅ Smart execution is now connected to real market data!")

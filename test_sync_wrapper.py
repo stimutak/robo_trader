@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Test the synchronous IBKR wrapper"""
+"""Test the ConnectionManager (ib_insync based)"""
 
 import asyncio
 import logging
 import sys
 
-from robo_trader.clients.sync_ibkr_wrapper import SyncIBKRWrapper
+from robo_trader.connection_manager import ConnectionManager
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -13,46 +13,33 @@ logger = logging.getLogger(__name__)
 
 
 async def test_sync_wrapper():
-    """Test the synchronous wrapper approach"""
+    """Test the new connection manager approach"""
     try:
-        print("Testing SyncIBKRWrapper...")
+        print("Testing ConnectionManager...")
 
-        # Create wrapper (auto-detects port)
-        wrapper = SyncIBKRWrapper(host="127.0.0.1", port=7497, readonly=True)
+        mgr = ConnectionManager(host="127.0.0.1", port=7497)
 
-        # Test connection
         print("Attempting to connect...")
-        result = await wrapper.connect()
+        ib = await mgr.connect()
+        print("✓ Successfully connected!")
+        print(f"Server version: {ib.client.serverVersion()}")
+        print(f"Accounts: {ib.managedAccounts()}")
 
-        if result["success"]:
-            print("✓ Successfully connected!")
-            print(f"Server version: {result['server_version']}")
-            print(f"Accounts: {result['accounts']}")
-            print(f"Client ID: {result['client_id']}")
+        # Test historical data
+        print("\nTesting historical data...")
+        from pandas import DataFrame
 
-            # Test historical data
-            print("\nTesting historical data...")
-            data_result = await wrapper.get_historical_data("AAPL", "1 D", "5 mins")
-
-            if data_result["success"]:
-                print(f"✓ Got {data_result['rows']} bars for AAPL")
-                if data_result["data"]:
-                    print(f"Sample data: {data_result['data'][0]}")
-            else:
-                print(f"✗ Historical data failed: {data_result['error']}")
-
-            # Disconnect
-            print("\nDisconnecting...")
-            disc_result = await wrapper.disconnect()
-            if disc_result["success"]:
-                print("✓ Disconnected successfully")
-            else:
-                print(f"✗ Disconnect failed: {disc_result['error']}")
-
-            return True
+        df = await mgr.fetch_historical_bars("AAPL", "1 D", "5 mins")
+        if isinstance(df, DataFrame) and not df.empty:
+            print(f"✓ Got {len(df)} bars for AAPL")
+            print(df.head(1).to_dict("records")[0])
         else:
-            print(f"✗ Connection failed: {result['error']}")
-            return False
+            print("✗ Historical data failed: empty result")
+
+        print("\nDisconnecting...")
+        await mgr.disconnect()
+        print("✓ Disconnected successfully")
+        return True
 
     except Exception as e:
         print(f"✗ Test failed: {e}")
@@ -64,7 +51,7 @@ async def test_sync_wrapper():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("Sync Wrapper Test")
+    print("Connection Manager Test")
     print("=" * 60)
 
     # Run the test

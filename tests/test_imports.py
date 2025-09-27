@@ -7,8 +7,8 @@ import sys
 def test_core_imports():
     """Test core package imports."""
     import robo_trader
-    from robo_trader.clients.async_ibkr_client import AsyncIBKRClient
     from robo_trader.config import load_config
+    from robo_trader.connection_manager import ConnectionManager, IBKRClient
     from robo_trader.database_async import AsyncTradingDatabase
     from robo_trader.execution import PaperExecutor
     from robo_trader.legacy_strategies import sma_crossover_signals
@@ -18,7 +18,7 @@ def test_core_imports():
 
 def test_async_imports():
     """Test async module imports."""
-    from robo_trader.clients import AsyncIBKRClient, ConnectionConfig
+    from robo_trader.connection_manager import ConnectionManager, IBKRClient
     from robo_trader.database_async import AsyncTradingDatabase
     from robo_trader.runner_async import AsyncRunner
 

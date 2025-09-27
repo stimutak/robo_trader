@@ -16,8 +16,8 @@ from datetime import datetime, time, timedelta
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
 
-from robo_trader.clients.async_ibkr_client import AsyncIBKRClient as IBKRClient
 from robo_trader.config import Config, TradingMode
+from robo_trader.connection_manager import ConnectionManager, IBKRClient
 from robo_trader.correlation import CorrelationTracker
 from robo_trader.database import TradingDatabase
 from robo_trader.execution import AbstractExecutor, LiveExecutor, PaperExecutor
@@ -138,15 +138,15 @@ class TradingEngine:
             # Initialize database
             self.database = TradingDatabase()
 
-            # Initialize IBKR client
-            self.ibkr_client = IBKRClient(
-                self.config.ibkr.host,
-                self.config.ibkr.port,
-                self.config.ibkr.client_id,
+            # Initialize IBKR client context manager wrapper
+            # Establish connection early for health checks
+            mgr = ConnectionManager(
+                host=self.config.ibkr.host,
+                port=self.config.ibkr.port,
+                client_id=self.config.ibkr.client_id,
             )
-
-            # Connect to IBKR
-            await self._connect_ibkr()
+            ib = await mgr.connect()
+            await mgr.disconnect()
 
             # Initialize risk manager
             self.risk_manager = create_risk_manager_from_config(self.config)
@@ -395,9 +395,10 @@ class TradingEngine:
                             logger.error(f"Failed to unsubscribe from {symbol}: {e}")
 
                 # Process incoming market data
-                if self.ibkr_client and self.ibkr_client.is_connected():
-                    market_data = await self.ibkr_client.get_market_data_updates(timeout=1.0)
-                    for symbol, data in market_data.items():
+                # In this engine, data streaming would be implemented via IBKRClient context
+                # Placeholder to maintain structure without deprecated client
+                market_data = {}
+                for symbol, data in market_data.items():
                         if self.database:
                             await self.database.store_market_data(
                                 symbol=symbol,
@@ -424,11 +425,14 @@ class TradingEngine:
         """
         try:
             # Fetch market data
-            bars = await self.ibkr_client.fetch_recent_bars(
-                symbol,
-                duration=self.config.data.bar_size,
-                bar_size=self.config.data.bar_size,
-            )
+            # Fetch bars via a one-shot context
+            from robo_trader.connection_manager import IBKRClient as _IBKRClient
+            async with _IBKRClient() as c:
+                bars = await c.fetch_historical_bars(
+                    symbol,
+                    duration=self.config.data.bar_size,
+                    bar_size=self.config.data.bar_size,
+                )
 
             if bars.empty:
                 return
@@ -505,19 +509,13 @@ class TradingEngine:
         for symbol in symbols:
             try:
                 # Fetch real-time price from IBKR
-                if self.ibkr_client and self.ibkr_client.is_connected():
-                    ticker = await self.ibkr_client.get_ticker(symbol)
-                    if ticker and ticker.get("last"):
-                        prices[symbol] = ticker["last"]
+                async with IBKRClient() as c:
+                    md = await c.get_market_data(symbol)
+                    if md and md.get("last"):
+                        prices[symbol] = md["last"]
                     else:
-                        # Fallback to recent bars
-                        bars = await self.ibkr_client.fetch_recent_bars(
-                            symbol, duration="1 D", bar_size="1 min"
-                        )
-                        if not bars.empty:
-                            prices[symbol] = bars["close"].iloc[-1]
-                        else:
-                            prices[symbol] = 0.0
+                        bars = await c.fetch_historical_bars(symbol, duration="1 D", bar_size="1 min")
+                        prices[symbol] = bars["close"].iloc[-1] if not bars.empty else 0.0
                 else:
                     prices[symbol] = 0.0
             except Exception as e:

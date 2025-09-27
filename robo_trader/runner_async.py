@@ -21,8 +21,8 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from .analysis.correlation_integration import AsyncCorrelationManager, CorrelationBasedPositionSizer
-from .clients import AsyncIBKRClient, ConnectionConfig
 from .config import load_config
+from .connection_manager import ConnectionManager
 from .correlation import CorrelationTracker
 from .database_async import AsyncTradingDatabase
 from .execution import Order, PaperExecutor
@@ -126,7 +126,8 @@ class AsyncRunner:
 
         # Will be initialized in setup
         self.cfg = None
-        self.client = None
+        self.conn_mgr = None
+        self.ib = None
         self.db = None
         self.risk = None
         self.advanced_risk = None  # Advanced risk manager with Kelly sizing
@@ -382,7 +383,7 @@ class AsyncRunner:
         logger.info("PERFORMING IBKR PRE-FLIGHT CONNECTION CHECK")
         logger.info("=" * 60)
 
-        # Test if TWS/IB Gateway is running
+        # Test if configured TWS/IB Gateway port is open
         import socket
         import sys
 
@@ -397,27 +398,12 @@ class AsyncRunner:
                 logger.error(f"Port test failed: {e}")
                 return False
 
-        # Check for Gateway ports first, then TWS ports
-        ports_to_check = [
-            (4002, "IB Gateway (Paper)"),
-            (4001, "IB Gateway (Live)"),
-            (7497, "TWS (Paper)"),
-            (7496, "TWS (Live)"),
-            (self.cfg.ibkr.port, "Configured"),  # Also check configured port
-        ]
+        host = self.cfg.ibkr.host
+        port = self.cfg.ibkr.port
 
-        port_found = False
-        port = self.cfg.ibkr.port  # Default to configured port
-        for check_port, name in ports_to_check:
-            if test_port_open(port=check_port):
-                logger.info(f"✓ Port {check_port} is open - {name} detected")
-                port_found = True
-                port = check_port  # Use the detected port
-                break
-
-        if not port_found:
+        if not test_port_open(host=host, port=port):
             logger.error(f"❌ IBKR PRE-FLIGHT CHECK FAILED")
-            logger.error(f"Port {self.cfg.ibkr.port} is not open - TWS/IB Gateway not running")
+            logger.error(f"Port {port} is not open on host {host} - TWS/IB Gateway not running")
             logger.error("Please ensure TWS or IB Gateway is running and configured properly:")
             logger.error("1. Start TWS/IB Gateway")
             logger.error("2. Enable API connections in Global Configuration")
@@ -426,30 +412,15 @@ class AsyncRunner:
             logger.error("REFUSING TO START WITHOUT IBKR CONNECTION")
             sys.exit(1)
 
-        logger.info(f"✓ Port {port} is open - TWS/IB Gateway detected")
+        logger.info(f"✓ Port {port} is open - proceeding to IBKR connect")
 
-        # Create async IBKR client with connection pooling
-        import random
+        # Initialize robust connection manager (uses env-configured client ID with rotation on conflict)
+        self.conn_mgr = ConnectionManager(host=host, port=port, client_id=self.cfg.ibkr.client_id)
 
-        # Use higher client ID range (900-1000) to avoid conflicts with stuck connections
-        # We know 999 works, so use that range
-        random_client_id = random.randint(900, 1000)
-        logger.info(f"Using client ID {random_client_id} for this session")
-        conn_config = ConnectionConfig(
-            host=self.cfg.ibkr.host,
-            # Use the detected open port to avoid mismatches between TWS/Gateway
-            port=port,
-            client_id=random_client_id,  # Use random ID to avoid conflicts
-            readonly=self.cfg.ibkr.readonly,
-            max_connections=1,  # Use single connection to avoid overwhelming TWS
-        )
-        self.client = AsyncIBKRClient(conn_config)
-
-        # Try to connect with timeout
+        # Try to connect with timeout and verify
         try:
-            await asyncio.wait_for(self.client.connect(), timeout=30)
+            self.ib = await asyncio.wait_for(self.conn_mgr.connect(), timeout=30)
             logger.info("✓ IBKR connection established successfully")
-            logger.info(f"✓ Connected with client ID {random_client_id}")
             logger.info("=" * 60)
         except asyncio.TimeoutError:
             logger.error("❌ IBKR CONNECTION TIMEOUT")
@@ -505,9 +476,8 @@ class AsyncRunner:
         if self.use_smart_execution:
             from .smart_execution.smart_executor import SmartExecutor
 
-            # Pass IBKR client for real market data (use direct connection)
-            ibkr_client = self.client._connection if self.client._connection else None
-            smart_executor = SmartExecutor(self.cfg, ibkr_client=ibkr_client)
+            # Pass IBKR instance for real market data
+            smart_executor = SmartExecutor(self.cfg, ibkr_client=self.ib)
             logger.info("Smart execution enabled with TWAP/VWAP/Iceberg algorithms")
 
         self.executor = PaperExecutor(
@@ -724,8 +694,8 @@ class AsyncRunner:
         """Clean up resources."""
         if self.correlation_manager:
             await self.correlation_manager.stop()
-        if self.client:
-            await self.client.disconnect()
+        if self.conn_mgr:
+            await self.conn_mgr.disconnect()
         if self.db:
             await self.db.close()
 
@@ -739,8 +709,9 @@ class AsyncRunner:
 
         try:
             with Timer("data_fetch", self.monitor):
-                df = await self.client.fetch_recent_bars(
-                    symbol, duration=self.duration, bar_size=self.bar_size
+                # Use ConnectionManager to fetch historical bars
+                df = await self.conn_mgr.fetch_historical_bars(
+                    symbol=symbol, duration=self.duration, bar_size=self.bar_size
                 )
 
             if df.empty:
@@ -1839,10 +1810,10 @@ class AsyncRunner:
                 self.advanced_risk.save_state(state_file)
                 logger.info("Advanced risk manager state saved")
 
-            # Disconnect from IBKR client if exists
-            if hasattr(self, "client") and self.client:
+            # Disconnect via ConnectionManager if exists
+            if hasattr(self, "conn_mgr") and self.conn_mgr:
                 logger.info("Disconnecting from IBKR...")
-                await self.client.disconnect()
+                await self.conn_mgr.disconnect()
 
             # Legacy IB Gateway disconnect (for backward compatibility)
             if hasattr(self, "ib") and self.ib and self.ib.isConnected():

@@ -8,23 +8,21 @@ Adds proper connection checking to prevent "Trading Active" without IBKR.
 def check_ibkr_connection():
     """Check if IBKR is actually connected."""
     try:
-        from ib_async import IB
+        from robo_trader.connection_manager import ConnectionManager
 
-        ib = IB()
-
-        # Try to connect to TWS/Gateway
-        # TWS uses port 7497 for paper, 7496 for live
-        # Gateway uses port 4002 for paper, 4001 for live
-
-        for port in [7497, 4002, 7496, 4001]:
+        mgr = ConnectionManager()
+        try:
+            ib = asyncio.get_event_loop().run_until_complete(mgr.connect())
+            if ib and ib.isConnected():
+                print("✅ IBKR connected")
+                return True
+        except Exception:
+            pass
+        finally:
             try:
-                ib.connect("127.0.0.1", port, clientId=999)
-                if ib.isConnected():
-                    print(f"✅ IBKR connected on port {port}")
-                    ib.disconnect()
-                    return True
+                asyncio.get_event_loop().run_until_complete(mgr.disconnect())
             except Exception:
-                continue
+                pass
 
         print("❌ IBKR not connected - TWS/Gateway not running")
         return False
@@ -47,13 +45,10 @@ def check_ibkr_connection():
     """Check IBKR connection status."""
     try:
         # Check if any runner processes have active IBKR connections
-        from robo_trader.clients.async_ibkr_client import AsyncIBKRClient
-        client = AsyncIBKRClient()
-        # Try to get connection from pool
-        if client.pool and client.pool.pool:
-            for conn in client.pool.pool:
-                if conn and conn.is_connected():
-                    return True
+        from robo_trader.connection_manager import ConnectionManager
+        mgr = ConnectionManager()
+        ib = asyncio.get_event_loop().run_until_complete(mgr.connect())
+        return bool(ib and ib.isConnected())
     except:
         pass
     return False
@@ -84,8 +79,7 @@ def _check_ibkr_connection(self) -> bool:
     # Paper trading still needs IBKR for market data
     # Check if client pool has active connections
     try:
-        from robo_trader.clients.async_ibkr_client import AsyncIBKRClient
-        client = AsyncIBKRClient()
+        # Deprecated client pool check removed
         return client.pool and any(
             conn.is_connected() for conn in client.pool.pool
         )

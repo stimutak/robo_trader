@@ -8,7 +8,7 @@ import asyncio
 import logging
 from datetime import datetime
 
-from robo_trader.clients.async_ibkr_client import AsyncIBKRClient
+from robo_trader.connection_manager import ConnectionManager
 from robo_trader.database_async import AsyncTradingDatabase
 
 logging.basicConfig(level=logging.INFO)
@@ -17,14 +17,14 @@ logger = logging.getLogger(__name__)
 
 async def sync_positions():
     """Sync IB positions to database."""
-    client = None
+    mgr = None
     db = None
 
     try:
         # Initialize IB client
         logger.info("Connecting to Interactive Brokers...")
-        client = AsyncIBKRClient()
-        await client.connect()
+        mgr = ConnectionManager()
+        ib = await mgr.connect()
 
         # Initialize database
         logger.info("Connecting to database...")
@@ -33,7 +33,16 @@ async def sync_positions():
 
         # Get real positions from IB
         logger.info("Fetching positions from IB...")
-        ib_positions = await client.get_positions()
+        # Get positions via ib_insync
+        ib_positions = [
+            {
+                "symbol": p.contract.symbol,
+                "quantity": p.position,
+                "avg_cost": p.avgCost,
+                "market_value": getattr(p, "marketValue", 0),
+            }
+            for p in ib.positions()
+        ]
 
         if not ib_positions:
             logger.warning("No positions found in IB account")
@@ -75,8 +84,8 @@ async def sync_positions():
         logger.error(f"Error syncing positions: {e}")
         raise
     finally:
-        if client:
-            await client.disconnect()
+        if mgr:
+            await mgr.disconnect()
         if db:
             await db.close()
 

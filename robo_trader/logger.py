@@ -65,7 +65,8 @@ class LogEvent(str, Enum):
 
 def add_timestamp(logger, method_name, event_dict):
     """Add timestamp to all log entries."""
-    event_dict["timestamp"] = datetime.now(timezone.utc).isoformat()
+    # Use local timezone instead of UTC
+    event_dict["timestamp"] = datetime.now().isoformat()
     return event_dict
 
 

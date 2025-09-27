@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Test the runner's connection approach directly"""
+"""Test the connection approach directly via ConnectionManager"""
 
 import asyncio
 import logging
 import sys
 
-from robo_trader.clients.async_ibkr_client import AsyncIBKRClient, ConnectionConfig
+from robo_trader.connection_manager import ConnectionManager
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -13,35 +13,23 @@ logger = logging.getLogger(__name__)
 
 
 async def test_runner_connection():
-    """Test the runner's connection approach"""
+    """Test the ConnectionManager approach"""
     try:
-        print("Testing AsyncIBKRClient connection...")
+        print("Testing ConnectionManager connection...")
 
-        # Create client with auto-detected port
-        config = ConnectionConfig(
-            host="127.0.0.1",
-            port=7497,  # Will auto-detect
-            readonly=True,
-            timeout=20.0,
-        )
-
-        client = AsyncIBKRClient(config)
-
-        # Try to connect
+        mgr = ConnectionManager(host="127.0.0.1", port=7497)
         print("Attempting to connect...")
-        await client.connect()
-
+        ib = await mgr.connect()
         print("✓ Successfully connected!")
 
         # Try to get account info
         try:
-            accounts = await client.get_account_summary()
-            print(f"Account summary: {accounts}")
+            print(f"Accounts: {ib.managedAccounts()}")
         except Exception as e:
             print(f"Account info failed: {e}")
 
         # Disconnect
-        await client.disconnect()
+        await mgr.disconnect()
         print("✓ Disconnected successfully")
         return True
 

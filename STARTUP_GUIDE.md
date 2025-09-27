@@ -1,8 +1,36 @@
 # Robo Trader Startup Guide
 
-## Quick Start
+## CRITICAL: Virtual Environment Required (Updated 2025-09-25)
+**ALWAYS use `.venv` virtual environment** - especially after macOS upgrades!
 
-### Manual Start (Recommended for Testing)
+## Quick Start - Current Working Method
+
+### Complete System Startup
+```bash
+# 1. Navigate to project
+cd /Users/oliver/robo_trader
+
+# 2. ACTIVATE VIRTUAL ENVIRONMENT (REQUIRED!)
+source .venv/bin/activate
+
+# 3. Kill any existing processes
+pkill -9 -f "runner_async" && pkill -9 -f "app.py" && pkill -9 -f "websocket_server"
+
+# 4. Start WebSocket server (MUST BE FIRST)
+python3 -m robo_trader.websocket_server &
+
+# 5. Start trading runner
+export LOG_FILE=/Users/oliver/robo_trader/robo_trader.log
+python3 -m robo_trader.runner_async --symbols AAPL,NVDA,TSLA,IXHL,NUAI,BZAI,ELTP,OPEN,CEG,VRT,PLTR,UPST,TEM,HTFL,SDGR,APLD,SOFI,CORZ,WULF,QQQ,QLD,BBIO,IMRX,CRGY &
+
+# 6. Start dashboard (ALWAYS port 5555)
+export DASH_PORT=5555
+python3 app.py &
+```
+
+**Dashboard URL: http://localhost:5555**
+
+### Legacy Script Method (May Need Updates)
 ```bash
 # Start everything at once
 ./start_all.sh
@@ -57,13 +85,22 @@ tail -f launchd_trading_error.log
    - Paper trading: Port 7497
    - Live trading: Port 7496
    - API must be enabled in settings
+   - May need periodic restart to clear stuck connections
 
-2. **Virtual environment must be set up**:
+2. **Virtual environment must be set up (.venv not venv)**:
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+# Create virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install dependencies
 pip install -r requirements.txt
+
+# CRITICAL: Install ib_async for IBKR connection
+pip install ib_async
 ```
+
+**Note**: After macOS upgrades, Python paths may reset. Always activate `.venv`!
 
 ## Scripts Overview
 
@@ -75,11 +112,18 @@ pip install -r requirements.txt
 
 ## Troubleshooting
 
+### "ModuleNotFoundError: No module named 'pandas'" or 'ib_async'
+**Common after macOS upgrades!**
+1. Not using virtual environment: `source .venv/bin/activate`
+2. If persists: `pip install pandas ib_async`
+
 ### Trading system not connecting to IB
 1. Ensure IB Gateway/TWS is running
 2. Check API is enabled in IB settings
 3. Verify port number (7497 for paper, 7496 for live)
-4. Check logs: `tail -f ai_trading.log`
+4. **Restart TWS to clear stuck connections** (common issue)
+5. Check for CLOSE_WAIT connections: `netstat -an | grep 7497 | grep CLOSE_WAIT`
+6. Check logs: `tail -f /Users/oliver/robo_trader/robo_trader.log`
 
 ### Scripts not executing
 ```bash

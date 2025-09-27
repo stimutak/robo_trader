@@ -27,13 +27,20 @@
 
 ## Testing Commands
 
+**CRITICAL (2025-09-25): ALWAYS USE VIRTUAL ENVIRONMENT**
+After macOS upgrades, Python paths reset. You MUST activate `.venv` first!
+
 # KILL ALL PROCESSES (run this first to prevent duplicates)
 ```bash
 pkill -9 -f "runner_async" && pkill -9 -f "app.py" && pkill -9 -f "websocket_server"
 ```
 
-# START SYSTEM (clean start)
+# START SYSTEM (clean start with .venv)
 ```bash
+# ACTIVATE VIRTUAL ENVIRONMENT (REQUIRED!)
+cd /Users/oliver/robo_trader
+source .venv/bin/activate
+
 # Start WebSocket server (REQUIRED FIRST)
 python3 -m robo_trader.websocket_server &
 
@@ -44,6 +51,12 @@ python3 -m robo_trader.runner_async --symbols AAPL,NVDA,TSLA,IXHL,NUAI,BZAI,ELTP
 # Start dashboard on port 5555 (ALWAYS USE PORT 5555)
 export DASH_PORT=5555
 python3 app.py &
+```
+
+# If missing dependencies (ib_async, pandas, etc.)
+```bash
+source .venv/bin/activate
+pip install ib_async pandas
 ```
 
 # RESTART DASHBOARD ONLY (when code changes)

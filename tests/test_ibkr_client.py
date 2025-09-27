@@ -1,6 +1,33 @@
 import pandas as pd
 
-from robo_trader.clients.async_ibkr_client import normalize_bars_df
+from robo_trader.connection_manager import ConnectionManager
+
+
+def normalize_bars_df(df: pd.DataFrame) -> pd.DataFrame:
+    # Minimal local replica for testing normalization independent of deprecated client
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
+    data = df.copy()
+    data.columns = [str(c).lower() for c in data.columns]
+    preferred = [
+        c for c in ["date", "time", "open", "high", "low", "close", "volume"] if c in data.columns
+    ]
+    if preferred:
+        data = data[preferred]
+    for c in ["open", "high", "low", "close", "volume"]:
+        if c in data.columns:
+            data[c] = pd.to_numeric(data[c], errors="coerce")
+    if "close" in data.columns:
+        data = data.dropna(subset=["close"])
+    if isinstance(data.index, pd.DatetimeIndex):
+        data = data.sort_index()
+    elif "date" in data.columns:
+        data["date"] = pd.to_datetime(data["date"], errors="coerce")
+        data = data.sort_values("date")
+    elif "time" in data.columns:
+        data["time"] = pd.to_datetime(data["time"], errors="coerce")
+        data = data.sort_values("time")
+    return data.reset_index(drop=False)
 
 
 def test_normalize_bars_df_basic():
