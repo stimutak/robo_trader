@@ -70,6 +70,9 @@ class ConnectionManager:
         self._max_retries: int = 5
         self._retry_delay: float = 2.0
 
+        # Track market data subscriptions to prevent leaks
+        self._market_data_subs: Dict[str, Any] = {}  # symbol -> ticker
+
         logger.info(f"Connection manager initialized for {self.host}:{self.port}")
 
     def _generate_client_id(self) -> int:
@@ -96,6 +99,18 @@ class ConnectionManager:
         """Properly clean up IB connection and event loop tasks."""
         if self.ib is not None:
             try:
+                # Cancel all market data subscriptions first to prevent leaks
+                if self.ib.isConnected() and self._market_data_subs:
+                    logger.info(
+                        f"Canceling {len(self._market_data_subs)} market data subscriptions..."
+                    )
+                    for symbol, ticker in list(self._market_data_subs.items()):
+                        try:
+                            self.ib.cancelMktData(ticker)
+                        except Exception as e:
+                            logger.warning(f"Failed to cancel market data for {symbol}: {e}")
+                    self._market_data_subs.clear()
+
                 if self.ib.isConnected():
                     logger.info("Disconnecting from IB...")
                     self.ib.disconnect()
@@ -415,8 +430,20 @@ class IBKRClient:
             raise ConnectionError("Not connected")
 
         contract = Stock(symbol, "SMART", "USD")
-        ticker = self._ib.reqMktData(contract, "", False, False)
 
+        # Cancel any existing subscription for this symbol to prevent leaks
+        if symbol in self._market_data_subs:
+            try:
+                self._ib.cancelMktData(self._market_data_subs[symbol])
+                del self._market_data_subs[symbol]
+            except Exception as e:
+                logger.warning(f"Failed to cancel existing market data for {symbol}: {e}")
+
+        # Create new subscription and track it
+        ticker = self._ib.reqMktData(contract, "", False, False)
+        self._market_data_subs[symbol] = ticker
+
+        # Wait for data with timeout
         for _ in range(50):
             await asyncio.sleep(0.1)
             # ib_insync ticker fields may be None until first update
@@ -427,13 +454,24 @@ class IBKRClient:
             ):
                 break
 
-        return {
+        # Get data before canceling
+        market_data = {
             "symbol": symbol,
             "last": getattr(ticker, "last", None),
             "bid": getattr(ticker, "bid", None),
             "ask": getattr(ticker, "ask", None),
             "time": time.time(),
         }
+
+        # Cancel subscription immediately after getting data to prevent memory leaks
+        try:
+            self._ib.cancelMktData(ticker)
+            if symbol in self._market_data_subs:
+                del self._market_data_subs[symbol]
+        except Exception as e:
+            logger.warning(f"Failed to cancel market data subscription for {symbol}: {e}")
+
+        return market_data
 
     # Account methods
     async def get_positions(self) -> List[Any]:

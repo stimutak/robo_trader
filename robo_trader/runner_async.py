@@ -39,6 +39,7 @@ try:
 except ImportError:
     ws_client = None
     WEBSOCKET_ENABLED = False
+from .circuit_breaker import CircuitBreaker
 from .portfolio import Portfolio  # Import Portfolio class from portfolio.py file
 from .portfolio_pkg.portfolio_manager import AllocationMethod, MultiStrategyPortfolioManager
 from .risk.advanced_risk import AdvancedRiskManager, risk_monitor_task
@@ -46,6 +47,8 @@ from .risk_manager import Position, RiskManager
 from .stop_loss_monitor import StopLossMonitor, StopType
 from .strategies import MLStrategy, sma_crossover_signals
 from .strategies.ml_enhanced_strategy import MLEnhancedStrategy
+from .utils.connection_recovery import OrderRateLimiter
+from .utils.pricing import PrecisePricing
 
 # Import mean reversion strategies if available
 logger = get_logger(__name__)
@@ -165,6 +168,19 @@ class AsyncRunner:
         self.stop_loss_percent = 0.02  # Default 2% stop-loss
         self.ml_enhanced_strategy = None
         self.active_strategy_name: Optional[str] = None
+
+        # Circuit breaker for order execution protection
+        self.circuit_breaker = CircuitBreaker(
+            name="order_execution",
+            failure_threshold=5,  # Allow 5 failures before opening
+            recovery_timeout=60,  # Wait 60 seconds before attempting recovery
+            half_open_requests=3,  # Allow 3 test requests in half-open state
+        )
+
+        # Rate limiter to prevent hitting IB API limits
+        self.rate_limiter = OrderRateLimiter(
+            max_per_second=2, max_per_minute=50  # Conservative limit  # IB's typical limit
+        )
 
         # Mean reversion strategies
         self.mean_reversion_strategy = None
@@ -312,6 +328,49 @@ class AsyncRunner:
             if symbol not in self._position_locks:
                 self._position_locks[symbol] = asyncio.Lock()
             return self._position_locks[symbol]
+
+    async def _place_order_with_circuit_breaker(self, order: Order):
+        """
+        Execute order with circuit breaker protection.
+
+        Checks circuit breaker state before execution and records
+        success/failure for fault tolerance monitoring.
+        """
+        # Check if circuit breaker allows the request
+        if not await self.circuit_breaker.can_proceed():
+            logger.error(f"Circuit breaker OPEN - order rejected for {order.symbol}")
+            return SimpleNamespace(ok=False, message="Circuit breaker open", fill_price=None)
+
+        # Apply rate limiting before order execution
+        await self.rate_limiter.acquire()
+        logger.debug(f"Rate limit acquired for {order.symbol} order")
+
+        try:
+            # Execute the order
+            with Timer("order_execution", self.monitor):
+                result = self.executor.place_order(order)
+
+            # Record success/failure with circuit breaker
+            if result.ok:
+                await self.circuit_breaker.record_success()
+                logger.debug(
+                    f"Order successful for {order.symbol} - circuit breaker recorded success"
+                )
+            else:
+                await self.circuit_breaker.record_failure()
+                logger.warning(
+                    f"Order failed for {order.symbol} - circuit breaker recorded failure"
+                )
+
+            return result
+
+        except Exception as e:
+            # Record failure and re-raise
+            await self.circuit_breaker.record_failure(e)
+            logger.error(
+                f"Order execution exception for {order.symbol} - circuit breaker recorded failure: {e}"
+            )
+            raise
 
     async def _update_position_atomic(
         self, symbol: str, quantity: int, price: float, side: str
@@ -1005,7 +1064,7 @@ class AsyncRunner:
             )
 
         last = signals.iloc[-1]
-        price = float(last.get("close", df["close"].iloc[-1]))
+        price = PrecisePricing.to_decimal(last.get("close", df["close"].iloc[-1]))
 
         # Get current equity
         equity = self.portfolio.equity({symbol: price for symbol in self.positions})
@@ -1063,12 +1122,9 @@ class AsyncRunner:
                             data=df,
                         )
 
-                with Timer("order_execution", self.monitor):
-                    res = self.executor.place_order(
-                        Order(
-                            symbol=symbol, quantity=qty_to_cover, side="BUY_TO_COVER", price=price
-                        )
-                    )
+                res = await self._place_order_with_circuit_breaker(
+                    Order(symbol=symbol, quantity=qty_to_cover, side="BUY_TO_COVER", price=price)
+                )
                 if res.ok:
                     # Cancel stop-loss when covering short position
                     if self.stop_loss_monitor:
@@ -1202,10 +1258,9 @@ class AsyncRunner:
                                 data=df,
                             )
 
-                    with Timer("order_execution", self.monitor):
-                        res = self.executor.place_order(
-                            Order(symbol=symbol, quantity=qty, side="BUY", price=price)
-                        )
+                    res = await self._place_order_with_circuit_breaker(
+                        Order(symbol=symbol, quantity=qty, side="BUY", price=price)
+                    )
                     if res.ok:
                         fill_price = res.fill_price or price
                         # Use atomic position update to prevent race conditions
@@ -1298,10 +1353,9 @@ class AsyncRunner:
                                 data=df,
                             )
 
-                    with Timer("order_execution", self.monitor):
-                        res = self.executor.place_order(
-                            Order(symbol=symbol, quantity=pos.quantity, side="SELL", price=price)
-                        )
+                    res = await self._place_order_with_circuit_breaker(
+                        Order(symbol=symbol, quantity=pos.quantity, side="SELL", price=price)
+                    )
                     if res.ok:
                         # Cancel stop-loss when closing position
                         if self.stop_loss_monitor:
@@ -1404,10 +1458,9 @@ class AsyncRunner:
                                 data=df,
                             )
 
-                    with Timer("order_execution", self.monitor):
-                        res = self.executor.place_order(
-                            Order(symbol=symbol, quantity=qty, side="SELL_SHORT", price=price)
-                        )
+                    res = await self._place_order_with_circuit_breaker(
+                        Order(symbol=symbol, quantity=qty, side="SELL_SHORT", price=price)
+                    )
                     if res.ok:
                         fill_price = res.fill_price or price
                         # Add stop-loss for short position
@@ -1486,13 +1539,24 @@ class AsyncRunner:
                 )
                 return result
 
-        # Process all symbols concurrently
+        # Process all symbols concurrently with exception safety
         tasks = [process_with_semaphore(symbol) for symbol in symbols]
-        results = await asyncio.gather(*tasks, return_exceptions=False)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Log results and collect market prices
+        # Handle exceptions and collect valid results
+        valid_results = []
         market_prices = {}
-        for result in results:
+        for i, result in enumerate(results):
+            symbol = symbols[i]
+            if isinstance(result, Exception):
+                logger.error(f"Task failed for symbol {symbol}: {result}")
+                # Continue processing other symbols, don't crash the entire run
+                continue
+            else:
+                valid_results.append(result)
+
+        # Use valid_results instead of results for further processing
+        for result in valid_results:
             if isinstance(result, SymbolResult):
                 logger.info(
                     f"{result.symbol}: Signal={result.signal}, "
@@ -1713,7 +1777,9 @@ class AsyncRunner:
                                                 side="BUY",
                                                 price=price_a,
                                             )
-                                            res_a = self.executor.place_order(order_a)
+                                            res_a = await self._place_order_with_circuit_breaker(
+                                                order_a
+                                            )
                                             if res_a.ok:
                                                 await self.db.record_trade(
                                                     symbol_a,
@@ -1734,7 +1800,11 @@ class AsyncRunner:
                                                     side="SELL",
                                                     price=price_b,
                                                 )
-                                                res_b = self.executor.place_order(order_b)
+                                                res_b = (
+                                                    await self._place_order_with_circuit_breaker(
+                                                        order_b
+                                                    )
+                                                )
                                                 if res_b.ok:
                                                     await self.db.record_trade(
                                                         symbol_b,
@@ -1759,7 +1829,9 @@ class AsyncRunner:
                                                 side="BUY",
                                                 price=price_b,
                                             )
-                                            res_b = self.executor.place_order(order_b)
+                                            res_b = await self._place_order_with_circuit_breaker(
+                                                order_b
+                                            )
                                             if res_b.ok:
                                                 await self.db.record_trade(
                                                     symbol_b,
@@ -1782,7 +1854,11 @@ class AsyncRunner:
                                                     side="SELL",
                                                     price=price_a,
                                                 )
-                                                res_a = self.executor.place_order(order_a)
+                                                res_a = (
+                                                    await self._place_order_with_circuit_breaker(
+                                                        order_a
+                                                    )
+                                                )
                                                 if res_a.ok:
                                                     await self.db.record_trade(
                                                         symbol_a,

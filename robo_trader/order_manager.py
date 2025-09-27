@@ -58,10 +58,10 @@ class OrderDetails:
     stop_price: Optional[float] = None
     filled_quantity: int = 0
     average_fill_price: float = 0.0
-    created_at: datetime = field(default_factory=datetime.now)
+    created_at: datetime = field(default_factory=get_market_time)
     submitted_at: Optional[datetime] = None
     filled_at: Optional[datetime] = None
-    last_update: datetime = field(default_factory=datetime.now)
+    last_update: datetime = field(default_factory=get_market_time)
     retry_count: int = 0
     error_message: Optional[str] = None
     broker_order_id: Optional[str] = None
