@@ -80,6 +80,9 @@ python3 test_m3_complete.py
 
 # Test performance analytics
 python3 test_m4_performance.py
+
+# Test critical safety features (added 2025-09-27)
+python3 test_safety_features.py
 ```
 
 ## Current Issues Status
@@ -88,6 +91,14 @@ python3 test_m4_performance.py
 3. ✅ Phase 1 F2: Upgrade config to Pydantic - COMPLETED
 4. ✅ WebSocket stability - Fixed with client/server separation
 5. ✅ TWS API Connection Issues - RESOLVED with subprocess approach
+
+## Critical Safety Features (2025-09-27) ✅
+**Added to address audit findings:**
+- **Order Management** (`order_manager.py`) - Full lifecycle tracking with retry logic
+- **Data Validation** (`data_validator.py`) - Market data quality checks
+- **Circuit Breaker** (`circuit_breaker.py`) - Fault tolerance system
+- **Safety configs in `.env`** - MAX_OPEN_POSITIONS, STOP_LOSS_PERCENT, etc.
+- Run `python3 test_safety_features.py` to validate all safety features
 
 ## Major Fixes Completed (2025-09-23)
 
