@@ -107,12 +107,13 @@ python3 test_m4_performance.py
 - `robo_trader/clients/sync_ibkr_wrapper.py` - New subprocess-based wrapper
 - `robo_trader/runner_async.py` - Updated to use new client approach
 
-### Library Migration Notes (2025-09-23)
-- Migrated from `ib_insync` (unmaintained) to `ib_async` v2.0.1 (maintained fork)
+### Library Migration Notes (2025-09-27)
+- **MIGRATION COMPLETE:** Successfully migrated from `ib_insync` to `ib_async` v2.0.1
 - ib_insync author passed away early 2024, library archived March 2024
-- ib_async is drop-in replacement, no API changes needed
+- ib_async is the community-maintained fork, drop-in replacement
 - All imports updated: `from ib_insync` → `from ib_async`
-- Both libraries supported for backward compatibility
+- Old ib_insync library has been uninstalled
+- System tested and running successfully with ib_async
 
 ### TWS Connection Requirements
 - TWS must be restarted periodically to clear stuck connections

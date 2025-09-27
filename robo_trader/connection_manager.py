@@ -30,9 +30,9 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 try:
-    from ib_insync import IB, Contract, LimitOrder, MarketOrder, Option, Stock, util
+    from ib_async import IB, Contract, LimitOrder, MarketOrder, Option, Stock, util
 except ImportError as import_err:
-    print("ERROR: ib_insync not installed. Run: pip install ib_insync")
+    print("ERROR: ib_async not installed. Run: pip install ib_async")
     raise
 
 

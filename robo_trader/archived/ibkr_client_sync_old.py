@@ -5,7 +5,7 @@ from typing import Optional
 
 import nest_asyncio
 import pandas as pd
-from ib_insync import IB, Stock, util
+from ib_async import IB, Stock, util
 
 # Apply nest_asyncio to allow nested event loops
 nest_asyncio.apply()
