@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from decimal import Decimal
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
@@ -21,6 +22,7 @@ import numpy as np
 import pandas as pd
 
 from .logger import get_logger
+from .utils.pricing import PrecisePricing
 
 logger = get_logger(__name__)
 
@@ -58,21 +60,22 @@ class Position:
     max_price_since_entry: Optional[float] = None
 
     @property
-    def notional_value(self) -> float:
+    def notional_value(self) -> Decimal:
         """Calculate position notional value."""
-        return abs(self.quantity * self.avg_price)
+        return PrecisePricing.calculate_notional(abs(self.quantity), self.avg_price)
 
     @property
     def is_long(self) -> bool:
         """Check if position is long."""
         return self.quantity > 0
 
-    def unrealized_pnl(self, current_price: float) -> float:
+    def unrealized_pnl(self, current_price: float) -> Decimal:
         """Calculate unrealized P&L."""
+        current_price_d = PrecisePricing.to_decimal(current_price)
         if self.is_long:
-            return (current_price - self.avg_price) * self.quantity
+            return PrecisePricing.calculate_pnl(self.avg_price, current_price_d, self.quantity)
         else:
-            return (self.avg_price - current_price) * abs(self.quantity)
+            return PrecisePricing.calculate_pnl(current_price_d, self.avg_price, abs(self.quantity))
 
 
 @dataclass
