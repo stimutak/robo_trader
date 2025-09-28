@@ -14,12 +14,12 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from decimal import Decimal
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from decimal import Decimal
 
 from .logger import get_logger
 from .utils.pricing import PrecisePricing
