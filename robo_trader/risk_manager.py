@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from .logger import get_logger
+from .utils.pricing import PrecisePricing
 
 logger = get_logger(__name__)
 
@@ -60,7 +61,7 @@ class Position:
     @property
     def notional_value(self) -> float:
         """Calculate position notional value."""
-        return abs(self.quantity * self.avg_price)
+        return float(PrecisePricing.calculate_notional(abs(self.quantity), self.avg_price))
 
     @property
     def is_long(self) -> bool:
@@ -70,9 +71,9 @@ class Position:
     def unrealized_pnl(self, current_price: float) -> float:
         """Calculate unrealized P&L."""
         if self.is_long:
-            return (current_price - self.avg_price) * self.quantity
+            return float(PrecisePricing.calculate_pnl(self.avg_price, current_price, self.quantity))
         else:
-            return (self.avg_price - current_price) * abs(self.quantity)
+            return float(PrecisePricing.calculate_pnl(current_price, self.avg_price, abs(self.quantity)))
 
 
 @dataclass
@@ -364,7 +365,7 @@ class RiskManager:
 
         total_heat = 0.0
         total_value = sum(
-            abs(pos.quantity) * current_prices.get(sym, pos.avg_price)
+            float(PrecisePricing.calculate_notional(abs(pos.quantity), current_prices.get(sym, pos.avg_price)))
             for sym, pos in positions.items()
         )
 
@@ -373,7 +374,7 @@ class RiskManager:
 
         for symbol, pos in positions.items():
             current_price = current_prices.get(symbol, pos.avg_price)
-            position_value = abs(pos.quantity) * current_price
+            position_value = float(PrecisePricing.calculate_notional(abs(pos.quantity), current_price))
 
             # Calculate position risk based on stop loss or ATR
             if pos.stop_loss:
@@ -431,7 +432,7 @@ class RiskManager:
 
         for symbol, pos in positions.items():
             current_price = current_prices.get(symbol, pos.avg_price)
-            position_value = abs(pos.quantity) * current_price
+            position_value = float(PrecisePricing.calculate_notional(abs(pos.quantity), current_price))
             total_value += position_value
 
             # Use cached beta or position beta
@@ -798,7 +799,7 @@ class RiskManager:
         for symbol, pos in positions.items():
             if pos.sector:
                 current_price = current_prices.get(symbol, pos.avg_price)
-                position_value = abs(pos.quantity) * current_price
+                position_value = float(PrecisePricing.calculate_notional(abs(pos.quantity), current_price))
                 exposure_pct = position_value / equity
 
                 if pos.sector in self.sector_exposures:

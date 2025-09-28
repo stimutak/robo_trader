@@ -24,6 +24,7 @@ from flask import Flask, Response, jsonify, render_template_string, request, sen
 load_dotenv()
 
 from robo_trader.analytics.performance import PerformanceAnalyzer  # noqa: E402
+from robo_trader.utils.pricing import PrecisePricing  # noqa: E402
 
 # Import our modules - using lazy imports to avoid startup issues
 from robo_trader.config import load_config  # noqa: E402
@@ -2859,14 +2860,14 @@ def status():
             positions_count = len(positions_data)
             
             # Calculate real P&L from positions
-            total_cost = sum(p['quantity'] * p['avg_cost'] for p in positions_data)
+            total_cost = sum(float(PrecisePricing.calculate_notional(p['quantity'], p['avg_cost'])) for p in positions_data)
             total_value = 0
             
             for pos in positions_data:
                 # Get latest market data for current price
                 market_data = await db.get_latest_market_data(pos['symbol'], limit=1)
                 current_price = market_data[0]['close'] if market_data else pos['avg_cost']
-                total_value += pos['quantity'] * current_price
+                total_value += float(PrecisePricing.calculate_notional(pos['quantity'], current_price))
             
             unrealized_pnl = total_value - total_cost
             pnl_pct = (unrealized_pnl / total_cost * 100) if total_cost > 0 else 0
@@ -3012,7 +3013,7 @@ def get_pnl():
         for trade in trades:
             if trade.get("side") == "SELL":
                 # Assume 1% profit on sells (simplified)
-                trade_value = trade.get("quantity", 0) * trade.get("price", 0)
+                trade_value = float(PrecisePricing.calculate_notional(trade.get("quantity", 0), trade.get("price", 0)))
                 profit = trade_value * 0.01
                 realized_pnl += profit
 
@@ -3065,14 +3066,16 @@ def get_pnl():
             
             if trade['side'] == 'BUY':
                 # Update average cost
-                total_cost = pos['avg_cost'] * pos['quantity'] + trade['price'] * trade['quantity']
+                pos_cost = PrecisePricing.calculate_notional(pos['quantity'], pos['avg_cost'])
+                trade_cost = PrecisePricing.calculate_notional(trade['quantity'], trade['price'])
+                total_cost = float(pos_cost + trade_cost)
                 pos['quantity'] += trade['quantity']
                 pos['avg_cost'] = total_cost / pos['quantity'] if pos['quantity'] > 0 else 0
                 
             elif trade['side'] == 'SELL':
                 # Calculate profit on this sale
                 if pos['quantity'] > 0:
-                    profit = (trade['price'] - pos['avg_cost']) * min(trade['quantity'], pos['quantity'])
+                    profit = float(PrecisePricing.calculate_pnl(pos['avg_cost'], trade['price'], min(trade['quantity'], pos['quantity'])))
                     pos['realized'] += profit
                     realized_pnl += profit
                     pos['quantity'] -= trade['quantity']
@@ -3085,7 +3088,7 @@ def get_pnl():
             market_data = db.get_latest_market_data(pos['symbol'], limit=1)
             if market_data:
                 current_price = market_data[0]['close']
-                unrealized_pnl += (current_price - pos['avg_cost']) * pos['quantity']
+                unrealized_pnl += float(PrecisePricing.calculate_pnl(pos['avg_cost'], current_price, pos['quantity']))
         
         pnl_data = {
             'daily': account.get('daily_pnl', 0),
@@ -3138,7 +3141,7 @@ def get_pnl_OLD():
             total_value = 0
 
             for pos in positions_data:
-                cost = pos["quantity"] * pos["avg_cost"]
+                cost = float(PrecisePricing.calculate_notional(pos["quantity"], pos["avg_cost"]))
                 total_cost += cost
 
                 # Get latest market data for current price
@@ -3153,7 +3156,7 @@ def get_pnl_OLD():
                         price_data = await client.get_market_data(pos["symbol"])
                         current_price = price_data.get("last") if price_data else pos["avg_cost"]
 
-                value = pos["quantity"] * current_price
+                value = float(PrecisePricing.calculate_notional(pos["quantity"], current_price))
                 total_value += value
 
             # Calculate unrealized P&L
@@ -3256,7 +3259,7 @@ def get_pnl_OLD():
                         break
 
                 # Daily P&L for this position
-                daily_change = (current_price - open_price) * pos["quantity"]
+                daily_change = float(PrecisePricing.calculate_pnl(open_price, current_price, pos["quantity"]))
                 daily_pnl += daily_change
 
             # Add today's realized P&L from trades
@@ -3345,10 +3348,10 @@ def get_positions():
             # Calculate P&L
             entry_price = pos.get("avg_cost", current_price)
             quantity = pos["quantity"]
-            market_value = current_price * quantity
-            unrealized_pnl = (current_price - entry_price) * quantity
+            market_value = float(PrecisePricing.calculate_notional(quantity, current_price))
+            unrealized_pnl = float(PrecisePricing.calculate_pnl(entry_price, current_price, quantity))
             unrealized_pnl_pct = (
-                (unrealized_pnl / (entry_price * abs(quantity))) * 100 if entry_price > 0 else 0
+                (unrealized_pnl / float(PrecisePricing.calculate_notional(abs(quantity), entry_price))) * 100 if entry_price > 0 else 0
             )
 
             enriched_positions.append(
@@ -3431,7 +3434,7 @@ def get_watchlist():
             # Calculate P&L if we have a position
             pnl = 0
             if position and current_price > 0:
-                pnl = (current_price - position["avg_cost"]) * position["quantity"]
+                pnl = float(PrecisePricing.calculate_pnl(position["avg_cost"], current_price, position["quantity"]))
 
             watchlist_data.append(
                 {
@@ -3677,7 +3680,7 @@ def performance():
         sell_trades = [t for t in all_trades if t.get("side") == "SELL"]
         for trade in sell_trades:
             # Assume 1% profit on sells (simplified)
-            trade_value = trade.get("quantity", 0) * trade.get("price", 0)
+            trade_value = float(PrecisePricing.calculate_notional(trade.get("quantity", 0), trade.get("price", 0)))
             realized_pnl += trade_value * 0.01
 
         # Total P&L is unrealized + realized
@@ -3727,7 +3730,7 @@ def performance():
         # Calculate average trade size from quantity * price
         total_trade_value = 0
         for trade in all_trades:
-            trade_value = trade.get("quantity", 0) * trade.get("price", 0)
+            trade_value = float(PrecisePricing.calculate_notional(trade.get("quantity", 0), trade.get("price", 0)))
             total_trade_value += trade_value
 
         avg_trade_size = total_trade_value / len(all_trades) if all_trades else 100000
@@ -3856,11 +3859,11 @@ def get_trades():
                         "timestamp": trade.get("timestamp", ""),
                         "slippage": trade.get("slippage", 0),
                         "commission": trade.get("commission", 0),
-                        "notional": trade["quantity"] * trade["price"],
+                        "notional": float(PrecisePricing.calculate_notional(trade["quantity"], trade["price"])),
                         "cash_impact": (
-                            -trade["quantity"] * trade["price"]
+                            -float(PrecisePricing.calculate_notional(trade["quantity"], trade["price"]))
                             if trade["side"] == "BUY"
-                            else trade["quantity"] * trade["price"]
+                            else float(PrecisePricing.calculate_notional(trade["quantity"], trade["price"]))
                         ),
                     }
                 )

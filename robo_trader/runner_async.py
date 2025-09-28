@@ -393,7 +393,11 @@ class AsyncRunner:
                         elif side.upper() == "BUY" and pos.quantity >= 0:
                             # Adding to long position
                             total_qty = pos.quantity + quantity
-                            new_avg = (pos.avg_price * pos.quantity + price * quantity) / total_qty
+                            # Use precise arithmetic for position averaging
+                            old_cost = PrecisePricing.calculate_notional(pos.quantity, pos.avg_price)
+                            new_cost = PrecisePricing.calculate_notional(quantity, price)
+                            total_cost = old_cost + new_cost
+                            new_avg = float(total_cost / PrecisePricing.to_decimal(total_qty))
                             self.positions[symbol] = Position(symbol, total_qty, new_avg)
                         else:
                             logger.error(
@@ -1143,7 +1147,7 @@ class AsyncRunner:
                             "BUY_TO_COVER",
                             qty_to_cover,
                             fill_price,
-                            slippage=(fill_price - price) * qty_to_cover if res.fill_price else 0,
+                            slippage=float(PrecisePricing.calculate_pnl(price, fill_price, qty_to_cover)) if res.fill_price else 0,
                         )
                         await self.db.update_position(symbol, 0, 0, 0)  # Close position
 
@@ -1156,7 +1160,7 @@ class AsyncRunner:
                         if self.production_monitor:
                             latency_ms = 10  # Simulated latency for paper trading
                             self.production_monitor.record_order(symbol, True, latency_ms)
-                            pnl = (pos.avg_cost - fill_price) * qty_to_cover  # Short position PnL
+                            pnl = float(PrecisePricing.calculate_pnl(fill_price, pos.avg_cost, qty_to_cover))  # Short position PnL
                             self.production_monitor.record_trade(symbol, pnl, True)
 
                         executed = True
@@ -1266,7 +1270,7 @@ class AsyncRunner:
                         # Use atomic position update to prevent race conditions
                         success = await self._update_position_atomic(symbol, qty, fill_price, "BUY")
                         if success:
-                            self.daily_executed_notional += price * qty
+                            self.daily_executed_notional += float(PrecisePricing.calculate_notional(qty, price))
 
                             # Record trade in database
                             await self.db.record_trade(
@@ -1274,7 +1278,7 @@ class AsyncRunner:
                                 "BUY",
                                 qty,
                                 fill_price,
-                                slippage=(fill_price - price) * qty if res.fill_price else 0,
+                                slippage=float(PrecisePricing.calculate_pnl(price, fill_price, qty)) if res.fill_price else 0,
                             )
                             await self.db.update_position(symbol, qty, fill_price, price)
 
@@ -1374,9 +1378,7 @@ class AsyncRunner:
                                 "SELL",
                                 pos.quantity,
                                 fill_price,
-                                slippage=(
-                                    (fill_price - price) * pos.quantity if res.fill_price else 0
-                                ),
+                                slippage=float(PrecisePricing.calculate_pnl(price, fill_price, pos.quantity)) if res.fill_price else 0,
                             )
                             await self.db.update_position(symbol, 0, 0, 0)  # Close position
 
@@ -1387,9 +1389,7 @@ class AsyncRunner:
                             if self.production_monitor:
                                 latency_ms = 10  # Simulated latency for paper trading
                                 self.production_monitor.record_order(symbol, True, latency_ms)
-                                pnl = (
-                                    fill_price - pos.avg_cost
-                                ) * pos.quantity  # Long position PnL
+                                pnl = float(PrecisePricing.calculate_pnl(pos.avg_cost, fill_price, pos.quantity))  # Long position PnL
                                 self.production_monitor.record_trade(symbol, pnl, pnl > 0)
 
                             executed = True
@@ -1490,7 +1490,7 @@ class AsyncRunner:
                             symbol, qty, fill_price, "SELL_SHORT"
                         )
                         if success:
-                            self.daily_executed_notional += price * qty
+                            self.daily_executed_notional += float(PrecisePricing.calculate_notional(qty, price))
 
                             # Record trade in database
                             await self.db.record_trade(
@@ -1498,7 +1498,7 @@ class AsyncRunner:
                                 "SELL_SHORT",
                                 qty,
                                 fill_price,
-                                slippage=(fill_price - price) * qty if res.fill_price else 0,
+                                slippage=float(PrecisePricing.calculate_pnl(price, fill_price, qty)) if res.fill_price else 0,
                             )
                             await self.db.update_position(symbol, -qty, fill_price, price)
 

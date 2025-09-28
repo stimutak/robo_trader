@@ -20,6 +20,7 @@ import pandas as pd
 from ..data.pipeline import DataPipeline
 from ..features.engine import FeatureEngine
 from ..logger import get_logger
+from ..utils.pricing import PrecisePricing
 from ..strategies.framework import Signal, SignalType, Strategy
 from .metrics import PerformanceMetrics, calculate_metrics
 
@@ -67,9 +68,9 @@ class Position:
     def update_pnl(self, current_price: float) -> float:
         """Update P&L with current price."""
         if self.quantity > 0:  # Long
-            self.pnl = (current_price - self.entry_price) * self.quantity
+            self.pnl = float(PrecisePricing.calculate_pnl(self.entry_price, current_price, self.quantity))
         else:  # Short
-            self.pnl = (self.entry_price - current_price) * abs(self.quantity)
+            self.pnl = float(PrecisePricing.calculate_pnl(current_price, self.entry_price, abs(self.quantity)))
 
         self.pnl -= self.commission_paid
         if self.exit_price:
@@ -88,12 +89,12 @@ class Position:
 
         # Calculate final P&L
         if self.quantity > 0:  # Long
-            gross_pnl = (exit_price - self.entry_price) * self.quantity
+            gross_pnl = float(PrecisePricing.calculate_pnl(self.entry_price, exit_price, self.quantity))
         else:  # Short
-            gross_pnl = (self.entry_price - exit_price) * abs(self.quantity)
+            gross_pnl = float(PrecisePricing.calculate_pnl(exit_price, self.entry_price, abs(self.quantity)))
 
         self.pnl = gross_pnl - self.commission_paid - commission
-        self.return_pct = self.pnl / (self.entry_price * abs(self.quantity))
+        self.return_pct = self.pnl / float(PrecisePricing.calculate_notional(abs(self.quantity), self.entry_price))
         self.bars_held = int((exit_time - self.entry_time).total_seconds() / 60)
 
         return self.pnl
@@ -282,7 +283,7 @@ class BacktestEngine:
         # Calculate commission
         commission = max(
             self.config.min_commission,
-            abs(signal.quantity or 100) * execution_price * self.config.commission,
+            float(PrecisePricing.calculate_notional(abs(signal.quantity or 100), execution_price)) * self.config.commission,
         )
 
         # Execute based on signal type
@@ -293,7 +294,7 @@ class BacktestEngine:
                     available_cash = self.cash * 0.95  # Keep 5% reserve
                     signal.quantity = int(available_cash / execution_price)
 
-                cost = signal.quantity * execution_price + commission
+                cost = float(PrecisePricing.calculate_notional(signal.quantity, execution_price)) + commission
 
                 if cost <= self.cash:
                     # Open long position
@@ -321,7 +322,7 @@ class BacktestEngine:
             if symbol in self.positions:
                 # Close long position
                 position = self.positions[symbol]
-                proceeds = position.quantity * execution_price - commission
+                proceeds = float(PrecisePricing.calculate_notional(position.quantity, execution_price)) - commission
                 pnl = position.close(execution_price, timestamp, commission)
 
                 self.cash += proceeds
@@ -342,7 +343,7 @@ class BacktestEngine:
                     signal.quantity = -int(available_margin / execution_price)
 
                 margin_required = (
-                    abs(signal.quantity) * execution_price * self.config.margin_requirement
+                    float(PrecisePricing.calculate_notional(abs(signal.quantity), execution_price)) * self.config.margin_requirement
                 )
 
                 if margin_required <= self.cash:
@@ -371,9 +372,9 @@ class BacktestEngine:
                 position = self.positions[symbol]
 
                 if position.quantity > 0:  # Close long
-                    proceeds = position.quantity * execution_price - commission
+                    proceeds = float(PrecisePricing.calculate_notional(position.quantity, execution_price)) - commission
                 else:  # Close short
-                    cost = abs(position.quantity) * execution_price + commission
+                    cost = float(PrecisePricing.calculate_notional(abs(position.quantity), execution_price)) + commission
                     proceeds = -cost + (
                         abs(position.quantity)
                         * position.entry_price
@@ -440,7 +441,7 @@ class BacktestEngine:
             )
 
             if position.quantity > 0:
-                proceeds = position.quantity * execution_price - commission
+                proceeds = float(PrecisePricing.calculate_notional(position.quantity, execution_price)) - commission
             else:
                 proceeds = (
                     -abs(position.quantity) * execution_price
