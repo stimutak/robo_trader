@@ -48,7 +48,7 @@ class Position:
 
     symbol: str
     quantity: int
-    avg_price: float
+    avg_price: Decimal
     entry_time: datetime = field(default_factory=datetime.now)
     sector: Optional[str] = None
     beta: float = 1.0
@@ -59,9 +59,14 @@ class Position:
     trailing_stop_distance: Optional[float] = None
     max_price_since_entry: Optional[float] = None
 
+    def __post_init__(self) -> None:
+        """Normalize price-related fields to Decimal where appropriate."""
+        # Ensure avg_price uses Decimal precision
+        self.avg_price = PrecisePricing.to_decimal(self.avg_price)
+
     @property
     def notional_value(self) -> Decimal:
-        """Calculate position notional value."""
+        """Calculate position notional value with Decimal precision."""
         return PrecisePricing.calculate_notional(abs(self.quantity), self.avg_price)
 
     @property
@@ -69,13 +74,9 @@ class Position:
         """Check if position is long."""
         return self.quantity > 0
 
-    def unrealized_pnl(self, current_price: float) -> Decimal:
-        """Calculate unrealized P&L."""
-        current_price_d = PrecisePricing.to_decimal(current_price)
-        if self.is_long:
-            return PrecisePricing.calculate_pnl(self.avg_price, current_price_d, self.quantity)
-        else:
-            return PrecisePricing.calculate_pnl(current_price_d, self.avg_price, abs(self.quantity))
+    def unrealized_pnl(self, current_price: float | int | str | Decimal) -> Decimal:
+        """Calculate unrealized P&L with Decimal precision."""
+        return PrecisePricing.calculate_pnl(self.avg_price, current_price, self.quantity)
 
 
 @dataclass
@@ -367,7 +368,7 @@ class RiskManager:
 
         total_heat = 0.0
         total_value = sum(
-            abs(pos.quantity) * current_prices.get(sym, pos.avg_price)
+            abs(pos.quantity) * current_prices.get(sym, float(pos.avg_price))
             for sym, pos in positions.items()
         )
 
@@ -375,7 +376,7 @@ class RiskManager:
             return 0.0
 
         for symbol, pos in positions.items():
-            current_price = current_prices.get(symbol, pos.avg_price)
+            current_price = current_prices.get(symbol, float(pos.avg_price))
             position_value = abs(pos.quantity) * current_price
 
             # Calculate position risk based on stop loss or ATR
@@ -433,7 +434,7 @@ class RiskManager:
         weighted_beta = 0.0
 
         for symbol, pos in positions.items():
-            current_price = current_prices.get(symbol, pos.avg_price)
+            current_price = current_prices.get(symbol, float(pos.avg_price))
             position_value = abs(pos.quantity) * current_price
             total_value += position_value
 
@@ -575,7 +576,7 @@ class RiskManager:
             return False, "Symbol exposure exceeds limit"
 
         # Leverage check
-        existing_notional = sum(pos.notional_value for pos in current_positions.values())
+        existing_notional = sum(float(pos.notional_value) for pos in current_positions.values())
         total_after = existing_notional + order_notional
         if equity > 0 and (total_after / equity) > self.max_leverage:
             self._record_violation(RiskViolationType.LEVERAGE_LIMIT, symbol)

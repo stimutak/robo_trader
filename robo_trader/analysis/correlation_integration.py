@@ -86,7 +86,7 @@ class CorrelationBasedPositionSizer:
                         {
                             "symbol": pos_symbol,
                             "correlation": correlation,
-                            "exposure": position.notional_value / portfolio_value,
+                            "exposure": float(position.notional_value) / portfolio_value,
                         }
                     )
 
@@ -180,7 +180,7 @@ class CorrelationBasedPositionSizer:
             }
 
         # Calculate position weights
-        total_value = sum(p.notional_value for p in self.positions.values())
+        total_value = sum(float(p.notional_value) for p in self.positions.values())
         if total_value == 0:
             return {
                 "herfindahl_index": 0,
@@ -190,7 +190,7 @@ class CorrelationBasedPositionSizer:
             }
 
         weights = {
-            symbol: position.notional_value / total_value
+            symbol: float(position.notional_value) / total_value
             for symbol, position in self.positions.items()
         }
 

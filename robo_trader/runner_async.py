@@ -389,11 +389,13 @@ class AsyncRunner:
                             if new_qty == 0:
                                 del self.positions[symbol]
                             else:
-                                self.positions[symbol] = Position(symbol, new_qty, pos.avg_price)
+                                self.positions[symbol] = Position(symbol, new_qty, float(pos.avg_price))
                         elif side.upper() == "BUY" and pos.quantity >= 0:
                             # Adding to long position
                             total_qty = pos.quantity + quantity
-                            new_avg = (pos.avg_price * pos.quantity + price * quantity) / total_qty
+                            new_avg = (
+                                float(pos.avg_price) * pos.quantity + price * quantity
+                            ) / total_qty
                             self.positions[symbol] = Position(symbol, total_qty, new_avg)
                         else:
                             logger.error(
@@ -413,7 +415,7 @@ class AsyncRunner:
                                 del self.positions[symbol]
                             else:
                                 remaining = pos.quantity - quantity
-                                self.positions[symbol] = Position(symbol, remaining, pos.avg_price)
+                                self.positions[symbol] = Position(symbol, remaining, float(pos.avg_price))
                         else:
                             logger.error(
                                 f"Invalid position update: {side} on {pos.quantity} shares of {symbol}"
@@ -1600,7 +1602,7 @@ class AsyncRunner:
             if latest_pos and latest_pos.get("market_price"):
                 market_prices[symbol] = latest_pos["market_price"]
             else:
-                market_prices[symbol] = pos.avg_price
+                market_prices[symbol] = float(pos.avg_price)
         equity = self.portfolio.equity(market_prices)
         unrealized = self.portfolio.compute_unrealized(market_prices)
 
