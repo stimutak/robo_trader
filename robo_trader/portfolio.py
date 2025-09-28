@@ -87,8 +87,8 @@ class Portfolio:
         # Equity = cash + current market value of positions
         value = Decimal('0.0')
         for sym, pos in self.positions.items():
-            mp = symbol_to_market_price.get(sym, float(pos.avg_price))
-            mp_d = PrecisePricing.to_decimal(mp)
+            mp = symbol_to_market_price.get(sym)
+            mp_d = PrecisePricing.to_decimal(mp) if mp is not None else pos.avg_price
             value += PrecisePricing.calculate_notional(pos.quantity, mp_d)
         return self.cash + value
 
