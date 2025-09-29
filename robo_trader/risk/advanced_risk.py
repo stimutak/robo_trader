@@ -315,7 +315,17 @@ class KillSwitch:
         self.peak_equity = max(self.peak_equity, equity)
 
     def check_daily_loss(self, current_equity: float, starting_equity: float) -> bool:
-        """Check if daily loss limit exceeded."""
+        """Check if daily loss limit exceeded with robust validation."""
+        # Validate inputs
+        if not self._validate_equity_inputs(current_equity, starting_equity):
+            self.trigger("Invalid equity data for daily loss check", "Data validation failed")
+            return True  # Fail safe - block trading on invalid data
+
+        # Validate configuration
+        if not self._validate_daily_loss_config():
+            self.trigger("Invalid daily loss configuration", "Config validation failed")
+            return True  # Fail safe
+
         daily_loss_pct = (starting_equity - current_equity) / starting_equity
 
         if daily_loss_pct > self.max_daily_loss_pct:
@@ -336,7 +346,17 @@ class KillSwitch:
         return False
 
     def check_consecutive_losses(self, trade_result: float) -> bool:
-        """Check consecutive loss limit."""
+        """Check consecutive loss limit with robust validation."""
+        # Validate trade result
+        if not isinstance(trade_result, (int, float)) or not np.isfinite(trade_result):
+            self.trigger("Invalid trade result data", f"Got {type(trade_result)}: {trade_result}")
+            return True  # Fail safe
+
+        # Validate configuration
+        if not isinstance(self.max_consecutive_losses, int) or self.max_consecutive_losses <= 0:
+            self.trigger("Invalid consecutive loss configuration", f"max_consecutive_losses: {self.max_consecutive_losses}")
+            return True  # Fail safe
+
         if trade_result < 0:
             self.consecutive_losses += 1
 
@@ -351,11 +371,31 @@ class KillSwitch:
         return False
 
     def check_position_loss(self, symbol: str, current_price: float) -> bool:
-        """Check if any position exceeds loss limit."""
+        """Check if any position exceeds loss limit with robust validation."""
+        # Validate inputs
+        if not isinstance(symbol, str) or not symbol.strip():
+            self.trigger("Invalid symbol for position loss check", f"Symbol: {symbol}")
+            return True  # Fail safe
+
+        if not isinstance(current_price, (int, float)) or current_price <= 0 or not np.isfinite(current_price):
+            self.trigger(f"Invalid price for {symbol}", f"Price: {current_price}")
+            return True  # Fail safe
+
+        # Validate configuration
+        if not isinstance(self.max_position_loss_pct, (int, float)) or self.max_position_loss_pct <= 0:
+            self.trigger("Invalid position loss configuration", f"max_position_loss_pct: {self.max_position_loss_pct}")
+            return True  # Fail safe
+
         if symbol not in self.position_entry:
             return False
 
         entry_price, entry_time = self.position_entry[symbol]
+
+        # Validate entry price
+        if not isinstance(entry_price, (int, float)) or entry_price <= 0 or not np.isfinite(entry_price):
+            self.trigger(f"Invalid entry price for {symbol}", f"Entry: {entry_price}")
+            return True  # Fail safe
+
         loss_pct = (entry_price - current_price) / entry_price
 
         if loss_pct > self.max_position_loss_pct:
@@ -396,6 +436,61 @@ class KillSwitch:
         if self.triggered:
             return False, self.trigger_reason
         return True, None
+
+    def _validate_equity_inputs(self, current_equity: float, starting_equity: float) -> bool:
+        """
+        Validate equity inputs for daily loss calculation.
+
+        Args:
+            current_equity: Current account equity
+            starting_equity: Starting account equity
+
+        Returns:
+            True if inputs are valid
+        """
+        # Check types and basic validity
+        if not isinstance(current_equity, (int, float)) or not isinstance(starting_equity, (int, float)):
+            return False
+
+        # Check for negative or zero starting equity
+        if starting_equity <= 0:
+            return False
+
+        # Check for negative current equity (unusual but possible)
+        if current_equity < 0:
+            return False
+
+        # Check for infinite or NaN values
+        if not np.isfinite(current_equity) or not np.isfinite(starting_equity):
+            return False
+
+        # Sanity check: current equity shouldn't be more than 10x starting (prevents manipulation)
+        if current_equity > starting_equity * 10:
+            return False
+
+        return True
+
+    def _validate_daily_loss_config(self) -> bool:
+        """
+        Validate daily loss configuration.
+
+        Returns:
+            True if configuration is valid
+        """
+        if not isinstance(self.max_daily_loss_pct, (int, float)):
+            return False
+
+        if self.max_daily_loss_pct <= 0:
+            return False
+
+        # Reasonable limit check (prevent extreme values)
+        if self.max_daily_loss_pct > 0.50:  # 50% daily loss seems unreasonable
+            return False
+
+        if not np.isfinite(self.max_daily_loss_pct):
+            return False
+
+        return True
 
 
 class AdvancedRiskManager:
