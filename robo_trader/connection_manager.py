@@ -52,6 +52,15 @@ except ImportError:
             return f"{str_val[:4]}****"
 
 
+# Import robust connection utilities
+try:
+    from .utils.robust_connection import CircuitBreaker, CircuitBreakerConfig
+except ImportError:
+    logger.warning("Circuit breaker not available, using basic retry logic")
+    CircuitBreaker = None
+    CircuitBreakerConfig = None
+
+
 class ConnectionManager:
     """
     Bulletproof-ish connection manager for Interactive Brokers via ib_insync.
@@ -82,6 +91,16 @@ class ConnectionManager:
         self._failed_client_ids: set[int] = set()
         self._max_retries: int = 5
         self._retry_delay: float = 2.0
+        self._max_delay: float = 30.0  # Maximum backoff delay
+
+        # Circuit breaker for connection management
+        if CircuitBreakerConfig:
+            config = CircuitBreakerConfig(
+                failure_threshold=3, recovery_timeout=60.0, success_threshold=2
+            )
+            self._circuit_breaker = CircuitBreaker(config) if CircuitBreaker else None
+        else:
+            self._circuit_breaker = None
 
         # Track market data subscriptions to prevent leaks
         self._market_data_subs: Dict[str, Any] = {}  # symbol -> ticker
@@ -165,6 +184,13 @@ class ConnectionManager:
                 logger.warning("Existing connection is dead, reconnecting...")
                 await self._cleanup_connection()
 
+        # Check circuit breaker if available
+        if self._circuit_breaker and not self._circuit_breaker.can_attempt_connection():
+            status = self._circuit_breaker.get_status()
+            raise ConnectionError(
+                f"Circuit breaker is OPEN due to repeated failures. Status: {status}"
+            )
+
         self._connecting = True
 
         try:
@@ -206,11 +232,21 @@ class ConnectionManager:
                         self._cleanup_registered = True
 
                     self._failed_client_ids.clear()
+
+                    # Record success in circuit breaker
+                    if self._circuit_breaker:
+                        self._circuit_breaker.record_success()
+
                     return self.ib
 
                 except asyncio.TimeoutError:
                     logger.warning(f"Connection timeout on attempt {attempt + 1}")
                     self._failed_client_ids.add(client_id)
+
+                    # Record failure in circuit breaker
+                    if self._circuit_breaker:
+                        self._circuit_breaker.record_failure()
+
                     await self._cleanup_connection()
 
                 except Exception as e:  # noqa: BLE001
@@ -221,11 +257,24 @@ class ConnectionManager:
                         logger.warning(f"Client ID {client_id_masked} already in use")
                     else:
                         logger.warning(f"Connection failed: {e}")
+
+                    # Record failure in circuit breaker
+                    if self._circuit_breaker:
+                        self._circuit_breaker.record_failure()
+
                     await self._cleanup_connection()
 
                 if attempt < self._max_retries - 1:
-                    delay = self._retry_delay * (1.5**attempt)
-                    logger.info(f"Retrying in {delay:.1f} seconds...")
+                    # Exponential backoff with cap and jitter
+                    delay = min(self._retry_delay * (2**attempt), self._max_delay)
+
+                    # Add jitter to prevent thundering herd
+                    jitter = delay * 0.25 * random.random()
+                    delay += jitter
+
+                    logger.info(
+                        f"Retrying in {delay:.1f} seconds (exponential backoff with jitter)..."
+                    )
                     await asyncio.sleep(delay)
 
             raise ConnectionError(f"Failed to connect after {self._max_retries} attempts")
