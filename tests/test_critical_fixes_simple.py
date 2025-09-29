@@ -94,7 +94,7 @@ class TestCriticalBugFixesSimple:
         portfolio = Portfolio(100000)
 
         # Buy 100 shares at $100
-        portfolio.update_fill("AAPL", "BUY", 100, 100.0)
+        portfolio.update_fill_sync("AAPL", "BUY", 100, 100.0)
         assert portfolio.cash == 90000  # 100000 - 10000
         assert "AAPL" in portfolio.positions
         assert portfolio.positions["AAPL"].quantity == 100
@@ -102,7 +102,7 @@ class TestCriticalBugFixesSimple:
         # Try to sell 150 shares (more than we have) at $110
         with patch("robo_trader.logger.get_logger") as mock_logger:
             mock_logger.return_value.warning = Mock()
-            portfolio.update_fill("AAPL", "SELL", 150, 110.0)
+            portfolio.update_fill_sync("AAPL", "SELL", 150, 110.0)
 
             # Should have warned about overselling
             mock_logger.return_value.warning.assert_called_once()
@@ -241,14 +241,14 @@ class TestCriticalBugFixesSimple:
         assert portfolio.realized_pnl == 0.0
 
         # Test buy
-        portfolio.update_fill("AAPL", "BUY", 100, 150.0)
+        portfolio.update_fill_sync("AAPL", "BUY", 100, 150.0)
         assert portfolio.cash == 85000  # 100000 - 15000
         assert "AAPL" in portfolio.positions
         assert portfolio.positions["AAPL"].quantity == 100
         assert portfolio.positions["AAPL"].avg_price == 150.0
 
         # Test partial sell
-        portfolio.update_fill("AAPL", "SELL", 50, 160.0)
+        portfolio.update_fill_sync("AAPL", "SELL", 50, 160.0)
         assert "AAPL" in portfolio.positions
         assert portfolio.positions["AAPL"].quantity == 50
         assert portfolio.realized_pnl == 500.0  # (160-150) * 50

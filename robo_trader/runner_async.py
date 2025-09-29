@@ -434,8 +434,8 @@ class AsyncRunner:
                         logger.error(f"Cannot {side} {symbol}: no existing position")
                         return False
 
-                # Update portfolio
-                self.portfolio.update_fill(symbol, side, quantity, price)
+                # Update portfolio (thread-safe async call)
+                await self.portfolio.update_fill(symbol, side, quantity, price)
 
                 # Update advanced risk manager if enabled
                 if self.use_advanced_risk and self.advanced_risk:
@@ -1088,8 +1088,8 @@ class AsyncRunner:
             for sym in self.positions
         }
         equity_prices[symbol] = price_float
-        # Get current equity
-        equity = self.portfolio.equity(equity_prices)
+        # Get current equity (thread-safe)
+        equity = await self.portfolio.equity(equity_prices)
 
         # Record signal in database with strength reflecting model confidence if available
         signal_value = int(last.get("signal", 0))
@@ -1627,8 +1627,8 @@ class AsyncRunner:
                 market_prices[symbol] = latest_pos["market_price"]
             else:
                 market_prices[symbol] = float(pos.avg_price)
-        equity = self.portfolio.equity(market_prices)
-        unrealized = self.portfolio.compute_unrealized(market_prices)
+        equity = await self.portfolio.equity(market_prices)
+        unrealized = await self.portfolio.compute_unrealized(market_prices)
 
         # Update portfolio manager capital and consider rebalancing
         if self.portfolio_manager:
@@ -1783,7 +1783,7 @@ class AsyncRunner:
                                     if price_a > 0 and price_b > 0:
                                         # Calculate position sizes (simplified - equal dollar amounts)
                                         # Calculate total portfolio value from positions
-                                        equity = self.portfolio.equity(current_prices)
+                                        equity = await self.portfolio.equity(current_prices)
                                         pair_allocation = min(
                                             10000, equity * 0.02
                                         )  # Max 2% per leg
