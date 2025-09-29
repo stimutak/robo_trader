@@ -1700,19 +1700,46 @@ HTML_TEMPLATE = """
                     const symbols = [...new Set(data.trades.map(t => t.symbol))];
                     updateSymbolFilter(symbols);
                     
+                    // Update 'trades today' counter from returned trades
+                    try {
+                        const today = new Date();
+                        const todayDateStr = today.toDateString();
+                        const tradesToday = data.trades.filter(t => {
+                            if (!t.timestamp) return false;
+                            const utcTimestamp = t.timestamp.replace(' ', 'T') + 'Z';
+                            const d = new Date(utcTimestamp);
+                            return d.toDateString() === todayDateStr;
+                        }).length;
+                        const tc = document.getElementById('trade-count');
+                        if (tc) {
+                            tc.textContent = `${tradesToday} trade${tradesToday === 1 ? '' : 's'} today`;
+                        }
+                    } catch (e) {
+                        console.debug('Could not update trades-today counter:', e);
+                    }
+
                     tbody.innerHTML = data.trades.map(trade => {
                         // SQLite timestamps are UTC but don't have 'Z' suffix
-                        // Add 'Z' to mark as UTC, then convert to local time  
-                        const utcTimestamp = trade.timestamp.replace(' ', 'T') + 'Z';
-                        const utcDate = new Date(utcTimestamp);
-                        const time = utcDate.toLocaleString('en-US', { 
-                            timeZone: 'America/New_York',
-                            month: 'short',
-                            day: 'numeric',
-                            hour: '2-digit',
-                            minute: '2-digit',
-                            second: '2-digit'
-                        });
+                        // Add 'Z' to mark as UTC, then convert to local time
+                        let time = trade.timestamp || 'N/A';
+                        try {
+                            if (trade.timestamp) {
+                                const utcTimestamp = trade.timestamp.replace(' ', 'T') + 'Z';
+                                const utcDate = new Date(utcTimestamp);
+                                if (!isNaN(utcDate.getTime())) {
+                                    time = utcDate.toLocaleString('en-US', {
+                                        timeZone: 'America/New_York',
+                                        month: 'short',
+                                        day: 'numeric',
+                                        hour: '2-digit',
+                                        minute: '2-digit',
+                                        second: '2-digit'
+                                    });
+                                }
+                            }
+                        } catch (e) {
+                            console.debug('Date parse error for trade:', trade.id, e);
+                        }
                         const sideColor = trade.side === 'BUY' ? '#4ade80' : '#f87171';
                         return `
                             <tr>
@@ -3836,11 +3863,24 @@ def get_trades():
 
         db = SyncDatabaseReader()
 
-        # Get trades with optional filtering
-        days = request.args.get("days", 30, type=int)
+        # Get trades with optional filtering with input validation
+        try:
+            days = request.args.get("days", 30, type=int)
+            # Validate days parameter
+            if days is not None and days < 0:
+                days = 30  # Default to 30 days for invalid input
+            elif days is not None and days > 365:
+                days = 365  # Cap at 1 year to prevent excessive data
+        except (ValueError, TypeError):
+            days = 30  # Default to 30 days on parse error
+
         symbol = request.args.get("symbol", None)
 
-        trades = db.get_recent_trades(limit=100, symbol=symbol)
+        # Make trade limit configurable via environment variable
+        trade_limit = int(os.getenv("DASHBOARD_TRADE_LIMIT", "1000"))
+        trade_limit = min(max(trade_limit, 10), 5000)  # Clamp between 10 and 5000
+
+        trades = db.get_recent_trades(limit=trade_limit, symbol=symbol, days=days)
 
         if trades:
             # Convert to expected format
@@ -3857,11 +3897,12 @@ def get_trades():
                         "slippage": trade.get("slippage", 0),
                         "commission": trade.get("commission", 0),
                         "notional": trade["quantity"] * trade["price"],
+                        # Include all four sides (BUY, SELL, SELL_SHORT, BUY_TO_COVER)
                         "cash_impact": (
                             -trade["quantity"] * trade["price"]
-                            if trade["side"] == "BUY"
+                            if trade["side"] in ("BUY", "BUY_TO_COVER")
                             else trade["quantity"] * trade["price"]
-                        ),
+                        )
                     }
                 )
 
@@ -3869,8 +3910,9 @@ def get_trades():
             total_trades = len(trade_list)
             total_volume = sum(t["notional"] for t in trade_list)
             total_commission = sum(t["commission"] for t in trade_list)
-            buy_trades = [t for t in trade_list if t["side"] == "BUY"]
-            sell_trades = [t for t in trade_list if t["side"] == "SELL"]
+            # Count by high-level direction for summary
+            buy_trades = [t for t in trade_list if t["side"] in ("BUY", "BUY_TO_COVER")]
+            sell_trades = [t for t in trade_list if t["side"] in ("SELL", "SELL_SHORT")]
 
             return jsonify(
                 {
