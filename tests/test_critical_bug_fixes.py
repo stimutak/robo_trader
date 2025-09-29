@@ -110,7 +110,12 @@ class TestCriticalBugFixes:
 
     def test_position_sizing_truncation_fix(self):
         """Test Bug #3: Position sizing truncation is fixed."""
-        risk = RiskManager(1000, 0.02, 0.2, 2.0)
+        risk = RiskManager(
+            max_daily_loss=1000,
+            max_position_risk_pct=0.02,
+            max_symbol_exposure_pct=0.2,
+            max_leverage=2.0,
+        )
 
         # Test case where old code would truncate to 0
         # $10,000 account, 2% risk = $200, stock at $199 = 1.005 shares
@@ -155,7 +160,12 @@ class TestCriticalBugFixes:
 
     def test_stop_loss_validation_fix(self):
         """Test Bug #5: Stop-loss validation is added."""
-        risk = RiskManager(1000, 0.02, 0.2, 2.0)
+        risk = RiskManager(
+            max_daily_loss=1000,
+            max_position_risk_pct=0.02,
+            max_symbol_exposure_pct=0.2,
+            max_leverage=2.0,
+        )
 
         # Create a position with a reasonable stop-loss
         pos = Position("AAPL", 100, 150.0)

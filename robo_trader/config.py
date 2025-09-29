@@ -14,6 +14,8 @@ from typing import Dict, List, Optional
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .utils.secure_config import ConfigValidationError, SecureConfig
+
 
 class TradingMode(str, Enum):
     """Trading mode enumeration."""
@@ -400,12 +402,16 @@ def load_config_from_env() -> Config:
             "bar_size": os.getenv("DATA_BAR_SIZE", "5 mins"),
         },
         "ibkr": {
-            "host": os.getenv("IBKR_HOST"),  # REQUIRED - no default
-            "port": int(os.getenv("IBKR_PORT")) if os.getenv("IBKR_PORT") else None,  # REQUIRED
-            "client_id": int(os.getenv("IBKR_CLIENT_ID"))
-            if os.getenv("IBKR_CLIENT_ID")
-            else None,  # REQUIRED
-            "account": os.getenv("IBKR_ACCOUNT"),
+            "host": SecureConfig.get_secure_config("IBKR_HOST", required=True, mask_in_logs=False),
+            "port": int(
+                SecureConfig.get_secure_config("IBKR_PORT", required=True, mask_in_logs=False)
+            ),
+            "client_id": int(
+                SecureConfig.get_secure_config("IBKR_CLIENT_ID", required=True, mask_in_logs=True)
+            ),
+            "account": SecureConfig.get_secure_config(
+                "IBKR_ACCOUNT", required=False, mask_in_logs=True
+            ),
             "readonly": os.getenv("IBKR_READONLY", "true").lower() == "true",
             "timeout": float(os.getenv("IBKR_TIMEOUT", "10.0")),
         },
@@ -463,21 +469,22 @@ def load_config_from_env() -> Config:
         "default_cash": float(os.getenv("DEFAULT_CASH", "100000")),
     }
 
-    # Validate critical IBKR connection parameters
-    if not config_dict["ibkr"]["host"]:
-        raise ValueError(
-            "IBKR_HOST environment variable is required. "
-            "Set it to your IB Gateway/TWS host address."
+    # Validation is now handled by SecureConfig.get_secure_config() above
+    # Additional validation for port/mode consistency
+    port = config_dict["ibkr"]["port"]
+    paper_ports = [7497, 4002]
+    live_ports = [7496, 4001]
+
+    mode = config_dict["execution"]["mode"]
+    if mode == "paper" and port in live_ports:
+        raise ConfigValidationError(
+            f"Paper mode configured but using live trading port {port}. "
+            f"Use port 7497 (TWS) or 4002 (Gateway) for paper trading."
         )
-    if config_dict["ibkr"]["port"] is None:
-        raise ValueError(
-            "IBKR_PORT environment variable is required. "
-            "Use 7497 for paper trading or 7496 for live trading."
-        )
-    if config_dict["ibkr"]["client_id"] is None:
-        raise ValueError(
-            "IBKR_CLIENT_ID environment variable is required. "
-            "Set it to a unique integer ID for this client."
+    elif mode == "live" and port in paper_ports:
+        raise ConfigValidationError(
+            f"Live mode configured but using paper trading port {port}. "
+            f"Use port 7496 (TWS) or 4001 (Gateway) for live trading. BE CAREFUL!"
         )
 
     return Config(**config_dict)

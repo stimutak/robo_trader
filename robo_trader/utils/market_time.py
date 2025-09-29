@@ -5,7 +5,7 @@ Provides timezone-aware datetime utilities for trading operations.
 Ensures all market operations use correct Eastern Time (ET) timezone.
 """
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from typing import Optional
 
 try:
@@ -157,18 +157,18 @@ def seconds_until_market_open(check_time: Optional[datetime] = None) -> int:
     if is_market_open(market_time):
         return 0
 
-    # Calculate next market open
+    # Calculate next market open starting from today at open time
     next_open = market_time.replace(
         hour=MARKET_OPEN_TIME.hour, minute=MARKET_OPEN_TIME.minute, second=0, microsecond=0
     )
 
-    # If it's already past market open today, move to next business day
+    # Advance to the next valid trading day if today's open has passed or it's a weekend
     if market_time.time() >= MARKET_OPEN_TIME or market_time.weekday() >= 5:
-        next_open = next_open.replace(day=next_open.day + 1)
+        next_open += timedelta(days=1)
 
-        # Skip weekends
-        while next_open.weekday() >= 5:
-            next_open = next_open.replace(day=next_open.day + 1)
+    # Skip weekends safely using timedelta arithmetic
+    while next_open.weekday() >= 5:
+        next_open += timedelta(days=1)
 
     return int((next_open - market_time).total_seconds())
 

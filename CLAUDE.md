@@ -4,10 +4,10 @@
 **IMPORTANT:** The authoritative phase plan is in `IMPLEMENTATION_PLAN.md`. This is the ML-focused 4-phase plan over 16 weeks:
 - Phase 1: Foundation & Quick Wins (Tasks F1-F5) - COMPLETE ✅
 - Phase 2: ML Infrastructure & Backtesting (Tasks M1-M5) - COMPLETE ✅
-- Phase 3: Advanced Strategy Development (Tasks S1-S5) - IN PROGRESS 🚧
+- Phase 3: Advanced Strategy Development (Tasks S1-S5) - COMPLETE ✅
 - Phase 4: Production Hardening & Deployment (Tasks P1-P6)
 
-**Current Status:** Phase 3 IN PROGRESS - S1-S4 COMPLETE ✅ (80%), S5 remaining.
+**Current Status:** Phase 3 COMPLETE ✅ - Phase 4 IN PROGRESS (P1-P2 complete, 33%)
 
 **Note:** The older 9-phase plan in `archived_plans/PROJECT_PLAN_9PHASE.md` is deprecated and should NOT be used. Any references to "Phase 5", "Phase 6" etc. from older commits refer to the old plan and should be ignored.
 
@@ -99,6 +99,22 @@ python3 test_safety_features.py
 - **Circuit Breaker** (`circuit_breaker.py`) - Fault tolerance system
 - **Safety configs in `.env`** - MAX_OPEN_POSITIONS, STOP_LOSS_PERCENT, etc.
 - Run `python3 test_safety_features.py` to validate all safety features
+
+## Security Enhancements (2025-09-28) ✅
+**Critical security vulnerability fixed:**
+- **Secure Configuration** (`utils/secure_config.py`) - Validates and masks sensitive data
+- **API Key Masking** - All sensitive values masked in logs (shows `1234****` instead of full value)
+- **Required Config Validation** - Fails fast if critical configs missing
+- **Port/Mode Consistency** - Prevents accidental live trading with paper ports
+- All IBKR client IDs, accounts, and API keys now properly secured
+
+## Decimal Precision Fix (2025-09-28) ✅
+**PR #39 merged - Float precision errors eliminated:**
+- **Portfolio** uses `Decimal` for cash, realized_pnl, avg_price
+- **RiskManager** uses `Decimal` for position calculations
+- **PrecisePricing** utilities handle all financial arithmetic
+- Eliminates order rejections due to float precision errors
+- See `DECIMAL_PRECISION_FIX.md` for details
 
 ## Major Fixes Completed (2025-09-23)
 

@@ -1,0 +1,12 @@
+{
+  "type": "gradient_boosting",
+  "metrics": {
+    "accuracy": 0.465,
+    "precision": 0.46482765551200883,
+    "recall": 0.465,
+    "f1_score": 0.4643438211809466
+  },
+  "model_id": "model_20250927_173504",
+  "model_path": "./test_models/model_20250927_173504.joblib",
+  "registered_at": "2025-09-27T17:35:04.905129"
+}

@@ -2,13 +2,23 @@ from robo_trader.risk import Position, RiskManager
 
 
 def test_position_size_basic():
-    risk = RiskManager(1000, 0.02, 0.2, 2.0)
+    risk = RiskManager(
+        max_daily_loss=1000,
+        max_position_risk_pct=0.02,
+        max_symbol_exposure_pct=0.2,
+        max_leverage=2.0,
+    )
     size = risk.position_size(100_000, 200)
     assert size == 10  # 2% of 100k = 2k notionals, at $200 -> 10 shares
 
 
 def test_validate_order_limits():
-    risk = RiskManager(1000, 0.02, 0.2, 2.0)
+    risk = RiskManager(
+        max_daily_loss=1000,
+        max_position_risk_pct=0.02,
+        max_symbol_exposure_pct=0.2,
+        max_leverage=2.0,
+    )
     ok, msg = risk.validate_order(
         symbol="AAPL",
         order_qty=1000,
@@ -21,7 +31,12 @@ def test_validate_order_limits():
 
 
 def test_validate_order_leverage():
-    risk = RiskManager(1000, 0.02, 0.2, 2.0)
+    risk = RiskManager(
+        max_daily_loss=1000,
+        max_position_risk_pct=0.02,
+        max_symbol_exposure_pct=0.2,
+        max_leverage=2.0,
+    )
     positions = {"AAPL": Position("AAPL", 50, 100)}  # 5k notional
     ok, msg = risk.validate_order(
         symbol="MSFT",

@@ -38,6 +38,19 @@ except ImportError as import_err:
 
 logger = logging.getLogger(__name__)
 
+# Import secure config for masking sensitive data
+try:
+    from .utils.secure_config import SecureConfig
+except ImportError:
+    # Fallback if secure_config not available
+    class SecureConfig:
+        @staticmethod
+        def mask_value(value, reveal_length=4):
+            str_val = str(value)
+            if len(str_val) <= 4:
+                return "****"
+            return f"{str_val[:4]}****"
+
 
 class ConnectionManager:
     """
@@ -185,7 +198,8 @@ class ConnectionManager:
                     await asyncio.wait_for(self._verify_connection(), timeout=5.0)
 
                     self._connected = True
-                    logger.info(f"\u2713 Successfully connected with client_id={client_id}")
+                    client_id_masked = SecureConfig.mask_value(client_id)
+                    logger.info(f"\u2713 Successfully connected with client_id={client_id_masked}")
 
                     if not self._cleanup_registered:
                         self._register_cleanup_handlers()
@@ -203,7 +217,8 @@ class ConnectionManager:
                     error_msg = str(e).lower()
                     if "already connected" in error_msg or "client id" in error_msg:
                         self._failed_client_ids.add(client_id)
-                        logger.warning(f"Client ID {client_id} already in use")
+                        client_id_masked = SecureConfig.mask_value(client_id)
+                        logger.warning(f"Client ID {client_id_masked} already in use")
                     else:
                         logger.warning(f"Connection failed: {e}")
                     await self._cleanup_connection()

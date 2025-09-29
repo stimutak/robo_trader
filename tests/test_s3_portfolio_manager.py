@@ -24,7 +24,7 @@ from robo_trader.portfolio_manager.portfolio_manager import (
 from robo_trader.risk import RiskManager
 from robo_trader.strategies.mean_reversion import MeanReversionStrategy
 from robo_trader.strategies.ml_enhanced_strategy import MLEnhancedStrategy
-from robo_trader.strategies.momentum import MomentumStrategy
+from robo_trader.strategies.momentum import EnhancedMomentumStrategy as MomentumStrategy
 
 # Setup logging
 structlog.configure(
@@ -48,7 +48,13 @@ async def test_portfolio_initialization():
 
     config = Config()
     portfolio = Portfolio(starting_cash=100000)
-    risk_manager = RiskManager(max_position_size=10000)
+    risk_manager = RiskManager(
+        max_daily_loss=10000,
+        max_position_risk_pct=0.02,
+        max_symbol_exposure_pct=0.1,
+        max_leverage=1.0,
+        max_position_size=10000,
+    )
 
     # Test each allocation method
     methods = [
@@ -80,7 +86,13 @@ async def test_strategy_registration():
 
     config = Config()
     portfolio = Portfolio(starting_cash=100000)
-    risk_manager = RiskManager(max_position_size=10000)
+    risk_manager = RiskManager(
+        max_daily_loss=10000,
+        max_position_risk_pct=0.02,
+        max_symbol_exposure_pct=0.1,
+        max_leverage=1.0,
+        max_position_size=10000,
+    )
 
     pm = MultiStrategyPortfolioManager(
         config=config, risk_manager=risk_manager, allocation_method=AllocationMethod.ADAPTIVE
@@ -122,7 +134,13 @@ async def test_capital_allocation():
 
     config = Config()
     portfolio = Portfolio(starting_cash=100000)
-    risk_manager = RiskManager(max_position_size=10000)
+    risk_manager = RiskManager(
+        max_daily_loss=10000,
+        max_position_risk_pct=0.02,
+        max_symbol_exposure_pct=0.1,
+        max_leverage=1.0,
+        max_position_size=10000,
+    )
 
     # Test each allocation method
     for method in [
@@ -171,7 +189,13 @@ async def test_rebalancing():
 
     config = Config()
     portfolio = Portfolio(starting_cash=100000)
-    risk_manager = RiskManager(max_position_size=10000)
+    risk_manager = RiskManager(
+        max_daily_loss=10000,
+        max_position_risk_pct=0.02,
+        max_symbol_exposure_pct=0.1,
+        max_leverage=1.0,
+        max_position_size=10000,
+    )
 
     pm = MultiStrategyPortfolioManager(
         config=config,
@@ -223,7 +247,13 @@ async def test_performance_metrics():
 
     config = Config()
     portfolio = Portfolio(starting_cash=100000)
-    risk_manager = RiskManager(max_position_size=10000)
+    risk_manager = RiskManager(
+        max_daily_loss=10000,
+        max_position_risk_pct=0.02,
+        max_symbol_exposure_pct=0.1,
+        max_leverage=1.0,
+        max_position_size=10000,
+    )
 
     pm = MultiStrategyPortfolioManager(
         config=config, risk_manager=risk_manager, allocation_method=AllocationMethod.ADAPTIVE
@@ -272,7 +302,13 @@ async def test_correlation_aware_allocation():
 
     config = Config()
     portfolio = Portfolio(starting_cash=100000)
-    risk_manager = RiskManager(max_position_size=10000)
+    risk_manager = RiskManager(
+        max_daily_loss=10000,
+        max_position_risk_pct=0.02,
+        max_symbol_exposure_pct=0.1,
+        max_leverage=1.0,
+        max_position_size=10000,
+    )
 
     pm = MultiStrategyPortfolioManager(
         config=config, risk_manager=risk_manager, allocation_method=AllocationMethod.ADAPTIVE
@@ -338,7 +374,13 @@ async def test_risk_budgeting():
 
     config = Config()
     portfolio = Portfolio(starting_cash=100000)
-    risk_manager = RiskManager(max_position_size=10000)
+    risk_manager = RiskManager(
+        max_daily_loss=10000,
+        max_position_risk_pct=0.02,
+        max_symbol_exposure_pct=0.1,
+        max_leverage=1.0,
+        max_position_size=10000,
+    )
 
     pm = MultiStrategyPortfolioManager(
         config=config, risk_manager=risk_manager, allocation_method=AllocationMethod.RISK_PARITY

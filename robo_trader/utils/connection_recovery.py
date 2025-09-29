@@ -42,45 +42,49 @@ class StateRecoveryManager:
         try:
             logger.info("Starting state resynchronization with broker...")
 
-            # Clear potentially corrupted state
-            old_position_count = len(self.positions)
-            self.positions.clear()
-            self.pending_orders.clear()
-
-            # Get fresh state from broker
-            if connection_manager and hasattr(connection_manager, "ib") and connection_manager.ib:
-                broker_positions = await connection_manager.ib.positionsAsync()
-                broker_orders = await connection_manager.ib.ordersAsync()
-
-                # Rebuild internal position state
-                for pos in broker_positions:
-                    if pos.position != 0:  # Only track actual positions
-                        position_state = PositionState(
-                            symbol=pos.contract.symbol,
-                            quantity=int(pos.position),
-                            entry_price=Decimal(str(pos.avgCost)),
-                            current_value=Decimal(str(pos.position * pos.avgCost)),
-                            last_updated=get_market_time(),
-                        )
-                        self.positions[pos.contract.symbol] = position_state
-
-                # Track pending orders
-                for order in broker_orders:
-                    if order.orderStatus.status in ["PreSubmitted", "Submitted", "PendingSubmit"]:
-                        self.pending_orders.add(str(order.orderId))
-
-                self.last_successful_sync = get_market_time()
-
-                logger.info(
-                    f"State resync complete: {len(self.positions)} positions, "
-                    f"{len(self.pending_orders)} pending orders "
-                    f"(was {old_position_count} positions)"
-                )
-                return True
-
-            else:
+            if not (
+                connection_manager and hasattr(connection_manager, "ib") and connection_manager.ib
+            ):
                 logger.error("No valid broker connection available for state resync")
                 return False
+
+            broker_positions = await connection_manager.ib.positionsAsync()
+            broker_orders = await connection_manager.ib.ordersAsync()
+
+            # Build fresh state without mutating existing caches until successful
+            fresh_positions: Dict[str, PositionState] = {}
+            fresh_pending: Set[str] = set()
+
+            for pos in broker_positions:
+                if pos.position != 0:  # Only track actual positions
+                    position_state = PositionState(
+                        symbol=pos.contract.symbol,
+                        quantity=int(pos.position),
+                        entry_price=Decimal(str(pos.avgCost)),
+                        current_value=Decimal(str(pos.position * pos.avgCost)),
+                        last_updated=get_market_time(),
+                    )
+                    fresh_positions[pos.contract.symbol] = position_state
+
+            for order in broker_orders:
+                if order.orderStatus.status in ["PreSubmitted", "Submitted", "PendingSubmit"]:
+                    fresh_pending.add(str(order.orderId))
+
+            old_position_count = len(self.positions)
+
+            # Atomically swap state now that we have valid data
+            self.positions.clear()
+            self.positions.update(fresh_positions)
+            self.pending_orders.clear()
+            self.pending_orders.update(fresh_pending)
+            self.last_successful_sync = get_market_time()
+
+            logger.info(
+                f"State resync complete: {len(self.positions)} positions, "
+                f"{len(self.pending_orders)} pending orders "
+                f"(was {old_position_count} positions)"
+            )
+            return True
 
         except Exception as e:
             logger.error(f"State resync failed: {e}")

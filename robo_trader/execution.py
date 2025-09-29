@@ -199,15 +199,42 @@ class PaperExecutor(BaseExecutor):
 
     def _place_simple_order(self, order: Order) -> ExecutionResult:
         """Place order with simple paper execution."""
-        # For paper, we mark fill at limit price if provided else 0.0 as placeholder
-        base = order.price if order.price is not None else 0.0
+        base: Optional[float]
+
+        if order.price is not None:
+            try:
+                base = float(order.price)
+            except (TypeError, ValueError):
+                logger.error(
+                    "Invalid price provided for paper order", symbol=order.symbol, price=order.price
+                )
+                return ExecutionResult(False, "Invalid price for paper execution")
+            if base <= 0:
+                logger.error(
+                    "Non-positive price provided for paper order",
+                    symbol=order.symbol,
+                    price=order.price,
+                )
+                return ExecutionResult(False, "Non-positive price for paper execution")
+            self._execution_cache[order.symbol] = base
+        else:
+            base = self._execution_cache.get(order.symbol)
+            if base is None:
+                logger.error(
+                    "Missing reference price for market order in paper execution",
+                    symbol=order.symbol,
+                )
+                return ExecutionResult(False, "No reference price for market order")
+
         # Apply symmetric slippage in basis points
-        slip = base * (self.slippage_bps / 10_000.0) if base > 0 else 0.0
+        slip = base * (self.slippage_bps / 10_000.0) if self.slippage_bps else 0.0
+
         # Handle all order sides including short selling
         if order.side.upper() in {"BUY", "BUY_TO_COVER"}:
             fill = base + slip
         else:  # SELL or SELL_SHORT
             fill = base - slip
+
         self.fills[f"{order.symbol}-{len(self.fills)+1}"] = (
             dt.datetime.utcnow(),
             order,

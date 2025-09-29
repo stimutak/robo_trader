@@ -49,6 +49,7 @@ from .strategies import MLStrategy, sma_crossover_signals
 from .strategies.ml_enhanced_strategy import MLEnhancedStrategy
 from .utils.connection_recovery import OrderRateLimiter
 from .utils.pricing import PrecisePricing
+from .utils.secure_config import SecureConfig
 
 # Import mean reversion strategies if available
 logger = get_logger(__name__)
@@ -140,6 +141,7 @@ class AsyncRunner:
         self.portfolio = None
         self.portfolio_manager: Optional[MultiStrategyPortfolioManager] = None
         self.positions: Dict[str, Position] = {}
+        self.latest_prices: Dict[str, float] = {}
         self.daily_pnl = 0.0
         self.daily_executed_notional = 0.0
         self.monitor = PerformanceMonitor()
@@ -389,7 +391,9 @@ class AsyncRunner:
                             if new_qty == 0:
                                 del self.positions[symbol]
                             else:
-                                self.positions[symbol] = Position(symbol, new_qty, float(pos.avg_price))
+                                self.positions[symbol] = Position(
+                                    symbol, new_qty, float(pos.avg_price)
+                                )
                         elif side.upper() == "BUY" and pos.quantity >= 0:
                             # Adding to long position
                             total_qty = pos.quantity + quantity
@@ -415,7 +419,9 @@ class AsyncRunner:
                                 del self.positions[symbol]
                             else:
                                 remaining = pos.quantity - quantity
-                                self.positions[symbol] = Position(symbol, remaining, float(pos.avg_price))
+                                self.positions[symbol] = Position(
+                                    symbol, remaining, float(pos.avg_price)
+                                )
                         else:
                             logger.error(
                                 f"Invalid position update: {side} on {pos.quantity} shares of {symbol}"
@@ -484,6 +490,10 @@ class AsyncRunner:
 
         # Initialize robust connection manager (uses env-configured client ID with rotation on conflict)
         self.conn_mgr = ConnectionManager(host=host, port=port, client_id=self.cfg.ibkr.client_id)
+
+        # Log connection details with secure masking
+        client_id_masked = SecureConfig.mask_value(self.cfg.ibkr.client_id)
+        logger.info(f"Initializing connection to {host}:{port} with client_id: {client_id_masked}")
 
         # Try to connect with timeout and verify
         try:
@@ -783,16 +793,18 @@ class AsyncRunner:
         try:
             positions_data = await self.db.get_positions()
             for pos in positions_data:
-                if pos.get("quantity", 0) > 0:  # Only load open positions
-                    symbol = pos["symbol"]
-                    quantity = pos["quantity"]
-                    avg_cost = pos.get("avg_cost", pos.get("price", 0))
+                quantity = pos.get("quantity", 0)
+                if quantity == 0:
+                    continue
 
-                    # Create Position object and add to positions dict
-                    self.positions[symbol] = Position(symbol, quantity, avg_cost)
-                    logger.info(
-                        f"Loaded existing position: {symbol} qty={quantity} avg_cost=${avg_cost:.2f}"
-                    )
+                symbol = pos["symbol"]
+                avg_cost = pos.get("avg_cost", pos.get("price", 0))
+
+                # Create Position object and add to positions dict
+                self.positions[symbol] = Position(symbol, quantity, avg_cost)
+                logger.info(
+                    f"Loaded existing position: {symbol} qty={quantity} avg_cost=${avg_cost:.2f}"
+                )
 
             if self.positions:
                 logger.info(
@@ -891,7 +903,7 @@ class AsyncRunner:
             return SymbolResult(
                 symbol=symbol,
                 signal=0,
-                price=0,
+                price=0.0,
                 quantity=0,
                 executed=False,
                 message="No data available",
@@ -907,6 +919,7 @@ class AsyncRunner:
         latest_price = None
         if df is not None and not df.empty:
             latest_price = float(df["close"].iloc[-1])
+            self.latest_prices[symbol] = latest_price
 
             if WEBSOCKET_ENABLED and ws_client:
                 try:
@@ -1067,9 +1080,16 @@ class AsyncRunner:
 
         last = signals.iloc[-1]
         price = PrecisePricing.to_decimal(last.get("close", df["close"].iloc[-1]))
+        price_float = float(price)
+        self.latest_prices[symbol] = price_float
 
+        equity_prices = {
+            sym: self.latest_prices.get(sym, self.positions[sym].avg_price)
+            for sym in self.positions
+        }
+        equity_prices[symbol] = price_float
         # Get current equity
-        equity = self.portfolio.equity({symbol: price for symbol in self.positions})
+        equity = self.portfolio.equity(equity_prices)
 
         # Record signal in database
         signal_value = int(last.get("signal", 0))
@@ -1117,7 +1137,7 @@ class AsyncRunner:
                         return SymbolResult(
                             symbol=symbol,
                             signal=0,  # No signal computed when kill switch active
-                            price=price,
+                            price=price_float,
                             quantity=0,
                             executed=False,
                             message=message,
@@ -1128,24 +1148,23 @@ class AsyncRunner:
                     Order(symbol=symbol, quantity=qty_to_cover, side="BUY_TO_COVER", price=price)
                 )
                 if res.ok:
-                    # Cancel stop-loss when covering short position
                     if self.stop_loss_monitor:
                         self.stop_loss_monitor.cancel_stop(symbol)
-                    fill_price = res.fill_price or price
-                    # Use atomic position update to prevent race conditions
+                    fill_price = res.fill_price if res.fill_price is not None else price_float
                     success = await self._update_position_atomic(
                         symbol, qty_to_cover, fill_price, "BUY_TO_COVER"
                     )
                     if success:
                         self.daily_pnl = self.portfolio.realized_pnl
 
-                        # Record trade in database
                         await self.db.record_trade(
                             symbol,
                             "BUY_TO_COVER",
                             qty_to_cover,
                             fill_price,
-                            slippage=(fill_price - price) * qty_to_cover if res.fill_price else 0,
+                            slippage=(fill_price - price_float) * qty_to_cover
+                            if res.fill_price is not None
+                            else 0,
                         )
                         await self.db.update_position(symbol, 0, 0, 0)  # Close position
 
@@ -1154,11 +1173,10 @@ class AsyncRunner:
                             symbol, "BUY_TO_COVER", qty_to_cover
                         )
 
-                        # Record metrics to ProductionMonitor (Phase 4 P2)
                         if self.production_monitor:
                             latency_ms = 10  # Simulated latency for paper trading
                             self.production_monitor.record_order(symbol, True, latency_ms)
-                            pnl = (pos.avg_cost - fill_price) * qty_to_cover  # Short position PnL
+                            pnl = (pos.avg_cost - fill_price) * qty_to_cover
                             self.production_monitor.record_trade(symbol, pnl, True)
 
                         executed = True
@@ -1193,7 +1211,9 @@ class AsyncRunner:
                         )
                         executed = False
                         message = f"Blocked: {sizing_result['block_reason']}"
-                        return SymbolResult(symbol, signal_value, price, 0, executed, message, df)
+                        return SymbolResult(
+                            symbol, signal_value, price_float, 0, executed, message, df
+                        )
 
                     qty = sizing_result["position_size"]
 
@@ -1253,7 +1273,7 @@ class AsyncRunner:
                             return SymbolResult(
                                 symbol=symbol,
                                 signal=0,  # No signal computed when kill switch active
-                                price=price,
+                                price=price_float,
                                 quantity=0,
                                 executed=False,
                                 message=message,
@@ -1264,11 +1284,11 @@ class AsyncRunner:
                         Order(symbol=symbol, quantity=qty, side="BUY", price=price)
                     )
                     if res.ok:
-                        fill_price = res.fill_price or price
+                        fill_price = res.fill_price if res.fill_price is not None else price_float
                         # Use atomic position update to prevent race conditions
                         success = await self._update_position_atomic(symbol, qty, fill_price, "BUY")
                         if success:
-                            self.daily_executed_notional += price * qty
+                            self.daily_executed_notional += price_float * qty
 
                             # Record trade in database
                             await self.db.record_trade(
@@ -1276,7 +1296,9 @@ class AsyncRunner:
                                 "BUY",
                                 qty,
                                 fill_price,
-                                slippage=(fill_price - price) * qty if res.fill_price else 0,
+                                slippage=(fill_price - price_float) * qty
+                                if res.fill_price is not None
+                                else 0,
                             )
                             await self.db.update_position(symbol, qty, fill_price, price)
 
@@ -1348,7 +1370,7 @@ class AsyncRunner:
                             return SymbolResult(
                                 symbol=symbol,
                                 signal=0,  # No signal computed when kill switch active
-                                price=price,
+                                price=price_float,
                                 quantity=0,
                                 executed=False,
                                 message=message,
@@ -1453,7 +1475,7 @@ class AsyncRunner:
                             return SymbolResult(
                                 symbol=symbol,
                                 signal=0,  # No signal computed when kill switch active
-                                price=price,
+                                price=price_float,
                                 quantity=0,
                                 executed=False,
                                 message=message,
@@ -1464,14 +1486,13 @@ class AsyncRunner:
                         Order(symbol=symbol, quantity=qty, side="SELL_SHORT", price=price)
                     )
                     if res.ok:
-                        fill_price = res.fill_price or price
-                        # Add stop-loss for short position
+                        fill_price = res.fill_price if res.fill_price is not None else price_float
+
                         if self.stop_loss_monitor and self.enable_stop_loss:
                             try:
-                                # Create position object for stop-loss (negative quantity for short)
                                 short_position = Position(
                                     symbol=symbol,
-                                    quantity=-qty,  # Negative for short
+                                    quantity=-qty,
                                     avg_price=fill_price,
                                     entry_time=datetime.now(),
                                 )
@@ -1486,21 +1507,21 @@ class AsyncRunner:
                                 )
                             except Exception as e:
                                 logger.error(f"Failed to add stop-loss for short {symbol}: {e}")
-                        fill_price = res.fill_price or price
-                        # Use atomic position update to prevent race conditions
+
                         success = await self._update_position_atomic(
                             symbol, qty, fill_price, "SELL_SHORT"
                         )
                         if success:
-                            self.daily_executed_notional += price * qty
+                            self.daily_executed_notional += price_float * qty
 
-                            # Record trade in database
                             await self.db.record_trade(
                                 symbol,
                                 "SELL_SHORT",
                                 qty,
                                 fill_price,
-                                slippage=(fill_price - price) * qty if res.fill_price else 0,
+                                slippage=(fill_price - price_float) * qty
+                                if res.fill_price is not None
+                                else 0,
                             )
                             await self.db.update_position(symbol, -qty, fill_price, price)
 
@@ -1522,7 +1543,7 @@ class AsyncRunner:
         return SymbolResult(
             symbol=symbol,
             signal=signal_value,
-            price=price,
+            price=price_float,
             quantity=quantity,
             executed=executed,
             message=message,
