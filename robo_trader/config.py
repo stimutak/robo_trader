@@ -14,7 +14,11 @@ from typing import Dict, List, Optional
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .logger import get_logger
+from .utils.config_validator import ConfigValidator, EnhancedTradingConfig
 from .utils.secure_config import ConfigValidationError, SecureConfig
+
+logger = get_logger(__name__)
 
 
 class TradingMode(str, Enum):
@@ -90,7 +94,7 @@ class ExecutionConfig(BaseModel):
 
 
 class RiskConfig(BaseModel):
-    """Risk management configuration."""
+    """Risk management configuration with enhanced validation."""
 
     max_position_pct: float = Field(
         default=0.02, gt=0, le=0.1, description="Max position size as % of portfolio"
@@ -98,6 +102,29 @@ class RiskConfig(BaseModel):
     max_daily_loss_pct: float = Field(
         default=0.005, gt=0, le=0.05, description="Max daily loss as % of portfolio"
     )
+
+    @field_validator("max_position_pct")
+    @classmethod
+    def validate_position_pct(cls, v: float) -> float:
+        """Validate position percentage with safety checks."""
+        if not 0 < v <= 0.1:
+            raise ValueError(f"max_position_pct must be between 0 and 0.1, got {v}")
+        if v > 0.05:
+            logger.warning(
+                f"High position size configured: {v * 100:.1f}% - ensure proper risk management"
+            )
+        return v
+
+    @field_validator("max_daily_loss_pct")
+    @classmethod
+    def validate_daily_loss_pct(cls, v: float) -> float:
+        """Validate daily loss percentage with safety checks."""
+        if not 0 < v <= 0.05:
+            raise ValueError(f"max_daily_loss_pct must be between 0 and 0.05, got {v}")
+        if v > 0.02:
+            logger.warning(f"High daily loss limit: {v * 100:.1f}% - be cautious")
+        return v
+
     max_portfolio_beta: float = Field(
         default=1.2, gt=0, le=2.0, description="Maximum portfolio beta"
     )
@@ -114,6 +141,17 @@ class RiskConfig(BaseModel):
         default=0.3, gt=0, le=0.5, description="Max sector exposure"
     )
     max_leverage: float = Field(default=2.0, ge=1.0, le=4.0, description="Maximum account leverage")
+
+    @field_validator("max_leverage")
+    @classmethod
+    def validate_leverage(cls, v: float) -> float:
+        """Validate leverage with safety warnings."""
+        if not 1.0 <= v <= 4.0:
+            raise ValueError(f"max_leverage must be between 1.0 and 4.0, got {v}")
+        if v > 2.0:
+            logger.warning(f"High leverage configured: {v}x - ensure you understand the risks")
+        return v
+
     stop_loss_pct: float = Field(
         default=0.02, gt=0, le=0.1, description="Default stop loss percentage"
     )
@@ -129,6 +167,39 @@ class RiskConfig(BaseModel):
         default=100_000, ge=1000, description="Max daily trading notional"
     )
     max_open_positions: int = Field(default=20, ge=1, le=100, description="Maximum open positions")
+
+    @field_validator("max_order_notional")
+    @classmethod
+    def validate_order_notional(cls, v: Optional[float]) -> Optional[float]:
+        """Validate order notional limit."""
+        if v is not None:
+            if v <= 0:
+                raise ValueError(f"max_order_notional must be positive, got {v}")
+            if v > 100_000:
+                logger.warning(f"Very high order notional: ${v:,.2f}")
+        return v
+
+    @field_validator("max_daily_notional")
+    @classmethod
+    def validate_daily_notional(cls, v: Optional[float]) -> Optional[float]:
+        """Validate daily notional limit."""
+        if v is not None:
+            if v <= 0:
+                raise ValueError(f"max_daily_notional must be positive, got {v}")
+            if v > 1_000_000:
+                logger.warning(f"Very high daily notional: ${v:,.2f}")
+        return v
+
+    @field_validator("max_open_positions")
+    @classmethod
+    def validate_open_positions(cls, v: int) -> int:
+        """Validate maximum open positions."""
+        if v <= 0:
+            raise ValueError(f"max_open_positions must be positive, got {v}")
+        if v > 50:
+            logger.warning(f"High position count: {v} - may impact monitoring and risk management")
+        return v
+
     position_sizing_method: str = Field(
         default="fixed", description="Position sizing method: fixed, atr, kelly"
     )
@@ -339,7 +410,7 @@ class Config(BaseModel):
 
 def load_config_from_env() -> Config:
     """
-    Load configuration from environment variables with validation.
+    Load configuration from environment variables with enhanced validation.
 
     Environment variables are prefixed with section names:
     - EXECUTION_MODE=paper
@@ -350,9 +421,15 @@ def load_config_from_env() -> Config:
     - MONITORING_LOG_LEVEL=INFO
 
     Returns:
-        Config: Validated configuration object
+        Config: Validated configuration object with comprehensive risk checks
+
+    Raises:
+        ConfigValidationError: If configuration fails validation
     """
     load_dotenv()
+
+    # Use enhanced validation for critical risk parameters
+    validator = ConfigValidator()
 
     config_dict = {
         "environment": os.getenv("ENVIRONMENT", "dev"),
@@ -365,27 +442,33 @@ def load_config_from_env() -> Config:
             "enable_short_selling": os.getenv("EXECUTION_SHORT_SELLING", "false").lower() == "true",
         },
         "risk": {
-            "max_position_pct": float(os.getenv("RISK_MAX_POSITION_PCT", "0.02")),
-            "max_daily_loss_pct": float(os.getenv("RISK_MAX_DAILY_LOSS_PCT", "0.005")),
-            "max_portfolio_beta": float(os.getenv("RISK_MAX_PORTFOLIO_BETA", "1.2")),
-            "correlation_limit": float(os.getenv("RISK_CORRELATION_LIMIT", "0.7")),
-            "min_volume": int(os.getenv("RISK_MIN_VOLUME", "1000000")),
-            "min_market_cap": float(os.getenv("RISK_MIN_MARKET_CAP", "1000000000")),
-            "max_sector_exposure_pct": float(os.getenv("RISK_MAX_SECTOR_EXPOSURE", "0.3")),
-            "max_leverage": float(os.getenv("RISK_MAX_LEVERAGE", "2.0")),
-            "stop_loss_pct": float(os.getenv("RISK_STOP_LOSS_PCT", "0.02")),
-            "take_profit_pct": float(os.getenv("RISK_TAKE_PROFIT_PCT", "0.05")),
-            "max_order_notional": (
-                float(os.getenv("RISK_MAX_ORDER_NOTIONAL", "10000"))
-                if os.getenv("RISK_MAX_ORDER_NOTIONAL")
-                else None
+            # Use validated values for critical risk parameters
+            "max_position_pct": validator.validate_percentage("RISK_MAX_POSITION_PCT", 0.02),
+            "max_daily_loss_pct": validator.validate_percentage("RISK_MAX_DAILY_LOSS_PCT", 0.005),
+            "max_portfolio_beta": validator.validate_range(
+                "RISK_MAX_PORTFOLIO_BETA", 0.5, 2.0, 1.2
             ),
-            "max_daily_notional": (
-                float(os.getenv("RISK_MAX_DAILY_NOTIONAL", "100000"))
-                if os.getenv("RISK_MAX_DAILY_NOTIONAL")
-                else None
+            "correlation_limit": validator.validate_range("RISK_CORRELATION_LIMIT", 0.0, 1.0, 0.7),
+            "min_volume": max(int(os.getenv("RISK_MIN_VOLUME", "1000000")), 100000),
+            "min_market_cap": max(float(os.getenv("RISK_MIN_MARKET_CAP", "1000000000")), 100000000),
+            "max_sector_exposure_pct": validator.validate_percentage(
+                "RISK_MAX_SECTOR_EXPOSURE", 0.3
             ),
-            "max_open_positions": int(os.getenv("RISK_MAX_OPEN_POSITIONS", "20")),
+            "max_leverage": validator.validate_leverage("RISK_MAX_LEVERAGE", 2.0),
+            "stop_loss_pct": validator.validate_stop_loss("RISK_STOP_LOSS_PCT", 0.02),
+            "take_profit_pct": validator.validate_percentage("RISK_TAKE_PROFIT_PCT", 0.05),
+            # Validated notional limits
+            "max_order_notional": validator.validate_positive_float(
+                "RISK_MAX_ORDER_NOTIONAL", 10000, min_value=100
+            )
+            if os.getenv("RISK_MAX_ORDER_NOTIONAL")
+            else None,
+            "max_daily_notional": validator.validate_positive_float(
+                "RISK_MAX_DAILY_NOTIONAL", 100000, min_value=1000
+            )
+            if os.getenv("RISK_MAX_DAILY_NOTIONAL")
+            else None,
+            "max_open_positions": validator.validate_position_limit("RISK_MAX_OPEN_POSITIONS", 20),
             "position_sizing_method": os.getenv("RISK_POSITION_SIZING", "fixed"),
             "use_trailing_stop": os.getenv("RISK_USE_TRAILING_STOP", "false").lower() == "true",
             "trailing_stop_pct": float(os.getenv("RISK_TRAILING_STOP_PCT", "0.015")),
