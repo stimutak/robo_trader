@@ -3902,7 +3902,7 @@ def get_trades():
                             -trade["quantity"] * trade["price"]
                             if trade["side"] in ("BUY", "BUY_TO_COVER")
                             else trade["quantity"] * trade["price"]
-                        )
+                        ),
                     }
                 )
 

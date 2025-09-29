@@ -4,6 +4,8 @@ Fix for IBKR connection verification.
 Adds proper connection checking to prevent "Trading Active" without IBKR.
 """
 
+import asyncio
+
 
 def check_ibkr_connection():
     """Check if IBKR is actually connected."""

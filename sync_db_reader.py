@@ -138,9 +138,7 @@ class SyncDatabaseReader:
 
             where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 
-            sql = (
-                "SELECT * FROM trades" + where_sql + " ORDER BY timestamp DESC LIMIT ?"
-            )
+            sql = "SELECT * FROM trades" + where_sql + " ORDER BY timestamp DESC LIMIT ?"
 
             params += (limit,)
 

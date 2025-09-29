@@ -15,18 +15,18 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 # Add project to path
-import sys
+import sys  # noqa: E402
 
 sys.path.append(".")
 
-from robo_trader.config import Config
-from robo_trader.features.feature_pipeline import FeaturePipeline
-from robo_trader.ml.model_trainer import ModelTrainer, ModelType, PredictionType
+from robo_trader.config import Config  # noqa: E402
+from robo_trader.features.feature_pipeline import FeaturePipeline  # noqa: E402
+from robo_trader.ml.model_trainer import ModelTrainer, ModelType, PredictionType  # noqa: E402
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 async def fetch_training_data(symbols: list, period: str = "2y") -> dict:

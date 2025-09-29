@@ -21,8 +21,8 @@ def test_float_precision_bug():
     print(f"Float repr: {total_float!r}")
 
     # Decimal calculation (precise)
-    price_d = Decimal('123.456789')
-    quantity_d = Decimal('0.1')
+    price_d = Decimal("123.456789")
+    quantity_d = Decimal("0.1")
     total_decimal = price_d * quantity_d
     print(f"Decimal: {price_d} * {quantity_d} = {total_decimal}")
 
@@ -42,9 +42,9 @@ def test_float_precision_bug():
     print(f"Float P&L repr: {pnl_float!r}")
 
     # Decimal P&L (precise)
-    entry_d = Decimal('123.456789')
-    exit_d = Decimal('125.987654')
-    shares_d = Decimal('100')
+    entry_d = Decimal("123.456789")
+    exit_d = Decimal("125.987654")
+    shares_d = Decimal("100")
     pnl_decimal = (exit_d - entry_d) * shares_d
     print(f"Decimal P&L: ({exit_d} - {entry_d}) * {shares_d} = {pnl_decimal}")
 
@@ -66,7 +66,7 @@ def test_pricing_utilities():
         return False
 
     # Test to_decimal conversion
-    test_values = [123.45, "123.45", Decimal('123.45'), 100]
+    test_values = [123.45, "123.45", Decimal("123.45"), 100]
     for val in test_values:
         result = PrecisePricing.to_decimal(val)
         print(f"to_decimal({val!r}) = {result}")
@@ -114,8 +114,12 @@ def test_portfolio_basic():
     portfolio = Portfolio(10000.0)
 
     # Verify Decimal types
-    assert isinstance(portfolio.cash, Decimal), f"Cash should be Decimal, got {type(portfolio.cash)}"
-    assert isinstance(portfolio.realized_pnl, Decimal), f"Realized P&L should be Decimal, got {type(portfolio.realized_pnl)}"
+    assert isinstance(
+        portfolio.cash, Decimal
+    ), f"Cash should be Decimal, got {type(portfolio.cash)}"
+    assert isinstance(
+        portfolio.realized_pnl, Decimal
+    ), f"Realized P&L should be Decimal, got {type(portfolio.realized_pnl)}"
     print(f"✅ Portfolio created with cash: ${portfolio.cash}")
 
     # Test buy order
@@ -123,11 +127,13 @@ def test_portfolio_basic():
 
     position = portfolio.positions.get("TEST")
     assert position is not None, "Position should be created"
-    assert isinstance(position.avg_price, Decimal), f"Position price should be Decimal, got {type(position.avg_price)}"
+    assert isinstance(
+        position.avg_price, Decimal
+    ), f"Position price should be Decimal, got {type(position.avg_price)}"
     print(f"✅ Buy order: 100 shares @ ${position.avg_price}")
 
     # Test cash deduction
-    expected_cash = Decimal('10000.0') - (Decimal('123.456789') * Decimal('100'))
+    expected_cash = Decimal("10000.0") - (Decimal("123.456789") * Decimal("100"))
     assert portfolio.cash == expected_cash, f"Expected {expected_cash}, got {portfolio.cash}"
     print(f"✅ Cash after buy: ${portfolio.cash}")
 
@@ -181,6 +187,7 @@ def main():
     except Exception as e:
         print(f"\n❌ TEST ERROR: {e}")
         import traceback
+
         traceback.print_exc()
         return 1
 

@@ -46,7 +46,6 @@ DEFAULT_SYMBOLS = [
 def load_symbols_from_settings():
     """Load symbols from user settings file if it exists."""
     import json
-    from pathlib import Path
 
     settings_file = Path("user_settings.json")
     if settings_file.exists():
