@@ -546,37 +546,67 @@ class RiskManager:
         if price <= 0:
             return False, "Invalid price"
 
-        # Daily loss limit
+        # Daily loss limit - Robust validation
+        if not self._validate_daily_loss_params(daily_pnl, self.max_daily_loss):
+            self._record_violation(RiskViolationType.DAILY_LOSS_LIMIT, symbol)
+            return False, "Invalid daily loss parameters"
+
         if daily_pnl <= -abs(self.max_daily_loss):
             self._record_violation(RiskViolationType.DAILY_LOSS_LIMIT, symbol)
             return False, "Daily loss limit reached"
 
-        # Position count limit
+        # Position count limit - Robust validation
+        if not isinstance(self.max_open_positions, int) or self.max_open_positions <= 0:
+            logger.error(f"Invalid max_open_positions configuration: {self.max_open_positions}")
+            return False, "Invalid position limit configuration"
+
         if len(current_positions) >= self.max_open_positions:
             return False, f"Maximum {self.max_open_positions} positions reached"
 
         order_notional = price * order_qty
 
-        # Per-order notional limit
-        if self.max_order_notional and order_notional > self.max_order_notional:
-            self._record_violation(RiskViolationType.ORDER_NOTIONAL_LIMIT, symbol)
-            return False, "Order notional exceeds per-order limit"
+        # Per-order notional limit - Robust validation
+        if self.max_order_notional is not None:
+            if not self._validate_numeric_limit(self.max_order_notional, "max_order_notional"):
+                return False, "Invalid max_order_notional configuration"
 
-        # Daily notional limit
-        if self.max_daily_notional:
+            if order_notional > self.max_order_notional:
+                self._record_violation(RiskViolationType.ORDER_NOTIONAL_LIMIT, symbol)
+                return False, "Order notional exceeds per-order limit"
+
+        # Daily notional limit - Robust validation
+        if self.max_daily_notional is not None:
+            if not self._validate_numeric_limit(self.max_daily_notional, "max_daily_notional"):
+                return False, "Invalid max_daily_notional configuration"
+
+            if not isinstance(daily_executed_notional, (int, float)) or daily_executed_notional < 0:
+                logger.error(f"Invalid daily_executed_notional: {daily_executed_notional}")
+                return False, "Invalid daily executed notional data"
+
             new_daily_total = daily_executed_notional + order_notional
             if new_daily_total > self.max_daily_notional:
                 self._record_violation(RiskViolationType.DAILY_NOTIONAL_LIMIT, symbol)
                 return False, "Daily notional exceeds limit"
 
-        # Symbol exposure limit
+        # Symbol exposure limit - Robust validation
+        if not self._validate_equity_and_percentage(equity, self.max_symbol_exposure_pct, "max_symbol_exposure_pct"):
+            return False, "Invalid equity or symbol exposure configuration"
+
         max_symbol_notional = equity * self.max_symbol_exposure_pct
         if order_notional > max_symbol_notional:
             self._record_violation(RiskViolationType.POSITION_SIZE_LIMIT, symbol)
             return False, "Symbol exposure exceeds limit"
 
-        # Leverage check
-        existing_notional = sum(float(pos.notional_value) for pos in current_positions.values())
+        # Leverage check - Robust validation
+        if not self._validate_leverage_params(equity, self.max_leverage):
+            return False, "Invalid leverage configuration"
+
+        try:
+            existing_notional = sum(float(pos.notional_value) for pos in current_positions.values())
+        except (ValueError, TypeError) as e:
+            logger.error(f"Error calculating existing notional: {e}")
+            return False, "Invalid position data for leverage calculation"
+
         total_after = existing_notional + order_notional
         if equity > 0 and (total_after / equity) > self.max_leverage:
             self._record_violation(RiskViolationType.LEVERAGE_LIMIT, symbol)
@@ -775,6 +805,126 @@ class RiskManager:
         """Record a risk violation."""
         self.violations.append((datetime.now(), violation_type, symbol))
         logger.warning(f"Risk violation: {violation_type.value} for {symbol}")
+
+    def _validate_daily_loss_params(self, daily_pnl: float, max_daily_loss: float) -> bool:
+        """
+        Validate daily loss parameters to prevent bypass vulnerabilities.
+
+        Args:
+            daily_pnl: Current daily P&L
+            max_daily_loss: Maximum allowed daily loss
+
+        Returns:
+            True if parameters are valid
+        """
+        # Validate max_daily_loss configuration
+        if max_daily_loss is None:
+            logger.error("max_daily_loss is None - risk check disabled!")
+            return False
+
+        if max_daily_loss <= 0:
+            logger.error(f"Invalid max_daily_loss configuration: {max_daily_loss}")
+            return False
+
+        if not isinstance(max_daily_loss, (int, float)):
+            logger.error(f"max_daily_loss must be numeric, got {type(max_daily_loss)}")
+            return False
+
+        # Validate daily_pnl data
+        if not isinstance(daily_pnl, (int, float, Decimal)):
+            logger.error(f"daily_pnl must be numeric, got {type(daily_pnl)}: {daily_pnl}")
+            return False
+
+        if not np.isfinite(float(daily_pnl)) or not np.isfinite(float(max_daily_loss)):
+            logger.error("Non-finite values detected in daily loss check")
+            return False
+
+        return True
+
+    def _validate_numeric_limit(self, limit_value: any, param_name: str) -> bool:
+        """
+        Validate numeric limit parameters.
+
+        Args:
+            limit_value: The limit value to validate
+            param_name: Name of parameter for error messages
+
+        Returns:
+            True if valid
+        """
+        if limit_value is None:
+            logger.error(f"{param_name} is None but should have a valid limit")
+            return False
+
+        if not isinstance(limit_value, (int, float)):
+            logger.error(f"{param_name} must be numeric, got {type(limit_value)}")
+            return False
+
+        if limit_value <= 0:
+            logger.error(f"Invalid {param_name} configuration: {limit_value} (must be > 0)")
+            return False
+
+        if not np.isfinite(float(limit_value)):
+            logger.error(f"Non-finite {param_name}: {limit_value}")
+            return False
+
+        return True
+
+    def _validate_equity_and_percentage(self, equity: float, percentage: float, param_name: str) -> bool:
+        """
+        Validate equity and percentage parameters.
+
+        Args:
+            equity: Account equity
+            percentage: Percentage limit (0-1)
+            param_name: Parameter name for errors
+
+        Returns:
+            True if valid
+        """
+        if not isinstance(equity, (int, float, Decimal)) or equity <= 0:
+            logger.error(f"Invalid equity for {param_name} check: {equity}")
+            return False
+
+        if not isinstance(percentage, (int, float)) or percentage <= 0 or percentage > 1:
+            logger.error(f"Invalid {param_name}: {percentage} (must be 0 < x <= 1)")
+            return False
+
+        if not np.isfinite(float(equity)) or not np.isfinite(float(percentage)):
+            logger.error(f"Non-finite values in {param_name} check")
+            return False
+
+        return True
+
+    def _validate_leverage_params(self, equity: float, max_leverage: float) -> bool:
+        """
+        Validate leverage calculation parameters.
+
+        Args:
+            equity: Account equity
+            max_leverage: Maximum leverage limit
+
+        Returns:
+            True if valid
+        """
+        if not isinstance(equity, (int, float, Decimal)) or equity <= 0:
+            logger.error(f"Invalid equity for leverage check: {equity}")
+            return False
+
+        if not isinstance(max_leverage, (int, float)) or max_leverage <= 0:
+            logger.error(f"Invalid max_leverage configuration: {max_leverage}")
+            return False
+
+        # Reasonable leverage limits (prevent extreme values)
+        if max_leverage > 10:
+            logger.error(f"Suspicious max_leverage value: {max_leverage} (> 10x)")
+            return False
+
+        if not np.isfinite(float(equity)) or not np.isfinite(float(max_leverage)):
+            logger.error("Non-finite values in leverage check")
+            return False
+
+        return True
 
     def reset_daily_counters(self) -> None:
         """Reset daily tracking counters."""
