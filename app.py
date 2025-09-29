@@ -1335,17 +1335,26 @@ HTML_TEMPLATE = """
 
                     tbody.innerHTML = data.trades.map(trade => {
                         // SQLite timestamps are UTC but don't have 'Z' suffix
-                        // Add 'Z' to mark as UTC, then convert to local time  
-                        const utcTimestamp = trade.timestamp.replace(' ', 'T') + 'Z';
-                        const utcDate = new Date(utcTimestamp);
-                        const time = utcDate.toLocaleString('en-US', { 
-                            timeZone: 'America/New_York',
-                            month: 'short',
-                            day: 'numeric',
-                            hour: '2-digit',
-                            minute: '2-digit',
-                            second: '2-digit'
-                        });
+                        // Add 'Z' to mark as UTC, then convert to local time
+                        let time = trade.timestamp || 'N/A';
+                        try {
+                            if (trade.timestamp) {
+                                const utcTimestamp = trade.timestamp.replace(' ', 'T') + 'Z';
+                                const utcDate = new Date(utcTimestamp);
+                                if (!isNaN(utcDate.getTime())) {
+                                    time = utcDate.toLocaleString('en-US', {
+                                        timeZone: 'America/New_York',
+                                        month: 'short',
+                                        day: 'numeric',
+                                        hour: '2-digit',
+                                        minute: '2-digit',
+                                        second: '2-digit'
+                                    });
+                                }
+                            }
+                        } catch (e) {
+                            console.debug('Date parse error for trade:', trade.id, e);
+                        }
                         const sideColor = trade.side === 'BUY' ? '#4ade80' : '#f87171';
                         return `
                             <tr>
@@ -2985,11 +2994,24 @@ def get_trades():
 
         db = SyncDatabaseReader()
 
-        # Get trades with optional filtering
-        days = request.args.get("days", 30, type=int)
+        # Get trades with optional filtering with input validation
+        try:
+            days = request.args.get("days", 30, type=int)
+            # Validate days parameter
+            if days is not None and days < 0:
+                days = 30  # Default to 30 days for invalid input
+            elif days is not None and days > 365:
+                days = 365  # Cap at 1 year to prevent excessive data
+        except (ValueError, TypeError):
+            days = 30  # Default to 30 days on parse error
+
         symbol = request.args.get("symbol", None)
 
-        trades = db.get_recent_trades(limit=1000, symbol=symbol, days=days)
+        # Make trade limit configurable via environment variable
+        trade_limit = int(os.getenv("DASHBOARD_TRADE_LIMIT", "1000"))
+        trade_limit = min(max(trade_limit, 10), 5000)  # Clamp between 10 and 5000
+
+        trades = db.get_recent_trades(limit=trade_limit, symbol=symbol, days=days)
 
         if trades:
             # Convert to expected format
