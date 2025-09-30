@@ -79,7 +79,10 @@ class ConnectionManager:
         # Load from environment if not provided
         self.host: str = host or os.getenv("IBKR_HOST", "127.0.0.1")
         self.port: int = int(port or os.getenv("IBKR_PORT", "7497"))
-        self.base_client_id: int = int(client_id or self._generate_client_id())
+        # Use client_id if explicitly provided (even if 0), otherwise generate one
+        self.base_client_id: int = (
+            int(client_id) if client_id is not None else self._generate_client_id()
+        )
 
         self.ib: Optional[IB] = None
         self._connected: bool = False
@@ -115,6 +118,12 @@ class ConnectionManager:
 
     def _get_next_client_id(self) -> int:
         """Get next available client ID, avoiding those that recently failed."""
+        # For explicitly configured client IDs (like 0), use it directly without incrementing
+        # This is important for TWS configured with Master API client ID = 0
+        if self.base_client_id == 0 and self._connection_count == 0:
+            self._connection_count += 1
+            return 0
+
         while True:
             self._connection_count += 1
             client_id = self.base_client_id + self._connection_count
@@ -283,19 +292,23 @@ class ConnectionManager:
             self._connecting = False
 
     async def _verify_connection(self) -> None:
-        """Verify that the connection is actually functional by querying accounts."""
+        """Verify that the connection is actually functional."""
         if not self.ib:
             raise ConnectionError("IB client not initialized")
 
+        # Just check that we're connected
+        if not self.ib.isConnected():
+            raise ConnectionError("IB client not connected")
+
+        # Give TWS a moment to send account data
+        await asyncio.sleep(0.5)
+
         accounts = self.ib.managedAccounts()
-        if not accounts:
-            await asyncio.sleep(1)
-            accounts = self.ib.managedAccounts()
-
-        if not accounts:
-            raise ConnectionError("No managed accounts - connection invalid")
-
-        logger.debug(f"Connection verified - accounts: {accounts}")
+        if accounts:
+            logger.debug(f"Connection verified - accounts: {accounts}")
+        else:
+            # Accounts not ready yet, but connection is established - this is OK
+            logger.debug("Connection established, accounts not yet cached")
 
     async def disconnect(self) -> None:
         """Gracefully disconnect from IB."""

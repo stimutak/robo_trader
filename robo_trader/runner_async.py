@@ -19,10 +19,10 @@ from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
+from ib_async import Stock
 
 from .analysis.correlation_integration import AsyncCorrelationManager, CorrelationBasedPositionSizer
 from .config import load_config
-from .connection_manager import ConnectionManager
 from .correlation import CorrelationTracker
 from .database_async import AsyncTradingDatabase
 from .execution import Order, PaperExecutor
@@ -30,6 +30,7 @@ from .logger import get_logger
 from .market_hours import get_market_session, is_market_open, seconds_until_market_open
 from .monitoring.performance import PerformanceMonitor, Timer
 from .monitoring.production_monitor import ProductionMonitor
+from .utils.robust_connection import CircuitBreakerConfig, connect_ibkr_robust
 
 # Import WebSocket client for real-time updates
 try:
@@ -131,7 +132,6 @@ class AsyncRunner:
 
         # Will be initialized in setup
         self.cfg = None
-        self.conn_mgr = None
         self.ib = None
         self.db = None
         self.risk = None
@@ -488,24 +488,31 @@ class AsyncRunner:
 
         logger.info(f"✓ Port {port} is open - proceeding to IBKR connect")
 
-        # Initialize robust connection manager (uses env-configured client ID with rotation on conflict)
-        self.conn_mgr = ConnectionManager(host=host, port=port, client_id=self.cfg.ibkr.client_id)
-
         # Log connection details with secure masking
         client_id_masked = SecureConfig.mask_value(self.cfg.ibkr.client_id)
-        logger.info(f"Initializing connection to {host}:{port} with client_id: {client_id_masked}")
+        logger.info(
+            f"Initializing robust connection to {host}:{port} with client_id: {client_id_masked}"
+        )
 
-        # Try to connect with timeout and verify
+        # Try to connect using robust connection with circuit breaker
         try:
-            self.ib = await asyncio.wait_for(self.conn_mgr.connect(), timeout=30)
-            logger.info("✓ IBKR connection established successfully")
+            # Configure circuit breaker from env
+            circuit_config = CircuitBreakerConfig(
+                failure_threshold=int(os.getenv("CIRCUIT_BREAKER_THRESHOLD", "5")),
+                recovery_timeout=float(os.getenv("CIRCUIT_BREAKER_TIMEOUT", "300")),
+                success_threshold=2,
+            )
+
+            self.ib = await connect_ibkr_robust(
+                host=host,
+                port=port,
+                client_id=self.cfg.ibkr.client_id,
+                max_retries=5,
+                circuit_breaker_config=circuit_config,
+            )
+            logger.info("✓ IBKR connection established successfully with robust connection")
             logger.info("=" * 60)
-        except asyncio.TimeoutError:
-            logger.error("❌ IBKR CONNECTION TIMEOUT")
-            logger.error("Failed to connect to IBKR after 30 seconds")
-            logger.error("Check TWS API configuration and try again")
-            sys.exit(1)
-        except Exception as e:
+        except ConnectionError as e:
             logger.error(f"❌ IBKR CONNECTION FAILED: {e}")
             logger.error("Cannot proceed without IBKR connection")
             sys.exit(1)
@@ -817,6 +824,54 @@ class AsyncRunner:
             logger.error(f"Failed to load existing positions from database: {e}")
             logger.warning("Starting with empty positions - may result in duplicate trades!")
 
+    async def _fetch_historical_bars(
+        self,
+        symbol: str,
+        duration: str = "2 D",
+        bar_size: str = "5 mins",
+        what_to_show: str = "TRADES",
+        use_rth: bool = True,
+    ) -> pd.DataFrame:
+        """Fetch historical bars from IBKR and return normalized DataFrame.
+
+        Args:
+            symbol: Ticker symbol
+            duration: IB duration string
+            bar_size: IB bar size
+            what_to_show: Data type to request
+            use_rth: Restrict to regular trading hours
+
+        Returns:
+            DataFrame with OHLCV columns
+        """
+        if not self.ib or not self.ib.isConnected():
+            raise ConnectionError("Not connected to IBKR")
+
+        contract = Stock(symbol, "SMART", "USD")
+        qualified = self.ib.qualifyContracts(contract)
+        if not qualified:
+            return pd.DataFrame()
+
+        bars = self.ib.reqHistoricalData(
+            qualified[0],
+            endDateTime="",
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow=what_to_show,
+            useRTH=use_rth,
+            formatDate=1,
+        )
+
+        if not bars:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(bars)
+        if not df.empty:
+            df.columns = [col.lower() for col in df.columns]
+            df = df.sort_values("date")
+
+        return df
+
     async def teardown(self):
         """Clean up resources."""
         if self.production_monitor:
@@ -839,8 +894,8 @@ class AsyncRunner:
         try:
             start_time = asyncio.get_event_loop().time()
             with Timer("data_fetch", self.monitor):
-                # Use ConnectionManager to fetch historical bars
-                df = await self.conn_mgr.fetch_historical_bars(
+                # Fetch historical bars using IB connection directly
+                df = await self._fetch_historical_bars(
                     symbol=symbol, duration=self.duration, bar_size=self.bar_size
                 )
 
@@ -2002,14 +2057,9 @@ class AsyncRunner:
                 self.advanced_risk.save_state(state_file)
                 logger.info("Advanced risk manager state saved")
 
-            # Disconnect via ConnectionManager if exists
-            if hasattr(self, "conn_mgr") and self.conn_mgr:
-                logger.info("Disconnecting from IBKR...")
-                await self.conn_mgr.disconnect()
-
-            # Legacy IB Gateway disconnect (for backward compatibility)
+            # Disconnect from IBKR
             if hasattr(self, "ib") and self.ib and self.ib.isConnected():
-                logger.info("Disconnecting from IB Gateway...")
+                logger.info("Disconnecting from IBKR...")
                 self.ib.disconnect()
 
             # Close database connections
