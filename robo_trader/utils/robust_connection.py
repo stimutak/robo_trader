@@ -391,21 +391,30 @@ async def connect_ibkr_robust(
     async def _connect():
         """Internal connection function."""
         ib = IB()
-        await ib.connectAsync(
-            host=host, port=port, clientId=client_id, timeout=10.0, readonly=False
-        )
+        try:
+            await ib.connectAsync(
+                host=host, port=port, clientId=client_id, timeout=10.0, readonly=False
+            )
 
-        # Verify connection
-        accounts = ib.managedAccounts()
-        if not accounts:
-            await asyncio.sleep(1)
+            # Verify connection
             accounts = ib.managedAccounts()
+            if not accounts:
+                await asyncio.sleep(1)
+                accounts = ib.managedAccounts()
 
-        if not accounts:
-            raise ConnectionError("No managed accounts - connection invalid")
+            if not accounts:
+                raise ConnectionError("No managed accounts - connection invalid")
 
-        logger.info(f"Connected to IBKR at {host}:{port} with client_id={client_id}")
-        return ib
+            logger.info(f"Connected to IBKR at {host}:{port} with client_id={client_id}")
+            return ib
+        except Exception as e:
+            # CRITICAL: Clean up failed connection to prevent zombie sockets
+            try:
+                if ib.isConnected():
+                    ib.disconnect()
+            except Exception as cleanup_err:
+                logger.warning(f"Error disconnecting failed IB connection: {cleanup_err}")
+            raise
 
     # Create robust connection manager
     manager = RobustConnectionManager(
