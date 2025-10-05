@@ -633,6 +633,14 @@ HTML_TEMPLATE = """
                     <div class="card-value" id="win-rate">0.0%</div>
                     <div class="card-change" id="trade-count">0 trades today</div>
                 </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">🔌 TWS Connection</span>
+                    </div>
+                    <div class="card-value" id="tws-status">Checking...</div>
+                    <div class="card-change" id="tws-detail">Port 7497</div>
+                </div>
             </div>
             
             <div class="metric-grid">
@@ -1934,10 +1942,37 @@ HTML_TEMPLATE = """
 
             if (isRunning) {
                 dot.classList.add('active');
-                text.textContent = 'Trading Active';
             } else {
                 dot.classList.remove('active');
+            }
+
+            // Use the message from the API if available, otherwise use default
+            if (typeof status === 'object' && status.message) {
+                text.textContent = status.message;
+                // Add detail as subtitle if available
+                if (status.detail) {
+                    text.title = status.detail; // Show detail as tooltip
+                }
+            } else if (isRunning) {
+                text.textContent = 'Trading Active';
+            } else {
                 text.textContent = 'Trading Stopped';
+            }
+
+            // Update TWS connection status
+            if (typeof status === 'object' && status.tws_health) {
+                const twsStatusEl = document.getElementById('tws-status');
+                const twsDetailEl = document.getElementById('tws-detail');
+
+                if (status.tws_health.includes('listening')) {
+                    twsStatusEl.textContent = '✅ Connected';
+                    twsStatusEl.className = 'card-value positive';
+                    twsDetailEl.textContent = status.tws_health;
+                } else {
+                    twsStatusEl.textContent = '❌ Disconnected';
+                    twsStatusEl.className = 'card-value negative';
+                    twsDetailEl.textContent = status.tws_health || 'Unknown';
+                }
             }
 
             // Also update market status
@@ -1977,18 +2012,31 @@ HTML_TEMPLATE = """
         
         function updatePnL(pnl) {
             console.log('updatePnL called with:', pnl);
-            
+
+            // If market is closed (all null), force immediate reset to $0.00
+            if (pnl && pnl.daily === null && pnl.total === null && pnl.unrealized === null) {
+                console.log('Market closed - forcing P&L reset to $0.00');
+                document.getElementById('total-pnl').textContent = '$0.00';
+                document.getElementById('daily-pnl').textContent = '$0.00';
+                document.getElementById('portfolio-value').textContent = '$100,000.00';
+                document.getElementById('today-pnl-large').textContent = '$0.00';
+                document.getElementById('portfolio-change').textContent = '+$0.00 (0.00%)';
+                document.getElementById('today-change-pct').textContent = '+0.00%';
+                lastPnLUpdate = { total: 0, daily: 0 };
+                return;
+            }
+
             // Debounce P&L updates to prevent flashing
             if (pnlUpdateTimeout) {
                 clearTimeout(pnlUpdateTimeout);
             }
-            
-            // Only update if values have actually changed
+
+            // Handle null values (market closed) - force update to $0.00
             const newTotal = (pnl.unrealized || 0) + (pnl.realized || 0);
             const newDaily = pnl.daily || 0;
-            
-            if (lastPnLUpdate && 
-                Math.abs(lastPnLUpdate.total - newTotal) < 0.01 && 
+
+            if (lastPnLUpdate &&
+                Math.abs(lastPnLUpdate.total - newTotal) < 0.01 &&
                 Math.abs(lastPnLUpdate.daily - newDaily) < 0.01) {
                 return; // Skip update if values haven't meaningfully changed
             }
@@ -2805,28 +2853,34 @@ def market_status():
 
 
 def check_ibkr_connection():
-    """Check if IBKR is actually connected."""
+    """
+    Check TWS connection using simple TCP socket check (no zombies).
+
+    Uses basic socket connection to port 7497 to verify TWS is listening.
+    No IB API handshake = no zombie connections.
+    """
+    import socket
+
+    tws_healthy = False
+    status_msg = "Unknown"
+
     try:
-        from ib_async import IB
+        # Simple TCP socket check - connect and immediately close
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)  # 1 second timeout
+        result = sock.connect_ex(("127.0.0.1", 7497))
+        sock.close()
 
-        ib = IB()
+        if result == 0:
+            tws_healthy = True
+            status_msg = "TWS port 7497 listening"
+        else:
+            status_msg = "TWS not responding on port 7497"
+    except Exception as e:
+        status_msg = f"TWS check error: {str(e)[:30]}"
+        logger.debug(f"TWS health check error: {e}")
 
-        # Try to connect to TWS/Gateway
-        # TWS uses port 7497 for paper, 7496 for live
-        # Gateway uses port 4002 for paper, 4001 for live
-        for port in [7497, 4002, 7496, 4001]:
-            try:
-                ib.connect("127.0.0.1", port, clientId=999, readonly=True)
-                if ib.isConnected():
-                    ib.disconnect()
-                    return True
-            except Exception:
-                continue
-        return False
-    except ImportError:
-        return False
-    except Exception:
-        return False
+    return {"connected": tws_healthy, "status": status_msg}
 
 
 @app.route("/api/status")
@@ -2845,33 +2899,76 @@ def status():
     if trading_process is None and trading_status == "running":
         trading_status = "stopped"
 
-    # Check real IBKR connection
-    is_connected = check_ibkr_connection()
+    # Check if runner is actually running system-wide (not just dashboard-started)
+    import subprocess
 
-    # Return status with sample data for display
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "runner_async"], capture_output=True, text=True, timeout=1
+        )
+        runner_actually_running = result.returncode == 0 and len(result.stdout.strip()) > 0
+    except Exception:
+        runner_actually_running = False
+
+    # Check real IBKR connection (simple check - no zombies)
+    # DISABLED: Health check creates zombie connections
+    # Use simple status based on runner state instead
+    from datetime import time as dt_time
+    from datetime import timedelta
+
+    now = datetime.now()
+    market_start = dt_time(9, 30)
+    market_end = dt_time(16, 0)
+    is_weekday = now.weekday() < 5
+    in_hours = market_start <= now.time() <= market_end
+    market_open = is_weekday and in_hours
+
+    # Build clear status message
+    runner_running = runner_actually_running
+
+    if not runner_running:
+        status_message = "⚠️ Runner not started - No trading activity"
+        status_detail = "Start the runner with: python3 -m robo_trader.runner_async"
+    elif not market_open:
+        status_message = "💤 Market Closed - Runner sleeping"
+        # Calculate time until market open
+        next_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        if now.time() >= market_end or not is_weekday:
+            # Move to next weekday
+            days_ahead = 1 if is_weekday else (7 - now.weekday())
+            next_open = next_open + timedelta(days=days_ahead)
+        hours_until = (next_open - now).total_seconds() / 3600
+        status_detail = f"Next market open: {next_open.strftime('%a %I:%M %p')} (in {hours_until:.1f} hours). Runner checks every 30 minutes."
+    else:
+        status_message = "✅ Market Open - Active Trading"
+        status_detail = "Runner connected and processing market data"
+
+    # Check TWS health with sync approach (no zombies)
+    tws_check = check_ibkr_connection()
+    tws_connected = tws_check.get("connected", False)
+    tws_status_msg = tws_check.get("status", "Unknown")
+
+    # Return status with NO FAKE DATA
+    # is_trading = True ONLY when runner is running AND market is open
+    is_actually_trading = runner_running and market_open
+
     return jsonify(
         {
             "trading_status": {
-                "is_trading": trading_status == "running",
-                "connected": is_connected,
+                "is_trading": is_actually_trading,
+                "connected": tws_connected,  # Real TWS connection status
+                "market_open": market_open,
                 "mode": "paper",
                 "session_start": datetime.now().isoformat(),
-                "positions_count": 5,
+                "message": status_message,
+                "detail": status_detail,
+                "runner_state": "running" if runner_running else "stopped",
+                "tws_health": tws_status_msg,
             },
-            "pnl": {"daily": 523.45, "total": 2847.30, "unrealized": 1612.30},
-            "metrics": {
-                "sharpe_ratio": 1.42,
-                "win_rate": 0.625,
-                "profit_factor": 1.85,
-                "max_drawdown": -0.082,
-            },
-            "positions_count": 5,
-            "ml_status": {
-                "models_trained": 3,
-                "last_prediction": datetime.now().isoformat(),
-                "feature_count": 24,
-                "model_performance": {"accuracy": 0.72},
-            },
+            "pnl": None,  # No fake data - will be populated when runner connects
+            "metrics": None,  # No fake data - will be populated when runner connects
+            "positions_count": 0,  # No fake data - will be populated when runner connects
+            "ml_status": None,  # No fake data - will be populated when runner connects
         }
     )
 
@@ -3009,6 +3106,20 @@ def status():
 @requires_auth
 def get_pnl():
     """Get P&L data from actual positions"""
+    # Check if market is open - don't show stale data when closed
+    from datetime import time as dt_time
+
+    now = datetime.now()
+    market_start = dt_time(9, 30)
+    market_end = dt_time(16, 0)
+    is_weekday = now.weekday() < 5
+    in_hours = market_start <= now.time() <= market_end
+    market_open = is_weekday and in_hours
+
+    # When market is closed, return None instead of stale data
+    if not market_open:
+        return jsonify({"total": None, "unrealized": None, "realized": None, "daily": None})
+
     try:
         from sync_db_reader import SyncDatabaseReader
 
