@@ -507,7 +507,7 @@ class AsyncRunner:
                 host=host,
                 port=port,
                 client_id=self.cfg.ibkr.client_id,
-                max_retries=5,
+                max_retries=2,  # Reduced from 5 to prevent zombie connection accumulation
                 circuit_breaker_config=circuit_config,
             )
             logger.info("✓ IBKR connection established successfully with robust connection")

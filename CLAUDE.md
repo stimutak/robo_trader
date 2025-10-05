@@ -11,6 +11,31 @@
 
 **Note:** The older 9-phase plan in `archived_plans/PROJECT_PLAN_9PHASE.md` is deprecated and should NOT be used. Any references to "Phase 5", "Phase 6" etc. from older commits refer to the old plan and should be ignored.
 
+## ⚠️ CRITICAL: TWS/IBKR Gateway Management
+
+**NEVER KILL TWS OR IBKR GATEWAY PROCESSES**
+
+TWS (Trader Workstation) and IBKR Gateway require manual login with credentials and 2FA. They CANNOT be automatically restarted.
+
+**Allowed:**
+- ✅ Kill Python processes: `runner_async`, `app.py`, `websocket_server`
+- ✅ Restart our application services
+- ✅ Check TWS connection status
+- ✅ Diagnose TWS health
+
+**FORBIDDEN:**
+- ❌ `pkill -f "tws"` or any TWS process killing
+- ❌ `pkill -f "ibgateway"` or Gateway process killing
+- ❌ Killing any Java processes related to IBKR
+- ❌ Automatic TWS restart attempts
+
+**If TWS needs restart:** User must do it manually with login credentials.
+
+**Safe Process Kill Command (Python only):**
+```bash
+pkill -9 -f "runner_async" && pkill -9 -f "app.py" && pkill -9 -f "websocket_server"
+```
+
 ## Key Project Files
 - `IMPLEMENTATION_PLAN.md` - The active project roadmap
 - `handoff/LATEST_HANDOFF.md` - Latest session handoff document

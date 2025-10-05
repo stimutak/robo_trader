@@ -9,6 +9,8 @@ This module provides enhanced connection resilience for IBKR connections:
 """
 
 import asyncio
+import os
+import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -18,6 +20,35 @@ from typing import Any, Callable, Optional, TypeVar
 from ..logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def kill_zombie_connections(port: int = 7497) -> None:
+    """Kill zombie CLOSE_WAIT connections on specified port.
+
+    This clears leftover connections from failed TWS API handshake attempts.
+    """
+    try:
+        script_path = os.path.join(os.path.dirname(__file__), "..", "..", "kill_zombies.sh")
+        if os.path.exists(script_path):
+            result = subprocess.run([script_path], capture_output=True, text=True, timeout=5)
+            if result.stdout:
+                for line in result.stdout.strip().split("\n"):
+                    logger.info(f"Zombie killer: {line}")
+        else:
+            # Fallback: Check manually
+            result = subprocess.run(["netstat", "-an"], capture_output=True, text=True, timeout=5)
+            zombie_count = len(
+                [
+                    line
+                    for line in result.stdout.split("\n")
+                    if str(port) in line and "CLOSE_WAIT" in line
+                ]
+            )
+            if zombie_count > 0:
+                logger.warning(f"Found {zombie_count} zombie connections on port {port}")
+    except Exception as e:
+        logger.debug(f"Could not check zombie connections: {e}")
+
 
 T = TypeVar("T")
 
@@ -127,6 +158,113 @@ class CircuitBreaker:
         }
 
 
+def kill_tws_zombie_connections(port: int = 7497) -> tuple[bool, str]:
+    """
+    Detect and kill CLOSE_WAIT zombie connections on TWS port.
+
+    This clears kernel-level TCP state that prevents new connections.
+
+    Returns:
+        tuple: (success, message)
+    """
+    try:
+        # Step 1: Find processes with CLOSE_WAIT connections on this port
+        lsof_result = subprocess.run(
+            ["lsof", "-i", f"tcp:{port}", "-sTCP:CLOSE_WAIT"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        if not lsof_result.stdout:
+            logger.info(f"✅ No CLOSE_WAIT zombies found on port {port}")
+            return True, "No zombies detected"
+
+        # Step 2: Extract PIDs from lsof output
+        pids = set()
+        for line in lsof_result.stdout.splitlines()[1:]:  # Skip header
+            parts = line.split()
+            if len(parts) > 1:
+                try:
+                    pid = int(parts[1])
+                    pids.add(pid)
+                except ValueError:
+                    continue
+
+        if not pids:
+            logger.warning("Found CLOSE_WAIT connections but could not extract PIDs")
+            return False, "Could not identify zombie processes"
+
+        # Step 3: Kill the zombie processes
+        killed_count = 0
+        for pid in pids:
+            try:
+                subprocess.run(["kill", "-9", str(pid)], timeout=2)
+                killed_count += 1
+                logger.info(f"Killed zombie process {pid}")
+            except Exception as e:
+                logger.warning(f"Could not kill process {pid}: {e}")
+
+        # Step 4: Verify cleanup
+        time.sleep(0.5)  # Give kernel time to clean up
+        verify_result = subprocess.run(
+            ["netstat", "-an"], capture_output=True, text=True, timeout=5
+        )
+
+        remaining_zombies = 0
+        for line in verify_result.stdout.splitlines():
+            if str(port) in line and "CLOSE_WAIT" in line:
+                remaining_zombies += 1
+
+        if remaining_zombies == 0:
+            msg = f"✅ Successfully killed {killed_count} zombie process(es). Port {port} is clean."
+            logger.info(msg)
+            return True, msg
+        else:
+            msg = f"⚠️ Killed {killed_count} processes but {remaining_zombies} zombies remain"
+            logger.warning(msg)
+            return False, msg
+
+    except FileNotFoundError:
+        logger.warning("lsof command not found - cannot kill zombies automatically")
+        return False, "lsof not available"
+    except Exception as e:
+        logger.error(f"Error killing zombie connections: {e}")
+        return False, f"Error: {e}"
+
+
+def check_tws_zombie_connections(port: int = 7497) -> tuple[int, str]:
+    """
+    Check for CLOSE_WAIT zombie connections on TWS port.
+
+    Returns:
+        tuple: (zombie_count, error_message)
+               zombie_count = 0 means clean state
+               zombie_count > 0 means zombies detected, error_message explains
+    """
+    try:
+        result = subprocess.run(["netstat", "-an"], capture_output=True, text=True, timeout=5)
+
+        # Count CLOSE_WAIT connections on TWS port
+        zombie_count = 0
+        for line in result.stdout.splitlines():
+            if str(port) in line and "CLOSE_WAIT" in line:
+                zombie_count += 1
+
+        if zombie_count > 0:
+            error_msg = (
+                f"❌ DETECTED {zombie_count} CLOSE_WAIT zombie connection(s) on port {port}.\n"
+                f"Attempting automatic cleanup..."
+            )
+            return zombie_count, error_msg
+
+        return 0, ""
+
+    except Exception as e:
+        logger.warning(f"Could not check for zombie connections: {e}")
+        return 0, ""  # Fail open - allow connection attempt
+
+
 class RobustConnectionManager:
     """
     Enhanced connection manager with exponential backoff and circuit breaker.
@@ -225,6 +363,10 @@ class RobustConnectionManager:
 
             for attempt in range(self.max_retries):
                 try:
+                    # Kill zombie connections before each attempt
+                    if attempt > 0:  # Skip first attempt, kill before retries
+                        await asyncio.to_thread(kill_zombie_connections)
+
                     logger.info(
                         f"Connection attempt {attempt + 1}/{self.max_retries} "
                         f"(circuit: {self.circuit_breaker.state.value})"
@@ -356,7 +498,7 @@ async def connect_ibkr_robust(
     host: str = "127.0.0.1",
     port: int = 7497,
     client_id: int = 1,
-    max_retries: int = 5,
+    max_retries: int = 2,  # Reduced from 5 to prevent zombie accumulation
     circuit_breaker_config: Optional[CircuitBreakerConfig] = None,
 ) -> Any:
     """
@@ -390,10 +532,16 @@ async def connect_ibkr_robust(
 
     async def _connect():
         """Internal connection function."""
+        import random
+
+        # Use unique client ID for each attempt to prevent TWS from getting confused
+        # Add small random offset to base client_id (0-99 range)
+        unique_client_id = client_id + random.randint(0, 99)
+
         ib = IB()
         try:
             await ib.connectAsync(
-                host=host, port=port, clientId=client_id, timeout=10.0, readonly=False
+                host=host, port=port, clientId=unique_client_id, timeout=10.0, readonly=False
             )
 
             # Verify connection
@@ -405,15 +553,18 @@ async def connect_ibkr_robust(
             if not accounts:
                 raise ConnectionError("No managed accounts - connection invalid")
 
-            logger.info(f"Connected to IBKR at {host}:{port} with client_id={client_id}")
+            logger.info(f"Connected to IBKR at {host}:{port} with client_id={unique_client_id}")
             return ib
         except Exception as e:
-            # CRITICAL: Clean up failed connection to prevent zombie sockets
+            # CRITICAL: ALWAYS disconnect, even if isConnected() returns False
+            # When handshake times out, isConnected() is False but socket is still open on TWS side
+            # This is THE fix for zombie connection accumulation
             try:
-                if ib.isConnected():
-                    ib.disconnect()
+                ib.disconnect()  # Always call, regardless of connection state
+                await asyncio.sleep(0.5)  # Give TWS time to process disconnect
+                logger.debug(f"Disconnected failed IB connection after error: {e}")
             except Exception as cleanup_err:
-                logger.warning(f"Error disconnecting failed IB connection: {cleanup_err}")
+                logger.debug(f"Error during disconnect (non-critical): {cleanup_err}")
             raise
 
     # Create robust connection manager

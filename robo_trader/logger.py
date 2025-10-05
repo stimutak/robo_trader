@@ -152,7 +152,7 @@ def configure_stdlib_logging():
         class JsonFormatter(logging.Formatter):
             def format(self, record):
                 log_obj = {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now().isoformat(),  # Use local time, not UTC
                     "level": record.levelname,
                     "logger": record.name,
                     "message": record.getMessage(),
