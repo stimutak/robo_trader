@@ -174,6 +174,16 @@ python3 test_safety_features.py
 - Monitor for CLOSE_WAIT connections: `netstat -an | grep 7497`
 - Restart TWS if stuck connections accumulate
 
+### TWS Readonly Connection (2025-10-05) ✅
+**Important: System uses READONLY mode for TWS connections**
+- `readonly=True` in all IBKR connections
+- No order placement through TWS API (PaperExecutor handles orders)
+- Only data access: historical bars, positions, account info
+- **Benefit**: No TWS security dialog popups (read-only doesn't require approval)
+- **Client ID Strategy**:
+  - First attempt: Fixed client_id (TWS remembers, no dialog)
+  - Retry attempts: Random client_id (zombie fix, prevent confusion)
+
 ## WebSocket Fix Notes (2025-08-28)
 - Fixed handler signature by adding `path` parameter
 - Fixed JSON serialization by using structlog properly

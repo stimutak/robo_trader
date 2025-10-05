@@ -530,18 +530,27 @@ async def connect_ibkr_robust(
     """
     from ib_async import IB
 
+    attempt_count = 0
+
     async def _connect():
         """Internal connection function."""
-        import random
+        nonlocal attempt_count
 
-        # Use unique client ID for each attempt to prevent TWS from getting confused
-        # Add small random offset to base client_id (0-99 range)
-        unique_client_id = client_id + random.randint(0, 99)
+        # Use fixed client_id on first attempt (TWS remembers, no dialog)
+        # Use unique client_id on retries (prevent TWS confusion from quick reconnects)
+        if attempt_count == 0:
+            use_client_id = client_id
+        else:
+            import random
+
+            use_client_id = client_id + random.randint(1, 99)
+
+        attempt_count += 1
 
         ib = IB()
         try:
             await ib.connectAsync(
-                host=host, port=port, clientId=unique_client_id, timeout=10.0, readonly=False
+                host=host, port=port, clientId=use_client_id, timeout=10.0, readonly=True
             )
 
             # Verify connection
@@ -553,7 +562,10 @@ async def connect_ibkr_robust(
             if not accounts:
                 raise ConnectionError("No managed accounts - connection invalid")
 
-            logger.info(f"Connected to IBKR at {host}:{port} with client_id={unique_client_id}")
+            logger.info(
+                f"Connected to IBKR at {host}:{port} with client_id={use_client_id}"
+                + (f" (base={client_id}, retry)" if use_client_id != client_id else "")
+            )
             return ib
         except Exception as e:
             # CRITICAL: ALWAYS disconnect, even if isConnected() returns False
