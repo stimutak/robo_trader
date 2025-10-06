@@ -44,12 +44,12 @@ async def simulate_trading_activity():
                 await asyncio.sleep(random.uniform(0.02, 0.1))
                 latency = monitor.end_timer("order_exec")
                 monitor.order_exec_samples.append(latency)
-                await monitor.record_order_placed(symbol, 100)
+                monitor.record_order_placed(symbol, 100)
                 monitor.order_timestamps.append(datetime.now())
 
                 # 80% of orders execute successfully
                 if random.random() < 0.8:
-                    await monitor.record_trade_executed(symbol, "BUY", 100)
+                    monitor.record_trade_executed(symbol, "BUY", 100)
 
             # Record database write latency (5-15ms)
             monitor.start_timer("db_write")
@@ -58,13 +58,13 @@ async def simulate_trading_activity():
             monitor.db_write_samples.append(latency)
 
             # Record symbol processed
-            await monitor.record_symbol_processed(symbol, success=random.random() < 0.95)
+            monitor.record_symbol_processed(symbol, success=random.random() < 0.95)
 
             # Record data points (simulate 10-50 data points per symbol)
-            await monitor.record_data_points(random.randint(10, 50))
+            monitor.record_data_points(random.randint(10, 50))
 
         # Get current metrics
-        metrics = await monitor.get_current_metrics()
+        metrics = monitor.get_current_metrics()
 
         # Export to file for dashboard
         metrics_file = Path("/tmp/robo_trader_metrics.pkl")
@@ -94,12 +94,12 @@ async def simulate_trading_activity():
     # Keep updating metrics for another minute
     for _ in range(30):
         # Add some variation to make it look live
-        await monitor.record_data_points(random.randint(5, 20))
+        monitor.record_data_points(random.randint(5, 20))
         if random.random() < 0.1:
-            await monitor.record_order_placed("TEST", 100)
+            monitor.record_order_placed("TEST", 100)
             monitor.order_timestamps.append(datetime.now())
 
-        metrics = await monitor.get_current_metrics()
+        metrics = monitor.get_current_metrics()
         with open(metrics_file, "wb") as f:
             pickle.dump(metrics, f)
 

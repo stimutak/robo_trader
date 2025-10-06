@@ -210,7 +210,8 @@ def test_structured_logging():
         # Test sensitive data censoring
         import os
 
-        test_api_key = os.getenv("TEST_API_KEY", f"test_key_{os.getpid()}")
+        # Security: Use environment variable or test placeholder (never a real key)
+        test_api_key = os.getenv("TEST_API_KEY", "TEST_PLACEHOLDER_NOT_A_REAL_KEY")
         logger.info("Test", api_key=test_api_key, safe_field="visible")
         print("✓ Sensitive data censoring working")
 

@@ -48,6 +48,8 @@ class BugDetectionSettings:
             "**/logs/**",
             "**/*.pyc",
             "**/*.pyo",
+            "**/archived/**",  # Exclude archived code
+            "**/bug_detection/**",  # Exclude bug detection tools themselves
         ]
     )
 

@@ -122,7 +122,7 @@ class PerformanceMonitor:
 
         return duration_ms
 
-    async def record_symbol_processed(self, symbol: str, success: bool = True) -> None:
+    def record_symbol_processed(self, symbol: str, success: bool = True) -> None:
         """Record that a symbol was processed."""
         self.total_symbols_processed += 1
         self.symbol_timestamps.append(datetime.now())
@@ -134,18 +134,18 @@ class PerformanceMonitor:
 
         logger.debug(f"Processed {symbol} - Total: {self.total_symbols_processed}")
 
-    async def record_order_placed(self, symbol: str, quantity: int) -> None:
+    def record_order_placed(self, symbol: str, quantity: int) -> None:
         """Record that an order was placed."""
         self.total_orders_placed += 1
         self.order_timestamps.append(datetime.now())
         logger.debug(f"Order placed for {symbol} qty={quantity}")
 
-    async def record_trade_executed(self, symbol: str, side: str, quantity: int) -> None:
+    def record_trade_executed(self, symbol: str, side: str, quantity: int) -> None:
         """Record that a trade was executed."""
         self.total_trades_executed += 1
         logger.debug(f"Trade executed: {side} {quantity} {symbol}")
 
-    async def record_data_points(self, count: int) -> None:
+    def record_data_points(self, count: int) -> None:
         """Record that data points were processed."""
         for _ in range(count):
             self.data_point_timestamps.append(datetime.now())
@@ -214,7 +214,7 @@ class PerformanceMonitor:
             logger.debug("psutil not installed, system metrics unavailable")
             return {"memory_usage_mb": 0.0, "cpu_usage_percent": 0.0, "num_threads": 0}
 
-    async def get_current_metrics(self) -> PerformanceMetrics:
+    def get_current_metrics(self) -> PerformanceMetrics:
         """Get current performance metrics snapshot."""
         latencies = self.get_average_latencies()
         throughput = self.calculate_throughput()
@@ -256,7 +256,7 @@ class PerformanceMonitor:
 
     async def log_performance_summary(self) -> None:
         """Log a performance summary."""
-        metrics = await self.get_current_metrics()
+        metrics = self.get_current_metrics()
 
         logger.info(
             f"Performance Summary: "
