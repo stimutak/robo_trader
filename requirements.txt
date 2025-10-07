@@ -1,4 +1,4 @@
- ib-insync>=0.9.86
+ib-async>=2.0.1
  pandas>=2.0.0
  numpy>=1.24.0
  scipy>=1.10.0

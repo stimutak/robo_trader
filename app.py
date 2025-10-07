@@ -2816,6 +2816,107 @@ def database_health():
         )
 
 
+@app.route("/health/live")
+def health_liveness():
+    """
+    Kubernetes liveness probe - checks if the application is running
+    Returns 200 if the application can serve traffic
+    """
+    try:
+        # Basic check - can we respond?
+        return (
+            jsonify(
+                {"status": "alive", "timestamp": datetime.now().isoformat(), "service": "dashboard"}
+            ),
+            200,
+        )
+    except Exception as e:
+        logger.error(f"Liveness check failed: {e}")
+        return (
+            jsonify({"status": "dead", "error": str(e), "timestamp": datetime.now().isoformat()}),
+            500,
+        )
+
+
+@app.route("/health/ready")
+def health_readiness():
+    """
+    Kubernetes readiness probe - checks if the application is ready to serve traffic
+    Returns 200 if all dependencies are available and healthy
+    """
+    checks = {
+        "timestamp": datetime.now().isoformat(),
+        "service": "dashboard",
+        "ready": True,
+        "checks": {},
+    }
+
+    # Check database connectivity
+    try:
+        from sync_db_reader import SyncDatabaseReader
+
+        db_reader = SyncDatabaseReader()
+        result = db_reader._fetch_one("SELECT 1")
+        checks["checks"]["database"] = "ready" if result else "not_ready"
+    except Exception as e:
+        logger.warning(f"Database readiness check failed: {e}")
+        checks["checks"]["database"] = "not_ready"
+        checks["ready"] = False
+
+    # Check if we can access config
+    try:
+        from robo_trader.config import load_config
+
+        cfg = load_config()
+        checks["checks"]["config"] = "ready" if cfg else "not_ready"
+    except Exception as e:
+        logger.warning(f"Config readiness check failed: {e}")
+        checks["checks"]["config"] = "not_ready"
+        checks["ready"] = False
+
+    # Check filesystem access
+    try:
+        data_path = Path("/app/data")
+        logs_path = Path("/app/logs")
+        checks["checks"]["filesystem"] = (
+            "ready" if data_path.exists() and logs_path.exists() else "not_ready"
+        )
+    except Exception as e:
+        logger.warning(f"Filesystem readiness check failed: {e}")
+        checks["checks"]["filesystem"] = "not_ready"
+        checks["ready"] = False
+
+    status_code = 200 if checks["ready"] else 503
+    return jsonify(checks), status_code
+
+
+@app.route("/metrics")
+def metrics():
+    """
+    Prometheus metrics endpoint
+    Exposes application metrics in Prometheus format
+    """
+    try:
+        from robo_trader.monitoring.production_monitor import ProductionMonitor
+
+        # Get metrics from production monitor if available
+        metrics_text = "# RoboTrader Dashboard Metrics\n"
+
+        # Add basic metrics
+        metrics_text += f"# HELP dashboard_up Dashboard service status\n"
+        metrics_text += f"# TYPE dashboard_up gauge\n"
+        metrics_text += f"dashboard_up 1\n"
+
+        metrics_text += f"# HELP dashboard_requests_total Total HTTP requests\n"
+        metrics_text += f"# TYPE dashboard_requests_total counter\n"
+        metrics_text += f"dashboard_requests_total {{}} {0}\n"
+
+        return Response(metrics_text, mimetype="text/plain")
+    except Exception as e:
+        logger.error(f"Metrics endpoint failed: {e}")
+        return Response("# Error generating metrics\n", mimetype="text/plain"), 500
+
+
 @app.route("/api/market/status")
 @requires_auth
 def market_status():

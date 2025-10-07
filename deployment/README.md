@@ -8,13 +8,19 @@ This directory contains deployment configurations and scripts for the RoboTrader
 
 ```
 deployment/
-├── docker/           # Docker configurations
-├── k8s/             # Kubernetes manifests
-│   ├── deployment.yaml
-│   ├── configmap.yaml
-│   └── secrets.yaml.template
-├── prometheus/      # Prometheus monitoring configs
-└── grafana/        # Grafana dashboards
+├── docker-compose.prod.yml    # Production Docker Compose config
+├── nginx.conf                 # Nginx reverse proxy configuration
+├── prometheus.yml             # Prometheus scrape configuration
+├── entrypoint.sh             # Container startup script
+├── k8s/                      # Kubernetes manifests
+│   ├── deployment.yaml       # K8s deployment and service
+│   └── configmap.yaml        # K8s config and monitoring rules
+└── grafana/                  # Grafana provisioning
+    ├── datasources/          # Datasource configurations
+    │   └── prometheus.yml    # Prometheus datasource
+    └── dashboards/           # Dashboard configurations
+        ├── dashboard-config.yml
+        └── trading-overview.json
 ```
 
 ## Deployment Environments
@@ -25,14 +31,41 @@ deployment/
 
 ## Prerequisites
 
-1. **Docker & Docker Compose** (for local deployment)
-2. **Kubernetes cluster** (for staging/production)
-3. **kubectl** configured with cluster access
-4. **GitHub Container Registry** access
+### Local Development
+1. **Docker** (v24.0+)
+2. **Docker Compose** (v2.20+)
+3. **IBKR TWS or Gateway** (running on port 7497/7496)
+4. **.env file** (copy from .env.example)
+
+### Production Deployment
+1. **Docker & Docker Compose** or **Kubernetes cluster**
+2. **kubectl** configured with cluster access (for K8s)
+3. **SSL certificates** (for production Nginx)
+4. **GitHub Container Registry** access (optional, for CI/CD)
+
+### Required Configuration Files
+
+All necessary configuration files are provided:
+- ✅ `Dockerfile` - Multi-stage build with security best practices
+- ✅ `docker-compose.yml` - Local development setup
+- ✅ `deployment/docker-compose.prod.yml` - Production setup
+- ✅ `deployment/nginx.conf` - Reverse proxy with SSL
+- ✅ `deployment/prometheus.yml` - Metrics collection
+- ✅ `deployment/entrypoint.sh` - Startup validation script
+- ✅ `deployment/grafana/` - Dashboard provisioning configs
+- ✅ `.dockerignore` - Build optimization
 
 ## Local Development
 
+### Quick Start
+
 ```bash
+# Copy environment file
+cp .env.example .env
+
+# Edit .env with your settings (IBKR credentials, etc.)
+vim .env
+
 # Build and run with Docker Compose
 docker-compose up -d
 
@@ -41,6 +74,30 @@ docker-compose logs -f trader
 
 # Stop services
 docker-compose down
+```
+
+### Health Checks
+
+The system exposes several health check endpoints:
+
+- `/health` - Basic health check (legacy)
+- `/health/live` - Kubernetes liveness probe
+- `/health/ready` - Kubernetes readiness probe (checks dependencies)
+- `/metrics` - Prometheus metrics endpoint
+
+Test health endpoints:
+```bash
+# Basic health check
+curl http://localhost:5555/health
+
+# Kubernetes-style liveness
+curl http://localhost:5555/health/live
+
+# Kubernetes-style readiness
+curl http://localhost:5555/health/ready
+
+# Prometheus metrics
+curl http://localhost:5555/metrics
 ```
 
 ## Kubernetes Deployment
@@ -149,6 +206,88 @@ graph LR
     L --> M{Healthy?}
     M -->|Yes| N[Complete]
     M -->|No| O[Rollback]
+```
+
+## Production Deployment with Docker Compose
+
+For production deployment using Docker Compose:
+
+```bash
+# Navigate to project root
+cd /path/to/robo_trader-phase4
+
+# Create production environment file
+cp .env.example .env.production
+vim .env.production  # Configure for production
+
+# Create required directories
+sudo mkdir -p /var/robo_trader/{data,logs,redis,prometheus,grafana,ssl,secrets}
+sudo chown -R $USER:$USER /var/robo_trader
+
+# Generate SSL certificates (for production)
+# Option 1: Use Let's Encrypt (recommended)
+sudo certbot certonly --standalone -d your-domain.com
+sudo cp /etc/letsencrypt/live/your-domain.com/fullchain.pem /var/robo_trader/ssl/cert.pem
+sudo cp /etc/letsencrypt/live/your-domain.com/privkey.pem /var/robo_trader/ssl/key.pem
+
+# Option 2: Self-signed certificate (development only)
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /var/robo_trader/ssl/key.pem \
+  -out /var/robo_trader/ssl/cert.pem
+
+# Build production image
+docker build -t robo_trader:latest .
+
+# Start production stack
+docker-compose -f deployment/docker-compose.prod.yml up -d
+
+# View logs
+docker-compose -f deployment/docker-compose.prod.yml logs -f
+
+# Check service status
+docker-compose -f deployment/docker-compose.prod.yml ps
+
+# Access services
+# Dashboard: https://your-domain.com or http://your-domain.com:8080
+# Grafana: http://your-domain.com:3000
+# Prometheus: http://your-domain.com:9090
+```
+
+### Production Stack Components
+
+The production deployment includes:
+
+1. **Trading System** - Main robo_trader application
+2. **Dashboard** - Web UI with Gunicorn (4 workers)
+3. **WebSocket Server** - Real-time updates
+4. **Redis** - Caching and session management
+5. **Nginx** - Reverse proxy with SSL termination
+6. **Prometheus** - Metrics collection and alerting
+7. **Grafana** - Visualization dashboards
+
+### Environment Variables for Production
+
+Key production environment variables (in `.env.production`):
+
+```bash
+# Trading
+TRADING_MODE=live  # IMPORTANT: Set to 'live' for production
+IBKR_PORT=4001     # Live trading port
+ENVIRONMENT=production
+
+# Monitoring
+LOG_LEVEL=WARNING
+MONITORING_LOG_FORMAT=json
+PYTHONOPTIMIZE=2
+
+# Security
+DASH_AUTH_ENABLED=true
+DASH_USER=admin
+DASH_PASS_HASH=<bcrypt-hash>
+
+# Risk Management
+RISK_MAX_DAILY_LOSS=5000
+RISK_MAX_DRAWDOWN=0.10
 ```
 
 ## Monitoring
