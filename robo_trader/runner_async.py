@@ -934,7 +934,7 @@ class AsyncRunner:
             if batch_data:
                 with Timer("database_write", self.monitor):
                     await self.db.batch_store_market_data(batch_data)
-                await self.monitor.record_data_points(len(batch_data))
+                self.monitor.record_data_points(len(batch_data))
 
             return df
 
@@ -1226,10 +1226,8 @@ class AsyncRunner:
                         )
                         await self.db.update_position(symbol, 0, 0, 0)  # Close position
 
-                        await self.monitor.record_order_placed(symbol, qty_to_cover)
-                        await self.monitor.record_trade_executed(
-                            symbol, "BUY_TO_COVER", qty_to_cover
-                        )
+                        self.monitor.record_order_placed(symbol, qty_to_cover)
+                        self.monitor.record_trade_executed(symbol, "BUY_TO_COVER", qty_to_cover)
 
                         if self.production_monitor:
                             latency_ms = 10  # Simulated latency for paper trading
@@ -1360,8 +1358,8 @@ class AsyncRunner:
                             )
                             await self.db.update_position(symbol, qty, fill_price, price)
 
-                            await self.monitor.record_order_placed(symbol, qty)
-                            await self.monitor.record_trade_executed(symbol, "BUY", qty)
+                            self.monitor.record_order_placed(symbol, qty)
+                            self.monitor.record_trade_executed(symbol, "BUY", qty)
 
                             # Record metrics to ProductionMonitor (Phase 4 P2)
                             if self.production_monitor:
@@ -1462,8 +1460,8 @@ class AsyncRunner:
                             )
                             await self.db.update_position(symbol, 0, 0, 0)  # Close position
 
-                            await self.monitor.record_order_placed(symbol, pos.quantity)
-                            await self.monitor.record_trade_executed(symbol, "SELL", pos.quantity)
+                            self.monitor.record_order_placed(symbol, pos.quantity)
+                            self.monitor.record_trade_executed(symbol, "SELL", pos.quantity)
 
                             # Record metrics to ProductionMonitor (Phase 4 P2)
                             if self.production_monitor:
@@ -1583,8 +1581,8 @@ class AsyncRunner:
                             )
                             await self.db.update_position(symbol, -qty, fill_price, price)
 
-                            await self.monitor.record_order_placed(symbol, qty)
-                            await self.monitor.record_trade_executed(symbol, "SELL_SHORT", qty)
+                            self.monitor.record_order_placed(symbol, qty)
+                            self.monitor.record_trade_executed(symbol, "SELL_SHORT", qty)
                             executed = True
                             quantity = qty
                             message = f"Opened short: Sold {qty} shares at ${fill_price:.2f}"
@@ -1615,7 +1613,7 @@ class AsyncRunner:
         async def process_with_semaphore(symbol: str) -> SymbolResult:
             async with semaphore:
                 result = await self.process_symbol(symbol)
-                await self.monitor.record_symbol_processed(
+                self.monitor.record_symbol_processed(
                     symbol, success=result.executed or result.signal == 0
                 )
                 return result

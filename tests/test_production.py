@@ -100,7 +100,8 @@ class TestConfigManager(unittest.TestCase):
         # With API key should pass
         import os
 
-        manager.config.api_key = os.getenv("TEST_API_KEY", "mock_test_key_12345")
+        # Security: Use environment variable or test placeholder (never a real key)
+        manager.config.api_key = os.getenv("TEST_API_KEY", "TEST_PLACEHOLDER_NOT_A_REAL_KEY")
         manager._validate_config()  # Should not raise
 
 
