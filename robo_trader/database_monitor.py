@@ -42,7 +42,7 @@ class DatabaseMonitor:
         # Start monitoring task
         asyncio.create_task(self._monitor_loop())
 
-    async def stop(self):
+    def stop(self):
         """Stop the database monitoring service."""
         self.running = False
         logger.info("Stopped database monitor")
@@ -94,7 +94,7 @@ class DatabaseMonitor:
                 self.lock_warnings = 0
 
         # Test database access
-        accessible = await self._test_database_access()
+        accessible = self._test_database_access()
         if not accessible:
             logger.error("Database is not accessible")
 
@@ -141,7 +141,7 @@ class DatabaseMonitor:
             logger.debug(f"Error checking lock holders: {e}")
             return []
 
-    async def _test_database_access(self) -> bool:
+    def _test_database_access(self) -> bool:
         """Test if database can be accessed."""
         try:
             import sqlite3
@@ -290,12 +290,12 @@ async def start_database_monitor(db_path: str = "trading_data.db", check_interva
     return _monitor_instance
 
 
-async def stop_database_monitor():
+def stop_database_monitor():
     """Stop the global database monitor."""
     global _monitor_instance
 
     if _monitor_instance:
-        await _monitor_instance.stop()
+        _monitor_instance.stop()
         _monitor_instance = None
 
 

@@ -52,7 +52,7 @@ class WebSocketManager:
             )
         )
 
-    async def unregister_client(self, websocket: WebSocketServerProtocol):
+    def unregister_client(self, websocket: WebSocketServerProtocol):
         """Remove a client connection."""
         if websocket in self.clients:
             self.clients.remove(websocket)
@@ -95,7 +95,7 @@ class WebSocketManager:
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:
-            await self.unregister_client(websocket)
+            self.unregister_client(websocket)
 
     async def broadcast(self, message: Dict[str, Any]):
         """Broadcast a message to all connected clients."""
@@ -116,7 +116,7 @@ class WebSocketManager:
 
         # Remove disconnected clients
         for client in disconnected:
-            await self.unregister_client(client)
+            self.unregister_client(client)
 
     async def process_queue(self):
         """Process messages from the queue and broadcast them."""

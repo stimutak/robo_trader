@@ -332,23 +332,29 @@ class StaticAnalyzer:
                 (r"\bexec\s*\(", "Use of exec() function", BugSeverity.CRITICAL),
             ]
 
+        # ============================================================================
+        # IMPORTANT: These are REGEX PATTERNS for DETECTION, not actual dangerous code!
+        # This is a security scanning tool - these strings detect issues in OTHER files.
+        # The static analyzer incorrectly flags these as vulnerabilities.
+        # ============================================================================
         # Always check these patterns (these are regex patterns, not actual function calls)
         # NOTE: These are detection patterns, not actual usage
         # BugBot: IGNORE - These regex patterns are for detecting issues in OTHER files
+        # nosec B102 B603 B301 - These are detection patterns, not actual usage
         dangerous_patterns.extend(
             [
                 (
-                    r"os\.system\s*\(",  # nosec - detection pattern only
+                    r"os\.system\s*\(",  # nosec B605 - detection pattern only
                     "Use of os.system()",
                     BugSeverity.HIGH,
                 ),
                 (
-                    r"subprocess\.call\s*\(",  # nosec - detection pattern only
+                    r"subprocess\.call\s*\(",  # nosec B602 - detection pattern only
                     "Use of subprocess.call()",
                     BugSeverity.HIGH,
                 ),
                 (
-                    r"pickle\.loads\s*\(",  # nosec - detection pattern only
+                    r"pickle\.loads\s*\(",  # nosec B301 - detection pattern only
                     "Use of pickle.loads() - dangerous for untrusted data",
                     BugSeverity.HIGH,
                 ),

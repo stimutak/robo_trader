@@ -1,0 +1,35 @@
+# BugBot Ignore Configuration
+# This file tells the static analysis tool to ignore certain patterns that are false positives
+
+# Standard library imports are safe
+import_security:os
+import_security:subprocess
+import_security:sys
+import_security:json
+import_security:pathlib
+
+# Bug detection patterns (these are strings, not actual dangerous code)
+security:robo_trader/bug_detection/bug_agent.py:*
+security:robo_trader/bug_detection/static_tools.py:*
+
+# Async interface methods (intentionally async even without await)
+async_no_await:robo_trader/execution.py:125  # Abstract method interface
+async_no_await:robo_trader/execution.py:288  # Interface implementation
+async_no_await:robo_trader/execution.py:413  # Interface implementation
+
+# Async functions that are part of async interfaces
+async_no_await:**/framework.py:*  # Strategy framework interfaces
+async_no_await:**/strategies/**:_initialize  # Strategy initialization interface
+async_no_await:**/strategies/**:_generate_signals  # Strategy signal interface
+
+# Test files with intentional patterns
+hardcoded:tests/**  # Test files can have mock credentials
+flask_debug:test_*.py  # Test files can have debug mode
+
+# Performance - nested loops are intentional for data processing
+nested_loops:robo_trader/backtest/**  # Backtesting requires nested loops
+nested_loops:robo_trader/analytics/**  # Analytics requires nested loops
+nested_loops:tests/**  # Tests can have nested loops
+
+# Data processing files
+data_error_handling:robo_trader/archived/**  # Archived code doesn't need fixes
