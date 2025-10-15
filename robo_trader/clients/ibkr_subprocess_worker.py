@@ -35,10 +35,19 @@ async def handle_connect(params: dict) -> dict:
         readonly = params.get("readonly", True)
         timeout = params.get("timeout", 15.0)
 
+        # DEBUG: Log to stderr
+        print(
+            f"DEBUG: Connecting to {host}:{port} client_id={client_id} timeout={timeout}",
+            file=sys.stderr,
+            flush=True,
+        )
+
         # Connect to IBKR
         await ib.connectAsync(
             host=host, port=port, clientId=client_id, readonly=readonly, timeout=timeout
         )
+
+        print(f"DEBUG: Connected successfully!", file=sys.stderr, flush=True)
 
         # Verify connection and get accounts
         if not ib.isConnected():

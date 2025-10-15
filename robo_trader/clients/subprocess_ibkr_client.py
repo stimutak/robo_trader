@@ -6,10 +6,16 @@ ib_async from the main trading system's complex async environment.
 
 This solves the ib_async library incompatibility issue where API handshakes
 timeout in complex async environments despite successful TCP connections.
+
+CRITICAL FIX: Uses threading for subprocess I/O instead of asyncio.create_subprocess_exec
+to avoid event loop starvation in busy async environments.
 """
 import asyncio
 import json
+import queue
+import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -42,16 +48,21 @@ class SubprocessIBKRClient:
 
     Provides complete process isolation for ib_async library to avoid
     async environment conflicts.
+
+    Uses threading for subprocess I/O to avoid asyncio event loop starvation.
     """
 
     def __init__(self):
-        self.process: Optional[asyncio.subprocess.Process] = None
+        self.process: Optional[subprocess.Popen] = None
         self.lock = asyncio.Lock()
         self._connected = False
+        self._response_queue: queue.Queue = queue.Queue()
+        self._reader_thread: Optional[threading.Thread] = None
+        self._stop_reader = threading.Event()
 
     async def start(self) -> None:
-        """Start the subprocess worker"""
-        if self.process and self.process.returncode is None:
+        """Start the subprocess worker with threading-based I/O"""
+        if self.process and self.process.poll() is None:
             logger.warning("Subprocess already running")
             return
 
@@ -63,31 +74,58 @@ class SubprocessIBKRClient:
         logger.info("Starting IBKR subprocess worker", script=str(worker_script))
 
         # Start subprocess using the same Python interpreter
-        # CRITICAL: Use sys.executable to ensure we use the venv Python
-        python_exe = sys.executable
-        logger.debug("Using Python executable", python_exe=python_exe)
+        # CRITICAL FIX: sys.executable might not be venv Python if runner was started
+        # via shebang or other means. Check for venv and use it if available.
+        venv_python = Path(__file__).parent.parent.parent / ".venv" / "bin" / "python3"
+        if venv_python.exists():
+            python_exe = str(venv_python)
+            logger.debug("Using venv Python", python_exe=python_exe)
+        else:
+            python_exe = sys.executable
+            logger.debug("Using sys.executable Python", python_exe=python_exe)
 
-        # Start subprocess with proper isolation
-        # CRITICAL: close_fds prevents inheriting parent's file descriptors
-        # This is essential when launching from complex async environments
-        import platform
+        # CRITICAL FIX: Use regular subprocess.Popen with threading instead of
+        # asyncio.create_subprocess_exec to avoid event loop starvation in
+        # busy async environments
+        # TEMP DEBUG: Redirect stderr to file
+        import tempfile
 
-        # close_fds is default True on POSIX, but explicit is better
-        kwargs = {
-            "stdin": asyncio.subprocess.PIPE,
-            "stdout": asyncio.subprocess.PIPE,
-            "stderr": asyncio.subprocess.PIPE,
-        }
+        stderr_log = tempfile.NamedTemporaryFile(
+            mode="w", delete=False, prefix="ibkr_worker_stderr_", suffix=".log"
+        )
+        logger.info("subprocess_stderr_log", path=stderr_log.name)
 
-        # On POSIX systems, explicitly close file descriptors
-        if platform.system() != "Windows":
-            kwargs["close_fds"] = True
-
-        self.process = await asyncio.create_subprocess_exec(
-            python_exe, str(worker_script), **kwargs
+        self.process = subprocess.Popen(
+            [python_exe, str(worker_script)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr_log,
+            text=True,
+            bufsize=1,  # Line buffered
+            close_fds=True,  # Don't inherit file descriptors
         )
 
         logger.info("IBKR subprocess worker started", pid=self.process.pid)
+
+        # Start reader thread to avoid blocking
+        self._stop_reader.clear()
+        self._reader_thread = threading.Thread(
+            target=self._read_loop, daemon=True, name="IBKRSubprocessReader"
+        )
+        self._reader_thread.start()
+
+    def _read_loop(self) -> None:
+        """Thread function to read subprocess stdout"""
+        try:
+            while not self._stop_reader.is_set() and self.process:
+                line = self.process.stdout.readline()
+                if not line:
+                    break
+                self._response_queue.put(line.strip())
+        except Exception as e:
+            logger.error("Reader thread error", error=str(e))
+        finally:
+            logger.debug("Reader thread exiting")
 
     async def stop(self) -> None:
         """Stop the subprocess worker"""
@@ -103,14 +141,24 @@ class SubprocessIBKRClient:
         except Exception:
             pass
 
-        # Terminate process
-        try:
-            self.process.terminate()
-            await asyncio.wait_for(self.process.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            logger.warning("Subprocess did not terminate, killing", pid=self.process.pid)
-            self.process.kill()
-            await self.process.wait()
+        # Signal reader thread to stop
+        self._stop_reader.set()
+
+        # Terminate process (use run_in_executor to avoid blocking)
+        def terminate_process():
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                logger.warning("Subprocess did not terminate, killing", pid=self.process.pid)
+                self.process.kill()
+                self.process.wait()
+
+        await asyncio.get_event_loop().run_in_executor(None, terminate_process)
+
+        # Wait for reader thread to finish
+        if self._reader_thread and self._reader_thread.is_alive():
+            await asyncio.get_event_loop().run_in_executor(None, self._reader_thread.join, 2.0)
 
         self.process = None
         self._connected = False
@@ -134,33 +182,43 @@ class SubprocessIBKRClient:
         """
         async with self.lock:
             # Check subprocess is running
-            if not self.process or self.process.returncode is not None:
+            if not self.process or self.process.poll() is not None:
                 raise SubprocessCrashError("Subprocess not running")
 
-            # Send command
+            # Send command (use run_in_executor to avoid blocking)
             command_json = json.dumps(command) + "\n"
             logger.debug("Sending command to subprocess", command=command.get("command"))
 
-            try:
-                self.process.stdin.write(command_json.encode())
-                await self.process.stdin.drain()
-            except Exception as e:
-                raise SubprocessCrashError(f"Failed to send command: {e}")
+            def write_command():
+                try:
+                    self.process.stdin.write(command_json)
+                    self.process.stdin.flush()
+                except Exception as e:
+                    raise SubprocessCrashError(f"Failed to send command: {e}")
 
-            # Read response with timeout
+            await asyncio.get_event_loop().run_in_executor(None, write_command)
+
+            # Read response from queue with timeout
             try:
-                line = await asyncio.wait_for(self.process.stdout.readline(), timeout=timeout)
+                # Use run_in_executor to wait on queue without blocking event loop
+                def read_response():
+                    return self._response_queue.get(timeout=timeout)
+
+                line = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(None, read_response),
+                    timeout=timeout + 1.0,  # Add buffer to asyncio timeout
+                )
 
                 if not line:
                     raise SubprocessCrashError("Subprocess closed stdout")
 
-                response = json.loads(line.decode().strip())
+                response = json.loads(line)
 
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, queue.Empty):
                 logger.error("Command timeout", command=command.get("command"), timeout=timeout)
                 raise IBKRTimeoutError(f"Command timeout after {timeout}s")
             except json.JSONDecodeError as e:
-                logger.error("Invalid JSON response", error=str(e), line=line.decode())
+                logger.error("Invalid JSON response", error=str(e), line=line)
                 raise SubprocessCrashError(f"Invalid JSON response: {e}")
 
             # Check response status
