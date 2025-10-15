@@ -539,7 +539,12 @@ class RobustConnectionManager:
         if hasattr(self.connection, "isConnected"):
             return self.connection.isConnected()
         elif hasattr(self.connection, "is_connected"):
-            return self.connection.is_connected()
+            # Check if it's a property or method
+            is_connected_attr = getattr(self.connection, "is_connected")
+            if callable(is_connected_attr):
+                return is_connected_attr()
+            else:
+                return is_connected_attr
 
         # Assume connected if no verification method available
         return True
@@ -582,6 +587,128 @@ class RobustConnectionManager:
         }
 
 
+async def connect_ibkr_robust_subprocess(
+    host: str = "127.0.0.1",
+    port: int = 7497,
+    client_id: int = 1,
+    *,
+    readonly: bool = True,
+    timeout: float = 10.0,
+    max_retries: int = 2,
+    circuit_breaker_config: Optional[CircuitBreakerConfig] = None,
+) -> Any:
+    """
+    Connect to IBKR using subprocess-based client for complete process isolation.
+
+    This solves the ib_async library incompatibility with complex async environments
+    by running ib_async in a completely isolated subprocess.
+
+    Args:
+        host: IBKR Gateway/TWS host
+        port: IBKR Gateway/TWS port
+        client_id: Client ID for connection
+        readonly: Readonly mode
+        timeout: Connection timeout
+        max_retries: Maximum retry attempts
+        circuit_breaker_config: Circuit breaker configuration
+
+    Returns:
+        SubprocessIBKRClient instance (connected)
+    """
+    from robo_trader.clients.subprocess_ibkr_client import (
+        SubprocessCrashError,
+        SubprocessIBKRClient,
+    )
+
+    attempt_count = 0
+    client = SubprocessIBKRClient()
+
+    # Start subprocess
+    await client.start()
+    logger.info(
+        "Started IBKR subprocess worker", pid=client.process.pid if client.process else None
+    )
+
+    async def _connect():
+        """Internal connection function."""
+        nonlocal attempt_count
+
+        # Use fixed client_id on first attempt
+        # Use unique client_id on retries
+        if attempt_count == 0:
+            use_client_id = client_id
+        else:
+            import random
+
+            use_client_id = client_id + random.randint(1, 99)
+
+        attempt_count += 1
+
+        try:
+            logger.info(
+                "Connecting to IBKR via subprocess host=%s port=%s client_id=%s readonly=%s timeout=%.1f",
+                host,
+                port,
+                SecureConfig.mask_value(use_client_id),
+                readonly,
+                timeout,
+            )
+
+            # Connect via subprocess
+            connected = await client.connect(
+                host=host, port=port, client_id=use_client_id, readonly=readonly, timeout=timeout
+            )
+
+            if not connected:
+                raise ConnectionError("Subprocess connection failed")
+
+            # Verify accounts
+            accounts = await client.get_accounts()
+            if not accounts:
+                raise ConnectionError("No managed accounts")
+
+            logger.info(
+                "Connected to IBKR via subprocess host=%s port=%s client_id=%s accounts=%d",
+                host,
+                port,
+                SecureConfig.mask_value(use_client_id),
+                len(accounts),
+            )
+
+            return client
+
+        except SubprocessCrashError as e:
+            # Subprocess crashed - restart it
+            logger.error("Subprocess crashed, restarting", error=str(e))
+            await client.stop()
+            await client.start()
+            raise
+        except Exception as e:
+            # Connection failed - disconnect cleanly
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            raise
+
+    # Create robust connection manager
+    manager = RobustConnectionManager(
+        connect_func=_connect,
+        max_retries=max_retries,
+        base_delay=5.0,
+        max_delay=120.0,
+        circuit_breaker_config=circuit_breaker_config,
+        port=port,
+    )
+
+    try:
+        return await manager.connect()
+    except Exception:
+        # Failed to connect - stop subprocess
+        await client.stop()
+        raise
+
+
 async def connect_ibkr_robust(
     host: str = "127.0.0.1",
     port: int = 7497,
@@ -592,6 +719,7 @@ async def connect_ibkr_robust(
     max_retries: int = 2,  # Reduced from 5 to prevent zombie accumulation
     circuit_breaker_config: Optional[CircuitBreakerConfig] = None,
     ssl_mode: Literal["auto", "require", "disabled"] = "auto",
+    use_subprocess: bool = True,  # NEW: Use subprocess by default
 ) -> Any:
     """
     Connect to IBKR with robust retry and circuit breaker logic.
@@ -605,14 +733,18 @@ async def connect_ibkr_robust(
         ssl_mode: Transport strategy. ``auto`` attempts plain TCP first and falls
             back to TLS on handshake timeouts. ``require`` forces TLS immediately.
             ``disabled`` keeps legacy plain TCP only.
+        use_subprocess: Use subprocess-based client (recommended, default=True)
 
     Returns:
-        IB connection object
+        SubprocessIBKRClient if use_subprocess=True, otherwise IB connection object
 
     Example:
         ```python
-        # Basic usage
-        ib = await connect_ibkr_robust()
+        # Basic usage (subprocess mode - recommended)
+        client = await connect_ibkr_robust()
+
+        # Legacy mode (direct ib_async)
+        ib = await connect_ibkr_robust(use_subprocess=False)
 
         # With custom circuit breaker
         config = CircuitBreakerConfig(
@@ -620,9 +752,24 @@ async def connect_ibkr_robust(
             recovery_timeout=30,
             success_threshold=1
         )
-        ib = await connect_ibkr_robust(circuit_breaker_config=config)
+        client = await connect_ibkr_robust(circuit_breaker_config=config)
         ```
     """
+    # Route to subprocess implementation by default
+    if use_subprocess:
+        logger.info("Using subprocess-based IBKR client (recommended)")
+        return await connect_ibkr_robust_subprocess(
+            host=host,
+            port=port,
+            client_id=client_id,
+            readonly=readonly,
+            timeout=timeout,
+            max_retries=max_retries,
+            circuit_breaker_config=circuit_breaker_config,
+        )
+
+    # Legacy direct ib_async implementation
+    logger.warning("Using legacy direct ib_async client (not recommended)")
     from ib_async import IB
 
     attempt_count = 0
