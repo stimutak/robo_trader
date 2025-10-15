@@ -67,12 +67,24 @@ class SubprocessIBKRClient:
         python_exe = sys.executable
         logger.debug("Using Python executable", python_exe=python_exe)
 
+        # Start subprocess with proper isolation
+        # CRITICAL: close_fds prevents inheriting parent's file descriptors
+        # This is essential when launching from complex async environments
+        import platform
+
+        # close_fds is default True on POSIX, but explicit is better
+        kwargs = {
+            "stdin": asyncio.subprocess.PIPE,
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE,
+        }
+
+        # On POSIX systems, explicitly close file descriptors
+        if platform.system() != "Windows":
+            kwargs["close_fds"] = True
+
         self.process = await asyncio.create_subprocess_exec(
-            python_exe,
-            str(worker_script),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            python_exe, str(worker_script), **kwargs
         )
 
         logger.info("IBKR subprocess worker started", pid=self.process.pid)
