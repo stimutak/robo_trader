@@ -16,6 +16,7 @@ from robo_trader.connection_manager import ConnectionManager
 from robo_trader.utils.robust_connection import (
     CircuitBreaker,
     CircuitBreakerConfig,
+    CircuitState,
     RobustConnectionManager,
     connect_ibkr_robust,
 )
@@ -39,7 +40,7 @@ async def test_exponential_backoff():
 
         # Mock IB to fail initially then succeed
         with patch("robo_trader.connection_manager.IB") as MockIB:
-            mock_ib = AsyncMock()
+            mock_ib = MagicMock()
 
             # Fail first 3 attempts, succeed on 4th
             connect_results = [
@@ -52,6 +53,7 @@ async def test_exponential_backoff():
             mock_ib.connectAsync = AsyncMock(side_effect=connect_results)
             mock_ib.isConnected.return_value = True
             mock_ib.managedAccounts.return_value = ["DU123456"]
+            mock_ib.disconnect = MagicMock()
 
             MockIB.return_value = mock_ib
 
@@ -64,12 +66,16 @@ async def test_exponential_backoff():
                 print(f"Retry delays: {delays}")
                 assert len(delays) >= 3, "Should have at least 3 retries"
 
-                # Check delays increase exponentially (with jitter)
-                for i in range(1, len(delays)):
-                    base_expected = 2 ** (i - 1) * 2.0  # base_delay=2.0
-                    # Allow for jitter (up to 25% variation)
-                    assert delays[i] >= delays[i - 1], f"Delay should increase: {delays}"
-                    assert delays[i] <= 30.0, f"Delay should be capped at max_delay: {delays[i]}"
+                # Ignore fast cleanup sleeps (< 1s) and validate monotonic backoff
+                backoff_delays = [d for d in delays if d > 1.0]
+                assert backoff_delays, "Expected backoff delays greater than 1s"
+                for i in range(1, len(backoff_delays)):
+                    assert (
+                        backoff_delays[i] >= backoff_delays[i - 1]
+                    ), f"Backoff should increase: {backoff_delays}"
+                    assert (
+                        backoff_delays[i] <= 30.0
+                    ), f"Delay should be capped at max_delay: {backoff_delays[i]}"
 
                 print("✅ Exponential backoff working correctly")
 
@@ -130,7 +136,7 @@ async def test_connection_with_circuit_breaker():
 
     # Mock circuit breaker to be open
     if manager._circuit_breaker:
-        manager._circuit_breaker.state = CircuitBreaker.CircuitState.OPEN
+        manager._circuit_breaker.state = CircuitState.OPEN
         manager._circuit_breaker.can_attempt_connection = MagicMock(return_value=False)
 
         try:
@@ -191,8 +197,10 @@ async def test_connect_ibkr_robust():
     """Test the connect_ibkr_robust convenience function."""
     print("\n=== Testing connect_ibkr_robust Function ===")
 
-    with patch("robo_trader.utils.robust_connection.IB") as MockIB:
-        mock_ib = AsyncMock()
+    with patch("ib_async.IB") as MockIB, patch(
+        "robo_trader.utils.robust_connection.SecureConfig.mask_value", side_effect=lambda v: "****"
+    ):
+        mock_ib = MagicMock()
         mock_ib.connectAsync = AsyncMock()
         mock_ib.managedAccounts = MagicMock(return_value=["DU123456"])
         mock_ib.isConnected = MagicMock(return_value=True)
@@ -212,12 +220,20 @@ async def test_connect_ibkr_robust():
                 host="127.0.0.1",
                 port=7497,
                 client_id=999,
+                readonly=False,
+                timeout=15.0,
                 max_retries=3,
                 circuit_breaker_config=config,
             )
 
             assert ib is not None
             mock_ib.connectAsync.assert_called_once()
+            call_kwargs = mock_ib.connectAsync.call_args.kwargs
+            assert call_kwargs["host"] == "127.0.0.1"
+            assert call_kwargs["port"] == 7497
+            assert call_kwargs["clientId"] == 999
+            assert call_kwargs["readonly"] is False
+            assert call_kwargs["timeout"] == 15.0
             print("✅ connect_ibkr_robust working correctly")
 
         except Exception as e:
