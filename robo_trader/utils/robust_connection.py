@@ -9,6 +9,7 @@ This module provides enhanced connection resilience for IBKR connections:
 """
 
 import asyncio
+import fcntl
 import os
 import ssl
 import subprocess
@@ -172,6 +173,33 @@ class CircuitBreaker:
             "last_state_change": self.last_state_change.isoformat(),
         }
 
+
+_GLOBAL_CONNECT_LOCK: asyncio.Lock = asyncio.Lock()
+
+
+class _ConnectFileLock:
+    """Simple cross-process file lock to serialize IBKR handshakes.
+
+    Prevents concurrent API handshakes across multiple processes which can
+    confuse Gateway/TWS and exhaust client slots.
+    """
+
+    def __init__(self, lock_path: str = "/tmp/ibkr_connect.lock") -> None:
+        self.lock_path = lock_path
+        self._fh: Optional[Any] = None
+
+    def __enter__(self):
+        self._fh = open(self.lock_path, "w")
+        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self._fh:
+                fcntl.flock(self._fh, fcntl.LOCK_UN)
+                self._fh.close()
+        finally:
+            self._fh = None
 
 def kill_tws_zombie_connections(port: int = 7497) -> tuple[bool, str]:
     """
@@ -519,8 +547,12 @@ class RobustConnectionManager:
         if self.connection:
             try:
                 # Implement cleanup based on connection type
-                if hasattr(self.connection, "disconnect"):
-                    await self.connection.disconnect()
+        if hasattr(self.connection, "disconnect"):
+            try:
+                await self.connection.disconnect()
+            except TypeError:
+                # Some clients expose sync disconnect
+                self.connection.disconnect()
                 elif hasattr(self.connection, "close"):
                     await self.connection.close()
             except Exception as e:
@@ -537,14 +569,20 @@ class RobustConnectionManager:
 
         # Default implementation - check for common connection methods
         if hasattr(self.connection, "isConnected"):
-            return self.connection.isConnected()
+            try:
+                return bool(self.connection.isConnected())
+            except Exception:
+                return False
         elif hasattr(self.connection, "is_connected"):
             # Check if it's a property or method
             is_connected_attr = getattr(self.connection, "is_connected")
-            if callable(is_connected_attr):
-                return is_connected_attr()
-            else:
-                return is_connected_attr
+            try:
+                if callable(is_connected_attr):
+                    return bool(is_connected_attr())
+                else:
+                    return bool(is_connected_attr)
+            except Exception:
+                return False
 
         # Assume connected if no verification method available
         return True
@@ -702,7 +740,10 @@ async def connect_ibkr_robust_subprocess(
     )
 
     try:
-        return await manager.connect()
+        async with _GLOBAL_CONNECT_LOCK:
+            # Cross-process serialization guard
+            with _ConnectFileLock():
+                return await manager.connect()
     except Exception:
         # Failed to connect - stop subprocess
         await client.stop()
@@ -926,7 +967,10 @@ async def connect_ibkr_robust(
         port=port,
     )
 
-    return await manager.connect()
+    async with _GLOBAL_CONNECT_LOCK:
+        # Cross-process serialization guard
+        with _ConnectFileLock():
+            return await manager.connect()
 
 
 # Example usage and testing
