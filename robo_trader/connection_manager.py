@@ -92,9 +92,10 @@ class ConnectionManager:
 
         # Track failed client IDs to avoid immediate reuse
         self._failed_client_ids: set[int] = set()
-        self._max_retries: int = 5
-        self._retry_delay: float = 2.0
-        self._max_delay: float = 30.0  # Maximum backoff delay
+        # Fewer retries and slower backoff to avoid zombie storms
+        self._max_retries: int = 2
+        self._retry_delay: float = 5.0
+        self._max_delay: float = 60.0  # Maximum backoff delay
 
         # Circuit breaker for connection management
         if CircuitBreakerConfig:
@@ -137,11 +138,16 @@ class ConnectionManager:
                 self._failed_client_ids.clear()
 
     async def _cleanup_connection(self) -> None:
-        """Properly clean up IB connection and event loop tasks."""
+        """Properly clean up IB connection resources without disturbing other tasks.
+
+        Always call ib.disconnect() to ensure any half-open handshakes on the
+        Gateway/TWS side are cleared, even if ib.isConnected() reports False.
+        This avoids accumulating CLOSE_WAIT zombies on the broker port.
+        """
         if self.ib is not None:
             try:
-                # Cancel all market data subscriptions first to prevent leaks
-                if self.ib.isConnected() and self._market_data_subs:
+                # Best-effort: cancel any tracked market data subscriptions
+                if self._market_data_subs:
                     logger.info(
                         f"Canceling {len(self._market_data_subs)} market data subscriptions..."
                     )
@@ -152,17 +158,22 @@ class ConnectionManager:
                             logger.warning(f"Failed to cancel market data for {symbol}: {e}")
                     self._market_data_subs.clear()
 
-                if self.ib.isConnected():
-                    logger.info("Disconnecting from IB...")
+                # CRITICAL: Always attempt disconnect to clear any half-open socket state
+                try:
+                    logger.info("Disconnecting IB client (forced cleanup)...")
                     self.ib.disconnect()
-                    await asyncio.sleep(0.5)
+                except Exception as disconnect_err:  # noqa: BLE001
+                    logger.debug(f"Non-critical disconnect error: {disconnect_err}")
+                # Give Gateway a moment to process the disconnect
+                await asyncio.sleep(0.3)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Error during disconnect: {e}")
             finally:
                 self.ib = None
                 self._connected = False
 
-        await self._cleanup_pending_tasks()
+        # IMPORTANT: Do NOT cancel arbitrary event loop tasks here. This manager
+        # should never interfere with unrelated tasks spawned elsewhere in the app.
 
     async def _cleanup_pending_tasks(self) -> None:
         """Cancel all pending tasks to prevent event loop contamination."""
@@ -202,93 +213,122 @@ class ConnectionManager:
 
         self._connecting = True
 
+        # Serialize connects across tasks and processes
+        global _GLOBAL_IB_CONNECT_LOCK
         try:
-            await self._cleanup_connection()
+            _GLOBAL_IB_CONNECT_LOCK
+        except NameError:
+            _GLOBAL_IB_CONNECT_LOCK = asyncio.Lock()  # type: ignore[assignment]
 
-            for attempt in range(self._max_retries):
-                client_id = self._get_next_client_id()
-                logger.info(
-                    f"Connection attempt {attempt + 1}/{self._max_retries} with client_id={client_id}"
-                )
-
+        lock_fh = None
+        try:
+            async with _GLOBAL_IB_CONNECT_LOCK:  # type: ignore[arg-type]
+                # Cross-process file lock
                 try:
-                    self.ib = IB()
-                    # Configure connection parameters
-                    self.ib.RequestTimeout = 10.0
-                    self.ib.RaiseRequestErrors = False
+                    lock_fh = open("/tmp/ibkr_connect.lock", "w")
+                    import fcntl as _fcntl  # Local import to avoid Windows issues
 
-                    # Attempt connection
-                    await asyncio.wait_for(
-                        self.ib.connectAsync(
-                            self.host,
-                            self.port,
-                            clientId=client_id,
-                            timeout=10.0,
-                            readonly=False,
-                        ),
-                        timeout=12.0,
-                    )
+                    _fcntl.flock(lock_fh, _fcntl.LOCK_EX)
+                except Exception:
+                    # Best-effort; proceed without file lock if unavailable
+                    lock_fh = None
 
-                    # Verify connection works
-                    await asyncio.wait_for(self._verify_connection(), timeout=5.0)
+                await self._cleanup_connection()
 
-                    self._connected = True
-                    client_id_masked = SecureConfig.mask_value(client_id)
-                    logger.info(f"\u2713 Successfully connected with client_id={client_id_masked}")
-
-                    if not self._cleanup_registered:
-                        self._register_cleanup_handlers()
-                        self._cleanup_registered = True
-
-                    self._failed_client_ids.clear()
-
-                    # Record success in circuit breaker
-                    if self._circuit_breaker:
-                        self._circuit_breaker.record_success()
-
-                    return self.ib
-
-                except asyncio.TimeoutError:
-                    logger.warning(f"Connection timeout on attempt {attempt + 1}")
-                    self._failed_client_ids.add(client_id)
-
-                    # Record failure in circuit breaker
-                    if self._circuit_breaker:
-                        self._circuit_breaker.record_failure()
-
-                    await self._cleanup_connection()
-
-                except Exception as e:  # noqa: BLE001
-                    error_msg = str(e).lower()
-                    if "already connected" in error_msg or "client id" in error_msg:
-                        self._failed_client_ids.add(client_id)
-                        client_id_masked = SecureConfig.mask_value(client_id)
-                        logger.warning(f"Client ID {client_id_masked} already in use")
-                    else:
-                        logger.warning(f"Connection failed: {e}")
-
-                    # Record failure in circuit breaker
-                    if self._circuit_breaker:
-                        self._circuit_breaker.record_failure()
-
-                    await self._cleanup_connection()
-
-                if attempt < self._max_retries - 1:
-                    # Exponential backoff with cap and jitter
-                    delay = min(self._retry_delay * (2**attempt), self._max_delay)
-
-                    # Add jitter to prevent thundering herd
-                    jitter = delay * 0.25 * random.random()
-                    delay += jitter
-
+                for attempt in range(self._max_retries):
+                    client_id = self._get_next_client_id()
                     logger.info(
-                        f"Retrying in {delay:.1f} seconds (exponential backoff with jitter)..."
+                        f"Connection attempt {attempt + 1}/{self._max_retries} with client_id={client_id}"
                     )
-                    await asyncio.sleep(delay)
 
-            raise ConnectionError(f"Failed to connect after {self._max_retries} attempts")
+                    try:
+                        self.ib = IB()
+                        # Configure connection parameters
+                        self.ib.RequestTimeout = 10.0
+                        self.ib.RaiseRequestErrors = False
 
+                        # Attempt connection
+                        await asyncio.wait_for(
+                            self.ib.connectAsync(
+                                self.host,
+                                self.port,
+                                clientId=client_id,
+                                timeout=10.0,
+                                readonly=True,
+                            ),
+                            timeout=12.0,
+                        )
+
+                        # Verify connection works
+                        await asyncio.wait_for(self._verify_connection(), timeout=5.0)
+
+                        self._connected = True
+                        client_id_masked = SecureConfig.mask_value(client_id)
+                        logger.info(
+                            f"\u2713 Successfully connected with client_id={client_id_masked}"
+                        )
+
+                        if not self._cleanup_registered:
+                            self._register_cleanup_handlers()
+                            self._cleanup_registered = True
+
+                        self._failed_client_ids.clear()
+
+                        # Record success in circuit breaker
+                        if self._circuit_breaker:
+                            self._circuit_breaker.record_success()
+
+                        return self.ib
+
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Connection timeout on attempt {attempt + 1}")
+                        self._failed_client_ids.add(client_id)
+
+                        # Record failure in circuit breaker
+                        if self._circuit_breaker:
+                            self._circuit_breaker.record_failure()
+
+                        await self._cleanup_connection()
+
+                    except Exception as e:  # noqa: BLE001
+                        error_msg = str(e).lower()
+                        if "already connected" in error_msg or "client id" in error_msg:
+                            self._failed_client_ids.add(client_id)
+                            client_id_masked = SecureConfig.mask_value(client_id)
+                            logger.warning(f"Client ID {client_id_masked} already in use")
+                        else:
+                            logger.warning(f"Connection failed: {e}")
+
+                        # Record failure in circuit breaker
+                        if self._circuit_breaker:
+                            self._circuit_breaker.record_failure()
+
+                        await self._cleanup_connection()
+
+                    # Backoff if we will retry
+                    if attempt < self._max_retries - 1:
+                        delay = min(self._retry_delay * (2**attempt), self._max_delay)
+                        jitter = delay * 0.25 * random.random()
+                        delay += jitter
+                        logger.info(
+                            f"Retrying in {delay:.1f} seconds (exponential backoff with jitter)..."
+                        )
+                        await asyncio.sleep(delay)
+
+                # All attempts exhausted
+                raise ConnectionError(
+                    f"Failed to connect after {self._max_retries} attempts"
+                )
         finally:
+            # Release file lock if held
+            try:
+                if lock_fh is not None:
+                    import fcntl as _fcntl
+
+                    _fcntl.flock(lock_fh, _fcntl.LOCK_UN)
+                    lock_fh.close()
+            except Exception:
+                pass
             self._connecting = False
 
     async def _verify_connection(self) -> None:
