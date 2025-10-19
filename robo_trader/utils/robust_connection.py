@@ -147,6 +147,8 @@ class CircuitBreaker:
         self.state = CircuitState.OPEN
         self.last_state_change = datetime.now()
         self.success_count = 0
+        # Emit telemetry/metrics
+        self._emit_state_change_metric("open")
 
     def _close_circuit(self) -> None:
         """Close the circuit breaker."""
@@ -155,6 +157,8 @@ class CircuitBreaker:
         self.last_state_change = datetime.now()
         self.failure_count = 0
         self.success_count = 0
+        # Emit telemetry/metrics
+        self._emit_state_change_metric("closed")
 
     def _half_open_circuit(self) -> None:
         """Set circuit to half-open for testing."""
@@ -162,6 +166,39 @@ class CircuitBreaker:
         self.state = CircuitState.HALF_OPEN
         self.last_state_change = datetime.now()
         self.success_count = 0
+        # Emit telemetry/metrics
+        self._emit_state_change_metric("half_open")
+
+    def _emit_state_change_metric(self, new_state: str) -> None:
+        """Emit telemetry/metrics for circuit breaker state changes.
+
+        This method logs structured metrics that can be captured by monitoring
+        systems (e.g., Prometheus, CloudWatch, DataDog).
+
+        Args:
+            new_state: New circuit breaker state (open, closed, half_open)
+        """
+        # Structured logging for metric collection
+        logger.info(
+            "circuit_breaker_state_change",
+            extra={
+                "metric_type": "circuit_breaker_state",
+                "state": new_state,
+                "failure_count": self.failure_count,
+                "success_count": self.success_count,
+                "timestamp": datetime.now().isoformat(),
+            },
+        )
+        # Additional metrics for monitoring
+        logger.info(
+            "circuit_breaker_metrics",
+            extra={
+                "metric_type": "circuit_breaker_counters",
+                "failures": self.failure_count,
+                "successes": self.success_count,
+                "state": new_state,
+            },
+        )
 
     def get_status(self) -> dict:
         """Get circuit breaker status."""
@@ -182,16 +219,58 @@ class _ConnectFileLock:
 
     Prevents concurrent API handshakes across multiple processes which can
     confuse Gateway/TWS and exhaust client slots.
+
+    File Lock Path Configuration:
+        Default: /tmp/ibkr_connect.lock
+        Override via environment variable: IBKR_LOCK_FILE_PATH
+        Example: export IBKR_LOCK_FILE_PATH=/var/run/ibkr_connect.lock
+
+    Timeout Configuration:
+        Default: 30 seconds
+        Override via environment variable: IBKR_LOCK_TIMEOUT
+        Example: export IBKR_LOCK_TIMEOUT=60
     """
 
-    def __init__(self, lock_path: str = "/tmp/ibkr_connect.lock") -> None:
-        self.lock_path = lock_path
+    def __init__(
+        self,
+        lock_path: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> None:
+        # Allow configuration via environment variable
+        self.lock_path = (
+            lock_path
+            or os.environ.get("IBKR_LOCK_FILE_PATH", "/tmp/ibkr_connect.lock")
+        )
+        # Timeout in seconds (default 30s, configurable via env)
+        self.timeout = float(
+            timeout or os.environ.get("IBKR_LOCK_TIMEOUT", "30")
+        )
         self._fh: Optional[Any] = None
 
     def __enter__(self):
-        self._fh = open(self.lock_path, "w")
-        fcntl.flock(self._fh, fcntl.LOCK_EX)
-        return self
+        import signal
+
+        def timeout_handler(signum, frame):
+            raise TimeoutError(
+                f"Failed to acquire file lock at {self.lock_path} within {self.timeout}s"
+            )
+
+        # Set timeout alarm (Unix-based systems only)
+        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(int(self.timeout))
+
+        try:
+            self._fh = open(self.lock_path, "w")
+            fcntl.flock(self._fh, fcntl.LOCK_EX)
+            signal.alarm(0)  # Cancel alarm on success
+            return self
+        except Exception:
+            signal.alarm(0)  # Cancel alarm on error
+            signal.signal(signal.SIGALRM, old_handler)  # Restore handler
+            if self._fh:
+                self._fh.close()
+                self._fh = None
+            raise
 
     def __exit__(self, exc_type, exc, tb):
         try:
@@ -547,12 +626,12 @@ class RobustConnectionManager:
         if self.connection:
             try:
                 # Implement cleanup based on connection type
-        if hasattr(self.connection, "disconnect"):
-            try:
-                await self.connection.disconnect()
-            except TypeError:
-                # Some clients expose sync disconnect
-                self.connection.disconnect()
+                if hasattr(self.connection, "disconnect"):
+                    try:
+                        await self.connection.disconnect()
+                    except TypeError:
+                        # Some clients expose sync disconnect
+                        self.connection.disconnect()
                 elif hasattr(self.connection, "close"):
                     await self.connection.close()
             except Exception as e:
