@@ -146,6 +146,11 @@ class AsyncRunner:
         self.daily_executed_notional = 0.0
         self.monitor = PerformanceMonitor()
 
+        # Persistent IBKR connection (FIX for zombie connection accumulation)
+        self._ibkr_client = None  # SubprocessIBKRClient instance
+        self._connection_healthy = False
+        self._connection_lock = asyncio.Lock()
+
         # Production monitoring (Phase 4 P2)
         self.production_monitor = None
         self.enable_production_monitoring = (
@@ -447,6 +452,121 @@ class AsyncRunner:
                 logger.error(f"Error updating position for {symbol}: {e}")
                 return False
 
+    async def _start_persistent_connection(self) -> None:
+        """
+        Start and maintain persistent IBKR connection.
+        
+        This prevents zombie CLOSE_WAIT connection accumulation by maintaining
+        a single long-lived connection instead of connect/disconnect cycles.
+        """
+        async with self._connection_lock:
+            if self._connection_healthy and self._ibkr_client:
+                logger.info("Persistent connection already established")
+                return
+            
+            logger.info("Starting persistent IBKR connection...")
+            
+            from .clients.subprocess_ibkr_client import SubprocessIBKRClient
+            from .utils.robust_connection import kill_tws_zombie_connections
+            
+            # Kill any existing zombies FIRST
+            try:
+                success, msg = kill_tws_zombie_connections(self.cfg.ibkr.port)
+                logger.info(f"Zombie cleanup: {msg}")
+                # Wait for cleanup to complete
+                await asyncio.sleep(1.0)
+            except Exception as e:
+                logger.warning(f"Zombie cleanup failed (non-fatal): {e}")
+            
+            # Create subprocess client
+            self._ibkr_client = SubprocessIBKRClient()
+            await self._ibkr_client.start()
+            
+            # Connect with retry logic
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    # Use different client IDs for retries to avoid conflicts
+                    client_id = self.cfg.ibkr.client_id + attempt
+                    
+                    logger.info(
+                        f"Connection attempt {attempt + 1}/{max_retries} with client_id={SecureConfig.mask_value(client_id)}"
+                    )
+                    
+                    connected = await self._ibkr_client.connect(
+                        host=self.cfg.ibkr.host,
+                        port=self.cfg.ibkr.port,
+                        client_id=client_id,
+                        readonly=self.cfg.ibkr.readonly,
+                        timeout=self.cfg.ibkr.timeout,
+                    )
+                    
+                    if connected:
+                        self._connection_healthy = True
+                        self.ib = self._ibkr_client  # Set for backward compatibility
+                        logger.info("✓ Persistent IBKR connection established successfully")
+                        return
+                        
+                except Exception as e:
+                    logger.warning(f"Connection attempt {attempt + 1} failed: {e}")
+                    if attempt < max_retries - 1:
+                        delay = 2.0 ** attempt  # Exponential backoff
+                        logger.info(f"Retrying in {delay}s...")
+                        await asyncio.sleep(delay)
+            
+            # All attempts failed
+            if self._ibkr_client:
+                await self._ibkr_client.stop()
+                self._ibkr_client = None
+            
+            raise ConnectionError(
+                f"Failed to establish persistent connection after {max_retries} attempts"
+            )
+
+    async def _stop_persistent_connection(self) -> None:
+        """
+        Stop persistent IBKR connection.
+        
+        Only called when runner is shutting down completely, not between runs.
+        """
+        async with self._connection_lock:
+            if not self._ibkr_client:
+                logger.info("No persistent connection to stop")
+                return
+            
+            logger.info("Stopping persistent IBKR connection...")
+            
+            try:
+                await self._ibkr_client.disconnect()
+                await self._ibkr_client.stop()
+                logger.info("✓ Persistent connection stopped cleanly")
+            except Exception as e:
+                logger.error(f"Error stopping connection: {e}")
+            finally:
+                self._ibkr_client = None
+                self.ib = None
+                self._connection_healthy = False
+
+    async def _check_connection_health(self) -> bool:
+        """
+        Check if persistent connection is still healthy.
+        
+        Returns:
+            True if connection is healthy and responsive
+        """
+        if not self._ibkr_client:
+            return False
+        
+        if not self._ibkr_client.is_connected:
+            return False
+        
+        try:
+            # Ping to verify subprocess is responsive
+            return await self._ibkr_client.ping()
+        except Exception as e:
+            logger.warning(f"Health check failed: {e}")
+            return False
+
     async def setup(self):
         """Initialize all components."""
         self.cfg = load_config()
@@ -488,32 +608,10 @@ class AsyncRunner:
 
         logger.info(f"✓ Port {port} is open - proceeding to IBKR connect")
 
-        # Log connection details with secure masking
-        client_id_masked = SecureConfig.mask_value(self.cfg.ibkr.client_id)
-        logger.info(
-            f"Initializing robust connection to {host}:{port} with client_id: {client_id_masked}"
-        )
-
-        # Try to connect using robust connection with circuit breaker
+        # Start persistent IBKR connection (prevents zombie accumulation)
+        # This maintains a single long-lived connection instead of connect/disconnect cycles
         try:
-            # Configure circuit breaker from env
-            circuit_config = CircuitBreakerConfig(
-                failure_threshold=int(os.getenv("CIRCUIT_BREAKER_THRESHOLD", "5")),
-                recovery_timeout=float(os.getenv("CIRCUIT_BREAKER_TIMEOUT", "300")),
-                success_threshold=2,
-            )
-
-            self.ib = await connect_ibkr_robust(
-                host=host,
-                port=port,
-                client_id=self.cfg.ibkr.client_id,
-                readonly=self.cfg.ibkr.readonly,
-                timeout=self.cfg.ibkr.timeout,
-                max_retries=2,  # Reduced from 5 to prevent zombie connection accumulation
-                circuit_breaker_config=circuit_config,
-                ssl_mode=self.cfg.ibkr.ssl_mode,
-            )
-            logger.info("✓ IBKR connection established successfully with robust connection")
+            await self._start_persistent_connection()
             logger.info("=" * 60)
         except ConnectionError as e:
             logger.error(f"❌ IBKR CONNECTION FAILED: {e}")
@@ -2083,21 +2181,10 @@ class AsyncRunner:
                 self.advanced_risk.save_state(state_file)
                 logger.info("Advanced risk manager state saved")
 
-            # Disconnect from IBKR (subprocess client)
-            if hasattr(self, "ib") and self.ib:
-                logger.info("Disconnecting from IBKR...")
-                # Check if it's subprocess client or legacy IB client
-                if hasattr(self.ib, "disconnect"):
-                    # Subprocess client has async disconnect()
-                    if asyncio.iscoroutinefunction(self.ib.disconnect):
-                        await self.ib.disconnect()
-                    else:
-                        self.ib.disconnect()
-                # Also stop the subprocess if it exists
-                if hasattr(self.ib, "stop"):
-                    await self.ib.stop()
-                    logger.info("Stopped IBKR subprocess")
-
+            # NOTE: DO NOT disconnect IBKR here - persistent connection stays alive
+            # between runs to prevent zombie CLOSE_WAIT connection accumulation.
+            # Connection will be closed when runner context exits via __aexit__().
+            
             # Close database connections
             if hasattr(self, "db") and self.db:
                 await self.db.close()
@@ -2106,9 +2193,41 @@ class AsyncRunner:
             if hasattr(self, "ws_client"):
                 self.ws_client.stop()
 
-            logger.info("Cleanup completed")
+            logger.info("Cleanup completed (persistent IBKR connection kept alive)")
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
+
+    async def __aenter__(self):
+        """
+        Context manager entry - starts persistent connection on first use.
+        
+        Usage:
+            async with AsyncRunner(...) as runner:
+                await runner.setup(symbols)
+                await runner.run(symbols)
+        """
+        # Connection will be started in setup() when cfg is available
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """
+        Context manager exit - stops persistent connection.
+        
+        This ensures clean shutdown and prevents zombie connections.
+        """
+        logger.info("Runner context exiting, stopping persistent connection...")
+        
+        try:
+            # Run normal cleanup first (database, monitors, etc.)
+            await self.cleanup()
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+        
+        # Now stop the persistent connection
+        await self._stop_persistent_connection()
+        
+        logger.info("Runner context exited cleanly")
+        return False  # Don't suppress exceptions
 
 
 async def run_once(
@@ -2126,8 +2245,9 @@ async def run_once(
     use_ml_enhanced: bool = False,
     use_smart_execution: bool = False,
 ) -> None:
-    """Run the trading system once with parallel processing."""
-    runner = AsyncRunner(
+    """Run the trading system once with parallel processing and persistent connection."""
+    # Use context manager to ensure proper connection lifecycle
+    async with AsyncRunner(
         duration=duration,
         bar_size=bar_size,
         sma_fast=sma_fast,
@@ -2141,8 +2261,11 @@ async def run_once(
         use_ml_strategy=use_ml_strategy,
         use_ml_enhanced=use_ml_enhanced,
         use_smart_execution=use_smart_execution,
-    )
-    await runner.run(symbols)
+    ) as runner:
+        await runner.run(symbols)
+    
+    # Connection automatically cleaned up when exiting context
+    logger.info("Single run complete (persistent connection cleaned up)")
 
 
 async def run_continuous(
@@ -2161,7 +2284,7 @@ async def run_continuous(
     use_ml_enhanced: bool = False,
     use_smart_execution: bool = False,
 ) -> None:
-    """Run the trading system continuously with market hours checking."""
+    """Run the trading system continuously with persistent connection and market hours checking."""
     import signal
     from datetime import datetime
 
@@ -2178,73 +2301,78 @@ async def run_continuous(
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    logger.info("Starting continuous trading system...")
+    logger.info("Starting continuous trading system with persistent connection...")
     logger.info("Press Ctrl+C to stop gracefully")
 
-    while not shutdown_flag:
-        eastern = pytz.timezone("US/Eastern")
-        current_time = datetime.now(eastern)
+    # Create runner with context manager - connection stays alive throughout
+    async with AsyncRunner(
+        duration=duration,
+        bar_size=bar_size,
+        sma_fast=sma_fast,
+        sma_slow=sma_slow,
+        slippage_bps=slippage_bps,
+        max_order_notional=max_order_notional,
+        max_daily_notional=max_daily_notional,
+        default_cash=default_cash,
+        max_concurrent_symbols=max_concurrent,
+        use_correlation_sizing=True,
+        use_ml_strategy=use_ml_strategy,
+        use_ml_enhanced=use_ml_enhanced,
+        use_smart_execution=use_smart_execution,
+    ) as runner:
+        
+        while not shutdown_flag:
+            eastern = pytz.timezone("US/Eastern")
+            current_time = datetime.now(eastern)
 
-        # Check market status but still run (data might be useful even after hours)
-        if not is_market_open():
-            session = get_market_session()
-            seconds_to_open = seconds_until_market_open()
+            # Check market status but still run (data might be useful even after hours)
+            if not is_market_open():
+                session = get_market_session()
+                seconds_to_open = seconds_until_market_open()
 
-            # During extended hours or shortly before open, run more frequently
-            if session in ["after-hours", "pre-market"] or seconds_to_open < 3600:
-                wait_time = min(interval_seconds, 300)  # Max 5 minutes
-            else:
-                # Market closed, check less frequently
-                wait_time = min(1800, seconds_to_open // 2)  # Max 30 minutes
-                logger.info(
-                    f"Market {session}. Next open in {seconds_to_open/3600:.1f} hours. "
-                    f"Waiting {wait_time/60:.1f} minutes..."
-                )
-                await asyncio.sleep(wait_time)
-                continue
-
-        try:
-            logger.info(
-                f"Starting trading cycle at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
-            )
-
-            # Run the trading system with proper cleanup
-            runner = AsyncRunner(
-                duration=duration,
-                bar_size=bar_size,
-                sma_fast=sma_fast,
-                sma_slow=sma_slow,
-                slippage_bps=slippage_bps,
-                max_order_notional=max_order_notional,
-                max_daily_notional=max_daily_notional,
-                default_cash=default_cash,
-                max_concurrent_symbols=max_concurrent,
-                use_correlation_sizing=True,  # FIXED: Enabled M5 correlation integration
-                use_ml_strategy=use_ml_strategy,
-                use_smart_execution=use_smart_execution,
-            )
+                # During extended hours or shortly before open, run more frequently
+                if session in ["after-hours", "pre-market"] or seconds_to_open < 3600:
+                    wait_time = min(interval_seconds, 300)  # Max 5 minutes
+                else:
+                    # Market closed, check less frequently
+                    wait_time = min(1800, seconds_to_open // 2)  # Max 30 minutes
+                    logger.info(
+                        f"Market {session}. Next open in {seconds_to_open/3600:.1f} hours. "
+                        f"Waiting {wait_time/60:.1f} minutes..."
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
 
             try:
+                logger.info(
+                    f"Starting trading cycle at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+                )
+                
+                # Check connection health before each run
+                if not await runner._check_connection_health():
+                    logger.warning("Connection unhealthy, reconnecting...")
+                    await runner._stop_persistent_connection()
+                    await runner._start_persistent_connection()
+
+                # Run trading cycle (connection stays alive)
                 await runner.run(symbols)
-            finally:
-                # Ensure proper cleanup of runner resources
-                await runner.cleanup()
 
-            # Wait before next iteration
-            if not shutdown_flag and is_market_open():
-                logger.info(f"Waiting {interval_seconds/60:.1f} minutes before next iteration...")
-                await asyncio.sleep(interval_seconds)
+                # Wait before next iteration
+                if not shutdown_flag and is_market_open():
+                    logger.info(f"Waiting {interval_seconds/60:.1f} minutes before next iteration...")
+                    await asyncio.sleep(interval_seconds)
 
-        except asyncio.CancelledError:
-            logger.info("Trading loop cancelled")
-            break
-        except Exception as e:
-            logger.error(f"Error in trading cycle: {e}")
-            if not shutdown_flag:
-                logger.info("Waiting 1 minute before retry...")
-                await asyncio.sleep(60)
-
-    logger.info("Trading system shutdown complete")
+            except Exception as e:
+                logger.error(f"Error in trading cycle: {e}")
+                if not shutdown_flag:
+                    logger.info("Waiting 1 minute before retry...")
+                    await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                logger.info("Trading loop cancelled, exiting gracefully...")
+                break
+    
+    # Connection automatically cleaned up when exiting context
+    logger.info("Trading system shutdown complete (persistent connection cleaned up)")
 
 
 def main() -> None:
