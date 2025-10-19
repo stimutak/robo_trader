@@ -298,6 +298,40 @@ class SubprocessIBKRClient:
         data = await self._execute_command({"command": "get_account_summary"})
         return data.get("summary", {})
 
+    async def get_historical_bars(
+        self,
+        symbol: str,
+        duration: str = "2 D",
+        bar_size: str = "5 mins",
+        what_to_show: str = "TRADES",
+        use_rth: bool = True,
+    ) -> list[dict]:
+        """
+        Get historical bars for a symbol.
+
+        Args:
+            symbol: Stock symbol
+            duration: IB duration string (e.g., "2 D", "1 W")
+            bar_size: IB bar size (e.g., "5 mins", "1 hour")
+            what_to_show: Data type (e.g., "TRADES", "MIDPOINT")
+            use_rth: Use regular trading hours only
+
+        Returns:
+            List of bar dictionaries with date, open, high, low, close, volume
+        """
+        data = await self._execute_command(
+            {
+                "command": "get_historical_bars",
+                "symbol": symbol,
+                "duration": duration,
+                "bar_size": bar_size,
+                "what_to_show": what_to_show,
+                "use_rth": use_rth,
+            },
+            timeout=60.0,  # Historical data can take longer
+        )
+        return data.get("bars", [])
+
     async def disconnect(self) -> None:
         """Disconnect from IBKR"""
         if not self._connected:

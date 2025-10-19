@@ -181,6 +181,74 @@ async def handle_ping() -> dict:
     return {"status": "success", "data": {"pong": True, "connected": connected}}
 
 
+async def handle_get_historical_bars(params: dict) -> dict:
+    """Handle get_historical_bars command"""
+    global ib
+
+    try:
+        if not ib or not ib.isConnected():
+            raise ConnectionError("Not connected to IBKR")
+
+        # Extract parameters
+        symbol = params.get("symbol")
+        duration = params.get("duration", "2 D")
+        bar_size = params.get("bar_size", "5 mins")
+        what_to_show = params.get("what_to_show", "TRADES")
+        use_rth = params.get("use_rth", True)
+
+        if not symbol:
+            raise ValueError("symbol parameter is required")
+
+        # Create contract
+        from ib_async import Stock
+
+        contract = Stock(symbol, "SMART", "USD")
+
+        # Qualify contract
+        qualified = ib.qualifyContracts(contract)
+        if not qualified:
+            raise ValueError(f"Could not qualify contract for {symbol}")
+
+        # Request historical data
+        bars = ib.reqHistoricalData(
+            qualified[0],
+            endDateTime="",
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow=what_to_show,
+            useRTH=use_rth,
+            formatDate=1,
+        )
+
+        # Convert bars to dict format
+        bars_data = []
+        for bar in bars:
+            bars_data.append(
+                {
+                    "date": bar.date.isoformat()
+                    if hasattr(bar.date, "isoformat")
+                    else str(bar.date),
+                    "open": float(bar.open),
+                    "high": float(bar.high),
+                    "low": float(bar.low),
+                    "close": float(bar.close),
+                    "volume": int(bar.volume),
+                    "average": float(bar.average) if hasattr(bar, "average") else 0.0,
+                    "barCount": int(bar.barCount) if hasattr(bar, "barCount") else 0,
+                }
+            )
+
+        return {"status": "success", "data": {"bars": bars_data}}
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "traceback": traceback.format_exc(),
+        }
+
+
 async def handle_command(command: dict) -> dict:
     """Route command to appropriate handler"""
     cmd = command.get("command")
@@ -193,6 +261,8 @@ async def handle_command(command: dict) -> dict:
         return await handle_get_positions()
     elif cmd == "get_account_summary":
         return await handle_get_account_summary()
+    elif cmd == "get_historical_bars":
+        return await handle_get_historical_bars(command)
     elif cmd == "disconnect":
         return await handle_disconnect()
     elif cmd == "ping":

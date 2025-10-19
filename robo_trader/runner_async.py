@@ -847,31 +847,58 @@ class AsyncRunner:
         Returns:
             DataFrame with OHLCV columns
         """
-        if not self.ib or not self.ib.isConnected():
+        if not self.ib:
             raise ConnectionError("Not connected to IBKR")
 
-        contract = Stock(symbol, "SMART", "USD")
-        qualified = self.ib.qualifyContracts(contract)
-        if not qualified:
-            return pd.DataFrame()
+        # Check if subprocess client or legacy IB client
+        if hasattr(self.ib, "get_historical_bars"):
+            # Subprocess client - use async method
+            bars = await self.ib.get_historical_bars(
+                symbol=symbol,
+                duration=duration,
+                bar_size=bar_size,
+                what_to_show=what_to_show,
+                use_rth=use_rth,
+            )
 
-        bars = self.ib.reqHistoricalData(
-            qualified[0],
-            endDateTime="",
-            durationStr=duration,
-            barSizeSetting=bar_size,
-            whatToShow=what_to_show,
-            useRTH=use_rth,
-            formatDate=1,
-        )
+            if not bars:
+                return pd.DataFrame()
 
-        if not bars:
-            return pd.DataFrame()
+            # Convert list of dicts to DataFrame
+            df = pd.DataFrame(bars)
+            if not df.empty:
+                # Ensure columns are lowercase
+                df.columns = [col.lower() for col in df.columns]
+                # Sort by date
+                if "date" in df.columns:
+                    df = df.sort_values("date")
+        else:
+            # Legacy IB client - use synchronous methods
+            if not self.ib.isConnected():
+                raise ConnectionError("Not connected to IBKR")
 
-        df = pd.DataFrame(bars)
-        if not df.empty:
-            df.columns = [col.lower() for col in df.columns]
-            df = df.sort_values("date")
+            contract = Stock(symbol, "SMART", "USD")
+            qualified = self.ib.qualifyContracts(contract)
+            if not qualified:
+                return pd.DataFrame()
+
+            bars = self.ib.reqHistoricalData(
+                qualified[0],
+                endDateTime="",
+                durationStr=duration,
+                barSizeSetting=bar_size,
+                whatToShow=what_to_show,
+                useRTH=use_rth,
+                formatDate=1,
+            )
+
+            if not bars:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(bars)
+            if not df.empty:
+                df.columns = [col.lower() for col in df.columns]
+                df = df.sort_values("date")
 
         return df
 
@@ -881,10 +908,8 @@ class AsyncRunner:
             await self.production_monitor.stop()
         if self.correlation_manager:
             await self.correlation_manager.stop()
-        if self.conn_mgr:
-            await self.conn_mgr.disconnect()
-        if self.db:
-            await self.db.close()
+        # Call cleanup to properly disconnect IBKR and close database
+        await self.cleanup()
 
     async def fetch_and_store_data(self, symbol: str) -> Optional[pd.DataFrame]:
         """Fetch market data for a symbol and store in database."""
@@ -2058,10 +2083,20 @@ class AsyncRunner:
                 self.advanced_risk.save_state(state_file)
                 logger.info("Advanced risk manager state saved")
 
-            # Disconnect from IBKR
-            if hasattr(self, "ib") and self.ib and self.ib.isConnected():
+            # Disconnect from IBKR (subprocess client)
+            if hasattr(self, "ib") and self.ib:
                 logger.info("Disconnecting from IBKR...")
-                self.ib.disconnect()
+                # Check if it's subprocess client or legacy IB client
+                if hasattr(self.ib, "disconnect"):
+                    # Subprocess client has async disconnect()
+                    if asyncio.iscoroutinefunction(self.ib.disconnect):
+                        await self.ib.disconnect()
+                    else:
+                        self.ib.disconnect()
+                # Also stop the subprocess if it exists
+                if hasattr(self.ib, "stop"):
+                    await self.ib.stop()
+                    logger.info("Stopped IBKR subprocess")
 
             # Close database connections
             if hasattr(self, "db") and self.db:
