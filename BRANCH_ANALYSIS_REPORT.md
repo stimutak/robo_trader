@@ -9,10 +9,69 @@
 
 **RECOMMENDATION:** Merge `fix/phase1-security-bugs` immediately, then archive all other unmerged branches as they contain outdated work that's been superseded by PR #43.
 
+**CRITICAL UPDATE - Connection Issue Status:**
+The "horrible bug preventing connections to gateway for over a month" **HAS BEEN FIXED IN MAIN** through commits `bd87fe5` and `3011b5f` (early October 2025). The fix uses **readonly connection mode + zombie cleanup**, NOT the subprocess approach. The subprocess branches represent an alternative solution that was developed in parallel but is no longer needed.
+
 **Key Findings:**
+- ✅ **Connection bug FIXED in main:** Readonly mode + zombie cleanup (Oct 2025)
 - ✅ **1 branch ready to merge:** `fix/phase1-security-bugs` - Critical bug fixes
-- ⚠️ **5 branches to archive:** All cursor/* and fix/subprocess branches contain work already integrated into main
+- ⚠️ **5 branches to archive:** All cursor/* and fix/subprocess branches contain work already integrated or superseded
 - ✅ **1 branch already merged:** `feature/phase4-production-hardening` (PR #43)
+
+---
+
+## Connection Bug: Timeline & Resolution
+
+### The Problem (September 2025)
+**Duration:** ~1 month (late Sept - early Oct 2025)
+**Impact:** System unable to connect to IBKR Gateway/TWS
+**Symptoms:**
+- TCP connection succeeded but API handshake timed out after 10-30 seconds
+- Zombie CLOSE_WAIT connections accumulated on port 7497/4002
+- TWS API listener not responding despite correct configuration
+- System completely blocked from live trading
+
+**Evidence:** Handoff document `2025-09-30_1600_handoff.md` documents the issue in detail.
+
+### The Solution in Main Branch ✅
+**Commits:**
+- `bd87fe5` - "fix: Eliminate TWS zombie connection bug" (Oct 2025)
+- `3011b5f` - "fix: Eliminate TWS dialog popup with readonly connection mode" (Oct 2025)
+
+**Approach:**
+1. **Readonly Connection Mode** (`readonly=True` in `connectAsync`)
+   - System only needs data access (historical bars, positions, account info)
+   - No order placement through TWS API (PaperExecutor handles orders)
+   - Readonly connections don't trigger TWS security dialogs
+   - Faster connection handshake
+   - Less prone to zombie connections
+
+2. **Zombie Connection Cleanup** (`robo_trader/utils/robust_connection.py`)
+   - Always disconnect on connection failure
+   - Prevents CLOSE_WAIT state accumulation
+   - Clean retry logic with exponential backoff
+
+**Current Status in Main:**
+- ✅ Connections work reliably
+- ✅ No zombie connection accumulation
+- ✅ No TWS security dialogs
+- ✅ Connection Manager in `connection_manager.py` handles all IBKR connectivity
+
+### The Alternative Solution in Unmerged Branches ❌
+**Branches:** `fix/subprocess-ibkr-wrapper`, `cursor/*`
+
+**Approach:**
+- Complete process isolation via subprocess
+- JSON IPC between main process and subprocess worker
+- Worker runs `ib_async` in clean environment without `patchAsyncio()`
+
+**Why It's Not in Main:**
+1. **Problem was solved differently:** Readonly mode + zombie cleanup proved sufficient
+2. **Simpler solution preferred:** Direct connection with proper cleanup vs. subprocess complexity
+3. **Developed in parallel:** Subprocess work started before readonly fix was discovered
+4. **Not needed:** Main branch connection is working reliably with simpler approach
+
+**Verdict:** The subprocess approach is technically sound and thoroughly tested, but unnecessary because main branch solved the problem more simply.
 
 ---
 
