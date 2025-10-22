@@ -28,8 +28,24 @@ TWS (Trader Workstation) and IBKR Gateway require manual login with credentials 
 - ❌ `pkill -f "ibgateway"` or Gateway process killing
 - ❌ Killing any Java processes related to IBKR
 - ❌ Automatic TWS restart attempts
+- ❌ **NEVER USE `lsof -ti:7497 | xargs kill` - THIS KILLS TWS!**
 
 **If TWS needs restart:** User must do it manually with login credentials.
+
+**CRITICAL - ZOMBIE CONNECTION HANDLING:**
+- Zombie CLOSE_WAIT connections ARE HARMFUL - they cause connection timeouts
+- They must be killed to restore connectivity
+- **DO NOT KILL TWS - USE SAFE ZOMBIE KILL COMMAND:**
+```bash
+# SAFE - Kills ONLY zombies, NOT TWS
+lsof -ti tcp:7497 -sTCP:CLOSE_WAIT | xargs kill -9
+
+# DANGEROUS - Kills EVERYTHING including TWS (NEVER USE)
+lsof -ti:7497 | xargs kill
+```
+- The system has `kill_tws_zombie_connections()` in `robust_connection.py:161`
+- Zombies accumulate from failed handshakes and prevent new connections
+- See commits bd87fe5, f55015c for zombie connection bug fixes
 
 **Safe Process Kill Command (Python only):**
 ```bash

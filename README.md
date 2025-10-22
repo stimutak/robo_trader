@@ -196,6 +196,9 @@ Create a `.env` file:
 IBKR_HOST=127.0.0.1
 IBKR_PORT=7497              # TWS Paper: 7497, Live: 7496
 IBKR_CLIENT_ID=123
+IBKR_READONLY=true          # Keep Gateway/TWS in read-only mode
+IBKR_TIMEOUT=10.0           # Handshake timeout (seconds)
+IBKR_SSL_MODE=auto          # auto | require (TLS only) | disabled (plain TCP)
 
 # Trading Mode
 EXECUTION_MODE=paper         # paper or live
@@ -215,6 +218,8 @@ ML_MIN_TRAIN_SAMPLES=100     # Minimum samples for training
 MONITORING_LOG_FORMAT=plain   # plain or json
 DASH_PORT=5555               # Dashboard port
 ```
+
+> ℹ️ **IBKR SSL mode**: leave `IBKR_SSL_MODE=auto` to try plain TCP first and fall back to TLS automatically. If your Gateway is configured to require TLS, set it to `require` to skip the initial plain attempt.
 
 ## 🧪 Testing
 
