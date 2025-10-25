@@ -473,21 +473,58 @@ class AsyncRunner:
                 logger.error(f"Port test failed: {e}")
                 return False
 
-        host = self.cfg.ibkr.host
-        port = self.cfg.ibkr.port
+        # Auto-detect IBKR port if environment variable is set or config port fails
+        from .utils.ibkr_port_detection import get_ibkr_port
 
+        host = self.cfg.ibkr.host
+        config_port = self.cfg.ibkr.port
+
+        # Check if environment variable overrides config
+        env_port = os.getenv("IBKR_PORT")
+        if env_port:
+            try:
+                port = int(env_port)
+                logger.info(f"Using IBKR_PORT from environment: {port}")
+            except ValueError:
+                port = config_port
+                logger.warning(f"Invalid IBKR_PORT in environment, using config: {port}")
+        else:
+            port = config_port
+
+        # Test configured port first
         if not test_port_open(host=host, port=port):
-            logger.error(f"❌ IBKR PRE-FLIGHT CHECK FAILED")
-            logger.error(f"Port {port} is not open on host {host} - TWS/IB Gateway not running")
-            logger.error("Please ensure TWS or IB Gateway is running and configured properly:")
-            logger.error("1. Start TWS/IB Gateway")
-            logger.error("2. Enable API connections in Global Configuration")
-            logger.error("3. Set correct port (7497 for paper, 7496 for live)")
-            logger.error("4. Allow connections from localhost")
-            logger.error("REFUSING TO START WITHOUT IBKR CONNECTION")
-            sys.exit(1)
+            logger.warning(f"Configured port {port} is not open, attempting auto-detection...")
+
+            # Try auto-detection
+            detected_port, reason = get_ibkr_port(fallback_port=port)
+            logger.info(f"Port detection: {reason}")
+
+            # Test detected port
+            if detected_port != port and test_port_open(host=host, port=detected_port):
+                logger.info(f"✓ Auto-detected port {detected_port} is open, using it instead of config port {port}")
+                port = detected_port
+            else:
+                logger.error(f"❌ IBKR PRE-FLIGHT CHECK FAILED")
+                logger.error(f"Neither config port {config_port} nor detected port {detected_port} is open")
+                logger.error("Please ensure TWS or IB Gateway is running and configured properly:")
+                logger.error("1. Start TWS/IB Gateway")
+                logger.error("2. Enable API connections in Global Configuration → API → Settings")
+                logger.error("3. Check 'Enable ActiveX and Socket Clients'")
+                logger.error("4. Add 127.0.0.1 to Trusted IPs")
+                logger.error("5. Correct ports: Gateway Paper=4002, Gateway Live=4001, TWS Paper=7497, TWS Live=7496")
+                logger.error("REFUSING TO START WITHOUT IBKR CONNECTION")
+                sys.exit(1)
 
         logger.info(f"✓ Port {port} is open - proceeding to IBKR connect")
+
+        # Determine service type for logging
+        if port in (4002, 4001):
+            service_name = "Gateway"
+            env_name = "Paper" if port == 4002 else "Live"
+        else:
+            service_name = "TWS"
+            env_name = "Paper" if port == 7497 else "Live"
+        logger.info(f"Detected IBKR service: {service_name} {env_name} on port {port}")
 
         # CRITICAL: Kill ALL zombie connections before attempting to connect
         # This is essential because Gateway-owned zombies block new API handshakes
@@ -1003,10 +1040,23 @@ class AsyncRunner:
 
             # Reconnect using robust connection
             from .utils.robust_connection import CircuitBreakerConfig, connect_ibkr_robust
+            from .utils.ibkr_port_detection import get_ibkr_port
 
             # Get connection parameters from config
             host = self.cfg.ibkr.host
-            port = self.cfg.ibkr.port
+
+            # Use auto-detection for port (same logic as setup)
+            env_port = os.getenv("IBKR_PORT")
+            if env_port:
+                try:
+                    port = int(env_port)
+                    logger.info(f"Reconnecting using IBKR_PORT from environment: {port}")
+                except ValueError:
+                    port, reason = get_ibkr_port(fallback_port=self.cfg.ibkr.port)
+                    logger.info(f"Auto-detected port for reconnection: {port} - {reason}")
+            else:
+                port, reason = get_ibkr_port(fallback_port=self.cfg.ibkr.port)
+                logger.info(f"Auto-detected port for reconnection: {port} - {reason}")
 
             circuit_config = CircuitBreakerConfig(
                 failure_threshold=int(os.getenv("CIRCUIT_BREAKER_THRESHOLD", "5")),
