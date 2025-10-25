@@ -260,6 +260,7 @@ class _ConnectFileLock:
             self._fh = open(self.lock_path, "w")
             fcntl.flock(self._fh, fcntl.LOCK_EX)
             signal.alarm(0)  # Cancel alarm on success
+            signal.signal(signal.SIGALRM, old_handler)  # Restore handler on success
             return self
         except Exception:
             signal.alarm(0)  # Cancel alarm on error
