@@ -4,7 +4,7 @@
       "quantity": 100,
       "avg_price": 150,
       "value": 15200,
-      "entry_time": "2025-09-27 17:49:48.611128-04:00"
+      "entry_time": "2025-10-23 00:22:03.958918-04:00"
     }
   },
   "daily_pnl": 0.0,
@@ -12,5 +12,5 @@
   "current_capital": 100000,
   "kill_switch_triggered": false,
   "kelly_trades": [],
-  "timestamp": "2025-09-27T17:49:48.611233-04:00"
+  "timestamp": "2025-10-23T00:22:03.958994-04:00"
 }

@@ -2955,18 +2955,19 @@ def market_status():
 
 def check_ibkr_connection():
     """
-    Check TWS connection using simple TCP socket check (no zombies).
+    Check TWS/Gateway connection using simple TCP socket check (no zombies).
 
-    Uses basic socket connection to port 7497 to verify TWS is listening.
+    Checks both TWS (port 7497) and Gateway (port 4002) to see which is running.
     No IB API handshake = no zombie connections.
     """
     import socket
 
     tws_healthy = False
+    gateway_healthy = False
     status_msg = "Unknown"
 
+    # Check TWS (port 7497)
     try:
-        # Simple TCP socket check - connect and immediately close
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(1)  # 1 second timeout
         result = sock.connect_ex(("127.0.0.1", 7497))
@@ -2974,14 +2975,37 @@ def check_ibkr_connection():
 
         if result == 0:
             tws_healthy = True
-            status_msg = "TWS port 7497 listening"
-        else:
-            status_msg = "TWS not responding on port 7497"
     except Exception as e:
-        status_msg = f"TWS check error: {str(e)[:30]}"
         logger.debug(f"TWS health check error: {e}")
 
-    return {"connected": tws_healthy, "status": status_msg}
+    # Check Gateway (port 4002)
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)  # 1 second timeout
+        result = sock.connect_ex(("127.0.0.1", 4002))
+        sock.close()
+
+        if result == 0:
+            gateway_healthy = True
+    except Exception as e:
+        logger.debug(f"Gateway health check error: {e}")
+
+    # Determine status message
+    if tws_healthy and gateway_healthy:
+        status_msg = "TWS (7497) and Gateway (4002) running"
+    elif tws_healthy:
+        status_msg = "TWS running (port 7497)"
+    elif gateway_healthy:
+        status_msg = "Gateway running (port 4002)"
+    else:
+        status_msg = "No TWS/Gateway detected"
+
+    return {
+        "connected": tws_healthy or gateway_healthy,
+        "status": status_msg,
+        "tws_running": tws_healthy,
+        "gateway_running": gateway_healthy,
+    }
 
 
 @app.route("/api/status")
@@ -3044,10 +3068,22 @@ def status():
         status_message = "✅ Market Open - Active Trading"
         status_detail = "Runner connected and processing market data"
 
-    # Check TWS health with sync approach (no zombies)
-    tws_check = check_ibkr_connection()
-    tws_connected = tws_check.get("connected", False)
-    tws_status_msg = tws_check.get("status", "Unknown")
+    # Check TWS/Gateway health with sync approach (no zombies)
+    ibkr_check = check_ibkr_connection()
+    ibkr_connected = ibkr_check.get("connected", False)
+    ibkr_status_msg = ibkr_check.get("status", "Unknown")
+    tws_running = ibkr_check.get("tws_running", False)
+    gateway_running = ibkr_check.get("gateway_running", False)
+
+    # Get symbol count from user_settings.json
+    symbols_count = 0
+    try:
+        with open("user_settings.json", "r") as f:
+            settings = json.load(f)
+            symbols = settings.get("default", {}).get("symbols", [])
+            symbols_count = len(symbols)
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        symbols_count = 0
 
     # Return status with NO FAKE DATA
     # is_trading = True ONLY when runner is running AND market is open
@@ -3057,14 +3093,17 @@ def status():
         {
             "trading_status": {
                 "is_trading": is_actually_trading,
-                "connected": tws_connected,  # Real TWS connection status
+                "connected": ibkr_connected,  # Real TWS/Gateway connection status
                 "market_open": market_open,
                 "mode": "paper",
                 "session_start": datetime.now().isoformat(),
                 "message": status_message,
                 "detail": status_detail,
                 "runner_state": "running" if runner_running else "stopped",
-                "tws_health": tws_status_msg,
+                "tws_health": ibkr_status_msg,
+                "tws_running": tws_running,  # TWS status
+                "gateway_running": gateway_running,  # Gateway status
+                "symbols_count": symbols_count,  # Number of symbols being traded
             },
             "pnl": None,  # No fake data - will be populated when runner connects
             "metrics": None,  # No fake data - will be populated when runner connects
@@ -4993,7 +5032,7 @@ def stop_trading():
 @app.route("/api/logs")
 @requires_auth
 def get_logs():
-    """Get recent logs from log file"""
+    """Get recent logs from log file (newest first)"""
     logs = []
     log_file = "robo_trader.log"
 
@@ -5008,11 +5047,27 @@ def get_logs():
                 try:
                     # Parse JSON log entry
                     log_entry = json.loads(line)
-                    timestamp = (
-                        log_entry.get("timestamp", "").split("T")[1].split(".")[0]
-                        if "timestamp" in log_entry
-                        else ""
-                    )
+
+                    # Parse ISO timestamp and convert to local time
+                    timestamp_str = log_entry.get("timestamp", "")
+                    if timestamp_str:
+                        try:
+                            # Parse ISO format timestamp
+                            from datetime import datetime
+
+                            dt = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+                            # Format as local time HH:MM:SS
+                            timestamp = dt.strftime("%H:%M:%S")
+                        except Exception:
+                            # Fallback to simple parsing
+                            timestamp = (
+                                timestamp_str.split("T")[1].split(".")[0]
+                                if "T" in timestamp_str
+                                else ""
+                            )
+                    else:
+                        timestamp = ""
+
                     message = log_entry.get("message", "")
 
                     # Extract event from nested JSON if present
@@ -5036,7 +5091,8 @@ def get_logs():
     except Exception as e:
         logs.append(f"Error reading logs: {str(e)}")
 
-    return jsonify({"logs": logs[-100:]})  # Last 100 log entries
+    # Return logs in reverse order (newest first)
+    return jsonify({"logs": list(reversed(logs[-100:]))})
 
 
 if __name__ == "__main__":

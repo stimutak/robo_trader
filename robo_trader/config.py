@@ -9,7 +9,7 @@ import os
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -249,12 +249,21 @@ class IBKRConfig(BaseModel):
     account: Optional[str] = Field(default=None, description="IBKR account number")
     readonly: bool = Field(default=True, description="Connect in read-only mode")
     timeout: float = Field(default=10.0, gt=0, description="Connection timeout in seconds")
+    ssl_mode: Literal["auto", "require", "disabled"] = Field(
+        default="auto",
+        description=(
+            "Socket transport strategy: auto (try TCP then TLS), require (TLS only), disabled (TCP only)"
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_port_for_mode(self) -> "IBKRConfig":
         """Validate port matches trading mode."""
         # TWS Paper: 7497, TWS Live: 7496
         # Gateway Paper: 4002, Gateway Live: 4001
+        allowed_ssl_modes = {"auto", "require", "disabled"}
+        if self.ssl_mode not in allowed_ssl_modes:
+            raise ValueError(f"ssl_mode must be one of {sorted(allowed_ssl_modes)}")
         return self
 
 
@@ -497,6 +506,7 @@ def load_config_from_env() -> Config:
             ),
             "readonly": os.getenv("IBKR_READONLY", "true").lower() == "true",
             "timeout": float(os.getenv("IBKR_TIMEOUT", "10.0")),
+            "ssl_mode": os.getenv("IBKR_SSL_MODE", "auto").strip().lower(),
         },
         "strategy": {
             "enabled_strategies": os.getenv("STRATEGY_ENABLED", "momentum,mean_reversion").split(

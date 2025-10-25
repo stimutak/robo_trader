@@ -83,6 +83,26 @@ cp .env.example .env
 
 ### Running the System
 
+**Recommended: Use the automated startup script**
+
+```bash
+# Start with default symbols (from user_settings.json)
+./START_TRADER.sh
+
+# Start with custom symbols
+./START_TRADER.sh "AAPL,NVDA,TSLA,QQQ"
+```
+
+The startup script automatically:
+- ✅ Kills existing processes
+- ✅ Cleans up zombie connections
+- ✅ Tests Gateway connectivity
+- ✅ Starts WebSocket server
+- ✅ Starts trading system
+- ✅ Monitors startup health
+
+**Manual startup (advanced users):**
+
 ```bash
 # Always activate virtual environment first
 source venv/bin/activate
@@ -102,6 +122,19 @@ python test_ml_pipeline.py
 
 # Option 5: Test ML Enhanced Strategy
 python test_ml_enhanced_strategy.py
+```
+
+**Diagnostic tools:**
+
+```bash
+# Test Gateway connectivity
+./force_gateway_reconnect.sh
+
+# Full system diagnostics
+python diagnose_gateway_api.py
+
+# Check for zombie connections
+lsof -nP -iTCP:4002 -sTCP:CLOSE_WAIT
 ```
 
 ## 📊 ML Capabilities
@@ -196,6 +229,9 @@ Create a `.env` file:
 IBKR_HOST=127.0.0.1
 IBKR_PORT=7497              # TWS Paper: 7497, Live: 7496
 IBKR_CLIENT_ID=123
+IBKR_READONLY=true          # Keep Gateway/TWS in read-only mode
+IBKR_TIMEOUT=10.0           # Handshake timeout (seconds)
+IBKR_SSL_MODE=auto          # auto | require (TLS only) | disabled (plain TCP)
 
 # Trading Mode
 EXECUTION_MODE=paper         # paper or live
@@ -215,6 +251,8 @@ ML_MIN_TRAIN_SAMPLES=100     # Minimum samples for training
 MONITORING_LOG_FORMAT=plain   # plain or json
 DASH_PORT=5555               # Dashboard port
 ```
+
+> ℹ️ **IBKR SSL mode**: leave `IBKR_SSL_MODE=auto` to try plain TCP first and fall back to TLS automatically. If your Gateway is configured to require TLS, set it to `require` to skip the initial plain attempt.
 
 ## 🧪 Testing
 
@@ -384,15 +422,32 @@ ls trained_models/
 
 **IBKR Connection Failed**
 ```bash
+# Use automated diagnostics (RECOMMENDED)
+./force_gateway_reconnect.sh
+python diagnose_gateway_api.py
+
+# Or manual checks:
 # Verify TWS/Gateway running
-# Check port (Paper: 7497, Live: 7496)
-# Enable API in TWS settings
-# Check for stuck connections: netstat -an | grep 7497
-# Restart TWS if CLOSE_WAIT connections exist
-# Test basic connection: python3 test_exact_working.py
+# Check port (Paper: 4002, Live: 4001)
+# Enable API in Gateway settings:
+#   File → Global Configuration → API → Settings
+#   ☑️ Enable ActiveX and Socket Clients
+#   Add 127.0.0.1 to Trusted IPs
+# Check for stuck connections: netstat -an | grep 4002
+# Clean up zombies: ./START_TRADER.sh
 ```
 
-**TWS API Timeout Issues (RESOLVED)**
+**Gateway API Handshake Timeout (2025-10-23)**
+- **Symptom:** TCP connection succeeds but API handshake times out
+- **Cause:** Gateway API socket clients not enabled or Gateway in bad state
+- **Solution:**
+  1. Check Gateway API settings (see above)
+  2. Run `./force_gateway_reconnect.sh` to test
+  3. Use `./START_TRADER.sh` for automatic zombie cleanup
+  4. Restart Gateway if needed (requires 2FA)
+- **Prevention:** Always use `START_TRADER.sh` for clean startup
+
+**TWS API Timeout Issues (RESOLVED 2025-09-23)**
 - Issue: `patchAsyncio()` caused API handshake timeouts
 - Solution: Subprocess-based IBKR operations for async isolation
 - Files: `robo_trader/clients/sync_ibkr_wrapper.py`
@@ -400,8 +455,15 @@ ls trained_models/
 
 ## 📚 Documentation
 
-- CRITICAL_BUG_FIXES_SUMMARY.md: Summary of recent critical fixes
-- tests/test_critical_bug_fixes.py: Regression suite for critical fixes
+- `IMPLEMENTATION_PLAN.md`: Complete development roadmap
+- `handoff/LATEST_HANDOFF.md`: Latest session notes
+- `CLAUDE.md`: Project guidelines and startup commands
+- `REAL_ISSUE_ANALYSIS.md`: Gateway connection troubleshooting
+- `START_TRADER.sh`: Automated startup script with zombie cleanup
+- `force_gateway_reconnect.sh`: Gateway connectivity testing
+- `diagnose_gateway_api.py`: Comprehensive diagnostics
+- `CRITICAL_BUG_FIXES_SUMMARY.md`: Summary of recent critical fixes
+- `tests/test_critical_bug_fixes.py`: Regression suite for critical fixes
 
 - `IMPLEMENTATION_PLAN.md`: Complete development roadmap
 - `handoff/LATEST_HANDOFF.md`: Latest session notes

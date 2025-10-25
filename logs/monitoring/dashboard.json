@@ -1,8 +1,8 @@
 {
   "status": {
     "is_running": true,
-    "uptime_hours": 0.0014491330555555554,
-    "start_time": "2025-09-27T17:49:39.206541"
+    "uptime_hours": 0.0014475769444444444,
+    "start_time": "2025-10-23T00:21:54.688860"
   },
   "metrics": {
     "success_rate": 0.5,
@@ -13,12 +13,12 @@
   },
   "health": {
     "is_healthy": true,
-    "cpu_percent": 12.3,
-    "memory_percent": 58.1,
-    "disk_usage_percent": 9.2,
+    "cpu_percent": 13.8,
+    "memory_percent": 58.0,
+    "disk_usage_percent": 6.4,
     "warnings": [],
     "errors": [
-      "psutil error: (pid=25355)"
+      "psutil error: (pid=22422)"
     ]
   },
   "alerts": {
@@ -26,14 +26,14 @@
     "triggered_today": 2,
     "recent": [
       {
-        "timestamp": "2025-09-27T17:49:39.315408",
+        "timestamp": "2025-10-23T00:21:54.790957",
         "alert": "high_error_rate",
         "severity": "error",
         "message": "Error rate is 50.00%",
         "value": 0.5
       },
       {
-        "timestamp": "2025-09-27T17:49:39.315479",
+        "timestamp": "2025-10-23T00:21:54.790986",
         "alert": "low_success_rate",
         "severity": "warning",
         "message": "Success rate dropped to 50.00%",

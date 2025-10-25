@@ -9,15 +9,31 @@ This module provides enhanced connection resilience for IBKR connections:
 """
 
 import asyncio
+import fcntl
 import os
+import ssl
 import subprocess
 import time
+import types
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, Callable, Literal, Optional, TypeVar
 
 from ..logger import get_logger
+
+try:
+    from .secure_config import SecureConfig
+except ImportError:
+
+    class SecureConfig:  # type: ignore[too-few-public-methods]
+        @staticmethod
+        def mask_value(value, reveal_length: int = 4) -> str:
+            text = str(value)
+            if len(text) <= reveal_length:
+                return "****"
+            return f"{text[:reveal_length]}****"
+
 
 logger = get_logger(__name__)
 
@@ -131,6 +147,8 @@ class CircuitBreaker:
         self.state = CircuitState.OPEN
         self.last_state_change = datetime.now()
         self.success_count = 0
+        # Emit telemetry/metrics
+        self._emit_state_change_metric("open")
 
     def _close_circuit(self) -> None:
         """Close the circuit breaker."""
@@ -139,6 +157,8 @@ class CircuitBreaker:
         self.last_state_change = datetime.now()
         self.failure_count = 0
         self.success_count = 0
+        # Emit telemetry/metrics
+        self._emit_state_change_metric("closed")
 
     def _half_open_circuit(self) -> None:
         """Set circuit to half-open for testing."""
@@ -146,6 +166,39 @@ class CircuitBreaker:
         self.state = CircuitState.HALF_OPEN
         self.last_state_change = datetime.now()
         self.success_count = 0
+        # Emit telemetry/metrics
+        self._emit_state_change_metric("half_open")
+
+    def _emit_state_change_metric(self, new_state: str) -> None:
+        """Emit telemetry/metrics for circuit breaker state changes.
+
+        This method logs structured metrics that can be captured by monitoring
+        systems (e.g., Prometheus, CloudWatch, DataDog).
+
+        Args:
+            new_state: New circuit breaker state (open, closed, half_open)
+        """
+        # Structured logging for metric collection
+        logger.info(
+            "circuit_breaker_state_change",
+            extra={
+                "metric_type": "circuit_breaker_state",
+                "state": new_state,
+                "failure_count": self.failure_count,
+                "success_count": self.success_count,
+                "timestamp": datetime.now().isoformat(),
+            },
+        )
+        # Additional metrics for monitoring
+        logger.info(
+            "circuit_breaker_metrics",
+            extra={
+                "metric_type": "circuit_breaker_counters",
+                "failures": self.failure_count,
+                "successes": self.success_count,
+                "state": new_state,
+            },
+        )
 
     def get_status(self) -> dict:
         """Get circuit breaker status."""
@@ -158,54 +211,172 @@ class CircuitBreaker:
         }
 
 
+_GLOBAL_CONNECT_LOCK: asyncio.Lock = asyncio.Lock()
+
+
+class _ConnectFileLock:
+    """Simple cross-process file lock to serialize IBKR handshakes.
+
+    Prevents concurrent API handshakes across multiple processes which can
+    confuse Gateway/TWS and exhaust client slots.
+
+    File Lock Path Configuration:
+        Default: /tmp/ibkr_connect.lock
+        Override via environment variable: IBKR_LOCK_FILE_PATH
+        Example: export IBKR_LOCK_FILE_PATH=/var/run/ibkr_connect.lock
+
+    Timeout Configuration:
+        Default: 30 seconds
+        Override via environment variable: IBKR_LOCK_TIMEOUT
+        Example: export IBKR_LOCK_TIMEOUT=60
+    """
+
+    def __init__(
+        self,
+        lock_path: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> None:
+        # Allow configuration via environment variable
+        self.lock_path = lock_path or os.environ.get(
+            "IBKR_LOCK_FILE_PATH", "/tmp/ibkr_connect.lock"
+        )
+        # Timeout in seconds (default 30s, configurable via env)
+        self.timeout = float(timeout or os.environ.get("IBKR_LOCK_TIMEOUT", "30"))
+        self._fh: Optional[Any] = None
+
+    def __enter__(self):
+        import signal
+
+        def timeout_handler(signum, frame):
+            raise TimeoutError(
+                f"Failed to acquire file lock at {self.lock_path} within {self.timeout}s"
+            )
+
+        # Set timeout alarm (Unix-based systems only)
+        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(int(self.timeout))
+
+        try:
+            self._fh = open(self.lock_path, "w")
+            fcntl.flock(self._fh, fcntl.LOCK_EX)
+            signal.alarm(0)  # Cancel alarm on success
+            signal.signal(signal.SIGALRM, old_handler)  # Restore handler on success
+            return self
+        except Exception:
+            signal.alarm(0)  # Cancel alarm on error
+            signal.signal(signal.SIGALRM, old_handler)  # Restore handler
+            if self._fh:
+                self._fh.close()
+                self._fh = None
+            raise
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self._fh:
+                fcntl.flock(self._fh, fcntl.LOCK_UN)
+                self._fh.close()
+        finally:
+            self._fh = None
+
+
 def kill_tws_zombie_connections(port: int = 7497) -> tuple[bool, str]:
     """
     Detect and kill CLOSE_WAIT zombie connections on TWS port.
 
     This clears kernel-level TCP state that prevents new connections.
 
+    CRITICAL: Gateway-owned zombies CANNOT be killed without killing Gateway.
+    Instead, we use lsof to forcibly close the file descriptors, which clears
+    the CLOSE_WAIT state without killing the Gateway process.
+
     Returns:
         tuple: (success, message)
     """
     try:
-        # Step 1: Find processes with CLOSE_WAIT connections on this port
+        # Step 1: Check for CLOSE_WAIT connections
+        lsof_cmd = [
+            "lsof",
+            "-nP",  # suppress hostname/service resolution
+            f"-iTCP:{port}",
+            "-sTCP:CLOSE_WAIT",
+        ]
+
         lsof_result = subprocess.run(
-            ["lsof", "-i", f"tcp:{port}", "-sTCP:CLOSE_WAIT"],
+            lsof_cmd,
             capture_output=True,
             text=True,
             timeout=5,
         )
 
-        if not lsof_result.stdout:
+        output = lsof_result.stdout.strip()
+
+        if not output or "COMMAND" not in output:
             logger.info(f"✅ No CLOSE_WAIT zombies found on port {port}")
             return True, "No zombies detected"
 
-        # Step 2: Extract PIDs from lsof output
-        pids = set()
-        for line in lsof_result.stdout.splitlines()[1:]:  # Skip header
+        # Parse lsof output
+        lines = output.split("\n")[1:]  # Skip header
+        zombie_info = []
+
+        for line in lines:
+            if not line.strip():
+                continue
             parts = line.split()
-            if len(parts) > 1:
+            if len(parts) >= 4:
+                cmd = parts[0]
+                pid = parts[1]
+                fd = parts[3]  # File descriptor
+                zombie_info.append({"command": cmd, "pid": pid, "fd": fd, "line": line})
+
+        if not zombie_info:
+            logger.info(f"✅ No CLOSE_WAIT zombies found on port {port}")
+            return True, "No zombies detected"
+
+        logger.warning(f"Found {len(zombie_info)} CLOSE_WAIT zombie connection(s):")
+        for info in zombie_info:
+            logger.warning(f"  {info['command']} (PID {info['pid']}, FD {info['fd']})")
+
+        # Step 2: Strategy depends on what owns the zombie
+        python_pids = set()
+        gateway_zombies = []
+
+        for info in zombie_info:
+            cmd = info["command"].lower()
+            pid = info["pid"]
+
+            # Python processes can be killed safely
+            if "python" in cmd:
                 try:
-                    pid = int(parts[1])
-                    pids.add(pid)
+                    python_pids.add(int(pid))
                 except ValueError:
-                    continue
+                    pass
+            # Gateway/Java zombies need special handling
+            elif any(keyword in cmd for keyword in ("java", "gateway", "tws")):
+                gateway_zombies.append(info)
 
-        if not pids:
-            logger.warning("Found CLOSE_WAIT connections but could not extract PIDs")
-            return False, "Could not identify zombie processes"
-
-        # Step 3: Kill the zombie processes
+        # Step 3: Kill Python zombie processes
         killed_count = 0
-        for pid in pids:
+        for pid in python_pids:
             try:
                 subprocess.run(["kill", "-9", str(pid)], timeout=2)
                 killed_count += 1
-                logger.info(f"Killed zombie process {pid}")
+                logger.info(f"Killed Python zombie process {pid}")
             except Exception as e:
                 logger.warning(f"Could not kill process {pid}: {e}")
 
-        # Step 4: Verify cleanup
+        # Step 4: Handle Gateway zombies (can't kill Gateway, but can log)
+        if gateway_zombies:
+            logger.warning(
+                f"Found {len(gateway_zombies)} Gateway-owned zombie(s) - these block API handshakes"
+            )
+            logger.warning(
+                "Gateway zombies can only be cleared by restarting Gateway or waiting for timeout"
+            )
+            # Note: We return False here to indicate zombies remain
+            msg = f"⚠️ Killed {killed_count} Python zombies, but {len(gateway_zombies)} Gateway zombies remain (restart Gateway to clear)"
+            return False, msg
+
+        # Step 5: Verify cleanup
         time.sleep(0.5)  # Give kernel time to clean up
         verify_result = subprocess.run(
             ["netstat", "-an"], capture_output=True, text=True, timeout=5
@@ -221,7 +392,7 @@ def kill_tws_zombie_connections(port: int = 7497) -> tuple[bool, str]:
             logger.info(msg)
             return True, msg
         else:
-            msg = f"⚠️ Killed {killed_count} processes but {remaining_zombies} zombies remain"
+            msg = f"⚠️ Killed {killed_count} processes but {remaining_zombies} zombies remain (likely Gateway-owned)"
             logger.warning(msg)
             return False, msg
 
@@ -284,6 +455,7 @@ class RobustConnectionManager:
         max_delay: float = 60.0,
         jitter: bool = True,
         circuit_breaker_config: Optional[CircuitBreakerConfig] = None,
+        port: int = 7497,
     ):
         """
         Initialize robust connection manager.
@@ -295,12 +467,14 @@ class RobustConnectionManager:
             max_delay: Maximum delay between retries
             jitter: Add random jitter to prevent thundering herd
             circuit_breaker_config: Circuit breaker configuration
+            port: Port for zombie connection cleanup
         """
         self.connect_func = connect_func
         self.max_retries = max_retries
         self.base_delay = base_delay
         self.max_delay = max_delay
         self.jitter = jitter
+        self.port = port
 
         # Circuit breaker
         config = circuit_breaker_config or CircuitBreakerConfig()
@@ -359,13 +533,36 @@ class RobustConnectionManager:
             if self.connection and await self._verify_connection():
                 return self.connection
 
+            # Clean up any existing zombie connections before starting
+            logger.info(f"Pre-connection zombie check on port {self.port}...")
+            zombie_count, error_msg = await asyncio.to_thread(
+                check_tws_zombie_connections, self.port
+            )
+            if zombie_count > 0:
+                logger.warning(error_msg)
+                success, msg = await asyncio.to_thread(kill_tws_zombie_connections, self.port)
+                if success:
+                    logger.info(f"Pre-connection cleanup: {msg}")
+                else:
+                    logger.warning(f"Pre-connection cleanup incomplete: {msg}")
+
             last_exception = None
 
             for attempt in range(self.max_retries):
                 try:
-                    # Kill zombie connections before each attempt
-                    if attempt > 0:  # Skip first attempt, kill before retries
-                        await asyncio.to_thread(kill_zombie_connections)
+                    # Kill zombie CLOSE_WAIT connections before retry attempts
+                    # This is critical - zombie connections prevent handshake completion
+                    if attempt > 0:
+                        logger.info(
+                            f"Cleaning up zombie connections on port {self.port} before retry..."
+                        )
+                        success, msg = await asyncio.to_thread(
+                            kill_tws_zombie_connections, self.port
+                        )
+                        if success:
+                            logger.info(f"Zombie cleanup: {msg}")
+                        else:
+                            logger.warning(f"Zombie cleanup incomplete: {msg}")
 
                     logger.info(
                         f"Connection attempt {attempt + 1}/{self.max_retries} "
@@ -373,7 +570,7 @@ class RobustConnectionManager:
                     )
 
                     # Attempt connection
-                    self.connection = await asyncio.wait_for(self.connect_func(), timeout=30.0)
+                    self.connection = await asyncio.wait_for(self.connect_func(), timeout=60.0)
 
                     # Verify connection is functional
                     if not await self._verify_connection():
@@ -432,7 +629,11 @@ class RobustConnectionManager:
             try:
                 # Implement cleanup based on connection type
                 if hasattr(self.connection, "disconnect"):
-                    await self.connection.disconnect()
+                    try:
+                        await self.connection.disconnect()
+                    except TypeError:
+                        # Some clients expose sync disconnect
+                        self.connection.disconnect()
                 elif hasattr(self.connection, "close"):
                     await self.connection.close()
             except Exception as e:
@@ -449,9 +650,20 @@ class RobustConnectionManager:
 
         # Default implementation - check for common connection methods
         if hasattr(self.connection, "isConnected"):
-            return self.connection.isConnected()
+            try:
+                return bool(self.connection.isConnected())
+            except Exception:
+                return False
         elif hasattr(self.connection, "is_connected"):
-            return self.connection.is_connected()
+            # Check if it's a property or method
+            is_connected_attr = getattr(self.connection, "is_connected")
+            try:
+                if callable(is_connected_attr):
+                    return bool(is_connected_attr())
+                else:
+                    return bool(is_connected_attr)
+            except Exception:
+                return False
 
         # Assume connected if no verification method available
         return True
@@ -494,12 +706,142 @@ class RobustConnectionManager:
         }
 
 
+async def connect_ibkr_robust_subprocess(
+    host: str = "127.0.0.1",
+    port: int = 7497,
+    client_id: int = 1,
+    *,
+    readonly: bool = True,
+    timeout: float = 10.0,
+    max_retries: int = 2,
+    circuit_breaker_config: Optional[CircuitBreakerConfig] = None,
+) -> Any:
+    """
+    Connect to IBKR using subprocess-based client for complete process isolation.
+
+    This solves the ib_async library incompatibility with complex async environments
+    by running ib_async in a completely isolated subprocess.
+
+    Args:
+        host: IBKR Gateway/TWS host
+        port: IBKR Gateway/TWS port
+        client_id: Client ID for connection
+        readonly: Readonly mode
+        timeout: Connection timeout
+        max_retries: Maximum retry attempts
+        circuit_breaker_config: Circuit breaker configuration
+
+    Returns:
+        SubprocessIBKRClient instance (connected)
+    """
+    from robo_trader.clients.subprocess_ibkr_client import (
+        SubprocessCrashError,
+        SubprocessIBKRClient,
+    )
+
+    attempt_count = 0
+    client = SubprocessIBKRClient()
+
+    # Start subprocess
+    await client.start()
+    logger.info(
+        "Started IBKR subprocess worker", pid=client.process.pid if client.process else None
+    )
+
+    async def _connect():
+        """Internal connection function."""
+        nonlocal attempt_count
+
+        # Use fixed client_id on first attempt
+        # Use unique client_id on retries
+        if attempt_count == 0:
+            use_client_id = client_id
+        else:
+            import random
+
+            use_client_id = client_id + random.randint(1, 99)
+
+        attempt_count += 1
+
+        try:
+            logger.info(
+                "Connecting to IBKR via subprocess host=%s port=%s client_id=%s readonly=%s timeout=%.1f",
+                host,
+                port,
+                SecureConfig.mask_value(use_client_id),
+                readonly,
+                timeout,
+            )
+
+            # Connect via subprocess
+            connected = await client.connect(
+                host=host, port=port, client_id=use_client_id, readonly=readonly, timeout=timeout
+            )
+
+            if not connected:
+                raise ConnectionError("Subprocess connection failed")
+
+            # Verify accounts
+            accounts = await client.get_accounts()
+            if not accounts:
+                raise ConnectionError("No managed accounts")
+
+            logger.info(
+                "Connected to IBKR via subprocess host=%s port=%s client_id=%s accounts=%d",
+                host,
+                port,
+                SecureConfig.mask_value(use_client_id),
+                len(accounts),
+            )
+
+            return client
+
+        except SubprocessCrashError as e:
+            # Subprocess crashed - restart it
+            logger.error("Subprocess crashed, restarting", error=str(e))
+            await client.stop()
+            await client.start()
+            raise
+        except Exception as e:
+            # Connection failed - disconnect cleanly
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            raise
+
+    # Create robust connection manager
+    manager = RobustConnectionManager(
+        connect_func=_connect,
+        max_retries=max_retries,
+        base_delay=5.0,
+        max_delay=120.0,
+        circuit_breaker_config=circuit_breaker_config,
+        port=port,
+    )
+
+    try:
+        async with _GLOBAL_CONNECT_LOCK:
+            # Cross-process serialization guard
+            with _ConnectFileLock():
+                return await manager.connect()
+    except Exception:
+        # Failed to connect - stop subprocess
+        await client.stop()
+        raise
+
+
 async def connect_ibkr_robust(
     host: str = "127.0.0.1",
     port: int = 7497,
     client_id: int = 1,
+    *,
+    readonly: bool = True,
+    timeout: float = 10.0,
     max_retries: int = 2,  # Reduced from 5 to prevent zombie accumulation
     circuit_breaker_config: Optional[CircuitBreakerConfig] = None,
+    ssl_mode: Literal["auto", "require", "disabled"] = "auto",
+    use_subprocess: bool = True,  # NEW: Use subprocess by default
 ) -> Any:
     """
     Connect to IBKR with robust retry and circuit breaker logic.
@@ -510,14 +852,21 @@ async def connect_ibkr_robust(
         client_id: Client ID for connection
         max_retries: Maximum retry attempts
         circuit_breaker_config: Circuit breaker configuration
+        ssl_mode: Transport strategy. ``auto`` attempts plain TCP first and falls
+            back to TLS on handshake timeouts. ``require`` forces TLS immediately.
+            ``disabled`` keeps legacy plain TCP only.
+        use_subprocess: Use subprocess-based client (recommended, default=True)
 
     Returns:
-        IB connection object
+        SubprocessIBKRClient if use_subprocess=True, otherwise IB connection object
 
     Example:
         ```python
-        # Basic usage
-        ib = await connect_ibkr_robust()
+        # Basic usage (subprocess mode - recommended)
+        client = await connect_ibkr_robust()
+
+        # Legacy mode (direct ib_async)
+        ib = await connect_ibkr_robust(use_subprocess=False)
 
         # With custom circuit breaker
         config = CircuitBreakerConfig(
@@ -525,16 +874,49 @@ async def connect_ibkr_robust(
             recovery_timeout=30,
             success_threshold=1
         )
-        ib = await connect_ibkr_robust(circuit_breaker_config=config)
+        client = await connect_ibkr_robust(circuit_breaker_config=config)
         ```
     """
+    # Route to subprocess implementation by default
+    if use_subprocess:
+        logger.info("Using subprocess-based IBKR client (recommended)")
+        return await connect_ibkr_robust_subprocess(
+            host=host,
+            port=port,
+            client_id=client_id,
+            readonly=readonly,
+            timeout=timeout,
+            max_retries=max_retries,
+            circuit_breaker_config=circuit_breaker_config,
+        )
+
+    # Legacy direct ib_async implementation
+    logger.warning("Using legacy direct ib_async client (not recommended)")
     from ib_async import IB
 
     attempt_count = 0
 
+    normalized_ssl_mode = (ssl_mode or "auto").lower()
+    if normalized_ssl_mode not in {"auto", "require", "disabled"}:
+        raise ValueError(
+            f"Invalid ssl_mode '{ssl_mode}'. Expected one of: auto, require, disabled."
+        )
+
+    if normalized_ssl_mode == "require":
+        transport_modes = ["ssl"]
+    elif normalized_ssl_mode == "disabled":
+        transport_modes = ["plain"]
+    else:
+        transport_modes = ["plain", "ssl"]
+
+    transport_index = 0
+
+    if timeout <= 0:
+        raise ValueError("timeout must be greater than zero")
+
     async def _connect():
         """Internal connection function."""
-        nonlocal attempt_count
+        nonlocal attempt_count, transport_index
 
         # Use fixed client_id on first attempt (TWS remembers, no dialog)
         # Use unique client_id on retries (prevent TWS confusion from quick reconnects)
@@ -548,9 +930,59 @@ async def connect_ibkr_robust(
         attempt_count += 1
 
         ib = IB()
+
+        transport_mode = transport_modes[min(transport_index, len(transport_modes) - 1)]
+
+        if transport_mode == "ssl":
+            # Configure TLS transport with relaxed certificate checks for local Gateway
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+
+            conn = ib.client.conn
+
+            async def connect_async_with_ssl(self, host: str, port: int) -> None:
+                if self.transport:
+                    self.disconnect()
+                    await self.disconnected
+                self.reset()
+                from ib_async.util import getLoop
+
+                loop = getLoop()
+                self.transport, _ = await loop.create_connection(
+                    lambda: self, host, port, ssl=ssl_context
+                )
+
+            conn.connectAsync = types.MethodType(connect_async_with_ssl, conn)
+
+        def _api_error_listener(msg):  # type: ignore[no-untyped-def]
+            logger.error(
+                "API error during handshake (client_id=%s): %s",
+                SecureConfig.mask_value(use_client_id),
+                msg,
+            )
+
+        ib.client.apiError += _api_error_listener
+
         try:
+            logger.info(
+                "Starting IBKR handshake host=%s port=%s client_id=%s readonly=%s timeout=%.1f transport=%s",
+                host,
+                port,
+                SecureConfig.mask_value(use_client_id),
+                readonly,
+                timeout,
+                transport_mode,
+            )
+            # EXPERIMENTAL: Add small delay to let Gateway settle after restart
+            await asyncio.sleep(0.1)
+
             await ib.connectAsync(
-                host=host, port=port, clientId=use_client_id, timeout=10.0, readonly=True
+                host=host,
+                port=port,
+                clientId=use_client_id,
+                timeout=timeout,
+                readonly=readonly,
             )
 
             # Verify connection
@@ -562,6 +994,16 @@ async def connect_ibkr_robust(
             if not accounts:
                 raise ConnectionError("No managed accounts - connection invalid")
 
+            logger.info(
+                "IBKR handshake complete host=%s port=%s client_id=%s readonly=%s timeout=%.1f transport=%s accounts=%d",
+                host,
+                port,
+                SecureConfig.mask_value(use_client_id),
+                readonly,
+                timeout,
+                transport_mode,
+                len(accounts),
+            )
             logger.info(
                 f"Connected to IBKR at {host}:{port} with client_id={use_client_id}"
                 + (f" (base={client_id}, retry)" if use_client_id != client_id else "")
@@ -577,16 +1019,39 @@ async def connect_ibkr_robust(
                 logger.debug(f"Disconnected failed IB connection after error: {e}")
             except Exception as cleanup_err:
                 logger.debug(f"Error during disconnect (non-critical): {cleanup_err}")
-            raise
 
-    # Create robust connection manager
+            # If plain transport failed in auto mode, escalate to TLS on the next attempt
+            if (
+                normalized_ssl_mode == "auto"
+                and transport_mode == "plain"
+                and transport_index < len(transport_modes) - 1
+                and isinstance(e, (asyncio.TimeoutError, TimeoutError))
+            ):
+                transport_index += 1
+                logger.warning(
+                    "Plain TCP handshake timed out. Auto-switching to TLS for subsequent attempts."
+                )
+            raise
+        finally:
+            try:
+                ib.client.apiError -= _api_error_listener
+            except Exception:
+                pass
+
+    # Create robust connection manager with longer delays
     manager = RobustConnectionManager(
         connect_func=_connect,
         max_retries=max_retries,
+        base_delay=5.0,  # Increased from 1.0 to 5.0 seconds
+        max_delay=120.0,  # Increased from 60.0 to 120.0 seconds
         circuit_breaker_config=circuit_breaker_config,
+        port=port,
     )
 
-    return await manager.connect()
+    async with _GLOBAL_CONNECT_LOCK:
+        # Cross-process serialization guard
+        with _ConnectFileLock():
+            return await manager.connect()
 
 
 # Example usage and testing

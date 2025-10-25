@@ -137,6 +137,7 @@ class AsyncRunner:
         self.risk = None
         self.advanced_risk = None  # Advanced risk manager with Kelly sizing
         self.risk_monitor_task = None  # Background risk monitoring task
+        self.subprocess_monitor_task = None  # Background subprocess health monitoring task
         self.executor = None
         self.portfolio = None
         self.portfolio_manager: Optional[MultiStrategyPortfolioManager] = None
@@ -488,6 +489,30 @@ class AsyncRunner:
 
         logger.info(f"✓ Port {port} is open - proceeding to IBKR connect")
 
+        # CRITICAL: Kill ALL zombie connections before attempting to connect
+        # This is essential because Gateway-owned zombies block new API handshakes
+        logger.info("=" * 60)
+        logger.info("CLEANING UP ZOMBIE CONNECTIONS BEFORE CONNECT")
+        logger.info("=" * 60)
+
+        from .utils.robust_connection import (
+            check_tws_zombie_connections,
+            kill_tws_zombie_connections,
+        )
+
+        # Check for zombies
+        zombie_count, error_msg = check_tws_zombie_connections(port)
+        if zombie_count > 0:
+            logger.warning(f"Found {zombie_count} zombie connection(s) - cleaning up...")
+            success, msg = kill_tws_zombie_connections(port)
+            if success:
+                logger.info(f"✓ {msg}")
+            else:
+                logger.warning(f"⚠️ {msg}")
+                logger.warning("Proceeding anyway - connection may fail")
+        else:
+            logger.info("✓ No zombie connections found")
+
         # Log connection details with secure masking
         client_id_masked = SecureConfig.mask_value(self.cfg.ibkr.client_id)
         logger.info(
@@ -507,11 +532,22 @@ class AsyncRunner:
                 host=host,
                 port=port,
                 client_id=self.cfg.ibkr.client_id,
+                readonly=self.cfg.ibkr.readonly,
+                timeout=self.cfg.ibkr.timeout,
                 max_retries=2,  # Reduced from 5 to prevent zombie connection accumulation
                 circuit_breaker_config=circuit_config,
+                ssl_mode=self.cfg.ibkr.ssl_mode,
             )
             logger.info("✓ IBKR connection established successfully with robust connection")
             logger.info("=" * 60)
+
+            # Start subprocess health monitoring if using subprocess client
+            if hasattr(self.ib, "ping"):
+                self.subprocess_monitor_task = asyncio.create_task(
+                    self._monitor_subprocess_health()
+                )
+                logger.info("✓ Subprocess health monitoring started (60s interval)")
+
         except ConnectionError as e:
             logger.error(f"❌ IBKR CONNECTION FAILED: {e}")
             logger.error("Cannot proceed without IBKR connection")
@@ -536,9 +572,11 @@ class AsyncRunner:
             logger.info("Initializing advanced risk management with Kelly sizing and kill switches")
             self.advanced_risk = AdvancedRiskManager(
                 config={
-                    "starting_capital": self.default_cash
-                    if self.default_cash is not None
-                    else self.cfg.default_cash,
+                    "starting_capital": (
+                        self.default_cash
+                        if self.default_cash is not None
+                        else self.cfg.default_cash
+                    ),
                     "max_position_pct": 0.1,
                     "max_risk_per_trade": 0.02,
                 },
@@ -844,31 +882,58 @@ class AsyncRunner:
         Returns:
             DataFrame with OHLCV columns
         """
-        if not self.ib or not self.ib.isConnected():
+        if not self.ib:
             raise ConnectionError("Not connected to IBKR")
 
-        contract = Stock(symbol, "SMART", "USD")
-        qualified = self.ib.qualifyContracts(contract)
-        if not qualified:
-            return pd.DataFrame()
+        # Check if subprocess client or legacy IB client
+        if hasattr(self.ib, "get_historical_bars"):
+            # Subprocess client - use async method
+            bars = await self.ib.get_historical_bars(
+                symbol=symbol,
+                duration=duration,
+                bar_size=bar_size,
+                what_to_show=what_to_show,
+                use_rth=use_rth,
+            )
 
-        bars = self.ib.reqHistoricalData(
-            qualified[0],
-            endDateTime="",
-            durationStr=duration,
-            barSizeSetting=bar_size,
-            whatToShow=what_to_show,
-            useRTH=use_rth,
-            formatDate=1,
-        )
+            if not bars:
+                return pd.DataFrame()
 
-        if not bars:
-            return pd.DataFrame()
+            # Convert list of dicts to DataFrame
+            df = pd.DataFrame(bars)
+            if not df.empty:
+                # Ensure columns are lowercase
+                df.columns = [col.lower() for col in df.columns]
+                # Sort by date
+                if "date" in df.columns:
+                    df = df.sort_values("date")
+        else:
+            # Legacy IB client - use synchronous methods
+            if not self.ib.isConnected():
+                raise ConnectionError("Not connected to IBKR")
 
-        df = pd.DataFrame(bars)
-        if not df.empty:
-            df.columns = [col.lower() for col in df.columns]
-            df = df.sort_values("date")
+            contract = Stock(symbol, "SMART", "USD")
+            qualified = self.ib.qualifyContracts(contract)
+            if not qualified:
+                return pd.DataFrame()
+
+            bars = self.ib.reqHistoricalData(
+                qualified[0],
+                endDateTime="",
+                durationStr=duration,
+                barSizeSetting=bar_size,
+                whatToShow=what_to_show,
+                useRTH=use_rth,
+                formatDate=1,
+            )
+
+            if not bars:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(bars)
+            if not df.empty:
+                df.columns = [col.lower() for col in df.columns]
+                df = df.sort_values("date")
 
         return df
 
@@ -878,10 +943,97 @@ class AsyncRunner:
             await self.production_monitor.stop()
         if self.correlation_manager:
             await self.correlation_manager.stop()
-        if self.conn_mgr:
-            await self.conn_mgr.disconnect()
-        if self.db:
-            await self.db.close()
+        # Call cleanup to properly disconnect IBKR and close database
+        await self.cleanup()
+
+    async def _monitor_subprocess_health(self):
+        """
+        Background task to monitor subprocess health.
+
+        Pings the subprocess every 60 seconds and automatically restarts
+        if the subprocess becomes unresponsive.
+        """
+        logger.info("Starting subprocess health monitoring (60s interval)")
+
+        while True:
+            try:
+                await asyncio.sleep(60)  # Check every minute
+
+                # Only monitor if using subprocess client
+                if not hasattr(self.ib, "ping"):
+                    logger.debug("Not using subprocess client, skipping health check")
+                    continue
+
+                # Ping subprocess
+                logger.debug("Pinging subprocess for health check...")
+                is_healthy = await self.ib.ping()
+
+                if not is_healthy:
+                    logger.error("Subprocess health check failed - subprocess unresponsive")
+                    await self._restart_subprocess()
+                else:
+                    logger.debug("Subprocess health check passed")
+
+            except asyncio.CancelledError:
+                logger.info("Subprocess health monitoring cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in subprocess health monitoring: {e}")
+                # Don't restart on monitoring errors, just log and continue
+                continue
+
+    async def _restart_subprocess(self):
+        """
+        Restart the IBKR subprocess after a crash or health check failure.
+
+        This attempts to gracefully stop the subprocess and create a new
+        connection using the same configuration.
+        """
+        logger.warning("⚠️ Restarting IBKR subprocess due to health check failure")
+
+        try:
+            # Stop the old subprocess
+            if hasattr(self.ib, "stop"):
+                try:
+                    await asyncio.wait_for(self.ib.stop(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Subprocess stop timed out, continuing with restart")
+                except Exception as e:
+                    logger.warning(f"Error stopping subprocess: {e}")
+
+            # Reconnect using robust connection
+            from .utils.robust_connection import CircuitBreakerConfig, connect_ibkr_robust
+
+            # Get connection parameters from config
+            host = self.cfg.ibkr.host
+            port = self.cfg.ibkr.port
+
+            circuit_config = CircuitBreakerConfig(
+                failure_threshold=int(os.getenv("CIRCUIT_BREAKER_THRESHOLD", "5")),
+                recovery_timeout=float(os.getenv("CIRCUIT_BREAKER_TIMEOUT", "300")),
+                success_threshold=2,
+            )
+
+            # Reconnect
+            logger.info(f"Reconnecting to IBKR at {host}:{port}")
+            self.ib = await connect_ibkr_robust(
+                host=host,
+                port=port,
+                client_id=self.cfg.ibkr.client_id,
+                readonly=self.cfg.ibkr.readonly,
+                timeout=self.cfg.ibkr.timeout,
+                max_retries=2,
+                circuit_breaker_config=circuit_config,
+                ssl_mode=self.cfg.ibkr.ssl_mode,
+            )
+
+            logger.info("✅ Subprocess restarted successfully")
+
+        except Exception as e:
+            logger.error(f"❌ Failed to restart subprocess: {e}")
+            logger.error("Manual intervention required - shutting down runner")
+            # Set a flag or raise to trigger shutdown
+            raise RuntimeError(f"Failed to restart subprocess: {e}")
 
     async def fetch_and_store_data(self, symbol: str) -> Optional[pd.DataFrame]:
         """Fetch market data for a symbol and store in database."""
@@ -1153,9 +1305,7 @@ class AsyncRunner:
             strategy_name = (
                 "ML_ENHANCED"
                 if self.use_ml_enhanced
-                else "ML_ENSEMBLE"
-                if self.use_ml_strategy
-                else "SMA_CROSSOVER"
+                else "ML_ENSEMBLE" if self.use_ml_strategy else "SMA_CROSSOVER"
             )
             await self.db.record_signal(
                 symbol,
@@ -1220,9 +1370,11 @@ class AsyncRunner:
                             "BUY_TO_COVER",
                             qty_to_cover,
                             fill_price,
-                            slippage=(fill_price - price_float) * qty_to_cover
-                            if res.fill_price is not None
-                            else 0,
+                            slippage=(
+                                (fill_price - price_float) * qty_to_cover
+                                if res.fill_price is not None
+                                else 0
+                            ),
                         )
                         await self.db.update_position(symbol, 0, 0, 0)  # Close position
 
@@ -1352,9 +1504,11 @@ class AsyncRunner:
                                 "BUY",
                                 qty,
                                 fill_price,
-                                slippage=(fill_price - price_float) * qty
-                                if res.fill_price is not None
-                                else 0,
+                                slippage=(
+                                    (fill_price - price_float) * qty
+                                    if res.fill_price is not None
+                                    else 0
+                                ),
                             )
                             await self.db.update_position(symbol, qty, fill_price, price)
 
@@ -1575,9 +1729,11 @@ class AsyncRunner:
                                 "SELL_SHORT",
                                 qty,
                                 fill_price,
-                                slippage=(fill_price - price_float) * qty
-                                if res.fill_price is not None
-                                else 0,
+                                slippage=(
+                                    (fill_price - price_float) * qty
+                                    if res.fill_price is not None
+                                    else 0
+                                ),
                             )
                             await self.db.update_position(symbol, -qty, fill_price, price)
 
@@ -2029,6 +2185,14 @@ class AsyncRunner:
     async def cleanup(self):
         """Clean up resources when runner is done."""
         try:
+            # Cancel subprocess monitor task if running
+            if self.subprocess_monitor_task and not self.subprocess_monitor_task.done():
+                self.subprocess_monitor_task.cancel()
+                try:
+                    await self.subprocess_monitor_task
+                except asyncio.CancelledError:
+                    pass
+
             # Cancel risk monitor task if running
             if self.risk_monitor_task and not self.risk_monitor_task.done():
                 self.risk_monitor_task.cancel()
@@ -2055,10 +2219,20 @@ class AsyncRunner:
                 self.advanced_risk.save_state(state_file)
                 logger.info("Advanced risk manager state saved")
 
-            # Disconnect from IBKR
-            if hasattr(self, "ib") and self.ib and self.ib.isConnected():
+            # Disconnect from IBKR (subprocess client)
+            if hasattr(self, "ib") and self.ib:
                 logger.info("Disconnecting from IBKR...")
-                self.ib.disconnect()
+                # Check if it's subprocess client or legacy IB client
+                if hasattr(self.ib, "disconnect"):
+                    # Subprocess client has async disconnect()
+                    if asyncio.iscoroutinefunction(self.ib.disconnect):
+                        await self.ib.disconnect()
+                    else:
+                        self.ib.disconnect()
+                # Also stop the subprocess if it exists
+                if hasattr(self.ib, "stop"):
+                    await self.ib.stop()
+                    logger.info("Stopped IBKR subprocess")
 
             # Close database connections
             if hasattr(self, "db") and self.db:

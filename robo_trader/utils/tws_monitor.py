@@ -12,7 +12,7 @@ Since TWS requires manual login, this provides:
 import asyncio
 from datetime import datetime
 from enum import Enum
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 
 from ..logger import get_logger
 from .tws_health import check_tws_api_health, diagnose_tws_connection
@@ -47,6 +47,7 @@ class TWSMonitor:
         health_check_interval: float = 30.0,
         recovery_check_interval: float = 10.0,
         alert_callback: Optional[Callable[[str, str], None]] = None,
+        ssl_mode: Literal["auto", "require", "disabled"] = "auto",
     ):
         """
         Initialize TWS monitor.
@@ -58,12 +59,14 @@ class TWSMonitor:
             recovery_check_interval: Seconds between checks when waiting for recovery
             alert_callback: Function to call for alerts: alert_callback(level, message)
                           Levels: "critical", "warning", "info"
+            ssl_mode: Socket transport to use when probing the API (aligned with trading config)
         """
         self.host = host
         self.port = port
         self.health_check_interval = health_check_interval
         self.recovery_check_interval = recovery_check_interval
         self.alert_callback = alert_callback or self._default_alert
+        self.ssl_mode = ssl_mode
 
         self.state = TWSState.UNKNOWN
         self.last_check_time: Optional[datetime] = None
@@ -92,7 +95,7 @@ class TWSMonitor:
         self.last_check_time = datetime.now()
 
         # Get diagnosis
-        diagnosis = await diagnose_tws_connection(self.host, self.port)
+        diagnosis = await diagnose_tws_connection(self.host, self.port, self.ssl_mode)
 
         if not diagnosis["port_listening"]:
             self._update_state(TWSState.OFFLINE)
@@ -267,7 +270,9 @@ class TWSMonitor:
 
 
 async def quick_tws_check_before_connect(
-    host: str = "127.0.0.1", port: int = 7497
+    host: str = "127.0.0.1",
+    port: int = 7497,
+    ssl_mode: Literal["auto", "require", "disabled"] = "auto",
 ) -> tuple[bool, str]:
     """
     Quick pre-flight check before attempting connection.
@@ -288,7 +293,7 @@ async def quick_tws_check_before_connect(
         ib = await connect_ibkr_robust(max_retries=2)  # Reduced retries
         ```
     """
-    healthy, message = await check_tws_api_health(host, port, timeout=2.0)
+    healthy, message = await check_tws_api_health(host, port, timeout=2.0, ssl_mode=ssl_mode)
 
     if healthy:
         return True, "TWS API healthy"
