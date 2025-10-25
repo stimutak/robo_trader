@@ -572,9 +572,11 @@ class AsyncRunner:
             logger.info("Initializing advanced risk management with Kelly sizing and kill switches")
             self.advanced_risk = AdvancedRiskManager(
                 config={
-                    "starting_capital": self.default_cash
-                    if self.default_cash is not None
-                    else self.cfg.default_cash,
+                    "starting_capital": (
+                        self.default_cash
+                        if self.default_cash is not None
+                        else self.cfg.default_cash
+                    ),
                     "max_position_pct": 0.1,
                     "max_risk_per_trade": 0.02,
                 },
@@ -1303,9 +1305,7 @@ class AsyncRunner:
             strategy_name = (
                 "ML_ENHANCED"
                 if self.use_ml_enhanced
-                else "ML_ENSEMBLE"
-                if self.use_ml_strategy
-                else "SMA_CROSSOVER"
+                else "ML_ENSEMBLE" if self.use_ml_strategy else "SMA_CROSSOVER"
             )
             await self.db.record_signal(
                 symbol,
@@ -1370,9 +1370,11 @@ class AsyncRunner:
                             "BUY_TO_COVER",
                             qty_to_cover,
                             fill_price,
-                            slippage=(fill_price - price_float) * qty_to_cover
-                            if res.fill_price is not None
-                            else 0,
+                            slippage=(
+                                (fill_price - price_float) * qty_to_cover
+                                if res.fill_price is not None
+                                else 0
+                            ),
                         )
                         await self.db.update_position(symbol, 0, 0, 0)  # Close position
 
@@ -1502,9 +1504,11 @@ class AsyncRunner:
                                 "BUY",
                                 qty,
                                 fill_price,
-                                slippage=(fill_price - price_float) * qty
-                                if res.fill_price is not None
-                                else 0,
+                                slippage=(
+                                    (fill_price - price_float) * qty
+                                    if res.fill_price is not None
+                                    else 0
+                                ),
                             )
                             await self.db.update_position(symbol, qty, fill_price, price)
 
@@ -1725,9 +1729,11 @@ class AsyncRunner:
                                 "SELL_SHORT",
                                 qty,
                                 fill_price,
-                                slippage=(fill_price - price_float) * qty
-                                if res.fill_price is not None
-                                else 0,
+                                slippage=(
+                                    (fill_price - price_float) * qty
+                                    if res.fill_price is not None
+                                    else 0
+                                ),
                             )
                             await self.db.update_position(symbol, -qty, fill_price, price)
 
