@@ -66,18 +66,45 @@ pkill -9 -f "runner_async" && pkill -9 -f "app.py" && pkill -9 -f "websocket_ser
 ## IMPORTANT: Python Command on macOS
 **ALWAYS USE `python3` NOT `python` - THIS SYSTEM USES macOS WITH NO `python` COMMAND**
 
-## Testing Commands
+## Starting the Trading System
+
+**RECOMMENDED: Use the automated startup script (2025-10-23)**
+
+The `START_TRADER.sh` script provides clean startup with automatic zombie cleanup and Gateway connectivity testing.
+
+### Default Symbols (from user_settings.json)
+```
+AAPL,NVDA,TSLA,IXHL,NUAI,BZAI,ELTP,OPEN,CEG,VRT,PLTR,UPST,TEM,HTFL,SDGR,APLD,SOFI,CORZ,WULF
+```
+
+### Quick Start (Recommended)
+```bash
+# Start with default symbols (from user_settings.json)
+./START_TRADER.sh
+
+# Start with custom symbols
+./START_TRADER.sh "AAPL,NVDA,TSLA,QQQ"
+```
+
+**What the script does:**
+1. ✅ Kills existing Python trader processes
+2. ✅ Cleans up zombie CLOSE_WAIT connections
+3. ✅ Tests Gateway connectivity (aborts if Gateway not responding)
+4. ✅ Starts WebSocket server
+5. ✅ Starts trading system with logging
+6. ✅ Monitors startup for 10 seconds
+
+**If startup fails:** The script will show clear error messages and diagnostic commands.
+
+### Manual Startup (Advanced)
 
 **CRITICAL (2025-09-25): ALWAYS USE VIRTUAL ENVIRONMENT**
 After macOS upgrades, Python paths reset. You MUST activate `.venv` first!
 
+```bash
 # KILL ALL PROCESSES (run this first to prevent duplicates)
-```bash
 pkill -9 -f "runner_async" && pkill -9 -f "app.py" && pkill -9 -f "websocket_server"
-```
 
-# START SYSTEM (clean start with .venv)
-```bash
 # ACTIVATE VIRTUAL ENVIRONMENT (REQUIRED!)
 cd /Users/oliver/robo_trader
 source .venv/bin/activate
@@ -87,25 +114,38 @@ python3 -m robo_trader.websocket_server &
 
 # Start trading runner with logging
 export LOG_FILE=/Users/oliver/robo_trader/robo_trader.log
-python3 -m robo_trader.runner_async --symbols AAPL,NVDA,TSLA,IXHL,NUAI,BZAI,ELTP,OPEN,CEG,VRT,PLTR,UPST,TEM,HTFL,SDGR,APLD,SOFI,CORZ,WULF,QQQ,QLD,BBIO,IMRX,CRGY &
+python3 -m robo_trader.runner_async --symbols AAPL,NVDA,TSLA,IXHL,NUAI,BZAI,ELTP,OPEN,CEG,VRT,PLTR,UPST,TEM,HTFL,SDGR,APLD,SOFI,CORZ,WULF &
 
 # Start dashboard on port 5555 (ALWAYS USE PORT 5555)
 export DASH_PORT=5555
 python3 app.py &
 ```
 
-# If missing dependencies (ib_async, pandas, etc.)
+### Diagnostic Commands
+
 ```bash
-source .venv/bin/activate
-pip install ib_async pandas
+# Test Gateway connectivity
+./force_gateway_reconnect.sh
+
+# Full diagnostics (checks Gateway, zombies, config)
+python3 diagnose_gateway_api.py
+
+# Check for zombie connections
+lsof -nP -iTCP:4002 -sTCP:CLOSE_WAIT
+
+# View logs
+tail -f robo_trader.log
 ```
 
-# RESTART DASHBOARD ONLY (when code changes)
-```bash
-pkill -9 -f "app.py" && sleep 2 && export DASH_PORT=5555 && python3 app.py &
+### Testing Commands
 
-# Run trading system
-python3 -m robo_trader.runner_async --symbols AAPL,NVDA,TSLA,IXHL,NUAI,BZAI,ELTP,OPEN,CEG,VRT,PLTR,UPST,TEM,HTFL,SDGR,APLD,SOFI,CORZ,WULF
+```bash
+# If missing dependencies (ib_async, pandas, etc.)
+source .venv/bin/activate
+pip install ib_async pandas
+
+# RESTART DASHBOARD ONLY (when code changes)
+pkill -9 -f "app.py" && sleep 2 && export DASH_PORT=5555 && python3 app.py &
 
 # Check market hours
 python3 test_market_hours.py
@@ -132,6 +172,8 @@ python3 test_safety_features.py
 3. ✅ Phase 1 F2: Upgrade config to Pydantic - COMPLETED
 4. ✅ WebSocket stability - Fixed with client/server separation
 5. ✅ TWS API Connection Issues - RESOLVED with subprocess approach
+6. ✅ Zombie connection cleanup - AUTOMATED at startup (2025-10-23)
+7. ✅ Gateway connectivity testing - BUILT INTO startup script (2025-10-23)
 
 ## Critical Safety Features (2025-09-27) ✅
 **Added to address audit findings:**
@@ -183,12 +225,32 @@ python3 test_safety_features.py
 - Old ib_insync library has been uninstalled
 - System tested and running successfully with ib_async
 
-### TWS Connection Requirements
-- TWS must be restarted periodically to clear stuck connections
-- Check TWS: File → Global Configuration → API → Settings
-- Set Master API client ID = 0, Enable Socket Clients, Add 127.0.0.1 to Trusted IPs
-- Monitor for CLOSE_WAIT connections: `netstat -an | grep 7497`
-- Restart TWS if stuck connections accumulate
+### Gateway Connection Management (2025-10-23)
+
+**Automated Zombie Cleanup:**
+- `runner_async.py` now automatically cleans up zombie connections at startup
+- `START_TRADER.sh` tests Gateway connectivity before starting trader
+- Zombie connections are detected and killed (Python processes only)
+- Gateway-owned zombies are logged but cannot be killed (require Gateway restart)
+
+**Gateway Connectivity Testing:**
+- `force_gateway_reconnect.sh` - Test if Gateway accepts API connections
+- `diagnose_gateway_api.py` - Comprehensive diagnostics (Gateway, port, TCP, API, zombies)
+- Startup script aborts with clear error if Gateway not responding
+
+**Gateway API Requirements:**
+- Gateway must have API socket clients enabled
+- Check Gateway: File → Global Configuration → API → Settings
+- ☑️ Enable ActiveX and Socket Clients (CRITICAL)
+- Add 127.0.0.1 to Trusted IPs
+- Socket port: 4002 (paper) or 4001 (live)
+- Master API client ID: 0 (or blank)
+
+**Troubleshooting:**
+- If API handshake times out: Check Gateway API settings (above)
+- If zombies accumulate: Use `START_TRADER.sh` for automatic cleanup
+- If Gateway not responding: Restart Gateway (requires 2FA login)
+- Monitor connections: `netstat -an | grep 4002`
 
 ### TWS Readonly Connection (2025-10-05) ✅
 **Important: System uses READONLY mode for TWS connections**

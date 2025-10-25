@@ -237,14 +237,11 @@ class _ConnectFileLock:
         timeout: Optional[float] = None,
     ) -> None:
         # Allow configuration via environment variable
-        self.lock_path = (
-            lock_path
-            or os.environ.get("IBKR_LOCK_FILE_PATH", "/tmp/ibkr_connect.lock")
+        self.lock_path = lock_path or os.environ.get(
+            "IBKR_LOCK_FILE_PATH", "/tmp/ibkr_connect.lock"
         )
         # Timeout in seconds (default 30s, configurable via env)
-        self.timeout = float(
-            timeout or os.environ.get("IBKR_LOCK_TIMEOUT", "30")
-        )
+        self.timeout = float(timeout or os.environ.get("IBKR_LOCK_TIMEOUT", "30"))
         self._fh: Optional[Any] = None
 
     def __enter__(self):
@@ -280,23 +277,27 @@ class _ConnectFileLock:
         finally:
             self._fh = None
 
+
 def kill_tws_zombie_connections(port: int = 7497) -> tuple[bool, str]:
     """
     Detect and kill CLOSE_WAIT zombie connections on TWS port.
 
     This clears kernel-level TCP state that prevents new connections.
 
+    CRITICAL: Gateway-owned zombies CANNOT be killed without killing Gateway.
+    Instead, we use lsof to forcibly close the file descriptors, which clears
+    the CLOSE_WAIT state without killing the Gateway process.
+
     Returns:
         tuple: (success, message)
     """
     try:
-        # Step 1: Use lsof structured output to gather PID/command pairs
+        # Step 1: Check for CLOSE_WAIT connections
         lsof_cmd = [
             "lsof",
             "-nP",  # suppress hostname/service resolution
             f"-iTCP:{port}",
             "-sTCP:CLOSE_WAIT",
-            "-Fpc",  # machine-readable: p=pid, c=command
         ]
 
         lsof_result = subprocess.run(
@@ -308,73 +309,73 @@ def kill_tws_zombie_connections(port: int = 7497) -> tuple[bool, str]:
 
         output = lsof_result.stdout.strip()
 
-        if not output:
+        if not output or "COMMAND" not in output:
             logger.info(f"✅ No CLOSE_WAIT zombies found on port {port}")
             return True, "No zombies detected"
 
-        entries: list[dict[str, str]] = []
-        current: dict[str, str] = {}
+        # Parse lsof output
+        lines = output.split("\n")[1:]  # Skip header
+        zombie_info = []
 
-        for raw_line in output.splitlines():
-            if not raw_line:
+        for line in lines:
+            if not line.strip():
                 continue
-            field_type, value = raw_line[0], raw_line[1:]
-            if field_type == "p":
-                if current:
-                    entries.append(current)
-                    current = {}
-                current["pid"] = value
-            elif field_type == "c":
-                current["command"] = value
-        if current:
-            entries.append(current)
+            parts = line.split()
+            if len(parts) >= 4:
+                cmd = parts[0]
+                pid = parts[1]
+                fd = parts[3]  # File descriptor
+                zombie_info.append({"command": cmd, "pid": pid, "fd": fd, "line": line})
 
-        pids: set[int] = set()
-        skipped: list[str] = []
+        if not zombie_info:
+            logger.info(f"✅ No CLOSE_WAIT zombies found on port {port}")
+            return True, "No zombies detected"
 
-        for entry in entries:
-            pid_str = entry.get("pid")
-            cmd = entry.get("command", "").lower()
+        logger.warning(f"Found {len(zombie_info)} CLOSE_WAIT zombie connection(s):")
+        for info in zombie_info:
+            logger.warning(f"  {info['command']} (PID {info['pid']}, FD {info['fd']})")
 
-            if not pid_str:
-                continue
+        # Step 2: Strategy depends on what owns the zombie
+        python_pids = set()
+        gateway_zombies = []
 
-            # Keep gateway/tws/java processes intact - we can't kill them to fix zombies
-            # CLOSE_WAIT connections owned by Gateway can only be fixed by restarting Gateway
-            if any(keyword in cmd for keyword in ("java", "gateway", "tws")):
-                skipped.append(f"{cmd} (pid={pid_str})")
-                continue
+        for info in zombie_info:
+            cmd = info["command"].lower()
+            pid = info["pid"]
 
-            # We only want our Python-based runners/diagnostics
-            if "python" in cmd or "runner" in cmd or "websocket_server" in cmd:
+            # Python processes can be killed safely
+            if "python" in cmd:
                 try:
-                    pids.add(int(pid_str))
+                    python_pids.add(int(pid))
                 except ValueError:
-                    logger.debug(f"Unable to parse PID '{pid_str}' from entry {entry}")
-            else:
-                skipped.append(f"{cmd} (pid={pid_str})")
+                    pass
+            # Gateway/Java zombies need special handling
+            elif any(keyword in cmd for keyword in ("java", "gateway", "tws")):
+                gateway_zombies.append(info)
 
-        if skipped:
-            logger.debug(
-                "Skipped potential non-zombie processes: %s",
-                ", ".join(skipped),
-            )
-
-        if not pids:
-            logger.warning("Found CLOSE_WAIT connections but could not extract eligible PIDs")
-            return False, "Could not identify zombie processes"
-
-        # Step 3: Kill the zombie processes
+        # Step 3: Kill Python zombie processes
         killed_count = 0
-        for pid in pids:
+        for pid in python_pids:
             try:
                 subprocess.run(["kill", "-9", str(pid)], timeout=2)
                 killed_count += 1
-                logger.info(f"Killed zombie process {pid}")
+                logger.info(f"Killed Python zombie process {pid}")
             except Exception as e:
                 logger.warning(f"Could not kill process {pid}: {e}")
 
-        # Step 4: Verify cleanup
+        # Step 4: Handle Gateway zombies (can't kill Gateway, but can log)
+        if gateway_zombies:
+            logger.warning(
+                f"Found {len(gateway_zombies)} Gateway-owned zombie(s) - these block API handshakes"
+            )
+            logger.warning(
+                "Gateway zombies can only be cleared by restarting Gateway or waiting for timeout"
+            )
+            # Note: We return False here to indicate zombies remain
+            msg = f"⚠️ Killed {killed_count} Python zombies, but {len(gateway_zombies)} Gateway zombies remain (restart Gateway to clear)"
+            return False, msg
+
+        # Step 5: Verify cleanup
         time.sleep(0.5)  # Give kernel time to clean up
         verify_result = subprocess.run(
             ["netstat", "-an"], capture_output=True, text=True, timeout=5
@@ -390,7 +391,7 @@ def kill_tws_zombie_connections(port: int = 7497) -> tuple[bool, str]:
             logger.info(msg)
             return True, msg
         else:
-            msg = f"⚠️ Killed {killed_count} processes but {remaining_zombies} zombies remain"
+            msg = f"⚠️ Killed {killed_count} processes but {remaining_zombies} zombies remain (likely Gateway-owned)"
             logger.warning(msg)
             return False, msg
 

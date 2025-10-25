@@ -58,6 +58,7 @@ class SubprocessIBKRClient:
         self._connected = False
         self._response_queue: queue.Queue = queue.Queue()
         self._reader_thread: Optional[threading.Thread] = None
+        self._stderr_reader_thread: Optional[threading.Thread] = None
         self._stop_reader = threading.Event()
 
     async def start(self) -> None:
@@ -87,19 +88,11 @@ class SubprocessIBKRClient:
         # CRITICAL FIX: Use regular subprocess.Popen with threading instead of
         # asyncio.create_subprocess_exec to avoid event loop starvation in
         # busy async environments
-        # TEMP DEBUG: Redirect stderr to file
-        import tempfile
-
-        stderr_log = tempfile.NamedTemporaryFile(
-            mode="w", delete=False, prefix="ibkr_worker_stderr_", suffix=".log"
-        )
-        logger.info("subprocess_stderr_log", path=stderr_log.name)
-
         self.process = subprocess.Popen(
             [python_exe, str(worker_script)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=stderr_log,
+            stderr=subprocess.PIPE,  # Capture stderr for logging
             text=True,
             bufsize=1,  # Line buffered
             close_fds=True,  # Don't inherit file descriptors
@@ -107,12 +100,18 @@ class SubprocessIBKRClient:
 
         logger.info("IBKR subprocess worker started", pid=self.process.pid)
 
-        # Start reader thread to avoid blocking
+        # Start reader threads to avoid blocking
         self._stop_reader.clear()
         self._reader_thread = threading.Thread(
             target=self._read_loop, daemon=True, name="IBKRSubprocessReader"
         )
         self._reader_thread.start()
+
+        # Start stderr reader thread
+        self._stderr_reader_thread = threading.Thread(
+            target=self._stderr_read_loop, daemon=True, name="IBKRSubprocessStderrReader"
+        )
+        self._stderr_reader_thread.start()
 
     def _read_loop(self) -> None:
         """Thread function to read subprocess stdout"""
@@ -126,6 +125,27 @@ class SubprocessIBKRClient:
             logger.error("Reader thread error", error=str(e))
         finally:
             logger.debug("Reader thread exiting")
+
+    def _stderr_read_loop(self) -> None:
+        """Thread function to read and log subprocess stderr"""
+        try:
+            while not self._stop_reader.is_set() and self.process:
+                line = self.process.stderr.readline()
+                if not line:
+                    break
+                # Log stderr output with warning level
+                line_stripped = line.strip()
+                if line_stripped:  # Only log non-empty lines
+                    if "DEBUG:" in line_stripped:
+                        logger.debug("subprocess_stderr", message=line_stripped)
+                    elif "ERROR:" in line_stripped or "Exception" in line_stripped:
+                        logger.error("subprocess_stderr", message=line_stripped)
+                    else:
+                        logger.warning("subprocess_stderr", message=line_stripped)
+        except Exception as e:
+            logger.error("Stderr reader thread error", error=str(e))
+        finally:
+            logger.debug("Stderr reader thread exiting")
 
     async def stop(self) -> None:
         """Stop the subprocess worker"""
@@ -156,9 +176,14 @@ class SubprocessIBKRClient:
 
         await asyncio.get_event_loop().run_in_executor(None, terminate_process)
 
-        # Wait for reader thread to finish
+        # Wait for reader threads to finish
         if self._reader_thread and self._reader_thread.is_alive():
             await asyncio.get_event_loop().run_in_executor(None, self._reader_thread.join, 2.0)
+
+        if self._stderr_reader_thread and self._stderr_reader_thread.is_alive():
+            await asyncio.get_event_loop().run_in_executor(
+                None, self._stderr_reader_thread.join, 2.0
+            )
 
         self.process = None
         self._connected = False

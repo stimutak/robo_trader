@@ -1,34 +1,49 @@
 {
   "status": {
     "is_running": true,
-    "uptime_hours": 2.9620555555555557e-05,
-    "start_time": "2025-10-10T11:15:38.913748"
+    "uptime_hours": 0.0014475769444444444,
+    "start_time": "2025-10-23T00:21:54.688860"
   },
   "metrics": {
-    "success_rate": 1.0,
-    "error_rate": 0.0,
-    "win_rate": 0.0,
-    "total_orders": 0,
-    "total_trades": 0
+    "success_rate": 0.5,
+    "error_rate": 0.5,
+    "win_rate": 0.5,
+    "total_orders": 2,
+    "total_trades": 2
   },
   "health": {
     "is_healthy": true,
-    "cpu_percent": 12.9,
-    "memory_percent": 43.1,
-    "disk_usage_percent": 10.1,
+    "cpu_percent": 13.8,
+    "memory_percent": 58.0,
+    "disk_usage_percent": 6.4,
     "warnings": [],
     "errors": [
-      "psutil error: (pid=52155)"
+      "psutil error: (pid=22422)"
     ]
   },
   "alerts": {
-    "active": 11,
-    "triggered_today": 0,
-    "recent": []
+    "active": 4,
+    "triggered_today": 2,
+    "recent": [
+      {
+        "timestamp": "2025-10-23T00:21:54.790957",
+        "alert": "high_error_rate",
+        "severity": "error",
+        "message": "Error rate is 50.00%",
+        "value": 0.5
+      },
+      {
+        "timestamp": "2025-10-23T00:21:54.790986",
+        "alert": "low_success_rate",
+        "severity": "warning",
+        "message": "Success rate dropped to 50.00%",
+        "value": 0.5
+      }
+    ]
   },
   "performance": {
-    "latency_p50": null,
-    "latency_p95": null,
-    "latency_p99": null
+    "latency_p50": 20.4,
+    "latency_p95": 20.4,
+    "latency_p99": 20.4
   }
 }
