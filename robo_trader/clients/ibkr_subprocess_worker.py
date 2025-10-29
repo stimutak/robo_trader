@@ -10,6 +10,7 @@ where API handshakes timeout despite successful TCP connections.
 """
 import asyncio
 import json
+import signal
 import sys
 import traceback
 from typing import Optional
@@ -18,6 +19,26 @@ from ib_async import IB
 
 # Global IB instance
 ib: Optional[IB] = None
+
+# Global shutdown flag
+shutdown_requested = False
+
+
+def signal_handler(signum, frame):
+    """Handle termination signals gracefully"""
+    global shutdown_requested
+    signal_name = signal.Signals(signum).name
+    print(
+        f"Received signal {signal_name} ({signum}), initiating graceful shutdown...",
+        file=sys.stderr,
+        flush=True,
+    )
+    shutdown_requested = True
+
+
+# Register signal handlers at module level
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
 
 
 async def handle_connect(params: dict) -> dict:
@@ -33,7 +54,7 @@ async def handle_connect(params: dict) -> dict:
         port = params.get("port", 4002)
         client_id = params.get("client_id", 1)
         readonly = params.get("readonly", True)
-        timeout = params.get("timeout", 15.0)
+        timeout = params.get("timeout", 30.0)
 
         # DEBUG: Log to stderr
         print(
@@ -70,11 +91,9 @@ async def handle_connect(params: dict) -> dict:
 
     except Exception as e:
         # Clean up on error
-        if ib:
-            try:
-                ib.disconnect()
-            except Exception:
-                pass
+        # NOTE: Do NOT call ib.disconnect() here! It crashes IBKR Gateway's API layer.
+        # Gateway has a bug where disconnect() during/after a failed connection
+        # causes the API client to go RED. Let Python's cleanup handle it naturally.
         ib = None
 
         return {
@@ -253,8 +272,12 @@ async def handle_command(command: dict) -> dict:
     """Route command to appropriate handler"""
     cmd = command.get("command")
 
+    # DEBUG: Log received command
+    print(f"DEBUG: Received command: {cmd}", file=sys.stderr, flush=True)
     if cmd == "connect":
-        return await handle_connect(command)
+        params = command.get("params", {})
+        print(f"DEBUG: Extracted params: {params}", file=sys.stderr, flush=True)
+        return await handle_connect(params)
     elif cmd == "get_accounts":
         return await handle_get_accounts()
     elif cmd == "get_positions":
@@ -262,7 +285,7 @@ async def handle_command(command: dict) -> dict:
     elif cmd == "get_account_summary":
         return await handle_get_account_summary()
     elif cmd == "get_historical_bars":
-        return await handle_get_historical_bars(command)
+        return await handle_get_historical_bars(command.get("params", {}))
     elif cmd == "disconnect":
         return await handle_disconnect()
     elif cmd == "ping":
@@ -277,15 +300,21 @@ async def handle_command(command: dict) -> dict:
 
 async def main():
     """Main loop - read commands from stdin, write responses to stdout"""
-    global ib
+    global ib, shutdown_requested
 
     try:
-        while True:
+        while not shutdown_requested:
             # Read command from stdin (blocking)
-            line = await asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline)
+            try:
+                line = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline),
+                    timeout=1.0,  # Check shutdown flag every second
+                )
+            except asyncio.TimeoutError:
+                continue  # Check shutdown flag and loop again
 
             # EOF - exit gracefully
-            if not line:
+            if not line or shutdown_requested:
                 break
 
             # Parse command
@@ -307,7 +336,7 @@ async def main():
             print(json.dumps(response), flush=True)
 
     except KeyboardInterrupt:
-        pass
+        print("Received KeyboardInterrupt, shutting down...", file=sys.stderr, flush=True)
     except Exception as e:
         error_response = {
             "status": "error",
@@ -318,11 +347,12 @@ async def main():
         print(json.dumps(error_response), flush=True)
     finally:
         # Cleanup on exit
-        if ib:
-            try:
-                ib.disconnect()
-            except Exception:
-                pass
+        print("Worker shutting down gracefully...", file=sys.stderr, flush=True)
+        # NOTE: Do NOT call ib.disconnect() here! It crashes IBKR Gateway's API layer.
+        # When the process exits, Python will clean up connections naturally without
+        # triggering Gateway's disconnect bug. Explicit disconnect() calls cause Gateway
+        # API client to go RED.
+        pass
 
 
 if __name__ == "__main__":

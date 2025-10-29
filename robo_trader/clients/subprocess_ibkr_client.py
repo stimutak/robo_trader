@@ -17,6 +17,7 @@ import queue
 import subprocess
 import sys
 import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -61,6 +62,8 @@ class SubprocessIBKRClient:
         self._reader_thread: Optional[threading.Thread] = None
         self._stderr_reader_thread: Optional[threading.Thread] = None
         self._stop_reader = threading.Event()
+        self._last_activity: Optional[datetime] = None
+        self._connection_start_time: Optional[datetime] = None
 
     async def start(self) -> None:
         """Start the subprocess worker with threading-based I/O"""
@@ -149,46 +152,69 @@ class SubprocessIBKRClient:
             logger.debug("Stderr reader thread exiting")
 
     async def stop(self) -> None:
-        """Stop the subprocess worker"""
+        """Stop the subprocess worker with graceful shutdown"""
         if not self.process:
             return
 
         logger.info("Stopping IBKR subprocess worker", pid=self.process.pid)
 
         try:
-            # Try graceful disconnect first
+            # Try graceful disconnect first (sends disconnect command to worker)
             if self._connected:
+                logger.debug("Sending disconnect command to worker")
                 await self.disconnect()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Disconnect command failed during shutdown", error=str(e))
 
-        # Signal reader thread to stop
+        # Signal reader threads to stop
         self._stop_reader.set()
 
-        # Terminate process (use run_in_executor to avoid blocking)
+        # Terminate process with graceful escalation (use run_in_executor to avoid blocking)
         def terminate_process():
             try:
+                # Send SIGTERM for graceful shutdown
+                logger.debug("Sending SIGTERM to worker process")
                 self.process.terminate()
-                self.process.wait(timeout=5.0)
+
+                # Wait up to 3 seconds for graceful shutdown
+                self.process.wait(timeout=3.0)
+                logger.info("Worker terminated gracefully via SIGTERM")
+
             except subprocess.TimeoutExpired:
-                logger.warning("Subprocess did not terminate, killing", pid=self.process.pid)
+                # Worker didn't respond to SIGTERM, escalate to SIGKILL
+                logger.warning(
+                    "Worker did not respond to SIGTERM within 3s, sending SIGKILL",
+                    pid=self.process.pid,
+                )
                 self.process.kill()
                 self.process.wait()
+                logger.warning("Worker killed via SIGKILL")
+
+            except Exception as e:
+                logger.error("Error during process termination", error=str(e))
+                # Ensure process is dead
+                try:
+                    self.process.kill()
+                    self.process.wait()
+                except Exception:
+                    pass
 
         await asyncio.get_event_loop().run_in_executor(None, terminate_process)
 
         # Wait for reader threads to finish
         if self._reader_thread and self._reader_thread.is_alive():
+            logger.debug("Waiting for reader thread to finish")
             await asyncio.get_event_loop().run_in_executor(None, self._reader_thread.join, 2.0)
 
         if self._stderr_reader_thread and self._stderr_reader_thread.is_alive():
+            logger.debug("Waiting for stderr reader thread to finish")
             await asyncio.get_event_loop().run_in_executor(
                 None, self._stderr_reader_thread.join, 2.0
             )
 
         self.process = None
         self._connected = False
-        logger.info("IBKR subprocess worker stopped")
+        logger.info("IBKR subprocess worker stopped cleanly")
 
     async def _execute_command(self, command: dict, timeout: float = 30.0) -> dict:
         """
@@ -268,7 +294,7 @@ class SubprocessIBKRClient:
         port: int = 4002,
         client_id: int = 1,
         readonly: bool = True,
-        timeout: float = 15.0,
+        timeout: float = 30.0,
     ) -> bool:
         """
         Connect to IBKR via subprocess.
@@ -289,11 +315,13 @@ class SubprocessIBKRClient:
         """
         command = {
             "command": "connect",
-            "host": host,
-            "port": port,
-            "client_id": client_id,
-            "readonly": readonly,
-            "timeout": timeout,
+            "params": {
+                "host": host,
+                "port": port,
+                "client_id": client_id,
+                "readonly": readonly,
+                "timeout": timeout,
+            },
         }
 
         logger.info("Connecting to IBKR via subprocess", host=host, port=port, client_id=client_id)
@@ -302,6 +330,11 @@ class SubprocessIBKRClient:
 
         self._connected = data.get("connected", False)
         accounts = data.get("accounts", [])
+
+        # Track connection timing for health monitoring
+        if self._connected:
+            self._connection_start_time = datetime.now()
+            self._last_activity = datetime.now()
 
         logger.info(
             "Connected to IBKR via subprocess", connected=self._connected, accounts=accounts
@@ -377,10 +410,51 @@ class SubprocessIBKRClient:
         """
         try:
             data = await self._execute_command({"command": "ping"}, timeout=5.0)
-            return data.get("pong", False)
+            pong = data.get("pong", False)
+            if pong:
+                self._last_activity = datetime.now()
+            return pong
         except Exception as e:
             logger.warning("Ping failed", error=str(e))
             return False
+
+    async def health_check(self) -> bool:
+        """
+        Check if connection is healthy.
+
+        Returns:
+            True if connection is healthy, False otherwise
+        """
+        # Check subprocess is alive
+        if not self.process or self.process.poll() is not None:
+            logger.error("Health check failed: Worker process is dead")
+            return False
+
+        # Ping worker to verify responsiveness
+        try:
+            pong = await self.ping()
+            if pong:
+                logger.debug("Health check passed: Worker is responsive")
+                return True
+            else:
+                logger.warning("Health check failed: Ping returned false")
+                return False
+        except Exception as e:
+            logger.error("Health check failed with exception", error=str(e))
+            return False
+
+    async def ensure_healthy(self) -> None:
+        """
+        Ensure connection is healthy, reconnect if needed.
+
+        Raises:
+            SubprocessCrashError: If reconnection fails
+        """
+        if not await self.health_check():
+            logger.warning("Connection unhealthy, attempting reconnection...")
+            await self.stop()
+            await self.start()
+            # Note: Caller needs to call connect() with appropriate params
 
     @property
     def is_connected(self) -> bool:

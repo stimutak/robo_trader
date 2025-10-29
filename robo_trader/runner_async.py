@@ -12,6 +12,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -1305,7 +1307,9 @@ class AsyncRunner:
             strategy_name = (
                 "ML_ENHANCED"
                 if self.use_ml_enhanced
-                else "ML_ENSEMBLE" if self.use_ml_strategy else "SMA_CROSSOVER"
+                else "ML_ENSEMBLE"
+                if self.use_ml_strategy
+                else "SMA_CROSSOVER"
             )
             await self.db.record_signal(
                 symbol,
@@ -2383,6 +2387,46 @@ async def run_continuous(
     logger.info("Trading system shutdown complete")
 
 
+def check_gateway_zombies(port: int = 4002) -> bool:
+    """
+    Check for zombie CLOSE_WAIT connections before starting.
+
+    Args:
+        port: IBKR Gateway port to check (default: 4002 for paper)
+
+    Returns:
+        True if no zombies detected, False if zombies found
+    """
+    try:
+        result = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:CLOSE_WAIT"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        if result.stdout.strip():
+            logger.error(f"Detected zombie CLOSE_WAIT connections on port {port}")
+            logger.error(result.stdout)
+            logger.error("Gateway may be full. Solutions:")
+            logger.error("  1. Restart Gateway (File → Exit → Restart with 2FA)")
+            logger.error("  2. Or try: ./START_TRADER.sh (has automatic cleanup)")
+            return False
+
+        logger.info(f"✓ No zombie connections detected on port {port}")
+        return True
+
+    except subprocess.TimeoutExpired:
+        logger.warning("lsof command timed out - skipping zombie check")
+        return True  # Don't block startup
+    except FileNotFoundError:
+        logger.debug("lsof not available - skipping zombie check")
+        return True  # Don't block startup on systems without lsof
+    except Exception as e:
+        logger.warning(f"Error checking for zombie connections: {e}")
+        return True  # Don't block startup on unexpected errors
+
+
 def main() -> None:
     """Main entry point with CLI argument parsing."""
     parser = argparse.ArgumentParser(
@@ -2465,6 +2509,13 @@ def main() -> None:
     cfg = load_config()
     if cfg.execution.mode == "live" and not args.confirm_live:
         raise SystemExit("Refusing to run in live mode without --confirm-live")
+
+    # Check for zombie connections before starting
+    port = cfg.ibkr.port  # Get port from config (4002 for paper, 4001 for live)
+    if not check_gateway_zombies(port):
+        logger.error("Cannot start with zombie connections present")
+        logger.error("Please restart Gateway or run ./START_TRADER.sh for automatic cleanup")
+        sys.exit(1)
 
     override_symbols = (
         [s.strip().upper() for s in args.symbols.split(",") if s.strip()] if args.symbols else None
