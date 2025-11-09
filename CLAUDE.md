@@ -47,6 +47,12 @@ lsof -ti:7497 | xargs kill
 - Zombies accumulate from failed handshakes and prevent new connections
 - See commits bd87fe5, f55015c for zombie connection bug fixes
 
+**CRITICAL - API DISCONNECT SAFEGUARD (2025-11-02):**
+- `ib.disconnect()` now defaults to a no-op to protect the Gateway API layer.
+- Use the new helper `robo_trader.utils.ibkr_safe.safe_disconnect()` when you absolutely must disconnect.
+- Override the guard only by exporting `IBKR_FORCE_DISCONNECT=1` for isolated tests.
+- If you see `Gateway API layer is unresponsive. Manual restart required.`: stop Python processes and restart IB Gateway (full exit + 2FA login), then rerun `./START_TRADER.sh`.
+
 **Safe Process Kill Command (Python only):**
 ```bash
 pkill -9 -f "runner_async" && pkill -9 -f "app.py" && pkill -9 -f "websocket_server"

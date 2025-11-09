@@ -232,6 +232,7 @@ IBKR_CLIENT_ID=123
 IBKR_READONLY=true          # Keep Gateway/TWS in read-only mode
 IBKR_TIMEOUT=10.0           # Handshake timeout (seconds)
 IBKR_SSL_MODE=auto          # auto | require (TLS only) | disabled (plain TCP)
+IBKR_FORCE_DISCONNECT=0     # Leave disabled; set to 1 only for controlled test scripts
 
 # Trading Mode
 EXECUTION_MODE=paper         # paper or live
@@ -446,6 +447,13 @@ python diagnose_gateway_api.py
   3. Use `./START_TRADER.sh` for automatic zombie cleanup
   4. Restart Gateway if needed (requires 2FA)
 - **Prevention:** Always use `START_TRADER.sh` for clean startup
+
+**Gateway API layer reported down (2025-11-02 guard)**
+- **Symptom:** Worker logs show `Gateway API layer is unresponsive. Manual restart required.`
+- **Cause:** Gateway API crashed after a previous disconnect or failed handshake.
+- **Solution:** Restart IB Gateway (full exit + login) before trying again.
+- **Guardrail:** `robo_trader` now short-circuits retries and surfaces this message instead of looping.
+- **Optional:** Set `IBKR_FORCE_DISCONNECT=1` only when you explicitly want to call `ib.disconnect()` (e.g., in isolated tests).
 
 **TWS API Timeout Issues (RESOLVED 2025-09-23)**
 - Issue: `patchAsyncio()` caused API handshake timeouts

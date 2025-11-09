@@ -13,6 +13,7 @@ import json
 import signal
 import sys
 import traceback
+from datetime import datetime
 from typing import Optional
 
 from ib_async import IB
@@ -22,6 +23,10 @@ ib: Optional[IB] = None
 
 # Global shutdown flag
 shutdown_requested = False
+
+# Tracks Gateway API failure state to avoid hammering a dead Gateway
+gateway_api_down = False
+gateway_failure_detail = ""
 
 
 def signal_handler(signum, frame):
@@ -43,9 +48,18 @@ signal.signal(signal.SIGINT, signal_handler)
 
 async def handle_connect(params: dict) -> dict:
     """Handle connect command"""
-    global ib
+    global ib, gateway_api_down, gateway_failure_detail
 
     try:
+        if gateway_api_down:
+            return {
+                "status": "error",
+                "error": "Gateway API layer is unresponsive. Manual restart required.",
+                "error_type": "GatewayRequiresRestartError",
+                "requires_restart": True,
+                "detail": gateway_failure_detail,
+            }
+
         # Create new IB instance
         ib = IB()
 
@@ -63,9 +77,17 @@ async def handle_connect(params: dict) -> dict:
             flush=True,
         )
 
-        # Connect to IBKR
-        await ib.connectAsync(
-            host=host, port=port, clientId=client_id, readonly=readonly, timeout=timeout
+        # Connect to IBKR synchronously in executor to avoid async patch issues
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: ib.connect(
+                host=host,
+                port=port,
+                clientId=client_id,
+                readonly=readonly,
+                timeout=timeout,
+            ),
         )
 
         print(f"DEBUG: Connected successfully!", file=sys.stderr, flush=True)
@@ -84,6 +106,9 @@ async def handle_connect(params: dict) -> dict:
         if not accounts:
             raise ConnectionError("No managed accounts found")
 
+        gateway_api_down = False
+        gateway_failure_detail = ""
+
         return {
             "status": "success",
             "data": {"connected": True, "accounts": accounts, "client_id": client_id},
@@ -96,11 +121,21 @@ async def handle_connect(params: dict) -> dict:
         # causes the API client to go RED. Let Python's cleanup handle it naturally.
         ib = None
 
+        error_text = str(e).lower()
+        if isinstance(e, TimeoutError) or "timeout" in error_text:
+            gateway_api_down = True
+            gateway_failure_detail = (
+                "Handshake timed out at "
+                f"{datetime.utcnow().isoformat()}Z. Restart IB Gateway before retrying."
+            )
+
         return {
             "status": "error",
             "error": str(e),
             "error_type": type(e).__name__,
             "traceback": traceback.format_exc(),
+            "requires_restart": gateway_api_down,
+            "detail": gateway_failure_detail if gateway_api_down else "",
         }
 
 
@@ -182,7 +217,7 @@ async def handle_disconnect() -> dict:
 
     try:
         if ib:
-            ib.disconnect()
+            # Do NOT call ib.disconnect() - let process exit naturally to avoid Gateway crash
             ib = None
 
         return {"status": "success", "data": {"disconnected": True}}
@@ -193,11 +228,31 @@ async def handle_disconnect() -> dict:
 
 async def handle_ping() -> dict:
     """Handle ping command (health check)"""
-    global ib
-
     connected = ib is not None and ib.isConnected()
 
-    return {"status": "success", "data": {"pong": True, "connected": connected}}
+    return {
+        "status": "success",
+        "data": {
+            "pong": True,
+            "connected": connected,
+            "gateway_api_down": gateway_api_down,
+            "detail": gateway_failure_detail if gateway_api_down else "",
+        },
+    }
+
+
+async def handle_health() -> dict:
+    """Provide extended health detail for diagnostics."""
+    connected = ib is not None and ib.isConnected()
+
+    return {
+        "status": "success",
+        "data": {
+            "connected": connected,
+            "gateway_api_down": gateway_api_down,
+            "detail": gateway_failure_detail if gateway_api_down else "",
+        },
+    }
 
 
 async def handle_get_historical_bars(params: dict) -> dict:
@@ -290,6 +345,8 @@ async def handle_command(command: dict) -> dict:
         return await handle_disconnect()
     elif cmd == "ping":
         return await handle_ping()
+    elif cmd == "health":
+        return await handle_health()
     else:
         return {
             "status": "error",

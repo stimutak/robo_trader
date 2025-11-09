@@ -190,7 +190,7 @@ pytest tests/test_zombie_cleanup_integration.py::TestZombieConnectionDetection::
 
 **Recommended:**
 - Use subprocess-based IBKR client (`use_subprocess=True`)
-- Always call `ib.disconnect()` even on failed handshakes
+- Let connections close naturally; avoid calling `ib.disconnect()` unless you enable `IBKR_FORCE_DISCONNECT=1` for a controlled test.
 - Set appropriate connection timeouts (10-30 seconds)
 - Use file lock to serialize handshakes
 

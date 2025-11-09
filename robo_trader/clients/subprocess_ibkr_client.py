@@ -44,6 +44,12 @@ class IBKRTimeoutError(IBKRError):
     pass
 
 
+class GatewayRequiresRestartError(IBKRError):
+    """Raised when the worker detects the Gateway API layer has crashed"""
+
+    pass
+
+
 class SubprocessIBKRClient:
     """
     Async client that manages IBKR connection via subprocess.
@@ -64,6 +70,7 @@ class SubprocessIBKRClient:
         self._stop_reader = threading.Event()
         self._last_activity: Optional[datetime] = None
         self._connection_start_time: Optional[datetime] = None
+        self._gateway_api_down_detail: Optional[str] = None
 
     async def start(self) -> None:
         """Start the subprocess worker with threading-based I/O"""
@@ -277,12 +284,22 @@ class SubprocessIBKRClient:
             if response.get("status") == "error":
                 error_msg = response.get("error", "Unknown error")
                 error_type = response.get("error_type", "IBKRError")
+                detail = response.get("detail") or ""
+                requires_restart = bool(response.get("requires_restart"))
+
                 logger.error(
                     "Command failed",
                     command=command.get("command"),
                     error=error_msg,
                     error_type=error_type,
+                    requires_restart=requires_restart,
                 )
+
+                if requires_restart or error_type == "GatewayRequiresRestartError":
+                    message = detail or error_msg
+                    self._gateway_api_down_detail = message or "Gateway API layer reported down"
+                    raise GatewayRequiresRestartError(message)
+
                 raise IBKRError(f"{error_type}: {error_msg}")
 
             logger.debug("Command succeeded", command=command.get("command"))
@@ -326,7 +343,11 @@ class SubprocessIBKRClient:
 
         logger.info("Connecting to IBKR via subprocess", host=host, port=port, client_id=client_id)
 
-        data = await self._execute_command(command, timeout=timeout + 10)
+        try:
+            data = await self._execute_command(command, timeout=timeout + 10)
+        except GatewayRequiresRestartError:
+            self._connected = False
+            raise
 
         self._connected = data.get("connected", False)
         accounts = data.get("accounts", [])
@@ -335,6 +356,7 @@ class SubprocessIBKRClient:
         if self._connected:
             self._connection_start_time = datetime.now()
             self._last_activity = datetime.now()
+            self._gateway_api_down_detail = None
 
         logger.info(
             "Connected to IBKR via subprocess", connected=self._connected, accounts=accounts
@@ -411,6 +433,11 @@ class SubprocessIBKRClient:
         try:
             data = await self._execute_command({"command": "ping"}, timeout=5.0)
             pong = data.get("pong", False)
+            if data.get("gateway_api_down"):
+                detail = data.get("detail") or "Gateway API layer reported down by worker ping"
+                self._gateway_api_down_detail = detail
+                logger.error("Worker ping reports Gateway API down", detail=detail)
+                return False
             if pong:
                 self._last_activity = datetime.now()
             return pong
@@ -437,6 +464,11 @@ class SubprocessIBKRClient:
                 logger.debug("Health check passed: Worker is responsive")
                 return True
             else:
+                if self._gateway_api_down_detail:
+                    logger.error(
+                        "Health check failed: Gateway API reported down",
+                        detail=self._gateway_api_down_detail,
+                    )
                 logger.warning("Health check failed: Ping returned false")
                 return False
         except Exception as e:
@@ -451,6 +483,8 @@ class SubprocessIBKRClient:
             SubprocessCrashError: If reconnection fails
         """
         if not await self.health_check():
+            if self._gateway_api_down_detail:
+                raise GatewayRequiresRestartError(self._gateway_api_down_detail)
             logger.warning("Connection unhealthy, attempting reconnection...")
             await self.stop()
             await self.start()
@@ -460,6 +494,11 @@ class SubprocessIBKRClient:
     def is_connected(self) -> bool:
         """Check if connected to IBKR"""
         return self._connected
+
+    @property
+    def gateway_failure_detail(self) -> Optional[str]:
+        """Return the last Gateway failure detail, if any."""
+        return self._gateway_api_down_detail
 
     async def __aenter__(self):
         """Async context manager entry"""

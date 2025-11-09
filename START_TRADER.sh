@@ -58,8 +58,18 @@ else
 fi
 echo ""
 
-# Step 3: Test Gateway connectivity
-echo "3. Testing Gateway connectivity..."
+# Step 3: Activate virtual environment
+echo "3. Activating virtual environment..."
+if [ -f ".venv/bin/activate" ]; then
+    source .venv/bin/activate
+    echo "   ✓ Virtual environment activated"
+else
+    echo "   ⚠️  No virtual environment found - using system Python"
+fi
+echo ""
+
+# Step 4: Test Gateway connectivity
+echo "4. Testing Gateway connectivity..."
 
 # Create test script
 cat > /tmp/test_gateway.py << 'PYEOF'
@@ -122,16 +132,6 @@ if [ $TEST_RESULT -ne 0 ]; then
 fi
 echo ""
 
-# Step 4: Activate virtual environment
-echo "4. Activating virtual environment..."
-if [ -f ".venv/bin/activate" ]; then
-    source .venv/bin/activate
-    echo "   ✓ Virtual environment activated"
-else
-    echo "   ⚠️  No virtual environment found - using system Python"
-fi
-echo ""
-
 # Step 5: Start WebSocket server
 echo "5. Starting WebSocket server..."
 python3 -m robo_trader.websocket_server &
@@ -159,8 +159,22 @@ TRADER_PID=$!
 echo "   ✓ Trading system started (PID: $TRADER_PID)"
 echo ""
 
-# Step 7: Monitor startup
-echo "7. Monitoring startup (10 seconds)..."
+# Step 7: Start dashboard
+echo "7. Starting dashboard..."
+export DASH_PORT=5555
+python3 app.py &
+DASH_PID=$!
+sleep 2
+
+if ps -p $DASH_PID > /dev/null; then
+    echo "   ✓ Dashboard started (PID: $DASH_PID)"
+else
+    echo "   ⚠️  Dashboard may have failed to start"
+fi
+echo ""
+
+# Step 8: Monitor startup
+echo "8. Monitoring startup (10 seconds)..."
 sleep 10
 
 if ps -p $TRADER_PID > /dev/null; then
@@ -172,6 +186,7 @@ if ps -p $TRADER_PID > /dev/null; then
     echo ""
     echo "Trading system is running with PID: $TRADER_PID"
     echo "WebSocket server PID: $WS_PID"
+    echo "Dashboard PID: $DASH_PID"
     echo ""
     echo "Monitor logs: tail -f robo_trader.log"
     echo "View dashboard: http://localhost:5555"
@@ -179,6 +194,7 @@ if ps -p $TRADER_PID > /dev/null; then
     echo "To stop:"
     echo "  pkill -9 -f runner_async"
     echo "  pkill -9 -f websocket_server"
+    echo "  pkill -9 -f app.py"
     echo ""
 else
     echo "   ❌ Trading system stopped unexpectedly"

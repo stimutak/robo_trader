@@ -9,6 +9,7 @@
 2. ✅ **CRITICAL BUG**: `ib.disconnect()` crashes IBKR Gateway API layer
 3. ✅ **Zombie connection bug**: Fixed in earlier PR (randomized client_id)
 4. ✅ **Timeout too short**: Increased from 15s to 30s
+5. ✅ **Guardrail added (2025-11-02)**: Worker stops retries after repeated timeouts and surfaces `Gateway API layer is unresponsive` message; `ib.disconnect()` now requires `IBKR_FORCE_DISCONNECT=1`.
 
 **Status**: All bugs fixed. System ready for testing.
 

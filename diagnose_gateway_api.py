@@ -17,6 +17,8 @@ from pathlib import Path
 
 from ib_async import IB
 
+from robo_trader.utils.ibkr_safe import safe_disconnect
+
 
 def print_section(title: str) -> None:
     """Print a formatted section header."""
@@ -168,8 +170,7 @@ async def check_api_handshake(
         return False, f"API handshake failed: {e}"
 
     finally:
-        if ib.isConnected():
-            ib.disconnect()
+        safe_disconnect(ib, context="diagnose_gateway_api.check_api_handshake")
 
 
 def check_zombie_connections(port: int = 4002) -> tuple[int, str]:

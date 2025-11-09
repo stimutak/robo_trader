@@ -35,6 +35,16 @@ except ImportError:
             return f"{text[:reveal_length]}****"
 
 
+try:
+    from robo_trader.clients.subprocess_ibkr_client import GatewayRequiresRestartError
+except Exception:  # noqa: BLE001
+
+    class GatewayRequiresRestartError(Exception):
+        """Fallback definition used when client module not yet available"""
+
+        pass
+
+
 logger = get_logger(__name__)
 
 
@@ -594,6 +604,18 @@ class RobustConnectionManager:
                     self.circuit_breaker.record_failure()
                     self.consecutive_failures += 1
 
+                except GatewayRequiresRestartError as e:
+                    last_exception = e
+                    logger.error(
+                        "Gateway API layer reported down; aborting retries and requiring manual restart",
+                        detail=str(e),
+                    )
+                    self.circuit_breaker.record_failure()
+                    self.consecutive_failures += 1
+                    raise ConnectionError(
+                        "IBKR Gateway API layer is unresponsive. "
+                        "Manual Gateway restart required before retrying."
+                    ) from e
                 except Exception as e:
                     last_exception = e
                     logger.warning(f"Connection failed on attempt {attempt + 1}: {e}")
@@ -735,6 +757,7 @@ async def connect_ibkr_robust_subprocess(
         SubprocessIBKRClient instance (connected)
     """
     from robo_trader.clients.subprocess_ibkr_client import (
+        GatewayRequiresRestartError,
         SubprocessCrashError,
         SubprocessIBKRClient,
     )
@@ -801,6 +824,12 @@ async def connect_ibkr_robust_subprocess(
             logger.error("Subprocess crashed, restarting", error=str(e))
             await client.stop()
             await client.start()
+            raise
+        except GatewayRequiresRestartError as e:
+            logger.error(
+                "Gateway API layer reported down during subprocess connect",
+                detail=str(e),
+            )
             raise
         except Exception as e:
             # Connection failed - disconnect cleanly
