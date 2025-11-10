@@ -2340,6 +2340,10 @@ async def run_continuous(
                     f"Market {session}. Next open in {seconds_to_open/3600:.1f} hours. "
                     f"Waiting {wait_time/60:.1f} minutes..."
                 )
+                logger.info(
+                    "📵 System quiet during market close - no trading activity, data fetching, "
+                    "or ML processing until market opens. Runner will wake periodically to check status."
+                )
                 await asyncio.sleep(wait_time)
                 continue
 

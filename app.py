@@ -295,6 +295,7 @@ HTML_TEMPLATE = """
         .positive { color: #44ff44; }
         .negative { color: #ff4444; }
         .neutral { color: #ffaa44; }
+        .warning { color: #ffa500; }
         
         .table-container {
             background: #1a1a1a;
@@ -1873,19 +1874,28 @@ HTML_TEMPLATE = """
                 const newLogs = deduplicatedLogs.slice(loadedLogCount);
                 
                 newLogs.forEach(log => {
-                    // Extract time from log if it starts with HH:MM:SS format
-                    const timeMatch = log.match(/^(\\d{2}:\\d{2}:\\d{2})/);
-                    const time = timeMatch ? timeMatch[1] : '';
-                    
+                    // Extract time from log if it starts with HH:MM:SS format (24-hour)
+                    const timeMatch = log.match(/^(\\d{2}):(\\d{2}):(\\d{2})/);
+                    let time = '';
+                    if (timeMatch) {
+                        // Convert 24-hour to 12-hour format
+                        const hours24 = parseInt(timeMatch[1]);
+                        const minutes = timeMatch[2];
+                        const seconds = timeMatch[3];
+                        const period = hours24 >= 12 ? 'PM' : 'AM';
+                        const hours12 = hours24 % 12 || 12;  // Convert 0 to 12
+                        time = `${hours12}:${minutes}:${seconds} ${period}`;
+                    }
+
                     // Handle both " - " and ": " after time
                     let message = log;
                     if (timeMatch) {
                         // Skip past time and separator (either " - " or ": ")
-                        const separatorIndex = log.indexOf(' - ', time.length);
+                        const separatorIndex = log.indexOf(' - ', timeMatch[0].length);
                         if (separatorIndex !== -1) {
                             message = log.substring(separatorIndex + 3);
                         } else {
-                            message = log.substring(time.length).replace(/^[\\s:-]+/, '');
+                            message = log.substring(timeMatch[0].length).replace(/^[\\s:-]+/, '');
                         }
                     }
                     
@@ -1964,14 +1974,31 @@ HTML_TEMPLATE = """
                 const twsStatusEl = document.getElementById('tws-status');
                 const twsDetailEl = document.getElementById('tws-detail');
 
-                if (status.tws_health.includes('listening')) {
+                // Determine connection state based on market status and gateway health
+                const marketOpen = status.market_open || false;
+                const gatewayRunning = status.gateway_running || false;
+                const isTrading = status.is_trading || false;
+
+                if (isTrading && marketOpen) {
+                    // Actually connected and trading
                     twsStatusEl.textContent = '✅ Connected';
                     twsStatusEl.className = 'card-value positive';
                     twsDetailEl.textContent = status.tws_health;
+                } else if (gatewayRunning && !marketOpen) {
+                    // Gateway running but market closed (normal standby)
+                    twsStatusEl.textContent = '⏸️ Standby';
+                    twsStatusEl.className = 'card-value warning';
+                    twsDetailEl.textContent = status.tws_health + ' (Market Closed)';
+                } else if (gatewayRunning) {
+                    // Gateway running but not connected yet
+                    twsStatusEl.textContent = '🔄 Ready';
+                    twsStatusEl.className = 'card-value warning';
+                    twsDetailEl.textContent = status.tws_health;
                 } else {
-                    twsStatusEl.textContent = '❌ Disconnected';
+                    // Gateway not running - actual error
+                    twsStatusEl.textContent = '❌ Not Available';
                     twsStatusEl.className = 'card-value negative';
-                    twsDetailEl.textContent = status.tws_health || 'Unknown';
+                    twsDetailEl.textContent = status.tws_health || 'Gateway/TWS not running';
                 }
             }
 
@@ -1994,7 +2021,7 @@ HTML_TEMPLATE = """
                 } else {
                     statusText.textContent = currentText + ` • Market ${data.status_text}`;
                     if (data.session === 'closed') {
-                        statusText.style.color = '#ff4444';
+                        statusText.style.color = '#88bbff';  // Info blue instead of error red
                         if (data.time_until_open) {
                             statusText.textContent += ` (Opens in ${data.time_until_open})`;
                         }
