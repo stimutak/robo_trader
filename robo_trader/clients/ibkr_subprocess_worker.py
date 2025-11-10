@@ -77,9 +77,17 @@ async def handle_connect(params: dict) -> dict:
             flush=True,
         )
 
-        # Connect to IBKR
-        await ib.connectAsync(
-            host=host, port=port, clientId=client_id, readonly=readonly, timeout=timeout
+        # Connect to IBKR synchronously in executor to avoid async patch issues
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: ib.connect(
+                host=host,
+                port=port,
+                clientId=client_id,
+                readonly=readonly,
+                timeout=timeout,
+            ),
         )
 
         print(f"DEBUG: Connected successfully!", file=sys.stderr, flush=True)
