@@ -47,6 +47,13 @@ lsof -ti:7497 | xargs kill
 - Zombies accumulate from failed handshakes and prevent new connections
 - See commits bd87fe5, f55015c for zombie connection bug fixes
 
+**CRITICAL - GATEWAY API CONFIGURATION (2025-11-10):**
+- **NEVER** suggest checking or enabling "ActiveX and Socket Clients" in Gateway configuration
+- This setting is **permanently enabled** in IB Gateway and **cannot be disabled**
+- Gateway is always listening on the configured API port (4002 for paper, 4001 for live)
+- If API connections fail, the issue is NOT this setting - look elsewhere
+- Common actual causes: IBKR account API permissions, Gateway version issues, library incompatibility
+
 **CRITICAL - API DISCONNECT SAFEGUARD (2025-11-02):**
 - `ib.disconnect()` now defaults to a no-op to protect the Gateway API layer.
 - Use the new helper `robo_trader.utils.ibkr_safe.safe_disconnect()` when you absolutely must disconnect.
@@ -281,3 +288,4 @@ python3 test_safety_features.py
 - Maintain backward compatibility with existing trading logic
 - Test all changes with paper trading before live
 - Document major changes in handoff documents
+- it is not the socket and activex param in gateway config that is at fault as it is perminantly on and cannot be disabled in gateway.
