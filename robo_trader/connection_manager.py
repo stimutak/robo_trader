@@ -161,7 +161,8 @@ class ConnectionManager:
                 # CRITICAL: Always attempt disconnect to clear any half-open socket state
                 try:
                     logger.info("Disconnecting IB client (forced cleanup)...")
-                    self.ib.disconnect()
+                    from .utils.ibkr_safe import safe_disconnect
+                    safe_disconnect(self.ib, context="connection_manager:_cleanup_connection")
                 except Exception as disconnect_err:  # noqa: BLE001
                     logger.debug(f"Non-critical disconnect error: {disconnect_err}")
                 # Give Gateway a moment to process the disconnect

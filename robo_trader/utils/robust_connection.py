@@ -1100,8 +1100,9 @@ async def example_usage():
         print(f"Connected: {ib.isConnected()}")
         print(f"Accounts: {ib.managedAccounts()}")
 
-        # Disconnect when done
-        ib.disconnect()
+        # Disconnect when done using safe helper
+        from .ibkr_safe import safe_disconnect
+        safe_disconnect(ib, context="robust_connection:example_usage")
 
     except ConnectionError as e:
         print(f"Connection failed: {e}")

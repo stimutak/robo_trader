@@ -16,6 +16,7 @@ import traceback
 from datetime import datetime
 from typing import Optional
 
+from robo_trader.utils import ibkr_safe as _ibkr_safe
 from ib_async import IB
 
 # Global IB instance

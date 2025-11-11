@@ -99,8 +99,9 @@ class SubprocessIBKRClient:
         # CRITICAL FIX: Use regular subprocess.Popen with threading instead of
         # asyncio.create_subprocess_exec to avoid event loop starvation in
         # busy async environments
+        # CRITICAL FIX 2: Launch as module with -m to ensure robo_trader/__init__.py
         self.process = subprocess.Popen(
-            [python_exe, str(worker_script)],
+            [python_exe, "-m", "robo_trader.clients.ibkr_subprocess_worker"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,  # Capture stderr for logging
