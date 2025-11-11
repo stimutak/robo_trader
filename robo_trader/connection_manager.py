@@ -29,6 +29,15 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+# CRITICAL: Apply disconnect safeguard monkey patch BEFORE importing ib_async
+# This prevents Gateway API crashes from ib.disconnect() calls
+try:
+    from .utils.ibkr_safe import patch_ib_disconnect
+    patch_ib_disconnect()
+except ImportError:
+    # Fallback if ibkr_safe not available (shouldn't happen in normal operation)
+    pass
+
 try:
     from ib_async import IB, Contract, LimitOrder, MarketOrder, Option, Stock, util
 except ImportError as import_err:
@@ -159,9 +168,11 @@ class ConnectionManager:
                     self._market_data_subs.clear()
 
                 # CRITICAL: Always attempt disconnect to clear any half-open socket state
+                # Use safe_disconnect to avoid crashing Gateway API layer
                 try:
+                    from .utils.ibkr_safe import safe_disconnect
                     logger.info("Disconnecting IB client (forced cleanup)...")
-                    self.ib.disconnect()
+                    safe_disconnect(self.ib, context="connection_cleanup")
                 except Exception as disconnect_err:  # noqa: BLE001
                     logger.debug(f"Non-critical disconnect error: {disconnect_err}")
                 # Give Gateway a moment to process the disconnect

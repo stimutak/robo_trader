@@ -70,6 +70,7 @@ echo ""
 # Create a simple Python test script
 cat > /tmp/test_gateway_accept.py << 'PYEOF'
 import asyncio
+import os
 import sys
 from ib_async import IB
 
@@ -82,22 +83,26 @@ async def test():
         )
         print("✅ Gateway ACCEPTS connections - API handshake successful!")
         print(f"   Accounts: {ib.managedAccounts()}")
+        # For short-lived test scripts, force disconnect is acceptable
+        os.environ["IBKR_FORCE_DISCONNECT"] = "1"
         ib.disconnect()
         return 0
     except asyncio.TimeoutError:
         print("❌ Gateway REJECTS connections - API handshake timeout")
         print("   This means Gateway is NOT responding to API protocol messages.")
         try:
+            os.environ["IBKR_FORCE_DISCONNECT"] = "1"
             ib.disconnect()
-        except:
-            pass
+        except Exception as disconnect_err:
+            print(f"   (Disconnect also failed: {disconnect_err})")
         return 1
     except Exception as e:
         print(f"❌ Connection failed: {e}")
         try:
+            os.environ["IBKR_FORCE_DISCONNECT"] = "1"
             ib.disconnect()
-        except:
-            pass
+        except Exception as disconnect_err:
+            print(f"   (Disconnect also failed: {disconnect_err})")
         return 1
 
 sys.exit(asyncio.run(test()))

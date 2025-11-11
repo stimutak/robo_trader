@@ -554,6 +554,12 @@ class RobustConnectionManager:
                 if success:
                     logger.info(f"Pre-connection cleanup: {msg}")
                 else:
+                    # Gateway-owned zombies cannot be killed - abort connection attempt
+                    if "Gateway zombies remain" in msg or "Gateway-owned" in msg:
+                        raise ConnectionError(
+                            f"Gateway-owned zombie connections blocking port {self.port}. "
+                            f"Manual Gateway restart required. {msg}"
+                        )
                     logger.warning(f"Pre-connection cleanup incomplete: {msg}")
 
             last_exception = None
@@ -572,6 +578,12 @@ class RobustConnectionManager:
                         if success:
                             logger.info(f"Zombie cleanup: {msg}")
                         else:
+                            # Gateway-owned zombies cannot be killed - abort retry
+                            if "Gateway zombies remain" in msg or "Gateway-owned" in msg:
+                                raise ConnectionError(
+                                    f"Gateway-owned zombie connections blocking port {self.port}. "
+                                    f"Manual Gateway restart required. {msg}"
+                                )
                             logger.warning(f"Zombie cleanup incomplete: {msg}")
 
                     logger.info(
@@ -921,6 +933,14 @@ async def connect_ibkr_robust(
 
     # Legacy direct ib_async implementation
     logger.warning("Using legacy direct ib_async client (not recommended)")
+
+    # Import safe_disconnect to avoid crashing Gateway API layer
+    try:
+        from .ibkr_safe import safe_disconnect
+    except ImportError:
+        # Fallback: use regular disconnect if safe_disconnect not available
+        safe_disconnect = None
+
     from ib_async import IB
 
     attempt_count = 0
@@ -1043,7 +1063,11 @@ async def connect_ibkr_robust(
             # When handshake times out, isConnected() is False but socket is still open on TWS side
             # This is THE fix for zombie connection accumulation
             try:
-                ib.disconnect()  # Always call, regardless of connection state
+                # Use safe_disconnect to avoid crashing Gateway API layer
+                if safe_disconnect is not None:
+                    safe_disconnect(ib, context="legacy_mode_cleanup")
+                else:
+                    ib.disconnect()  # Fallback if safe_disconnect not available
                 await asyncio.sleep(0.5)  # Give TWS time to process disconnect
                 logger.debug(f"Disconnected failed IB connection after error: {e}")
             except Exception as cleanup_err:

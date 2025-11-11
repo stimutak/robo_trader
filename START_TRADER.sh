@@ -74,6 +74,7 @@ echo "4. Testing Gateway connectivity..."
 # Create test script
 cat > /tmp/test_gateway.py << 'PYEOF'
 import asyncio
+import os
 import sys
 from ib_async import IB
 
@@ -85,6 +86,8 @@ async def test():
             timeout=7.0
         )
         print("   ✅ Gateway connection successful!")
+        # For short-lived test scripts, force disconnect is acceptable
+        os.environ["IBKR_FORCE_DISCONNECT"] = "1"
         ib.disconnect()
         return 0
     except asyncio.TimeoutError:
@@ -99,16 +102,18 @@ async def test():
         print("   3. Check firewall/security software")
         print("")
         try:
+            os.environ["IBKR_FORCE_DISCONNECT"] = "1"
             ib.disconnect()
-        except:
-            pass
+        except Exception as disconnect_err:
+            print(f"   (Disconnect also failed: {disconnect_err})")
         return 1
     except Exception as e:
         print(f"   ❌ Connection failed: {e}")
         try:
+            os.environ["IBKR_FORCE_DISCONNECT"] = "1"
             ib.disconnect()
-        except:
-            pass
+        except Exception as disconnect_err:
+            print(f"   (Disconnect also failed: {disconnect_err})")
         return 1
 
 sys.exit(asyncio.run(test()))
