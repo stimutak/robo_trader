@@ -143,8 +143,6 @@ async def handle_connect(params: dict) -> dict:
 
 async def handle_get_accounts() -> dict:
     """Handle get_accounts command"""
-    global ib
-
     try:
         if not ib or not ib.isConnected():
             raise ConnectionError("Not connected to IBKR")
@@ -159,8 +157,6 @@ async def handle_get_accounts() -> dict:
 
 async def handle_get_positions() -> dict:
     """Handle get_positions command"""
-    global ib
-
     try:
         if not ib or not ib.isConnected():
             raise ConnectionError("Not connected to IBKR")
@@ -192,8 +188,6 @@ async def handle_get_positions() -> dict:
 
 async def handle_get_account_summary() -> dict:
     """Handle get_account_summary command"""
-    global ib
-
     try:
         if not ib or not ib.isConnected():
             raise ConnectionError("Not connected to IBKR")
@@ -259,8 +253,6 @@ async def handle_health() -> dict:
 
 async def handle_get_historical_bars(params: dict) -> dict:
     """Handle get_historical_bars command"""
-    global ib
-
     try:
         if not ib or not ib.isConnected():
             raise ConnectionError("Not connected to IBKR")
@@ -359,8 +351,6 @@ async def handle_command(command: dict) -> dict:
 
 async def main():
     """Main loop - read commands from stdin, write responses to stdout"""
-    global ib, shutdown_requested
-
     try:
         while not shutdown_requested:
             # Read command from stdin (blocking)
