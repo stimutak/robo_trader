@@ -156,18 +156,22 @@ class TradingEngine:
                 self.executor = PaperExecutor(
                     slippage_bps=self.config.execution.slippage_bps,
                     use_smart_execution=self.config.execution.use_smart_execution,
-                    skip_execution_delays=self.config.execution.skip_execution_delays
-                    if hasattr(self.config.execution, "skip_execution_delays")
-                    else True,
+                    skip_execution_delays=(
+                        self.config.execution.skip_execution_delays
+                        if hasattr(self.config.execution, "skip_execution_delays")
+                        else True
+                    ),
                 )
             else:
                 # Live trading executor
                 self.executor = LiveExecutor(
                     ibkr_client=self.ibkr_client,
                     use_smart_execution=self.config.execution.use_smart_execution,
-                    skip_execution_delays=self.config.execution.skip_execution_delays
-                    if hasattr(self.config.execution, "skip_execution_delays")
-                    else False,
+                    skip_execution_delays=(
+                        self.config.execution.skip_execution_delays
+                        if hasattr(self.config.execution, "skip_execution_delays")
+                        else False
+                    ),
                 )
 
             # Initialize portfolio

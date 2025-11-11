@@ -589,7 +589,9 @@ class RiskManager:
                 return False, "Daily notional exceeds limit"
 
         # Symbol exposure limit - Robust validation
-        if not self._validate_equity_and_percentage(equity, self.max_symbol_exposure_pct, "max_symbol_exposure_pct"):
+        if not self._validate_equity_and_percentage(
+            equity, self.max_symbol_exposure_pct, "max_symbol_exposure_pct"
+        ):
             return False, "Invalid equity or symbol exposure configuration"
 
         max_symbol_notional = equity * self.max_symbol_exposure_pct
@@ -870,7 +872,9 @@ class RiskManager:
 
         return True
 
-    def _validate_equity_and_percentage(self, equity: float, percentage: float, param_name: str) -> bool:
+    def _validate_equity_and_percentage(
+        self, equity: float, percentage: float, param_name: str
+    ) -> bool:
         """
         Validate equity and percentage parameters.
 

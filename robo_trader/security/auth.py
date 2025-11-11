@@ -479,9 +479,9 @@ class AuthManager:
                 is_active=data.get("is_active", True),
                 is_2fa_enabled=data.get("is_2fa_enabled", False),
                 totp_secret=data.get("totp_secret"),
-                created_at=datetime.fromisoformat(data["created_at"])
-                if data.get("created_at")
-                else None,
+                created_at=(
+                    datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
+                ),
             )
 
     def save_api_keys(self, filepath: Path) -> None:
@@ -517,9 +517,9 @@ class AuthManager:
                 user_id=data["user_id"],
                 permissions={Permission(p) for p in data["permissions"]},
                 rate_limit=data["rate_limit"],
-                expires_at=datetime.fromisoformat(data["expires_at"])
-                if data.get("expires_at")
-                else None,
+                expires_at=(
+                    datetime.fromisoformat(data["expires_at"]) if data.get("expires_at") else None
+                ),
                 is_active=data.get("is_active", True),
                 allowed_ips=data.get("allowed_ips", []),
             )

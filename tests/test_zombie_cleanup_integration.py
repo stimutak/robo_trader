@@ -15,9 +15,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from robo_trader.utils.robust_connection import (
+    RobustConnectionManager,
     check_tws_zombie_connections,
     kill_tws_zombie_connections,
-    RobustConnectionManager,
 )
 
 
@@ -194,9 +194,7 @@ ctws
             # Should identify zombies but skip killing Java processes
             assert success is False
             # Should only kill python process (12345), not java/gateway/tws
-            kill_calls = [
-                call for call in mock_run.call_args_list if "kill" in str(call)
-            ]
+            kill_calls = [call for call in mock_run.call_args_list if "kill" in str(call)]
             # Only one kill call for python process
             assert len(kill_calls) == 1
 
@@ -227,11 +225,10 @@ class TestRobustConnectionManagerZombieIntegration:
 
     async def test_pre_connection_zombie_check(self):
         """Test that zombie check runs before connection attempt."""
-        with patch(
-            "robo_trader.utils.robust_connection.check_tws_zombie_connections"
-        ) as mock_check, patch(
-            "robo_trader.utils.robust_connection.kill_tws_zombie_connections"
-        ) as mock_kill:
+        with (
+            patch("robo_trader.utils.robust_connection.check_tws_zombie_connections") as mock_check,
+            patch("robo_trader.utils.robust_connection.kill_tws_zombie_connections") as mock_kill,
+        ):
             # Mock zombies found on first check
             mock_check.return_value = (2, "Found 2 zombies")
             mock_kill.return_value = (True, "Killed 2 zombies")
@@ -270,9 +267,7 @@ class TestRobustConnectionManagerZombieIntegration:
             mock_conn.isConnected = MagicMock(return_value=True)
             return mock_conn
 
-        with patch(
-            "robo_trader.utils.robust_connection.kill_tws_zombie_connections"
-        ) as mock_kill:
+        with patch("robo_trader.utils.robust_connection.kill_tws_zombie_connections") as mock_kill:
             mock_kill.return_value = (True, "Killed zombies")
 
             manager = RobustConnectionManager(
@@ -291,9 +286,7 @@ class TestRobustConnectionManagerZombieIntegration:
 
     async def test_zombie_cleanup_failure_does_not_block_connection(self):
         """Test that zombie cleanup failure doesn't prevent connection attempts."""
-        with patch(
-            "robo_trader.utils.robust_connection.kill_tws_zombie_connections"
-        ) as mock_kill:
+        with patch("robo_trader.utils.robust_connection.kill_tws_zombie_connections") as mock_kill:
             # Zombie cleanup fails
             mock_kill.return_value = (False, "Could not kill zombies")
 
@@ -337,9 +330,7 @@ class TestZombieCleanupEndToEnd:
 
             def run_side_effect(cmd, **kwargs):
                 if "lsof" in cmd:
-                    return MagicMock(
-                        stdout="p12345\ncpython3\np12346\ncpython3\n", returncode=0
-                    )
+                    return MagicMock(stdout="p12345\ncpython3\np12346\ncpython3\n", returncode=0)
                 elif "kill" in cmd:
                     return MagicMock(stdout="", returncode=0)
                 elif "netstat" in cmd:

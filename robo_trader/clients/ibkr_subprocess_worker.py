@@ -16,8 +16,9 @@ import traceback
 from datetime import datetime
 from typing import Optional
 
-from robo_trader.utils import ibkr_safe as _ibkr_safe
 from ib_async import IB
+
+from robo_trader.utils import ibkr_safe as _ibkr_safe
 
 # Global IB instance
 ib: Optional[IB] = None
@@ -300,9 +301,9 @@ async def handle_get_historical_bars(params: dict) -> dict:
         for bar in bars:
             bars_data.append(
                 {
-                    "date": bar.date.isoformat()
-                    if hasattr(bar.date, "isoformat")
-                    else str(bar.date),
+                    "date": (
+                        bar.date.isoformat() if hasattr(bar.date, "isoformat") else str(bar.date)
+                    ),
                     "open": float(bar.open),
                     "high": float(bar.high),
                     "low": float(bar.low),

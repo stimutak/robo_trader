@@ -448,9 +448,9 @@ class TradeCostCalculator:
             "exit_costs": exit_costs.total_cost,
             "total_costs": total_costs,
             "net_pnl": net_pnl,
-            "cost_percentage": (total_costs / abs(gross_pnl)) * Decimal("100")
-            if gross_pnl != 0
-            else Decimal("0"),
+            "cost_percentage": (
+                (total_costs / abs(gross_pnl)) * Decimal("100") if gross_pnl != 0 else Decimal("0")
+            ),
         }
 
 

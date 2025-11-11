@@ -12,6 +12,7 @@ import types
 from typing import Literal, Tuple
 
 from ..logger import get_logger
+from .ibkr_safe import safe_disconnect
 
 logger = get_logger(__name__)
 
@@ -129,7 +130,6 @@ async def check_tws_api_health(
 
         finally:
             try:
-                from .ibkr_safe import safe_disconnect
                 safe_disconnect(ib, context="tws_health:check_tws_api_health")
             except Exception:
                 pass

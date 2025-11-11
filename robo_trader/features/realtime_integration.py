@@ -259,9 +259,9 @@ class RealtimeFeaturePipeline:
             "inference_metrics": inference_metrics,
             "active_symbols": len(self.symbols),
             "signals": dict(self.latest_signals),
-            "feature_store_version": self.feature_store.get_latest_version()
-            if self.feature_store
-            else None,
+            "feature_store_version": (
+                self.feature_store.get_latest_version() if self.feature_store else None
+            ),
         }
 
     async def update_model(self, new_model_path: str, rollout_pct: float = 0.1):

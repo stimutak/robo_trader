@@ -114,9 +114,7 @@ async def main():
         if bugs:
             critical_bugs = [b for b in bugs if b.severity.value == "critical"]
             if critical_bugs:
-                print(
-                    f"⚠️  {len(critical_bugs)} critical bugs found - consider fixing these first!"
-                )
+                print(f"⚠️  {len(critical_bugs)} critical bugs found - consider fixing these first!")
 
     except Exception as e:
         print(f"❌ Test failed: {e}")

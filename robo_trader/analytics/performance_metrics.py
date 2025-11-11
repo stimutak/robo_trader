@@ -166,9 +166,11 @@ class StrategyPerformanceAnalyzer:
             "cvar_95": cvar_95,
             "skewness": returns.skew(),
             "kurtosis": returns.kurtosis(),
-            "tail_ratio": abs(returns.quantile(0.95) / returns.quantile(0.05))
-            if returns.quantile(0.05) != 0
-            else 0,
+            "tail_ratio": (
+                abs(returns.quantile(0.95) / returns.quantile(0.05))
+                if returns.quantile(0.05) != 0
+                else 0
+            ),
         }
 
     def _calculate_risk_adjusted_metrics(self, returns: pd.Series) -> Dict:

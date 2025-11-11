@@ -21,6 +21,7 @@ from enum import Enum
 from typing import Any, Callable, Literal, Optional, TypeVar
 
 from ..logger import get_logger
+from .ibkr_safe import safe_disconnect
 
 try:
     from .secure_config import SecureConfig
@@ -1043,7 +1044,7 @@ async def connect_ibkr_robust(
             # When handshake times out, isConnected() is False but socket is still open on TWS side
             # This is THE fix for zombie connection accumulation
             try:
-                ib.disconnect()  # Always call, regardless of connection state
+                safe_disconnect(ib, context="robust_connection:connect_ibkr_robust")
                 await asyncio.sleep(0.5)  # Give TWS time to process disconnect
                 logger.debug(f"Disconnected failed IB connection after error: {e}")
             except Exception as cleanup_err:
@@ -1101,7 +1102,6 @@ async def example_usage():
         print(f"Accounts: {ib.managedAccounts()}")
 
         # Disconnect when done using safe helper
-        from .ibkr_safe import safe_disconnect
         safe_disconnect(ib, context="robust_connection:example_usage")
 
     except ConnectionError as e:

@@ -467,16 +467,16 @@ def load_config_from_env() -> Config:
             "stop_loss_pct": validator.validate_stop_loss("RISK_STOP_LOSS_PCT", 0.02),
             "take_profit_pct": validator.validate_percentage("RISK_TAKE_PROFIT_PCT", 0.05),
             # Validated notional limits
-            "max_order_notional": validator.validate_positive_float(
-                "RISK_MAX_ORDER_NOTIONAL", 10000, min_value=100
-            )
-            if os.getenv("RISK_MAX_ORDER_NOTIONAL")
-            else None,
-            "max_daily_notional": validator.validate_positive_float(
-                "RISK_MAX_DAILY_NOTIONAL", 100000, min_value=1000
-            )
-            if os.getenv("RISK_MAX_DAILY_NOTIONAL")
-            else None,
+            "max_order_notional": (
+                validator.validate_positive_float("RISK_MAX_ORDER_NOTIONAL", 10000, min_value=100)
+                if os.getenv("RISK_MAX_ORDER_NOTIONAL")
+                else None
+            ),
+            "max_daily_notional": (
+                validator.validate_positive_float("RISK_MAX_DAILY_NOTIONAL", 100000, min_value=1000)
+                if os.getenv("RISK_MAX_DAILY_NOTIONAL")
+                else None
+            ),
             "max_open_positions": validator.validate_position_limit("RISK_MAX_OPEN_POSITIONS", 20),
             "position_sizing_method": os.getenv("RISK_POSITION_SIZING", "fixed"),
             "use_trailing_stop": os.getenv("RISK_USE_TRAILING_STOP", "false").lower() == "true",
