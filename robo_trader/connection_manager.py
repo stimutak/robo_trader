@@ -35,6 +35,7 @@ except ImportError as import_err:
     print("ERROR: ib_async not installed. Run: pip install ib_async")
     raise
 
+from .utils.ibkr_safe import safe_disconnect
 
 logger = logging.getLogger(__name__)
 
@@ -161,7 +162,7 @@ class ConnectionManager:
                 # CRITICAL: Always attempt disconnect to clear any half-open socket state
                 try:
                     logger.info("Disconnecting IB client (forced cleanup)...")
-                    self.ib.disconnect()
+                    safe_disconnect(self.ib, context="connection_manager:_cleanup_connection")
                 except Exception as disconnect_err:  # noqa: BLE001
                     logger.debug(f"Non-critical disconnect error: {disconnect_err}")
                 # Give Gateway a moment to process the disconnect
@@ -316,9 +317,7 @@ class ConnectionManager:
                         await asyncio.sleep(delay)
 
                 # All attempts exhausted
-                raise ConnectionError(
-                    f"Failed to connect after {self._max_retries} attempts"
-                )
+                raise ConnectionError(f"Failed to connect after {self._max_retries} attempts")
         finally:
             # Release file lock if held
             try:

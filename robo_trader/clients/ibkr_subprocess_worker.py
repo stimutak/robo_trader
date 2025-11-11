@@ -18,6 +18,8 @@ from typing import Optional
 
 from ib_async import IB
 
+from robo_trader.utils import ibkr_safe as _ibkr_safe
+
 # Global IB instance
 ib: Optional[IB] = None
 
@@ -141,8 +143,6 @@ async def handle_connect(params: dict) -> dict:
 
 async def handle_get_accounts() -> dict:
     """Handle get_accounts command"""
-    global ib
-
     try:
         if not ib or not ib.isConnected():
             raise ConnectionError("Not connected to IBKR")
@@ -157,8 +157,6 @@ async def handle_get_accounts() -> dict:
 
 async def handle_get_positions() -> dict:
     """Handle get_positions command"""
-    global ib
-
     try:
         if not ib or not ib.isConnected():
             raise ConnectionError("Not connected to IBKR")
@@ -190,8 +188,6 @@ async def handle_get_positions() -> dict:
 
 async def handle_get_account_summary() -> dict:
     """Handle get_account_summary command"""
-    global ib
-
     try:
         if not ib or not ib.isConnected():
             raise ConnectionError("Not connected to IBKR")
@@ -257,8 +253,6 @@ async def handle_health() -> dict:
 
 async def handle_get_historical_bars(params: dict) -> dict:
     """Handle get_historical_bars command"""
-    global ib
-
     try:
         if not ib or not ib.isConnected():
             raise ConnectionError("Not connected to IBKR")
@@ -299,9 +293,9 @@ async def handle_get_historical_bars(params: dict) -> dict:
         for bar in bars:
             bars_data.append(
                 {
-                    "date": bar.date.isoformat()
-                    if hasattr(bar.date, "isoformat")
-                    else str(bar.date),
+                    "date": (
+                        bar.date.isoformat() if hasattr(bar.date, "isoformat") else str(bar.date)
+                    ),
                     "open": float(bar.open),
                     "high": float(bar.high),
                     "low": float(bar.low),
@@ -357,8 +351,6 @@ async def handle_command(command: dict) -> dict:
 
 async def main():
     """Main loop - read commands from stdin, write responses to stdout"""
-    global ib, shutdown_requested
-
     try:
         while not shutdown_requested:
             # Read command from stdin (blocking)

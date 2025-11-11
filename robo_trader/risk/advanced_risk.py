@@ -354,7 +354,10 @@ class KillSwitch:
 
         # Validate configuration
         if not isinstance(self.max_consecutive_losses, int) or self.max_consecutive_losses <= 0:
-            self.trigger("Invalid consecutive loss configuration", f"max_consecutive_losses: {self.max_consecutive_losses}")
+            self.trigger(
+                "Invalid consecutive loss configuration",
+                f"max_consecutive_losses: {self.max_consecutive_losses}",
+            )
             return True  # Fail safe
 
         if trade_result < 0:
@@ -377,13 +380,23 @@ class KillSwitch:
             self.trigger("Invalid symbol for position loss check", f"Symbol: {symbol}")
             return True  # Fail safe
 
-        if not isinstance(current_price, (int, float)) or current_price <= 0 or not np.isfinite(current_price):
+        if (
+            not isinstance(current_price, (int, float))
+            or current_price <= 0
+            or not np.isfinite(current_price)
+        ):
             self.trigger(f"Invalid price for {symbol}", f"Price: {current_price}")
             return True  # Fail safe
 
         # Validate configuration
-        if not isinstance(self.max_position_loss_pct, (int, float)) or self.max_position_loss_pct <= 0:
-            self.trigger("Invalid position loss configuration", f"max_position_loss_pct: {self.max_position_loss_pct}")
+        if (
+            not isinstance(self.max_position_loss_pct, (int, float))
+            or self.max_position_loss_pct <= 0
+        ):
+            self.trigger(
+                "Invalid position loss configuration",
+                f"max_position_loss_pct: {self.max_position_loss_pct}",
+            )
             return True  # Fail safe
 
         if symbol not in self.position_entry:
@@ -392,7 +405,11 @@ class KillSwitch:
         entry_price, entry_time = self.position_entry[symbol]
 
         # Validate entry price
-        if not isinstance(entry_price, (int, float)) or entry_price <= 0 or not np.isfinite(entry_price):
+        if (
+            not isinstance(entry_price, (int, float))
+            or entry_price <= 0
+            or not np.isfinite(entry_price)
+        ):
             self.trigger(f"Invalid entry price for {symbol}", f"Entry: {entry_price}")
             return True  # Fail safe
 
@@ -449,7 +466,9 @@ class KillSwitch:
             True if inputs are valid
         """
         # Check types and basic validity
-        if not isinstance(current_equity, (int, float)) or not isinstance(starting_equity, (int, float)):
+        if not isinstance(current_equity, (int, float)) or not isinstance(
+            starting_equity, (int, float)
+        ):
             return False
 
         # Check for negative or zero starting equity
@@ -795,10 +814,12 @@ class AdvancedRiskManager:
                     "quantity": pos["quantity"],
                     "value": pos["value"],
                     "pnl": pos["value"] - pos["quantity"] * pos["avg_price"],
-                    "pnl_pct": (pos["value"] - pos["quantity"] * pos["avg_price"])
-                    / (pos["quantity"] * pos["avg_price"])
-                    if pos["quantity"] * pos["avg_price"] != 0
-                    else 0,
+                    "pnl_pct": (
+                        (pos["value"] - pos["quantity"] * pos["avg_price"])
+                        / (pos["quantity"] * pos["avg_price"])
+                        if pos["quantity"] * pos["avg_price"] != 0
+                        else 0
+                    ),
                 }
                 for symbol, pos in self.positions.items()
             },
@@ -806,9 +827,9 @@ class AdvancedRiskManager:
             "kill_switch": {
                 "active": self.kill_switch.is_active() if self.kill_switch else False,
                 "reason": self.kill_switch.trigger_reason if self.kill_switch else None,
-                "consecutive_losses": self.kill_switch.consecutive_losses
-                if self.kill_switch
-                else 0,
+                "consecutive_losses": (
+                    self.kill_switch.consecutive_losses if self.kill_switch else 0
+                ),
             },
             "daily_pnl": self.daily_pnl,
             "total_pnl": self.total_pnl,

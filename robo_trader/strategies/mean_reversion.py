@@ -518,9 +518,11 @@ class MeanReversionStrategy(Strategy):
                 window["volume"].iloc[-1] / window["volume"].mean() if "volume" in window else 1.0,
                 # Trend features
                 (window["close"].iloc[-1] / window["close"].iloc[0]) - 1,
-                (window["close"].iloc[-1] / window["close"].iloc[-5]) - 1
-                if len(window) >= 5
-                else 0,
+                (
+                    (window["close"].iloc[-1] / window["close"].iloc[-5]) - 1
+                    if len(window) >= 5
+                    else 0
+                ),
             ]
 
             features.append(feature_vector)

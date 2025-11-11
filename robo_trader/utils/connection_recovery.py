@@ -98,9 +98,9 @@ class StateRecoveryManager:
             "total_positions": len(self.positions),
             "pending_orders": len(self.pending_orders),
             "total_value": float(total_value),
-            "last_sync": self.last_successful_sync.isoformat()
-            if self.last_successful_sync
-            else None,
+            "last_sync": (
+                self.last_successful_sync.isoformat() if self.last_successful_sync else None
+            ),
             "positions": {
                 symbol: {
                     "quantity": pos.quantity,

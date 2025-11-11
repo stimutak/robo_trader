@@ -24,6 +24,7 @@ from ib_async import IB
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from ..logger import get_logger
+from ..utils.ibkr_safe import safe_disconnect
 
 logger = get_logger(__name__)
 
@@ -84,8 +85,6 @@ def test_connection():
         server_version = ib.client.serverVersion()
         accounts = ib.managedAccounts()
 
-        # Disconnect cleanly
-        ib.disconnect()
 
         return {{
             "success": True,
@@ -199,7 +198,7 @@ if __name__ == "__main__":
             # Clean up failed connection
             try:
                 if ib and hasattr(ib, "disconnect"):
-                    ib.disconnect()
+                    safe_disconnect(ib, context="async_ibkr_client:_create_direct_connection")
                     await asyncio.sleep(0.5)  # Give time for cleanup
             except Exception:
                 pass

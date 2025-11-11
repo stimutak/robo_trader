@@ -407,9 +407,11 @@ class WalkForwardOptimizer:
             "avg_out_sample_score": np.mean(out_sample_scores),
             "performance_degradation": avg_degradation,
             "avg_overfitting_score": np.mean(overfitting_scores),
-            "consistency_score": 1 - np.std(out_sample_scores) / np.mean(out_sample_scores)
-            if np.mean(out_sample_scores) != 0
-            else 0,
+            "consistency_score": (
+                1 - np.std(out_sample_scores) / np.mean(out_sample_scores)
+                if np.mean(out_sample_scores) != 0
+                else 0
+            ),
         }
 
     def _select_best_parameters(self) -> Dict[str, Any]:

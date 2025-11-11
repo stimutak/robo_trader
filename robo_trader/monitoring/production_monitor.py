@@ -674,21 +674,26 @@ class ProductionMonitor:
             },
             "health": None,
             "alerts": {
-                "active": len([a for a in self.alert_manager.alerts.values() if a.active])
-                if self.alert_manager
-                else 0,
-                "triggered_today": len(
-                    [
-                        a
-                        for a in self.alert_manager.alert_history
-                        if datetime.fromisoformat(a["timestamp"]).date() == datetime.now().date()
-                    ]
-                )
-                if self.alert_manager
-                else 0,
-                "recent": list(self.alert_manager.alert_history)[-10:]
-                if self.alert_manager
-                else [],
+                "active": (
+                    len([a for a in self.alert_manager.alerts.values() if a.active])
+                    if self.alert_manager
+                    else 0
+                ),
+                "triggered_today": (
+                    len(
+                        [
+                            a
+                            for a in self.alert_manager.alert_history
+                            if datetime.fromisoformat(a["timestamp"]).date()
+                            == datetime.now().date()
+                        ]
+                    )
+                    if self.alert_manager
+                    else 0
+                ),
+                "recent": (
+                    list(self.alert_manager.alert_history)[-10:] if self.alert_manager else []
+                ),
             },
             "performance": {
                 "latency_p50": self.metrics_collector.get_percentile(MetricType.LATENCY, 50),
