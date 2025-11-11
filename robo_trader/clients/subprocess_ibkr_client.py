@@ -87,12 +87,32 @@ class SubprocessIBKRClient:
 
         # Start subprocess using the same Python interpreter
         # CRITICAL FIX: sys.executable might not be venv Python if runner was started
-        # via shebang or other means. Check for venv and use it if available.
-        venv_python = Path(__file__).parent.parent.parent / ".venv" / "bin" / "python3"
-        if venv_python.exists():
-            python_exe = str(venv_python)
-            logger.debug("Using venv Python", python_exe=python_exe)
-        else:
+        # via shebang or other means. Check for VIRTUAL_ENV environment variable first.
+        python_exe = None
+
+        # Try VIRTUAL_ENV environment variable (most reliable)
+        venv_path = os.environ.get("VIRTUAL_ENV")
+        if venv_path:
+            import platform
+
+            if platform.system() == "Windows":
+                venv_python = Path(venv_path) / "Scripts" / "python.exe"
+            else:
+                venv_python = Path(venv_path) / "bin" / "python3"
+
+            if venv_python.exists():
+                python_exe = str(venv_python)
+                logger.debug("Using VIRTUAL_ENV Python", python_exe=python_exe)
+
+        # Fallback: Try relative path from project root (legacy)
+        if not python_exe:
+            venv_python = Path(__file__).parent.parent.parent / ".venv" / "bin" / "python3"
+            if venv_python.exists():
+                python_exe = str(venv_python)
+                logger.debug("Using relative venv Python", python_exe=python_exe)
+
+        # Last resort: Use sys.executable
+        if not python_exe:
             python_exe = sys.executable
             logger.debug("Using sys.executable Python", python_exe=python_exe)
 
@@ -260,12 +280,14 @@ class SubprocessIBKRClient:
             # Read response from queue with timeout
             try:
                 # Use run_in_executor to wait on queue without blocking event loop
+                # IMPORTANT: Make queue timeout longer than asyncio timeout to avoid race condition
+                # This ensures asyncio.wait_for is the only timeout that matters
                 def read_response():
-                    return self._response_queue.get(timeout=timeout)
+                    return self._response_queue.get(timeout=timeout + 10.0)
 
                 line = await asyncio.wait_for(
                     asyncio.get_event_loop().run_in_executor(None, read_response),
-                    timeout=timeout + 1.0,  # Add buffer to asyncio timeout
+                    timeout=timeout,  # This is the real timeout
                 )
 
                 if not line:

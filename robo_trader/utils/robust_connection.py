@@ -289,15 +289,20 @@ class _ConnectFileLock:
             self._fh = None
 
 
-def kill_tws_zombie_connections(port: int = 7497) -> tuple[bool, str]:
+def kill_tws_zombie_connections(port: int = 4002) -> tuple[bool, str]:
     """
-    Detect and kill CLOSE_WAIT zombie connections on TWS port.
+    Detect and kill CLOSE_WAIT zombie connections on Gateway/TWS port.
+
+    Default port 4002 is for Gateway (paper trading). Use 7497 for TWS.
 
     This clears kernel-level TCP state that prevents new connections.
 
     CRITICAL: Gateway-owned zombies CANNOT be killed without killing Gateway.
     Instead, we use lsof to forcibly close the file descriptors, which clears
     the CLOSE_WAIT state without killing the Gateway process.
+
+    Args:
+        port: Port to check (default 4002 for Gateway paper, 7497 for TWS)
 
     Returns:
         tuple: (success, message)
@@ -414,9 +419,14 @@ def kill_tws_zombie_connections(port: int = 7497) -> tuple[bool, str]:
         return False, f"Error: {e}"
 
 
-def check_tws_zombie_connections(port: int = 7497) -> tuple[int, str]:
+def check_tws_zombie_connections(port: int = 4002) -> tuple[int, str]:
     """
-    Check for CLOSE_WAIT zombie connections on TWS port.
+    Check for CLOSE_WAIT zombie connections on Gateway/TWS port.
+
+    Default port 4002 is for Gateway (paper trading). Use 7497 for TWS.
+
+    Args:
+        port: Port to check (default 4002 for Gateway paper, 7497 for TWS)
 
     Returns:
         tuple: (zombie_count, error_message)
@@ -465,7 +475,7 @@ class RobustConnectionManager:
         max_delay: float = 60.0,
         jitter: bool = True,
         circuit_breaker_config: Optional[CircuitBreakerConfig] = None,
-        port: int = 7497,
+        port: int = 4002,
     ):
         """
         Initialize robust connection manager.
@@ -477,7 +487,7 @@ class RobustConnectionManager:
             max_delay: Maximum delay between retries
             jitter: Add random jitter to prevent thundering herd
             circuit_breaker_config: Circuit breaker configuration
-            port: Port for zombie connection cleanup
+            port: Port for zombie connection cleanup (default 4002 for Gateway paper, 7497 for TWS)
         """
         self.connect_func = connect_func
         self.max_retries = max_retries
@@ -622,11 +632,22 @@ class RobustConnectionManager:
                         "Gateway API layer reported down; aborting retries and requiring manual restart",
                         detail=str(e),
                     )
+                    # Force circuit breaker OPEN permanently for Gateway failures
+                    # No point retrying until user manually restarts Gateway
                     self.circuit_breaker.record_failure()
+                    self.circuit_breaker.state = CircuitState.OPEN
+                    self.circuit_breaker.failure_count = 999  # Prevent automatic recovery
                     self.consecutive_failures += 1
+
+                    logger.warning(
+                        "Circuit breaker locked OPEN due to Gateway failure. "
+                        "Restart trading system after fixing Gateway."
+                    )
+
                     raise ConnectionError(
                         "IBKR Gateway API layer is unresponsive. "
-                        "Manual Gateway restart required before retrying."
+                        "Manual Gateway restart required before retrying. "
+                        "Circuit breaker locked OPEN - restart trading system after fixing Gateway."
                     ) from e
                 except Exception as e:
                     last_exception = e
@@ -865,7 +886,11 @@ async def connect_ibkr_robust_subprocess(
         async with _GLOBAL_CONNECT_LOCK:
             # Cross-process serialization guard
             with _ConnectFileLock():
-                return await manager.connect()
+                result = await manager.connect()
+                # Give Gateway time to finish handshake processing before releasing lock
+                # This prevents concurrent handshakes if another process acquires lock immediately
+                await asyncio.sleep(0.5)
+                return result
     except Exception:
         # Failed to connect - stop subprocess
         await client.stop()
@@ -1104,7 +1129,11 @@ async def connect_ibkr_robust(
     async with _GLOBAL_CONNECT_LOCK:
         # Cross-process serialization guard
         with _ConnectFileLock():
-            return await manager.connect()
+            result = await manager.connect()
+            # Give Gateway time to finish handshake processing before releasing lock
+            # This prevents concurrent handshakes if another process acquires lock immediately
+            await asyncio.sleep(0.5)
+            return result
 
 
 # Example usage and testing
