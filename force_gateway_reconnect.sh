@@ -103,8 +103,11 @@ async def test():
 sys.exit(asyncio.run(test()))
 PYEOF
 
+# Force disconnect in test script to avoid leaving zombie connections
+export IBKR_FORCE_DISCONNECT=1
 python3 /tmp/test_gateway_accept.py
 TEST_RESULT=$?
+unset IBKR_FORCE_DISCONNECT
 echo ""
 
 # Step 5: Recommendations based on test result

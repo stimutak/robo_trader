@@ -12,13 +12,15 @@ import asyncio
 import json
 import signal
 import sys
+import time
 import traceback
 from datetime import datetime
 from typing import Optional
 
 from ib_async import IB
 
-from robo_trader.utils import ibkr_safe as _ibkr_safe
+# Removed ibkr_safe import - subprocess worker doesn't need disconnect patch
+# from robo_trader.utils import ibkr_safe as _ibkr_safe
 
 # Global IB instance
 ib: Optional[IB] = None
@@ -79,34 +81,74 @@ async def handle_connect(params: dict) -> dict:
             flush=True,
         )
 
-        # Connect to IBKR synchronously in executor to avoid async patch issues
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: ib.connect(
-                host=host,
-                port=port,
-                clientId=client_id,
-                readonly=readonly,
-                timeout=timeout,
-            ),
+        # Connect to IBKR using native async (like test script)
+        # This allows ib_async to properly process incoming messages from Gateway
+        await ib.connectAsync(
+            host=host,
+            port=port,
+            clientId=client_id,
+            readonly=readonly,
+            timeout=timeout,
         )
 
-        print(f"DEBUG: Connected successfully!", file=sys.stderr, flush=True)
+        print(f"DEBUG: Connection initiated, waiting for handshake...", file=sys.stderr, flush=True)
+
+        # CRITICAL FIX: Wait for connection to be fully established before proceeding
+        # The original 0.5s was too short - handshake takes ~300ms + account data retrieval
+        max_handshake_wait = 10  # seconds
+        handshake_start = time.time()
+
+        while not ib.isConnected():
+            if time.time() - handshake_start > max_handshake_wait:
+                raise TimeoutError(f"Connection handshake timeout after {max_handshake_wait}s")
+            await asyncio.sleep(0.1)  # Check every 100ms
+
+        # Additional wait for API protocol to stabilize
+        await asyncio.sleep(2.0)  # Increased from 0.5s to 2.0s based on handoff analysis
+
+        print(f"DEBUG: Connected successfully after {time.time() - handshake_start:.2f}s!", file=sys.stderr, flush=True)
 
         # Verify connection and get accounts
         if not ib.isConnected():
             raise ConnectionError("Connection failed - not connected")
 
-        accounts = ib.managedAccounts()
+        # Wait for account data to arrive after connection
+        # Gateway sends account data asynchronously after API handshake completes
+        # Use ib.waitOnUpdate() to actively process incoming IB messages
+        print(
+            f"DEBUG: Waiting for account data to arrive...", file=sys.stderr, flush=True
+        )
 
-        # Retry once if no accounts
-        if not accounts:
-            await asyncio.sleep(1)
+        accounts = []
+        max_wait_seconds = 10
+        poll_interval = 0.5
+        attempts = int(max_wait_seconds / poll_interval)
+
+        for attempt in range(attempts):
+            # First try to get accounts
             accounts = ib.managedAccounts()
+            if accounts:
+                print(
+                    f"DEBUG: Received accounts after {(attempt + 1) * poll_interval:.1f}s: {accounts}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                break
+
+            # Use waitOnUpdate() to actively process IB events instead of just sleeping
+            # This allows ib_async to process incoming messages from Gateway
+            try:
+                ib.waitOnUpdate(timeout=poll_interval)
+            except Exception:
+                # waitOnUpdate might timeout, that's ok
+                await asyncio.sleep(poll_interval)
 
         if not accounts:
-            raise ConnectionError("No managed accounts found")
+            raise ConnectionError(
+                f"No managed accounts found after {max_wait_seconds}s wait. "
+                "Gateway may be sending data but worker cannot retrieve it. "
+                "Check Gateway API logs for account data transmission."
+            )
 
         gateway_api_down = False
         gateway_failure_detail = ""

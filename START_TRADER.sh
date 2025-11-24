@@ -68,68 +68,10 @@ else
 fi
 echo ""
 
-# Step 4: Test Gateway connectivity
-echo "4. Testing Gateway connectivity..."
-
-# Create test script
-cat > /tmp/test_gateway.py << 'PYEOF'
-import asyncio
-import sys
-from ib_async import IB
-
-async def test():
-    ib = IB()
-    try:
-        await asyncio.wait_for(
-            ib.connectAsync("127.0.0.1", 4002, clientId=999, readonly=True, timeout=5.0),
-            timeout=7.0
-        )
-        print("   ✅ Gateway connection successful!")
-        ib.disconnect()
-        return 0
-    except asyncio.TimeoutError:
-        print("   ❌ Gateway connection TIMEOUT")
-        print("")
-        print("   Gateway is NOT responding to API requests.")
-        print("   This will prevent the trading system from starting.")
-        print("")
-        print("   Possible solutions:")
-        print("   1. Check Gateway API settings (File → Global Configuration → API)")
-        print("   2. Restart Gateway (close and relaunch with 2FA)")
-        print("   3. Check firewall/security software")
-        print("")
-        try:
-            ib.disconnect()
-        except:
-            pass
-        return 1
-    except Exception as e:
-        print(f"   ❌ Connection failed: {e}")
-        try:
-            ib.disconnect()
-        except:
-            pass
-        return 1
-
-sys.exit(asyncio.run(test()))
-PYEOF
-
-python3 /tmp/test_gateway.py
-TEST_RESULT=$?
-rm -f /tmp/test_gateway.py
-
-if [ $TEST_RESULT -ne 0 ]; then
-    echo "=========================================="
-    echo "❌ STARTUP ABORTED"
-    echo "=========================================="
-    echo ""
-    echo "Cannot start trading system - Gateway not responding."
-    echo ""
-    echo "Run diagnostics: python3 diagnose_gateway_api.py"
-    echo "Or force reconnect: ./force_gateway_reconnect.sh"
-    echo ""
-    exit 1
-fi
+# Step 4: Test Gateway connectivity (COMMENTED OUT - creates zombies)
+# echo "4. Testing Gateway connectivity..."
+# Skipping connectivity test - let runner connect directly
+echo "4. Skipping Gateway connectivity test (runner will connect directly)..."
 echo ""
 
 # Step 5: Start WebSocket server

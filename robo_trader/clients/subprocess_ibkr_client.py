@@ -17,6 +17,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -71,6 +72,7 @@ class SubprocessIBKRClient:
         self._last_activity: Optional[datetime] = None
         self._connection_start_time: Optional[datetime] = None
         self._gateway_api_down_detail: Optional[str] = None
+        self._debug_log_file = None  # For capturing worker stderr to file
 
     async def start(self) -> None:
         """Start the subprocess worker with threading-based I/O"""
@@ -95,6 +97,15 @@ class SubprocessIBKRClient:
         else:
             python_exe = sys.executable
             logger.debug("Using sys.executable Python", python_exe=python_exe)
+
+        # DEBUGGING FIX: Create debug log file for worker stderr capture
+        debug_log_path = "/tmp/worker_debug.log"
+        try:
+            self._debug_log_file = open(debug_log_path, "w")
+            logger.info("Worker debug output will be captured", debug_log=debug_log_path)
+        except Exception as e:
+            logger.warning("Could not create debug log file", error=str(e))
+            self._debug_log_file = None
 
         # CRITICAL FIX: Use regular subprocess.Popen with threading instead of
         # asyncio.create_subprocess_exec to avoid event loop starvation in
@@ -132,7 +143,24 @@ class SubprocessIBKRClient:
                 line = self.process.stdout.readline()
                 if not line:
                     break
-                self._response_queue.put(line.strip())
+
+                line_stripped = line.strip()
+                if not line_stripped:
+                    continue
+
+                # CRITICAL FIX: Filter out ib_async log messages that pollute stdout
+                # Only queue lines that look like JSON responses from our worker
+                if line_stripped.startswith('{"status":') or line_stripped.startswith('{"timestamp":'):
+                    # ib_async logs start with {"timestamp": - log these but don't queue
+                    if line_stripped.startswith('{"timestamp":'):
+                        logger.debug("ib_async_stdout", message=line_stripped)
+                        continue
+
+                    # Worker responses start with {"status": - queue these
+                    self._response_queue.put(line_stripped)
+                else:
+                    # Unknown format - log for debugging
+                    logger.warning("unexpected_stdout", message=line_stripped)
         except Exception as e:
             logger.error("Reader thread error", error=str(e))
         finally:
@@ -145,7 +173,16 @@ class SubprocessIBKRClient:
                 line = self.process.stderr.readline()
                 if not line:
                     break
-                # Log stderr output with warning level
+
+                # Write to debug file for detailed analysis
+                if self._debug_log_file:
+                    try:
+                        self._debug_log_file.write(f"{datetime.now().isoformat()}: {line}")
+                        self._debug_log_file.flush()
+                    except Exception:
+                        pass  # Don't let debug logging break the main flow
+
+                # Log stderr output with appropriate level
                 line_stripped = line.strip()
                 if line_stripped:  # Only log non-empty lines
                     if "DEBUG:" in line_stripped:
@@ -158,6 +195,11 @@ class SubprocessIBKRClient:
             logger.error("Stderr reader thread error", error=str(e))
         finally:
             logger.debug("Stderr reader thread exiting")
+            if self._debug_log_file:
+                try:
+                    self._debug_log_file.close()
+                except Exception:
+                    pass
 
     async def stop(self) -> None:
         """Stop the subprocess worker with graceful shutdown"""
@@ -344,10 +386,36 @@ class SubprocessIBKRClient:
 
         logger.info("Connecting to IBKR via subprocess", host=host, port=port, client_id=client_id)
 
+        # ZOMBIE CONNECTION PREVENTION: Check for Gateway zombies before attempting connection
+        # This prevents wasting time on connections that will fail due to zombie blocking
+        logger.debug("Pre-connection zombie check...")
+        zombie_count, zombie_msg = await self._check_zombie_connections(port)
+        if zombie_count > 0:
+            logger.error("Zombie connections detected - aborting connection attempt",
+                        zombie_count=zombie_count, message=zombie_msg)
+            self._gateway_api_down_detail = (
+                f"Gateway has {zombie_count} zombie connection(s) blocking API handshakes. "
+                "Restart Gateway (File→Exit, relaunch with 2FA) before retrying."
+            )
+            raise GatewayRequiresRestartError(self._gateway_api_down_detail)
+
+        # Record connection attempt timing for debugging
+        connection_start = time.time()
+
         try:
-            data = await self._execute_command(command, timeout=timeout + 10)
+            # Increase timeout to account for new synchronization wait in worker
+            extended_timeout = timeout + 15  # Extra buffer for handshake + account data wait
+            logger.debug("Sending connect command with extended timeout", timeout=extended_timeout)
+
+            data = await self._execute_command(command, timeout=extended_timeout)
+
+            connection_duration = time.time() - connection_start
+            logger.info("Connect command completed", duration_seconds=f"{connection_duration:.2f}")
+
         except GatewayRequiresRestartError:
             self._connected = False
+            connection_duration = time.time() - connection_start
+            logger.error("Connection failed - Gateway restart required", duration_seconds=f"{connection_duration:.2f}")
             raise
 
         self._connected = data.get("connected", False)
@@ -364,6 +432,50 @@ class SubprocessIBKRClient:
         )
 
         return self._connected
+
+    async def _check_zombie_connections(self, port: int) -> tuple[int, str]:
+        """
+        Check for zombie CLOSE_WAIT connections that block API handshakes.
+
+        Returns:
+            tuple: (zombie_count, error_message)
+        """
+        try:
+            import subprocess as sp
+
+            # Use lsof to check for CLOSE_WAIT connections on the port
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: sp.run(
+                    ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:CLOSE_WAIT"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            )
+
+            if not result.stdout.strip():
+                return 0, "No zombies detected"
+
+            # Count zombie connections (skip header line)
+            lines = [line for line in result.stdout.split("\n") if line.strip() and not line.startswith("COMMAND")]
+            zombie_count = len(lines)
+
+            if zombie_count > 0:
+                error_msg = f"Found {zombie_count} CLOSE_WAIT zombie connection(s) on port {port}"
+                logger.warning("Zombie connections detected", count=zombie_count, port=port)
+                for line in lines:
+                    logger.warning("Zombie connection", connection=line.strip())
+                return zombie_count, error_msg
+
+            return 0, "No zombies detected"
+
+        except FileNotFoundError:
+            logger.warning("lsof command not available - cannot check for zombies")
+            return 0, "lsof not available"
+        except Exception as e:
+            logger.warning("Error checking for zombie connections", error=str(e))
+            return 0, f"Error checking zombies: {e}"
 
     async def get_accounts(self) -> list[str]:
         """Get managed accounts"""
