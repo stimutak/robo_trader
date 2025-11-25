@@ -13,6 +13,7 @@ to avoid event loop starvation in busy async environments.
 
 import asyncio
 import json
+import os
 import queue
 import subprocess
 import sys
