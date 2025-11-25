@@ -13,6 +13,7 @@ to avoid event loop starvation in busy async environments.
 
 import asyncio
 import json
+import os
 import queue
 import subprocess
 import sys
@@ -89,12 +90,32 @@ class SubprocessIBKRClient:
 
         # Start subprocess using the same Python interpreter
         # CRITICAL FIX: sys.executable might not be venv Python if runner was started
-        # via shebang or other means. Check for venv and use it if available.
-        venv_python = Path(__file__).parent.parent.parent / ".venv" / "bin" / "python3"
-        if venv_python.exists():
-            python_exe = str(venv_python)
-            logger.debug("Using venv Python", python_exe=python_exe)
-        else:
+        # via shebang or other means. Check for VIRTUAL_ENV environment variable first.
+        python_exe = None
+
+        # Try VIRTUAL_ENV environment variable (most reliable)
+        venv_path = os.environ.get("VIRTUAL_ENV")
+        if venv_path:
+            import platform
+
+            if platform.system() == "Windows":
+                venv_python = Path(venv_path) / "Scripts" / "python.exe"
+            else:
+                venv_python = Path(venv_path) / "bin" / "python3"
+
+            if venv_python.exists():
+                python_exe = str(venv_python)
+                logger.debug("Using VIRTUAL_ENV Python", python_exe=python_exe)
+
+        # Fallback: Try relative path from project root (legacy)
+        if not python_exe:
+            venv_python = Path(__file__).parent.parent.parent / ".venv" / "bin" / "python3"
+            if venv_python.exists():
+                python_exe = str(venv_python)
+                logger.debug("Using relative venv Python", python_exe=python_exe)
+
+        # Last resort: Use sys.executable
+        if not python_exe:
             python_exe = sys.executable
             logger.debug("Using sys.executable Python", python_exe=python_exe)
 
