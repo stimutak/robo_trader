@@ -89,9 +89,21 @@ pkill -9 -f "runner_async" && pkill -9 -f "app.py" && pkill -9 -f "websocket_ser
 
 ## Starting the Trading System
 
-**RECOMMENDED: Use the automated startup script (2025-10-23)**
+### THE ONLY CORRECT WAY TO START THE TRADER
 
-The `START_TRADER.sh` script provides clean startup with automatic zombie cleanup and Gateway connectivity testing.
+```bash
+./START_TRADER.sh
+# Or with custom symbols:
+./START_TRADER.sh "AAPL,NVDA,TSLA"
+```
+
+**DO NOT:**
+- ❌ Run `force_gateway_reconnect.sh` before starting - it's for diagnostics ONLY if things aren't working
+- ❌ Run any test scripts that connect to Gateway before starting the trader
+- ❌ Run `python3 -m robo_trader.runner_async` directly without using START_TRADER.sh
+- ❌ Connect to Gateway from any Python script without using `safe_disconnect()` with `IBKR_FORCE_DISCONNECT=1`
+
+**WHY:** Any script that connects to Gateway and doesn't properly disconnect creates a zombie connection that blocks ALL future API handshakes until Gateway is restarted (requires 2FA login).
 
 ### Default Symbols (from user_settings.json)
 ```

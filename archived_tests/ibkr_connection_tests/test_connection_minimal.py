@@ -37,7 +37,7 @@ async def test_minimal_connection():
         print(f"❌ Connection failed: {e}")
         try:
             ib.disconnect()
-        except:
+        except:  # noqa: E722
             pass
 
 

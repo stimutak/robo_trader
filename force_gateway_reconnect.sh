@@ -67,11 +67,17 @@ echo "4. Testing if Gateway accepts new API connections..."
 echo "   (This will attempt a connection with client_id=777)"
 echo ""
 
-# Create a simple Python test script
+# Create a simple Python test script that uses safe_disconnect
 cat > /tmp/test_gateway_accept.py << 'PYEOF'
 import asyncio
+import os
 import sys
+
+# CRITICAL: Set force disconnect BEFORE importing anything
+os.environ["IBKR_FORCE_DISCONNECT"] = "1"
+
 from ib_async import IB
+from robo_trader.utils.ibkr_safe import safe_disconnect
 
 async def test():
     ib = IB()
@@ -82,20 +88,21 @@ async def test():
         )
         print("✅ Gateway ACCEPTS connections - API handshake successful!")
         print(f"   Accounts: {ib.managedAccounts()}")
-        ib.disconnect()
+        # Use safe_disconnect to avoid creating zombies
+        safe_disconnect(ib)
         return 0
     except asyncio.TimeoutError:
         print("❌ Gateway REJECTS connections - API handshake timeout")
         print("   This means Gateway is NOT responding to API protocol messages.")
         try:
-            ib.disconnect()
+            safe_disconnect(ib)
         except:
             pass
         return 1
     except Exception as e:
         print(f"❌ Connection failed: {e}")
         try:
-            ib.disconnect()
+            safe_disconnect(ib)
         except:
             pass
         return 1
@@ -103,8 +110,6 @@ async def test():
 sys.exit(asyncio.run(test()))
 PYEOF
 
-# Force disconnect in test script to avoid leaving zombie connections
-export IBKR_FORCE_DISCONNECT=1
 python3 /tmp/test_gateway_accept.py
 TEST_RESULT=$?
 unset IBKR_FORCE_DISCONNECT

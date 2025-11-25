@@ -46,7 +46,7 @@ async def test_robust_logic():
         print(f"❌ Failed: {e}")
         try:
             ib.disconnect()
-        except:
+        except:  # noqa: E722
             pass
 
 

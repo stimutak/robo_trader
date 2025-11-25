@@ -45,7 +45,7 @@ async def test_exact_params():
         print(f"❌ Failed: {e}")
         try:
             ib.disconnect()
-        except:
+        except:  # noqa: E722
             pass
 
 

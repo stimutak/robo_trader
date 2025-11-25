@@ -51,7 +51,7 @@ def test_sync_connect():
         print(f"❌ Connection failed: {e}")
         try:
             ib.disconnect()
-        except:
+        except:  # noqa: E722
             pass
         return False
 

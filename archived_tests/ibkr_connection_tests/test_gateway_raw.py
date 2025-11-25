@@ -31,7 +31,7 @@ def test_raw_connection():
                 print(f"   Hex: {data.hex()}")
                 try:
                     print(f"   ASCII: {data.decode('ascii', errors='ignore')}")
-                except:
+                except:  # noqa: E722
                     pass
             else:
                 print("   No initial data received")
@@ -64,7 +64,7 @@ def test_raw_connection():
                 print(f"   Hex: {response.hex()}")
                 try:
                     print(f"   ASCII: {response.decode('ascii', errors='ignore')}")
-                except:
+                except:  # noqa: E722
                     pass
             else:
                 print("   ✗ No response received")

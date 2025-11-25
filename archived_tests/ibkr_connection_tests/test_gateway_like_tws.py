@@ -57,14 +57,14 @@ async def test_variations():
             print("❌ Timeout - API handshake failed")
             try:
                 ib.disconnect()
-            except:
+            except:  # noqa: E722
                 pass
 
         except Exception as e:
             print(f"❌ Error: {e}")
             try:
                 ib.disconnect()
-            except:
+            except:  # noqa: E722
                 pass
 
     return False
