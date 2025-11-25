@@ -567,7 +567,7 @@ class RobustConnectionManager:
                 else:
                     # Gateway-owned zombies cannot be killed - abort connection attempt
                     if "Gateway zombies remain" in msg or "Gateway-owned" in msg:
-                        raise ConnectionError(
+                        raise GatewayRequiresRestartError(
                             f"Gateway-owned zombie connections blocking port {self.port}. "
                             f"Manual Gateway restart required. {msg}"
                         )
@@ -590,8 +590,9 @@ class RobustConnectionManager:
                             logger.info(f"Zombie cleanup: {msg}")
                         else:
                             # Gateway-owned zombies cannot be killed - abort retry
+                            # Use GatewayRequiresRestartError to escape the retry loop
                             if "Gateway zombies remain" in msg or "Gateway-owned" in msg:
-                                raise ConnectionError(
+                                raise GatewayRequiresRestartError(
                                     f"Gateway-owned zombie connections blocking port {self.port}. "
                                     f"Manual Gateway restart required. {msg}"
                                 )
