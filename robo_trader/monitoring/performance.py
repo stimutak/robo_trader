@@ -89,6 +89,23 @@ class PerformanceMonitor:
         # Timing contexts
         self._timers: Dict[str, float] = {}
 
+    def timer_context(self, operation: str) -> "Timer":
+        """
+        Get a context manager for timing an operation.
+
+        Args:
+            operation: Name of the operation to time
+
+        Returns:
+            Timer context manager
+
+        Example:
+            with monitor.timer_context("feature_calculation"):
+                # do work
+                pass
+        """
+        return Timer(operation, self)
+
     def start_timer(self, operation: str) -> None:
         """Start timing an operation."""
         self._timers[operation] = time.perf_counter()
@@ -121,6 +138,26 @@ class PerformanceMonitor:
             self.db_write_samples.append(duration_ms)
 
         return duration_ms
+
+    def increment_counter(self, counter_name: str, amount: int = 1) -> None:
+        """
+        Increment a named counter.
+
+        Args:
+            counter_name: Name of the counter to increment
+            amount: Amount to increment by (default 1)
+        """
+        if not hasattr(self, "_counters"):
+            self._counters = {}
+        if counter_name not in self._counters:
+            self._counters[counter_name] = 0
+        self._counters[counter_name] += amount
+
+    def get_counter(self, counter_name: str) -> int:
+        """Get the value of a named counter."""
+        if not hasattr(self, "_counters"):
+            return 0
+        return self._counters.get(counter_name, 0)
 
     def record_symbol_processed(self, symbol: str, success: bool = True) -> None:
         """Record that a symbol was processed."""

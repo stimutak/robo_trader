@@ -302,6 +302,11 @@ python3 test_safety_features.py
 - If Gateway not responding: Restart Gateway (requires 2FA login)
 - Monitor connections: `netstat -an | grep 4002`
 
+#### Gateway Handshake Regression (2025-11)
+- The current handshake failure is **not** caused by Gateway API settings or IBKR account permissions. ActiveX/Socket Clients are permanently enabled in IB Gateway ≥10.41, and account `DUN264991` has API access.
+- The timeout reproduces on Gateway 10.40 and 10.41 across both `ib_async` 2.0.1 and legacy `ib_insync` 0.9.86, pointing to Gateway build behavior plus subprocess timing gaps. Official `ibapi` 10.37.2 scripts connect successfully when Gateway responds, so the worker must wait for `nextValidId`/`managedAccounts` before bailing.
+- Resolution plan: build a Gateway version matrix (test older builds like 10.39/10.37), capture results with the official ibapi probe, and update the subprocess worker to synchronize on those callbacks. Document every version test in the handoff docs.
+
 ### TWS Readonly Connection (2025-10-05) ✅
 **Important: System uses READONLY mode for TWS connections**
 - `readonly=True` in all IBKR connections
