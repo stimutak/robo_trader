@@ -224,23 +224,20 @@ async def test_with_real_data():
     db = AsyncDatabase(Path("trading_data.db"))
     await db.initialize()
 
-    # Get recent market data
-    query = """
-        SELECT timestamp, open, high, low, close, volume, symbol
-        FROM market_data
-        WHERE symbol IN ('AAPL', 'NVDA', 'TSLA')
-        AND timestamp > datetime('now', '-2 days')
-        ORDER BY symbol, timestamp DESC
-        LIMIT 500
-    """
+    # Get recent market data using actual database methods
+    symbols_to_check = ["AAPL", "NVDA", "TSLA"]
+    all_data = []
 
-    rows = await db.fetch_all(query)
+    for symbol in symbols_to_check:
+        rows = await db.get_latest_market_data(symbol, limit=200)
+        if rows:
+            for row in rows:
+                row["symbol"] = symbol
+                all_data.append(row)
 
-    if rows:
+    if all_data:
         # Convert to DataFrame
-        df = pd.DataFrame(
-            rows, columns=["timestamp", "open", "high", "low", "close", "volume", "symbol"]
-        )
+        df = pd.DataFrame(all_data)
         df["timestamp"] = pd.to_datetime(df["timestamp"])
 
         # Group by symbol

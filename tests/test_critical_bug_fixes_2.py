@@ -215,7 +215,7 @@ async def test_task_management():
     print("   ✅ Background task management working correctly")
 
 
-def test_circuit_breaker_integration():
+async def test_circuit_breaker_integration():
     """Test circuit breaker integration."""
     print_header("Testing Circuit Breaker Integration")
 
@@ -223,18 +223,18 @@ def test_circuit_breaker_integration():
     breaker = CircuitBreaker("test_breaker", failure_threshold=3, recovery_timeout=5)
 
     print(f"   ✓ Circuit breaker created: {breaker.name}")
-    print(f"   ✓ Initial state: OPEN = {breaker.is_open()}")
+    print(f"   ✓ Initial state: OPEN = {breaker.is_open}")
 
     print("\n2. Testing failure recording...")
     # Simulate some failures
     for i in range(3):
-        asyncio.create_task(breaker.record_failure(Exception(f"Test failure {i+1}")))
+        await breaker.record_failure(Exception(f"Test failure {i+1}"))
 
-    print(f"   ✓ After failures: OPEN = {breaker.is_open()}")
+    print(f"   ✓ After failures: OPEN = {breaker.is_open}")
 
     print("\n3. Testing usage pattern for order execution...")
     # Simulate how it should be used in order execution
-    if breaker.is_open():
+    if breaker.is_open:
         print("   ✓ Circuit breaker OPEN - would block order execution")
     else:
         print("   ✓ Circuit breaker CLOSED - would allow order execution")
@@ -322,7 +322,7 @@ async def test_integration():
 
     async def simulate_order_execution(symbol, price):
         # Check circuit breaker first
-        if breaker.is_open():
+        if breaker.is_open:
             print(f"   ⚠️  Order for {symbol} blocked by circuit breaker")
             return False
 

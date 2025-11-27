@@ -89,9 +89,21 @@ pkill -9 -f "runner_async" && pkill -9 -f "app.py" && pkill -9 -f "websocket_ser
 
 ## Starting the Trading System
 
-**RECOMMENDED: Use the automated startup script (2025-10-23)**
+### THE ONLY CORRECT WAY TO START THE TRADER
 
-The `START_TRADER.sh` script provides clean startup with automatic zombie cleanup and Gateway connectivity testing.
+```bash
+./START_TRADER.sh
+# Or with custom symbols:
+./START_TRADER.sh "AAPL,NVDA,TSLA"
+```
+
+**DO NOT:**
+- ❌ Run `force_gateway_reconnect.sh` before starting - it's for diagnostics ONLY if things aren't working
+- ❌ Run any test scripts that connect to Gateway before starting the trader
+- ❌ Run `python3 -m robo_trader.runner_async` directly without using START_TRADER.sh
+- ❌ Connect to Gateway from any Python script without using `safe_disconnect()` with `IBKR_FORCE_DISCONNECT=1`
+
+**WHY:** Any script that connects to Gateway and doesn't properly disconnect creates a zombie connection that blocks ALL future API handshakes until Gateway is restarted (requires 2FA login).
 
 ### Default Symbols (from user_settings.json)
 ```
@@ -301,6 +313,11 @@ python3 test_safety_features.py
 - If zombies accumulate: Use `START_TRADER.sh` for automatic cleanup
 - If Gateway not responding: Restart Gateway (requires 2FA login)
 - Monitor connections: `netstat -an | grep 4002`
+
+#### Gateway Handshake Regression (2025-11)
+- The current handshake failure is **not** caused by Gateway API settings or IBKR account permissions. ActiveX/Socket Clients are permanently enabled in IB Gateway ≥10.41, and account `DUN264991` has API access.
+- The timeout reproduces on Gateway 10.40 and 10.41 across both `ib_async` 2.0.1 and legacy `ib_insync` 0.9.86, pointing to Gateway build behavior plus subprocess timing gaps. Official `ibapi` 10.37.2 scripts connect successfully when Gateway responds, so the worker must wait for `nextValidId`/`managedAccounts` before bailing.
+- Resolution plan: build a Gateway version matrix (test older builds like 10.39/10.37), capture results with the official ibapi probe, and update the subprocess worker to synchronize on those callbacks. Document every version test in the handoff docs.
 
 ### TWS Readonly Connection (2025-10-05) ✅
 **Important: System uses READONLY mode for TWS connections**

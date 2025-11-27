@@ -88,8 +88,8 @@ async def handle_connect(params: dict) -> dict:
             flush=True,
         )
 
-        # Track connection timing
-        handshake_start = time.time()
+        # Track connection timing separately from handshake verification
+        connect_start = time.time()
 
         # Connect to IBKR using native async
         # The timeout here only applies to the initial TCP connection
@@ -102,7 +102,7 @@ async def handle_connect(params: dict) -> dict:
         )
 
         print(
-            f"DEBUG: connectAsync() returned after {time.time() - handshake_start:.2f}s",
+            f"DEBUG: connectAsync() returned after {time.time() - connect_start:.2f}s",
             file=sys.stderr,
             flush=True,
         )
@@ -113,6 +113,7 @@ async def handle_connect(params: dict) -> dict:
         max_handshake_wait = 15.0  # seconds for full API handshake
         handshake_poll_interval = 0.25  # 250ms polling - balanced for CPU efficiency
 
+        handshake_start = time.time()
         server_version = None
         while time.time() - handshake_start < max_handshake_wait:
             # Check if connected at TCP level first

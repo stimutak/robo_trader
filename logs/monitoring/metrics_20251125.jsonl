@@ -1,0 +1,4 @@
+{"timestamp": "2025-11-25T09:57:01.582898", "metrics": {"success_rate": 0.5, "error_rate": 0.5, "latency": 20.4, "pnl": 37.5, "cpu_usage": 7.3, "memory_usage": 43.7}}
+{"timestamp": "2025-11-25T09:57:06.689250", "metrics": {"success_rate": 0.5, "error_rate": 0.5, "cpu_usage": 9.8, "memory_usage": 43.6}}
+{"timestamp": "2025-11-25T10:01:36.609583", "metrics": {"success_rate": 0.5, "error_rate": 0.5, "latency": 20.4, "pnl": 37.5, "cpu_usage": 7.8, "memory_usage": 43.8}}
+{"timestamp": "2025-11-25T10:01:41.718139", "metrics": {"success_rate": 0.5, "error_rate": 0.5, "cpu_usage": 13.6, "memory_usage": 44.1}}

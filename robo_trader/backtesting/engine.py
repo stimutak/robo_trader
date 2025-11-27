@@ -257,6 +257,9 @@ class BacktestEngine:
                 continue
 
             current_price = current_data.loc[symbol, "close"]
+            # Skip if price is NaN or zero
+            if pd.isna(current_price) or current_price <= 0:
+                continue
             target_value = portfolio_value * target_weight
             target_shares = (
                 int(target_value / current_price)
@@ -306,6 +309,11 @@ class BacktestEngine:
         self, symbol: str, market_data: pd.Series, signal: Dict[str, Any]
     ) -> int:
         """Calculate position size for a trade."""
+        # Check for NaN/invalid price data
+        close_price = market_data.get("close", 0)
+        if pd.isna(close_price) or close_price <= 0:
+            return 0
+
         if self.position_sizer:
             return self.position_sizer.calculate_size(
                 symbol, market_data, signal, self.cash, self.positions
@@ -313,18 +321,18 @@ class BacktestEngine:
         else:
             # Default sizing - equal weight
             max_position_value = self.cash / max(1, self.max_positions - len(self.positions))
-            shares = int(max_position_value / market_data["close"])
+            shares = int(max_position_value / close_price)
 
             if not self.use_fractional_shares:
                 return shares
             else:
-                return max_position_value / market_data["close"]
+                return max_position_value / close_price
 
     def _execute_buy(
         self, symbol: str, quantity: float, market_data: pd.Series, timestamp: datetime
     ) -> None:
         """Execute buy order."""
-        if quantity <= 0:
+        if quantity <= 0 or pd.isna(quantity):
             return
 
         # Simulate execution
@@ -345,6 +353,8 @@ class BacktestEngine:
 
         if total_cost > self.cash:
             # Insufficient funds - reduce quantity
+            if pd.isna(order.fill_price) or order.fill_price <= 0:
+                return
             affordable_quantity = int(
                 (self.cash - order.execution_cost.commission) / order.fill_price
             )
