@@ -5,8 +5,12 @@
 # This script ensures clean startup by:
 # 1. Killing all existing Python trader processes
 # 2. Cleaning up zombie CLOSE_WAIT connections
-# 3. Testing Gateway connectivity
-# 4. Starting the trading system
+# 3. Starting the trading system (NO pre-flight connectivity test)
+#
+# ⚠️  CRITICAL WARNING:
+# DO NOT run test_gateway_connection_fix.py before running this script!
+# Running tests creates Gateway zombies that will block trader startup.
+# If you ran a test, either wait 30+ seconds or restart Gateway.
 #
 
 set -e
@@ -17,6 +21,9 @@ SYMBOLS="${1:-AAPL,NVDA,TSLA}"
 echo "=========================================="
 echo "RoboTrader Startup Script"
 echo "=========================================="
+echo ""
+echo "⚠️  REMINDER: Do NOT run test_gateway_connection_fix.py before this!"
+echo "    If you did, wait 30s or restart Gateway first."
 echo ""
 
 # Step 1: Kill existing processes
