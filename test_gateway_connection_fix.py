@@ -2,12 +2,28 @@
 """
 Test script to verify the Gateway connection fix (2025-11-27).
 
+⚠️  CRITICAL WARNING ⚠️
+=======================
+DO NOT run this script immediately before starting the trader!
+
+Even with proper cleanup, this test creates Gateway connections that may
+leave brief zombie states. Running this and then immediately starting
+./START_TRADER.sh will likely fail due to CLOSE_WAIT zombies.
+
+SAFE USAGE:
+- Run this ONLY to diagnose connection problems AFTER startup fails
+- If you run this test, wait 30+ seconds before starting the trader
+- OR restart Gateway (File → Exit, relaunch with 2FA) after testing
+
+For quick connectivity checks without zombie risk, use:
+    ./force_gateway_reconnect.sh
+
+=======================
+
 This script tests the critical fixes made to the subprocess worker:
 1. Removed blocking waitOnUpdate() call
 2. Added serverVersion() check for API handshake verification
 3. Proper async polling for account data
-
-Run this test AFTER restarting Gateway to verify the fix works.
 
 IMPORTANT: This test uses IBKR_FORCE_DISCONNECT=1 to properly clean up
 connections and avoid creating zombies.
@@ -279,6 +295,19 @@ async def check_zombies():
 async def main():
     """Run all tests."""
     print("\n" + "=" * 60)
+    print("⚠️  CRITICAL WARNING ⚠️")
+    print("=" * 60)
+    print("")
+    print("DO NOT run this test immediately before starting the trader!")
+    print("")
+    print("This test creates Gateway connections that may leave zombies.")
+    print("After running, either:")
+    print("  - Wait 30+ seconds before ./START_TRADER.sh")
+    print("  - OR restart Gateway (File→Exit, relaunch with 2FA)")
+    print("")
+    print("For quick checks, use: ./force_gateway_reconnect.sh")
+    print("")
+    print("=" * 60)
     print("GATEWAY CONNECTION FIX VERIFICATION")
     print("=" * 60)
     print("\nThis test verifies the 2025-11-27 fix for:")
@@ -324,6 +353,10 @@ async def main():
         print("ALL TESTS PASSED!")
         print("The Gateway connection fix is working correctly.")
         print("=" * 60)
+        print("")
+        print("⚠️  REMINDER: Wait 30+ seconds before running ./START_TRADER.sh")
+        print("   or restart Gateway to avoid zombie connections.")
+        print("")
     else:
         print("\n" + "=" * 60)
         print("SOME TESTS FAILED")

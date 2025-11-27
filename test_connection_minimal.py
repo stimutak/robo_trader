@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
 Minimal connection test - no managedAccounts() call
+
+⚠️  WARNING: Creates Gateway connection - wait 30s before starting trader!
+For quick checks, use: ./force_gateway_reconnect.sh
 """
 import asyncio
 

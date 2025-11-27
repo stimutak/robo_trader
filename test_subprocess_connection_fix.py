@@ -2,6 +2,16 @@
 """
 Test script for subprocess worker connection fix.
 
+⚠️  CRITICAL WARNING ⚠️
+=======================
+DO NOT run this script immediately before starting the trader!
+
+This test creates Gateway connections that may leave zombie states.
+After running, wait 30+ seconds or restart Gateway before starting trader.
+
+For quick connectivity checks, use: ./force_gateway_reconnect.sh
+=======================
+
 This script validates the timing and zombie connection fixes implemented
 to resolve the subprocess worker connection failure issue.
 """

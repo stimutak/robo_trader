@@ -4,6 +4,29 @@
 
 ---
 
+## ⚠️ CRITICAL WARNING - READ FIRST
+
+**DO NOT run `test_gateway_connection_fix.py` immediately before starting the trader!**
+
+Running the test script creates brief Gateway connections that, even with proper cleanup, can leave zombie connections that block trader startup. If you run the test and then immediately start the trader:
+
+1. The test creates a connection to Gateway
+2. Even with `safe_disconnect()`, Gateway may retain the connection state briefly
+3. This creates a CLOSE_WAIT zombie that blocks the trader's connection
+4. **Result: Trader fails to connect**
+
+**If you need to test Gateway connectivity:**
+- Use `./force_gateway_reconnect.sh` instead (quick test, minimal zombie risk)
+- OR wait 30+ seconds after running `test_gateway_connection_fix.py`
+- OR restart Gateway after testing (requires 2FA login)
+
+**The safe workflow is:**
+1. Check for zombies: `lsof -nP -iTCP:4002 -sTCP:CLOSE_WAIT`
+2. Start directly: `./START_TRADER.sh`
+3. Only run diagnostic tests if startup fails
+
+---
+
 ## Pre-Flight Checklist
 
 Before starting the trader, verify:
@@ -89,16 +112,25 @@ python3 app.py &
 
 ---
 
-## Verify Connection Works
+## Verify Connection Works (Troubleshooting Only)
 
-Run the test script BEFORE starting the full system:
+⚠️ **DO NOT run this before starting the trader** - it creates zombies!
+
+Only use this test script **after** startup fails to diagnose issues:
 ```bash
 python3 test_gateway_connection_fix.py
 ```
 
 Expected output: All 3 tests pass (Direct, Worker, Client)
 
-If tests fail → Fix Gateway connection first (see Troubleshooting)
+**IMPORTANT:** After running this test, you MUST either:
+- Wait 30+ seconds before starting the trader, OR
+- Restart Gateway (File → Exit, relaunch with 2FA)
+
+For quick connectivity checks without zombie risk, use:
+```bash
+./force_gateway_reconnect.sh
+```
 
 ---
 
