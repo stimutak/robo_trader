@@ -51,7 +51,15 @@ signal.signal(signal.SIGINT, signal_handler)
 
 
 async def handle_connect(params: dict) -> dict:
-    """Handle connect command"""
+    """Handle connect command with proper async handling.
+
+    CRITICAL FIX (2025-11-27): Removed blocking waitOnUpdate() call which was
+    freezing the async event loop. Now uses proper async patterns:
+    1. connectAsync() with explicit timeout
+    2. serverVersion() check to verify API handshake completion
+    3. Async polling with asyncio.sleep() for account data
+    4. Event-based waiting using ib_async's internal event loop
+    """
     global ib, gateway_api_down, gateway_failure_detail
 
     try:
@@ -74,15 +82,17 @@ async def handle_connect(params: dict) -> dict:
         readonly = params.get("readonly", True)
         timeout = params.get("timeout", 30.0)
 
-        # DEBUG: Log to stderr
         print(
             f"DEBUG: Connecting to {host}:{port} client_id={client_id} timeout={timeout}",
             file=sys.stderr,
             flush=True,
         )
 
-        # Connect to IBKR using native async (like test script)
-        # This allows ib_async to properly process incoming messages from Gateway
+        # Track connection timing separately from handshake verification
+        connect_start = time.time()
+
+        # Connect to IBKR using native async
+        # The timeout here only applies to the initial TCP connection
         await ib.connectAsync(
             host=host,
             port=port,
@@ -91,71 +101,129 @@ async def handle_connect(params: dict) -> dict:
             timeout=timeout,
         )
 
-        print(f"DEBUG: Connection initiated, waiting for handshake...", file=sys.stderr, flush=True)
-
-        # CRITICAL FIX: Wait for connection to be fully established before proceeding
-        # The original 0.5s was too short - handshake takes ~300ms + account data retrieval
-        max_handshake_wait = 10  # seconds
-        handshake_start = time.time()
-
-        while not ib.isConnected():
-            if time.time() - handshake_start > max_handshake_wait:
-                raise TimeoutError(f"Connection handshake timeout after {max_handshake_wait}s")
-            await asyncio.sleep(0.1)  # Check every 100ms
-
-        # Additional wait for API protocol to stabilize
-        await asyncio.sleep(2.0)  # Increased from 0.5s to 2.0s based on handoff analysis
-
-        print(f"DEBUG: Connected successfully after {time.time() - handshake_start:.2f}s!", file=sys.stderr, flush=True)
-
-        # Verify connection and get accounts
-        if not ib.isConnected():
-            raise ConnectionError("Connection failed - not connected")
-
-        # Wait for account data to arrive after connection
-        # Gateway sends account data asynchronously after API handshake completes
-        # Use ib.waitOnUpdate() to actively process incoming IB messages
         print(
-            f"DEBUG: Waiting for account data to arrive...", file=sys.stderr, flush=True
+            f"DEBUG: connectAsync() returned after {time.time() - connect_start:.2f}s",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        # CRITICAL FIX #1: Verify API handshake completed by checking serverVersion
+        # The serverVersion is only available after the API protocol handshake succeeds
+        # This is more reliable than isConnected() which only checks TCP state
+        max_handshake_wait = 15.0  # seconds for full API handshake
+        handshake_poll_interval = 0.25  # 250ms polling - balanced for CPU efficiency
+
+        handshake_start = time.time()
+        server_version = None
+        while time.time() - handshake_start < max_handshake_wait:
+            # Check if connected at TCP level first
+            if not ib.isConnected():
+                await asyncio.sleep(handshake_poll_interval)
+                continue
+
+            # Now check if API handshake is complete by checking serverVersion
+            try:
+                server_version = ib.client.serverVersion()
+                if server_version and server_version > 0:
+                    print(
+                        f"DEBUG: API handshake complete! serverVersion={server_version} "
+                        f"after {time.time() - handshake_start:.2f}s",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    break
+            except AttributeError:
+                # client.serverVersion() not available yet - handshake incomplete
+                pass
+            except (ConnectionError, OSError) as e:
+                # Connection-related errors during handshake
+                print(
+                    f"DEBUG: serverVersion() connection error: {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception as e:
+                # Unexpected error - log but continue polling
+                print(
+                    f"DEBUG: serverVersion() unexpected error ({type(e).__name__}): {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+            # CRITICAL FIX #2: Use async sleep, NOT blocking waitOnUpdate()
+            # waitOnUpdate() is synchronous and blocks the event loop, which
+            # prevents ib_async from processing incoming Gateway messages
+            await asyncio.sleep(handshake_poll_interval)
+
+        if not server_version or server_version <= 0:
+            elapsed = time.time() - handshake_start
+            raise TimeoutError(
+                f"API handshake timeout after {elapsed:.1f}s. "
+                f"TCP connected but Gateway did not complete protocol negotiation. "
+                f"isConnected={ib.isConnected()}"
+            )
+
+        # Small stabilization delay after handshake (reduced from 2.0s)
+        # This gives Gateway time to send initial account data
+        await asyncio.sleep(0.5)
+
+        # CRITICAL FIX #3: Wait for account data with pure async polling
+        # Do NOT use waitOnUpdate() as it's blocking
+        print(
+            f"DEBUG: Waiting for account data to arrive...",
+            file=sys.stderr,
+            flush=True,
         )
 
         accounts = []
-        max_wait_seconds = 10
-        poll_interval = 0.5
-        attempts = int(max_wait_seconds / poll_interval)
+        account_wait_start = time.time()
+        max_account_wait = 10.0  # seconds
+        account_poll_interval = 0.3  # 300ms polling - balanced for CPU efficiency
 
-        for attempt in range(attempts):
-            # First try to get accounts
+        while time.time() - account_wait_start < max_account_wait:
+            # Check for managed accounts
             accounts = ib.managedAccounts()
             if accounts:
                 print(
-                    f"DEBUG: Received accounts after {(attempt + 1) * poll_interval:.1f}s: {accounts}",
+                    f"DEBUG: Received accounts after {time.time() - account_wait_start:.2f}s: {accounts}",
                     file=sys.stderr,
                     flush=True,
                 )
                 break
 
-            # Use waitOnUpdate() to actively process IB events instead of just sleeping
-            # This allows ib_async to process incoming messages from Gateway
-            try:
-                ib.waitOnUpdate(timeout=poll_interval)
-            except Exception:
-                # waitOnUpdate might timeout, that's ok
-                await asyncio.sleep(poll_interval)
+            # Pure async sleep - let ib_async's internal event loop process messages
+            # This is critical: ib_async processes incoming data in the background
+            # when we yield control with await asyncio.sleep()
+            await asyncio.sleep(account_poll_interval)
 
         if not accounts:
+            elapsed = time.time() - handshake_start
             raise ConnectionError(
-                f"No managed accounts found after {max_wait_seconds}s wait. "
-                "Gateway may be sending data but worker cannot retrieve it. "
-                "Check Gateway API logs for account data transmission."
+                f"No managed accounts received after {elapsed:.1f}s total wait. "
+                f"API handshake succeeded (serverVersion={server_version}) but "
+                f"Gateway did not send account data. Check Gateway API permissions."
             )
 
+        # Connection fully established
         gateway_api_down = False
         gateway_failure_detail = ""
 
+        total_time = time.time() - handshake_start
+        print(
+            f"DEBUG: Connection fully established in {total_time:.2f}s "
+            f"(serverVersion={server_version}, accounts={accounts})",
+            file=sys.stderr,
+            flush=True,
+        )
+
         return {
             "status": "success",
-            "data": {"connected": True, "accounts": accounts, "client_id": client_id},
+            "data": {
+                "connected": True,
+                "accounts": accounts,
+                "client_id": client_id,
+                "server_version": server_version,
+            },
         }
 
     except Exception as e:

@@ -285,6 +285,15 @@ class SubprocessIBKRClient:
 
         self.process = None
         self._connected = False
+
+        # Ensure debug log file is closed (belt-and-suspenders cleanup)
+        if self._debug_log_file:
+            try:
+                self._debug_log_file.close()
+            except Exception:
+                pass
+            self._debug_log_file = None
+
         logger.info("IBKR subprocess worker stopped cleanly")
 
     async def _execute_command(self, command: dict, timeout: float = 30.0) -> dict:
@@ -424,8 +433,12 @@ class SubprocessIBKRClient:
         connection_start = time.time()
 
         try:
-            # Increase timeout to account for new synchronization wait in worker
-            extended_timeout = timeout + 15  # Extra buffer for handshake + account data wait
+            # Increase timeout to account for worker's connection sequence:
+            # - 15s max for API handshake (serverVersion verification)
+            # - 0.5s stabilization delay
+            # - 10s max for account data retrieval
+            # Total worker max wait: ~25.5s, so add 30s buffer to base timeout
+            extended_timeout = timeout + 30
             logger.debug("Sending connect command with extended timeout", timeout=extended_timeout)
 
             data = await self._execute_command(command, timeout=extended_timeout)
@@ -441,6 +454,7 @@ class SubprocessIBKRClient:
 
         self._connected = data.get("connected", False)
         accounts = data.get("accounts", [])
+        server_version = data.get("server_version")
 
         # Track connection timing for health monitoring
         if self._connected:
@@ -449,7 +463,11 @@ class SubprocessIBKRClient:
             self._gateway_api_down_detail = None
 
         logger.info(
-            "Connected to IBKR via subprocess", connected=self._connected, accounts=accounts
+            "Connected to IBKR via subprocess",
+            connected=self._connected,
+            accounts=accounts,
+            server_version=server_version,
+            duration_seconds=f"{time.time() - connection_start:.2f}",
         )
 
         return self._connected
