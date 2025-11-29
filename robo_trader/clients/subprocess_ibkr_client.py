@@ -62,6 +62,12 @@ class SubprocessIBKRClient:
     Uses threading for subprocess I/O to avoid asyncio event loop starvation.
     """
 
+    # Worker timeout constants (must match ibkr_subprocess_worker.py)
+    WORKER_HANDSHAKE_TIMEOUT = 15.0  # max_handshake_wait in worker
+    WORKER_STABILIZATION_DELAY = 0.5  # stabilization sleep in worker
+    WORKER_ACCOUNT_TIMEOUT = 10.0  # max_account_wait in worker
+    WORKER_MAX_WAIT = WORKER_HANDSHAKE_TIMEOUT + WORKER_STABILIZATION_DELAY + WORKER_ACCOUNT_TIMEOUT  # 25.5s
+
     def __init__(self):
         self.process: Optional[subprocess.Popen] = None
         self.lock = asyncio.Lock()
@@ -120,42 +126,61 @@ class SubprocessIBKRClient:
             logger.debug("Using sys.executable Python", python_exe=python_exe)
 
         # DEBUGGING FIX: Create debug log file for worker stderr capture
+        # Use try/finally to ensure cleanup even if subprocess/thread startup fails
         debug_log_path = "/tmp/worker_debug.log"
+        debug_log_file = None
         try:
-            self._debug_log_file = open(debug_log_path, "w")
+            debug_log_file = open(debug_log_path, "w")
             logger.info("Worker debug output will be captured", debug_log=debug_log_path)
         except Exception as e:
             logger.warning("Could not create debug log file", error=str(e))
-            self._debug_log_file = None
+            debug_log_file = None
 
-        # CRITICAL FIX: Use regular subprocess.Popen with threading instead of
-        # asyncio.create_subprocess_exec to avoid event loop starvation in
-        # busy async environments
-        # CRITICAL FIX 2: Launch as module with -m to ensure robo_trader/__init__.py
-        self.process = subprocess.Popen(
-            [python_exe, "-m", "robo_trader.clients.ibkr_subprocess_worker"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,  # Capture stderr for logging
-            text=True,
-            bufsize=1,  # Line buffered
-            close_fds=True,  # Don't inherit file descriptors
-        )
+        # Wrap subprocess and thread startup in try block to ensure cleanup
+        try:
+            # CRITICAL FIX: Use regular subprocess.Popen with threading instead of
+            # asyncio.create_subprocess_exec to avoid event loop starvation in
+            # busy async environments
+            # CRITICAL FIX 2: Launch as module with -m to ensure robo_trader/__init__.py
+            self.process = subprocess.Popen(
+                [python_exe, "-m", "robo_trader.clients.ibkr_subprocess_worker"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,  # Capture stderr for logging
+                text=True,
+                bufsize=1,  # Line buffered
+                close_fds=True,  # Don't inherit file descriptors
+            )
 
-        logger.info("IBKR subprocess worker started", pid=self.process.pid)
+            logger.info("IBKR subprocess worker started", pid=self.process.pid)
 
-        # Start reader threads to avoid blocking
-        self._stop_reader.clear()
-        self._reader_thread = threading.Thread(
-            target=self._read_loop, daemon=True, name="IBKRSubprocessReader"
-        )
-        self._reader_thread.start()
+            # Store debug log file only after successful subprocess start
+            self._debug_log_file = debug_log_file
 
-        # Start stderr reader thread
-        self._stderr_reader_thread = threading.Thread(
-            target=self._stderr_read_loop, daemon=True, name="IBKRSubprocessStderrReader"
-        )
-        self._stderr_reader_thread.start()
+            # Start reader threads to avoid blocking
+            self._stop_reader.clear()
+            self._reader_thread = threading.Thread(
+                target=self._read_loop, daemon=True, name="IBKRSubprocessReader"
+            )
+            self._reader_thread.start()
+
+            # Start stderr reader thread (this thread will manage debug_log_file lifecycle)
+            self._stderr_reader_thread = threading.Thread(
+                target=self._stderr_read_loop, daemon=True, name="IBKRSubprocessStderrReader"
+            )
+            self._stderr_reader_thread.start()
+
+        except Exception:
+            # Clean up debug log file if subprocess/thread startup fails
+            if debug_log_file and not self._debug_log_file:
+                # File was opened but not yet handed to stderr reader thread
+                try:
+                    debug_log_file.close()
+                    logger.debug("Closed debug log file after startup failure")
+                except Exception:
+                    pass
+            # Re-raise the original exception
+            raise
 
     def _read_loop(self) -> None:
         """Thread function to read subprocess stdout"""
@@ -433,13 +458,15 @@ class SubprocessIBKRClient:
         connection_start = time.time()
 
         try:
-            # Increase timeout to account for worker's connection sequence:
-            # - 15s max for API handshake (serverVersion verification)
-            # - 0.5s stabilization delay
-            # - 10s max for account data retrieval
-            # Total worker max wait: ~25.5s, so add 30s buffer to base timeout
-            extended_timeout = timeout + 30
-            logger.debug("Sending connect command with extended timeout", timeout=extended_timeout)
+            # Calculate timeout: base TCP timeout + worker's internal sequence + buffer
+            # Worker sequence: handshake (15s) + stabilization (0.5s) + accounts (10s) = 25.5s
+            # Add 5s buffer for network/processing overhead
+            # Total: timeout (TCP) + 25.5s (worker) + 5s (buffer)
+            extended_timeout = timeout + self.WORKER_MAX_WAIT + 5.0
+            logger.debug("Sending connect command with extended timeout",
+                        base_timeout=timeout,
+                        worker_max_wait=self.WORKER_MAX_WAIT,
+                        extended_timeout=extended_timeout)
 
             data = await self._execute_command(command, timeout=extended_timeout)
 
