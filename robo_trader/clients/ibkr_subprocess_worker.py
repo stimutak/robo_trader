@@ -110,6 +110,7 @@ async def handle_connect(params: dict) -> dict:
         # CRITICAL FIX #1: Verify API handshake completed by checking serverVersion
         # The serverVersion is only available after the API protocol handshake succeeds
         # This is more reliable than isConnected() which only checks TCP state
+        # NOTE: This timeout must match WORKER_HANDSHAKE_TIMEOUT in subprocess_ibkr_client.py
         max_handshake_wait = 15.0  # seconds for full API handshake
         handshake_poll_interval = 0.25  # 250ms polling - balanced for CPU efficiency
 
@@ -165,6 +166,7 @@ async def handle_connect(params: dict) -> dict:
 
         # Small stabilization delay after handshake (reduced from 2.0s)
         # This gives Gateway time to send initial account data
+        # NOTE: This delay must match WORKER_STABILIZATION_DELAY in subprocess_ibkr_client.py
         await asyncio.sleep(0.5)
 
         # CRITICAL FIX #3: Wait for account data with pure async polling
@@ -177,6 +179,7 @@ async def handle_connect(params: dict) -> dict:
 
         accounts = []
         account_wait_start = time.time()
+        # NOTE: This timeout must match WORKER_ACCOUNT_TIMEOUT in subprocess_ibkr_client.py
         max_account_wait = 10.0  # seconds
         account_poll_interval = 0.3  # 300ms polling - balanced for CPU efficiency
 
