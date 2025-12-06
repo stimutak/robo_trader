@@ -46,6 +46,10 @@ root/
 cookies.txt
 doc/
 
+# IBC Configuration (contains credentials)
+config/ibc/config.ini
+config/ibc/logs/
+
 # IDE
 .vscode/
 .idea/

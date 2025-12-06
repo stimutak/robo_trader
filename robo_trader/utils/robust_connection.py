@@ -457,6 +457,104 @@ def check_tws_zombie_connections(port: int = 4002) -> tuple[int, str]:
         return 0, ""  # Fail open - allow connection attempt
 
 
+def restart_gateway_for_zombies(port: int = 4002, timeout: int = 180) -> bool:
+    """
+    Restart Gateway to clear zombie connections.
+
+    This function calls the gateway_manager.py script to restart Gateway,
+    which clears all CLOSE_WAIT zombie connections that block API handshakes.
+
+    Args:
+        port: Port to determine trading mode (4002=paper, 4001=live)
+        timeout: Maximum time to wait for restart (default 180s for 2FA)
+
+    Returns:
+        True if restart succeeded and port is listening, False otherwise
+    """
+    import sys
+
+    trading_mode_flag = "--paper" if port == 4002 else "--live"
+
+    logger.warning(f"🔄 Restarting Gateway to clear zombie connections on port {port}...")
+
+    try:
+        # Get the project root directory
+        script_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        gateway_manager_path = os.path.join(script_dir, "scripts", "gateway_manager.py")
+
+        if not os.path.exists(gateway_manager_path):
+            logger.error(f"Gateway manager script not found: {gateway_manager_path}")
+            return False
+
+        # Call gateway_manager.py restart command
+        result = subprocess.run(
+            [sys.executable, gateway_manager_path, "restart", trading_mode_flag],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=script_dir,
+        )
+
+        if result.returncode == 0:
+            logger.info("✅ Gateway restart command completed - waiting for Gateway to be ready...")
+
+            # Wait for Gateway to start listening on the port
+            # This can take 30-90 seconds depending on 2FA completion
+            max_wait = 120  # 2 minutes max wait for Gateway to be ready
+            poll_interval = 3  # Check every 3 seconds
+            waited = 0
+
+            while waited < max_wait:
+                time.sleep(poll_interval)
+                waited += poll_interval
+
+                # Check if port is listening
+                try:
+                    check_result = subprocess.run(
+                        ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if check_result.returncode == 0 and "LISTEN" in check_result.stdout:
+                        logger.info(f"✅ Gateway is now listening on port {port}")
+                        # Give it a moment to fully stabilize
+                        time.sleep(2)
+                        # Check for zombies
+                        zombie_count, _ = check_tws_zombie_connections(port)
+                        if zombie_count == 0:
+                            logger.info("✅ No zombie connections after restart")
+                            return True
+                        else:
+                            logger.warning(f"⚠️ Still have {zombie_count} zombies after restart")
+                            return False
+                except Exception as e:
+                    logger.debug(f"Port check error: {e}")
+
+                if waited % 15 == 0:
+                    logger.info(f"  Waiting for Gateway... ({waited}s / {max_wait}s)")
+
+            logger.error(f"Gateway did not start listening on port {port} within {max_wait}s")
+            return False
+        else:
+            logger.error(f"Gateway restart failed with code {result.returncode}")
+            if result.stderr:
+                logger.error(f"stderr: {result.stderr[:500]}")
+            return False
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"Gateway restart timed out after {timeout}s")
+        return False
+    except Exception as e:
+        logger.error(f"Error restarting Gateway: {e}")
+        return False
+
+
+async def restart_gateway_for_zombies_async(port: int = 4002, timeout: int = 180) -> bool:
+    """Async wrapper for restart_gateway_for_zombies."""
+    return await asyncio.to_thread(restart_gateway_for_zombies, port, timeout)
+
+
 class RobustConnectionManager:
     """
     Enhanced connection manager with exponential backoff and circuit breaker.
@@ -565,13 +663,23 @@ class RobustConnectionManager:
                 if success:
                     logger.info(f"Pre-connection cleanup: {msg}")
                 else:
-                    # Gateway-owned zombies cannot be killed - abort connection attempt
+                    # Gateway-owned zombies block API handshakes and MUST be cleared
+                    # The only way to clear them is to restart Gateway
                     if "Gateway zombies remain" in msg or "Gateway-owned" in msg:
-                        raise GatewayRequiresRestartError(
-                            f"Gateway-owned zombie connections blocking port {self.port}. "
-                            f"Manual Gateway restart required. {msg}"
+                        logger.warning(
+                            f"Gateway-owned zombies detected - triggering Gateway restart. {msg}"
                         )
-                    logger.warning(f"Pre-connection cleanup incomplete: {msg}")
+                        # Attempt automatic Gateway restart
+                        restart_success = await restart_gateway_for_zombies_async(self.port)
+                        if not restart_success:
+                            raise ConnectionError(
+                                "Gateway-owned zombie connections detected. "
+                                "Automatic restart failed. Please restart Gateway manually: "
+                                "python3 scripts/gateway_manager.py restart"
+                            )
+                        logger.info("✅ Gateway restarted - zombies cleared")
+                    else:
+                        logger.warning(f"Pre-connection cleanup incomplete: {msg}")
 
             last_exception = None
 
@@ -589,14 +697,18 @@ class RobustConnectionManager:
                         if success:
                             logger.info(f"Zombie cleanup: {msg}")
                         else:
-                            # Gateway-owned zombies cannot be killed - abort retry
-                            # Use GatewayRequiresRestartError to escape the retry loop
+                            # Gateway-owned zombies block API handshakes
+                            # Trigger Gateway restart before retry
                             if "Gateway zombies remain" in msg or "Gateway-owned" in msg:
-                                raise GatewayRequiresRestartError(
-                                    f"Gateway-owned zombie connections blocking port {self.port}. "
-                                    f"Manual Gateway restart required. {msg}"
+                                logger.warning(
+                                    f"Gateway-owned zombies detected during retry - restarting Gateway. {msg}"
                                 )
-                            logger.warning(f"Zombie cleanup incomplete: {msg}")
+                                restart_success = await restart_gateway_for_zombies_async(self.port)
+                                if not restart_success:
+                                    logger.error("Gateway restart failed during retry")
+                                    # Continue anyway - the connection will fail and we'll exit the loop
+                            else:
+                                logger.warning(f"Zombie cleanup incomplete: {msg}")
 
                     logger.info(
                         f"Connection attempt {attempt + 1}/{self.max_retries} "
@@ -631,15 +743,23 @@ class RobustConnectionManager:
                 except GatewayRequiresRestartError as e:
                     last_exception = e
                     logger.error(
-                        "Gateway API layer reported down; aborting retries and requiring manual restart",
+                        "Gateway API layer reported down - attempting automatic restart",
                         detail=str(e),
                     )
                     self.circuit_breaker.record_failure()
                     self.consecutive_failures += 1
-                    raise ConnectionError(
-                        "IBKR Gateway API layer is unresponsive. "
-                        "Manual Gateway restart required before retrying."
-                    ) from e
+                    # Attempt automatic Gateway restart
+                    restart_success = await restart_gateway_for_zombies_async(self.port)
+                    if restart_success:
+                        logger.info("✅ Gateway restarted successfully - retrying connection")
+                        # Don't raise - continue to next retry attempt
+                        continue
+                    else:
+                        raise ConnectionError(
+                            "IBKR Gateway API layer is unresponsive. "
+                            "Automatic restart failed. Please restart Gateway manually: "
+                            "python3 scripts/gateway_manager.py restart"
+                        ) from e
                 except Exception as e:
                     last_exception = e
                     logger.warning(f"Connection failed on attempt {attempt + 1}: {e}")

@@ -460,17 +460,20 @@ class AsyncRunner:
         logger.info("PERFORMING IBKR PRE-FLIGHT CONNECTION CHECK")
         logger.info("=" * 60)
 
-        # Test if configured TWS/IB Gateway port is open
-        import socket
-        import sys
+        # Test if configured TWS/IB Gateway port is open using lsof
+        # IMPORTANT: Do NOT use socket.connect_ex() - it creates zombie connections
+        # that block subsequent IBKR API handshakes!
 
-        def test_port_open(host="127.0.0.1", port=7497, timeout=5):
+        def test_port_open_lsof(port=7497):
+            """Check if port is listening using lsof (no zombies)."""
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(timeout)
-                result = sock.connect_ex((host, port))
-                sock.close()
-                return result == 0
+                result = subprocess.run(
+                    ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                return result.returncode == 0 and "LISTEN" in result.stdout
             except Exception as e:
                 logger.error(f"Port test failed: {e}")
                 return False
@@ -478,9 +481,9 @@ class AsyncRunner:
         host = self.cfg.ibkr.host
         port = self.cfg.ibkr.port
 
-        if not test_port_open(host=host, port=port):
+        if not test_port_open_lsof(port=port):
             logger.error(f"❌ IBKR PRE-FLIGHT CHECK FAILED")
-            logger.error(f"Port {port} is not open on host {host} - TWS/IB Gateway not running")
+            logger.error(f"Port {port} is not listening - TWS/IB Gateway not running")
             logger.error("Please ensure TWS or IB Gateway is running and configured properly:")
             logger.error("1. Start TWS/IB Gateway")
             logger.error("2. Enable API connections in Global Configuration")
@@ -500,6 +503,7 @@ class AsyncRunner:
         from .utils.robust_connection import (
             check_tws_zombie_connections,
             kill_tws_zombie_connections,
+            restart_gateway_for_zombies,
         )
 
         # Check for zombies
@@ -511,7 +515,26 @@ class AsyncRunner:
                 logger.info(f"✓ {msg}")
             else:
                 logger.warning(f"⚠️ {msg}")
-                logger.warning("Proceeding anyway - connection may fail")
+                # Gateway-owned zombies require Gateway restart
+                # NOTE: We do NOT auto-restart Gateway here because:
+                # 1. Gateway restart requires 2FA which can't be completed in a subprocess
+                # 2. The startup script (START_TRADER.sh) handles Gateway restarts properly
+                # 3. If we get here, something created a zombie after the startup script checked
+                if "Gateway zombies remain" in msg or "Gateway-owned" in msg:
+                    logger.error("❌ Gateway-owned zombies detected - these block API handshakes")
+                    logger.error(
+                        "The dashboard or another process may have created a zombie connection."
+                    )
+                    logger.error("Please restart Gateway manually and try again:")
+                    logger.error("  1. Kill this process: Ctrl+C")
+                    logger.error(
+                        "  2. Restart Gateway: python3 scripts/gateway_manager.py restart --paper"
+                    )
+                    logger.error("  3. Complete 2FA on your phone")
+                    logger.error("  4. Run: ./START_TRADER.sh")
+                    raise RuntimeError(
+                        "Gateway-owned zombie connections detected. Manual Gateway restart required."
+                    )
         else:
             logger.info("✓ No zombie connections found")
 
@@ -786,8 +809,8 @@ class AsyncRunner:
         # Initialize Production Monitoring (Phase 4 P2)
         if self.enable_production_monitoring:
             import json
-            from pathlib import Path
 
+            # Note: Path is already imported at module level (line 19)
             # Load monitoring config
             config_path = Path("config/monitoring_config.json")
             monitoring_config = {}
@@ -1307,7 +1330,9 @@ class AsyncRunner:
             strategy_name = (
                 "ML_ENHANCED"
                 if self.use_ml_enhanced
-                else "ML_ENSEMBLE" if self.use_ml_strategy else "SMA_CROSSOVER"
+                else "ML_ENSEMBLE"
+                if self.use_ml_strategy
+                else "SMA_CROSSOVER"
             )
             await self.db.record_signal(
                 symbol,
@@ -2298,6 +2323,7 @@ async def run_continuous(
     use_ml_strategy: bool = False,
     use_ml_enhanced: bool = False,
     use_smart_execution: bool = False,
+    force_connect: bool = False,
 ) -> None:
     """Run the trading system continuously with market hours checking."""
     import signal
@@ -2324,7 +2350,7 @@ async def run_continuous(
         current_time = datetime.now(eastern)
 
         # Check market status but still run (data might be useful even after hours)
-        if not is_market_open():
+        if not is_market_open() and not force_connect:
             session = get_market_session()
             seconds_to_open = seconds_until_market_open()
 
@@ -2344,6 +2370,10 @@ async def run_continuous(
                 )
                 await asyncio.sleep(wait_time)
                 continue
+        elif force_connect and not is_market_open():
+            logger.warning(
+                "⚠️ Force-connect enabled - connecting to IBKR despite market being closed"
+            )
 
         try:
             logger.info(
@@ -2506,6 +2536,11 @@ def main() -> None:
         action="store_true",
         help="Enable smart execution algorithms (TWAP, VWAP, Iceberg)",
     )
+    parser.add_argument(
+        "--force-connect",
+        action="store_true",
+        help="Force IBKR connection even when market is closed (for testing)",
+    )
     args = parser.parse_args()
 
     cfg = load_config()
@@ -2513,11 +2548,10 @@ def main() -> None:
         raise SystemExit("Refusing to run in live mode without --confirm-live")
 
     # Check for zombie connections before starting
+    # Gateway-owned zombies will be handled in setup() by triggering Gateway restart
     port = cfg.ibkr.port  # Get port from config (4002 for paper, 4001 for live)
     if not check_gateway_zombies(port):
-        logger.error("Cannot start with zombie connections present")
-        logger.error("Please restart Gateway or run ./START_TRADER.sh for automatic cleanup")
-        sys.exit(1)
+        logger.warning("Zombie connections detected - setup() will attempt cleanup/restart")
 
     override_symbols = (
         [s.strip().upper() for s in args.symbols.split(",") if s.strip()] if args.symbols else None
@@ -2560,6 +2594,7 @@ def main() -> None:
                 use_ml_strategy=args.use_ml,
                 use_ml_enhanced=args.use_ml_enhanced,
                 use_smart_execution=args.use_smart_execution,
+                force_connect=args.force_connect,
             )
         )
 

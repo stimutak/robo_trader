@@ -11,67 +11,106 @@
 
 **Note:** The older 9-phase plan in `archived_plans/PROJECT_PLAN_9PHASE.md` is deprecated and should NOT be used. Any references to "Phase 5", "Phase 6" etc. from older commits refer to the old plan and should be ignored.
 
-## ⚠️ CRITICAL: TWS/IBKR Gateway Management
+## ⚠️ IBKR Gateway Management (Updated 2025-12-03)
 
-**NEVER KILL TWS OR IBKR GATEWAY PROCESSES**
+### Automated Gateway Management via IBC
 
-TWS (Trader Workstation) and IBKR Gateway require manual login with credentials and 2FA. They CANNOT be automatically restarted.
+The system now uses **IBC (IB Controller)** for automated Gateway management. Gateway restarts are **fully automated** when zombie connections are detected.
 
-**Allowed:**
-- ✅ Kill Python processes: `runner_async`, `app.py`, `websocket_server`
-- ✅ Restart our application services
-- ✅ Check TWS connection status
-- ✅ Diagnose TWS health
+**How it works:**
+- `START_TRADER.sh` automatically starts Gateway via IBC if not running
+- Detects zombie CLOSE_WAIT connections that block API handshakes
+- Automatically restarts Gateway to clear zombies (up to 3 retries)
+- Tests actual API connectivity before proceeding
+- Only requires manual 2FA on your phone when Gateway starts
 
-**FORBIDDEN:**
-- ❌ `pkill -f "tws"` or any TWS process killing
-- ❌ `pkill -f "ibgateway"` or Gateway process killing
-- ❌ Killing any Java processes related to IBKR
-- ❌ Automatic TWS restart attempts
-- ❌ **NEVER USE `lsof -ti:7497 | xargs kill` - THIS KILLS TWS!**
+**IBC Configuration:**
+- Config file: `config/ibc/config.ini` (gitignored - contains credentials)
+- Template: `config/ibc/config.ini.template`
+- IBC scripts: `IBCMacos-3/` (macOS) or `IBCWin-3/` (Windows)
 
-**If TWS needs restart:** User must do it manually with login credentials.
+### Gateway Startup Flow
 
-**CRITICAL - ZOMBIE CONNECTION HANDLING:**
-- Zombie CLOSE_WAIT connections ARE HARMFUL - they cause connection timeouts
-- They must be killed to restore connectivity
-- **DO NOT KILL TWS - USE SAFE ZOMBIE KILL COMMAND:**
+1. `./START_TRADER.sh` is the **only command you need**
+2. If Gateway not running → starts via IBC automatically
+3. If zombies detected → kills Python zombies, restarts Gateway if needed
+4. Tests API connectivity with actual handshake
+5. Retries up to 3 times if connection fails
+6. Only proceeds when API is confirmed working
+
+### What You Need to Do
+
+**First-time setup:**
 ```bash
-# SAFE - Kills ONLY zombies, NOT TWS
-lsof -ti tcp:7497 -sTCP:CLOSE_WAIT | xargs kill -9
-
-# DANGEROUS - Kills EVERYTHING including TWS (NEVER USE)
-lsof -ti:7497 | xargs kill
+cp config/ibc/config.ini.template config/ibc/config.ini
+# Edit config.ini with your IBKR credentials:
+#   IbLoginId=YOUR_USERNAME
+#   IbPassword=YOUR_PASSWORD
 ```
-- The system has `kill_tws_zombie_connections()` in `robust_connection.py:161`
-- Zombies accumulate from failed handshakes and prevent new connections
-- See commits bd87fe5, f55015c for zombie connection bug fixes
 
-**CRITICAL - GATEWAY API CONFIGURATION (2025-11-10):**
-- **NEVER** suggest checking or enabling "ActiveX and Socket Clients" in Gateway configuration
-- This setting is **permanently enabled** in IB Gateway and **cannot be disabled**
-- Gateway is always listening on the configured API port (4002 for paper, 4001 for live)
-- If API connections fail, the issue is NOT this setting - look elsewhere
-- Common actual causes: IBKR account API permissions, Gateway version issues, library incompatibility
+**Starting the trader:**
+```bash
+./START_TRADER.sh
+# Watch for 2FA prompt on your IBKR Mobile app
+# The script handles everything else automatically
+```
 
-**CRITICAL - API DISCONNECT SAFEGUARD (2025-11-02):**
-- `ib.disconnect()` now defaults to a no-op to protect the Gateway API layer.
-- Use the new helper `robo_trader.utils.ibkr_safe.safe_disconnect()` when you absolutely must disconnect.
-- Override the guard only by exporting `IBKR_FORCE_DISCONNECT=1` for isolated tests.
-- If you see `Gateway API layer is unresponsive. Manual restart required.`: stop Python processes and restart IB Gateway (full exit + 2FA login), then rerun `./START_TRADER.sh`.
+### Gateway Management Commands
 
-**CRITICAL - DISCONNECT ZOMBIE FIX (2025-11-20):**
-- **FIXED:** `START_TRADER.sh` and `force_gateway_reconnect.sh` now use `safe_disconnect()` with `IBKR_FORCE_DISCONNECT=1`
-- Previously, test scripts called `ib.disconnect()` which was a no-op, leaving orphaned connections that became Gateway zombies
-- These zombies blocked subsequent API handshakes, requiring Gateway restart
-- Now test scripts properly disconnect using `safe_disconnect()` with force flag enabled
-- This prevents zombie accumulation during startup connectivity tests
-- See commits for zombie connection bug investigation
+```bash
+# Start trader (handles Gateway automatically)
+./START_TRADER.sh
 
-**Safe Process Kill Command (Python only):**
+# Start Gateway manually (for debugging)
+./scripts/start_gateway.sh paper
+
+# Check Gateway status
+python3 scripts/gateway_manager.py status
+
+# Force restart Gateway (clears all zombies)
+python3 scripts/gateway_manager.py restart
+
+# View Gateway logs
+tail -f config/ibc/logs/*.txt
+```
+
+### Zombie Connections
+
+**What are zombies?**
+- CLOSE_WAIT connections from failed/incomplete API handshakes
+- They block ALL future API connections until cleared
+- Gateway-owned zombies require Gateway restart to clear
+
+**The startup script handles this automatically:**
+1. Detects zombie connections via `lsof`
+2. Kills Python-owned zombies
+3. If Gateway-owned zombies remain → restarts Gateway
+4. Verifies API works before proceeding
+
+**Manual zombie check:**
+```bash
+lsof -nP -iTCP:4002 -sTCP:CLOSE_WAIT
+```
+
+### Safe Process Management
+
+**Kill Python processes (always safe):**
 ```bash
 pkill -9 -f "runner_async" && pkill -9 -f "app.py" && pkill -9 -f "websocket_server"
 ```
+
+**Kill Gateway (triggers auto-restart on next START_TRADER.sh):**
+```bash
+pkill -f "IB Gateway"
+```
+
+### Gateway API Notes
+
+- **Port 4002**: Paper trading API
+- **Port 4001**: Live trading API
+- ActiveX/Socket Clients is **permanently enabled** in IB Gateway (cannot be disabled)
+- API permissions are configured in your IBKR account settings
+- System uses **readonly** connections (no order placement via API)
 
 ## Key Project Files
 - `IMPLEMENTATION_PLAN.md` - The active project roadmap
@@ -83,13 +122,16 @@ pkill -9 -f "runner_async" && pkill -9 -f "app.py" && pkill -9 -f "websocket_ser
 - `robo_trader/ml/` - ML model training & selection (Phase 2 - COMPLETE)
 - `robo_trader/analytics/` - Performance analytics (Phase 2 - COMPLETE)
 - `robo_trader/backtesting/` - Walk-forward backtesting (Phase 2 - COMPLETE)
+- `scripts/gateway_manager.py` - Cross-platform Gateway management
+- `scripts/start_gateway.sh` - Gateway launcher script
+- `config/ibc/config.ini` - IBC credentials (gitignored)
 
 ## IMPORTANT: Python Command on macOS
 **ALWAYS USE `python3` NOT `python` - THIS SYSTEM USES macOS WITH NO `python` COMMAND**
 
 ## Starting the Trading System
 
-### THE ONLY CORRECT WAY TO START THE TRADER
+### The Only Command You Need
 
 ```bash
 ./START_TRADER.sh
@@ -97,105 +139,50 @@ pkill -9 -f "runner_async" && pkill -9 -f "app.py" && pkill -9 -f "websocket_ser
 ./START_TRADER.sh "AAPL,NVDA,TSLA"
 ```
 
-**DO NOT:**
-- ❌ Run `force_gateway_reconnect.sh` before starting - it's for diagnostics ONLY if things aren't working
-- ❌ Run any test scripts that connect to Gateway before starting the trader
-- ❌ Run `python3 -m robo_trader.runner_async` directly without using START_TRADER.sh
-- ❌ Connect to Gateway from any Python script without using `safe_disconnect()` with `IBKR_FORCE_DISCONNECT=1`
-
-**WHY:** Any script that connects to Gateway and doesn't properly disconnect creates a zombie connection that blocks ALL future API handshakes until Gateway is restarted (requires 2FA login).
+**What the script does:**
+1. ✅ Kills existing Python trader processes
+2. ✅ Starts Gateway via IBC if not running
+3. ✅ Detects and cleans up zombie connections
+4. ✅ Restarts Gateway automatically if zombies block API
+5. ✅ Tests actual API connectivity (not just port open)
+6. ✅ Retries up to 3 times on failure
+7. ✅ Starts WebSocket server, trading system, and dashboard
+8. ✅ Monitors startup for 10 seconds
 
 ### Default Symbols (from user_settings.json)
 ```
 AAPL,NVDA,TSLA,IXHL,NUAI,BZAI,ELTP,OPEN,CEG,VRT,PLTR,UPST,TEM,HTFL,SDGR,APLD,SOFI,CORZ,WULF
 ```
 
-### Quick Start (Recommended)
-```bash
-# Start with default symbols (from user_settings.json)
-./START_TRADER.sh
-
-# Start with custom symbols
-./START_TRADER.sh "AAPL,NVDA,TSLA,QQQ"
-```
-
-**What the script does:**
-1. ✅ Kills existing Python trader processes
-2. ✅ Cleans up zombie CLOSE_WAIT connections
-3. ✅ Tests Gateway connectivity (aborts if Gateway not responding)
-4. ✅ Starts WebSocket server
-5. ✅ Starts trading system with logging
-6. ✅ Monitors startup for 10 seconds
-
-**If startup fails:** The script will show clear error messages and diagnostic commands.
-
-### Manual Startup (Advanced)
-
-**CRITICAL (2025-09-25): ALWAYS USE VIRTUAL ENVIRONMENT**
-After macOS upgrades, Python paths reset. You MUST activate `.venv` first!
-
-```bash
-# KILL ALL PROCESSES (run this first to prevent duplicates)
-pkill -9 -f "runner_async" && pkill -9 -f "app.py" && pkill -9 -f "websocket_server"
-
-# ACTIVATE VIRTUAL ENVIRONMENT (REQUIRED!)
-cd /Users/oliver/robo_trader
-source .venv/bin/activate
-
-# Start WebSocket server (REQUIRED FIRST)
-python3 -m robo_trader.websocket_server &
-
-# Start trading runner with logging
-export LOG_FILE=/Users/oliver/robo_trader/robo_trader.log
-python3 -m robo_trader.runner_async --symbols AAPL,NVDA,TSLA,IXHL,NUAI,BZAI,ELTP,OPEN,CEG,VRT,PLTR,UPST,TEM,HTFL,SDGR,APLD,SOFI,CORZ,WULF &
-
-# Start dashboard on port 5555 (ALWAYS USE PORT 5555)
-export DASH_PORT=5555
-python3 app.py &
-```
-
 ### Diagnostic Commands
 
 ```bash
-# Test Gateway connectivity
-./force_gateway_reconnect.sh
-
-# Full diagnostics (checks Gateway, zombies, config)
-python3 diagnose_gateway_api.py
+# Check Gateway status
+python3 scripts/gateway_manager.py status
 
 # Check for zombie connections
 lsof -nP -iTCP:4002 -sTCP:CLOSE_WAIT
 
-# View logs
+# View trader logs
 tail -f robo_trader.log
+
+# View Gateway/IBC logs
+tail -f config/ibc/logs/*.txt
 ```
 
 ### Testing Commands
 
 ```bash
-# If missing dependencies (ib_async, pandas, etc.)
+# Activate virtual environment first
 source .venv/bin/activate
-pip install ib_async pandas
-
-# RESTART DASHBOARD ONLY (when code changes)
-pkill -9 -f "app.py" && sleep 2 && export DASH_PORT=5555 && python3 app.py &
-
-# Check market hours
-python3 test_market_hours.py
 
 # Run tests
 pytest
 
-# Test ML pipeline (Phase 2)
+# Test ML pipeline
 python3 test_ml_pipeline.py
 
-# Test model training
-python3 test_m3_complete.py
-
-# Test performance analytics
-python3 test_m4_performance.py
-
-# Test critical safety features (added 2025-09-27)
+# Test safety features
 python3 test_safety_features.py
 ```
 
@@ -205,9 +192,11 @@ python3 test_safety_features.py
 3. ✅ Phase 1 F2: Upgrade config to Pydantic - COMPLETED
 4. ✅ WebSocket stability - Fixed with client/server separation
 5. ✅ TWS API Connection Issues - RESOLVED with subprocess approach
-6. ✅ Zombie connection cleanup - AUTOMATED at startup (2025-10-23)
-7. ✅ Gateway connectivity testing - BUILT INTO startup script (2025-10-23)
+6. ✅ Zombie connection cleanup - AUTOMATED with Gateway restart (2025-12-03)
+7. ✅ Gateway connectivity testing - BUILT INTO startup script with auto-restart
 8. ✅ Subprocess worker connection failure - RESOLVED (2025-11-24)
+9. ✅ IBC Integration - Gateway auto-start and zombie handling (2025-12-03)
+10. ✅ **Socket Zombie Creation Bug - FIXED (2025-12-06)** - See below
 
 ## Critical Safety Features (2025-09-27) ✅
 **Added to address audit findings:**
@@ -233,7 +222,39 @@ python3 test_safety_features.py
 - Eliminates order rejections due to float precision errors
 - See `DECIMAL_PRECISION_FIX.md` for details
 
-## Major Fixes Completed (2025-09-23)
+## Major Fixes Completed
+
+### Socket Zombie Creation Bug Fix (2025-12-06) ✅
+
+**CRITICAL FIX:** System now stable for 1+ hour continuous IBKR connection.
+
+**Root Cause:** Three code locations used `socket.connect_ex()` to check if Gateway port was open. This creates a full TCP 3-way handshake, and when the socket is closed without completing the IBKR API handshake, Gateway sees it as an improperly disconnected client, creating CLOSE_WAIT zombie connections that block ALL future API connections.
+
+**Fix:** Replaced `socket.connect_ex()` with `lsof -nP -iTCP:PORT -sTCP:LISTEN` which queries the kernel's socket table without creating any TCP connections.
+
+**Files Fixed:**
+- `app.py` - `check_ibkr_connection()` function (lines 2983-3041)
+- `robo_trader/runner_async.py` - `test_port_open_lsof()` function (lines 460-497)
+- `robo_trader/utils/tws_health.py` - `is_port_listening()` function (lines 141-180)
+- `robo_trader/runner_async.py` - Fixed Python 3.12+ variable scoping error (removed redundant Path import)
+
+**See:** `handoff/HANDOFF_2025-12-06_ZOMBIE_FIX.md` for complete details.
+
+### IBC Gateway Integration (2025-12-03) ✅
+
+**Automated Gateway Management:**
+- `START_TRADER.sh` now handles everything automatically
+- Gateway started via IBC with credentials from `config/ibc/config.ini`
+- Zombie connections detected and Gateway restarted automatically
+- API connectivity verified before proceeding
+- Up to 3 retry attempts on failure
+
+**Files Added/Modified:**
+- `config/ibc/config.ini.template` - IBC config template
+- `scripts/gateway_manager.py` - Cross-platform Gateway management
+- `scripts/start_gateway.sh` - Gateway launcher
+- `START_TRADER.sh` - Full auto-start with retry logic
+- `IBCMacos-3/gatewaystartmacos.sh` - Environment variable support
 
 ### TWS API Connection Resolution ✅
 **Problem:** Async context (`patchAsyncio()`) caused TWS API handshake timeouts and stuck connections
@@ -245,11 +266,6 @@ python3 test_safety_features.py
 - Fixed connection pooling complexity (removed, simplified to direct connections)
 - Enhanced client ID management (unique timestamp + PID based IDs)
 - Comprehensive error handling and cleanup
-
-**Files Modified:**
-- `robo_trader/clients/async_ibkr_client.py` - Simplified connection architecture
-- `robo_trader/clients/sync_ibkr_wrapper.py` - New subprocess-based wrapper
-- `robo_trader/runner_async.py` - Updated to use new client approach
 
 ### Library Migration Notes (2025-09-27)
 - **MIGRATION COMPLETE:** Successfully migrated from `ib_insync` to `ib_async` v2.0.1
@@ -274,60 +290,14 @@ python3 test_safety_features.py
 - **Enhanced Debugging**: Worker stderr captured to `/tmp/worker_debug.log` for troubleshooting
 - **Response Filtering**: JSON response filtering prevents ib_async log pollution
 
-**Results:**
-- **Connection Time**: 2-3 seconds (vs previous ~163ms failure)
-- **Success Rate**: 100% when Gateway clean (vs 0% before)
-- **Error Detection**: Immediate zombie detection vs 30s timeout
-- **User Experience**: Clear error messages with specific restart instructions
-
-**Files Modified:**
-- `robo_trader/clients/ibkr_subprocess_worker.py` - Synchronization fix
-- `robo_trader/clients/subprocess_ibkr_client.py` - Zombie prevention + debug capture
-- `test_subprocess_connection_fix.py` - Comprehensive test suite
-
 **Documentation:** See `docs/SUBPROCESS_WORKER_CONNECTION_FIX.md` for complete technical details.
 
-### Gateway Connection Management (2025-10-23)
+### Gateway API Notes
 
-**Automated Zombie Cleanup:**
-- `runner_async.py` now automatically cleans up zombie connections at startup
-- `START_TRADER.sh` tests Gateway connectivity before starting trader
-- Zombie connections are detected and killed (Python processes only)
-- Gateway-owned zombies are logged but cannot be killed (require Gateway restart)
-
-**Gateway Connectivity Testing:**
-- `force_gateway_reconnect.sh` - Test if Gateway accepts API connections
-- `diagnose_gateway_api.py` - Comprehensive diagnostics (Gateway, port, TCP, API, zombies)
-- Startup script aborts with clear error if Gateway not responding
-
-**Gateway API Requirements:**
-- Gateway must have API socket clients enabled
-- Check Gateway: File → Global Configuration → API → Settings
-- ☑️ Enable ActiveX and Socket Clients (CRITICAL)
-- Add 127.0.0.1 to Trusted IPs
-- Socket port: 4002 (paper) or 4001 (live)
-- Master API client ID: 0 (or blank)
-
-**Troubleshooting:**
-- If API handshake times out: Check Gateway API settings (above)
-- If zombies accumulate: Use `START_TRADER.sh` for automatic cleanup
-- If Gateway not responding: Restart Gateway (requires 2FA login)
-- Monitor connections: `netstat -an | grep 4002`
-
-#### Gateway Handshake Regression (2025-11)
-- The current handshake failure is **not** caused by Gateway API settings or IBKR account permissions. ActiveX/Socket Clients are permanently enabled in IB Gateway ≥10.41, and account `DUN264991` has API access.
-- The timeout reproduces on Gateway 10.40 and 10.41 across both `ib_async` 2.0.1 and legacy `ib_insync` 0.9.86, pointing to Gateway build behavior plus subprocess timing gaps. Official `ibapi` 10.37.2 scripts connect successfully when Gateway responds, so the worker must wait for `nextValidId`/`managedAccounts` before bailing.
-- Resolution plan: build a Gateway version matrix (test older builds like 10.39/10.37), capture results with the official ibapi probe, and update the subprocess worker to synchronize on those callbacks. Document every version test in the handoff docs.
-
-### TWS Readonly Connection (2025-10-05) ✅
-**Important: System uses READONLY mode for TWS connections**
-- `readonly=True` in all IBKR connections
-- No order placement through TWS API (PaperExecutor handles orders)
-- Only data access: historical bars, positions, account info
-- **Benefit**: No TWS security dialog popups (read-only doesn't require approval)
-- **Client ID Strategy**:
-  - First attempt: Fixed client_id (TWS remembers, no dialog)
-  - Retry attempts: Random client_id (zombie fix, prevent confusion)
+- ActiveX/Socket Clients is **permanently enabled** in IB Gateway ≥10.41 and cannot be disabled
+- System uses **READONLY mode** for TWS connections (no order placement via API)
+- PaperExecutor handles orders separately
+- No TWS security dialog popups with read-only connections
 
 ## WebSocket Fix Notes (2025-08-28)
 - Fixed handler signature by adding `path` parameter
@@ -342,4 +312,4 @@ python3 test_safety_features.py
 - Maintain backward compatibility with existing trading logic
 - Test all changes with paper trading before live
 - Document major changes in handoff documents
-- it is not the socket and activex param in gateway config that is at fault as it is perminantly on and cannot be disabled in gateway.
+- Use `./START_TRADER.sh` for all startup - it handles Gateway automatically

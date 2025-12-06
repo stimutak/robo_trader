@@ -140,43 +140,44 @@ async def check_tws_api_health(
 
 def is_port_listening(host: str = "127.0.0.1", port: int = 7497, timeout: float = 1.0) -> bool:
     """
-    Check if TCP port is listening (OS-level check).
+    Check if TCP port is listening using lsof (no zombies).
 
     This is a quick pre-check before attempting API health check.
 
+    IMPORTANT: Do NOT use socket.connect_ex() here - it creates zombie connections
+    that block subsequent IBKR API handshakes!
+
     Args:
-        host: Host to check
+        host: Host to check (ignored - lsof checks all interfaces)
         port: Port to check
-        timeout: Connection timeout
+        timeout: Command timeout
 
     Returns:
         True if port is listening, False otherwise
     """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
+    import subprocess
 
     try:
-        result = sock.connect_ex((host, port))
-        sock.close()
+        result = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
 
-        if result == 0:
+        if result.returncode == 0 and "LISTEN" in result.stdout:
             logger.debug(f"✅ Port {port} is LISTENING")
             return True
         else:
-            logger.warning(f"❌ Port {port} is NOT listening (error code: {result})")
+            logger.warning(f"❌ Port {port} is NOT listening")
             return False
 
-    except socket.timeout:
+    except subprocess.TimeoutExpired:
         logger.warning(f"❌ Port {port} check timeout")
         return False
     except Exception as e:
         logger.warning(f"❌ Port {port} check error: {e}")
         return False
-    finally:
-        try:
-            sock.close()
-        except Exception:
-            pass
 
 
 async def diagnose_tws_connection(

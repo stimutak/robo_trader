@@ -2982,37 +2982,37 @@ def market_status():
 
 def check_ibkr_connection():
     """
-    Check TWS/Gateway connection using simple TCP socket check (no zombies).
+    Check TWS/Gateway connection using lsof (no zombies).
 
     Checks both TWS (port 7497) and Gateway (port 4002) to see which is running.
-    No IB API handshake = no zombie connections.
+    Uses lsof to check if ports are listening - this does NOT create TCP connections
+    and therefore does NOT create zombie CLOSE_WAIT connections.
+
+    IMPORTANT: Do NOT use socket.connect_ex() here - it creates zombie connections
+    that block subsequent IBKR API handshakes!
     """
-    import socket
+    import subprocess
 
     tws_healthy = False
     gateway_healthy = False
     status_msg = "Unknown"
 
-    # Check TWS (port 7497)
+    # Check TWS (port 7497) using lsof
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(1)  # 1 second timeout
-        result = sock.connect_ex(("127.0.0.1", 7497))
-        sock.close()
-
-        if result == 0:
+        result = subprocess.run(
+            ["lsof", "-nP", "-iTCP:7497", "-sTCP:LISTEN"], capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0 and "LISTEN" in result.stdout:
             tws_healthy = True
     except Exception as e:
         logger.debug(f"TWS health check error: {e}")
 
-    # Check Gateway (port 4002)
+    # Check Gateway (port 4002) using lsof
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(1)  # 1 second timeout
-        result = sock.connect_ex(("127.0.0.1", 4002))
-        sock.close()
-
-        if result == 0:
+        result = subprocess.run(
+            ["lsof", "-nP", "-iTCP:4002", "-sTCP:LISTEN"], capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0 and "LISTEN" in result.stdout:
             gateway_healthy = True
     except Exception as e:
         logger.debug(f"Gateway health check error: {e}")

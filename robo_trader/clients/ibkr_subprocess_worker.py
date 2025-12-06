@@ -9,7 +9,9 @@ This solves the ib_async library incompatibility with complex async environments
 where API handshakes timeout despite successful TCP connections.
 """
 import asyncio
+import atexit
 import json
+import os
 import signal
 import sys
 import time
@@ -17,10 +19,13 @@ import traceback
 from datetime import datetime
 from typing import Optional
 
-from ib_async import IB
+# CRITICAL: Enable real disconnect BEFORE importing ib_async or ibkr_safe
+# This prevents zombie connections when the worker process exits
+os.environ["IBKR_FORCE_DISCONNECT"] = "1"
 
-# Removed ibkr_safe import - subprocess worker doesn't need disconnect patch
-# from robo_trader.utils import ibkr_safe as _ibkr_safe
+from ib_async import IB  # noqa: E402
+
+from robo_trader.utils.ibkr_safe import safe_disconnect  # noqa: E402
 
 # Global IB instance
 ib: Optional[IB] = None
@@ -31,6 +36,23 @@ shutdown_requested = False
 # Tracks Gateway API failure state to avoid hammering a dead Gateway
 gateway_api_down = False
 gateway_failure_detail = ""
+
+
+def _cleanup_on_exit():
+    """Atexit handler to ensure we disconnect from IBKR to prevent zombies"""
+    global ib
+    if ib is not None:
+        print("atexit: Disconnecting from IBKR...", file=sys.stderr, flush=True)
+        try:
+            safe_disconnect(ib)
+            print("atexit: Disconnected successfully", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"atexit: Disconnect error: {e}", file=sys.stderr, flush=True)
+        ib = None
+
+
+# Register atexit handler as safety net
+atexit.register(_cleanup_on_exit)
 
 
 def signal_handler(signum, frame):
@@ -326,7 +348,9 @@ async def handle_disconnect() -> dict:
 
     try:
         if ib:
-            # Do NOT call ib.disconnect() - let process exit naturally to avoid Gateway crash
+            # Properly disconnect to avoid zombie connections
+            print("Disconnecting from IBKR...", file=sys.stderr, flush=True)
+            safe_disconnect(ib)
             ib = None
 
         return {"status": "success", "data": {"disconnected": True}}
@@ -508,13 +532,15 @@ async def main():
         }
         print(json.dumps(error_response), flush=True)
     finally:
-        # Cleanup on exit
+        # Cleanup on exit - MUST disconnect to avoid zombies
         print("Worker shutting down gracefully...", file=sys.stderr, flush=True)
-        # NOTE: Do NOT call ib.disconnect() here! It crashes IBKR Gateway's API layer.
-        # When the process exits, Python will clean up connections naturally without
-        # triggering Gateway's disconnect bug. Explicit disconnect() calls cause Gateway
-        # API client to go RED.
-        pass
+        if ib is not None:
+            print("Disconnecting from IBKR to prevent zombie...", file=sys.stderr, flush=True)
+            try:
+                safe_disconnect(ib)
+                print("Disconnected successfully", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"Disconnect error (non-fatal): {e}", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

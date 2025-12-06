@@ -66,7 +66,9 @@ class SubprocessIBKRClient:
     WORKER_HANDSHAKE_TIMEOUT = 15.0  # max_handshake_wait in worker
     WORKER_STABILIZATION_DELAY = 0.5  # stabilization sleep in worker
     WORKER_ACCOUNT_TIMEOUT = 10.0  # max_account_wait in worker
-    WORKER_MAX_WAIT = WORKER_HANDSHAKE_TIMEOUT + WORKER_STABILIZATION_DELAY + WORKER_ACCOUNT_TIMEOUT  # 25.5s
+    WORKER_MAX_WAIT = (
+        WORKER_HANDSHAKE_TIMEOUT + WORKER_STABILIZATION_DELAY + WORKER_ACCOUNT_TIMEOUT
+    )  # 25.5s
 
     def __init__(self):
         self.process: Optional[subprocess.Popen] = None
@@ -80,6 +82,9 @@ class SubprocessIBKRClient:
         self._connection_start_time: Optional[datetime] = None
         self._gateway_api_down_detail: Optional[str] = None
         self._debug_log_file = None  # For capturing worker stderr to file
+        self._zombies_detected_before_connect = (
+            False  # Track if zombies were present before connect
+        )
 
     async def start(self) -> None:
         """Start the subprocess worker with threading-based I/O"""
@@ -196,7 +201,9 @@ class SubprocessIBKRClient:
 
                 # CRITICAL FIX: Filter out ib_async log messages that pollute stdout
                 # Only queue lines that look like JSON responses from our worker
-                if line_stripped.startswith('{"status":') or line_stripped.startswith('{"timestamp":'):
+                if line_stripped.startswith('{"status":') or line_stripped.startswith(
+                    '{"timestamp":'
+                ):
                     # ib_async logs start with {"timestamp": - log these but don't queue
                     if line_stripped.startswith('{"timestamp":'):
                         logger.debug("ib_async_stdout", message=line_stripped)
@@ -441,18 +448,19 @@ class SubprocessIBKRClient:
 
         logger.info("Connecting to IBKR via subprocess", host=host, port=port, client_id=client_id)
 
-        # ZOMBIE CONNECTION PREVENTION: Check for Gateway zombies before attempting connection
-        # This prevents wasting time on connections that will fail due to zombie blocking
+        # ZOMBIE CONNECTION CHECK: Detect zombies before connection attempt
+        # Gateway-owned zombies will block API handshakes
+        # The caller (robust_connection.py) should handle Gateway restart if connection fails
         logger.debug("Pre-connection zombie check...")
         zombie_count, zombie_msg = await self._check_zombie_connections(port)
+        self._zombies_detected_before_connect = zombie_count > 0
         if zombie_count > 0:
-            logger.error("Zombie connections detected - aborting connection attempt",
-                        zombie_count=zombie_count, message=zombie_msg)
-            self._gateway_api_down_detail = (
-                f"Gateway has {zombie_count} zombie connection(s) blocking API handshakes. "
-                "Restart Gateway (File→Exit, relaunch with 2FA) before retrying."
+            logger.warning(
+                "Gateway zombies detected - connection may fail due to blocked handshake",
+                zombie_count=zombie_count,
+                message=zombie_msg,
             )
-            raise GatewayRequiresRestartError(self._gateway_api_down_detail)
+            # Note: We proceed here but the caller should restart Gateway if connection fails
 
         # Record connection attempt timing for debugging
         connection_start = time.time()
@@ -463,10 +471,12 @@ class SubprocessIBKRClient:
             # Add 5s buffer for network/processing overhead
             # Total: timeout (TCP) + 25.5s (worker) + 5s (buffer)
             extended_timeout = timeout + self.WORKER_MAX_WAIT + 5.0
-            logger.debug("Sending connect command with extended timeout",
-                        base_timeout=timeout,
-                        worker_max_wait=self.WORKER_MAX_WAIT,
-                        extended_timeout=extended_timeout)
+            logger.debug(
+                "Sending connect command with extended timeout",
+                base_timeout=timeout,
+                worker_max_wait=self.WORKER_MAX_WAIT,
+                extended_timeout=extended_timeout,
+            )
 
             data = await self._execute_command(command, timeout=extended_timeout)
 
@@ -476,7 +486,10 @@ class SubprocessIBKRClient:
         except GatewayRequiresRestartError:
             self._connected = False
             connection_duration = time.time() - connection_start
-            logger.error("Connection failed - Gateway restart required", duration_seconds=f"{connection_duration:.2f}")
+            logger.error(
+                "Connection failed - Gateway restart required",
+                duration_seconds=f"{connection_duration:.2f}",
+            )
             raise
 
         self._connected = data.get("connected", False)
@@ -517,14 +530,18 @@ class SubprocessIBKRClient:
                     capture_output=True,
                     text=True,
                     timeout=5,
-                )
+                ),
             )
 
             if not result.stdout.strip():
                 return 0, "No zombies detected"
 
             # Count zombie connections (skip header line)
-            lines = [line for line in result.stdout.split("\n") if line.strip() and not line.startswith("COMMAND")]
+            lines = [
+                line
+                for line in result.stdout.split("\n")
+                if line.strip() and not line.startswith("COMMAND")
+            ]
             zombie_count = len(lines)
 
             if zombie_count > 0:
@@ -542,6 +559,11 @@ class SubprocessIBKRClient:
         except Exception as e:
             logger.warning("Error checking for zombie connections", error=str(e))
             return 0, f"Error checking zombies: {e}"
+
+    @property
+    def zombies_detected_before_connect(self) -> bool:
+        """Returns True if zombie connections were detected before the last connect attempt."""
+        return self._zombies_detected_before_connect
 
     async def get_accounts(self) -> list[str]:
         """Get managed accounts"""
