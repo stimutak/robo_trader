@@ -197,6 +197,7 @@ python3 test_safety_features.py
 8. ✅ Subprocess worker connection failure - RESOLVED (2025-11-24)
 9. ✅ IBC Integration - Gateway auto-start and zombie handling (2025-12-03)
 10. ✅ **Socket Zombie Creation Bug - FIXED (2025-12-06)** - See below
+11. ✅ **Dashboard Connection Status Accuracy - IMPROVED (2025-12-10)** - See below
 
 ## Critical Safety Features (2025-09-27) ✅
 **Added to address audit findings:**
@@ -223,6 +224,26 @@ python3 test_safety_features.py
 - See `DECIMAL_PRECISION_FIX.md` for details
 
 ## Major Fixes Completed
+
+### Dashboard Connection Status Accuracy (2025-12-10) ✅
+
+**Issue:** Dashboard showed "Connected" when Gateway was merely listening, even if no active API session existed.
+
+**Fix:** Enhanced `check_ibkr_connection()` to distinguish between:
+- **Gateway available** (port listening) - Gateway is running and can accept connections
+- **API connected** (ESTABLISHED socket) - Runner has an active API session
+
+**New Status Messages:**
+- `✅ Market Open - API Connected` - Active IBKR API connection
+- `🔄 Market Open - Waiting for cycle` - Gateway available, runner uses per-cycle connections
+- `⚠️ Market Open - No Gateway` - Gateway/TWS not detected
+
+**API Response Changes:**
+- `connected` now means actual ESTABLISHED socket (was: just port listening)
+- `api_connected` - explicit field for active connection status
+- `gateway_available` - Gateway is listening and can accept connections
+
+**File Modified:** `app.py` - `check_ibkr_connection()` function
 
 ### Socket Zombie Creation Bug Fix (2025-12-06) ✅
 

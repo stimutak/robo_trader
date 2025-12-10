@@ -2592,7 +2592,9 @@ HTML_TEMPLATE = """
         }
         
         function handleSignalUpdate(data) {
-            addLog(`Signal: ${data.signal} for ${data.symbol} (strength: ${data.strength.toFixed(2)})`);
+            const reason = data.reason ? ` - ${data.reason}` : '';
+            const signalEmoji = data.signal === 'BUY' ? '🟢' : data.signal === 'SELL' ? '🔴' : '⚪';
+            addLog(`${signalEmoji} ${data.symbol}: ${data.signal}${reason}`);
         }
         
         function updatePositionsFromWS(positions) {
@@ -2985,6 +2987,10 @@ def check_ibkr_connection():
     Check TWS/Gateway connection using lsof (no zombies).
 
     Checks both TWS (port 7497) and Gateway (port 4002) to see which is running.
+    Also checks for ESTABLISHED connections to distinguish between:
+    - Gateway available (listening) but no active API connection
+    - Gateway available AND runner has active API connection
+
     Uses lsof to check if ports are listening - this does NOT create TCP connections
     and therefore does NOT create zombie CLOSE_WAIT connections.
 
@@ -2995,6 +3001,7 @@ def check_ibkr_connection():
 
     tws_healthy = False
     gateway_healthy = False
+    api_connected = False  # True if there's an ESTABLISHED connection to Gateway/TWS
     status_msg = "Unknown"
 
     # Check TWS (port 7497) using lsof
@@ -3017,21 +3024,58 @@ def check_ibkr_connection():
     except Exception as e:
         logger.debug(f"Gateway health check error: {e}")
 
-    # Determine status message
-    if tws_healthy and gateway_healthy:
-        status_msg = "TWS (7497) and Gateway (4002) running"
-    elif tws_healthy:
-        status_msg = "TWS running (port 7497)"
-    elif gateway_healthy:
-        status_msg = "Gateway running (port 4002)"
+    # Check for ESTABLISHED connections (actual API connections)
+    # This tells us if the runner currently has an active connection to Gateway/TWS
+    try:
+        # Check for established connections on port 4002 (Gateway) or 7497 (TWS)
+        result = subprocess.run(
+            ["lsof", "-nP", "-iTCP:4002", "-sTCP:ESTABLISHED"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode == 0 and "ESTABLISHED" in result.stdout:
+            api_connected = True
+        else:
+            # Also check TWS port
+            result = subprocess.run(
+                ["lsof", "-nP", "-iTCP:7497", "-sTCP:ESTABLISHED"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if result.returncode == 0 and "ESTABLISHED" in result.stdout:
+                api_connected = True
+    except Exception as e:
+        logger.debug(f"API connection check error: {e}")
+
+    # Determine status message - be clear about the distinction
+    if api_connected:
+        if gateway_healthy:
+            status_msg = "Gateway API connected (port 4002)"
+        elif tws_healthy:
+            status_msg = "TWS API connected (port 7497)"
+        else:
+            status_msg = "API connected"
+    elif gateway_healthy or tws_healthy:
+        # Gateway/TWS is running but no active API connection
+        if gateway_healthy and tws_healthy:
+            status_msg = "Gateway & TWS available (no active API session)"
+        elif gateway_healthy:
+            status_msg = "Gateway available (no active API session)"
+        else:
+            status_msg = "TWS available (no active API session)"
     else:
         status_msg = "No TWS/Gateway detected"
 
     return {
-        "connected": tws_healthy or gateway_healthy,
+        "connected": api_connected,  # Now means actually connected, not just available
+        "gateway_available": gateway_healthy,  # Gateway is listening
+        "tws_available": tws_healthy,  # TWS is listening
+        "api_connected": api_connected,  # Active ESTABLISHED connection exists
         "status": status_msg,
-        "tws_running": tws_healthy,
-        "gateway_running": gateway_healthy,
+        "tws_running": tws_healthy,  # Keep for backwards compat
+        "gateway_running": gateway_healthy,  # Keep for backwards compat
     }
 
 
@@ -3068,16 +3112,31 @@ def status():
     from datetime import time as dt_time
     from datetime import timedelta
 
+    # Get current time and market hours for status messages
     now = datetime.now()
     market_start = dt_time(9, 30)
     market_end = dt_time(16, 0)
     is_weekday = now.weekday() < 5
-    in_hours = market_start <= now.time() <= market_end
-    market_open = is_weekday and in_hours
+
+    # Use the centralized market hours logic
+    from robo_trader.market_hours import is_market_open as check_market_open
+
+    market_open = check_market_open()
 
     # Build clear status message
     runner_running = runner_actually_running
 
+    # Check TWS/Gateway health with sync approach (no zombies)
+    # Do this FIRST so we can use it in status messages
+    ibkr_check = check_ibkr_connection()
+    api_connected = ibkr_check.get("api_connected", False)  # Active ESTABLISHED connection
+    gateway_available = ibkr_check.get("gateway_available", False)  # Gateway is listening
+    tws_available = ibkr_check.get("tws_available", False)  # TWS is listening
+    ibkr_status_msg = ibkr_check.get("status", "Unknown")
+    tws_running = ibkr_check.get("tws_running", False)
+    gateway_running = ibkr_check.get("gateway_running", False)
+
+    # Build clear status message based on actual connection state
     if not runner_running:
         status_message = "⚠️ Runner not started - No trading activity"
         status_detail = "Start the runner with: python3 -m robo_trader.runner_async"
@@ -3091,16 +3150,21 @@ def status():
             next_open = next_open + timedelta(days=days_ahead)
         hours_until = (next_open - now).total_seconds() / 3600
         status_detail = f"Next market open: {next_open.strftime('%a %I:%M %p')} (in {hours_until:.1f} hours). Runner checks every 30 minutes."
+    elif api_connected:
+        # Runner is running, market is open, AND we have an active API connection
+        status_message = "✅ Market Open - API Connected"
+        status_detail = "Runner has active IBKR API connection and is processing data"
+    elif gateway_available or tws_available:
+        # Runner is running, market is open, but NO active API connection
+        # This is the per-cycle mode - connects only during trading cycles
+        status_message = "🔄 Market Open - Waiting for cycle"
+        status_detail = (
+            "Gateway available. Runner connects per-cycle for stability (no active API session now)"
+        )
     else:
-        status_message = "✅ Market Open - Active Trading"
-        status_detail = "Runner connected and processing market data"
-
-    # Check TWS/Gateway health with sync approach (no zombies)
-    ibkr_check = check_ibkr_connection()
-    ibkr_connected = ibkr_check.get("connected", False)
-    ibkr_status_msg = ibkr_check.get("status", "Unknown")
-    tws_running = ibkr_check.get("tws_running", False)
-    gateway_running = ibkr_check.get("gateway_running", False)
+        # Runner is running, market is open, but no Gateway/TWS
+        status_message = "⚠️ Market Open - No Gateway"
+        status_detail = "Runner is running but Gateway/TWS not detected. Check IBKR Gateway."
 
     # Get symbol count from user_settings.json
     symbols_count = 0
@@ -3113,14 +3177,16 @@ def status():
         symbols_count = 0
 
     # Return status with NO FAKE DATA
-    # is_trading = True ONLY when runner is running AND market is open
-    is_actually_trading = runner_running and market_open
+    # is_trading = True ONLY when runner is running AND market is open AND gateway available
+    is_actually_trading = runner_running and market_open and (gateway_available or tws_available)
 
     return jsonify(
         {
             "trading_status": {
                 "is_trading": is_actually_trading,
-                "connected": ibkr_connected,  # Real TWS/Gateway connection status
+                "connected": api_connected,  # Now means ACTUALLY connected (ESTABLISHED socket)
+                "api_connected": api_connected,  # Explicit: active ESTABLISHED connection
+                "gateway_available": gateway_available,  # Gateway is listening (can connect)
                 "market_open": market_open,
                 "mode": "paper",
                 "session_start": datetime.now().isoformat(),
@@ -3128,8 +3194,8 @@ def status():
                 "detail": status_detail,
                 "runner_state": "running" if runner_running else "stopped",
                 "tws_health": ibkr_status_msg,
-                "tws_running": tws_running,  # TWS status
-                "gateway_running": gateway_running,  # Gateway status
+                "tws_running": tws_running,  # TWS status (backwards compat)
+                "gateway_running": gateway_running,  # Gateway status (backwards compat)
                 "symbols_count": symbols_count,  # Number of symbols being traded
             },
             "pnl": None,  # No fake data - will be populated when runner connects
@@ -3274,14 +3340,10 @@ def status():
 def get_pnl():
     """Get P&L data from actual positions"""
     # Check if market is open - don't show stale data when closed
-    from datetime import time as dt_time
+    # Use the centralized market hours logic
+    from robo_trader.market_hours import is_market_open as check_market_open
 
-    now = datetime.now()
-    market_start = dt_time(9, 30)
-    market_end = dt_time(16, 0)
-    is_weekday = now.weekday() < 5
-    in_hours = market_start <= now.time() <= market_end
-    market_open = is_weekday and in_hours
+    market_open = check_market_open()
 
     # When market is closed, return None instead of stale data
     if not market_open:
