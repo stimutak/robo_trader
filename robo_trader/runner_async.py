@@ -51,11 +51,24 @@ from .stop_loss_monitor import StopLossMonitor, StopType
 from .strategies import MLStrategy, sma_crossover_signals
 from .strategies.ml_enhanced_strategy import MLEnhancedStrategy
 from .utils.connection_recovery import OrderRateLimiter
-from .utils.pricing import PrecisePricing
-from .utils.secure_config import SecureConfig
+
+# Initialize logger early for use in import error handling
+logger = get_logger(__name__)
+
+# Import AI analyst for news-driven trading
+try:
+    from .ai_analyst import AIAnalyst, MarketSentiment, create_analyst
+    from .news_fetcher import fetch_rss_news
+
+    AI_ANALYST_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"AI analyst not available: {e}")
+    AI_ANALYST_AVAILABLE = False
+    create_analyst = None
+from .utils.pricing import PrecisePricing  # noqa: E402
+from .utils.secure_config import SecureConfig  # noqa: E402
 
 # Import mean reversion strategies if available
-logger = get_logger(__name__)
 
 try:
     from .strategies.mean_reversion import MeanReversionStrategy
@@ -191,6 +204,13 @@ class AsyncRunner:
         self.mean_reversion_strategy = None
         self.pairs_strategy = None
         self.stat_arb_strategy = None
+
+        # AI Analyst for news-driven trading
+        self.ai_analyst = None
+        self.use_ai_trading = os.getenv("AI_TRADING_ENABLED", "true").lower() == "true"
+        self.news_cache = {}  # Cache recent news to avoid re-fetching
+        self.last_news_fetch = None
+        self._ai_opportunities = {}  # AI-identified buying opportunities
         # Cache for pairs/stat arb analysis with size limit
         from collections import OrderedDict
 
@@ -452,6 +472,23 @@ class AsyncRunner:
 
     async def setup(self):
         """Initialize all components."""
+        # Skip setup if already connected (for persistent connections)
+        if hasattr(self, "_setup_complete") and self._setup_complete:
+            # Just verify connection is still alive
+            if hasattr(self, "ib") and self.ib:
+                try:
+                    if hasattr(self.ib, "ping"):
+                        ping_ok = await self.ib.ping()
+                        if ping_ok:
+                            logger.info("✓ Persistent IBKR connection still active")
+                            return
+                    elif hasattr(self.ib, "isConnected") and self.ib.isConnected():
+                        logger.info("✓ Persistent IBKR connection still active")
+                        return
+                except Exception as e:
+                    logger.warning(f"Connection check failed: {e}, will reconnect")
+                    self._setup_complete = False
+
         self.cfg = load_config()
 
         # CRITICAL PRE-FLIGHT CHECK: Test IBKR connection before proceeding
@@ -566,12 +603,11 @@ class AsyncRunner:
             logger.info("✓ IBKR connection established successfully with robust connection")
             logger.info("=" * 60)
 
-            # Start subprocess health monitoring if using subprocess client
-            if hasattr(self.ib, "ping"):
-                self.subprocess_monitor_task = asyncio.create_task(
-                    self._monitor_subprocess_health()
-                )
-                logger.info("✓ Subprocess health monitoring started (60s interval)")
+            # Skip subprocess health monitoring - we disconnect between cycles for stability
+            # This avoids the health check triggering restarts and lock file contention
+            logger.info(
+                "✓ Using per-cycle connection mode (disconnect between cycles for stability)"
+            )
 
         except ConnectionError as e:
             logger.error(f"❌ IBKR CONNECTION FAILED: {e}")
@@ -806,6 +842,18 @@ class AsyncRunner:
             except Exception as e:
                 logger.error(f"Failed to initialize mean reversion strategies: {e}")
 
+        # Initialize AI Analyst for news-driven trading
+        if self.use_ai_trading and AI_ANALYST_AVAILABLE and create_analyst:
+            try:
+                self.ai_analyst = create_analyst()
+                if self.ai_analyst:
+                    logger.info("AI Analyst initialized for news-driven trading")
+                else:
+                    logger.warning("AI Analyst not available (no API keys)")
+            except Exception as e:
+                logger.error(f"Failed to initialize AI analyst: {e}")
+                self.ai_analyst = None
+
         # Initialize Production Monitoring (Phase 4 P2)
         if self.enable_production_monitoring:
             import json
@@ -856,6 +904,8 @@ class AsyncRunner:
         # Load existing positions from database to prevent duplicate buying
         await self.load_existing_positions()
 
+        # Mark setup as complete for persistent connections
+        self._setup_complete = True
         logger.info("AsyncRunner setup complete")
 
     async def load_existing_positions(self):
@@ -962,23 +1012,36 @@ class AsyncRunner:
 
         return df
 
-    async def teardown(self):
-        """Clean up resources."""
+    async def teardown(self, full_cleanup: bool = False):
+        """Clean up resources after a run cycle.
+
+        Args:
+            full_cleanup: If True, calls full cleanup() including IBKR disconnect.
+                          If False (default), only stops monitors but keeps connection alive.
+        """
+        # Only stop monitors that need cycle-level cleanup
         if self.production_monitor:
             await self.production_monitor.stop()
         if self.correlation_manager:
             await self.correlation_manager.stop()
-        # Call cleanup to properly disconnect IBKR and close database
-        await self.cleanup()
+
+        # Only do full cleanup (IBKR disconnect) when explicitly requested
+        # This allows persistent connections across trading cycles
+        if full_cleanup:
+            await self.cleanup()
+        else:
+            logger.info("Cycle complete - keeping IBKR connection alive for next cycle")
 
     async def _monitor_subprocess_health(self):
         """
         Background task to monitor subprocess health.
 
         Pings the subprocess every 60 seconds and automatically restarts
-        if the subprocess becomes unresponsive.
+        if the subprocess becomes unresponsive after multiple failures.
         """
-        logger.info("Starting subprocess health monitoring (60s interval)")
+        logger.info("Starting subprocess health monitoring (60s interval, 3 failures to restart)")
+        consecutive_failures = 0
+        max_failures = 3  # Require 3 consecutive failures before restart
 
         while True:
             try:
@@ -994,9 +1057,21 @@ class AsyncRunner:
                 is_healthy = await self.ib.ping()
 
                 if not is_healthy:
-                    logger.error("Subprocess health check failed - subprocess unresponsive")
-                    await self._restart_subprocess()
+                    consecutive_failures += 1
+                    logger.warning(
+                        f"Subprocess health check failed ({consecutive_failures}/{max_failures})"
+                    )
+
+                    if consecutive_failures >= max_failures:
+                        logger.error(
+                            f"Subprocess unresponsive after {max_failures} consecutive failures - restarting"
+                        )
+                        await self._restart_subprocess()
+                        consecutive_failures = 0  # Reset after restart attempt
                 else:
+                    if consecutive_failures > 0:
+                        logger.info("Subprocess health check recovered")
+                    consecutive_failures = 0
                     logger.debug("Subprocess health check passed")
 
             except asyncio.CancelledError:
@@ -1004,7 +1079,8 @@ class AsyncRunner:
                 break
             except Exception as e:
                 logger.error(f"Error in subprocess health monitoring: {e}")
-                # Don't restart on monitoring errors, just log and continue
+                consecutive_failures += 1
+                # Continue monitoring even on errors
                 continue
 
     async def _restart_subprocess(self):
@@ -1017,6 +1093,17 @@ class AsyncRunner:
         logger.warning("⚠️ Restarting IBKR subprocess due to health check failure")
 
         try:
+            # Clean up stale lock files first
+            import os
+
+            lock_path = os.environ.get("IBKR_LOCK_FILE_PATH", "/tmp/ibkr_connect.lock")
+            try:
+                if os.path.exists(lock_path):
+                    os.remove(lock_path)
+                    logger.info(f"Removed stale lock file: {lock_path}")
+            except Exception as e:
+                logger.warning(f"Could not remove lock file: {e}")
+
             # Stop the old subprocess
             if hasattr(self.ib, "stop"):
                 try:
@@ -1025,6 +1112,14 @@ class AsyncRunner:
                     logger.warning("Subprocess stop timed out, continuing with restart")
                 except Exception as e:
                     logger.warning(f"Error stopping subprocess: {e}")
+
+            # Kill any orphaned worker processes
+            import subprocess
+
+            subprocess.run(
+                ["pkill", "-9", "-f", "ibkr_subprocess_worker"], capture_output=True, timeout=5
+            )
+            await asyncio.sleep(1)  # Give time for cleanup
 
             # Reconnect using robust connection
             from .utils.robust_connection import CircuitBreakerConfig, connect_ibkr_robust
@@ -1047,7 +1142,7 @@ class AsyncRunner:
                 client_id=self.cfg.ibkr.client_id,
                 readonly=self.cfg.ibkr.readonly,
                 timeout=self.cfg.ibkr.timeout,
-                max_retries=2,
+                max_retries=3,  # More retries
                 circuit_breaker_config=circuit_config,
                 ssl_mode=self.cfg.ibkr.ssl_mode,
             )
@@ -1056,9 +1151,9 @@ class AsyncRunner:
 
         except Exception as e:
             logger.error(f"❌ Failed to restart subprocess: {e}")
-            logger.error("Manual intervention required - shutting down runner")
-            # Set a flag or raise to trigger shutdown
-            raise RuntimeError(f"Failed to restart subprocess: {e}")
+            logger.warning("Will retry on next health check cycle")
+            # Don't raise - let it retry on the next health check
+            # raise RuntimeError(f"Failed to restart subprocess: {e}")
 
     async def fetch_and_store_data(self, symbol: str) -> Optional[pd.DataFrame]:
         """Fetch market data for a symbol and store in database."""
@@ -1187,11 +1282,120 @@ class AsyncRunner:
                     stop_loss = signal_obj.features.get("stop_loss", 0.02)
                     take_profit = signal_obj.features.get("take_profit", 0.05)
                 else:
+                    # ML returned no signal - use AI analyst for news-driven trading
                     signal_value = 0
                     confidence = 0.5
                     position_size = 0.02
                     stop_loss = 0.02
                     take_profit = 0.05
+
+                    # Check if this symbol is an AI-identified opportunity (from news scan)
+                    ai_opps = getattr(self, "_ai_opportunities", {})
+                    if symbol in ai_opps:
+                        opp = ai_opps[symbol]
+                        signal_value = 1  # BUY
+                        confidence = opp.get("confidence", 0.7)
+                        logger.info(
+                            f"🎯 AI OPPORTUNITY BUY for {symbol}: "
+                            f"conf={confidence:.0%} - {opp.get('reason', 'AI identified')}"
+                        )
+                    # Try AI-driven signal from news analysis
+                    elif self.ai_analyst and AI_ANALYST_AVAILABLE:
+                        try:
+                            # Fetch news (cached for 5 minutes)
+                            from datetime import timedelta
+
+                            now = datetime.now()
+                            if self.last_news_fetch is None or (
+                                now - self.last_news_fetch
+                            ) > timedelta(minutes=5):
+                                self.news_cache = {
+                                    item["title"]: item for item in fetch_rss_news(max_items=15)
+                                }
+                                self.last_news_fetch = now
+                                logger.info(f"Fetched {len(self.news_cache)} news items")
+
+                            # Find relevant news for this symbol
+                            symbol_news = [
+                                n
+                                for n in self.news_cache.values()
+                                if symbol.upper() in n["title"].upper()
+                            ]
+
+                            # Also check general market news for broader context
+                            market_keywords = [
+                                "market",
+                                "fed",
+                                "economy",
+                                "inflation",
+                                "stocks",
+                                "rally",
+                                "crash",
+                            ]
+                            market_news = [
+                                n
+                                for n in self.news_cache.values()
+                                if any(kw in n["title"].lower() for kw in market_keywords)
+                            ]
+
+                            relevant_news = symbol_news or market_news[:3]
+
+                            if relevant_news:
+                                # Combine news into single event text
+                                news_text = "\n".join(
+                                    [f"- {n['title']} ({n['source']})" for n in relevant_news[:3]]
+                                )
+
+                                # Get AI analysis
+                                analysis = self.ai_analyst.analyze_market_event(
+                                    symbol=symbol,
+                                    event_text=news_text,
+                                    market_data={
+                                        "price": float(df["close"].iloc[-1]) if len(df) > 0 else 0,
+                                        "change_5d": float(
+                                            (df["close"].iloc[-1] / df["close"].iloc[0] - 1) * 100
+                                        )
+                                        if len(df) > 5
+                                        else 0,
+                                    },
+                                )
+
+                                # Convert AI suggestion to signal
+                                if analysis.suggested_action == "buy" and analysis.confidence > 0.5:
+                                    signal_value = 1
+                                    confidence = analysis.confidence
+                                    logger.info(
+                                        f"AI BUY signal for {symbol}: {analysis.reasoning[:80]}"
+                                    )
+                                elif (
+                                    analysis.suggested_action == "sell"
+                                    and analysis.confidence > 0.5
+                                ):
+                                    signal_value = -1
+                                    confidence = analysis.confidence
+                                    logger.info(
+                                        f"AI SELL signal for {symbol}: {analysis.reasoning[:80]}"
+                                    )
+                                else:
+                                    logger.debug(
+                                        f"AI HOLD for {symbol}: {analysis.suggested_action} conf={analysis.confidence:.2f}"
+                                    )
+                        except Exception as e:
+                            logger.warning(f"AI analysis failed for {symbol}: {e}")
+
+                    # Fall back to SMA if AI didn't produce a signal
+                    if signal_value == 0:
+                        sma_signals = sma_crossover_signals(
+                            pd.DataFrame({"close": df["close"]}),
+                            fast=self.sma_fast,
+                            slow=self.sma_slow,
+                        )
+                        signal_value = (
+                            int(sma_signals["signal"].iloc[-1]) if len(sma_signals) > 0 else 0
+                        )
+                        if signal_value != 0:
+                            confidence = 0.6
+                            logger.info(f"SMA crossover signal for {symbol}: {signal_value}")
 
                 signals = pd.DataFrame(
                     {
@@ -1326,6 +1530,16 @@ class AsyncRunner:
         # Record signal in database with strength reflecting model confidence if available
         signal_value = int(last.get("signal", 0))
         signal_strength = float(last.get("confidence", 1.0)) if "confidence" in last else 1.0
+
+        # Determine signal type for WebSocket/logging
+        if signal_value == 1:
+            signal_type = "BUY"
+        elif signal_value == -1:
+            signal_type = "SELL"
+        else:
+            signal_type = "HOLD"
+
+        # Record non-zero signals in database
         if signal_value != 0:
             strategy_name = (
                 "ML_ENHANCED"
@@ -1341,15 +1555,18 @@ class AsyncRunner:
                 max(0.0, min(1.0, float(signal_strength))),
             )
 
-            # Send signal update via WebSocket
-            if WEBSOCKET_ENABLED and ws_client:
-                try:
-                    signal_type = "BUY" if signal_value == 1 else "SELL"
-                    ws_client.send_signal_update(
-                        symbol, signal_type, max(0.0, min(1.0, float(signal_strength)))
-                    )
-                except Exception as e:
-                    logger.debug(f"Could not send signal WebSocket update: {e}")
+        # ALWAYS send signal update via WebSocket (including HOLD signals)
+        # This lets the dashboard show real-time activity
+        if WEBSOCKET_ENABLED and ws_client:
+            try:
+                ws_client.send_signal_update(
+                    symbol,
+                    signal_type,
+                    max(0.0, min(1.0, float(signal_strength))),
+                    reason=f"Price: ${price_float:.2f}",
+                )
+            except Exception as e:
+                logger.debug(f"Could not send signal WebSocket update: {e}")
 
         # Execute trades based on signal
         executed = False
@@ -1908,7 +2125,42 @@ class AsyncRunner:
             else:
                 logger.info(f"Market is open, proceeding with data collection")
 
+            # AI Opportunity Scanner - find new stocks to buy from news
+            ai_opportunities = []
+            if self.ai_analyst and AI_ANALYST_AVAILABLE and is_market_open():
+                try:
+                    # Get current positions to exclude
+                    owned_symbols = list(self.positions.keys())
+
+                    # Fetch fresh news
+                    news_items = fetch_rss_news(max_items=20)
+                    headlines = [item["title"] for item in news_items]
+
+                    if headlines:
+                        logger.info(f"AI scanning {len(headlines)} headlines for opportunities...")
+                        ai_opportunities = self.ai_analyst.find_opportunities(
+                            headlines, exclude_symbols=owned_symbols
+                        )
+
+                        for opp in ai_opportunities:
+                            logger.info(
+                                f"🎯 AI OPPORTUNITY: {opp['symbol']} - "
+                                f"Confidence: {opp['confidence']:.0%} - {opp['reason']}"
+                            )
+                except Exception as e:
+                    logger.warning(f"AI opportunity scan failed: {e}")
+
+            # Build symbols list - start with configured symbols
             symbols_to_process = symbols if symbols else self.cfg.symbols
+
+            # Add AI-discovered opportunities to processing list
+            for opp in ai_opportunities:
+                if opp["symbol"] not in symbols_to_process:
+                    symbols_to_process = list(symbols_to_process) + [opp["symbol"]]
+                    logger.info(f"Added AI opportunity {opp['symbol']} to processing queue")
+
+            # Store AI opportunities for signal generation
+            self._ai_opportunities = {opp["symbol"]: opp for opp in ai_opportunities}
             logger.info(
                 f"Processing {len(symbols_to_process)} symbols "
                 f"with max {self.max_concurrent_symbols} concurrent"
@@ -2319,7 +2571,7 @@ async def run_continuous(
     max_daily_notional: Optional[float] = None,
     default_cash: Optional[float] = None,
     max_concurrent: int = 8,
-    interval_seconds: int = 300,
+    interval_seconds: int = 60,  # 1 minute between cycles
     use_ml_strategy: bool = False,
     use_ml_enhanced: bool = False,
     use_smart_execution: bool = False,
@@ -2345,78 +2597,98 @@ async def run_continuous(
     logger.info("Starting continuous trading system...")
     logger.info("Press Ctrl+C to stop gracefully")
 
-    while not shutdown_flag:
-        eastern = pytz.timezone("US/Eastern")
-        current_time = datetime.now(eastern)
+    # Persistent runner - created once, reused across cycles
+    runner = None
 
-        # Check market status but still run (data might be useful even after hours)
-        if not is_market_open() and not force_connect:
-            session = get_market_session()
-            seconds_to_open = seconds_until_market_open()
+    try:
+        while not shutdown_flag:
+            eastern = pytz.timezone("US/Eastern")
+            current_time = datetime.now(eastern)
 
-            # During extended hours or shortly before open, run more frequently
-            if session in ["after-hours", "pre-market"] or seconds_to_open < 3600:
-                wait_time = min(interval_seconds, 300)  # Max 5 minutes
-            else:
-                # Market closed, check less frequently
-                wait_time = min(1800, seconds_to_open // 2)  # Max 30 minutes
-                logger.info(
-                    f"Market {session}. Next open in {seconds_to_open/3600:.1f} hours. "
-                    f"Waiting {wait_time/60:.1f} minutes..."
+            # Check market status but still run (data might be useful even after hours)
+            if not is_market_open() and not force_connect:
+                session = get_market_session()
+                seconds_to_open = seconds_until_market_open()
+
+                # During extended hours or shortly before open, run more frequently
+                if session in ["after-hours", "pre-market"] or seconds_to_open < 3600:
+                    wait_time = min(interval_seconds, 300)  # Max 5 minutes
+                else:
+                    # Market closed, check less frequently
+                    wait_time = min(1800, seconds_to_open // 2)  # Max 30 minutes
+                    logger.info(
+                        f"Market {session}. Next open in {seconds_to_open/3600:.1f} hours. "
+                        f"Waiting {wait_time/60:.1f} minutes..."
+                    )
+                    logger.info(
+                        "📵 System quiet during market close - no trading activity, data fetching, "
+                        "or ML processing until market opens. Runner will wake periodically to check status."
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
+            elif force_connect and not is_market_open():
+                logger.warning(
+                    "⚠️ Force-connect enabled - connecting to IBKR despite market being closed"
                 )
-                logger.info(
-                    "📵 System quiet during market close - no trading activity, data fetching, "
-                    "or ML processing until market opens. Runner will wake periodically to check status."
-                )
-                await asyncio.sleep(wait_time)
-                continue
-        elif force_connect and not is_market_open():
-            logger.warning(
-                "⚠️ Force-connect enabled - connecting to IBKR despite market being closed"
-            )
-
-        try:
-            logger.info(
-                f"Starting trading cycle at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
-            )
-
-            # Run the trading system with proper cleanup
-            runner = AsyncRunner(
-                duration=duration,
-                bar_size=bar_size,
-                sma_fast=sma_fast,
-                sma_slow=sma_slow,
-                slippage_bps=slippage_bps,
-                max_order_notional=max_order_notional,
-                max_daily_notional=max_daily_notional,
-                default_cash=default_cash,
-                max_concurrent_symbols=max_concurrent,
-                use_correlation_sizing=True,  # FIXED: Enabled M5 correlation integration
-                use_ml_strategy=use_ml_strategy,
-                use_smart_execution=use_smart_execution,
-            )
 
             try:
+                logger.info(
+                    f"Starting trading cycle at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+                )
+
+                # Create fresh runner each cycle for stability (disconnect between cycles)
+                # This avoids connection timeouts and subprocess health check issues
+                logger.info("Creating fresh runner for this cycle...")
+                runner = AsyncRunner(
+                    duration=duration,
+                    bar_size=bar_size,
+                    sma_fast=sma_fast,
+                    sma_slow=sma_slow,
+                    slippage_bps=slippage_bps,
+                    max_order_notional=max_order_notional,
+                    max_daily_notional=max_daily_notional,
+                    default_cash=default_cash,
+                    max_concurrent_symbols=max_concurrent,
+                    use_correlation_sizing=True,  # FIXED: Enabled M5 correlation integration
+                    use_ml_strategy=use_ml_strategy,
+                    use_smart_execution=use_smart_execution,
+                )
+
                 await runner.run(symbols)
-            finally:
-                # Ensure proper cleanup of runner resources
+
+                # Clean up connection after each cycle (more stable for long-running)
+                logger.info("Cleaning up runner after cycle...")
                 await runner.cleanup()
+                runner = None
 
-            # Wait before next iteration
-            if not shutdown_flag and is_market_open():
-                logger.info(f"Waiting {interval_seconds/60:.1f} minutes before next iteration...")
-                await asyncio.sleep(interval_seconds)
+                # Wait before next iteration
+                if not shutdown_flag and is_market_open():
+                    logger.info(
+                        f"Waiting {interval_seconds/60:.1f} minutes before next iteration..."
+                    )
+                    await asyncio.sleep(interval_seconds)
 
-        except asyncio.CancelledError:
-            logger.info("Trading loop cancelled")
-            break
-        except Exception as e:
-            logger.error(f"Error in trading cycle: {e}")
-            if not shutdown_flag:
-                logger.info("Waiting 1 minute before retry...")
-                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                logger.info("Trading loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in trading cycle: {e}")
+                # If connection error, reset runner to force reconnect
+                if "connect" in str(e).lower() or "timeout" in str(e).lower():
+                    logger.warning("Connection error detected, will reconnect on next cycle")
+                    if runner:
+                        await runner.cleanup()
+                    runner = None
+                if not shutdown_flag:
+                    logger.info("Waiting 1 minute before retry...")
+                    await asyncio.sleep(60)
 
-    logger.info("Trading system shutdown complete")
+    finally:
+        # Cleanup on shutdown
+        if runner:
+            logger.info("Cleaning up persistent runner...")
+            await runner.cleanup()
+        logger.info("Trading system shutdown complete")
 
 
 def check_gateway_zombies(port: int = 4002) -> bool:

@@ -12,8 +12,10 @@ import asyncio
 import atexit
 import json
 import os
+import queue
 import signal
 import sys
+import threading
 import time
 import traceback
 from datetime import datetime
@@ -36,6 +38,38 @@ shutdown_requested = False
 # Tracks Gateway API failure state to avoid hammering a dead Gateway
 gateway_api_down = False
 gateway_failure_detail = ""
+
+# CRITICAL FIX: Use a dedicated thread for stdin reading to avoid
+# run_in_executor race condition where orphaned threads consume data
+stdin_queue: queue.Queue = queue.Queue()
+stdin_reader_thread: Optional[threading.Thread] = None
+
+
+def _stdin_reader():
+    """Dedicated thread to read stdin lines and put them in queue.
+
+    This avoids the race condition with run_in_executor where:
+    1. run_in_executor submits readline() to thread pool
+    2. asyncio timeout cancels the future after 1s
+    3. BUT the thread pool thread continues blocking on readline()
+    4. Next iteration submits ANOTHER readline()
+    5. When data arrives, the orphaned thread consumes it
+    6. Result is never returned because its future was cancelled
+
+    Using a dedicated thread ensures exactly one readline() is active.
+    """
+    while not shutdown_requested:
+        try:
+            line = sys.stdin.readline()
+            if not line:  # EOF
+                stdin_queue.put(None)
+                break
+            stdin_queue.put(line)
+        except Exception as e:
+            print(f"DEBUG: stdin reader error: {e}", file=sys.stderr, flush=True)
+            stdin_queue.put(None)
+            break
+    print("DEBUG: stdin reader thread exiting", file=sys.stderr, flush=True)
 
 
 def _cleanup_on_exit():
@@ -360,8 +394,29 @@ async def handle_disconnect() -> dict:
 
 
 async def handle_ping() -> dict:
-    """Handle ping command (health check)"""
+    """Handle ping command (health check) - also triggers IBKR keep-alive"""
+    global ib
     connected = ib is not None and ib.isConnected()
+
+    # If we have an IB instance but it's disconnected, try to keep it alive
+    # by running a simple async loop iteration - this helps maintain connection
+    if ib is not None:
+        try:
+            # Running sleep(0) through ib_async's event loop helps keep connection alive
+            await asyncio.sleep(0)
+            # Check connection status after the async yield
+            connected = ib.isConnected()
+            if connected:
+                print("DEBUG: Ping keep-alive check passed", file=sys.stderr, flush=True)
+            else:
+                print(
+                    "DEBUG: IBKR connection lost, will need reconnection",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        except Exception as e:
+            print(f"DEBUG: Keep-alive check failed: {e}", file=sys.stderr, flush=True)
+            connected = False
 
     return {
         "status": "success",
@@ -409,13 +464,13 @@ async def handle_get_historical_bars(params: dict) -> dict:
 
         contract = Stock(symbol, "SMART", "USD")
 
-        # Qualify contract
-        qualified = ib.qualifyContracts(contract)
+        # Qualify contract (must await - it's a coroutine in ib_async)
+        qualified = await ib.qualifyContractsAsync(contract)
         if not qualified:
             raise ValueError(f"Could not qualify contract for {symbol}")
 
-        # Request historical data
-        bars = ib.reqHistoricalData(
+        # Request historical data (must await - it's a coroutine in ib_async)
+        bars = await ib.reqHistoricalDataAsync(
             qualified[0],
             endDateTime="",
             durationStr=duration,
@@ -488,19 +543,30 @@ async def handle_command(command: dict) -> dict:
 
 async def main():
     """Main loop - read commands from stdin, write responses to stdout"""
+    global stdin_reader_thread
+
+    # Start dedicated stdin reader thread
+    stdin_reader_thread = threading.Thread(target=_stdin_reader, daemon=True, name="StdinReader")
+    stdin_reader_thread.start()
+    print("DEBUG: Started stdin reader thread", file=sys.stderr, flush=True)
+
     try:
         while not shutdown_requested:
-            # Read command from stdin (blocking)
+            # Read command from queue (populated by dedicated reader thread)
+            # This avoids the run_in_executor race condition
             try:
+                # Use run_in_executor to wait on queue without blocking event loop
                 line = await asyncio.wait_for(
-                    asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline),
-                    timeout=1.0,  # Check shutdown flag every second
+                    asyncio.get_event_loop().run_in_executor(
+                        None, lambda: stdin_queue.get(timeout=1.0)
+                    ),
+                    timeout=2.0,  # Slightly longer than queue timeout
                 )
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, queue.Empty):
                 continue  # Check shutdown flag and loop again
 
-            # EOF - exit gracefully
-            if not line or shutdown_requested:
+            # EOF or shutdown - exit gracefully
+            if line is None or shutdown_requested:
                 break
 
             # Parse command
@@ -514,6 +580,10 @@ async def main():
                 }
                 print(json.dumps(response), flush=True)
                 continue
+
+            # Log receipt of command for debugging pipe issues
+            cmd = command.get("command", "unknown")
+            print(f"DEBUG: Processing command: {cmd}", file=sys.stderr, flush=True)
 
             # Handle command
             response = await handle_command(command)

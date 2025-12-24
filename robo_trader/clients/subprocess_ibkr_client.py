@@ -349,18 +349,25 @@ class SubprocessIBKRClient:
             if not self.process or self.process.poll() is not None:
                 raise SubprocessCrashError("Subprocess not running")
 
-            # Send command (use run_in_executor to avoid blocking)
+            # Send command - write directly to stdin (no executor to avoid event loop starvation)
             command_json = json.dumps(command) + "\n"
             logger.debug("Sending command to subprocess", command=command.get("command"))
 
-            def write_command():
-                try:
-                    self.process.stdin.write(command_json)
-                    self.process.stdin.flush()
-                except Exception as e:
-                    raise SubprocessCrashError(f"Failed to send command: {e}")
+            try:
+                self.process.stdin.write(command_json)
+                self.process.stdin.flush()
+            except Exception as e:
+                raise SubprocessCrashError(f"Failed to send command: {e}")
 
-            await asyncio.get_event_loop().run_in_executor(None, write_command)
+            # Log write confirmation
+            logger.debug(
+                "Command sent to subprocess",
+                command=command.get("command"),
+                bytes_written=len(command_json),
+            )
+
+            # Small yield to let reader thread process
+            await asyncio.sleep(0.001)
 
             # Read response from queue with timeout
             try:
@@ -604,11 +611,13 @@ class SubprocessIBKRClient:
         data = await self._execute_command(
             {
                 "command": "get_historical_bars",
-                "symbol": symbol,
-                "duration": duration,
-                "bar_size": bar_size,
-                "what_to_show": what_to_show,
-                "use_rth": use_rth,
+                "params": {
+                    "symbol": symbol,
+                    "duration": duration,
+                    "bar_size": bar_size,
+                    "what_to_show": what_to_show,
+                    "use_rth": use_rth,
+                },
             },
             timeout=60.0,  # Historical data can take longer
         )
@@ -619,9 +628,19 @@ class SubprocessIBKRClient:
         if not self._connected:
             return
 
-        logger.info("Disconnecting from IBKR via subprocess")
-        await self._execute_command({"command": "disconnect"})
+        # Set _connected = False FIRST to prevent infinite loop with stop()
+        # (stop() calls disconnect() if _connected is True)
         self._connected = False
+
+        logger.info("Disconnecting from IBKR via subprocess")
+        try:
+            # Use a short timeout - if it doesn't respond quickly, just terminate
+            await self._execute_command({"command": "disconnect"}, timeout=5.0)
+        except Exception as e:
+            logger.warning(f"Disconnect command failed, will terminate subprocess: {e}")
+
+        # Always stop the subprocess to ensure clean state
+        await self.stop()
         logger.info("Disconnected from IBKR")
 
     async def ping(self) -> bool:
