@@ -198,6 +198,8 @@ python3 test_safety_features.py
 9. ✅ IBC Integration - Gateway auto-start and zombie handling (2025-12-03)
 10. ✅ **Socket Zombie Creation Bug - FIXED (2025-12-06)** - See below
 11. ✅ **Dashboard Connection Status Accuracy - IMPROVED (2025-12-10)** - See below
+12. ✅ **Subprocess Pipe Blocking - FIXED (2025-12-24)** - See below
+13. ✅ **Near Real-Time Trading - IMPLEMENTED (2025-12-24)** - See below
 
 ## Critical Safety Features (2025-09-27) ✅
 **Added to address audit findings:**
@@ -224,6 +226,43 @@ python3 test_safety_features.py
 - See `DECIMAL_PRECISION_FIX.md` for details
 
 ## Major Fixes Completed
+
+### Near Real-Time Trading System (2025-12-24) ✅
+
+**System now runs with ~15-second latency during market hours.**
+
+**Polling Intervals by Market State:**
+| Market State | Polling Interval | Notes |
+|-------------|------------------|-------|
+| **Market Open** | 15 seconds | Near real-time with 1-minute bars |
+| **Pre/After Hours** | 2 minutes | Extended hours data still available |
+| **Near Open (<1hr)** | 5 minutes | Preparing for market open |
+| **Closed (overnight/weekend)** | 30 minutes max | Conserve resources |
+
+**Configuration Changes:**
+- `bar_size`: 30 min → **1 minute** (finer granularity)
+- `duration`: 10 days → **1 day** (faster data fetch)
+- `interval_seconds`: 300 → **15** (near real-time)
+
+**Files Modified:** `robo_trader/runner_async.py`
+
+**Future Enhancement:** True streaming with `reqMktData()` for <1 second latency (Phase 2 planned)
+
+### Subprocess Pipe Blocking Fix (2025-12-24) ✅
+
+**CRITICAL FIX:** Resolved race condition where data fetch commands were lost.
+
+**Root Cause:** Worker used `run_in_executor` with timeout for `stdin.readline()`. When timeout fired, asyncio cancelled the future BUT the thread pool thread continued blocking. Next iteration spawned another thread, causing orphaned threads to consume data that was never returned.
+
+**Fix:**
+- Worker: Dedicated stdin reader thread with queue (no race condition)
+- Parent: Direct `stdin.write()` without executor wrapper
+
+**Files Modified:**
+- `robo_trader/clients/ibkr_subprocess_worker.py` - Added `_stdin_reader()` thread
+- `robo_trader/clients/subprocess_ibkr_client.py` - Direct stdin writes
+
+**See:** `handoff/HANDOFF_2025-12-24_subprocess_pipe_fix_complete.md`
 
 ### Dashboard Connection Status Accuracy (2025-12-10) ✅
 

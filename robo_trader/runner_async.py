@@ -98,8 +98,8 @@ class AsyncRunner:
 
     def __init__(
         self,
-        duration: str = "10 D",
-        bar_size: str = "30 mins",
+        duration: str = "1 D",  # Reduced from 10D for faster cycles
+        bar_size: str = "1 min",  # 1-minute bars for near real-time
         sma_fast: int = 10,
         sma_slow: int = 20,
         slippage_bps: float = 0.0,
@@ -2528,8 +2528,8 @@ class AsyncRunner:
 
 async def run_once(
     symbols: Optional[List[str]] = None,
-    duration: str = "10 D",
-    bar_size: str = "30 mins",
+    duration: str = "1 D",
+    bar_size: str = "1 min",
     sma_fast: int = 10,
     sma_slow: int = 20,
     slippage_bps: float = 0.0,
@@ -2562,8 +2562,8 @@ async def run_once(
 
 async def run_continuous(
     symbols: Optional[List[str]] = None,
-    duration: str = "10 D",
-    bar_size: str = "30 mins",
+    duration: str = "1 D",
+    bar_size: str = "1 min",
     sma_fast: int = 10,
     sma_slow: int = 20,
     slippage_bps: float = 0.0,
@@ -2571,7 +2571,7 @@ async def run_continuous(
     max_daily_notional: Optional[float] = None,
     default_cash: Optional[float] = None,
     max_concurrent: int = 8,
-    interval_seconds: int = 60,  # 1 minute between cycles
+    interval_seconds: int = 15,  # 15 seconds between cycles for near real-time
     use_ml_strategy: bool = False,
     use_ml_enhanced: bool = False,
     use_smart_execution: bool = False,
@@ -2605,24 +2605,31 @@ async def run_continuous(
             eastern = pytz.timezone("US/Eastern")
             current_time = datetime.now(eastern)
 
-            # Check market status but still run (data might be useful even after hours)
+            # Check market status and adjust polling frequency
             if not is_market_open() and not force_connect:
                 session = get_market_session()
                 seconds_to_open = seconds_until_market_open()
 
-                # During extended hours or shortly before open, run more frequently
-                if session in ["after-hours", "pre-market"] or seconds_to_open < 3600:
-                    wait_time = min(interval_seconds, 300)  # Max 5 minutes
+                # Extended hours: slower polling (2 min) - market data still available
+                if session in ["after-hours", "pre-market"]:
+                    wait_time = 120  # 2 minutes during extended hours
+                    logger.info(f"Extended hours ({session}). Polling every 2 minutes...")
+                    await asyncio.sleep(wait_time)
+                    continue
+                # Within 1 hour of open: moderate polling (5 min)
+                elif seconds_to_open < 3600:
+                    wait_time = 300  # 5 minutes when close to open
+                    logger.info(
+                        f"Market opens in {seconds_to_open/60:.0f} min. Polling every 5 minutes..."
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
                 else:
-                    # Market closed, check less frequently
+                    # Market fully closed (overnight/weekend): long wait (30 min max)
                     wait_time = min(1800, seconds_to_open // 2)  # Max 30 minutes
                     logger.info(
                         f"Market {session}. Next open in {seconds_to_open/3600:.1f} hours. "
-                        f"Waiting {wait_time/60:.1f} minutes..."
-                    )
-                    logger.info(
-                        "📵 System quiet during market close - no trading activity, data fetching, "
-                        "or ML processing until market opens. Runner will wake periodically to check status."
+                        f"Sleeping {wait_time/60:.1f} minutes..."
                     )
                     await asyncio.sleep(wait_time)
                     continue
@@ -2743,11 +2750,9 @@ def main() -> None:
         default="",
     )
     parser.add_argument(
-        "--duration", type=str, help="IB duration string (e.g. '10 D')", default="10 D"
+        "--duration", type=str, help="IB duration string (e.g. '1 D')", default="1 D"
     )
-    parser.add_argument(
-        "--bar-size", type=str, help="IB bar size (e.g. '30 mins')", default="30 mins"
-    )
+    parser.add_argument("--bar-size", type=str, help="IB bar size (e.g. '1 min')", default="1 min")
     parser.add_argument(
         "--confirm-live",
         action="store_true",
@@ -2790,8 +2795,8 @@ def main() -> None:
     parser.add_argument(
         "--interval",
         type=int,
-        default=300,
-        help="Seconds between trading cycles (default: 300 = 5 minutes)",
+        default=15,
+        help="Seconds between trading cycles (default: 15 for near real-time)",
     )
     parser.add_argument(
         "--use-ml",
