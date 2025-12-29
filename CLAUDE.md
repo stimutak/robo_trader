@@ -200,6 +200,9 @@ python3 test_safety_features.py
 11. ✅ **Dashboard Connection Status Accuracy - IMPROVED (2025-12-10)** - See below
 12. ✅ **Subprocess Pipe Blocking - FIXED (2025-12-24)** - See below
 13. ✅ **Near Real-Time Trading - IMPLEMENTED (2025-12-24)** - See below
+14. ✅ **Decimal/Float Type Mismatch - FIXED (2025-12-29)** - See below
+15. ✅ **Market Close Time Wrong - FIXED (2025-12-29)** - Was 4:30 PM, now 4:00 PM
+16. ⚠️ **Int/Datetime Comparison Error - OPEN (2025-12-29)** - Affects GM/GOLD, needs investigation
 
 ## Critical Safety Features (2025-09-27) ✅
 **Added to address audit findings:**
@@ -247,6 +250,27 @@ python3 test_safety_features.py
 **Files Modified:** `robo_trader/runner_async.py`
 
 **Future Enhancement:** True streaming with `reqMktData()` for <1 second latency (Phase 2 planned)
+
+### Trading Bug Fixes (2025-12-29) ✅
+
+**Fixed two critical bugs preventing trade execution:**
+
+1. **Decimal/Float Type Mismatch**
+   - **File:** `runner_async.py` line 1656
+   - **Error:** `unsupported operand type(s) for /: 'float' and 'decimal.Decimal'`
+   - **Fix:** Changed `current_price=price` to `current_price=price_float`
+
+2. **Market Close Time Wrong**
+   - **File:** `market_hours.py` line 36
+   - **Error:** Market showing as "open" after 4:00 PM
+   - **Fix:** Changed `time(16, 30)` to `time(16, 0)` (4:30 PM → 4:00 PM)
+
+**Known Issue (Open):**
+- **Int/Datetime Comparison Error** affecting GM/GOLD symbols
+- Error: `'>=' not supported between instances of 'int' and 'datetime.datetime'`
+- Needs further investigation
+
+**See:** `handoff/HANDOFF_2025-12-29_trading_bugs_fixed.md`
 
 ### Subprocess Pipe Blocking Fix (2025-12-24) ✅
 

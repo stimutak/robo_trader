@@ -1653,7 +1653,7 @@ class AsyncRunner:
                     sizing_result = await self.advanced_risk.calculate_position_size(
                         symbol=symbol,
                         signal_strength=abs(signal_value),  # Use signal strength from strategy
-                        current_price=price,
+                        current_price=price_float,  # Use float, not Decimal
                         atr=atr,
                     )
 

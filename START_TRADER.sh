@@ -271,20 +271,43 @@ fi
 echo "   ✓ Zombie cleanup complete"
 echo ""
 
-# Step 4: Activate virtual environment
-echo "4. Activating virtual environment..."
+# Step 4: Set up Python environment
+echo "4. Setting up Python environment..."
 cd "$SCRIPT_DIR"
-if [ -f ".venv/bin/activate" ]; then
-    source .venv/bin/activate
-    echo "   ✓ Virtual environment activated"
+
+# Determine Python path - prefer .venv, fall back to system python3
+if [ -x ".venv/bin/python" ]; then
+    PYTHON="$SCRIPT_DIR/.venv/bin/python"
+    echo "   ✓ Using virtualenv Python: $PYTHON"
+elif [ -x "venv/bin/python" ]; then
+    PYTHON="$SCRIPT_DIR/venv/bin/python"
+    echo "   ✓ Using virtualenv Python: $PYTHON"
 else
-    echo "   ⚠️  No virtual environment found - using system Python"
+    # Check if we need to create virtualenv
+    if [ -f "requirements.txt" ]; then
+        echo "   Creating virtual environment..."
+        python3 -m venv .venv
+        PYTHON="$SCRIPT_DIR/.venv/bin/python"
+        echo "   Installing dependencies..."
+        $PYTHON -m pip install -r requirements.txt -q
+        echo "   ✓ Virtual environment created and dependencies installed"
+    else
+        PYTHON="python3"
+        echo "   ⚠️  No virtualenv found - using system Python"
+    fi
+fi
+
+# Verify Python works and has required packages
+if ! $PYTHON -c "import pandas" 2>/dev/null; then
+    echo "   ⚠️  Missing dependencies - installing from requirements.txt..."
+    $PYTHON -m pip install -r requirements.txt -q
+    echo "   ✓ Dependencies installed"
 fi
 echo ""
 
 # Step 5: Start WebSocket server
 echo "5. Starting WebSocket server..."
-python3 -m robo_trader.websocket_server &
+$PYTHON -m robo_trader.websocket_server &
 WS_PID=$!
 sleep 2
 
@@ -301,9 +324,9 @@ echo "   Symbols: $SYMBOLS"
 echo "   Log: robo_trader.log"
 echo ""
 
-export LOG_FILE=/Users/oliver/robo_trader/robo_trader.log
+export LOG_FILE="$SCRIPT_DIR/robo_trader.log"
 
-python3 -m robo_trader.runner_async --symbols "$SYMBOLS" --force-connect &
+$PYTHON -m robo_trader.runner_async --symbols "$SYMBOLS" --force-connect &
 TRADER_PID=$!
 
 echo "   ✓ Trading system started (PID: $TRADER_PID)"
@@ -312,7 +335,7 @@ echo ""
 # Step 7: Start dashboard
 echo "7. Starting dashboard..."
 export DASH_PORT=5555
-python3 app.py &
+$PYTHON app.py &
 DASH_PID=$!
 sleep 2
 
