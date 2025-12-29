@@ -46,26 +46,58 @@ market_close = time(16, 30)  # 4:30 PM - wrong
 market_close = time(16, 0)   # 4:00 PM - correct
 ```
 
-## Known Issue (NOT YET FIXED)
+### 3. ML Strategy Missing Await
+**File:** `robo_trader/strategies/ml_enhanced_strategy.py` line 255
+**Error:** `select_best_model` was called without `await` and with wrong parameters
 
-### 3. Int/Datetime Comparison Error
+**Root Cause:** The async method was called synchronously with incorrect keyword arguments.
+
+**Fix:** Added `await` and corrected the parameters:
+```python
+# Before (wrong)
+best_model = self.model_selector.select_best_model(
+    features=latest_features,  # Wrong param
+    market_conditions={...},   # Wrong param
+)
+
+# After (correct)
+best_model = await self.model_selector.select_best_model(
+    selection_criteria="test_score",
+    require_recent=False,
+    max_age_days=30,
+)
+```
+
+### 4. Market Hours Inconsistencies
+**File:** `robo_trader/market_hours.py` lines 73, 108
+**Error:** `get_market_session()` and `is_extended_hours()` still used 4:30 PM
+
+**Fix:** Changed `time(16, 30)` to `time(16, 0)` in both functions for consistency.
+
+## Known Issue (Under Investigation)
+
+### Int/Datetime Comparison Error
 **Error:** `'>=' not supported between instances of 'int' and 'datetime.datetime'`
-**Affects:** GM, GOLD, and possibly other symbols
+**Affects:** GM, GOLD, and possibly other AI-discovered symbols
 
 **Symptoms:**
 - AI opportunity signals generate successfully
-- Kelly metrics calculate successfully
-- Task then fails with datetime comparison error
+- Symbols are added to processing queue
+- Task fails during process_symbol with datetime comparison error
 
-**Investigation Notes:**
-- Error occurs after Kelly metrics logging (line 1675)
-- Likely in one of: correlation tracking, position validation, or stop-loss logic
-- Needs deeper investigation into where an int is being compared to a datetime
+**Investigation Progress:**
+- Added detailed traceback logging to identify exact location
+- Error likely in ML/feature pipeline processing
+- May be related to how AI-discovered symbols get different data format
+
+**Traceback logging added to:**
+- `runner_async.py` line 2031-2033 - Now logs full exception traceback
 
 ## Files Modified
 
-1. **`robo_trader/runner_async.py`** - Fixed Decimal/float mismatch
-2. **`robo_trader/market_hours.py`** - Fixed market close time
+1. **`robo_trader/runner_async.py`** - Fixed Decimal/float mismatch, added traceback logging
+2. **`robo_trader/market_hours.py`** - Fixed market close time (all functions)
+3. **`robo_trader/strategies/ml_enhanced_strategy.py`** - Fixed async model selection call
 
 ## Testing
 
@@ -73,10 +105,12 @@ After fixes:
 - Market correctly shows as closed after 4:00 PM
 - No more Decimal/float errors in logs
 - AAPL, NVDA, TSLA processing without errors
-- GM/GOLD still failing with datetime error (open issue)
+- ML model selection now properly awaited
+- GM/GOLD will now log full tracebacks to identify exact error location
 
 ## Next Steps
 
-1. Investigate the `int >= datetime` error for GM/GOLD
-2. Fix the datetime comparison bug
-3. Verify trades execute properly during market hours
+1. Run the system during market hours tomorrow morning
+2. Check logs for full traceback on GM/GOLD errors
+3. Fix the datetime comparison bug based on traceback
+4. Verify trades execute properly

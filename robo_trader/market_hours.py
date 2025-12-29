@@ -69,8 +69,8 @@ def is_extended_hours(dt: Optional[datetime] = None) -> bool:
     pre_market_start = time(4, 0)
     pre_market_end = time(9, 30)
 
-    # After-hours: 4:30 PM - 8:00 PM
-    after_hours_start = time(16, 30)
+    # After-hours: 4:00 PM - 8:00 PM
+    after_hours_start = time(16, 0)  # Starts when regular hours end
     after_hours_end = time(20, 0)
 
     return (
@@ -105,7 +105,7 @@ def get_market_session(dt: Optional[datetime] = None) -> str:
     # Define market hours
     pre_market_start = time(4, 0)
     regular_start = time(9, 30)
-    regular_end = time(16, 30)
+    regular_end = time(16, 0)  # Market closes at 4:00 PM ET
     after_hours_end = time(20, 0)
 
     if pre_market_start <= current_time < regular_start:

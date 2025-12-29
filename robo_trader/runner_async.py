@@ -2028,7 +2028,12 @@ class AsyncRunner:
         for i, result in enumerate(results):
             symbol = symbols[i]
             if isinstance(result, Exception):
-                logger.error(f"Task failed for symbol {symbol}: {result}")
+                import traceback
+
+                tb_str = "".join(
+                    traceback.format_exception(type(result), result, result.__traceback__)
+                )
+                logger.error(f"Task failed for symbol {symbol}: {result}\nTraceback:\n{tb_str}")
                 # Continue processing other symbols, don't crash the entire run
                 continue
             else:

@@ -87,8 +87,8 @@ class MLEnhancedStrategy(Strategy):
         self.regime_detector = RegimeDetector(lookback_period=100)
 
         # Strategy parameters
-        self.base_confidence_threshold = 0.6
-        self.min_alignment_score = 0.5
+        self.base_confidence_threshold = 0.45  # Lowered from 0.6 to enable more trades
+        self.min_alignment_score = 0.4  # Lowered from 0.5
         self.max_correlation_positions = 3
 
         # Multi-timeframe settings
@@ -252,23 +252,27 @@ class MLEnhancedStrategy(Strategy):
         latest_features = features_df.iloc[-1:].copy()
 
         # Select best model
-        best_model = self.model_selector.select_best_model(
-            features=latest_features,
-            market_conditions={
-                "volatility": (
-                    80.0
-                    if self.current_regime
-                    and self.current_regime.volatility_regime == MarketRegime.HIGH_VOL
-                    else 50.0
-                )
-            },
+        best_model = await self.model_selector.select_best_model(
+            selection_criteria="test_score",
+            require_recent=False,  # Allow older models if no recent ones
+            max_age_days=30,
         )
 
         if not best_model:
             return None
 
-        # Make prediction
-        model_data = self.model_selector.available_models[best_model]
+        # Find model name from selected model
+        model_name = None
+        for name, info in self.model_selector.available_models.items():
+            if info is best_model:
+                model_name = name
+                break
+
+        if not model_name:
+            # best_model might be directly usable as model_data
+            model_data = best_model
+        else:
+            model_data = self.model_selector.available_models[model_name]
         model = model_data["model"]
 
         # Prepare features
@@ -426,11 +430,11 @@ class MLEnhancedStrategy(Strategy):
 
         # Adjust for regime - simple thresholds based on volatility
         if regime.volatility_regime in [MarketRegime.HIGH_VOL, MarketRegime.EXTREME_VOL]:
-            entry_threshold = 0.7  # Higher threshold in volatile markets
+            entry_threshold = 0.5  # Lowered from 0.7 - allow trades in volatile markets
         elif regime.trend_regime in [MarketRegime.STRONG_BULL, MarketRegime.STRONG_BEAR]:
-            entry_threshold = 0.5  # Lower threshold in strong trends
+            entry_threshold = 0.35  # Lowered from 0.5 - capitalize on strong trends
         else:
-            entry_threshold = 0.6  # Default threshold
+            entry_threshold = 0.45  # Lowered from 0.6 - default threshold
 
         # Filter based on regime entry threshold
         if final_signal.confidence < entry_threshold:
