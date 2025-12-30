@@ -563,7 +563,7 @@ class RiskManager:
         if len(current_positions) >= self.max_open_positions:
             return False, f"Maximum {self.max_open_positions} positions reached"
 
-        order_notional = price * order_qty
+        order_notional = float(price) * order_qty  # Ensure float for arithmetic operations
 
         # Per-order notional limit - Robust validation
         if self.max_order_notional is not None:
@@ -594,7 +594,7 @@ class RiskManager:
         ):
             return False, "Invalid equity or symbol exposure configuration"
 
-        max_symbol_notional = equity * self.max_symbol_exposure_pct
+        max_symbol_notional = float(equity) * self.max_symbol_exposure_pct
         if order_notional > max_symbol_notional:
             self._record_violation(RiskViolationType.POSITION_SIZE_LIMIT, symbol)
             return False, "Symbol exposure exceeds limit"
@@ -610,7 +610,7 @@ class RiskManager:
             return False, "Invalid position data for leverage calculation"
 
         total_after = existing_notional + order_notional
-        if equity > 0 and (total_after / equity) > self.max_leverage:
+        if equity > 0 and (total_after / float(equity)) > self.max_leverage:
             self._record_violation(RiskViolationType.LEVERAGE_LIMIT, symbol)
             return False, "Account leverage exceeds limit"
 
