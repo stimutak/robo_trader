@@ -4465,9 +4465,11 @@ def strategies_status():
         # Calculate real PnL from watchlist cache (has live prices)
         total_pnl = 0
         winning_positions = 0
+        watchlist_position_count = 0
         if hasattr(app, "_watchlist_cache") and app._watchlist_cache:
             for item in app._watchlist_cache:
                 if item.get("has_position") and item.get("quantity", 0) > 0:
+                    watchlist_position_count += 1
                     pnl = item.get("pnl", 0)
                     total_pnl += pnl
                     if pnl > 0:
@@ -4517,8 +4519,8 @@ def strategies_status():
                 "performance_by_strategy": {
                     "ml_enhanced": {
                         "pnl": round(total_pnl, 2),
-                        "win_rate": round(winning_positions / len(active_positions), 3)
-                        if active_positions
+                        "win_rate": round(winning_positions / watchlist_position_count, 3)
+                        if watchlist_position_count > 0
                         else 0,
                         "total_trades": len(trades),
                         "winning_positions": winning_positions,
