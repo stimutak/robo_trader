@@ -70,7 +70,7 @@ class AIAnalyst:
         if self.provider == "openai":
             return "gpt-4-turbo-preview"
         elif self.provider == "anthropic":
-            return "claude-3-5-sonnet-20241022"  # Changed from opus (10x cheaper, same quality)
+            return "claude-3-haiku-20240307"  # Claude 3 Haiku (fastest, cheapest)
         else:
             raise ValueError(f"Unknown provider: {self.provider}")
 
