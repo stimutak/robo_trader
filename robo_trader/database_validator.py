@@ -175,8 +175,7 @@ class DatabaseValidator:
                 f"Quantity {qty_int} must be at least {DatabaseValidator.MIN_QUANTITY}"
             )
 
-        if allow_negative and qty_int == 0:
-            raise ValidationError("Quantity cannot be zero")
+        # Note: qty_int == 0 is allowed for closing positions (DELETE in update_position)
 
         max_check = max_val if max_val else DatabaseValidator.MAX_QUANTITY
         if abs(qty_int) > max_check:

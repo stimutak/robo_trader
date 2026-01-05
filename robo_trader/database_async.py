@@ -327,19 +327,22 @@ class AsyncTradingDatabase:
         try:
             symbol = DatabaseValidator.validate_symbol(symbol)
             quantity = DatabaseValidator.validate_quantity(quantity, allow_negative=True)
-            avg_cost = DatabaseValidator.validate_price(avg_cost, field_name="avg_cost")
-            if market_price is not None:
-                market_price = DatabaseValidator.validate_price(
-                    market_price, field_name="market_price"
-                )
+            # Skip price validation when closing position (quantity=0)
+            if quantity != 0:
+                avg_cost = DatabaseValidator.validate_price(avg_cost, field_name="avg_cost")
+                if market_price is not None:
+                    market_price = DatabaseValidator.validate_price(
+                        market_price, field_name="market_price"
+                    )
         except ValidationError as e:
             logger.error(f"Position update validation failed: {e}")
             raise
 
         async with self.get_connection() as conn:
             if quantity == 0:
-                # Close position
+                # Close position - delete from database
                 await conn.execute("DELETE FROM positions WHERE symbol = ?", (symbol,))
+                logger.info(f"Closed position for {symbol}")
             else:
                 # Update or insert position
                 await conn.execute(

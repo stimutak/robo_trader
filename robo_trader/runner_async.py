@@ -1911,7 +1911,7 @@ class AsyncRunner:
                                 latency_ms = 10  # Simulated latency for paper trading
                                 self.production_monitor.record_order(symbol, True, latency_ms)
                                 pnl = (
-                                    fill_price - pos.avg_cost
+                                    float(fill_price) - float(pos.avg_price)
                                 ) * pos.quantity  # Long position PnL
                                 self.production_monitor.record_trade(symbol, pnl, pnl > 0)
 
