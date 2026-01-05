@@ -16,7 +16,9 @@ fi
 # Run BugBot scan
 echo "🔍 Running bug scan..."
 # Use venv if it exists, otherwise use system python3
-if [ -f "venv/bin/python" ]; then
+if [ -f ".venv/bin/python" ]; then
+    .venv/bin/python scripts/bug_detector.py --scan --config production --output bug-report.json
+elif [ -f "venv/bin/python" ]; then
     venv/bin/python scripts/bug_detector.py --scan --config production --output bug-report.json
 else
     python3 scripts/bug_detector.py --scan --config production --output bug-report.json
@@ -30,7 +32,9 @@ if [ -f "bug-report.json" ]; then
     # Extract summary from JSON
     # Use venv python if available
     PYTHON_CMD="python3"
-    if [ -f "venv/bin/python" ]; then
+    if [ -f ".venv/bin/python" ]; then
+        PYTHON_CMD=".venv/bin/python"
+    elif [ -f "venv/bin/python" ]; then
         PYTHON_CMD="venv/bin/python"
     fi
     

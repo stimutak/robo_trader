@@ -986,7 +986,7 @@ HTML_TEMPLATE = """
             
             <!-- Advanced Risk Management -->
             <div class="table-container">
-                <h3 style="color: #ff6b6b;">🛡️ Advanced Risk Management</h3>
+                <h3 style="color: #ffa500;">🛡️ Advanced Risk Management</h3>
                 
                 <!-- Kelly Sizing Section -->
                 <div style="margin-bottom: 20px;">
@@ -1087,98 +1087,90 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- Safety Monitoring Section -->
+            <!-- Safety & System Health (Consolidated) -->
             <div class="table-container" style="margin-top: 20px;">
-                <h3 style="color: #ffa500;">🚨 Safety Monitoring</h3>
-
-                <!-- Circuit Breakers -->
-                <div style="margin-bottom: 20px;">
-                    <h4 style="color: #fff;">Circuit Breakers</h4>
-                    <div class="metrics-grid" id="circuit-breakers">
-                        <div class="metric-item">
-                            <div class="metric-label">API Circuit</div>
-                            <div class="metric-value positive" id="api-circuit">CLOSED</div>
+                <h3 style="color: #ffa500;">🛡️ System Health & Safety</h3>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                    <!-- Left Column: Circuit Breakers + Order Management -->
+                    <div>
+                        <h4 style="color: #888; font-size: 13px; margin-bottom: 10px;">Circuit Breakers</h4>
+                        <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-bottom: 15px;">
+                            <div class="metric-item" style="padding: 8px;">
+                                <div class="metric-label">API</div>
+                                <div class="metric-value positive" id="api-circuit" style="font-size: 14px;">✓ OK</div>
+                            </div>
+                            <div class="metric-item" style="padding: 8px;">
+                                <div class="metric-label">Data</div>
+                                <div class="metric-value positive" id="data-circuit" style="font-size: 14px;">✓ OK</div>
+                            </div>
+                            <div class="metric-item" style="padding: 8px;">
+                                <div class="metric-label">Trading</div>
+                                <div class="metric-value positive" id="trading-circuit" style="font-size: 14px;">✓ OK</div>
+                            </div>
+                            <div class="metric-item" style="padding: 8px;">
+                                <div class="metric-label">Tripped</div>
+                                <div class="metric-value" id="open-breakers" style="font-size: 14px;">0</div>
+                            </div>
                         </div>
-                        <div class="metric-item">
-                            <div class="metric-label">Data Circuit</div>
-                            <div class="metric-value positive" id="data-circuit">CLOSED</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-label">Trading Circuit</div>
-                            <div class="metric-value positive" id="trading-circuit">CLOSED</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-label">Open Breakers</div>
-                            <div class="metric-value" id="open-breakers">0</div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Order Management -->
-                <div style="margin-bottom: 20px;">
-                    <h4 style="color: #fff;">Order Management</h4>
-                    <div class="metrics-grid" id="order-management">
-                        <div class="metric-item">
-                            <div class="metric-label">Active Orders</div>
-                            <div class="metric-value" id="active-orders">0</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-label">Fill Rate</div>
-                            <div class="metric-value positive" id="fill-rate">0%</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-label">Failed Orders</div>
-                            <div class="metric-value" id="failed-orders">0</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-label">Retry Count</div>
-                            <div class="metric-value" id="retry-count">0</div>
+                        <h4 style="color: #888; font-size: 13px; margin-bottom: 10px;">Order Management</h4>
+                        <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px;">
+                            <div class="metric-item" style="padding: 8px;">
+                                <div class="metric-label">Active</div>
+                                <div class="metric-value" id="active-orders" style="font-size: 14px;">0</div>
+                            </div>
+                            <div class="metric-item" style="padding: 8px;">
+                                <div class="metric-label">Fill Rate</div>
+                                <div class="metric-value positive" id="fill-rate" style="font-size: 14px;">0%</div>
+                            </div>
+                            <div class="metric-item" style="padding: 8px;">
+                                <div class="metric-label">Failed</div>
+                                <div class="metric-value" id="failed-orders" style="font-size: 14px;">0</div>
+                            </div>
+                            <div class="metric-item" style="padding: 8px;">
+                                <div class="metric-label">Retries</div>
+                                <div class="metric-value" id="retry-count" style="font-size: 14px;">0</div>
+                            </div>
                         </div>
                     </div>
-                </div>
-
-                <!-- Data Validation -->
-                <div style="margin-bottom: 20px;">
-                    <h4 style="color: #fff;">Data Validation</h4>
-                    <div class="metrics-grid" id="data-validation">
-                        <div class="metric-item">
-                            <div class="metric-label">Pass Rate</div>
-                            <div class="metric-value positive" id="data-pass-rate">100%</div>
+                    <!-- Right Column: Data Validation + Safety Thresholds -->
+                    <div>
+                        <h4 style="color: #888; font-size: 13px; margin-bottom: 10px;">Data Validation</h4>
+                        <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-bottom: 15px;">
+                            <div class="metric-item" style="padding: 8px;">
+                                <div class="metric-label">Pass Rate</div>
+                                <div class="metric-value positive" id="data-pass-rate" style="font-size: 14px;">100%</div>
+                            </div>
+                            <div class="metric-item" style="padding: 8px;">
+                                <div class="metric-label">Stale</div>
+                                <div class="metric-value" id="stale-data" style="font-size: 14px;">0</div>
+                            </div>
+                            <div class="metric-item" style="padding: 8px;">
+                                <div class="metric-label">Wide Spread</div>
+                                <div class="metric-value" id="wide-spreads" style="font-size: 14px;">0</div>
+                            </div>
+                            <div class="metric-item" style="padding: 8px;">
+                                <div class="metric-label">Anomalies</div>
+                                <div class="metric-value" id="anomalies" style="font-size: 14px;">0</div>
+                            </div>
                         </div>
-                        <div class="metric-item">
-                            <div class="metric-label">Stale Data</div>
-                            <div class="metric-value" id="stale-data">0</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-label">Wide Spreads</div>
-                            <div class="metric-value" id="wide-spreads">0</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-label">Anomalies</div>
-                            <div class="metric-value" id="anomalies">0</div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Safety Thresholds -->
-                <div style="margin-bottom: 20px;">
-                    <h4 style="color: #fff;">Safety Thresholds</h4>
-                    <div class="metrics-grid" id="safety-thresholds">
-                        <div class="metric-item">
-                            <div class="metric-label">Max Positions</div>
-                            <div class="metric-value" id="max-positions">5</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-label">Stop Loss</div>
-                            <div class="metric-value negative" id="stop-loss">2.0%</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-label">Take Profit</div>
-                            <div class="metric-value positive" id="take-profit">3.0%</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-label">Max Daily Trades</div>
-                            <div class="metric-value" id="max-daily">100</div>
+                        <h4 style="color: #888; font-size: 13px; margin-bottom: 10px;">Safety Limits</h4>
+                        <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px;">
+                            <div class="metric-item" style="padding: 8px;">
+                                <div class="metric-label">Max Pos</div>
+                                <div class="metric-value" id="max-positions" style="font-size: 14px;">5</div>
+                            </div>
+                            <div class="metric-item" style="padding: 8px;">
+                                <div class="metric-label">Stop Loss</div>
+                                <div class="metric-value negative" id="stop-loss" style="font-size: 14px;">2.0%</div>
+                            </div>
+                            <div class="metric-item" style="padding: 8px;">
+                                <div class="metric-label">Take Profit</div>
+                                <div class="metric-value positive" id="take-profit" style="font-size: 14px;">3.0%</div>
+                            </div>
+                            <div class="metric-item" style="padding: 8px;">
+                                <div class="metric-label">Daily Limit</div>
+                                <div class="metric-value" id="max-daily" style="font-size: 14px;">100</div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -1542,6 +1534,21 @@ HTML_TEMPLATE = """
         </div>
         
         <div id="logs-tab" class="tab-content" style="display: none;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                <h3 style="color: #ffa500; margin: 0;">📋 System Logs</h3>
+                <div style="display: flex; gap: 10px; align-items: center;">
+                    <label style="display: flex; align-items: center; gap: 5px; cursor: pointer; color: #888; font-size: 13px;">
+                        <input type="checkbox" id="auto-scroll-toggle" checked style="cursor: pointer;">
+                        Auto-scroll
+                    </label>
+                    <button onclick="scrollLogsToBottom()" style="background: #333; border: 1px solid #555; color: #fff; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">
+                        ↓ Jump to Bottom
+                    </button>
+                    <button onclick="clearLogs()" style="background: #333; border: 1px solid #555; color: #fff; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">
+                        Clear
+                    </button>
+                </div>
+            </div>
             <div class="log-container" id="log-container">
                 <div class="log-entry">
                     <span class="log-time">00:00:00</span>
@@ -1922,8 +1929,9 @@ HTML_TEMPLATE = """
                 // Update loaded count
                 loadedLogCount = deduplicatedLogs.length;
                 
-                // ONLY auto-scroll if user was already at bottom - NEVER disrupt manual positioning
-                if (isAtBottom) {
+                // Auto-scroll if toggle is checked OR user was already at bottom
+                const autoScrollEnabled = document.getElementById('auto-scroll-toggle')?.checked;
+                if (autoScrollEnabled || isAtBottom) {
                     container.scrollTop = container.scrollHeight;
                 }
                 
@@ -2465,7 +2473,27 @@ HTML_TEMPLATE = """
             const time = new Date().toLocaleTimeString();
             entry.innerHTML = `<span class="log-time">${time}</span><span>${message}</span>`;
             container.appendChild(entry);
-            // Disabled auto-scroll to allow manual reading
+            // Auto-scroll if enabled
+            const autoScrollEnabled = document.getElementById('auto-scroll-toggle')?.checked;
+            if (autoScrollEnabled) {
+                container.scrollTop = container.scrollHeight;
+            }
+        }
+
+        function scrollLogsToBottom() {
+            const container = document.getElementById('log-container');
+            if (container) {
+                container.scrollTop = container.scrollHeight;
+            }
+        }
+
+        function clearLogs() {
+            const container = document.getElementById('log-container');
+            if (container) {
+                container.innerHTML = '<div class="log-entry"><span class="log-time">' +
+                    new Date().toLocaleTimeString() + '</span><span>Logs cleared</span></div>';
+                loadedLogCount = 0;
+            }
         }
         
         function formatCurrency(value) {
@@ -3773,6 +3801,7 @@ def get_watchlist():
         "SOFI",
         "CORZ",
         "WULF",
+        "IMRX",
     ]
 
     watchlist_data = []
@@ -4433,9 +4462,16 @@ def strategies_status():
             except (FileNotFoundError, json.JSONDecodeError, KeyError):
                 pass
 
-        # Calculate real PnL by strategy (simplified - assuming all trades are ML enhanced)
-        total_pnl = sum(t.get("pnl", 0) for t in trades if t.get("pnl") is not None)
-        winning_trades = [t for t in trades if t.get("pnl", 0) > 0]
+        # Calculate real PnL from watchlist cache (has live prices)
+        total_pnl = 0
+        winning_positions = 0
+        if hasattr(app, "_watchlist_cache") and app._watchlist_cache:
+            for item in app._watchlist_cache:
+                if item.get("has_position") and item.get("quantity", 0) > 0:
+                    pnl = item.get("pnl", 0)
+                    total_pnl += pnl
+                    if pnl > 0:
+                        winning_positions += 1
 
         # Calculate slippage from trades
         slippages = []
@@ -4453,7 +4489,7 @@ def strategies_status():
                         "regime": ml_regime,
                         "confidence": round(ml_confidence, 3),
                         "positions": len(active_positions),
-                        "symbols_tracked": 19,  # From runner config
+                        "symbols_tracked": len(active_positions),  # Actual tracked symbols
                     },
                     "microstructure": {
                         "enabled": False,  # S4 complete but not actively running
@@ -4466,7 +4502,8 @@ def strategies_status():
                         "enabled": True,
                         "allocation_method": "Equal Weight",  # Current implementation
                         "positions_count": len(active_positions),
-                        "max_positions": 20,
+                        "strategies_count": 4,  # ML Enhanced, Mean Reversion, Momentum, Pairs
+                        "max_positions": int(os.getenv("RISK_MAX_OPEN_POSITIONS", 30)),
                         "rebalance_due": False,
                     },
                     "smart_execution": {
@@ -4480,9 +4517,11 @@ def strategies_status():
                 "performance_by_strategy": {
                     "ml_enhanced": {
                         "pnl": round(total_pnl, 2),
-                        "win_rate": round(len(winning_trades) / len(trades), 3) if trades else 0,
+                        "win_rate": round(winning_positions / len(active_positions), 3)
+                        if active_positions
+                        else 0,
                         "total_trades": len(trades),
-                        "winning_trades": len(winning_trades),
+                        "winning_positions": winning_positions,
                     },
                     "microstructure": {"pnl": 0.0, "win_rate": 0.0},  # Not active
                     "smart_execution": {
@@ -4504,7 +4543,11 @@ def strategies_status():
                 "active_strategies": {
                     "ml_enhanced": {"enabled": True, "error": str(e)},
                     "microstructure": {"enabled": False},
-                    "portfolio_manager": {"enabled": True},
+                    "portfolio_manager": {
+                        "enabled": True,
+                        "allocation_method": "Equal Weight",
+                        "strategies_count": 4,
+                    },
                     "smart_execution": {"enabled": True},
                 },
                 "performance_by_strategy": {},

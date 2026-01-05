@@ -626,6 +626,7 @@ class AsyncRunner:
             max_leverage=self.cfg.risk.max_leverage,
             max_order_notional=self.max_order_notional or self.cfg.risk.max_order_notional,
             max_daily_notional=self.max_daily_notional or self.cfg.risk.max_daily_notional,
+            max_open_positions=self.cfg.risk.max_open_positions,
         )
 
         # Initialize advanced risk manager with Kelly sizing and kill switches
