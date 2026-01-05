@@ -110,13 +110,29 @@ def is_gateway_running() -> bool:
 
 
 def is_api_port_listening(port: int = PAPER_PORT) -> bool:
-    """Check if the API port is accepting connections."""
+    """Check if the API port is accepting connections using lsof (no zombies)."""
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(2)
-        result = sock.connect_ex(("127.0.0.1", port))
-        sock.close()
-        return result == 0
+        if PLATFORM == "Darwin":
+            # Use lsof to check for LISTEN state - does NOT create zombie connections
+            result = subprocess.run(
+                ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return result.returncode == 0 and len(result.stdout.strip()) > 0
+        elif PLATFORM == "Windows":
+            result = subprocess.run(["netstat", "-ano"], capture_output=True, text=True)
+            return f":{port}" in result.stdout and "LISTENING" in result.stdout
+        else:
+            # Fallback for other platforms - use lsof
+            result = subprocess.run(
+                ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return result.returncode == 0 and len(result.stdout.strip()) > 0
     except Exception:
         return False
 

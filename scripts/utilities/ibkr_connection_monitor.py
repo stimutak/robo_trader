@@ -83,16 +83,17 @@ class IBKRConnectionMonitor:
         ib = IB()
 
         try:
-            # First check socket connectivity
-            import socket
+            # First check if port is listening using lsof (no zombie creation)
+            import subprocess
 
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            socket_result = sock.connect_ex(("127.0.0.1", self.port))
-            sock.close()
-
-            if socket_result != 0:
-                return False, f"Socket connection failed to port {self.port}"
+            result = subprocess.run(
+                ["lsof", "-nP", f"-iTCP:{self.port}", "-sTCP:LISTEN"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                return False, f"Port {self.port} not listening"
 
             # Try API connection with timeout
             import random

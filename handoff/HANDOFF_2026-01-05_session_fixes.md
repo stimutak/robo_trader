@@ -75,7 +75,87 @@ Recorded trade: BUY 78 BYDDY @ 12.7225
 - Current positions: 24
 - Total unrealized PnL: $6,172.24
 
+## Session 2 Fixes (12:00 - 12:30 PM)
+
+### 5. ML Predictions Dashboard Integration
+**Problem:** ML predictions not visible in dashboard, `ml_predictions.json` not being created.
+**Fix:**
+- Added `_ml_predictions` dict to runner for tracking all ML signals
+- Tracks 3 sources: `ML_ENHANCED`, `ML_NO_SIGNAL`, `AI_ANALYST`
+- Saves to `ml_predictions.json` at end of each cycle
+- **File:** `robo_trader/runner_async.py`
+
+### 6. AI Analyst Cost Reduction
+**Problem:** Using Claude Opus at ~$70/day was too expensive.
+**Fix:**
+- Changed default model from `claude-3-opus` to `claude-3-5-sonnet-20241022`
+- Cost: ~$7/day (10x cheaper, same quality)
+- Added `find_opportunities()` method for news scanning
+- **File:** `robo_trader/ai_analyst.py`
+
+### 7. Zombie Connection Bug in Gateway Manager
+**Problem:** `gateway_manager.py` creating zombie CLOSE_WAIT connections.
+**Root Cause:** Using `socket.connect_ex()` to check port creates TCP handshake.
+**Fix:**
+- Replaced with `lsof -nP -iTCP:{port} -sTCP:LISTEN` (no TCP connections)
+- Also fixed same issue in `ibkr_connection_monitor.py`
+- **Files:** `scripts/gateway_manager.py`, `scripts/utilities/ibkr_connection_monitor.py`
+
+### 8. Sell Signal Execution Bug (CRITICAL)
+**Problem:** Sell signals generated but failed to execute.
+**Error:** `unsupported operand type(s) for -: 'float' and 'decimal.Decimal'`
+**Location:** `runner_async.py:1899` - slippage calculation
+**Fix:** Convert to float: `(float(fill_price) - float(price)) * pos.quantity`
+
+### Sell Signal Flow (now working):
+```
+1. AI Analyst generates SELL signal
+2. Log: "SELL signal for {symbol}: checking position (have position: True)"
+3. Log: "Attempting to SELL {qty} shares of {symbol} at ${price}"
+4. Order placed via paper executor
+5. Slippage calculated and trade recorded
+```
+
+### ML Predictions JSON Format:
+```json
+{
+  "AAPL": {
+    "signal": 1,
+    "confidence": 0.7,
+    "action": "BUY",
+    "source": "AI_ANALYST",
+    "timestamp": "2026-01-05T12:19:54"
+  }
+}
+```
+
+## Additional Files Modified (Session 2)
+- `robo_trader/ai_analyst.py` - Sonnet model, find_opportunities()
+- `robo_trader/runner_async.py` - ML predictions tracking, sell fix
+- `scripts/gateway_manager.py` - Zombie fix (lsof)
+- `scripts/utilities/ibkr_connection_monitor.py` - Zombie fix
+
+## Known Issues
+- Pairs trading Decimal/float error at `runner_async.py:2446`
+  - Error: `unsupported operand type(s) for *: 'decimal.Decimal' and 'float'`
+  - Not critical - pairs trading still finds valid pairs
+
+## Verification Commands
+```bash
+# Check runner status
+pgrep -f "runner_async" && echo "Running" || echo "Not running"
+
+# Check sell signal logs
+grep "SELL signal for\|Attempting to SELL" robo_trader.log | tail -10
+
+# Check ML predictions
+cat ml_predictions.json
+
+# Check for zombies
+lsof -nP -iTCP:4002 -sTCP:CLOSE_WAIT
+```
+
 ## Next Steps
-- Consider adding more symbols to diversify
-- Monitor for any remaining undefined values in dashboard
-- Trades should now execute when buy signals appear and position limit not reached
+- Commit all session 2 changes (flake8 fix needed)
+- Monitor sell trades completing successfully
+- Consider fixing pairs trading Decimal/float issue

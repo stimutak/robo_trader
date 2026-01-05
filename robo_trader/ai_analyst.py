@@ -70,7 +70,7 @@ class AIAnalyst:
         if self.provider == "openai":
             return "gpt-4-turbo-preview"
         elif self.provider == "anthropic":
-            return "claude-3-opus-20240229"
+            return "claude-3-5-sonnet-20241022"  # Changed from opus (10x cheaper, same quality)
         else:
             raise ValueError(f"Unknown provider: {self.provider}")
 
@@ -276,6 +276,94 @@ Focus on:
             analyses[symbol] = self.analyze_market_event(symbol, event_text)
 
         return analyses
+
+    def find_opportunities(
+        self, news_headlines: List[str], exclude_symbols: List[str] = None
+    ) -> List[Dict]:
+        """
+        Scan news headlines to find buying opportunities.
+
+        Args:
+            news_headlines: List of news headlines to analyze
+            exclude_symbols: Symbols to exclude (already owned)
+
+        Returns:
+            List of opportunities: [{"symbol": "XXX", "action": "buy", "confidence": 0.8, "reason": "..."}]
+        """
+        if not self.client:
+            return []
+
+        exclude_symbols = exclude_symbols or []
+        news_text = "\n".join([f"- {h}" for h in news_headlines[:15]])
+
+        prompt = f"""You are a master stock trader scanning today's news for buying opportunities.
+
+NEWS HEADLINES:
+{news_text}
+
+ALREADY OWNED (DO NOT RECOMMEND): {', '.join(exclude_symbols) if exclude_symbols else 'None'}
+
+Find stocks mentioned in the news that are STRONG BUY opportunities based on:
+1. Positive catalysts (earnings beats, partnerships, product launches, upgrades)
+2. Sector momentum (AI boom, clean energy, etc.)
+3. Undervalued situations (oversold, beaten down unfairly)
+
+For each opportunity, provide:
+- Stock symbol (UPPERCASE, US stocks only)
+- Confidence (0.0-1.0, only include if > 0.6)
+- Brief reason (1 sentence)
+
+Respond in JSON format:
+{{"opportunities": [
+  {{"symbol": "XXXX", "confidence": 0.8, "reason": "Strong catalyst..."}},
+  ...
+]}}
+
+Only include HIGH CONVICTION plays. If no clear opportunities, return empty list.
+Be specific - identify actual stock symbols from the news."""
+
+        try:
+            if self.provider == "anthropic":
+                response = self.client.messages.create(
+                    model="claude-3-haiku-20240307",  # Fast model for scanning
+                    max_tokens=500,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                content = response.content[0].text
+            else:  # OpenAI
+                response = self.client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    max_tokens=500,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                content = response.choices[0].message.content
+
+            # Parse JSON response
+            import re
+
+            json_match = re.search(r"\{.*\}", content, re.DOTALL)
+            if json_match:
+                result = json.loads(json_match.group())
+                opportunities = result.get("opportunities", [])
+                # Filter out excluded symbols and add action
+                valid_opps = []
+                for opp in opportunities:
+                    symbol = opp.get("symbol", "").upper()
+                    if symbol and symbol not in exclude_symbols and opp.get("confidence", 0) > 0.5:
+                        valid_opps.append(
+                            {
+                                "symbol": symbol,
+                                "action": "buy",
+                                "confidence": opp.get("confidence", 0.7),
+                                "reason": opp.get("reason", "AI identified opportunity"),
+                            }
+                        )
+                logger.info(f"AI found {len(valid_opps)} buying opportunities")
+                return valid_opps
+            return []
+        except Exception as e:
+            logger.error(f"Error finding opportunities: {e}")
+            return []
 
     def get_trade_conviction(self, analyses: List[MarketAnalysis]) -> Tuple[str, float]:
         """

@@ -186,6 +186,7 @@ class AsyncRunner:
         self.stop_loss_percent = 0.02  # Default 2% stop-loss
         self.ml_enhanced_strategy = None
         self.active_strategy_name: Optional[str] = None
+        self._ml_predictions: Dict[str, Dict] = {}  # Track ML predictions for dashboard
 
         # Circuit breaker for order execution protection
         self.circuit_breaker = CircuitBreaker(
@@ -1282,13 +1283,31 @@ class AsyncRunner:
                     position_size = signal_obj.features.get("position_size", 0.02)
                     stop_loss = signal_obj.features.get("stop_loss", 0.02)
                     take_profit = signal_obj.features.get("take_profit", 0.05)
+
+                    # Track prediction for dashboard
+                    self._ml_predictions[symbol] = {
+                        "signal": signal_value,
+                        "confidence": confidence,
+                        "action": signal_obj.action,
+                        "source": "ML_ENHANCED",
+                        "timestamp": datetime.now().isoformat(),
+                    }
                 else:
-                    # ML returned no signal - use AI analyst for news-driven trading
+                    # ML returned no signal - track as HOLD and use AI analyst fallback
                     signal_value = 0
                     confidence = 0.5
                     position_size = 0.02
                     stop_loss = 0.02
                     take_profit = 0.05
+
+                    # Track ML HOLD for dashboard
+                    self._ml_predictions[symbol] = {
+                        "signal": 0,
+                        "confidence": 0.5,
+                        "action": "HOLD",
+                        "source": "ML_NO_SIGNAL",
+                        "timestamp": datetime.now().isoformat(),
+                    }
 
                     # Check if this symbol is an AI-identified opportunity (from news scan)
                     ai_opps = getattr(self, "_ai_opportunities", {})
@@ -1368,6 +1387,14 @@ class AsyncRunner:
                                     logger.info(
                                         f"AI BUY signal for {symbol}: {analysis.reasoning[:80]}"
                                     )
+                                    # Update prediction with AI signal
+                                    self._ml_predictions[symbol] = {
+                                        "signal": 1,
+                                        "confidence": confidence,
+                                        "action": "BUY",
+                                        "source": "AI_ANALYST",
+                                        "timestamp": datetime.now().isoformat(),
+                                    }
                                 elif (
                                     analysis.suggested_action == "sell"
                                     and analysis.confidence > 0.5
@@ -1377,6 +1404,14 @@ class AsyncRunner:
                                     logger.info(
                                         f"AI SELL signal for {symbol}: {analysis.reasoning[:80]}"
                                     )
+                                    # Update prediction with AI signal
+                                    self._ml_predictions[symbol] = {
+                                        "signal": -1,
+                                        "confidence": confidence,
+                                        "action": "SELL",
+                                        "source": "AI_ANALYST",
+                                        "timestamp": datetime.now().isoformat(),
+                                    }
                                 else:
                                     logger.debug(
                                         f"AI HOLD for {symbol}: {analysis.suggested_action} conf={analysis.confidence:.2f}"
@@ -1811,12 +1846,19 @@ class AsyncRunner:
 
         elif signal_value == -1:  # Sell signal
             enable_short_selling = self.cfg.execution.enable_short_selling
+            logger.info(
+                f"SELL signal for {symbol}: checking position (have position: {symbol in self.positions})"
+            )
 
             if symbol in self.positions:
                 # Close long position or cover short
                 pos = self.positions[symbol]
 
                 if pos.quantity > 0:  # Closing long position
+                    logger.info(
+                        f"Attempting to SELL {pos.quantity} shares of {symbol} at ${price_float:.2f}"
+                    )
+
                     # Check kill switch before order execution
                     if self.advanced_risk and hasattr(self.advanced_risk, "kill_switch"):
                         if self.advanced_risk.kill_switch.triggered:
@@ -1854,7 +1896,9 @@ class AsyncRunner:
                                 pos.quantity,
                                 fill_price,
                                 slippage=(
-                                    (fill_price - price) * pos.quantity if res.fill_price else 0
+                                    (float(fill_price) - float(price)) * pos.quantity
+                                    if res.fill_price
+                                    else 0
                                 ),
                             )
                             await self.db.update_position(symbol, 0, 0, 0)  # Close position
@@ -2106,6 +2150,21 @@ class AsyncRunner:
             realized_pnl=self.portfolio.realized_pnl,
             unrealized_pnl=unrealized,
         )
+
+        # Save ML predictions to file for dashboard
+        if self._ml_predictions:
+            try:
+                import json
+                from pathlib import Path
+
+                predictions_file = Path("ml_predictions.json")
+                with open(predictions_file, "w") as f:
+                    json.dump(self._ml_predictions, f, indent=2)
+                logger.debug(
+                    f"Saved {len(self._ml_predictions)} ML predictions to {predictions_file}"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to save ML predictions: {e}")
 
         logger.info(
             f"Trading cycle complete. Equity: ${equity:,.2f}, "
