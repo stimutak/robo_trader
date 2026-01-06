@@ -172,17 +172,29 @@ HTML_TEMPLATE = """
             display: flex;
             justify-content: space-between;
             align-items: center;
-            padding: 20px 0;
-            border-bottom: 1px solid #2a2a2a;
-            margin-bottom: 30px;
+            padding: 8px 0;
+            border-bottom: 1px solid #21262d;
+            margin-bottom: 10px;
         }
-        
+
         .logo {
-            font-size: 24px;
-            font-weight: 600;
+            font-size: 18px;
+            font-weight: 700;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
+        }
+
+        .header-center {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 10px;
         }
         
         /* Regime Detection Colors */
@@ -222,24 +234,26 @@ HTML_TEMPLATE = """
         .status-indicator {
             display: flex;
             align-items: center;
-            gap: 10px;
-            padding: 8px 16px;
-            background: #1a1a1a;
-            border-radius: 20px;
+            gap: 6px;
+            padding: 4px 10px;
+            background: #161b22;
+            border-radius: 12px;
+            font-size: 11px;
+            border: 1px solid #21262d;
         }
-        
+
         .status-dot {
-            width: 8px;
-            height: 8px;
+            width: 6px;
+            height: 6px;
             border-radius: 50%;
-            background: #ff4444;
+            background: #f87171;
         }
-        
+
         .status-dot.active {
-            background: #44ff44;
+            background: #4ade80;
             animation: pulse 2s infinite;
         }
-        
+
         @keyframes pulse {
             0% { opacity: 1; }
             50% { opacity: 0.5; }
@@ -333,34 +347,44 @@ HTML_TEMPLATE = """
         
         .button-group {
             display: flex;
-            gap: 10px;
-            margin-bottom: 20px;
+            gap: 6px;
         }
-        
+
         button {
-            padding: 10px 20px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 5px 12px;
+            background: linear-gradient(135deg, #238636 0%, #2ea043 100%);
             color: white;
             border: none;
-            border-radius: 8px;
-            font-size: 14px;
+            border-radius: 6px;
+            font-size: 11px;
             font-weight: 500;
             cursor: pointer;
-            transition: all 0.3s ease;
+            transition: all 0.2s ease;
         }
-        
+
         button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.4);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(46, 160, 67, 0.3);
         }
-        
+
         button:disabled {
             opacity: 0.5;
             cursor: not-allowed;
+            transform: none;
         }
-        
+
         button.secondary {
-            background: #2a2a2a;
+            background: #21262d;
+            border: 1px solid #30363d;
+        }
+
+        button.secondary:hover {
+            background: #30363d;
+            box-shadow: none;
+        }
+
+        button.danger {
+            background: linear-gradient(135deg, #da3633 0%, #f85149 100%);
         }
         
         .chart-container {
@@ -374,22 +398,32 @@ HTML_TEMPLATE = """
         
         .tabs {
             display: flex;
-            gap: 20px;
-            border-bottom: 1px solid #2a2a2a;
-            margin-bottom: 20px;
+            gap: 4px;
+            background: #0d1117;
+            padding: 4px;
+            border-radius: 8px;
+            margin-bottom: 12px;
+            border: 1px solid #21262d;
         }
-        
+
         .tab {
-            padding: 10px 0;
-            color: #888;
+            padding: 6px 12px;
+            color: #8b949e;
             cursor: pointer;
-            border-bottom: 2px solid transparent;
-            transition: all 0.3s ease;
+            border-radius: 6px;
+            transition: all 0.2s ease;
+            font-size: 12px;
+            font-weight: 500;
         }
-        
+
+        .tab:hover {
+            color: #c9d1d9;
+            background: #161b22;
+        }
+
         .tab.active {
             color: #fff;
-            border-bottom-color: #667eea;
+            background: linear-gradient(135deg, #238636 0%, #2ea043 100%);
         }
         
         .log-container {
@@ -539,995 +573,677 @@ HTML_TEMPLATE = """
             transition: width 0.3s ease;
         }
     </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
     <div class="container">
         <header>
             <div class="logo">RoboTrader</div>
-            <div class="status-indicator">
-                <div class="status-dot" id="status-dot"></div>
-                <span id="status-text">Disconnected</span>
+            <div class="header-center">
+                <div class="status-indicator">
+                    <div class="status-dot" id="status-dot"></div>
+                    <span id="status-text">Disconnected</span>
+                </div>
+                <div class="status-indicator" id="market-status-badge" style="border-color: #30363d;">
+                    <span style="color: #8b949e;">Market:</span>
+                    <span id="market-status-text" style="color: #fbbf24;">Closed</span>
+                </div>
+            </div>
+            <div class="header-right">
+                <div class="button-group">
+                    <button onclick="startTrading()" id="start-btn">Start</button>
+                    <button onclick="stopTrading()" id="stop-btn" class="danger">Stop</button>
+                    <button onclick="refreshData()" class="secondary">Refresh</button>
+                </div>
             </div>
         </header>
-        
-        <div class="button-group">
-            <button onclick="startTrading()" id="start-btn">Start Trading</button>
-            <button onclick="stopTrading()" id="stop-btn" class="secondary">Stop Trading</button>
-            <button onclick="refreshData()" class="secondary">Refresh Data</button>
-        </div>
-        
+
         <div class="tabs">
             <div class="tab active" onclick="switchTab('overview', this)">Overview</div>
             <div class="tab" onclick="switchTab('watchlist', this)">Watchlist</div>
             <div class="tab" onclick="switchTab('positions', this)">Positions</div>
             <div class="tab" onclick="switchTab('strategies', this)">Strategies</div>
-            <div class="tab" onclick="switchTab('trades', this)">Trade History</div>
-            <div class="tab" onclick="switchTab('ml', this)">ML Models</div>
+            <div class="tab" onclick="switchTab('trades', this)">Trades</div>
+            <div class="tab" onclick="switchTab('ml', this)">ML</div>
             <div class="tab" onclick="switchTab('performance', this)">Performance</div>
             <div class="tab" onclick="switchTab('logs', this)">Logs</div>
         </div>
         
         <div id="overview-tab" class="tab-content">
-            <!-- Portfolio Summary Section -->
-            <div class="portfolio-summary" style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); border-radius: 12px; padding: 25px; margin-bottom: 30px; border: 1px solid #2a2a3e;">
-                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 30px;">
-                    <div>
-                        <div style="font-size: 14px; color: #888; margin-bottom: 8px;">Portfolio Value</div>
-                        <div style="font-size: 32px; font-weight: 600; color: #fff;" id="portfolio-value">$100,000.00</div>
-                        <div style="font-size: 14px; margin-top: 5px;">
-                            <span id="portfolio-change" style="color: #44ff44;">+$2,847.30 (+2.85%)</span>
-                            <span style="color: #666; margin-left: 10px;">All Time</span>
-                        </div>
-                    </div>
-                    <div>
-                        <div style="font-size: 14px; color: #888; margin-bottom: 8px;">Today's P&L</div>
-                        <div style="font-size: 32px; font-weight: 600;" id="today-pnl-large">$523.45</div>
-                        <div style="font-size: 14px; margin-top: 5px;">
-                            <span id="today-change-pct" style="color: #44ff44;">+0.52%</span>
-                            <span style="color: #666; margin-left: 10px;">vs Yesterday</span>
-                        </div>
-                    </div>
-                    <div>
-                        <div style="font-size: 14px; color: #888; margin-bottom: 8px;">Cash Available</div>
-                        <div style="font-size: 32px; font-weight: 600; color: #fff;" id="cash-available">$94,235.50</div>
-                        <div style="font-size: 14px; color: #666; margin-top: 5px;">94.2% of portfolio</div>
-                    </div>
-                    <div>
-                        <div style="font-size: 14px; color: #888; margin-bottom: 8px;">Active Positions</div>
-                        <div style="font-size: 32px; font-weight: 600; color: #fff;" id="active-positions-large">5</div>
-                        <div style="font-size: 14px; color: #666; margin-top: 5px;" id="positions-value-text">
-                            Monitoring 5 symbols
-                        </div>
-                    </div>
+            <!-- Top Stats Row -->
+            <div style="display: grid; grid-template-columns: repeat(8, 1fr); gap: 8px; margin-bottom: 12px;">
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #60a5fa;">
+                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Portfolio</div>
+                    <div style="font-size: 16px; font-weight: bold;" id="ov-portfolio">$100,000</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #4ade80;">
+                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Today P&L</div>
+                    <div style="font-size: 16px; font-weight: bold;" id="ov-today-pnl">$0</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #fbbf24;">
+                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Total P&L</div>
+                    <div style="font-size: 16px; font-weight: bold;" id="ov-total-pnl">$0</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #a78bfa;">
+                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Cash</div>
+                    <div style="font-size: 16px; font-weight: bold;" id="ov-cash">$0</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #f472b6;">
+                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Positions</div>
+                    <div style="font-size: 16px; font-weight: bold;" id="ov-positions">0</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #34d399;">
+                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Win Rate</div>
+                    <div style="font-size: 16px; font-weight: bold;" id="ov-win-rate">0%</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #fb923c;">
+                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Trades</div>
+                    <div style="font-size: 16px; font-weight: bold;" id="ov-trades">0</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #38bdf8;">
+                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Connection</div>
+                    <div style="font-size: 14px; font-weight: bold;" id="tws-status">...</div>
                 </div>
             </div>
-            
-            <div class="grid">
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">Total P&L</span>
+
+            <!-- Two Column Layout -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px;">
+                <!-- Left: Equity Curve -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 12px; text-transform: uppercase;">Equity Curve</h4>
+                    <div style="height: 140px;">
+                        <canvas id="overview-equity-chart"></canvas>
                     </div>
-                    <div class="card-value" id="total-pnl">$0.00</div>
-                    <div class="card-change" id="pnl-change">0.00%</div>
-                </div>
-                
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">Daily P&L</span>
-                    </div>
-                    <div class="card-value" id="daily-pnl">$0.00</div>
-                    <div class="card-change" id="daily-change">0.00%</div>
-                </div>
-                
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">Open Positions</span>
-                    </div>
-                    <div class="card-value" id="position-count">0</div>
-                    <div class="card-change" id="position-value">$0.00 value</div>
-                </div>
-                
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">Win Rate</span>
-                    </div>
-                    <div class="card-value" id="win-rate">0.0%</div>
-                    <div class="card-change" id="trade-count">0 trades today</div>
                 </div>
 
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">🔌 TWS Connection</span>
+                <!-- Right: Top Positions -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 12px; text-transform: uppercase;">Top Positions by P&L</h4>
+                    <div id="top-positions-list" style="font-size: 11px;">
+                        <div style="color: #666; text-align: center; padding: 20px;">Loading...</div>
                     </div>
-                    <div class="card-value" id="tws-status">Checking...</div>
-                    <div class="card-change" id="tws-detail">Port 7497</div>
                 </div>
             </div>
-            
-            <div class="metric-grid">
-                <div class="metric-item">
-                    <div class="metric-label">Sharpe Ratio</div>
-                    <div class="metric-value" id="sharpe">0.00</div>
+
+            <!-- Bottom Row: Key Metrics + Recent Trades -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                <!-- Left: Key Metrics -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 12px; text-transform: uppercase;">Key Metrics</h4>
+                    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;">
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Sharpe</div>
+                            <div style="font-size: 14px; font-weight: bold;" id="sharpe">0.00</div>
+                        </div>
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Max DD</div>
+                            <div style="font-size: 14px; font-weight: bold; color: #f87171;" id="max-dd">0%</div>
+                        </div>
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Profit Factor</div>
+                            <div style="font-size: 14px; font-weight: bold;" id="profit-factor">0.00</div>
+                        </div>
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Correlation</div>
+                            <div style="font-size: 14px; font-weight: bold;" id="avg-correlation">0.00</div>
+                        </div>
+                    </div>
+                    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 8px;">
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Daily P&L</div>
+                            <div style="font-size: 14px; font-weight: bold;" id="daily-pnl">$0</div>
+                        </div>
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Daily %</div>
+                            <div style="font-size: 14px; font-weight: bold;" id="daily-change">0%</div>
+                        </div>
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Pos Value</div>
+                            <div style="font-size: 14px; font-weight: bold;" id="position-value">$0</div>
+                        </div>
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Pos Count</div>
+                            <div style="font-size: 14px; font-weight: bold;" id="position-count">0</div>
+                        </div>
+                    </div>
                 </div>
-                <div class="metric-item">
-                    <div class="metric-label">Max Drawdown</div>
-                    <div class="metric-value negative" id="max-dd">0.0%</div>
+
+                <!-- Right: Recent Trades -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 12px; text-transform: uppercase;">Recent Trades</h4>
+                    <div id="recent-trades-list" style="font-size: 11px; max-height: 130px; overflow-y: auto;">
+                        <div style="color: #666; text-align: center; padding: 20px;">Loading...</div>
+                    </div>
                 </div>
-                <div class="metric-item">
-                    <div class="metric-label">Profit Factor</div>
-                    <div class="metric-value" id="profit-factor">0.00</div>
-                </div>
-                <div class="metric-item">
-                    <div class="metric-label">Avg Correlation</div>
-                    <div class="metric-value" id="avg-correlation">0.00</div>
-                </div>
+            </div>
+            <!-- Hidden elements for backward compat -->
+            <div style="display: none;">
+                <span id="portfolio-change"></span>
+                <span id="today-change-pct"></span>
+                <span id="positions-value-text"></span>
+                <span id="pnl-change"></span>
+                <span id="tws-detail"></span>
             </div>
         </div>
         
         <div id="ml-tab" class="tab-content" style="display: none;">
-            <!-- Market Regime Detection Section -->
-            <div class="table-container" style="margin-bottom: 30px; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);">
-                <h3 style="color: #00ff00; margin-bottom: 20px;">🌡️ Market Regime Detection</h3>
-                <div style="text-align: center; padding: 20px;">
-                    <div id="regime-indicator" style="font-size: 32px; font-weight: bold; margin: 10px 0;">
-                        <span id="regime-name" class="regime-bull">BULL MARKET</span>
+            <!-- Compact Two-Column Layout -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                <!-- Left: Key Metrics -->
+                <div class="table-container" style="margin: 0; padding: 12px;">
+                    <h3 style="margin-bottom: 10px; font-size: 14px;">ML System Status</h3>
+                    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;">
+                        <div style="text-align: center; padding: 8px; background: #1a1a2e; border-radius: 6px;">
+                            <div style="font-size: 11px; color: #888;">Models</div>
+                            <div style="font-size: 16px; font-weight: bold;" id="models-trained">0</div>
+                        </div>
+                        <div style="text-align: center; padding: 8px; background: #1a1a2e; border-radius: 6px;">
+                            <div style="font-size: 11px; color: #888;">Accuracy</div>
+                            <div style="font-size: 16px; font-weight: bold;" id="model-accuracy">0%</div>
+                        </div>
+                        <div style="text-align: center; padding: 8px; background: #1a1a2e; border-radius: 6px;">
+                            <div style="font-size: 11px; color: #888;">Confidence</div>
+                            <div style="font-size: 16px; font-weight: bold;" id="prediction-confidence">0%</div>
+                        </div>
+                        <div style="text-align: center; padding: 8px; background: #1a1a2e; border-radius: 6px;">
+                            <div style="font-size: 11px; color: #888;">Features</div>
+                            <div style="font-size: 16px; font-weight: bold;" id="feature-count">0</div>
+                        </div>
+                        <div style="text-align: center; padding: 8px; background: #1a1a2e; border-radius: 6px;">
+                            <div style="font-size: 11px; color: #888;">Predictions</div>
+                            <div style="font-size: 16px; font-weight: bold;" id="active-predictions">0</div>
+                        </div>
+                        <div style="text-align: center; padding: 8px; background: #1a1a2e; border-radius: 6px;">
+                            <div style="font-size: 11px; color: #888;">Signals</div>
+                            <div style="font-size: 14px;"><span id="ml-buy-count" style="color: #4ade80;">0</span> / <span id="ml-sell-count" style="color: #ff6b6b;">0</span> / <span id="ml-hold-count" style="color: #888;">0</span></div>
+                        </div>
                     </div>
-                    <div style="font-size: 16px; color: #888;">Confidence: <span id="regime-confidence" style="color: #0ff;">75%</span></div>
-                    <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-top: 20px;">
-                        <div style="text-align: center;">
-                            <div style="color: #666; font-size: 12px;">1min</div>
-                            <div id="regime-1m" class="regime-bull" style="font-weight: bold;">BULL</div>
-                        </div>
-                        <div style="text-align: center;">
-                            <div style="color: #666; font-size: 12px;">5min</div>
-                            <div id="regime-5m" class="regime-bull" style="font-weight: bold;">BULL</div>
-                        </div>
-                        <div style="text-align: center;">
-                            <div style="color: #666; font-size: 12px;">15min</div>
-                            <div id="regime-15m" class="regime-ranging" style="font-weight: bold;">RANGING</div>
-                        </div>
-                        <div style="text-align: center;">
-                            <div style="color: #666; font-size: 12px;">1hour</div>
-                            <div id="regime-1h" class="regime-bull" style="font-weight: bold;">BULL</div>
-                        </div>
-                        <div style="text-align: center;">
-                            <div style="color: #666; font-size: 12px;">Daily</div>
-                            <div id="regime-1d" class="regime-bull" style="font-weight: bold;">BULL</div>
-                        </div>
+                </div>
+                <!-- Right: Feature Importance Chart -->
+                <div class="table-container" style="margin: 0; padding: 12px;">
+                    <h3 style="margin-bottom: 10px; font-size: 14px;">Top Features</h3>
+                    <div style="height: 140px; position: relative;">
+                        <canvas id="feature-chart-canvas"></canvas>
                     </div>
                 </div>
             </div>
-            
-            <div class="grid">
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">Models Trained</span>
-                        <span class="badge ml">ML</span>
-                    </div>
-                    <div class="card-value" id="models-trained">0</div>
-                    <div class="card-change">Last trained: <span id="last-train">Never</span></div>
-                </div>
-                
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">Active Features</span>
-                        <span class="badge ml">ML</span>
-                    </div>
-                    <div class="card-value" id="feature-count">0</div>
-                    <div class="card-change">Feature pipeline status</div>
-                </div>
-                
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">Model Accuracy</span>
-                        <span class="badge ml">ML</span>
-                    </div>
-                    <div class="card-value" id="model-accuracy">0.0%</div>
-                    <div class="card-change">Direction accuracy</div>
-                </div>
-                
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">Prediction Confidence</span>
-                        <span class="badge ml">ML</span>
-                    </div>
-                    <div class="card-value" id="prediction-confidence">0.0%</div>
-                    <div class="card-change">Average confidence</div>
+
+            <!-- ML Predictions Table -->
+            <div class="table-container" style="padding: 12px; margin-bottom: 15px;">
+                <h3 style="margin-bottom: 10px; font-size: 14px;">Current Predictions</h3>
+                <div style="max-height: 200px; overflow-y: auto;">
+                    <table style="font-size: 12px;">
+                        <thead><tr><th>Symbol</th><th>Signal</th><th>Confidence</th><th>Source</th><th>Time</th></tr></thead>
+                        <tbody id="predictions-table">
+                            <tr><td colspan="5" style="text-align: center; color: #666;">Loading...</td></tr>
+                        </tbody>
+                    </table>
                 </div>
             </div>
-            
-            <div class="table-container">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Model Type</th>
-                            <th>Test Score</th>
-                            <th>Features Used</th>
-                            <th>Last Updated</th>
-                            <th>Status</th>
-                        </tr>
-                    </thead>
-                    <tbody id="model-table">
-                        <tr>
-                            <td colspan="5" style="text-align: center; color: #666;">No models trained yet</td>
-                        </tr>
-                    </tbody>
-                </table>
-            </div>
-            
-            <div class="table-container">
-                <h3 style="margin-bottom: 15px; color: #888;">Top Features by Importance</h3>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Feature Name</th>
-                            <th>Importance Score</th>
-                            <th>Category</th>
-                        </tr>
-                    </thead>
-                    <tbody id="feature-table">
-                        <tr>
-                            <td colspan="3" style="text-align: center; color: #666;">No feature data available</td>
-                        </tr>
-                    </tbody>
-                </table>
+
+            <!-- Two-Column: Models & Model Performance -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                <!-- Trained Models -->
+                <div class="table-container" style="margin: 0; padding: 12px;">
+                    <h3 style="margin-bottom: 10px; font-size: 14px;">Trained Models</h3>
+                    <div style="max-height: 150px; overflow-y: auto;">
+                        <table style="font-size: 11px;">
+                            <thead><tr><th>Type</th><th>Score</th><th>Features</th><th>Status</th></tr></thead>
+                            <tbody id="model-table">
+                                <tr><td colspan="4" style="text-align: center; color: #666;">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <!-- Model Accuracy by Type -->
+                <div class="table-container" style="margin: 0; padding: 12px;">
+                    <h3 style="margin-bottom: 10px; font-size: 14px;">Model Accuracy</h3>
+                    <div style="height: 150px; position: relative;">
+                        <canvas id="model-accuracy-chart"></canvas>
+                    </div>
+                </div>
             </div>
         </div>
         
         <div id="performance-tab" class="tab-content" style="display: none;">
-            <!-- Performance Summary Cards -->
-            <div class="summary-cards">
-                <div class="summary-card">
-                    <h3>Total P&L</h3>
-                    <div class="metric-value" id="perf-total-pnl">$0.00</div>
-                    <div class="metric-subtitle">All Time</div>
+            <!-- Compact Two-Column Layout -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                <!-- Left: Key Metrics -->
+                <div class="table-container" style="margin: 0; padding: 12px;">
+                    <h3 style="margin-bottom: 10px; font-size: 14px;">Key Metrics</h3>
+                    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;">
+                        <div style="text-align: center; padding: 8px; background: #1a1a2e; border-radius: 6px;">
+                            <div style="font-size: 11px; color: #888;">Total P&L</div>
+                            <div style="font-size: 16px; font-weight: bold;" id="perf-total-pnl">$0</div>
+                        </div>
+                        <div style="text-align: center; padding: 8px; background: #1a1a2e; border-radius: 6px;">
+                            <div style="font-size: 11px; color: #888;">Return</div>
+                            <div style="font-size: 16px; font-weight: bold;" id="total-return">0%</div>
+                        </div>
+                        <div style="text-align: center; padding: 8px; background: #1a1a2e; border-radius: 6px;">
+                            <div style="font-size: 11px; color: #888;">Win Rate</div>
+                            <div style="font-size: 16px; font-weight: bold;" id="win-rate">0%</div>
+                        </div>
+                        <div style="text-align: center; padding: 8px; background: #1a1a2e; border-radius: 6px;">
+                            <div style="font-size: 11px; color: #888;">Sharpe</div>
+                            <div style="font-size: 16px; font-weight: bold;" id="total-sharpe">0</div>
+                        </div>
+                        <div style="text-align: center; padding: 8px; background: #1a1a2e; border-radius: 6px;">
+                            <div style="font-size: 11px; color: #888;">Max DD</div>
+                            <div style="font-size: 16px; font-weight: bold; color: #ff6b6b;" id="total-drawdown">0%</div>
+                        </div>
+                        <div style="text-align: center; padding: 8px; background: #1a1a2e; border-radius: 6px;">
+                            <div style="font-size: 11px; color: #888;">Trades</div>
+                            <div style="font-size: 16px; font-weight: bold;" id="perf-total-trades">0</div>
+                        </div>
+                    </div>
                 </div>
-                <div class="summary-card">
-                    <h3>Total Return</h3>
-                    <div class="metric-value" id="total-return">0.00%</div>
-                    <div class="metric-subtitle">All Time</div>
+                <!-- Right: Period Breakdown -->
+                <div class="table-container" style="margin: 0; padding: 12px;">
+                    <h3 style="margin-bottom: 10px; font-size: 14px;">Period P&L</h3>
+                    <table style="font-size: 12px;">
+                        <thead><tr><th>Period</th><th>P&L</th><th>Return</th><th>Trades</th></tr></thead>
+                        <tbody>
+                            <tr><td>Today</td><td id="pnl-daily">$0</td><td id="return-daily">0%</td><td id="trades-daily">0</td></tr>
+                            <tr><td>Week</td><td id="pnl-weekly">$0</td><td id="return-weekly">0%</td><td id="trades-weekly">0</td></tr>
+                            <tr><td>Month</td><td id="pnl-monthly">$0</td><td id="return-monthly">0%</td><td id="trades-monthly">0</td></tr>
+                            <tr><td>All</td><td id="pnl-all">$0</td><td id="return-all">0%</td><td id="trades-all">0</td></tr>
+                        </tbody>
+                    </table>
                 </div>
-                <div class="summary-card">
-                    <h3>Sharpe Ratio</h3>
-                    <div class="metric-value" id="total-sharpe">0.00</div>
-                    <div class="metric-subtitle">Risk-Adjusted</div>
-                </div>
-                <div class="summary-card">
-                    <h3>Max Drawdown</h3>
-                    <div class="metric-value negative" id="total-drawdown">0.00%</div>
-                    <div class="metric-subtitle">Peak to Trough</div>
-                </div>
-                <div class="summary-card">
-                    <h3>Win Rate</h3>
-                    <div class="metric-value" id="win-rate">0.00%</div>
-                    <div class="metric-subtitle">Profitable Trades</div>
-                </div>
-                <div class="summary-card">
-                    <h3>Total Trades</h3>
-                    <div class="metric-value" id="perf-total-trades">0</div>
-                    <div class="metric-subtitle">All Time</div>
-                </div>
-            </div>
-
-            <div class="table-container">
-                <h3>Performance Breakdown</h3>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Metric</th>
-                            <th>Daily</th>
-                            <th>Weekly</th>
-                            <th>Monthly</th>
-                            <th>All Time</th>
-                        </tr>
-                    </thead>
-                    <tbody id="performance-table">
-                        <tr>
-                            <td>P&L</td>
-                            <td id="pnl-daily">$0.00</td>
-                            <td id="pnl-weekly">$0.00</td>
-                            <td id="pnl-monthly">$0.00</td>
-                            <td id="pnl-all">$0.00</td>
-                        </tr>
-                        <tr>
-                            <td>Return</td>
-                            <td id="return-daily">0.00%</td>
-                            <td id="return-weekly">0.00%</td>
-                            <td id="return-monthly">0.00%</td>
-                            <td id="return-all">0.00%</td>
-                        </tr>
-                        <tr>
-                            <td>Trades</td>
-                            <td id="trades-daily">0</td>
-                            <td id="trades-weekly">0</td>
-                            <td id="trades-monthly">0</td>
-                            <td id="trades-all">0</td>
-                        </tr>
-                        <tr>
-                            <td>Volatility</td>
-                            <td id="vol-daily">0.00%</td>
-                            <td id="vol-weekly">0.00%</td>
-                            <td id="vol-monthly">0.00%</td>
-                            <td id="vol-all">0.00%</td>
-                        </tr>
-                        <tr>
-                            <td>Sharpe Ratio</td>
-                            <td id="sharpe-daily">0.00</td>
-                            <td id="sharpe-weekly">0.00</td>
-                            <td id="sharpe-monthly">0.00</td>
-                            <td id="sharpe-all">0.00</td>
-                        </tr>
-                        <tr>
-                            <td>Max Drawdown</td>
-                            <td id="dd-daily">0.00%</td>
-                            <td id="dd-weekly">0.00%</td>
-                            <td id="dd-monthly">0.00%</td>
-                            <td id="dd-all">0.00%</td>
-                        </tr>
-                    </tbody>
-                </table>
             </div>
 
             <!-- Equity Curve Chart -->
-            <div class="table-container">
-                <h3>Equity Curve</h3>
-                <div id="equity-chart" style="height: 200px; background: #0a0a0a; border-radius: 8px; padding: 20px; display: flex; align-items: center; justify-content: center; color: #666;">
-                    <div style="text-align: center;">
-                        <div style="font-size: 14px; margin-bottom: 10px;">📈 Equity Curve Visualization</div>
-                        <div style="font-size: 12px;">Chart will be implemented when historical data is available</div>
-                    </div>
+            <div class="table-container" style="padding: 12px; margin-bottom: 15px;">
+                <h3 style="margin-bottom: 10px; font-size: 14px;">Equity Curve (Realized P&L)</h3>
+                <div style="height: 220px; position: relative;">
+                    <canvas id="equity-chart-canvas"></canvas>
                 </div>
             </div>
 
-            <!-- Trade Statistics -->
-            <div class="table-container">
-                <h3>Trade Statistics</h3>
-                <div class="metric-grid" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px;">
-                    <div class="metric-item">
-                        <div class="metric-label">Average Win</div>
-                        <div class="metric-value positive" id="avg-win">$0.00</div>
+            <!-- Compact Trade Statistics -->
+            <div class="table-container" style="padding: 12px;">
+                <h3 style="margin-bottom: 10px; font-size: 14px;">Trade Statistics</h3>
+                <div style="display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px;">
+                    <div style="text-align: center; padding: 6px; background: #1a1a2e; border-radius: 4px;">
+                        <div style="font-size: 10px; color: #888;">Avg Win</div>
+                        <div style="font-size: 13px; color: #4ade80;" id="avg-win">$0</div>
                     </div>
-                    <div class="metric-item">
-                        <div class="metric-label">Average Loss</div>
-                        <div class="metric-value negative" id="avg-loss">$0.00</div>
+                    <div style="text-align: center; padding: 6px; background: #1a1a2e; border-radius: 4px;">
+                        <div style="font-size: 10px; color: #888;">Avg Loss</div>
+                        <div style="font-size: 13px; color: #ff6b6b;" id="avg-loss">$0</div>
                     </div>
-                    <div class="metric-item">
-                        <div class="metric-label">Profit Factor</div>
-                        <div class="metric-value" id="profit-factor">0.00</div>
+                    <div style="text-align: center; padding: 6px; background: #1a1a2e; border-radius: 4px;">
+                        <div style="font-size: 10px; color: #888;">Profit Factor</div>
+                        <div style="font-size: 13px;" id="profit-factor">0</div>
                     </div>
-                    <div class="metric-item">
-                        <div class="metric-label">Expectancy</div>
-                        <div class="metric-value" id="expectancy">$0.00</div>
+                    <div style="text-align: center; padding: 6px; background: #1a1a2e; border-radius: 4px;">
+                        <div style="font-size: 10px; color: #888;">Expectancy</div>
+                        <div style="font-size: 13px;" id="expectancy">$0</div>
                     </div>
-                    <div class="metric-item">
-                        <div class="metric-label">Largest Win</div>
-                        <div class="metric-value positive" id="largest-win">$0.00</div>
+                    <div style="text-align: center; padding: 6px; background: #1a1a2e; border-radius: 4px;">
+                        <div style="font-size: 10px; color: #888;">Best Trade</div>
+                        <div style="font-size: 13px; color: #4ade80;" id="largest-win">$0</div>
                     </div>
-                    <div class="metric-item">
-                        <div class="metric-label">Largest Loss</div>
-                        <div class="metric-value negative" id="largest-loss">$0.00</div>
-                    </div>
-                    <div class="metric-item">
-                        <div class="metric-label">Avg Hold Time</div>
-                        <div class="metric-value" id="avg-hold-time">0h 0m</div>
-                    </div>
-                    <div class="metric-item">
-                        <div class="metric-label">Win Streak</div>
-                        <div class="metric-value" id="win-streak">0</div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Risk Metrics -->
-            <div class="table-container">
-                <h3>Risk Metrics</h3>
-                <div class="metric-grid" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px;">
-                    <div class="metric-item">
-                        <div class="metric-label">Value at Risk (95%)</div>
-                        <div class="metric-value" id="var-95">$0.00</div>
-                    </div>
-                    <div class="metric-item">
-                        <div class="metric-label">Beta vs SPY</div>
-                        <div class="metric-value" id="beta">0.00</div>
-                    </div>
-                    <div class="metric-item">
-                        <div class="metric-label">Sortino Ratio</div>
-                        <div class="metric-value" id="sortino">0.00</div>
-                    </div>
-                    <div class="metric-item">
-                        <div class="metric-label">Calmar Ratio</div>
-                        <div class="metric-value" id="calmar">0.00</div>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- Execution Analytics -->
-            <div class="table-container">
-                <h3 style="color: #00ff00;">⚡ Execution Analytics</h3>
-                <div class="metric-grid" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px;">
-                    <div class="metric-item">
-                        <div class="metric-label">Avg Slippage</div>
-                        <div class="metric-value" id="exec-slippage">0.0 bps</div>
-                    </div>
-                    <div class="metric-item">
-                        <div class="metric-label">Market Impact</div>
-                        <div class="metric-value" id="exec-impact">0.0 bps</div>
-                    </div>
-                    <div class="metric-item">
-                        <div class="metric-label">Fill Rate</div>
-                        <div class="metric-value" id="exec-fill-rate">100%</div>
-                    </div>
-                    <div class="metric-item">
-                        <div class="metric-label">Avg Fill Time</div>
-                        <div class="metric-value" id="exec-fill-time">0.0s</div>
-                    </div>
-                </div>
-                <div style="margin-top: 15px;">
-                    <h4 style="color: #888; font-size: 14px; margin-bottom: 10px;">Algorithm Performance</h4>
-                    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;">
-                        <div style="background: #1a1a2e; padding: 10px; border-radius: 4px;">
-                            <div style="color: #4CAF50;">TWAP</div>
-                            <div style="font-size: 12px; color: #666;">Slippage: <span id="twap-perf-slip">0.0</span> bps</div>
-                            <div style="font-size: 12px; color: #666;">Success: <span id="twap-perf-success">100%</span></div>
-                        </div>
-                        <div style="background: #1a1a2e; padding: 10px; border-radius: 4px;">
-                            <div style="color: #2196F3;">VWAP</div>
-                            <div style="font-size: 12px; color: #666;">Slippage: <span id="vwap-perf-slip">0.0</span> bps</div>
-                            <div style="font-size: 12px; color: #666;">Success: <span id="vwap-perf-success">100%</span></div>
-                        </div>
-                        <div style="background: #1a1a2e; padding: 10px; border-radius: 4px;">
-                            <div style="color: #FF9800;">Iceberg</div>
-                            <div style="font-size: 12px; color: #666;">Detection: <span id="iceberg-perf-detect">0%</span></div>
-                            <div style="font-size: 12px; color: #666;">Success: <span id="iceberg-perf-success">100%</span></div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- Advanced Risk Management -->
-            <div class="table-container">
-                <h3 style="color: #ffa500;">🛡️ Advanced Risk Management</h3>
-                
-                <!-- Kelly Sizing Section -->
-                <div style="margin-bottom: 20px;">
-                    <h4 style="color: #888; font-size: 14px; margin-bottom: 10px;">Kelly Criterion Position Sizing</h4>
-                    <div class="metric-grid" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px;">
-                        <div class="metric-item">
-                            <div class="metric-label">Portfolio Kelly</div>
-                            <div class="metric-value" id="portfolio-kelly">5.8%</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-label">Avg Win Rate</div>
-                            <div class="metric-value positive" id="avg-win-rate">55%</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-label">Portfolio Edge</div>
-                            <div class="metric-value positive" id="portfolio-edge">0.025</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-label">Using Half-Kelly</div>
-                            <div class="metric-value" style="color: #4CAF50;" id="kelly-mode">✓ Yes</div>
-                        </div>
-                    </div>
-                </div>
-                
-                <!-- Kill Switches Section -->
-                <div style="margin-bottom: 20px;">
-                    <h4 style="color: #888; font-size: 14px; margin-bottom: 10px;">Kill Switch Status</h4>
-                    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px;">
-                        <div style="background: #1a1a2e; padding: 15px; border-radius: 4px;">
-                            <div style="display: flex; justify-content: space-between; align-items: center;">
-                                <span style="color: #666;">Kill Switch</span>
-                                <span id="kill-switch-status" style="color: #4CAF50; font-weight: bold;">ACTIVE ✓</span>
-                            </div>
-                            <div style="margin-top: 10px; font-size: 12px;">
-                                <div style="display: flex; justify-content: space-between; margin: 5px 0;">
-                                    <span style="color: #666;">Daily Loss:</span>
-                                    <span id="daily-loss-status">1.2% / 5.0%</span>
-                                </div>
-                                <div style="display: flex; justify-content: space-between; margin: 5px 0;">
-                                    <span style="color: #666;">Consecutive Losses:</span>
-                                    <span id="consecutive-losses">1 / 5</span>
-                                </div>
-                                <div style="display: flex; justify-content: space-between; margin: 5px 0;">
-                                    <span style="color: #666;">Max Drawdown:</span>
-                                    <span id="max-dd-status">2.5% / 10.0%</span>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <div style="background: #1a1a2e; padding: 15px; border-radius: 4px;">
-                            <div style="display: flex; justify-content: space-between; align-items: center;">
-                                <span style="color: #666;">Correlation Limits</span>
-                                <span id="correlation-status" style="color: #4CAF50; font-weight: bold;">OK</span>
-                            </div>
-                            <div style="margin-top: 10px; font-size: 12px;">
-                                <div style="display: flex; justify-content: space-between; margin: 5px 0;">
-                                    <span style="color: #666;">Max Correlation:</span>
-                                    <span>0.70</span>
-                                </div>
-                                <div style="display: flex; justify-content: space-between; margin: 5px 0;">
-                                    <span style="color: #666;">High Correlations:</span>
-                                    <span id="high-corr-count" style="color: #FFA500;">2 pairs</span>
-                                </div>
-                                <div style="display: flex; justify-content: space-between; margin: 5px 0;">
-                                    <span style="color: #666;">Corr. Exposure:</span>
-                                    <span id="corr-exposure">18% / 30%</span>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                
-                <!-- Risk Metrics -->
-                <div>
-                    <h4 style="color: #888; font-size: 14px; margin-bottom: 10px;">Risk Metrics</h4>
-                    <div class="metric-grid" style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 15px;">
-                        <div class="metric-item">
-                            <div class="metric-label">Leverage</div>
-                            <div class="metric-value" id="leverage">0.45x</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-label">VaR (95%)</div>
-                            <div class="metric-value negative" id="var-95">-$2,500</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-label">Exposure</div>
-                            <div class="metric-value" id="total-exposure">$45,000</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-label">Risk Sharpe</div>
-                            <div class="metric-value positive" id="risk-sharpe">1.8</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-label">Risk Level</div>
-                            <div class="metric-value" style="color: #4CAF50;" id="risk-level">LOW</div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Safety & System Health (Consolidated) -->
-            <div class="table-container" style="margin-top: 20px;">
-                <h3 style="color: #ffa500;">🛡️ System Health & Safety</h3>
-                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
-                    <!-- Left Column: Circuit Breakers + Order Management -->
-                    <div>
-                        <h4 style="color: #888; font-size: 13px; margin-bottom: 10px;">Circuit Breakers</h4>
-                        <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-bottom: 15px;">
-                            <div class="metric-item" style="padding: 8px;">
-                                <div class="metric-label">API</div>
-                                <div class="metric-value positive" id="api-circuit" style="font-size: 14px;">✓ OK</div>
-                            </div>
-                            <div class="metric-item" style="padding: 8px;">
-                                <div class="metric-label">Data</div>
-                                <div class="metric-value positive" id="data-circuit" style="font-size: 14px;">✓ OK</div>
-                            </div>
-                            <div class="metric-item" style="padding: 8px;">
-                                <div class="metric-label">Trading</div>
-                                <div class="metric-value positive" id="trading-circuit" style="font-size: 14px;">✓ OK</div>
-                            </div>
-                            <div class="metric-item" style="padding: 8px;">
-                                <div class="metric-label">Tripped</div>
-                                <div class="metric-value" id="open-breakers" style="font-size: 14px;">0</div>
-                            </div>
-                        </div>
-                        <h4 style="color: #888; font-size: 13px; margin-bottom: 10px;">Order Management</h4>
-                        <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px;">
-                            <div class="metric-item" style="padding: 8px;">
-                                <div class="metric-label">Active</div>
-                                <div class="metric-value" id="active-orders" style="font-size: 14px;">0</div>
-                            </div>
-                            <div class="metric-item" style="padding: 8px;">
-                                <div class="metric-label">Fill Rate</div>
-                                <div class="metric-value positive" id="fill-rate" style="font-size: 14px;">0%</div>
-                            </div>
-                            <div class="metric-item" style="padding: 8px;">
-                                <div class="metric-label">Failed</div>
-                                <div class="metric-value" id="failed-orders" style="font-size: 14px;">0</div>
-                            </div>
-                            <div class="metric-item" style="padding: 8px;">
-                                <div class="metric-label">Retries</div>
-                                <div class="metric-value" id="retry-count" style="font-size: 14px;">0</div>
-                            </div>
-                        </div>
-                    </div>
-                    <!-- Right Column: Data Validation + Safety Thresholds -->
-                    <div>
-                        <h4 style="color: #888; font-size: 13px; margin-bottom: 10px;">Data Validation</h4>
-                        <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-bottom: 15px;">
-                            <div class="metric-item" style="padding: 8px;">
-                                <div class="metric-label">Pass Rate</div>
-                                <div class="metric-value positive" id="data-pass-rate" style="font-size: 14px;">100%</div>
-                            </div>
-                            <div class="metric-item" style="padding: 8px;">
-                                <div class="metric-label">Stale</div>
-                                <div class="metric-value" id="stale-data" style="font-size: 14px;">0</div>
-                            </div>
-                            <div class="metric-item" style="padding: 8px;">
-                                <div class="metric-label">Wide Spread</div>
-                                <div class="metric-value" id="wide-spreads" style="font-size: 14px;">0</div>
-                            </div>
-                            <div class="metric-item" style="padding: 8px;">
-                                <div class="metric-label">Anomalies</div>
-                                <div class="metric-value" id="anomalies" style="font-size: 14px;">0</div>
-                            </div>
-                        </div>
-                        <h4 style="color: #888; font-size: 13px; margin-bottom: 10px;">Safety Limits</h4>
-                        <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px;">
-                            <div class="metric-item" style="padding: 8px;">
-                                <div class="metric-label">Max Pos</div>
-                                <div class="metric-value" id="max-positions" style="font-size: 14px;">5</div>
-                            </div>
-                            <div class="metric-item" style="padding: 8px;">
-                                <div class="metric-label">Stop Loss</div>
-                                <div class="metric-value negative" id="stop-loss" style="font-size: 14px;">2.0%</div>
-                            </div>
-                            <div class="metric-item" style="padding: 8px;">
-                                <div class="metric-label">Take Profit</div>
-                                <div class="metric-value positive" id="take-profit" style="font-size: 14px;">3.0%</div>
-                            </div>
-                            <div class="metric-item" style="padding: 8px;">
-                                <div class="metric-label">Daily Limit</div>
-                                <div class="metric-value" id="max-daily" style="font-size: 14px;">100</div>
-                            </div>
-                        </div>
+                    <div style="text-align: center; padding: 6px; background: #1a1a2e; border-radius: 4px;">
+                        <div style="font-size: 10px; color: #888;">Worst Trade</div>
+                        <div style="font-size: 13px; color: #ff6b6b;" id="largest-loss">$0</div>
                     </div>
                 </div>
             </div>
         </div>
 
         <div id="watchlist-tab" class="tab-content" style="display: none;">
-            <div class="table-container">
-                <h3>Watched Symbols</h3>
-                <table>
+            <!-- Watchlist Summary -->
+            <div style="display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; margin-bottom: 12px;">
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #60a5fa;">
+                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Watching</div>
+                    <div style="font-size: 18px; font-weight: bold;" id="watch-total">0</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #4ade80;">
+                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">With Position</div>
+                    <div style="font-size: 18px; font-weight: bold; color: #4ade80;" id="watch-with-pos">0</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #fbbf24;">
+                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Total P&L</div>
+                    <div style="font-size: 18px; font-weight: bold;" id="watch-total-pnl">$0</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #a78bfa;">
+                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Winners</div>
+                    <div style="font-size: 18px; font-weight: bold; color: #4ade80;" id="watch-winners">0</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #f472b6;">
+                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Losers</div>
+                    <div style="font-size: 18px; font-weight: bold; color: #f87171;" id="watch-losers">0</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #34d399;">
+                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Best P&L</div>
+                    <div style="font-size: 18px; font-weight: bold; color: #4ade80;" id="watch-best">$0</div>
+                </div>
+            </div>
+            <!-- Watchlist Table -->
+            <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; overflow: hidden;">
+                <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
                     <thead>
-                        <tr>
-                            <th>Symbol</th>
-                            <th>Current Price</th>
-                            <th>Position</th>
-                            <th>Avg Cost</th>
-                            <th>P&L</th>
-                            <th>Notes</th>
+                        <tr style="background: #161b22;">
+                            <th style="padding: 8px 10px; text-align: left; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Symbol</th>
+                            <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Price</th>
+                            <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Qty</th>
+                            <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Avg Cost</th>
+                            <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">P&L</th>
+                            <th style="padding: 8px 10px; text-align: center; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Status</th>
                         </tr>
                     </thead>
                     <tbody id="watchlist-table">
-                        <tr>
-                            <td colspan="6" style="text-align: center; color: #666;">Loading watchlist...</td>
-                        </tr>
+                        <tr><td colspan="6" style="padding: 20px; text-align: center; color: #666;">Loading...</td></tr>
                     </tbody>
                 </table>
             </div>
         </div>
-        
+
         <div id="positions-tab" class="tab-content" style="display: none;">
-            <div class="table-container">
-                <h3>Open Positions</h3>
-                <table>
+            <!-- Positions Summary -->
+            <div style="display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; margin-bottom: 12px;">
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #60a5fa;">
+                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Positions</div>
+                    <div style="font-size: 18px; font-weight: bold;" id="pos-count">0</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #4ade80;">
+                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Total Value</div>
+                    <div style="font-size: 18px; font-weight: bold;" id="pos-total-value">$0</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #fbbf24;">
+                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Unrealized P&L</div>
+                    <div style="font-size: 18px; font-weight: bold;" id="pos-unrealized-pnl">$0</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #a78bfa;">
+                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Winners</div>
+                    <div style="font-size: 18px; font-weight: bold; color: #4ade80;" id="pos-winners">0</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #f472b6;">
+                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Losers</div>
+                    <div style="font-size: 18px; font-weight: bold; color: #f87171;" id="pos-losers">0</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #34d399;">
+                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Avg P&L %</div>
+                    <div style="font-size: 18px; font-weight: bold;" id="pos-avg-pnl-pct">0%</div>
+                </div>
+            </div>
+            <!-- Positions Table -->
+            <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; overflow: hidden;">
+                <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
                     <thead>
-                        <tr>
-                            <th>Symbol</th>
-                            <th>Quantity</th>
-                            <th>Entry Price</th>
-                            <th>Current Price</th>
-                            <th>P&L</th>
-                            <th>P&L %</th>
-                            <th>Value</th>
-                            <th>ML Signal</th>
+                        <tr style="background: #161b22;">
+                            <th style="padding: 8px 10px; text-align: left; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Symbol</th>
+                            <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Qty</th>
+                            <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Entry</th>
+                            <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Current</th>
+                            <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">P&L</th>
+                            <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">P&L %</th>
+                            <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Value</th>
+                            <th style="padding: 8px 10px; text-align: center; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Signal</th>
                         </tr>
                     </thead>
                     <tbody id="positions-table">
-                        <tr>
-                            <td colspan="8" style="text-align: center; color: #666;">No open positions</td>
-                        </tr>
+                        <tr><td colspan="8" style="padding: 20px; text-align: center; color: #666;">Loading...</td></tr>
                     </tbody>
                 </table>
             </div>
         </div>
         
         <div id="strategies-tab" class="tab-content" style="display: none;">
-            <!-- Portfolio Allocation Section -->
-            <div class="table-container" style="margin-bottom: 30px;">
-                <h3 style="color: #00ff00; margin-bottom: 15px;">📊 Portfolio Allocation</h3>
-                <div class="allocation-bar" id="portfolio-allocation-bar">
-                    <div class="allocation-segment" style="width: 30%; background: #4CAF50;">Momentum 30%</div>
-                    <div class="allocation-segment" style="width: 25%; background: #2196F3;">Mean Rev 25%</div>
-                    <div class="allocation-segment" style="width: 20%; background: #FF9800;">ML Enhanced 20%</div>
-                    <div class="allocation-segment" style="width: 15%; background: #9C27B0;">Microstructure 15%</div>
-                    <div class="allocation-segment" style="width: 10%; background: #F44336;">Pairs 10%</div>
+            <!-- Compact Strategy Summary -->
+            <div style="display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; margin-bottom: 15px;">
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 12px; border-radius: 8px; border-left: 3px solid #4ade80;">
+                    <div style="color: #888; font-size: 10px; text-transform: uppercase;">Active</div>
+                    <div style="font-size: 20px; font-weight: bold; color: #4ade80;" id="strat-active-count">3</div>
                 </div>
-                <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-top: 15px;">
-                    <div style="text-align: center;">
-                        <div style="color: #4CAF50; font-weight: bold;">Momentum</div>
-                        <div id="alloc-momentum">30%</div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 12px; border-radius: 8px; border-left: 3px solid #60a5fa;">
+                    <div style="color: #888; font-size: 10px; text-transform: uppercase;">Positions</div>
+                    <div style="font-size: 20px; font-weight: bold;" id="strat-positions">30</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 12px; border-radius: 8px; border-left: 3px solid #fbbf24;">
+                    <div style="color: #888; font-size: 10px; text-transform: uppercase;">Total P&L</div>
+                    <div style="font-size: 20px; font-weight: bold; color: #4ade80;" id="strat-total-pnl">$4,519</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 12px; border-radius: 8px; border-left: 3px solid #a78bfa;">
+                    <div style="color: #888; font-size: 10px; text-transform: uppercase;">Win Rate</div>
+                    <div style="font-size: 20px; font-weight: bold;" id="strat-win-rate">62.5%</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 12px; border-radius: 8px; border-left: 3px solid #f472b6;">
+                    <div style="color: #888; font-size: 10px; text-transform: uppercase;">Trades</div>
+                    <div style="font-size: 20px; font-weight: bold;" id="strat-trades">100</div>
+                </div>
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 12px; border-radius: 8px; border-left: 3px solid #34d399;">
+                    <div style="color: #888; font-size: 10px; text-transform: uppercase;">Slippage</div>
+                    <div style="font-size: 20px; font-weight: bold;" id="strat-slippage">1.2 bps</div>
+                </div>
+            </div>
+
+            <!-- Two Column Layout -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                <!-- Left: Strategy Cards -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 12px; text-transform: uppercase;">Active Strategies</h4>
+                    <div id="strategy-cards" style="display: flex; flex-direction: column; gap: 8px;">
+                        <!-- ML Enhanced -->
+                        <div style="display: grid; grid-template-columns: 100px 1fr 80px 80px; gap: 10px; padding: 8px; background: #161b22; border-radius: 6px; align-items: center;">
+                            <div>
+                                <div style="font-weight: bold; color: #c9d1d9; font-size: 11px;">ML Enhanced</div>
+                                <div style="font-size: 10px; color: #4ade80;" id="ml-status-badge">ACTIVE</div>
+                            </div>
+                            <div style="font-size: 10px; color: #8b949e;">
+                                Regime: <span style="color: #fbbf24;" id="ml-regime-small">NEUTRAL</span> |
+                                Conf: <span id="ml-conf-small">53.3%</span>
+                            </div>
+                            <div style="text-align: right;">
+                                <div style="font-size: 10px; color: #8b949e;">Positions</div>
+                                <div style="font-weight: bold;" id="ml-pos-count">30</div>
+                            </div>
+                            <div style="text-align: right;">
+                                <div style="font-size: 10px; color: #8b949e;">P&L</div>
+                                <div style="font-weight: bold; color: #4ade80;" id="ml-pnl-small">$4,519</div>
+                            </div>
+                        </div>
+                        <!-- Smart Execution -->
+                        <div style="display: grid; grid-template-columns: 100px 1fr 80px 80px; gap: 10px; padding: 8px; background: #161b22; border-radius: 6px; align-items: center;">
+                            <div>
+                                <div style="font-weight: bold; color: #c9d1d9; font-size: 11px;">Smart Exec</div>
+                                <div style="font-size: 10px; color: #4ade80;" id="exec-status-badge">ACTIVE</div>
+                            </div>
+                            <div style="font-size: 10px; color: #8b949e;">
+                                Algo: <span style="color: #60a5fa;" id="exec-algo-small">Market</span> |
+                                Fill: <span id="exec-fill-rate">98%</span>
+                            </div>
+                            <div style="text-align: right;">
+                                <div style="font-size: 10px; color: #8b949e;">Trades</div>
+                                <div style="font-weight: bold;" id="exec-trade-count">100</div>
+                            </div>
+                            <div style="text-align: right;">
+                                <div style="font-size: 10px; color: #8b949e;">Saved</div>
+                                <div style="font-weight: bold; color: #4ade80;" id="exec-saved-small">5.0 bps</div>
+                            </div>
+                        </div>
+                        <!-- Portfolio Manager -->
+                        <div style="display: grid; grid-template-columns: 100px 1fr 80px 80px; gap: 10px; padding: 8px; background: #161b22; border-radius: 6px; align-items: center;">
+                            <div>
+                                <div style="font-weight: bold; color: #c9d1d9; font-size: 11px;">Portfolio Mgr</div>
+                                <div style="font-size: 10px; color: #4ade80;" id="pm-status-badge">ACTIVE</div>
+                            </div>
+                            <div style="font-size: 10px; color: #8b949e;">
+                                Method: <span style="color: #a78bfa;" id="pm-method-small">Equal Weight</span> |
+                                Max: <span id="pm-max-pos">30</span>
+                            </div>
+                            <div style="text-align: right;">
+                                <div style="font-size: 10px; color: #8b949e;">Positions</div>
+                                <div style="font-weight: bold;" id="pm-pos-count">30</div>
+                            </div>
+                            <div style="text-align: right;">
+                                <div style="font-size: 10px; color: #8b949e;">Rebalance</div>
+                                <div style="font-weight: bold;" id="pm-rebalance-small">No</div>
+                            </div>
+                        </div>
+                        <!-- Microstructure -->
+                        <div style="display: grid; grid-template-columns: 100px 1fr 80px 80px; gap: 10px; padding: 8px; background: #161b22; border-radius: 6px; align-items: center; opacity: 0.5;" id="micro-row">
+                            <div>
+                                <div style="font-weight: bold; color: #c9d1d9; font-size: 11px;">Microstructure</div>
+                                <div style="font-size: 10px; color: #f87171;" id="micro-status-badge">DISABLED</div>
+                            </div>
+                            <div style="font-size: 10px; color: #8b949e;">
+                                OFI: <span id="micro-ofi-small">0.00</span> |
+                                Score: <span id="micro-score-small">0.00</span>
+                            </div>
+                            <div style="text-align: right;">
+                                <div style="font-size: 10px; color: #8b949e;">Signals</div>
+                                <div style="font-weight: bold;" id="micro-signals-small">0</div>
+                            </div>
+                            <div style="text-align: right;">
+                                <div style="font-size: 10px; color: #8b949e;">Win Rate</div>
+                                <div style="font-weight: bold;" id="micro-win-small">0%</div>
+                            </div>
+                        </div>
                     </div>
-                    <div style="text-align: center;">
-                        <div style="color: #2196F3; font-weight: bold;">Mean Reversion</div>
-                        <div id="alloc-mean-rev">25%</div>
+                </div>
+
+                <!-- Right: Allocation Chart -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 12px; text-transform: uppercase;">Portfolio Allocation</h4>
+                    <div style="display: flex; gap: 15px; align-items: center;">
+                        <canvas id="allocation-pie-chart" width="120" height="120"></canvas>
+                        <div id="allocation-legend" style="flex: 1; font-size: 11px;">
+                            <div style="display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #21262d;">
+                                <span><span style="display: inline-block; width: 10px; height: 10px; background: #667eea; border-radius: 2px; margin-right: 6px;"></span>ML Enhanced</span>
+                                <span style="font-weight: bold;" id="alloc-ml-pct">35%</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #21262d;">
+                                <span><span style="display: inline-block; width: 10px; height: 10px; background: #4ade80; border-radius: 2px; margin-right: 6px;"></span>Microstructure</span>
+                                <span style="font-weight: bold;" id="alloc-micro-pct">25%</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #21262d;">
+                                <span><span style="display: inline-block; width: 10px; height: 10px; background: #fbbf24; border-radius: 2px; margin-right: 6px;"></span>Mean Reversion</span>
+                                <span style="font-weight: bold;" id="alloc-mr-pct">20%</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; padding: 4px 0;">
+                                <span><span style="display: inline-block; width: 10px; height: 10px; background: #f87171; border-radius: 2px; margin-right: 6px;"></span>Momentum</span>
+                                <span style="font-weight: bold;" id="alloc-mom-pct">20%</span>
+                            </div>
+                        </div>
                     </div>
-                    <div style="text-align: center;">
-                        <div style="color: #FF9800; font-weight: bold;">ML Enhanced</div>
-                        <div id="alloc-ml">20%</div>
-                    </div>
-                    <div style="text-align: center;">
-                        <div style="color: #9C27B0; font-weight: bold;">Microstructure</div>
-                        <div id="alloc-micro">15%</div>
-                    </div>
-                    <div style="text-align: center;">
-                        <div style="color: #F44336; font-weight: bold;">Pairs Trading</div>
-                        <div id="alloc-pairs">10%</div>
+                    <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #21262d;">
+                        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; font-size: 10px;">
+                            <div style="text-align: center;">
+                                <div style="color: #8b949e;">Method</div>
+                                <div style="font-weight: bold; color: #a78bfa;" id="alloc-method">Risk Parity</div>
+                            </div>
+                            <div style="text-align: center;">
+                                <div style="color: #8b949e;">Diversification</div>
+                                <div style="font-weight: bold;" id="alloc-div-ratio">1.85</div>
+                            </div>
+                            <div style="text-align: center;">
+                                <div style="color: #8b949e;">Drift</div>
+                                <div style="font-weight: bold;" id="alloc-drift">3.0%</div>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
-            
-            <!-- Smart Execution Status -->
-            <div class="table-container" style="margin-bottom: 30px;">
-                <h3 style="color: #00ff00; margin-bottom: 15px;">⚡ Smart Execution Status</h3>
-                <div id="execution-status" style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px;">
-                    <div style="background: #1a1a2e; padding: 15px; border-radius: 8px; border: 1px solid #333;">
-                        <div style="color: #888; font-size: 12px;">TWAP Orders</div>
-                        <div style="font-size: 24px; color: #4CAF50; font-weight: bold;" id="twap-count">0</div>
-                        <div style="color: #666; font-size: 11px;">Avg Slippage: <span id="twap-slippage">0.0</span> bps</div>
-                    </div>
-                    <div style="background: #1a1a2e; padding: 15px; border-radius: 8px; border: 1px solid #333;">
-                        <div style="color: #888; font-size: 12px;">VWAP Orders</div>
-                        <div style="font-size: 24px; color: #2196F3; font-weight: bold;" id="vwap-count">0</div>
-                        <div style="color: #666; font-size: 11px;">Avg Slippage: <span id="vwap-slippage">0.0</span> bps</div>
-                    </div>
-                    <div style="background: #1a1a2e; padding: 15px; border-radius: 8px; border: 1px solid #333;">
-                        <div style="color: #888; font-size: 12px;">Iceberg Orders</div>
-                        <div style="font-size: 24px; color: #FF9800; font-weight: bold;" id="iceberg-count">0</div>
-                        <div style="color: #666; font-size: 11px;">Hidden Liquidity: <span id="iceberg-hidden">0%</span></div>
+
+            <!-- Bottom Row: Strategy P&L Chart + Execution Stats -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                <!-- Strategy P&L Comparison -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 12px; text-transform: uppercase;">Strategy Performance</h4>
+                    <div style="height: 120px;">
+                        <canvas id="strategy-pnl-chart"></canvas>
                     </div>
                 </div>
-            </div>
-            
-            <div class="grid">
-                <!-- ML Enhanced Strategy Card -->
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">ML Enhanced</span>
-                        <span class="badge ml">ACTIVE</span>
+
+                <!-- Execution Metrics -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 12px; text-transform: uppercase;">Execution Metrics</h4>
+                    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 8px;">
+                        <div style="background: #161b22; padding: 6px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Slippage</div>
+                            <div style="font-size: 14px; font-weight: bold; color: #4ade80;" id="exec-avg-slip">1.2 bps</div>
+                        </div>
+                        <div style="background: #161b22; padding: 6px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Impact</div>
+                            <div style="font-size: 14px; font-weight: bold; color: #fbbf24;" id="exec-impact">0.8 bps</div>
+                        </div>
+                        <div style="background: #161b22; padding: 6px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Fill Rate</div>
+                            <div style="font-size: 14px; font-weight: bold;" id="exec-fill-pct">98%</div>
+                        </div>
+                        <div style="background: #161b22; padding: 6px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Saved</div>
+                            <div style="font-size: 14px; font-weight: bold; color: #4ade80;" id="exec-total-saved">8.5 bps</div>
+                        </div>
                     </div>
-                    <div class="card-value" id="ml-regime">Loading...</div>
-                    <div class="card-change">
-                        <span id="ml-confidence">Confidence: 0%</span>
-                    </div>
-                    <div class="metric-row">
-                        <span>Positions: <span id="ml-positions">0</span></span>
-                        <span>P&L: <span id="ml-pnl">$0</span></span>
-                    </div>
-                </div>
-                
-                <!-- Microstructure Strategy Card -->
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">Microstructure</span>
-                        <span class="badge">HFT</span>
-                    </div>
-                    <div class="card-value">
-                        OFI: <span id="micro-ofi">0.00</span>
-                    </div>
-                    <div class="card-change">
-                        <span id="micro-spread">Spread: 0.0 bps</span>
-                    </div>
-                    <div class="metric-row">
-                        <span>Signals: <span id="micro-signals">0</span></span>
-                        <span>Win: <span id="micro-winrate">0%</span></span>
+                    <div style="font-size: 10px; color: #8b949e; margin-bottom: 4px;">Algorithm Usage</div>
+                    <div style="height: 50px;">
+                        <canvas id="algo-usage-chart"></canvas>
                     </div>
                 </div>
-                
-                <!-- Portfolio Manager Card -->
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">Portfolio Manager</span>
-                        <span class="badge" id="pm-method">Risk Parity</span>
-                    </div>
-                    <div class="card-value" id="pm-strategies">4 Strategies</div>
-                    <div class="card-change">
-                        <span id="pm-rebalance">Next: Tomorrow</span>
-                    </div>
-                    <div class="metric-row">
-                        <span>Drift: <span id="pm-drift">0.0%</span></span>
-                        <span>Div: <span id="pm-diversification">1.85</span></span>
-                    </div>
-                </div>
-                
-                <!-- Smart Execution Card -->
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">Smart Execution</span>
-                        <span class="badge" id="exec-algo">VWAP</span>
-                    </div>
-                    <div class="card-value">
-                        <span id="exec-pending">2</span> Pending
-                    </div>
-                    <div class="card-change">
-                        <span id="exec-slippage">Slippage: 1.2 bps</span>
-                    </div>
-                    <div class="metric-row">
-                        <span>Filled: <span id="exec-filled">15</span></span>
-                        <span>Saved: <span id="exec-saved">8.5 bps</span></span>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- Microstructure Details Section -->
-            <div class="table-container">
-                <h3>Microstructure Metrics</h3>
-                <div class="metric-grid">
-                    <div class="metric-item">
-                        <div class="metric-label">Order Flow Imbalance</div>
-                        <div class="metric-value" id="ofi-detailed">0.00</div>
-                    </div>
-                    <div class="metric-item">
-                        <div class="metric-label">Book Pressure</div>
-                        <div class="metric-value" id="book-pressure">0.00</div>
-                    </div>
-                    <div class="metric-item">
-                        <div class="metric-label">Tick Direction</div>
-                        <div class="metric-value" id="tick-direction">0.00</div>
-                    </div>
-                    <div class="metric-item">
-                        <div class="metric-label">Ensemble Score</div>
-                        <div class="metric-value" id="ensemble-score">0.00</div>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- Portfolio Allocation Chart -->
-            <div class="table-container">
-                <h3>Portfolio Allocation</h3>
-                <div id="allocation-chart" style="height: 200px;">
-                    <div class="allocation-bar" style="display: flex; height: 40px; margin: 20px 0;">
-                        <div style="width: 35%; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); display: flex; align-items: center; justify-content: center; color: white; font-size: 12px;">ML 35%</div>
-                        <div style="width: 25%; background: #44ff44; display: flex; align-items: center; justify-content: center; color: black; font-size: 12px;">Micro 25%</div>
-                        <div style="width: 20%; background: #ffaa44; display: flex; align-items: center; justify-content: center; color: black; font-size: 12px;">MR 20%</div>
-                        <div style="width: 20%; background: #ff4444; display: flex; align-items: center; justify-content: center; color: white; font-size: 12px;">Mom 20%</div>
-                    </div>
-                </div>
-                <table style="margin-top: 20px;">
-                    <thead>
-                        <tr>
-                            <th>Strategy</th>
-                            <th>Allocation</th>
-                            <th>Risk Budget</th>
-                            <th>P&L Today</th>
-                            <th>Status</th>
-                        </tr>
-                    </thead>
-                    <tbody id="allocation-table">
-                        <tr>
-                            <td>ML Enhanced</td>
-                            <td>35%</td>
-                            <td>30%</td>
-                            <td class="positive">+$1,250</td>
-                            <td><span class="badge ml">Active</span></td>
-                        </tr>
-                        <tr>
-                            <td>Microstructure</td>
-                            <td>25%</td>
-                            <td>25%</td>
-                            <td class="positive">+$320</td>
-                            <td><span class="badge">Active</span></td>
-                        </tr>
-                        <tr>
-                            <td>Mean Reversion</td>
-                            <td>20%</td>
-                            <td>25%</td>
-                            <td class="neutral">$0</td>
-                            <td><span class="badge" style="opacity: 0.5;">Pending</span></td>
-                        </tr>
-                        <tr>
-                            <td>Momentum</td>
-                            <td>20%</td>
-                            <td>20%</td>
-                            <td class="negative">-$150</td>
-                            <td><span class="badge">Active</span></td>
-                        </tr>
-                    </tbody>
-                </table>
-            </div>
-            
-            <!-- Execution Algorithm Status -->
-            <div class="table-container">
-                <h3>Smart Execution Orders</h3>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Symbol</th>
-                            <th>Algorithm</th>
-                            <th>Progress</th>
-                            <th>Slices</th>
-                            <th>Slippage</th>
-                            <th>Status</th>
-                        </tr>
-                    </thead>
-                    <tbody id="execution-table">
-                        <tr>
-                            <td>AAPL</td>
-                            <td>VWAP</td>
-                            <td><div class="progress-bar"><div class="progress-fill" style="width: 65%;"></div></div></td>
-                            <td>5/8</td>
-                            <td class="positive">0.8 bps</td>
-                            <td><span class="badge">Executing</span></td>
-                        </tr>
-                        <tr>
-                            <td>MSFT</td>
-                            <td>TWAP</td>
-                            <td><div class="progress-bar"><div class="progress-fill" style="width: 30%;"></div></div></td>
-                            <td>3/10</td>
-                            <td class="positive">1.1 bps</td>
-                            <td><span class="badge">Executing</span></td>
-                        </tr>
-                    </tbody>
-                </table>
             </div>
         </div>
         
         <div id="trades-tab" class="tab-content" style="display: none;">
-            <div class="card">
-                <h3>Trade History Summary</h3>
-                <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 20px;">
-                    <div style="background: #1a1a1a; padding: 15px; border-radius: 8px;">
-                        <div style="font-size: 12px; color: #888; margin-bottom: 5px;">Total Trades</div>
-                        <div style="font-size: 20px; font-weight: bold;" id="total-trades">0</div>
+            <!-- Trade Summary + Filters Row -->
+            <div style="display: flex; gap: 10px; margin-bottom: 12px; align-items: stretch;">
+                <div style="display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; flex: 1;">
+                    <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #60a5fa;">
+                        <div style="color: #888; font-size: 9px; text-transform: uppercase;">Total</div>
+                        <div style="font-size: 18px; font-weight: bold;" id="total-trades">0</div>
                     </div>
-                    <div style="background: #1a1a1a; padding: 15px; border-radius: 8px;">
-                        <div style="font-size: 12px; color: #888; margin-bottom: 5px;">Buy Trades</div>
-                        <div style="font-size: 20px; font-weight: bold; color: #4ade80;" id="buy-trades">0</div>
+                    <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #4ade80;">
+                        <div style="color: #888; font-size: 9px; text-transform: uppercase;">Buys</div>
+                        <div style="font-size: 18px; font-weight: bold; color: #4ade80;" id="buy-trades">0</div>
                     </div>
-                    <div style="background: #1a1a1a; padding: 15px; border-radius: 8px;">
-                        <div style="font-size: 12px; color: #888; margin-bottom: 5px;">Sell Trades</div>
-                        <div style="font-size: 20px; font-weight: bold; color: #f87171;" id="sell-trades">0</div>
+                    <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #f87171;">
+                        <div style="color: #888; font-size: 9px; text-transform: uppercase;">Sells</div>
+                        <div style="font-size: 18px; font-weight: bold; color: #f87171;" id="sell-trades">0</div>
                     </div>
-                    <div style="background: #1a1a1a; padding: 15px; border-radius: 8px;">
-                        <div style="font-size: 12px; color: #888; margin-bottom: 5px;">Total Volume</div>
-                        <div style="font-size: 20px; font-weight: bold;" id="total-volume">$0</div>
+                    <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #fbbf24;">
+                        <div style="color: #888; font-size: 9px; text-transform: uppercase;">Volume</div>
+                        <div style="font-size: 18px; font-weight: bold;" id="total-volume">$0</div>
                     </div>
-                    <div style="background: #1a1a1a; padding: 15px; border-radius: 8px;">
-                        <div style="font-size: 12px; color: #888; margin-bottom: 5px;">Total Commission</div>
-                        <div style="font-size: 20px; font-weight: bold; color: #fbbf24;" id="total-commission">$0</div>
+                    <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #a78bfa;">
+                        <div style="color: #888; font-size: 9px; text-transform: uppercase;">Commission</div>
+                        <div style="font-size: 18px; font-weight: bold; color: #fbbf24;" id="total-commission">$0</div>
                     </div>
-                    <div style="background: #1a1a1a; padding: 15px; border-radius: 8px;">
-                        <div style="font-size: 12px; color: #888; margin-bottom: 5px;">Avg Trade Size</div>
-                        <div style="font-size: 20px; font-weight: bold;" id="avg-trade-size">$0</div>
+                    <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #34d399;">
+                        <div style="color: #888; font-size: 9px; text-transform: uppercase;">Avg Size</div>
+                        <div style="font-size: 18px; font-weight: bold;" id="avg-trade-size">$0</div>
                     </div>
                 </div>
-            </div>
-            
-            <div class="table-container">
-                <div style="margin-bottom: 15px;">
-                    <label style="color: #888; margin-right: 10px;">Filter by Symbol:</label>
-                    <select id="trade-symbol-filter" onchange="loadTrades()" style="background: #1a1a1a; color: #fff; border: 1px solid #2a2a2a; padding: 5px 10px; border-radius: 4px;">
+                <!-- Filters -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 10px; display: flex; flex-direction: column; gap: 6px; min-width: 160px;">
+                    <select id="trade-symbol-filter" onchange="loadTrades()" style="background: #161b22; color: #c9d1d9; border: 1px solid #21262d; padding: 6px 8px; border-radius: 4px; font-size: 11px;">
                         <option value="">All Symbols</option>
                     </select>
-                    <label style="color: #888; margin-left: 20px; margin-right: 10px;">Days:</label>
-                    <select id="trade-days-filter" onchange="loadTrades()" style="background: #1a1a1a; color: #fff; border: 1px solid #2a2a2a; padding: 5px 10px; border-radius: 4px;">
-                        <option value="1">Last 24 Hours</option>
-                        <option value="7">Last Week</option>
-                        <option value="30" selected>Last 30 Days</option>
-                        <option value="90">Last 90 Days</option>
-                        <option value="365">Last Year</option>
+                    <select id="trade-days-filter" onchange="loadTrades()" style="background: #161b22; color: #c9d1d9; border: 1px solid #21262d; padding: 6px 8px; border-radius: 4px; font-size: 11px;">
+                        <option value="1">24 Hours</option>
+                        <option value="7" selected>7 Days</option>
+                        <option value="30">30 Days</option>
+                        <option value="90">90 Days</option>
                     </select>
                 </div>
-                <table>
+            </div>
+            <!-- Trades Table -->
+            <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; overflow: hidden;">
+                <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
                     <thead>
-                        <tr>
-                            <th>Time</th>
-                            <th>Symbol</th>
-                            <th>Side</th>
-                            <th>Quantity</th>
-                            <th>Price</th>
-                            <th>Notional</th>
-                            <th>Commission</th>
-                            <th>Slippage</th>
+                        <tr style="background: #161b22;">
+                            <th style="padding: 8px 10px; text-align: left; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Time</th>
+                            <th style="padding: 8px 10px; text-align: left; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Symbol</th>
+                            <th style="padding: 8px 10px; text-align: center; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Side</th>
+                            <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Qty</th>
+                            <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Price</th>
+                            <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Notional</th>
                         </tr>
                     </thead>
                     <tbody id="trades-table">
-                        <tr>
-                            <td colspan="8" style="text-align: center; color: #666;">Loading trades...</td>
-                        </tr>
+                        <tr><td colspan="6" style="padding: 20px; text-align: center; color: #666;">Loading...</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -1638,8 +1354,225 @@ HTML_TEMPLATE = """
                 loadPositions(),
                 loadMLData(),
                 loadPerformanceData(),
-                loadTrades()  // Add trades to refresh cycle
+                loadTrades(),
+                loadOverviewData()
             ]);
+        }
+
+        let overviewEquityChart = null;
+        async function loadOverviewData() {
+            try {
+                // Load all data in parallel
+                const [equityResp, posResp, tradesResp, strategiesResp, perfResp] = await Promise.all([
+                    fetch('/api/equity-curve'),
+                    fetch('/api/positions'),
+                    fetch('/api/trades?days=30'),
+                    fetch('/api/strategies/status'),
+                    fetch('/api/performance')
+                ]);
+
+                // Equity curve
+                if (equityResp.ok) {
+                    const data = await equityResp.json();
+                    renderOverviewEquityChart(data);
+                }
+
+                // Positions - update count and top positions list
+                if (posResp.ok) {
+                    const data = await posResp.json();
+                    const positions = data.positions || [];
+                    document.getElementById('ov-positions').textContent = positions.length;
+
+                    // Calculate total value and unrealized P&L from positions
+                    let totalValue = 0;
+                    let totalUnrealizedPnl = 0;
+                    positions.forEach(p => {
+                        totalValue += parseFloat(p.market_value || p.value || 0);
+                        totalUnrealizedPnl += parseFloat(p.unrealized_pnl || 0);
+                    });
+
+                    // Cash = starting capital - cost basis of positions
+                    const costBasis = totalValue - totalUnrealizedPnl;
+                    const cash = 100000 - costBasis;
+                    document.getElementById('ov-cash').textContent = formatCurrency(cash > 0 ? cash : 0);
+
+                    renderTopPositions(positions);
+                }
+
+                // Trades - update count and recent trades
+                if (tradesResp.ok) {
+                    const data = await tradesResp.json();
+                    const trades = data.trades || [];
+                    document.getElementById('ov-trades').textContent = trades.length;
+
+                    // Filter to today's trades for recent trades display
+                    const today = new Date().toISOString().split('T')[0];
+                    const todayTrades = trades.filter(t => t.timestamp && t.timestamp.startsWith(today));
+                    renderRecentTrades(todayTrades.length > 0 ? todayTrades : trades.slice(0, 8));
+                }
+
+                // Performance metrics - includes REAL total P&L (realized + unrealized)
+                if (perfResp.ok) {
+                    const perfData = await perfResp.json();
+                    console.log('Performance data:', perfData);
+
+                    // Use total P&L from performance API (includes realized from closed trades)
+                    let totalPnl = 0;
+                    if (perfData.summary && perfData.summary.total_pnl !== undefined) {
+                        totalPnl = perfData.summary.total_pnl;
+                    } else if (perfData.all && perfData.all.pnl !== undefined) {
+                        totalPnl = perfData.all.pnl;
+                    }
+                    console.log('Total P&L from performance:', totalPnl);
+
+                    // Update Overview tab stats
+                    const ovTotalPnl = document.getElementById('ov-total-pnl');
+                    ovTotalPnl.textContent = formatCurrency(totalPnl);
+                    ovTotalPnl.style.color = totalPnl >= 0 ? '#4ade80' : '#f87171';
+
+                    // Portfolio value = starting capital + total P&L
+                    const portfolioValue = 100000 + totalPnl;
+                    document.getElementById('ov-portfolio').textContent = formatCurrency(portfolioValue);
+                    console.log('Portfolio value set to:', portfolioValue);
+
+                    // Today P&L from daily performance
+                    const todayPnl = perfData.daily ? perfData.daily.pnl || 0 : 0;
+                    const ovTodayPnl = document.getElementById('ov-today-pnl');
+                    ovTodayPnl.textContent = formatCurrency(todayPnl);
+                    ovTodayPnl.style.color = todayPnl >= 0 ? '#4ade80' : '#f87171';
+
+                    // Win rate from performance
+                    if (perfData.summary && perfData.summary.win_rate !== undefined) {
+                        document.getElementById('ov-win-rate').textContent = (perfData.summary.win_rate * 100).toFixed(1) + '%';
+                    }
+
+                    // Key metrics in the bottom section
+                    const metrics = perfData.summary || perfData.all || {};
+                    document.getElementById('sharpe').textContent = (metrics.total_sharpe || metrics.sharpe || 0).toFixed(2);
+                    document.getElementById('max-dd').textContent = ((metrics.total_drawdown || metrics.max_drawdown || 0) * 100).toFixed(1) + '%';
+                }
+
+            } catch (error) {
+                console.error('Error loading overview data:', error);
+            }
+        }
+
+        function renderOverviewEquityChart(data) {
+            const ctx = document.getElementById('overview-equity-chart');
+            if (!ctx || !data.values || data.values.length === 0) return;
+
+            const values = data.values;
+            const labels = data.labels || values.map((_, i) => i);
+
+            if (overviewEquityChart) {
+                overviewEquityChart.data.labels = labels;
+                overviewEquityChart.data.datasets[0].data = values;
+                overviewEquityChart.update('none');
+                return;
+            }
+
+            const gradient = ctx.getContext('2d').createLinearGradient(0, 0, 0, 140);
+            const lastValue = values[values.length - 1] || 0;
+            if (lastValue >= 0) {
+                gradient.addColorStop(0, 'rgba(74, 222, 128, 0.3)');
+                gradient.addColorStop(1, 'rgba(74, 222, 128, 0)');
+            } else {
+                gradient.addColorStop(0, 'rgba(248, 113, 113, 0.3)');
+                gradient.addColorStop(1, 'rgba(248, 113, 113, 0)');
+            }
+
+            overviewEquityChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        data: values,
+                        borderColor: lastValue >= 0 ? '#4ade80' : '#f87171',
+                        backgroundColor: gradient,
+                        fill: true,
+                        tension: 0.3,
+                        pointRadius: 0,
+                        borderWidth: 2
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        x: { display: false },
+                        y: {
+                            grid: { color: '#21262d' },
+                            ticks: { color: '#8b949e', font: { size: 9 } }
+                        }
+                    }
+                }
+            });
+        }
+
+        function renderTopPositions(positions) {
+            const container = document.getElementById('top-positions-list');
+            if (!container) return;
+
+            if (!positions || positions.length === 0) {
+                container.innerHTML = '<div style="color: #666; text-align: center; padding: 20px;">No positions</div>';
+                return;
+            }
+
+            // Calculate P&L and sort
+            const withPnl = positions.map(p => ({
+                ...p,
+                pnl: (p.current_price - p.entry_price) * p.quantity,
+                pnlPct: ((p.current_price - p.entry_price) / p.entry_price) * 100
+            })).sort((a, b) => Math.abs(b.pnl) - Math.abs(a.pnl)).slice(0, 6);
+
+            container.innerHTML = withPnl.map(p => {
+                const pnlColor = p.pnl >= 0 ? '#4ade80' : '#f87171';
+                const arrow = p.pnl >= 0 ? '▲' : '▼';
+                return `
+                    <div style="display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #21262d;">
+                        <div>
+                            <span style="color: #58a6ff; font-weight: bold;">${p.symbol}</span>
+                            <span style="color: #8b949e; margin-left: 8px;">${p.quantity} @ $${p.entry_price.toFixed(2)}</span>
+                        </div>
+                        <div style="color: ${pnlColor}; font-weight: bold;">
+                            ${arrow} $${Math.abs(p.pnl).toFixed(0)} (${p.pnlPct >= 0 ? '+' : ''}${p.pnlPct.toFixed(1)}%)
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function renderRecentTrades(trades) {
+            const container = document.getElementById('recent-trades-list');
+            if (!container) return;
+
+            if (!trades || trades.length === 0) {
+                container.innerHTML = '<div style="color: #666; text-align: center; padding: 20px;">No trades today</div>';
+                return;
+            }
+
+            const recent = trades.slice(0, 8);
+            container.innerHTML = recent.map(t => {
+                const sideColor = t.side === 'BUY' ? '#4ade80' : '#f87171';
+                const sideBg = t.side === 'BUY' ? '#238636' : '#da3633';
+                let time = '';
+                try {
+                    const d = new Date(t.timestamp.replace(' ', 'T') + 'Z');
+                    time = d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+                } catch (e) { time = ''; }
+                return `
+                    <div style="display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid #21262d;">
+                        <div>
+                            <span style="background: ${sideBg}; color: #fff; padding: 1px 5px; border-radius: 3px; font-size: 9px; margin-right: 6px;">${t.side}</span>
+                            <span style="color: #58a6ff; font-weight: bold;">${t.symbol}</span>
+                        </div>
+                        <div style="color: #8b949e;">
+                            ${t.quantity} @ $${t.price.toFixed(2)} <span style="color: #666; margin-left: 5px;">${time}</span>
+                        </div>
+                    </div>
+                `;
+            }).join('');
         }
         
         async function loadStatus() {
@@ -1736,7 +1669,6 @@ HTML_TEMPLATE = """
 
                     tbody.innerHTML = data.trades.map(trade => {
                         // SQLite timestamps are UTC but don't have 'Z' suffix
-                        // Add 'Z' to mark as UTC, then convert to local time
                         let time = trade.timestamp || 'N/A';
                         try {
                             if (trade.timestamp) {
@@ -1748,8 +1680,7 @@ HTML_TEMPLATE = """
                                         month: 'short',
                                         day: 'numeric',
                                         hour: '2-digit',
-                                        minute: '2-digit',
-                                        second: '2-digit'
+                                        minute: '2-digit'
                                     });
                                 }
                             }
@@ -1757,26 +1688,25 @@ HTML_TEMPLATE = """
                             console.debug('Date parse error for trade:', trade.id, e);
                         }
                         const sideColor = trade.side === 'BUY' ? '#4ade80' : '#f87171';
+                        const sideBg = trade.side === 'BUY' ? '#238636' : '#da3633';
                         return `
-                            <tr>
-                                <td>${time}</td>
-                                <td>${trade.symbol}</td>
-                                <td style="color: ${sideColor}; font-weight: bold;">${trade.side}</td>
-                                <td>${trade.quantity}</td>
-                                <td>$${trade.price.toFixed(2)}</td>
-                                <td>$${trade.notional.toFixed(2)}</td>
-                                <td>$${trade.commission.toFixed(2)}</td>
-                                <td>${(trade.slippage * 100).toFixed(2)}%</td>
+                            <tr style="border-bottom: 1px solid #21262d;">
+                                <td style="padding: 6px 10px; color: #8b949e;">${time}</td>
+                                <td style="padding: 6px 10px;"><strong style="color: #58a6ff;">${trade.symbol}</strong></td>
+                                <td style="padding: 6px 10px; text-align: center;"><span style="background: ${sideBg}; color: #fff; padding: 2px 8px; border-radius: 3px; font-size: 10px; font-weight: bold;">${trade.side}</span></td>
+                                <td style="padding: 6px 10px; text-align: right;">${trade.quantity}</td>
+                                <td style="padding: 6px 10px; text-align: right;">$${trade.price.toFixed(2)}</td>
+                                <td style="padding: 6px 10px; text-align: right;">$${trade.notional.toFixed(0)}</td>
                             </tr>
                         `;
                     }).join('');
                 } else {
-                    tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: #666;">No trades found</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="6" style="padding: 20px; text-align: center; color: #666;">No trades found</td></tr>';
                 }
             } catch (error) {
                 console.error('Error loading trades:', error);
-                document.getElementById('trades-table').innerHTML = 
-                    '<tr><td colspan="8" style="text-align: center; color: #f87171;">Error loading trades</td></tr>';
+                document.getElementById('trades-table').innerHTML =
+                    '<tr><td colspan="6" style="padding: 20px; text-align: center; color: #f87171;">Error loading trades</td></tr>';
             }
         }
         
@@ -1797,11 +1727,19 @@ HTML_TEMPLATE = """
             }
         }
         
+        let featureChart = null;
+        let modelAccuracyChart = null;
+
         async function loadMLData() {
             try {
-                const response = await fetch('/api/ml/status');
-                const data = await response.json();
-                updateMLMetrics(data);
+                // Load ML status and predictions in parallel
+                const [statusResponse, predictionsResponse] = await Promise.all([
+                    fetch('/api/ml/status'),
+                    fetch('/api/ml/predictions')
+                ]);
+                const statusData = await statusResponse.json();
+                const predictionsData = await predictionsResponse.json();
+                updateMLMetrics(statusData, predictionsData);
             } catch (error) {
                 console.error('Error loading ML data:', error);
             }
@@ -1940,15 +1878,105 @@ HTML_TEMPLATE = """
             }
         }
         
+        let equityChart = null;
+
         async function loadPerformanceData() {
             try {
-                const response = await fetch('/api/performance');
-                const data = await response.json();
+                // Load performance metrics and equity curve in parallel
+                const [perfResponse, equityResponse] = await Promise.all([
+                    fetch('/api/performance'),
+                    fetch('/api/equity-curve')
+                ]);
+                const data = await perfResponse.json();
+                const equityData = await equityResponse.json();
                 console.log('Performance data received:', data);
                 updatePerformanceTable(data);
+                renderEquityCurve(equityData);
             } catch (error) {
                 console.error('Error loading performance data:', error);
             }
+        }
+
+        function renderEquityCurve(data) {
+            const ctx = document.getElementById('equity-chart-canvas');
+            if (!ctx) return;
+
+            // Destroy existing chart if it exists
+            if (equityChart) {
+                equityChart.destroy();
+            }
+
+            if (!data.values || data.values.length === 0) {
+                ctx.parentElement.innerHTML = '<div style="display: flex; align-items: center; justify-content: center; height: 100%; color: #666;">No trade data yet</div>';
+                return;
+            }
+
+            // Create gradient
+            const gradient = ctx.getContext('2d').createLinearGradient(0, 0, 0, 200);
+            const lastValue = data.values[data.values.length - 1];
+            if (lastValue >= 0) {
+                gradient.addColorStop(0, 'rgba(74, 222, 128, 0.3)');
+                gradient.addColorStop(1, 'rgba(74, 222, 128, 0)');
+            } else {
+                gradient.addColorStop(0, 'rgba(255, 107, 107, 0.3)');
+                gradient.addColorStop(1, 'rgba(255, 107, 107, 0)');
+            }
+
+            equityChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: data.labels,
+                    datasets: [{
+                        label: 'Cumulative P&L',
+                        data: data.values,
+                        borderColor: lastValue >= 0 ? '#4ade80' : '#ff6b6b',
+                        backgroundColor: gradient,
+                        fill: true,
+                        tension: 0.3,
+                        pointRadius: 0,
+                        pointHoverRadius: 4,
+                        borderWidth: 2
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            mode: 'index',
+                            intersect: false,
+                            backgroundColor: '#1a1a2e',
+                            titleColor: '#fff',
+                            bodyColor: '#4ade80',
+                            borderColor: '#333',
+                            borderWidth: 1,
+                            callbacks: {
+                                label: function(context) {
+                                    return '$' + context.parsed.y.toFixed(2);
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            display: true,
+                            grid: { color: '#222' },
+                            ticks: { color: '#666', maxTicksLimit: 6, font: { size: 10 } }
+                        },
+                        y: {
+                            display: true,
+                            grid: { color: '#222' },
+                            ticks: {
+                                color: '#666',
+                                font: { size: 10 },
+                                callback: function(value) { return '$' + value; }
+                            }
+                        }
+                    },
+                    interaction: { mode: 'nearest', axis: 'x', intersect: false }
+                }
+            });
         }
         
         function updateStatus(status) {
@@ -2019,22 +2047,21 @@ HTML_TEMPLATE = """
                 const response = await fetch('/api/market/status');
                 const data = await response.json();
 
-                // Update status text to include market status
-                const statusText = document.getElementById('status-text');
-                const currentText = statusText.textContent;
-
-                if (data.is_open) {
-                    statusText.textContent = currentText + ' • Market Open';
-                    statusText.style.color = '#44ff44';
-                } else {
-                    statusText.textContent = currentText + ` • Market ${data.status_text}`;
-                    if (data.session === 'closed') {
-                        statusText.style.color = '#88bbff';  // Info blue instead of error red
-                        if (data.time_until_open) {
-                            statusText.textContent += ` (Opens in ${data.time_until_open})`;
-                        }
+                // Update header market status badge
+                const marketStatusText = document.getElementById('market-status-text');
+                if (marketStatusText) {
+                    if (data.is_open) {
+                        marketStatusText.textContent = 'Open';
+                        marketStatusText.style.color = '#4ade80';
+                    } else if (data.session === 'pre_market') {
+                        marketStatusText.textContent = 'Pre-Market';
+                        marketStatusText.style.color = '#fbbf24';
+                    } else if (data.session === 'after_hours') {
+                        marketStatusText.textContent = 'After Hours';
+                        marketStatusText.style.color = '#fbbf24';
                     } else {
-                        statusText.style.color = '#ffaa44';
+                        marketStatusText.textContent = 'Closed';
+                        marketStatusText.style.color = '#f87171';
                     }
                 }
             } catch (error) {
@@ -2048,16 +2075,9 @@ HTML_TEMPLATE = """
         function updatePnL(pnl) {
             console.log('updatePnL called with:', pnl);
 
-            // If market is closed (all null), force immediate reset to $0.00
-            if (pnl && pnl.daily === null && pnl.total === null && pnl.unrealized === null) {
-                console.log('Market closed - forcing P&L reset to $0.00');
-                document.getElementById('total-pnl').textContent = '$0.00';
-                document.getElementById('daily-pnl').textContent = '$0.00';
-                document.getElementById('portfolio-value').textContent = '$100,000.00';
-                document.getElementById('today-pnl-large').textContent = '$0.00';
-                document.getElementById('portfolio-change').textContent = '+$0.00 (0.00%)';
-                document.getElementById('today-change-pct').textContent = '+0.00%';
-                lastPnLUpdate = { total: 0, daily: 0 };
+            // If P&L API returns null, skip - let loadOverviewData calculate from positions
+            if (!pnl || (pnl.daily === null && pnl.total === null && pnl.unrealized === null)) {
+                console.log('P&L API returned null - skipping, positions will provide data');
                 return;
             }
 
@@ -2153,59 +2173,195 @@ HTML_TEMPLATE = """
             }
         }
         
-        function updateMLMetrics(data) {
+        function updateMLMetrics(data, predictions) {
+            // Update key metrics
             document.getElementById('models-trained').textContent = data.models_trained || 0;
             document.getElementById('feature-count').textContent = data.feature_count || 0;
             document.getElementById('model-accuracy').textContent = ((data.accuracy || 0) * 100).toFixed(1) + '%';
-            document.getElementById('prediction-confidence').textContent = ((data.confidence || 0) * 100).toFixed(1) + '%';
-            
-            // Update model table
+            document.getElementById('prediction-confidence').textContent = ((data.avg_confidence || data.confidence || 0) * 100).toFixed(1) + '%';
+
+            // Update predictions count and signals
+            const predElem = document.getElementById('active-predictions');
+            if (predElem) predElem.textContent = data.active_predictions || 0;
+
+            if (data.market_sentiment) {
+                const buyElem = document.getElementById('ml-buy-count');
+                const sellElem = document.getElementById('ml-sell-count');
+                const holdElem = document.getElementById('ml-hold-count');
+                if (buyElem) buyElem.textContent = data.market_sentiment.bullish || 0;
+                if (sellElem) sellElem.textContent = data.market_sentiment.bearish || 0;
+                if (holdElem) holdElem.textContent = data.market_sentiment.neutral || 0;
+            }
+
+            // Update model table (compact format)
             if (data.models && data.models.length > 0) {
                 const tbody = document.getElementById('model-table');
                 tbody.innerHTML = data.models.map(model => `
                     <tr>
                         <td>${model.type}</td>
-                        <td>${(model.test_score * 100).toFixed(2)}%</td>
+                        <td style="color: ${model.test_score >= 0.55 ? '#4ade80' : '#fff'}">${(model.test_score * 100).toFixed(1)}%</td>
                         <td>${model.feature_count}</td>
-                        <td>${formatTime(model.updated)}</td>
-                        <td><span class="badge ${model.status === 'active' ? 'ml' : ''}">${model.status}</span></td>
+                        <td><span style="color: ${model.status === 'active' ? '#4ade80' : '#666'};">${model.status === 'active' ? '●' : '○'}</span></td>
                     </tr>
                 `).join('');
+
+                // Render model accuracy chart
+                renderModelAccuracyChart(data.models);
             }
-            
-            // Update feature table
+
+            // Render feature importance chart
             if (data.top_features && data.top_features.length > 0) {
-                const tbody = document.getElementById('feature-table');
-                tbody.innerHTML = data.top_features.map(feature => `
-                    <tr>
-                        <td>${feature.name}</td>
-                        <td>${(feature.importance * 100).toFixed(2)}%</td>
-                        <td>${feature.category}</td>
-                    </tr>
-                `).join('');
+                renderFeatureChart(data.top_features);
             }
+
+            // Update predictions table
+            if (predictions && predictions.predictions) {
+                renderPredictionsTable(predictions.predictions);
+            }
+        }
+
+        function renderFeatureChart(features) {
+            const ctx = document.getElementById('feature-chart-canvas');
+            if (!ctx) return;
+
+            if (featureChart) featureChart.destroy();
+
+            const labels = features.slice(0, 5).map(f => f.name.replace(/_/g, ' '));
+            const values = features.slice(0, 5).map(f => f.importance * 100);
+
+            featureChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        data: values,
+                        backgroundColor: ['#4ade80', '#60a5fa', '#f472b6', '#fbbf24', '#a78bfa'],
+                        borderRadius: 4
+                    }]
+                },
+                options: {
+                    indexAxis: 'y',
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        x: { display: true, grid: { color: '#222' }, ticks: { color: '#666', font: { size: 9 }, callback: v => v + '%' } },
+                        y: { display: true, grid: { display: false }, ticks: { color: '#888', font: { size: 9 } } }
+                    }
+                }
+            });
+        }
+
+        function renderModelAccuracyChart(models) {
+            const ctx = document.getElementById('model-accuracy-chart');
+            if (!ctx) return;
+
+            if (modelAccuracyChart) modelAccuracyChart.destroy();
+
+            const labels = models.map(m => m.type.split(' ')[0]);
+            const values = models.map(m => m.test_score * 100);
+            const colors = values.map(v => v >= 55 ? '#4ade80' : v >= 52 ? '#fbbf24' : '#ff6b6b');
+
+            modelAccuracyChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        data: values,
+                        backgroundColor: colors,
+                        borderRadius: 4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        x: { display: true, grid: { display: false }, ticks: { color: '#888', font: { size: 9 } } },
+                        y: { display: true, min: 45, max: 60, grid: { color: '#222' }, ticks: { color: '#666', font: { size: 9 }, callback: v => v + '%' } }
+                    }
+                }
+            });
+        }
+
+        function renderPredictionsTable(predictions) {
+            const tbody = document.getElementById('predictions-table');
+            if (!tbody) return;
+
+            if (!predictions || predictions.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: #666;">No predictions</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = predictions.map(p => {
+                const actionColor = p.action === 'BUY' ? '#4ade80' : p.action === 'SELL' ? '#ff6b6b' : '#888';
+                const confColor = p.confidence >= 0.7 ? '#4ade80' : p.confidence >= 0.5 ? '#fbbf24' : '#888';
+                const time = p.timestamp ? p.timestamp.split('T')[1]?.split('.')[0] || '' : '';
+                return `
+                    <tr>
+                        <td><strong>${p.symbol}</strong></td>
+                        <td style="color: ${actionColor}; font-weight: bold;">${p.action}</td>
+                        <td style="color: ${confColor}">${(p.confidence * 100).toFixed(0)}%</td>
+                        <td style="color: #666; font-size: 10px;">${p.source}</td>
+                        <td style="color: #666; font-size: 10px;">${time}</td>
+                    </tr>
+                `;
+            }).join('');
         }
         
         function updateWatchlistTable(watchlist) {
             const tbody = document.getElementById('watchlist-table');
             if (!watchlist || watchlist.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: #666;">No symbols in watchlist</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="6" style="padding: 20px; text-align: center; color: #666;">No symbols in watchlist</td></tr>';
+                // Reset summary stats
+                document.getElementById('watch-total').textContent = '0';
+                document.getElementById('watch-with-pos').textContent = '0';
+                document.getElementById('watch-total-pnl').textContent = '$0';
+                document.getElementById('watch-winners').textContent = '0';
+                document.getElementById('watch-losers').textContent = '0';
+                document.getElementById('watch-best').textContent = '$0';
                 return;
             }
-            
+
+            // Calculate summary stats
+            let totalPnl = 0, winners = 0, losers = 0, withPos = 0, bestPnl = 0;
+            watchlist.forEach(item => {
+                if (item.quantity > 0) {
+                    withPos++;
+                    const pnl = (item.current_price - item.avg_cost) * item.quantity;
+                    totalPnl += pnl;
+                    if (pnl > 0) winners++;
+                    else if (pnl < 0) losers++;
+                    if (pnl > bestPnl) bestPnl = pnl;
+                }
+            });
+
+            // Update summary
+            document.getElementById('watch-total').textContent = watchlist.length;
+            document.getElementById('watch-with-pos').textContent = withPos;
+            const pnlEl = document.getElementById('watch-total-pnl');
+            pnlEl.textContent = '$' + totalPnl.toFixed(0);
+            pnlEl.style.color = totalPnl >= 0 ? '#4ade80' : '#f87171';
+            document.getElementById('watch-winners').textContent = winners;
+            document.getElementById('watch-losers').textContent = losers;
+            document.getElementById('watch-best').textContent = '$' + bestPnl.toFixed(0);
+
             tbody.innerHTML = watchlist.map(item => {
                 const pnl = item.quantity > 0 ? (item.current_price - item.avg_cost) * item.quantity : 0;
                 const pnlDisplay = item.quantity > 0 ? `$${pnl.toFixed(2)}` : '-';
-                const pnlClass = pnl >= 0 ? 'positive' : 'negative';
-                
+                const pnlColor = pnl >= 0 ? '#4ade80' : '#f87171';
+                const statusBadge = item.quantity > 0
+                    ? '<span style="background: #238636; color: #fff; padding: 2px 6px; border-radius: 3px; font-size: 10px;">HOLDING</span>'
+                    : '<span style="background: #30363d; color: #8b949e; padding: 2px 6px; border-radius: 3px; font-size: 10px;">WATCHING</span>';
+
                 return `
-                    <tr>
-                        <td><strong>${item.symbol}</strong></td>
-                        <td>$${item.current_price.toFixed(2)}</td>
-                        <td>${item.quantity || '-'}</td>
-                        <td>${item.avg_cost > 0 ? '$' + item.avg_cost.toFixed(2) : '-'}</td>
-                        <td class="${item.quantity > 0 ? pnlClass : ''}">${pnlDisplay}</td>
-                        <td>${item.notes || ''}</td>
+                    <tr style="border-bottom: 1px solid #21262d;">
+                        <td style="padding: 6px 10px;"><strong style="color: #58a6ff;">${item.symbol}</strong></td>
+                        <td style="padding: 6px 10px; text-align: right;">$${item.current_price.toFixed(2)}</td>
+                        <td style="padding: 6px 10px; text-align: right;">${item.quantity || '-'}</td>
+                        <td style="padding: 6px 10px; text-align: right;">${item.avg_cost > 0 ? '$' + item.avg_cost.toFixed(2) : '-'}</td>
+                        <td style="padding: 6px 10px; text-align: right; color: ${item.quantity > 0 ? pnlColor : '#8b949e'};">${pnlDisplay}</td>
+                        <td style="padding: 6px 10px; text-align: center;">${statusBadge}</td>
                     </tr>
                 `;
             }).join('');
@@ -2214,54 +2370,81 @@ HTML_TEMPLATE = """
         function updatePositionsTable(positions) {
             const tbody = document.getElementById('positions-table');
             if (!positions || positions.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: #666;">No open positions</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="8" style="padding: 20px; text-align: center; color: #666;">No open positions</td></tr>';
                 document.getElementById('position-count').textContent = '0';
                 document.getElementById('position-value').textContent = '$0.00 value';
+                // Reset summary stats
+                document.getElementById('pos-count').textContent = '0';
+                document.getElementById('pos-total-value').textContent = '$0';
+                document.getElementById('pos-unrealized-pnl').textContent = '$0';
+                document.getElementById('pos-winners').textContent = '0';
+                document.getElementById('pos-losers').textContent = '0';
+                document.getElementById('pos-avg-pnl-pct').textContent = '0%';
                 return;
             }
-            
-            let totalValue = 0;
-            tbody.innerHTML = positions.map(pos => {
+
+            // Calculate summary stats
+            let totalValue = 0, totalPnl = 0, winners = 0, losers = 0, totalPnlPct = 0;
+            const posData = positions.map(pos => {
                 const pnl = (pos.current_price - pos.entry_price) * pos.quantity;
                 const pnlPct = ((pos.current_price - pos.entry_price) / pos.entry_price) * 100;
                 const value = pos.current_price * pos.quantity;
                 totalValue += value;
-                
-                // Add pnl to position object for later use
-                pos.pnl = pnl;
-                
+                totalPnl += pnl;
+                totalPnlPct += pnlPct;
+                if (pnl > 0) winners++;
+                else if (pnl < 0) losers++;
+                return { ...pos, pnl, pnlPct, value };
+            });
+
+            // Update summary stats
+            document.getElementById('pos-count').textContent = positions.length;
+            document.getElementById('pos-total-value').textContent = '$' + (totalValue / 1000).toFixed(1) + 'k';
+            const pnlEl = document.getElementById('pos-unrealized-pnl');
+            pnlEl.textContent = '$' + totalPnl.toFixed(0);
+            pnlEl.style.color = totalPnl >= 0 ? '#4ade80' : '#f87171';
+            document.getElementById('pos-winners').textContent = winners;
+            document.getElementById('pos-losers').textContent = losers;
+            const avgPnlPct = totalPnlPct / positions.length;
+            const avgEl = document.getElementById('pos-avg-pnl-pct');
+            avgEl.textContent = avgPnlPct.toFixed(1) + '%';
+            avgEl.style.color = avgPnlPct >= 0 ? '#4ade80' : '#f87171';
+
+            tbody.innerHTML = posData.map(pos => {
+                const pnlColor = pos.pnl >= 0 ? '#4ade80' : '#f87171';
+                const signalBadge = pos.ml_signal === 'buy'
+                    ? '<span style="background: #238636; color: #fff; padding: 2px 6px; border-radius: 3px; font-size: 10px;">BUY</span>'
+                    : pos.ml_signal === 'sell'
+                    ? '<span style="background: #da3633; color: #fff; padding: 2px 6px; border-radius: 3px; font-size: 10px;">SELL</span>'
+                    : '<span style="background: #30363d; color: #8b949e; padding: 2px 6px; border-radius: 3px; font-size: 10px;">HOLD</span>';
+
                 return `
-                    <tr>
-                        <td>${pos.symbol}</td>
-                        <td>${pos.quantity}</td>
-                        <td>$${pos.entry_price.toFixed(2)}</td>
-                        <td>$${pos.current_price.toFixed(2)}</td>
-                        <td class="${pnl >= 0 ? 'positive' : 'negative'}">$${pnl.toFixed(2)}</td>
-                        <td class="${pnl >= 0 ? 'positive' : 'negative'}">${pnlPct.toFixed(2)}%</td>
-                        <td>$${value.toFixed(2)}</td>
-                        <td><span class="badge ${pos.ml_signal === 'buy' ? 'ml' : ''}">${pos.ml_signal || 'none'}</span></td>
+                    <tr style="border-bottom: 1px solid #21262d;">
+                        <td style="padding: 6px 10px;"><strong style="color: #58a6ff;">${pos.symbol}</strong></td>
+                        <td style="padding: 6px 10px; text-align: right;">${pos.quantity}</td>
+                        <td style="padding: 6px 10px; text-align: right;">$${pos.entry_price.toFixed(2)}</td>
+                        <td style="padding: 6px 10px; text-align: right;">$${pos.current_price.toFixed(2)}</td>
+                        <td style="padding: 6px 10px; text-align: right; color: ${pnlColor};">$${pos.pnl.toFixed(2)}</td>
+                        <td style="padding: 6px 10px; text-align: right; color: ${pnlColor};">${pos.pnlPct.toFixed(1)}%</td>
+                        <td style="padding: 6px 10px; text-align: right;">$${pos.value.toFixed(0)}</td>
+                        <td style="padding: 6px 10px; text-align: center;">${signalBadge}</td>
                     </tr>
                 `;
             }).join('');
-            
+
             document.getElementById('position-count').textContent = positions.length.toString();
             document.getElementById('position-value').textContent = formatCurrency(totalValue) + ' value';
-            
+
             // Update portfolio summary
             document.getElementById('active-positions-large').textContent = positions.length.toString();
-            // Update position text with actual symbols or total value
             const posTextEl = document.getElementById('positions-value-text');
             if (posTextEl) {
                 if (positions.length === 0) {
                     posTextEl.textContent = 'No open positions';
                 } else if (positions.length <= 4) {
-                    // Show actual symbols if 4 or fewer
-                    const symbols = positions.map(p => p.symbol).join(', ');
-                    posTextEl.textContent = symbols;
+                    posTextEl.textContent = positions.map(p => p.symbol).join(', ');
                 } else {
-                    // Show total position value for many positions
-                    const totalPositionValue = positions.reduce((sum, p) => sum + (p.current_price * p.quantity), 0);
-                    posTextEl.textContent = `${formatCurrency(totalPositionValue)} deployed`;
+                    posTextEl.textContent = `${formatCurrency(totalValue)} deployed`;
                 }
             }
         }
@@ -2392,78 +2575,85 @@ HTML_TEMPLATE = """
         function updatePerformanceTable(data) {
             if (!data) return;
 
-            // Update summary cards
+            // Update key metrics (summary cards)
             if (data.summary) {
                 const summary = data.summary;
-                
+
                 // Total P&L with color
                 const pnlElem = document.getElementById('perf-total-pnl');
-                const pnlValue = summary.total_pnl || 0;
-                pnlElem.textContent = formatCurrency(pnlValue);
-                pnlElem.className = pnlValue >= 0 ? 'metric-value positive' : 'metric-value negative';
-                
+                if (pnlElem) {
+                    const pnlValue = summary.total_pnl || 0;
+                    pnlElem.textContent = formatCurrency(pnlValue);
+                    pnlElem.style.color = pnlValue >= 0 ? '#4ade80' : '#ff6b6b';
+                }
+
                 // Total Return with color
                 const returnElem = document.getElementById('total-return');
-                const returnValue = summary.total_return || 0;
-                returnElem.textContent = formatPercent(returnValue);
-                returnElem.className = returnValue >= 0 ? 'metric-value positive' : 'metric-value negative';
-                
+                if (returnElem) {
+                    const returnValue = summary.total_return || 0;
+                    returnElem.textContent = formatPercent(returnValue);
+                    returnElem.style.color = returnValue >= 0 ? '#4ade80' : '#ff6b6b';
+                }
+
                 // Sharpe Ratio with color
                 const sharpeElem = document.getElementById('total-sharpe');
-                const sharpeValue = summary.total_sharpe || 0;
-                sharpeElem.textContent = sharpeValue.toFixed(2);
-                sharpeElem.className = sharpeValue >= 0 ? 'metric-value positive' : 'metric-value negative';
-                
-                // Drawdown (always negative if non-zero)
+                if (sharpeElem) {
+                    const sharpeValue = summary.total_sharpe || 0;
+                    sharpeElem.textContent = sharpeValue.toFixed(2);
+                    sharpeElem.style.color = sharpeValue >= 1 ? '#4ade80' : (sharpeValue >= 0 ? '#fff' : '#ff6b6b');
+                }
+
+                // Max Drawdown
                 const ddElem = document.getElementById('total-drawdown');
-                const ddValue = summary.total_drawdown || 0;
-                ddElem.textContent = formatPercent(ddValue);
-                ddElem.className = ddValue < 0 ? 'metric-value negative' : 'metric-value';
-                
+                if (ddElem) {
+                    const ddValue = summary.total_drawdown || 0;
+                    ddElem.textContent = formatPercent(ddValue);
+                }
+
                 // Win Rate with color
                 const winRateElem = document.getElementById('win-rate');
-                const winRate = summary.win_rate || 0;
-                winRateElem.textContent = formatPercent(winRate);
-                winRateElem.className = winRate >= 0.5 ? 'metric-value positive' : 'metric-value';
-                
-                // Total trades (neutral)
-                document.getElementById('perf-total-trades').textContent = summary.total_trades || 0;
+                if (winRateElem) {
+                    const winRate = summary.win_rate || 0;
+                    winRateElem.textContent = formatPercent(winRate);
+                    winRateElem.style.color = winRate >= 0.5 ? '#4ade80' : '#ff6b6b';
+                }
+
+                // Total trades
+                const tradesElem = document.getElementById('perf-total-trades');
+                if (tradesElem) tradesElem.textContent = summary.total_trades || 0;
             }
 
-            // Update performance table
+            // Update period breakdown table
             ['daily', 'weekly', 'monthly', 'all'].forEach(period => {
                 const metrics = data[period] || {};
-                
+
                 // P&L with color
                 const pnlElem = document.getElementById(`pnl-${period}`);
-                const pnlValue = metrics.pnl || 0;
-                pnlElem.textContent = formatCurrency(pnlValue);
-                pnlElem.className = pnlValue >= 0 ? 'positive' : 'negative';
-                
+                if (pnlElem) {
+                    const pnlValue = metrics.pnl || 0;
+                    pnlElem.textContent = formatCurrency(pnlValue);
+                    pnlElem.style.color = pnlValue >= 0 ? '#4ade80' : '#ff6b6b';
+                }
+
                 // Return with color
                 const returnElem = document.getElementById(`return-${period}`);
-                const returnValue = metrics.return_pct || 0;
-                returnElem.textContent = formatPercent(returnValue);
-                returnElem.className = returnValue >= 0 ? 'positive' : 'negative';
-                
-                // Trades (neutral)
-                document.getElementById(`trades-${period}`).textContent = metrics.trades || 0;
-                
-                // Volatility (neutral)
-                document.getElementById(`vol-${period}`).textContent = formatPercent(metrics.volatility);
-                
-                // Sharpe with color
-                const sharpeElem = document.getElementById(`sharpe-${period}`);
-                const sharpeValue = metrics.sharpe || 0;
-                sharpeElem.textContent = sharpeValue.toFixed(2);
-                sharpeElem.className = sharpeValue >= 0 ? 'positive' : 'negative';
-                
-                // Drawdown (always negative color if non-zero)
-                const ddElem = document.getElementById(`dd-${period}`);
-                const ddValue = metrics.max_drawdown || 0;
-                ddElem.textContent = formatPercent(ddValue);
-                ddElem.className = ddValue < 0 ? 'negative' : '';
+                if (returnElem) {
+                    const returnValue = metrics.return_pct || 0;
+                    returnElem.textContent = formatPercent(returnValue);
+                    returnElem.style.color = returnValue >= 0 ? '#4ade80' : '#ff6b6b';
+                }
+
+                // Trades
+                const tradesElem = document.getElementById(`trades-${period}`);
+                if (tradesElem) tradesElem.textContent = metrics.trades || 0;
             });
+
+            // Update trade statistics from equity curve data
+            if (data.summary) {
+                const wins = data.summary.winning_trades || 0;
+                const losses = data.summary.losing_trades || 0;
+                // These will be populated when we have more detailed trade stats
+            }
         }
         
         function addLog(message) {
@@ -2632,160 +2822,311 @@ HTML_TEMPLATE = """
             }
         }
         
+        // Strategy charts
+        let allocationPieChart = null;
+        let strategyPnlChart = null;
+        let algoUsageChart = null;
+
         // Refresh strategies tab data
         async function refreshStrategies() {
             try {
-                // Get strategies status
-                const strategiesResp = await fetch('/api/strategies/status');
-                if (strategiesResp.ok) {
-                    const data = await strategiesResp.json();
-                    
-                    // Update ML Enhanced card
-                    if (data.active_strategies.ml_enhanced) {
-                        const ml = data.active_strategies.ml_enhanced;
-                        document.getElementById('ml-regime').textContent = ml.regime.toUpperCase();
-                        document.getElementById('ml-confidence').textContent = `Confidence: ${(ml.confidence * 100).toFixed(0)}%`;
-                        document.getElementById('ml-positions').textContent = ml.positions;
+                // Fetch all data in parallel
+                const [strategiesResp, allocResp, execResp, riskResp] = await Promise.all([
+                    fetch('/api/strategies/status'),
+                    fetch('/api/portfolio/allocation'),
+                    fetch('/api/execution/status'),
+                    fetch('/api/risk/status')
+                ]);
+
+                let strategiesData = null;
+                let allocData = null;
+                let execData = null;
+                let riskData = null;
+
+                if (strategiesResp.ok) strategiesData = await strategiesResp.json();
+                if (allocResp.ok) allocData = await allocResp.json();
+                if (execResp.ok) execData = await execResp.json();
+                if (riskResp.ok) riskData = await riskResp.json();
+
+                // Update summary metrics
+                if (strategiesData) {
+                    const ml = strategiesData.active_strategies.ml_enhanced || {};
+                    const exec = strategiesData.active_strategies.smart_execution || {};
+                    const micro = strategiesData.active_strategies.microstructure || {};
+                    const pm = strategiesData.active_strategies.portfolio_manager || {};
+                    const perf = strategiesData.performance_by_strategy || {};
+
+                    // Count active strategies
+                    let activeCount = 0;
+                    if (ml.enabled) activeCount++;
+                    if (exec.enabled) activeCount++;
+                    if (pm.enabled) activeCount++;
+                    if (micro.enabled) activeCount++;
+
+                    document.getElementById('strat-active-count').textContent = activeCount;
+                    document.getElementById('strat-positions').textContent = ml.positions || pm.positions_count || 0;
+
+                    const totalPnl = (perf.ml_enhanced?.pnl || 0) + (perf.microstructure?.pnl || 0);
+                    const pnlEl = document.getElementById('strat-total-pnl');
+                    pnlEl.textContent = '$' + totalPnl.toLocaleString(undefined, {maximumFractionDigits: 0});
+                    pnlEl.style.color = totalPnl >= 0 ? '#4ade80' : '#f87171';
+
+                    document.getElementById('strat-win-rate').textContent = ((perf.ml_enhanced?.win_rate || 0) * 100).toFixed(1) + '%';
+                    document.getElementById('strat-trades').textContent = perf.ml_enhanced?.total_trades || exec.total_trades || 0;
+                    document.getElementById('strat-slippage').textContent = (exec.avg_slippage_bps || 0).toFixed(1) + ' bps';
+
+                    // Update ML Enhanced row
+                    document.getElementById('ml-status-badge').textContent = ml.enabled ? 'ACTIVE' : 'DISABLED';
+                    document.getElementById('ml-status-badge').style.color = ml.enabled ? '#4ade80' : '#f87171';
+                    document.getElementById('ml-regime-small').textContent = ml.regime || 'NEUTRAL';
+                    document.getElementById('ml-conf-small').textContent = ((ml.confidence || 0) * 100).toFixed(1) + '%';
+                    document.getElementById('ml-pos-count').textContent = ml.positions || 0;
+                    const mlPnl = perf.ml_enhanced?.pnl || 0;
+                    const mlPnlEl = document.getElementById('ml-pnl-small');
+                    mlPnlEl.textContent = '$' + mlPnl.toLocaleString(undefined, {maximumFractionDigits: 0});
+                    mlPnlEl.style.color = mlPnl >= 0 ? '#4ade80' : '#f87171';
+
+                    // Update Smart Execution row
+                    document.getElementById('exec-status-badge').textContent = exec.enabled ? 'ACTIVE' : 'DISABLED';
+                    document.getElementById('exec-status-badge').style.color = exec.enabled ? '#4ade80' : '#f87171';
+                    document.getElementById('exec-algo-small').textContent = exec.algorithm || 'Market';
+                    document.getElementById('exec-trade-count').textContent = exec.total_trades || 0;
+                    document.getElementById('exec-saved-small').textContent = (perf.smart_execution?.saved_bps || 0).toFixed(1) + ' bps';
+
+                    // Update Portfolio Manager row
+                    document.getElementById('pm-status-badge').textContent = pm.enabled ? 'ACTIVE' : 'DISABLED';
+                    document.getElementById('pm-status-badge').style.color = pm.enabled ? '#4ade80' : '#f87171';
+                    document.getElementById('pm-method-small').textContent = pm.allocation_method || 'Equal Weight';
+                    document.getElementById('pm-max-pos').textContent = pm.max_positions || 30;
+                    document.getElementById('pm-pos-count').textContent = pm.positions_count || 0;
+                    document.getElementById('pm-rebalance-small').textContent = pm.rebalance_due ? 'Yes' : 'No';
+
+                    // Update Microstructure row
+                    const microRow = document.getElementById('micro-row');
+                    if (micro.enabled) {
+                        microRow.style.opacity = '1';
+                        document.getElementById('micro-status-badge').textContent = 'ACTIVE';
+                        document.getElementById('micro-status-badge').style.color = '#4ade80';
+                    } else {
+                        microRow.style.opacity = '0.5';
+                        document.getElementById('micro-status-badge').textContent = 'DISABLED';
+                        document.getElementById('micro-status-badge').style.color = '#f87171';
                     }
-                    
-                    // Update Microstructure card
-                    if (data.active_strategies.microstructure) {
-                        const micro = data.active_strategies.microstructure;
-                        document.getElementById('micro-ofi').textContent = micro.ofi.toFixed(2);
-                        document.getElementById('micro-spread').textContent = `Spread: ${micro.spread_bps.toFixed(1)} bps`;
-                        document.getElementById('ensemble-score').textContent = micro.ensemble_score.toFixed(2);
-                    }
-                    
-                    // Update Portfolio Manager card
-                    if (data.active_strategies.portfolio_manager) {
-                        const pm = data.active_strategies.portfolio_manager;
-                        document.getElementById('pm-method').textContent = pm.allocation_method;
-                        document.getElementById('pm-strategies').textContent = `${pm.strategies_count} Strategies`;
-                    }
-                    
-                    // Update Smart Execution card
-                    if (data.active_strategies.smart_execution) {
-                        const exec = data.active_strategies.smart_execution;
-                        document.getElementById('exec-algo').textContent = exec.algorithm;
-                        document.getElementById('exec-pending').textContent = exec.orders_pending;
-                        document.getElementById('exec-slippage').textContent = `Slippage: ${exec.avg_slippage_bps.toFixed(1)} bps`;
-                    }
+                    document.getElementById('micro-ofi-small').textContent = (micro.ofi || 0).toFixed(2);
+                    document.getElementById('micro-score-small').textContent = (micro.ensemble_score || 0).toFixed(2);
+                    document.getElementById('micro-win-small').textContent = ((perf.microstructure?.win_rate || 0) * 100).toFixed(0) + '%';
+
+                    // Render Strategy P&L Chart
+                    renderStrategyPnlChart(perf);
                 }
-                
-                // Get microstructure metrics
-                const microResp = await fetch('/api/microstructure/metrics');
-                if (microResp.ok) {
-                    const data = await microResp.json();
-                    
-                    // Update detailed microstructure metrics
-                    if (document.getElementById('ofi-detailed')) {
-                        document.getElementById('ofi-detailed').textContent = data.order_flow_imbalance.current.toFixed(3);
-                    }
-                    if (document.getElementById('book-pressure')) {
-                        document.getElementById('book-pressure').textContent = (data.book_pressure || 0).toFixed(2);
-                    }
-                    if (document.getElementById('tick-direction')) {
-                        document.getElementById('tick-direction').textContent = (data.tick_direction || 0).toFixed(2);
-                    }
-                    if (document.getElementById('ensemble-score')) {
-                        document.getElementById('ensemble-score').textContent = data.ensemble_metrics.combined_score.toFixed(2);
-                    }
-                    
-                    // Update micro signals and win rate if elements exist
-                    if (document.getElementById('micro-signals')) {
-                        document.getElementById('micro-signals').textContent = data.ensemble_metrics.active_signals;
-                    }
-                    if (document.getElementById('micro-winrate')) {
-                        document.getElementById('micro-winrate').textContent = (data.performance.win_rate * 100).toFixed(0) + '%';
-                    }
+
+                // Update allocation section
+                if (allocData) {
+                    const allocs = allocData.allocations || {};
+                    document.getElementById('alloc-ml-pct').textContent = ((allocs['ML Enhanced'] || 0) * 100).toFixed(0) + '%';
+                    document.getElementById('alloc-micro-pct').textContent = ((allocs['Microstructure'] || 0) * 100).toFixed(0) + '%';
+                    document.getElementById('alloc-mr-pct').textContent = ((allocs['Mean Reversion'] || 0) * 100).toFixed(0) + '%';
+                    document.getElementById('alloc-mom-pct').textContent = ((allocs['Momentum'] || 0) * 100).toFixed(0) + '%';
+
+                    document.getElementById('alloc-method').textContent = allocData.method || 'Risk Parity';
+                    document.getElementById('alloc-div-ratio').textContent = (allocData.correlation_matrix?.diversification_ratio || 0).toFixed(2);
+                    document.getElementById('alloc-drift').textContent = ((allocData.rebalance?.drift || 0) * 100).toFixed(1) + '%';
+
+                    // Render pie chart
+                    renderAllocationPieChart(allocs);
                 }
-                
-                // Get portfolio allocation
-                const allocResp = await fetch('/api/portfolio/allocation');
-                if (allocResp.ok) {
-                    const data = await allocResp.json();
-                    document.getElementById('pm-drift').textContent = `${(data.rebalance.drift * 100).toFixed(1)}%`;
-                    document.getElementById('pm-diversification').textContent = data.correlation_matrix.diversification_ratio.toFixed(2);
+
+                // Update execution metrics
+                if (execData) {
+                    document.getElementById('exec-avg-slip').textContent = (execData.avg_slippage || 0).toFixed(1) + ' bps';
+                    document.getElementById('exec-impact').textContent = (execData.market_impact || 0).toFixed(1) + ' bps';
+                    document.getElementById('exec-fill-pct').textContent = ((execData.fill_rate || 0) * 100).toFixed(0) + '%';
+                    document.getElementById('exec-fill-rate').textContent = ((execData.fill_rate || 0) * 100).toFixed(0) + '%';
+                    document.getElementById('exec-total-saved').textContent = (execData.performance?.total_saved_bps || 0).toFixed(1) + ' bps';
+
+                    // Render algo usage chart
+                    renderAlgoUsageChart(execData.algorithms_used || {});
                 }
-                
-                // Get execution status
-                const execResp = await fetch('/api/execution/status');
-                if (execResp.ok) {
-                    const data = await execResp.json();
-                    document.getElementById('exec-filled').textContent = data.orders.completed;
-                    document.getElementById('exec-saved').textContent = `${data.performance.total_saved_bps.toFixed(1)} bps`;
-                }
-                
-                // Get risk management status
-                const riskResp = await fetch('/api/risk/status');
-                if (riskResp.ok) {
-                    const data = await riskResp.json();
-                    
-                    // Update Kelly sizing
-                    if (data.kelly_sizing) {
-                        document.getElementById('portfolio-kelly').textContent = `${(data.kelly_sizing.portfolio_kelly * 100).toFixed(1)}%`;
-                        
-                        // Calculate average win rate
-                        const positions = Object.values(data.kelly_sizing.current_positions);
-                        if (positions.length > 0) {
-                            const avgWinRate = positions.reduce((sum, p) => sum + p.win_rate, 0) / positions.length;
-                            document.getElementById('avg-win-rate').textContent = `${(avgWinRate * 100).toFixed(0)}%`;
-                            
-                            const avgEdge = positions.reduce((sum, p) => sum + p.edge, 0) / positions.length;
-                            document.getElementById('portfolio-edge').textContent = avgEdge.toFixed(3);
-                        }
+
+                // Update risk metrics (keep backward compat)
+                if (riskData) {
+                    if (riskData.kelly_sizing && document.getElementById('portfolio-kelly')) {
+                        document.getElementById('portfolio-kelly').textContent = `${(riskData.kelly_sizing.portfolio_kelly * 100).toFixed(1)}%`;
                     }
-                    
-                    // Update kill switches
-                    if (data.kill_switches) {
-                        const ks = data.kill_switches;
-                        document.getElementById('kill-switch-status').textContent = ks.active ? 'TRIGGERED ⚠️' : 'ACTIVE ✓';
+                    if (riskData.kill_switches && document.getElementById('kill-switch-status')) {
+                        const ks = riskData.kill_switches;
+                        document.getElementById('kill-switch-status').textContent = ks.active ? 'TRIGGERED' : 'ACTIVE';
                         document.getElementById('kill-switch-status').style.color = ks.active ? '#ff6b6b' : '#4CAF50';
-                        
-                        document.getElementById('daily-loss-status').textContent = 
-                            `${(ks.limits.daily_loss.current * 100).toFixed(1)}% / ${(ks.limits.daily_loss.limit * 100).toFixed(0)}%`;
-                        document.getElementById('consecutive-losses').textContent = 
-                            `${ks.limits.consecutive_losses.current} / ${ks.limits.consecutive_losses.limit}`;
-                        document.getElementById('max-dd-status').textContent = 
-                            `${(ks.limits.max_drawdown.current * 100).toFixed(1)}% / ${(ks.limits.max_drawdown.limit * 100).toFixed(0)}%`;
                     }
-                    
-                    // Update correlation limits
-                    if (data.correlation_limits) {
-                        const cl = data.correlation_limits;
-                        document.getElementById('high-corr-count').textContent = `${cl.high_correlations.length} pairs`;
-                        document.getElementById('correlation-status').textContent = 
-                            cl.high_correlations.length > 3 ? 'WARNING' : 'OK';
-                        document.getElementById('correlation-status').style.color = 
-                            cl.high_correlations.length > 3 ? '#FFA500' : '#4CAF50';
-                    }
-                    
-                    // Update risk metrics
-                    if (data.risk_metrics) {
-                        const rm = data.risk_metrics;
+                    if (riskData.risk_metrics && document.getElementById('leverage')) {
+                        const rm = riskData.risk_metrics;
                         document.getElementById('leverage').textContent = `${rm.leverage.toFixed(2)}x`;
-                        document.getElementById('var-95').textContent = formatCurrency(rm.var_95);
-                        document.getElementById('total-exposure').textContent = formatCurrency(rm.total_exposure);
-                        document.getElementById('risk-sharpe').textContent = rm.sharpe_ratio.toFixed(2);
-                        
-                        // Determine risk level
-                        let riskLevel = 'LOW';
-                        let riskColor = '#4CAF50';
-                        if (rm.leverage > 1.5 || Math.abs(rm.max_drawdown) > 0.08) {
-                            riskLevel = 'HIGH';
-                            riskColor = '#ff6b6b';
-                        } else if (rm.leverage > 1.0 || Math.abs(rm.max_drawdown) > 0.05) {
-                            riskLevel = 'MEDIUM';
-                            riskColor = '#FFA500';
-                        }
-                        document.getElementById('risk-level').textContent = riskLevel;
-                        document.getElementById('risk-level').style.color = riskColor;
                     }
                 }
-                
+
             } catch (error) {
                 console.error('Error refreshing strategies:', error);
             }
+        }
+
+        function renderAllocationPieChart(allocations) {
+            const ctx = document.getElementById('allocation-pie-chart');
+            if (!ctx) return;
+
+            const labels = Object.keys(allocations);
+            const data = Object.values(allocations).map(v => v * 100);
+            const colors = ['#667eea', '#4ade80', '#fbbf24', '#f87171'];
+
+            if (allocationPieChart) {
+                allocationPieChart.data.labels = labels;
+                allocationPieChart.data.datasets[0].data = data;
+                allocationPieChart.update('none');
+                return;
+            }
+
+            allocationPieChart = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        data: data,
+                        backgroundColor: colors,
+                        borderWidth: 0
+                    }]
+                },
+                options: {
+                    responsive: false,
+                    maintainAspectRatio: true,
+                    plugins: {
+                        legend: { display: false }
+                    },
+                    cutout: '60%'
+                }
+            });
+        }
+
+        function renderStrategyPnlChart(perf) {
+            const ctx = document.getElementById('strategy-pnl-chart');
+            if (!ctx) return;
+
+            const strategies = ['ML Enhanced', 'Microstructure', 'Smart Exec'];
+            const pnlValues = [
+                perf.ml_enhanced?.pnl || 0,
+                perf.microstructure?.pnl || 0,
+                0  // Smart exec doesn't have P&L, shows saved bps
+            ];
+            const winRates = [
+                (perf.ml_enhanced?.win_rate || 0) * 100,
+                (perf.microstructure?.win_rate || 0) * 100,
+                (perf.smart_execution?.success_rate || 0.95) * 100
+            ];
+
+            if (strategyPnlChart) {
+                strategyPnlChart.data.datasets[0].data = pnlValues;
+                strategyPnlChart.data.datasets[1].data = winRates;
+                strategyPnlChart.update('none');
+                return;
+            }
+
+            strategyPnlChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: strategies,
+                    datasets: [
+                        {
+                            label: 'P&L ($)',
+                            data: pnlValues,
+                            backgroundColor: pnlValues.map(v => v >= 0 ? '#4ade80' : '#f87171'),
+                            yAxisID: 'y'
+                        },
+                        {
+                            label: 'Win Rate (%)',
+                            data: winRates,
+                            backgroundColor: '#60a5fa',
+                            yAxisID: 'y1'
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: true,
+                            position: 'top',
+                            labels: { color: '#8b949e', font: { size: 10 } }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            grid: { color: '#21262d' },
+                            ticks: { color: '#8b949e', font: { size: 10 } }
+                        },
+                        y: {
+                            type: 'linear',
+                            position: 'left',
+                            grid: { color: '#21262d' },
+                            ticks: { color: '#4ade80', font: { size: 10 } },
+                            title: { display: true, text: 'P&L ($)', color: '#4ade80', font: { size: 10 } }
+                        },
+                        y1: {
+                            type: 'linear',
+                            position: 'right',
+                            grid: { display: false },
+                            ticks: { color: '#60a5fa', font: { size: 10 } },
+                            title: { display: true, text: 'Win Rate (%)', color: '#60a5fa', font: { size: 10 } },
+                            min: 0,
+                            max: 100
+                        }
+                    }
+                }
+            });
+        }
+
+        function renderAlgoUsageChart(algoUsage) {
+            const ctx = document.getElementById('algo-usage-chart');
+            if (!ctx) return;
+
+            const labels = Object.keys(algoUsage).map(k => k.toUpperCase());
+            const data = Object.values(algoUsage);
+            const colors = ['#4ade80', '#60a5fa', '#fbbf24', '#a78bfa'];
+
+            if (algoUsageChart) {
+                algoUsageChart.data.labels = labels;
+                algoUsageChart.data.datasets[0].data = data;
+                algoUsageChart.update('none');
+                return;
+            }
+
+            algoUsageChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        data: data,
+                        backgroundColor: colors.slice(0, labels.length),
+                        borderRadius: 4
+                    }]
+                },
+                options: {
+                    indexAxis: 'y',
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false }
+                    },
+                    scales: {
+                        x: {
+                            grid: { color: '#21262d' },
+                            ticks: { color: '#8b949e', font: { size: 9 } }
+                        },
+                        y: {
+                            grid: { display: false },
+                            ticks: { color: '#8b949e', font: { size: 9 } }
+                        }
+                    }
+                }
+            });
         }
         
         // Initialize on load
@@ -4040,6 +4381,59 @@ def ml_status():
     )
 
 
+@app.route("/api/ml/predictions")
+@requires_auth
+def ml_predictions():
+    """Get current ML predictions for all symbols"""
+    from pathlib import Path
+
+    predictions_file = Path("ml_predictions.json")
+    predictions_list = []
+
+    if predictions_file.exists():
+        try:
+            with open(predictions_file) as f:
+                predictions = json.load(f)
+                for symbol, pred in predictions.items():
+                    predictions_list.append(
+                        {
+                            "symbol": symbol,
+                            "signal": pred.get("signal", 0),
+                            "action": pred.get("action", "HOLD"),
+                            "confidence": pred.get("confidence", 0.5),
+                            "source": pred.get("source", "Unknown"),
+                            "timestamp": pred.get("timestamp", ""),
+                        }
+                    )
+        except Exception as e:
+            logger.error(f"Error loading predictions: {e}")
+
+    # Sort by confidence descending
+    predictions_list.sort(key=lambda x: x["confidence"], reverse=True)
+
+    # Calculate summary stats
+    buy_signals = len([p for p in predictions_list if p["action"] == "BUY"])
+    sell_signals = len([p for p in predictions_list if p["action"] == "SELL"])
+    hold_signals = len([p for p in predictions_list if p["action"] == "HOLD"])
+
+    return jsonify(
+        {
+            "predictions": predictions_list,
+            "summary": {
+                "total": len(predictions_list),
+                "buy": buy_signals,
+                "sell": sell_signals,
+                "hold": hold_signals,
+                "avg_confidence": round(
+                    sum(p["confidence"] for p in predictions_list) / len(predictions_list), 3
+                )
+                if predictions_list
+                else 0,
+            },
+        }
+    )
+
+
 @app.route("/api/performance")
 @requires_auth
 def performance():
@@ -4056,45 +4450,69 @@ def performance():
         if not all_trades and not positions:
             return jsonify({"error": "No trades or positions found", "summary": {}})
 
-        # Calculate PnL from positions (unrealized)
+        # Load watchlist cache for current prices
+        watchlist_prices = {}
+        try:
+            with open("watchlist_cache.json", "r") as f:
+                cache = json.load(f)
+                for symbol, data in cache.items():
+                    if isinstance(data, dict) and "price" in data:
+                        watchlist_prices[symbol] = data["price"]
+                    elif isinstance(data, (int, float)):
+                        watchlist_prices[symbol] = data
+        except Exception:
+            pass
+
+        # Calculate unrealized PnL from positions
         unrealized_pnl = 0
+        position_value = 0
         for pos in positions:
             qty = pos.get("quantity", 0)
+            symbol = pos.get("symbol", "")
             if qty > 0:
                 avg_cost = pos.get("avg_cost", 0)
-                market_price = pos.get("market_price", avg_cost)  # Use avg_cost if no market price
+                # Use watchlist price if available, otherwise market_price, then avg_cost
+                current_price = watchlist_prices.get(symbol, pos.get("market_price", avg_cost))
                 if avg_cost > 0:
-                    # Calculate unrealized PnL
-                    position_pnl = (market_price - avg_cost) * qty
+                    position_pnl = (current_price - avg_cost) * qty
                     unrealized_pnl += position_pnl
+                    position_value += current_price * qty
 
-        # Calculate realized PnL from SELL trades
+        # Calculate realized PnL by matching BUY/SELL trades per symbol
         realized_pnl = 0
-        sell_trades = [t for t in all_trades if t.get("side") == "SELL"]
-        for trade in sell_trades:
-            # Assume 1% profit on sells (simplified)
-            trade_value = trade.get("quantity", 0) * trade.get("price", 0)
-            realized_pnl += trade_value * 0.01
+        symbol_costs = {}  # Track avg cost per symbol from BUY trades
+        winning_count = 0
+        losing_count = 0
 
-        # Total P&L is unrealized + realized
+        for trade in sorted(all_trades, key=lambda x: x["timestamp"]):
+            symbol = trade.get("symbol", "")
+            side = trade.get("side", "")
+            qty = trade.get("quantity", 0)
+            price = trade.get("price", 0)
+
+            if side == "BUY":
+                # Track cost basis
+                if symbol not in symbol_costs:
+                    symbol_costs[symbol] = {"qty": 0, "cost": 0}
+                symbol_costs[symbol]["qty"] += qty
+                symbol_costs[symbol]["cost"] += qty * price
+            elif side == "SELL":
+                # Calculate realized PnL
+                if symbol in symbol_costs and symbol_costs[symbol]["qty"] > 0:
+                    avg_cost = symbol_costs[symbol]["cost"] / symbol_costs[symbol]["qty"]
+                    trade_pnl = (price - avg_cost) * qty
+                    realized_pnl += trade_pnl
+                    if trade_pnl > 0:
+                        winning_count += 1
+                    else:
+                        losing_count += 1
+                    # Reduce cost basis
+                    symbol_costs[symbol]["qty"] -= qty
+                    symbol_costs[symbol]["cost"] -= avg_cost * qty
+
         total_pnl = unrealized_pnl + realized_pnl
-
-        # Calculate win rate from SELL trades (since we track those as realized P&L)
-        winning_trades = []
-        losing_trades = []
-        if all_trades:
-            # Count SELL trades as wins if we made profit (using our 1% assumption)
-            sell_count = len([t for t in all_trades if t.get("side") == "SELL"])
-            # For now, consider all sells as winning trades since we assume 1% profit
-            winning_trades = [t for t in all_trades if t.get("side") == "SELL"]
-            # The rest are either losing or neutral (BUY trades still open)
-            losing_trades = [t for t in all_trades if t.get("side") != "SELL"]
-
-        # Win rate based on closed trades only (SELL trades)
-        closed_trades = len(winning_trades) + len(
-            [t for t in losing_trades if t.get("side") == "SELL"]
-        )
-        win_rate = len(winning_trades) / closed_trades if closed_trades > 0 else 0
+        total_trades_closed = winning_count + losing_count
+        win_rate = winning_count / total_trades_closed if total_trades_closed > 0 else 0
 
         # Calculate returns for different periods
         now = datetime.now()
@@ -4114,105 +4532,120 @@ def performance():
             if datetime.fromisoformat(t["timestamp"].replace(" ", "T")) > now - timedelta(days=30)
         ]
 
-        # Calculate period returns
-        daily_pnl = sum(t.get("pnl", 0) for t in daily_trades if t.get("pnl") is not None)
-        weekly_pnl = sum(t.get("pnl", 0) for t in weekly_trades if t.get("pnl") is not None)
-        monthly_pnl = sum(t.get("pnl", 0) for t in monthly_trades if t.get("pnl") is not None)
+        # Estimate capital (position value + 20% cash buffer)
+        estimated_capital = position_value * 1.2 if position_value > 0 else 100000
 
-        # Get total capital for return calculations (approximate from trade volumes)
-        # Calculate average trade size from quantity * price
-        total_trade_value = 0
-        for trade in all_trades:
-            trade_value = trade.get("quantity", 0) * trade.get("price", 0)
-            total_trade_value += trade_value
+        # Calculate period PnL by matching trades in each period
+        def calc_period_pnl(trades):
+            pnl = 0
+            costs = {}
+            for trade in sorted(trades, key=lambda x: x["timestamp"]):
+                symbol, side = trade.get("symbol", ""), trade.get("side", "")
+                qty, price = trade.get("quantity", 0), trade.get("price", 0)
+                if side == "BUY":
+                    if symbol not in costs:
+                        costs[symbol] = {"qty": 0, "cost": 0}
+                    costs[symbol]["qty"] += qty
+                    costs[symbol]["cost"] += qty * price
+                elif side == "SELL" and symbol in costs and costs[symbol]["qty"] > 0:
+                    avg = costs[symbol]["cost"] / costs[symbol]["qty"]
+                    pnl += (price - avg) * qty
+            return pnl
 
-        avg_trade_size = total_trade_value / len(all_trades) if all_trades else 100000
-        # Estimate capital as sum of all position values plus some cash buffer
-        position_value = sum(
-            pos.get("quantity", 0) * pos.get("market_price", pos.get("avg_cost", 0))
-            for pos in positions
-        )
-        estimated_capital = (
-            position_value * 1.2 if position_value > 0 else 100000
-        )  # 20% cash buffer assumption
+        daily_pnl = calc_period_pnl(daily_trades)
+        weekly_pnl = calc_period_pnl(weekly_trades)
+        monthly_pnl = calc_period_pnl(monthly_trades)
 
-        # Calculate Sharpe ratio (simplified)
-        if all_trades:
-            returns = [
-                t.get("pnl", 0) / avg_trade_size for t in all_trades if t.get("pnl") is not None
-            ]
-            if returns:
-                avg_return = np.mean(returns)
-                std_return = np.std(returns) if len(returns) > 1 else 0.01
-                sharpe = (avg_return * 252) / (std_return * np.sqrt(252)) if std_return > 0 else 0
-            else:
-                sharpe = 0
-        else:
-            sharpe = 0
-
-        # Calculate max drawdown
-        cumulative_pnl = 0
-        peak_pnl = 0
-        max_dd = 0
+        # Build equity curve for volatility/sharpe/drawdown calculations
+        equity_curve = []
+        cumulative = 0
+        costs = {}
         for trade in sorted(all_trades, key=lambda x: x["timestamp"]):
-            trade_pnl = trade.get("pnl", 0)
-            cumulative_pnl += trade_pnl
-            if cumulative_pnl > peak_pnl:
-                peak_pnl = cumulative_pnl
-            drawdown = (cumulative_pnl - peak_pnl) / peak_pnl if peak_pnl > 0 else 0
-            max_dd = min(max_dd, drawdown)
+            symbol, side = trade.get("symbol", ""), trade.get("side", "")
+            qty, price = trade.get("quantity", 0), trade.get("price", 0)
+            if side == "BUY":
+                if symbol not in costs:
+                    costs[symbol] = {"qty": 0, "cost": 0}
+                costs[symbol]["qty"] += qty
+                costs[symbol]["cost"] += qty * price
+            elif side == "SELL" and symbol in costs and costs[symbol]["qty"] > 0:
+                avg = costs[symbol]["cost"] / costs[symbol]["qty"]
+                trade_pnl = (price - avg) * qty
+                cumulative += trade_pnl
+                equity_curve.append(cumulative)
+                costs[symbol]["qty"] -= qty
+                costs[symbol]["cost"] -= avg * qty
+
+        # Calculate metrics from equity curve
+        if len(equity_curve) > 1:
+            returns = np.diff(equity_curve)
+            avg_return = np.mean(returns)
+            std_return = np.std(returns) if len(returns) > 1 else 0.01
+            volatility = std_return
+            sharpe = (avg_return * np.sqrt(252)) / std_return if std_return > 0 else 0
+
+            # Max drawdown
+            peak = equity_curve[0]
+            max_dd = 0
+            for val in equity_curve:
+                if val > peak:
+                    peak = val
+                dd = (val - peak) / peak if peak > 0 else 0
+                max_dd = min(max_dd, dd)
+        else:
+            volatility, sharpe, max_dd = 0, 0, 0
 
         return jsonify(
             {
                 "summary": {
-                    "total_return": (
-                        round(total_pnl / estimated_capital, 4) if estimated_capital > 0 else 0
-                    ),
+                    "total_return": round(total_pnl / estimated_capital, 4)
+                    if estimated_capital > 0
+                    else 0,
                     "total_pnl": round(total_pnl, 2),
                     "total_sharpe": round(sharpe, 2),
                     "total_drawdown": round(max_dd, 4),
                     "win_rate": round(win_rate, 3),
                     "total_trades": len(all_trades),
-                    "winning_trades": len(winning_trades),
-                    "losing_trades": len(losing_trades),
+                    "winning_trades": winning_count,
+                    "losing_trades": losing_count,
                 },
                 "daily": {
-                    "return_pct": (
-                        round(daily_pnl / estimated_capital, 4) if estimated_capital > 0 else 0
-                    ),
+                    "return_pct": round(daily_pnl / estimated_capital, 4)
+                    if estimated_capital > 0
+                    else 0,
                     "pnl": round(daily_pnl, 2),
                     "trades": len(daily_trades),
-                    "volatility": 0,  # Not calculated yet
-                    "sharpe": 0,  # Not calculated yet
-                    "max_drawdown": 0,  # Not calculated yet
+                    "volatility": round(volatility, 4),
+                    "sharpe": round(sharpe, 2),
+                    "max_drawdown": round(max_dd, 4),
                 },
                 "weekly": {
-                    "return_pct": (
-                        round(weekly_pnl / estimated_capital, 4) if estimated_capital > 0 else 0
-                    ),
+                    "return_pct": round(weekly_pnl / estimated_capital, 4)
+                    if estimated_capital > 0
+                    else 0,
                     "pnl": round(weekly_pnl, 2),
                     "trades": len(weekly_trades),
-                    "volatility": 0,  # Not calculated yet
-                    "sharpe": 0,  # Not calculated yet
-                    "max_drawdown": 0,  # Not calculated yet
+                    "volatility": round(volatility, 4),
+                    "sharpe": round(sharpe, 2),
+                    "max_drawdown": round(max_dd, 4),
                 },
                 "monthly": {
-                    "return_pct": (
-                        round(monthly_pnl / estimated_capital, 4) if estimated_capital > 0 else 0
-                    ),
+                    "return_pct": round(monthly_pnl / estimated_capital, 4)
+                    if estimated_capital > 0
+                    else 0,
                     "pnl": round(monthly_pnl, 2),
                     "trades": len(monthly_trades),
-                    "volatility": 0,  # Not calculated yet
-                    "sharpe": 0,  # Not calculated yet
-                    "max_drawdown": 0,  # Not calculated yet
+                    "volatility": round(volatility, 4),
+                    "sharpe": round(sharpe, 2),
+                    "max_drawdown": round(max_dd, 4),
                 },
                 "all": {
-                    "return_pct": (
-                        round(total_pnl / estimated_capital, 4) if estimated_capital > 0 else 0
-                    ),
+                    "return_pct": round(total_pnl / estimated_capital, 4)
+                    if estimated_capital > 0
+                    else 0,
                     "pnl": round(total_pnl, 2),
                     "trades": len(all_trades),
-                    "volatility": round(std_return if "std_return" in locals() else 0, 3),
+                    "volatility": round(volatility, 4),
                     "sharpe": round(sharpe, 2),
                     "max_drawdown": round(max_dd, 4),
                 },
@@ -4220,7 +4653,65 @@ def performance():
         )
     except Exception as e:
         logger.error(f"Error calculating performance: {e}")
+        import traceback
+
+        traceback.print_exc()
         return jsonify({"error": str(e), "summary": {}})
+
+
+@app.route("/api/equity-curve")
+@requires_auth
+def equity_curve():
+    """Get equity curve data for charting"""
+    try:
+        from sync_db_reader import SyncDatabaseReader
+
+        db = SyncDatabaseReader()
+        all_trades = db.get_recent_trades(limit=1000)
+
+        if not all_trades:
+            return jsonify({"labels": [], "values": [], "pnl_by_trade": []})
+
+        # Build equity curve by matching BUY/SELL trades
+        equity_data = []
+        cumulative = 0
+        costs = {}
+
+        for trade in sorted(all_trades, key=lambda x: x["timestamp"]):
+            symbol = trade.get("symbol", "")
+            side = trade.get("side", "")
+            qty = trade.get("quantity", 0)
+            price = trade.get("price", 0)
+            timestamp = trade.get("timestamp", "")
+
+            if side == "BUY":
+                if symbol not in costs:
+                    costs[symbol] = {"qty": 0, "cost": 0}
+                costs[symbol]["qty"] += qty
+                costs[symbol]["cost"] += qty * price
+            elif side == "SELL" and symbol in costs and costs[symbol]["qty"] > 0:
+                avg = costs[symbol]["cost"] / costs[symbol]["qty"]
+                trade_pnl = (price - avg) * qty
+                cumulative += trade_pnl
+                equity_data.append(
+                    {
+                        "timestamp": timestamp,
+                        "pnl": round(trade_pnl, 2),
+                        "cumulative": round(cumulative, 2),
+                        "symbol": symbol,
+                    }
+                )
+                costs[symbol]["qty"] -= qty
+                costs[symbol]["cost"] -= avg * qty
+
+        # Format for Chart.js
+        labels = [d["timestamp"][:10] for d in equity_data]  # Just date
+        values = [d["cumulative"] for d in equity_data]
+
+        return jsonify({"labels": labels, "values": values, "pnl_by_trade": equity_data})
+    except Exception as e:
+        logger.error(f"Error getting equity curve: {e}")
+        return jsonify({"labels": [], "values": [], "pnl_by_trade": []})
 
 
 @app.route("/api/trades")
