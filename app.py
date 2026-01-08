@@ -13,8 +13,10 @@ import subprocess
 import threading
 import time
 from datetime import datetime, timedelta
+from decimal import Decimal
 from functools import wraps
 from pathlib import Path
+from typing import Dict
 
 import numpy as np
 import pandas as pd
@@ -3726,48 +3728,78 @@ def get_pnl():
         # Get positions for P&L calculation
         positions = db.get_positions()
 
-        # Calculate total unrealized P&L from positions
-        unrealized_pnl = 0
+        # Calculate total unrealized P&L from positions using Decimal
+        unrealized_pnl = Decimal("0")
         for pos in positions:
-            qty = pos.get("quantity", 0)
+            qty = Decimal(str(pos.get("quantity", 0)))
             if qty > 0:
-                avg_cost = pos.get("avg_cost", 0)
-                market_price = pos.get("market_price", avg_cost)
+                avg_cost = Decimal(str(pos.get("avg_cost", 0)))
+                market_price = Decimal(str(pos.get("market_price", avg_cost)))
                 if avg_cost > 0:
                     unrealized_pnl += (market_price - avg_cost) * qty
 
-        # Get trades for realized P&L (simplified - assumes sells are realized gains)
+        # Get trades for realized P&L using proper position tracking
         trades = db.get_recent_trades(limit=1000)
-        realized_pnl = 0
-        daily_pnl = 0
-
-        # Simple realized P&L from SELL trades
-
         today = datetime.now().date()
 
-        for trade in trades:
-            if trade.get("side") == "SELL":
-                # Assume 1% profit on sells (simplified)
-                trade_value = trade.get("quantity", 0) * trade.get("price", 0)
-                profit = trade_value * 0.01
-                realized_pnl += profit
+        # Track positions to calculate actual realized P&L (FIFO cost basis)
+        position_tracker: Dict[str, Dict] = {}
+        realized_pnl = Decimal("0")
+        daily_pnl = Decimal("0")
 
-                # Check if trade is from today
-                trade_time = trade.get("timestamp", "")
-                if trade_time:
-                    trade_date = datetime.fromisoformat(trade_time.replace(" ", "T")).date()
-                    if trade_date == today:
-                        daily_pnl += profit
+        # Sort trades chronologically for correct cost basis tracking
+        sorted_trades = sorted(trades, key=lambda x: x.get("timestamp", ""))
+
+        for trade in sorted_trades:
+            symbol = trade.get("symbol", "")
+            side = trade.get("side", "")
+            qty = Decimal(str(trade.get("quantity", 0)))
+            price = Decimal(str(trade.get("price", 0)))
+            trade_time = trade.get("timestamp", "")
+
+            if not symbol:
+                continue
+
+            # Initialize position tracker for this symbol
+            if symbol not in position_tracker:
+                position_tracker[symbol] = {"quantity": Decimal("0"), "avg_cost": Decimal("0")}
+
+            pos = position_tracker[symbol]
+
+            if side == "BUY":
+                # Update average cost using weighted average
+                total_cost = pos["avg_cost"] * pos["quantity"] + price * qty
+                pos["quantity"] += qty
+                if pos["quantity"] > 0:
+                    pos["avg_cost"] = total_cost / pos["quantity"]
+
+            elif side == "SELL":
+                # Calculate realized profit on this sale
+                if pos["quantity"] > 0 and pos["avg_cost"] > 0:
+                    sell_qty = min(qty, pos["quantity"])
+                    profit = (price - pos["avg_cost"]) * sell_qty
+                    realized_pnl += profit
+                    pos["quantity"] -= sell_qty
+
+                    # Track daily P&L
+                    if trade_time:
+                        try:
+                            trade_date = datetime.fromisoformat(trade_time.replace(" ", "T")).date()
+                            if trade_date == today:
+                                daily_pnl += profit
+                        except ValueError:
+                            pass  # Skip if timestamp parsing fails
 
         # Total P&L is unrealized + realized
         total_pnl = unrealized_pnl + realized_pnl
 
+        # Convert Decimal to float for JSON serialization
         return jsonify(
             {
-                "total": round(total_pnl, 2),
-                "unrealized": round(unrealized_pnl, 2),
-                "realized": round(realized_pnl, 2),
-                "daily": round(daily_pnl, 2),
+                "total": float(round(total_pnl, 2)),
+                "unrealized": float(round(unrealized_pnl, 2)),
+                "realized": float(round(realized_pnl, 2)),
+                "daily": float(round(daily_pnl, 2)),
             }
         )
 
@@ -5662,11 +5694,11 @@ def get_logs():
     log_file = "robo_trader.log"
 
     try:
-        # Read last 100 lines from log file
+        # Read last 5000 lines from log file to get past repetitive warnings
         with open(log_file, "r") as f:
-            # Get last 100 lines efficiently
+            # Get last 5000 lines efficiently
             lines = f.readlines()
-            recent_lines = lines[-100:] if len(lines) > 100 else lines
+            recent_lines = lines[-5000:] if len(lines) > 5000 else lines
 
             for line in recent_lines:
                 try:
@@ -5705,18 +5737,29 @@ def get_logs():
                     else:
                         event_msg = message
 
+                    # Skip repetitive correlation warnings (keep only 1)
+                    if "Not enough symbols with sufficient data for correlation" in event_msg:
+                        if hasattr(get_logs, "_seen_correlation_warning"):
+                            continue
+                        get_logs._seen_correlation_warning = True
+
                     # Format log entry for display
                     if timestamp and event_msg:
                         logs.append(f"{timestamp} - {event_msg}")
                 except json.JSONDecodeError:
                     # Handle non-JSON log lines
                     logs.append(line.strip())
+
+        # Reset correlation warning flag for next request
+        if hasattr(get_logs, "_seen_correlation_warning"):
+            delattr(get_logs, "_seen_correlation_warning")
+
     except FileNotFoundError:
         logs.append("Log file not found")
     except Exception as e:
         logs.append(f"Error reading logs: {str(e)}")
 
-    # Return logs in reverse order (newest first)
+    # Return logs in reverse order (newest first), max 100
     return jsonify({"logs": list(reversed(logs[-100:]))})
 
 

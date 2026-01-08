@@ -397,3 +397,92 @@ python3 test_safety_features.py
 - Test all changes with paper trading before live
 - Document major changes in handoff documents
 - Use `./START_TRADER.sh` for all startup - it handles Gateway automatically
+
+---
+
+## Common Mistakes (Auto-Updated)
+
+**When Claude makes an error, add it here so it won't repeat.**
+
+### Type Errors
+| Mistake | Correct Approach | Date |
+|---------|-----------------|------|
+| Using `price` (Decimal) in float division | Use `price_float` for calculations | 2025-12-29 |
+| Market close at 4:30 PM | Close is 4:00 PM ET (`time(16, 0)`) | 2025-12-29 |
+| Int/datetime comparison | Ensure both operands are same type | 2025-12-29 |
+
+### Connection & Socket Errors
+| Mistake | Correct Approach | Date |
+|---------|-----------------|------|
+| Using `socket.connect_ex()` for port check | Use `lsof -nP -iTCP:PORT -sTCP:LISTEN` | 2025-12-06 |
+| Not checking for zombies before connect | Check CLOSE_WAIT connections first | 2025-11-24 |
+| Reading subprocess stdout too early | Wait for `isConnected()` polling loop | 2025-11-24 |
+
+### Async/Await Errors
+| Mistake | Correct Approach | Date |
+|---------|-----------------|------|
+| `run_in_executor` with timeout for stdin | Use dedicated reader thread with queue | 2025-12-24 |
+| Cancelling futures with blocking threads | Thread continues even after cancel | 2025-12-24 |
+
+### Trading Logic Errors
+| Mistake | Correct Approach | Date |
+|---------|-----------------|------|
+| Float precision in position sizing | Use `Decimal` for all financial math | 2025-09-28 |
+| Hardcoding market hours | Use `MarketHours` class | 2025-12-29 |
+| Assuming fixed % profit on sells | Track cost basis with position tracker (FIFO) | 2026-01-06 |
+| P&L dashboard using float | Use `Decimal` for all P&L calculations | 2026-01-06 |
+
+---
+
+## Verification Checklist
+
+**Before any PR, verify:**
+- [ ] `python3 -m pytest tests/` passes
+- [ ] `python3 -m black --check .` passes
+- [ ] `python3 -m flake8 .` passes
+- [ ] `./scripts/run_bugbot.sh` finds no critical issues
+- [ ] `lsof -nP -iTCP:4002 -sTCP:CLOSE_WAIT` shows no zombies
+- [ ] Manual test of affected functionality
+
+---
+
+## Slash Commands (Boris Cherny Style)
+
+Run these with `/command` in Claude Code:
+
+| Command | Purpose |
+|---------|---------|
+| `/review` | Multi-subagent code review (4 reviewers + 2 verifiers) |
+| `/test-and-commit` | Run tests, fix if failing, then commit |
+| `/verify-trading` | Check Gateway, zombies, risk params, logs |
+| `/pr` | Full PR workflow with tests and linting |
+| `/commit` | Quick commit with proper format |
+| `/code-simplifier` | Review and simplify recent code |
+| `/oncall-debug` | Debug production issues systematically |
+
+---
+
+## Two-Phase Development Loop
+
+**Phase 1: Planning**
+1. Enter Plan Mode: `Shift+Tab` twice
+2. Iterate on the plan until satisfied
+3. A good plan is critical for success
+
+**Phase 2: Execution**
+1. Switch to auto-accept mode
+2. Claude executes the plan
+3. Use verification loops to ensure quality
+
+---
+
+## Adding New Mistakes
+
+When Claude makes an error:
+
+1. **Identify the root cause**
+2. **Add to table above** with:
+   - What went wrong
+   - Correct approach
+   - Date discovered
+3. **Commit the update** so all future sessions learn

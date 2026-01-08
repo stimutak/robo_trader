@@ -1,0 +1,36 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/Users/oliver/robo_trader"
+      ],
+      "description": "File system access for robo_trader project"
+    },
+    "memory": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-memory"
+      ],
+      "description": "Persistent memory for session context"
+    }
+  },
+  "futureIntegrations": {
+    "_comment": "Planned MCP integrations for future setup",
+    "slack": {
+      "purpose": "Trading alerts and notifications",
+      "setup": "Requires Slack app with bot token"
+    },
+    "postgres": {
+      "purpose": "Trade history and analytics queries",
+      "setup": "Requires database connection string"
+    },
+    "prometheus": {
+      "purpose": "System metrics and monitoring",
+      "setup": "Requires Prometheus endpoint"
+    }
+  }
+}
