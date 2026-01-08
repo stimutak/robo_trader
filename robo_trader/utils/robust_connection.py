@@ -575,6 +575,7 @@ class RobustConnectionManager:
         jitter: bool = True,
         circuit_breaker_config: Optional[CircuitBreakerConfig] = None,
         port: int = 4002,
+        enable_health_monitor: bool = False,  # Disabled by default for per-cycle connections
     ):
         """
         Initialize robust connection manager.
@@ -587,6 +588,7 @@ class RobustConnectionManager:
             jitter: Add random jitter to prevent thundering herd
             circuit_breaker_config: Circuit breaker configuration
             port: Port for zombie connection cleanup (default 4002 for Gateway paper, 7497 for TWS)
+            enable_health_monitor: Enable background health monitoring (default False for per-cycle connections)
         """
         self.connect_func = connect_func
         self.max_retries = max_retries
@@ -594,6 +596,7 @@ class RobustConnectionManager:
         self.max_delay = max_delay
         self.jitter = jitter
         self.port = port
+        self.enable_health_monitor = enable_health_monitor
 
         # Circuit breaker
         config = circuit_breaker_config or CircuitBreakerConfig()
@@ -729,8 +732,10 @@ class RobustConnectionManager:
 
                     logger.info("✅ Connection established successfully")
 
-                    # Start health monitoring
-                    self._start_health_monitor()
+                    # Start health monitoring only if enabled
+                    # (disabled by default for per-cycle connections to avoid orphaned monitors)
+                    if self.enable_health_monitor:
+                        self._start_health_monitor()
 
                     return self.connection
 

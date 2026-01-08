@@ -2,10 +2,67 @@
 Market hours utilities for checking if the stock market is open.
 """
 
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Optional, Tuple
 
 import pytz
+
+# Early close days (1:00 PM ET) - month, day tuples
+# Note: These vary by year - check NYSE calendar for specifics
+EARLY_CLOSE_DAYS = [
+    (7, 3),  # Day before Independence Day (if July 4 is not weekend)
+    (12, 24),  # Christmas Eve (when it falls on a weekday)
+    # Note: Dec 31, 2025 is NOT an early close day per NYSE calendar
+    # Note: Black Friday (day after Thanksgiving) is dynamic, handled separately
+]
+
+# Full market holidays - month, day tuples (fixed dates only)
+MARKET_HOLIDAYS = [
+    (1, 1),  # New Year's Day
+    (7, 4),  # Independence Day
+    (12, 25),  # Christmas Day
+    # Note: Other holidays (MLK, Presidents, Memorial, Labor, Thanksgiving) are dynamic
+]
+
+
+def _is_early_close_day(dt: datetime) -> bool:
+    """Check if the given date is an early close day (1:00 PM ET close)."""
+    month_day = (dt.month, dt.day)
+
+    # Check fixed early close days
+    if month_day in EARLY_CLOSE_DAYS:
+        return True
+
+    # Check for Black Friday (4th Friday of November)
+    if dt.month == 11 and dt.weekday() == 4:  # Friday in November
+        # Count Fridays in November up to this date
+        first_day = dt.replace(day=1)
+        friday_count = sum(1 for d in range(1, dt.day + 1) if dt.replace(day=d).weekday() == 4)
+        if friday_count == 4:  # 4th Friday
+            return True
+
+    return False
+
+
+def _is_market_holiday(dt: datetime) -> bool:
+    """Check if the given date is a market holiday."""
+    month_day = (dt.month, dt.day)
+
+    # Check fixed holidays
+    if month_day in MARKET_HOLIDAYS:
+        return True
+
+    # TODO: Add dynamic holidays (MLK, Presidents, Memorial, Labor, Thanksgiving)
+    # For now, just handle the fixed ones
+
+    return False
+
+
+def _get_market_close_time(dt: datetime) -> time:
+    """Get the market close time for a given date."""
+    if _is_early_close_day(dt):
+        return time(13, 0)  # 1:00 PM ET on early close days
+    return time(16, 0)  # 4:00 PM ET normally
 
 
 def is_market_open(dt: Optional[datetime] = None) -> bool:
@@ -31,9 +88,13 @@ def is_market_open(dt: Optional[datetime] = None) -> bool:
     if dt.weekday() >= 5:  # Saturday or Sunday
         return False
 
-    # Check time (9:30 AM - 4:00 PM Eastern)
+    # Check for market holidays
+    if _is_market_holiday(dt):
+        return False
+
+    # Check time (9:30 AM - close time, which varies by day)
     market_open = time(9, 30)
-    market_close = time(16, 0)
+    market_close = _get_market_close_time(dt)
     current_time = dt.time()
 
     return market_open <= current_time < market_close
@@ -63,14 +124,18 @@ def is_extended_hours(dt: Optional[datetime] = None) -> bool:
     if dt.weekday() >= 5:  # Weekend
         return False
 
+    # Check for market holidays
+    if _is_market_holiday(dt):
+        return False
+
     current_time = dt.time()
 
     # Pre-market: 4:00 AM - 9:30 AM
     pre_market_start = time(4, 0)
     pre_market_end = time(9, 30)
 
-    # After-hours: 4:00 PM - 8:00 PM
-    after_hours_start = time(16, 0)  # Starts when regular hours end
+    # After-hours: starts when regular hours end (varies by day)
+    after_hours_start = _get_market_close_time(dt)
     after_hours_end = time(20, 0)
 
     return (
@@ -100,12 +165,16 @@ def get_market_session(dt: Optional[datetime] = None) -> str:
     if dt.weekday() >= 5:
         return "closed"
 
+    # Check for market holidays
+    if _is_market_holiday(dt):
+        return "closed"
+
     current_time = dt.time()
 
-    # Define market hours
+    # Define market hours (close time varies by day)
     pre_market_start = time(4, 0)
     regular_start = time(9, 30)
-    regular_end = time(16, 0)  # Market closes at 4:00 PM ET
+    regular_end = _get_market_close_time(dt)  # 1:00 PM on early close days, 4:00 PM otherwise
     after_hours_end = time(20, 0)
 
     if pre_market_start <= current_time < regular_start:
