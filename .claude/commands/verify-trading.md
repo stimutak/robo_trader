@@ -2,7 +2,28 @@
 
 Comprehensive verification of the trading system health and readiness.
 
-## Step 1: Gateway Status
+## Step 1: Process Status Check
+
+```bash
+ps aux | grep -E "(runner_async|app.py|websocket_server)" | grep -v grep
+```
+
+**Required processes:**
+- `runner_async` - Main trading engine (CRITICAL)
+- `websocket_server` - Real-time updates
+- `app.py` - Dashboard
+
+If `runner_async` is NOT running, start it:
+```bash
+nohup python3 -m robo_trader.runner_async > robo_trader.log 2>&1 &
+```
+
+Or use the full startup script:
+```bash
+./START_TRADER.sh
+```
+
+## Step 2: Gateway Status
 
 ```bash
 python3 scripts/gateway_manager.py status
@@ -10,7 +31,7 @@ python3 scripts/gateway_manager.py status
 
 Expected output shows Gateway running on correct port.
 
-## Step 2: Zombie Connection Check
+## Step 3: Zombie Connection Check
 
 ```bash
 lsof -nP -iTCP:4002 -sTCP:CLOSE_WAIT
@@ -25,7 +46,7 @@ pkill -9 -f "runner_async" && pkill -9 -f "app.py"
 python3 scripts/gateway_manager.py restart
 ```
 
-## Step 3: Risk Parameters Validation
+## Step 4: Risk Parameters Validation
 
 Check `.env` for required safety configs:
 - `MAX_OPEN_POSITIONS` - Should be set (default: 10)
@@ -33,15 +54,15 @@ Check `.env` for required safety configs:
 - `MAX_POSITION_SIZE` - Should be set
 - `EXECUTION_MODE` - Should be `paper` for testing
 
-## Step 4: Safety Feature Tests
+## Step 5: Safety Feature Tests
 
 ```bash
-python3 test_safety_features.py
+/Users/oliver/robo_trader/venv/bin/python3 -m pytest tests/test_safety_features.py -v
 ```
 
 All tests should pass.
 
-## Step 5: Market Hours Logic
+## Step 6: Market Hours Logic
 
 ```bash
 python3 -c "from robo_trader.market_hours import is_market_open, get_market_session; print(f'Market open: {is_market_open()}'); print(f'Current session: {get_market_session()}')"
@@ -52,7 +73,7 @@ Verify market state matches actual NYSE hours:
 - Pre-market: 4:00 AM - 9:30 AM ET
 - After-hours: 4:00 PM - 8:00 PM ET
 
-## Step 6: Recent Logs Check
+## Step 7: Recent Logs Check
 
 ```bash
 tail -50 robo_trader.log | grep -E "(ERROR|CRITICAL|Exception)"
@@ -69,6 +90,7 @@ Report format:
 
 | Check | Status | Notes |
 |-------|--------|-------|
+| Processes | ✅/❌ | runner_async, websocket_server, app.py |
 | Gateway | ✅/❌ | Port 4002 |
 | Zombies | ✅/❌ | Count: X |
 | Risk Params | ✅/❌ | |
@@ -78,3 +100,5 @@ Report format:
 
 **Overall Status:** READY / NOT READY
 ```
+
+**CRITICAL:** If `runner_async` is not running, status is NOT READY regardless of other checks.
