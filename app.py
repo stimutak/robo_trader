@@ -4532,15 +4532,17 @@ def performance():
                 # Calculate realized PnL
                 if symbol in symbol_costs and symbol_costs[symbol]["qty"] > 0:
                     avg_cost = symbol_costs[symbol]["cost"] / symbol_costs[symbol]["qty"]
-                    trade_pnl = (price - avg_cost) * qty
+                    # Cap sell quantity at held quantity to handle orphaned sells
+                    sell_qty = min(qty, symbol_costs[symbol]["qty"])
+                    trade_pnl = (price - avg_cost) * sell_qty
                     realized_pnl += trade_pnl
                     if trade_pnl > 0:
                         winning_count += 1
                     else:
                         losing_count += 1
                     # Reduce cost basis
-                    symbol_costs[symbol]["qty"] -= qty
-                    symbol_costs[symbol]["cost"] -= avg_cost * qty
+                    symbol_costs[symbol]["qty"] -= sell_qty
+                    symbol_costs[symbol]["cost"] -= avg_cost * sell_qty
 
         total_pnl = unrealized_pnl + realized_pnl
         total_trades_closed = winning_count + losing_count
@@ -4581,7 +4583,11 @@ def performance():
                     costs[symbol]["cost"] += qty * price
                 elif side == "SELL" and symbol in costs and costs[symbol]["qty"] > 0:
                     avg = costs[symbol]["cost"] / costs[symbol]["qty"]
-                    pnl += (price - avg) * qty
+                    # Cap sell at held quantity to handle orphaned sells
+                    sell_qty = min(qty, costs[symbol]["qty"])
+                    pnl += (price - avg) * sell_qty
+                    costs[symbol]["qty"] -= sell_qty
+                    costs[symbol]["cost"] -= avg * sell_qty
             return pnl
 
         daily_pnl = calc_period_pnl(daily_trades)
@@ -4602,11 +4608,13 @@ def performance():
                 costs[symbol]["cost"] += qty * price
             elif side == "SELL" and symbol in costs and costs[symbol]["qty"] > 0:
                 avg = costs[symbol]["cost"] / costs[symbol]["qty"]
-                trade_pnl = (price - avg) * qty
+                # Cap sell at held quantity to handle orphaned sells
+                sell_qty = min(qty, costs[symbol]["qty"])
+                trade_pnl = (price - avg) * sell_qty
                 cumulative += trade_pnl
                 equity_curve.append(cumulative)
-                costs[symbol]["qty"] -= qty
-                costs[symbol]["cost"] -= avg * qty
+                costs[symbol]["qty"] -= sell_qty
+                costs[symbol]["cost"] -= avg * sell_qty
 
         # Calculate metrics from equity curve
         if len(equity_curve) > 1:
