@@ -1165,6 +1165,15 @@ class AsyncRunner:
             logger.debug(f"Market is {session}, skipping data fetch for {symbol}")
             return None
 
+        # Check connection health and reconnect if needed
+        if hasattr(self.ib, "is_connected") and not self.ib.is_connected:
+            logger.warning(f"Connection lost before fetching {symbol}, attempting reconnect...")
+            try:
+                await self.restart_subprocess()
+            except Exception as e:
+                logger.error(f"Failed to reconnect: {e}")
+                return None
+
         try:
             start_time = asyncio.get_event_loop().time()
             with Timer("data_fetch", self.monitor):
@@ -1213,7 +1222,15 @@ class AsyncRunner:
             return df
 
         except Exception as e:
+            error_str = str(e)
             logger.error(f"Failed to fetch data for {symbol}: {e}")
+
+            # If connection error, mark as disconnected to trigger reconnect on next fetch
+            if "ConnectionError" in error_str or "Not connected" in error_str:
+                if hasattr(self.ib, "_connected"):
+                    self.ib._connected = False
+                logger.warning("Marked connection as disconnected for next retry")
+
             return None
 
     def _manage_cache_size(self):
@@ -1742,6 +1759,21 @@ class AsyncRunner:
                         )
                         qty = adjusted_qty
 
+                # Enforce minimum position value to prevent position sprawl
+                min_position_value = float(os.getenv("MIN_POSITION_VALUE", "500"))
+                position_value = qty * price_float
+                if position_value < min_position_value and qty > 0:
+                    logger.info(
+                        f"Skipping {symbol}: position value ${position_value:.0f} below minimum ${min_position_value:.0f}"
+                    )
+                    return SymbolResult(
+                        symbol=symbol,
+                        signal=signal_value,
+                        price=price_float,
+                        action="SKIP",
+                        message=f"Position value ${position_value:.0f} below min ${min_position_value:.0f}",
+                    )
+
                 ok, msg = self.risk.validate_order(
                     symbol,
                     qty,
@@ -2216,7 +2248,17 @@ class AsyncRunner:
                     logger.warning(f"AI opportunity scan failed: {e}")
 
             # Build symbols list - start with configured symbols
-            symbols_to_process = symbols if symbols else self.cfg.symbols
+            symbols_to_process = list(symbols if symbols else self.cfg.symbols)
+
+            # CRITICAL: Add existing positions to monitor for SELL signals
+            owned_symbols = list(self.positions.keys())
+            for sym in owned_symbols:
+                if sym not in symbols_to_process:
+                    symbols_to_process.append(sym)
+            if owned_symbols:
+                logger.info(
+                    f"Added {len(owned_symbols)} owned positions to monitoring: {owned_symbols[:5]}..."
+                )
 
             # Add AI-discovered opportunities to processing list
             for opp in ai_opportunities:
