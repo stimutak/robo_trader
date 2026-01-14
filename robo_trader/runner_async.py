@@ -1098,7 +1098,9 @@ class AsyncRunner:
             # Clean up stale lock files first
             import os
 
-            lock_path = os.environ.get("IBKR_LOCK_FILE_PATH", "/tmp/ibkr_connect.lock")
+            lock_path = os.environ.get(
+                "IBKR_LOCK_FILE_PATH", "/tmp/ibkr_connect.lock"
+            )  # nosec B108
             try:
                 if os.path.exists(lock_path):
                     os.remove(lock_path)
@@ -2197,8 +2199,8 @@ class AsyncRunner:
                     # Get current positions to exclude
                     owned_symbols = list(self.positions.keys())
 
-                    # Fetch fresh news
-                    news_items = fetch_rss_news(max_items=20)
+                    # Fetch fresh news from diverse sources
+                    news_items = fetch_rss_news(max_items=50)
                     headlines = [item["title"] for item in news_items]
 
                     if headlines:

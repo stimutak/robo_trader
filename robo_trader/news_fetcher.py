@@ -10,11 +10,23 @@ import feedparser
 
 logger = logging.getLogger(__name__)
 
-# Free RSS feeds for financial news
+# Free RSS feeds for financial news - diverse sources for AI discovery
 RSS_FEEDS = {
+    # Major financial news
     "Yahoo Finance": "https://finance.yahoo.com/rss/topfinstories",
+    "Yahoo Tech": "https://finance.yahoo.com/rss/industry?s=technology",
     "Reuters Markets": "https://feeds.reuters.com/reuters/USMarketsNews",
-    "CNBC": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114",
+    "Reuters Business": "https://feeds.reuters.com/reuters/businessNews",
+    "CNBC Top": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114",
+    "CNBC Investing": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839069",
+    # Stock-specific sources
+    "MarketWatch": "https://feeds.marketwatch.com/marketwatch/topstories/",
+    "MarketWatch Stocks": "https://feeds.marketwatch.com/marketwatch/marketpulse/",
+    "Seeking Alpha": "https://seekingalpha.com/market_currents.xml",
+    "Seeking Alpha News": "https://seekingalpha.com/feed.xml",
+    # Tech and growth stocks
+    "TechCrunch": "https://techcrunch.com/feed/",
+    "Benzinga": "https://www.benzinga.com/feed",
 }
 
 
@@ -26,7 +38,7 @@ def fetch_rss_news(max_items: int = 20) -> List[Dict]:
         try:
             feed = feedparser.parse(feed_url)
 
-            for entry in feed.entries[:5]:
+            for entry in feed.entries[:8]:
                 published = datetime.now()
                 if hasattr(entry, "published_parsed") and entry.published_parsed:
                     published = datetime(*entry.published_parsed[:6])

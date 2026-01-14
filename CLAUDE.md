@@ -204,6 +204,41 @@ python3 test_safety_features.py
 15. ✅ **Market Close Time Wrong - FIXED (2025-12-29)** - Was 4:30 PM, now 4:00 PM
 16. ⚠️ **Int/Datetime Comparison Error - OPEN (2025-12-29)** - Affects GM/GOLD, needs investigation
 
+## AI-Driven Symbol Discovery (2026-01-14)
+
+**The system discovers new trading opportunities from news - DO NOT manually expand symbol lists.**
+
+### How It Works
+1. **Base Symbols** in `.env` `SYMBOLS=` - Your watchlist (20 stocks)
+2. **Existing Positions** - Automatically added for SELL signal monitoring
+3. **AI Discovery** - Scans 50+ news headlines per cycle, finds new opportunities
+
+### News Sources (12 RSS feeds)
+- Yahoo Finance (top stories + tech)
+- Reuters (markets + business)
+- CNBC (top + investing)
+- MarketWatch (top + market pulse)
+- Seeking Alpha (currents + news)
+- TechCrunch, Benzinga
+
+### AI Discovery Flow
+```
+fetch_rss_news(50 headlines) → AI finds opportunities → Adds to processing queue
+```
+
+**Example discoveries:** OKTA (Cantor upgrade), SNPS (Loop Capital AI bullish)
+
+### Important Behavior
+- **"Already have long position"** = CORRECT behavior, not a bug
+- System prevents duplicate positions in same stock
+- New positions only opened for stocks NOT already owned
+- AI confidence threshold: 50%+ required
+
+### DO NOT
+- Arbitrarily add stocks to SYMBOLS list
+- Expand symbol list without AI/news basis
+- Confuse "no new buys" with "system broken" (may already own those stocks)
+
 ## Critical Safety Features (2025-09-27) ✅
 **Added to address audit findings:**
 - **Order Management** (`order_manager.py`) - Full lifecycle tracking with retry logic
@@ -431,6 +466,8 @@ python3 test_safety_features.py
 | Hardcoding market hours | Use `MarketHours` class | 2025-12-29 |
 | Assuming fixed % profit on sells | Track cost basis with position tracker (FIFO) | 2026-01-06 |
 | P&L dashboard using float | Use `Decimal` for all P&L calculations | 2026-01-06 |
+| Arbitrarily expanding symbol list | Let AI discover from news, don't add random stocks | 2026-01-14 |
+| "Already have position" = bug | This is CORRECT behavior - prevents duplicate buys | 2026-01-14 |
 
 ---
 
