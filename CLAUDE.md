@@ -1,13 +1,13 @@
 # RoboTrader Project Guidelines
 
 ## Project Phase Plan
-**IMPORTANT:** The authoritative phase plan is in `IMPLEMENTATION_PLAN.md`. This is the ML-focused 4-phase plan over 16 weeks:
+**IMPORTANT:** The authoritative phase plan is in `IMPLEMENTATION_PLAN.md`. This is the ML-focused 4-phase plan:
 - Phase 1: Foundation & Quick Wins (Tasks F1-F5) - COMPLETE ✅
 - Phase 2: ML Infrastructure & Backtesting (Tasks M1-M5) - COMPLETE ✅
 - Phase 3: Advanced Strategy Development (Tasks S1-S5) - COMPLETE ✅
-- Phase 4: Production Hardening & Deployment (Tasks P1-P6)
+- Phase 4: Stabilization & Code Quality (Tasks P1-P10) - REVISED 2026-01-15
 
-**Current Status:** Phase 3 COMPLETE ✅ - Phase 4 IN PROGRESS (P1-P2 complete, 33%)
+**Current Status:** Phase 4 IN PROGRESS - P1-P6 complete (60%), P7-P10 pending
 
 **Note:** The older 9-phase plan in `archived_plans/PROJECT_PLAN_9PHASE.md` is deprecated and should NOT be used. Any references to "Phase 5", "Phase 6" etc. from older commits refer to the old plan and should be ignored.
 
@@ -200,9 +200,10 @@ python3 test_safety_features.py
 11. ✅ **Dashboard Connection Status Accuracy - IMPROVED (2025-12-10)** - See below
 12. ✅ **Subprocess Pipe Blocking - FIXED (2025-12-24)** - See below
 13. ✅ **Near Real-Time Trading - IMPLEMENTED (2025-12-24)** - See below
-14. ✅ **Decimal/Float Type Mismatch - FIXED (2025-12-29)** - See below
+14. ✅ **Decimal/Float Type Mismatch - FIXED (2025-12-29, enhanced 2026-01-15)** - See below
 15. ✅ **Market Close Time Wrong - FIXED (2025-12-29)** - Was 4:30 PM, now 4:00 PM
-16. ⚠️ **Int/Datetime Comparison Error - OPEN (2025-12-29)** - Affects GM/GOLD, needs investigation
+16. ✅ **Int/Datetime Comparison Error - FIXED (2026-01-15)** - Added try/except fallback in correlation.py
+17. ✅ **Missing Market Holidays - FIXED (2026-01-15)** - Added MLK, Presidents, Good Friday, Memorial, Labor, Thanksgiving, Juneteenth
 
 ## AI-Driven Symbol Discovery (2026-01-14)
 
@@ -445,6 +446,9 @@ fetch_rss_news(50 headlines) → AI finds opportunities → Adds to processing q
 | Using `price` (Decimal) in float division | Use `price_float` for calculations | 2025-12-29 |
 | Market close at 4:30 PM | Close is 4:00 PM ET (`time(16, 0)`) | 2025-12-29 |
 | Int/datetime comparison | Ensure both operands are same type | 2025-12-29 |
+| `portfolio.equity()` returns Decimal | Always `float(equity)` before math ops | 2026-01-15 |
+| `portfolio.realized_pnl` is Decimal | Convert to float: `float(portfolio.realized_pnl)` | 2026-01-15 |
+| Passing Decimal to `db.update_account()` | Convert all values to float first | 2026-01-15 |
 
 ### Connection & Socket Errors
 | Mistake | Correct Approach | Date |
@@ -468,6 +472,7 @@ fetch_rss_news(50 headlines) → AI finds opportunities → Adds to processing q
 | P&L dashboard using float | Use `Decimal` for all P&L calculations | 2026-01-06 |
 | Arbitrarily expanding symbol list | Let AI discover from news, don't add random stocks | 2026-01-14 |
 | "Already have position" = bug | This is CORRECT behavior - prevents duplicate buys | 2026-01-14 |
+| Missing dynamic market holidays | Use `_is_market_holiday()` - includes MLK, Presidents, etc. | 2026-01-15 |
 
 ---
 

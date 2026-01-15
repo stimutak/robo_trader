@@ -1645,7 +1645,7 @@ class AsyncRunner:
                         symbol, qty_to_cover, fill_price, "BUY_TO_COVER"
                     )
                     if success:
-                        self.daily_pnl = self.portfolio.realized_pnl
+                        self.daily_pnl = float(self.portfolio.realized_pnl)
 
                         await self.db.record_trade(
                             symbol,
@@ -1889,7 +1889,7 @@ class AsyncRunner:
                             symbol, pos.quantity, fill_price, "SELL"
                         )
                         if success:
-                            self.daily_pnl = self.portfolio.realized_pnl
+                            self.daily_pnl = float(self.portfolio.realized_pnl)
 
                             # Record trade in database
                             await self.db.record_trade(
@@ -2135,10 +2135,16 @@ class AsyncRunner:
         equity = await self.portfolio.equity(market_prices)
         unrealized = await self.portfolio.compute_unrealized(market_prices)
 
+        # Convert Decimal to float for APIs that expect float
+        equity_float = float(equity)
+        unrealized_float = float(unrealized)
+        cash_float = float(self.portfolio.cash)
+        realized_pnl_float = float(self.portfolio.realized_pnl)
+
         # Update portfolio manager capital and consider rebalancing
         if self.portfolio_manager:
             try:
-                self.portfolio_manager.update_capital(equity)
+                self.portfolio_manager.update_capital(equity_float)
                 if await self.portfolio_manager.should_rebalance():
                     rb = await self.portfolio_manager.rebalance()
                     logger.info(f"Rebalanced strategies at {rb['timestamp']}: {rb['new_weights']}")
@@ -2146,11 +2152,11 @@ class AsyncRunner:
                 logger.debug(f"Portfolio manager update failed: {e}")
 
         await self.db.update_account(
-            cash=self.portfolio.cash,
-            equity=equity,
+            cash=cash_float,
+            equity=equity_float,
             daily_pnl=self.daily_pnl,
-            realized_pnl=self.portfolio.realized_pnl,
-            unrealized_pnl=unrealized,
+            realized_pnl=realized_pnl_float,
+            unrealized_pnl=unrealized_float,
         )
 
         # Save ML predictions to file for dashboard
@@ -2339,8 +2345,9 @@ class AsyncRunner:
                                         # Calculate position sizes (simplified - equal dollar amounts)
                                         # Calculate total portfolio value from positions
                                         equity = await self.portfolio.equity(current_prices)
+                                        equity_float = float(equity)  # Convert Decimal to float
                                         pair_allocation = min(
-                                            10000, equity * 0.02
+                                            10000.0, equity_float * 0.02
                                         )  # Max 2% per leg
                                         qty_a = int(pair_allocation / price_a)
                                         qty_b = int(pair_allocation / price_b)
