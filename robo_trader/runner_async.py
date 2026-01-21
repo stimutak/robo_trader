@@ -1391,11 +1391,14 @@ class AsyncRunner:
                                     event_text=news_text,
                                     market_data={
                                         "price": float(df["close"].iloc[-1]) if len(df) > 0 else 0,
-                                        "change_5d": float(
-                                            (df["close"].iloc[-1] / df["close"].iloc[0] - 1) * 100
-                                        )
-                                        if len(df) > 5
-                                        else 0,
+                                        "change_5d": (
+                                            float(
+                                                (df["close"].iloc[-1] / df["close"].iloc[0] - 1)
+                                                * 100
+                                            )
+                                            if len(df) > 5
+                                            else 0
+                                        ),
                                     },
                                 )
 
@@ -1599,9 +1602,7 @@ class AsyncRunner:
             strategy_name = (
                 "ML_ENHANCED"
                 if self.use_ml_enhanced
-                else "ML_ENSEMBLE"
-                if self.use_ml_strategy
-                else "SMA_CROSSOVER"
+                else "ML_ENSEMBLE" if self.use_ml_strategy else "SMA_CROSSOVER"
             )
             await self.db.record_signal(
                 symbol,

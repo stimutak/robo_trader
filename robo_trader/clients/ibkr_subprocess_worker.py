@@ -395,7 +395,6 @@ async def handle_disconnect() -> dict:
 
 async def handle_ping() -> dict:
     """Handle ping command (health check) - also triggers IBKR keep-alive"""
-    global ib
     connected = ib is not None and ib.isConnected()
 
     # If we have an IB instance but it's disconnected, try to keep it alive
