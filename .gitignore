@@ -31,12 +31,29 @@ Icon
 
 # Logs & Databases
 *.log
+*.log.*
 *.db
 *.sqlite
 *.sqlite3
 *.db-shm
 *.db-wal
 launchd_*.log
+
+# Runtime data files
+logs/monitoring/metrics_*.jsonl
+logs/monitoring/dashboard.json
+data/risk_state.json
+data/test_risk_state.json
+reports/production_validation.json
+ml_predictions.json
+
+# ML model artifacts (regenerated)
+models/*.pkl
+models/*.json
+performance_results/
+
+# Test artifacts
+test_feature_store/
 
 # IBKR/Trading specific
 clientportal.gw/
@@ -45,6 +62,10 @@ bin/
 root/
 cookies.txt
 doc/
+
+# IBC (platform-specific binaries)
+IBCMacos-3/
+IBCWin-3/
 
 # IBC Configuration (contains credentials)
 config/ibc/config.ini

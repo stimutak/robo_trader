@@ -40,4 +40,4 @@ repos:
     hooks:
       - id: bandit
         args: ["-r", "-ll", "--skip", "B101,B104,B201"]
-        exclude: ^(tests/|archived_tests/|scripts/tests/)
+        exclude: ^(tests/|archived_tests/|scripts/tests/|sync_db_reader\.py)

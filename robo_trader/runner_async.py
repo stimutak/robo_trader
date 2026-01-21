@@ -1792,7 +1792,11 @@ class AsyncRunner:
                                     else 0
                                 ),
                             )
-                            await self.db.update_position(symbol, qty, fill_price, price)
+                            # Use accumulated position qty/avg from self.positions, not just this order's qty
+                            pos = self.positions[symbol]
+                            await self.db.update_position(
+                                symbol, pos.quantity, pos.avg_price, price
+                            )
 
                             self.monitor.record_order_placed(symbol, qty)
                             self.monitor.record_trade_executed(symbol, "BUY", qty)
@@ -2026,7 +2030,11 @@ class AsyncRunner:
                                     else 0
                                 ),
                             )
-                            await self.db.update_position(symbol, -qty, fill_price, price)
+                            # Use accumulated position qty/avg from self.positions
+                            pos = self.positions[symbol]
+                            await self.db.update_position(
+                                symbol, pos.quantity, pos.avg_price, price
+                            )
 
                             self.monitor.record_order_placed(symbol, qty)
                             self.monitor.record_trade_executed(symbol, "SELL_SHORT", qty)

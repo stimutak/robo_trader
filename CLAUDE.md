@@ -473,6 +473,7 @@ fetch_rss_news(50 headlines) → AI finds opportunities → Adds to processing q
 | Arbitrarily expanding symbol list | Let AI discover from news, don't add random stocks | 2026-01-14 |
 | "Already have position" = bug | This is CORRECT behavior - prevents duplicate buys | 2026-01-14 |
 | Missing dynamic market holidays | Use `_is_market_holiday()` - includes MLK, Presidents, etc. | 2026-01-15 |
+| `db.update_position(qty)` uses order qty | Use `self.positions[symbol].quantity` (accumulated) | 2026-01-16 |
 
 ---
 
