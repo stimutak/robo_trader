@@ -11,10 +11,16 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
+import pytest
 
-# Add project root to path
-sys.path.insert(0, "/Users/oliver/robo_trader")
+# Try to import yfinance - skip tests if not available
+try:
+    import yfinance as yf
+
+    HAS_YFINANCE = True
+except ImportError:
+    HAS_YFINANCE = False
+    yf = None
 
 # flake8: noqa: E402
 from robo_trader.features.realtime_integration import RealtimeFeaturePipeline, WebSocketIntegration
@@ -315,6 +321,7 @@ async def test_model_updates():
     return True
 
 
+@pytest.mark.skipif(not HAS_YFINANCE, reason="yfinance not installed")
 def test_with_real_data():
     """Test with real market data."""
     print("\n" + "=" * 80)
@@ -377,8 +384,11 @@ def main():
         ("Streaming Features", test_streaming_features),
         ("Online Inference", test_online_inference),
         ("Feature Store", test_feature_store),
-        ("Real Market Data", test_with_real_data),
     ]
+
+    # Only include yfinance test if available
+    if HAS_YFINANCE:
+        tests.append(("Real Market Data", test_with_real_data))
 
     for test_name, test_func in tests:
         try:

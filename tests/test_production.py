@@ -7,24 +7,39 @@ import unittest
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, Mock, patch
 
-from robo_trader.production import (
-    AlertCategory,
-    AlertManager,
-    AlertRule,
-    AlertSeverity,
-    ComponentHealth,
-    ComponentStatus,
-    ConfigManager,
-    EmergencyStopManager,
-    Environment,
-    FeatureFlags,
-    HealthMonitor,
-    HealthStatus,
-    ProductionConfig,
-    StopReason,
-    StopScope,
-    TradingLimits,
-)
+import pytest
+
+# Skip entire module if production imports fail (requires cryptography)
+try:
+    from robo_trader.production import (
+        AlertCategory,
+        AlertManager,
+        AlertRule,
+        AlertSeverity,
+        ComponentHealth,
+        ComponentStatus,
+        ConfigManager,
+        EmergencyStopManager,
+        Environment,
+        FeatureFlags,
+        HealthMonitor,
+        HealthStatus,
+        ProductionConfig,
+        StopReason,
+        StopScope,
+        TradingLimits,
+    )
+
+    HAS_PRODUCTION = True
+except ImportError as e:
+    HAS_PRODUCTION = False
+    # Create dummy classes for pytest collection
+    AlertCategory = AlertManager = AlertRule = AlertSeverity = None
+    ComponentHealth = ComponentStatus = ConfigManager = EmergencyStopManager = None
+    Environment = FeatureFlags = HealthMonitor = HealthStatus = None
+    ProductionConfig = StopReason = StopScope = TradingLimits = None
+
+pytestmark = pytest.mark.skipif(not HAS_PRODUCTION, reason="cryptography not available")
 
 
 class TestConfigManager(unittest.TestCase):
