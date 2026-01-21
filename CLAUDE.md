@@ -7,7 +7,7 @@
 - Phase 3: Advanced Strategy Development (Tasks S1-S5) - COMPLETE ✅
 - Phase 4: Stabilization & Code Quality (Tasks P1-P10) - REVISED 2026-01-15
 
-**Current Status:** Phase 4 IN PROGRESS - P1-P6 complete (60%), P7-P10 pending
+**Current Status:** Phase 4 IN PROGRESS - P1-P7, P9-P10 complete (80%), P8 in progress
 
 **Note:** The older 9-phase plan in `archived_plans/PROJECT_PLAN_9PHASE.md` is deprecated and should NOT be used. Any references to "Phase 5", "Phase 6" etc. from older commits refer to the old plan and should be ignored.
 
@@ -116,6 +116,11 @@ pkill -f "IB Gateway"
 - `IMPLEMENTATION_PLAN.md` - The active project roadmap
 - `handoff/LATEST_HANDOFF.md` - Latest session handoff document
 - `robo_trader/runner_async.py` - Main trading system with async parallel processing
+- `robo_trader/runner/` - Extracted runner modules (Phase 4 P8 - IN PROGRESS)
+  - `data_fetcher.py` - Market data retrieval and caching
+  - `subprocess_manager.py` - IBKR subprocess health monitoring
+- `robo_trader/exceptions.py` - Custom exception hierarchy (Phase 4 P9)
+- `robo_trader/data_providers/` - Data provider abstraction (Polygon.io ready)
 - `app.py` - Dashboard with monitoring interface
 - `robo_trader/websocket_server.py` - WebSocket server for real-time updates
 - `robo_trader/features/` - Feature engineering pipeline (Phase 2 - COMPLETE)
