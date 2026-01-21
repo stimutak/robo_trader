@@ -1,0 +1,68 @@
+# IBC Configuration Template for RoboTrader
+#
+# SETUP INSTRUCTIONS:
+# 1. Copy this file to config.ini: cp config.ini.template config.ini
+# 2. Edit config.ini and set your IBKR credentials
+# 3. config.ini is gitignored - your credentials stay private
+#
+# For full documentation, see IBCMacos-3/userguide.pdf
+
+# =============================================================================
+# Authentication Settings
+# =============================================================================
+
+# Your IBKR username:
+IbLoginId=YOUR_IBKR_USERNAME
+
+# Your IBKR password:
+IbPassword=YOUR_IBKR_PASSWORD
+
+# Second Factor Authentication
+SecondFactorDevice=
+ReloginAfterSecondFactorAuthenticationTimeout=yes
+SecondFactorAuthenticationExitInterval=120
+SecondFactorAuthenticationTimeout=180
+
+# Trading Mode: 'paper' or 'live'
+TradingMode=paper
+
+# =============================================================================
+# Gateway Startup Settings
+# =============================================================================
+
+FIX=no
+AcceptNonBrokerageAccountWarning=yes
+LoginDialogDisplayTimeout=90
+MinimizeMainWindow=yes
+ExistingSessionDetectedAction=primaryoverride
+ReadOnlyApi=no
+AcceptIncomingConnectionAction=accept
+
+# =============================================================================
+# Auto-Restart Settings (keeps session alive without daily 2FA)
+# =============================================================================
+
+# Gateway auto-restarts at this time (HH:MM AM/PM format)
+AutoRestartTime=11:45 PM
+
+# Cold restart on Sundays (requires 2FA re-authentication)
+# Set to a time after 01:00 US/Eastern
+ColdRestartTime=07:00
+
+# =============================================================================
+# IBC Command Server (for remote stop/restart commands)
+# =============================================================================
+
+CommandServerPort=7462
+ControlFrom=127.0.0.1
+
+# =============================================================================
+# Other Settings
+# =============================================================================
+
+AllowBlindTrading=yes
+DismissPasswordExpiryWarning=no
+DismissNSEComplianceNotice=yes
+AcceptBidAskLastSizeDisplayUpdateNotification=accept
+LogStructureWhen=never
+LogStructureScope=known

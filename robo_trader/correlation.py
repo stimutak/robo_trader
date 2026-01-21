@@ -171,12 +171,16 @@ class CorrelationTracker:
         for symbol in valid_symbols:
             returns = self.returns_history[symbol]
             # Filter to lookback period - handle both datetime and integer indices
-            if hasattr(returns.index, "dtype") and pd.api.types.is_datetime64_any_dtype(
-                returns.index
-            ):
-                recent_returns = returns[returns.index >= cutoff_date]
-            else:
-                # For integer-indexed data, use last N observations based on lookback
+            try:
+                # Try datetime comparison first
+                if hasattr(returns.index, "dtype") and pd.api.types.is_datetime64_any_dtype(
+                    returns.index
+                ):
+                    recent_returns = returns[returns.index >= cutoff_date]
+                else:
+                    raise TypeError("Non-datetime index")
+            except (TypeError, ValueError):
+                # For integer-indexed data or comparison failure, use last N observations
                 # Assuming ~390 trading minutes per day for minute data, or ~252 days for daily
                 max_observations = self.lookback_days * 390  # Generous estimate
                 recent_returns = returns.tail(max_observations)

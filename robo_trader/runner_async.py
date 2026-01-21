@@ -1098,7 +1098,9 @@ class AsyncRunner:
             # Clean up stale lock files first
             import os
 
-            lock_path = os.environ.get("IBKR_LOCK_FILE_PATH", "/tmp/ibkr_connect.lock")
+            lock_path = os.environ.get(
+                "IBKR_LOCK_FILE_PATH", "/tmp/ibkr_connect.lock"
+            )  # nosec B108
             try:
                 if os.path.exists(lock_path):
                     os.remove(lock_path)
@@ -1660,7 +1662,7 @@ class AsyncRunner:
                         symbol, qty_to_cover, fill_price, "BUY_TO_COVER"
                     )
                     if success:
-                        self.daily_pnl = self.portfolio.realized_pnl
+                        self.daily_pnl = float(self.portfolio.realized_pnl)
 
                         await self.db.record_trade(
                             symbol,
@@ -1822,7 +1824,11 @@ class AsyncRunner:
                                     else 0
                                 ),
                             )
-                            await self.db.update_position(symbol, qty, fill_price, price)
+                            # Use accumulated position qty/avg from self.positions, not just this order's qty
+                            pos = self.positions[symbol]
+                            await self.db.update_position(
+                                symbol, pos.quantity, pos.avg_price, price
+                            )
 
                             self.monitor.record_order_placed(symbol, qty)
                             self.monitor.record_trade_executed(symbol, "BUY", qty)
@@ -1919,7 +1925,7 @@ class AsyncRunner:
                             symbol, pos.quantity, fill_price, "SELL"
                         )
                         if success:
-                            self.daily_pnl = self.portfolio.realized_pnl
+                            self.daily_pnl = float(self.portfolio.realized_pnl)
 
                             # Record trade in database
                             await self.db.record_trade(
@@ -2056,7 +2062,11 @@ class AsyncRunner:
                                     else 0
                                 ),
                             )
-                            await self.db.update_position(symbol, -qty, fill_price, price)
+                            # Use accumulated position qty/avg from self.positions
+                            pos = self.positions[symbol]
+                            await self.db.update_position(
+                                symbol, pos.quantity, pos.avg_price, price
+                            )
 
                             self.monitor.record_order_placed(symbol, qty)
                             self.monitor.record_trade_executed(symbol, "SELL_SHORT", qty)
@@ -2165,10 +2175,16 @@ class AsyncRunner:
         equity = await self.portfolio.equity(market_prices)
         unrealized = await self.portfolio.compute_unrealized(market_prices)
 
+        # Convert Decimal to float for APIs that expect float
+        equity_float = float(equity)
+        unrealized_float = float(unrealized)
+        cash_float = float(self.portfolio.cash)
+        realized_pnl_float = float(self.portfolio.realized_pnl)
+
         # Update portfolio manager capital and consider rebalancing
         if self.portfolio_manager:
             try:
-                self.portfolio_manager.update_capital(equity)
+                self.portfolio_manager.update_capital(equity_float)
                 if await self.portfolio_manager.should_rebalance():
                     rb = await self.portfolio_manager.rebalance()
                     logger.info(f"Rebalanced strategies at {rb['timestamp']}: {rb['new_weights']}")
@@ -2176,11 +2192,11 @@ class AsyncRunner:
                 logger.debug(f"Portfolio manager update failed: {e}")
 
         await self.db.update_account(
-            cash=self.portfolio.cash,
-            equity=equity,
+            cash=cash_float,
+            equity=equity_float,
             daily_pnl=self.daily_pnl,
-            realized_pnl=self.portfolio.realized_pnl,
-            unrealized_pnl=unrealized,
+            realized_pnl=realized_pnl_float,
+            unrealized_pnl=unrealized_float,
         )
 
         # Save ML predictions to file for dashboard
@@ -2229,8 +2245,8 @@ class AsyncRunner:
                     # Get current positions to exclude
                     owned_symbols = list(self.positions.keys())
 
-                    # Fetch fresh news
-                    news_items = fetch_rss_news(max_items=20)
+                    # Fetch fresh news from diverse sources
+                    news_items = fetch_rss_news(max_items=50)
                     headlines = [item["title"] for item in news_items]
 
                     if headlines:
@@ -2379,8 +2395,9 @@ class AsyncRunner:
                                         # Calculate position sizes (simplified - equal dollar amounts)
                                         # Calculate total portfolio value from positions
                                         equity = await self.portfolio.equity(current_prices)
+                                        equity_float = float(equity)  # Convert Decimal to float
                                         pair_allocation = min(
-                                            10000, equity * 0.02
+                                            10000.0, equity_float * 0.02
                                         )  # Max 2% per leg
                                         qty_a = int(pair_allocation / price_a)
                                         qty_b = int(pair_allocation / price_b)

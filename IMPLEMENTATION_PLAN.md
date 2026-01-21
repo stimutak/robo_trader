@@ -1,11 +1,11 @@
 # RoboTrader Production ML Platform - Implementation Plan
 
-## Current Status (2025-10-06)
-**Active Phase:** Phase 4 - Production Hardening & Deployment
+## Current Status (2026-01-15)
+**Active Phase:** Phase 4 - Stabilization & Code Quality
 **Phase 2 Status:** 100% Complete ✅
 **Phase 3 Status:** 100% Complete ✅
-**Phase 4 Status:** 50% Complete (3/6 tasks done)
-**Phase 4 Progress:** P1 Complete (Advanced Risk Management) ✅, P2 Complete (Production Monitoring) ✅, P3 Complete (Docker Production Environment) ✅, P4-P6 remaining
+**Phase 4 Status:** 70% Complete (7/10 tasks done)
+**Phase 4 Progress:** P1-P7 Complete ✅, P8-P10 remaining
 **Trading System:** Running with async IBKR client, parallel symbol processing  
 **ML Infrastructure:** Feature engineering, model training, and performance analytics operational
 **Dashboard:** Basic monitoring with WebSocket real-time updates
@@ -180,8 +180,8 @@ Transform the robo_trader system into a production-grade, ML-driven trading plat
 
 ---
 
-## Phase 4: Production Hardening & Deployment (Weeks 13-16)
-*Production deployment with comprehensive monitoring, security, and fail-safes*
+## Phase 4: Stabilization & Code Quality (Weeks 13-20)
+*Fix active bugs, improve code quality, and establish CI/CD - revised 2026-01-15*
 
 ### Week 13-14: Advanced Risk Management
 - [x] **[risk][critical]** P1: Implement Advanced Risk Management (32h) ✅ COMPLETE
@@ -241,29 +241,65 @@ Transform the robo_trader system into a production-grade, ML-driven trading plat
   - ✅ Updated deployment README with production setup guide
   - Files: `Dockerfile`, `docker-compose.yml`, `deployment/*`, `app.py`
 
-### Week 15-16: Security & Final Validation
-- [ ] **[security][high]** P4: Implement Security & Compliance (20h)
-  - Dependencies: P3
-  - Build secrets management and API authentication
-  - Implement comprehensive audit trail logging
-  - Files: `robo_trader/security/auth.py`, `robo_trader/security/secrets.py`
+### Week 15-16: Type Safety & Bug Fixes (REVISED 2026-01-15)
 
-- [ ] **[devops][medium]** P5: Setup CI/CD Pipeline (16h)
-  - Dependencies: P3
-  - Create automated testing and deployment pipeline
-  - Files: `.github/workflows/deploy.yml`, `.github/workflows/docker.yml`
+**Note:** Original P4-P6 (Security, CI/CD, Validation) were deprioritized after codebase analysis revealed more urgent issues. The system is already in production and trading daily - stability issues take precedence over new features.
 
-- [ ] **[testing][critical]** P6: Production Validation & Testing (24h)
-  - Dependencies: P1, P2, P4
-  - Conduct 30-day paper trading validation
-  - Validate all risk controls and performance targets
-  - Files: `tests/test_production.py`, `tests/integration/test_live_trading.py`
+- [ ] **[bugfix][critical]** P4: Fix Decimal/Float Type Mismatches (8h)
+  - Audit all math operations in trading pipeline
+  - Standardize on float for calculations, Decimal for storage
+  - Fix pairs trading which is currently broken
+  - Files: `robo_trader/runner_async.py`, `robo_trader/strategies/pairs_trading.py`
+
+- [ ] **[bugfix][high]** P5: Add Dynamic Market Holidays (2h)
+  - Add MLK Day, Presidents Day, Good Friday, Memorial Day, Labor Day, Thanksgiving
+  - Prevent trading on US market holidays
+  - Files: `robo_trader/market_hours.py`
+
+- [ ] **[bugfix][high]** P6: Fix Int/Datetime Comparison Bug (4h)
+  - Investigate GM/GOLD symbol errors
+  - Root cause: `'>=' not supported between instances of 'int' and 'datetime.datetime'`
+  - Files: `robo_trader/correlation.py` (suspected)
+
+### Week 17-18: Code Quality & Testing
+
+- [x] **[quality][high]** P7: Consolidate Test Suite (8h) ✅ COMPLETE
+  - Removed 47 duplicate/broken test files (79 → 32)
+  - All 166 remaining tests pass
+  - Added pytest-cov (36% coverage baseline)
+  - Files: `tests/` directory cleanup complete
+
+- [ ] **[refactor][critical]** P8: Split runner_async.py (16h)
+  - Current: 2,947 lines, single point of failure
+  - Extract: `data_fetcher.py`, `signal_generator.py`, `trade_executor.py`, `portfolio_tracker.py`
+  - Target: 4-5 files of ~500 lines each
+  - Files: `robo_trader/runner_async.py` → multiple modules
+
+- [ ] **[quality][medium]** P9: Replace Catch-All Exceptions (8h)
+  - Replace 39 `except Exception` blocks with specific types
+  - Add retry logic with exponential backoff
+  - Integrate circuit breaker for external services
+  - Files: `robo_trader/runner_async.py`, `robo_trader/clients/*.py`
+
+### Week 19-20: CI/CD & Automation
+
+- [ ] **[devops][medium]** P10: Setup CI/CD Pipeline (8h)
+  - GitHub Actions for pytest on PR
+  - Linting with black/flake8
+  - Coverage reporting
+  - Files: `.github/workflows/test.yml`
 
 **Phase 4 Success Metrics:**
-- ✅ Kelly sizing and kill switches functional
-- ✅ Docker deployment with CI/CD pipeline operational
-- ✅ Paper trading validated with risk controls tested
-- ✅ Performance targets achieved for live trading
+- ✅ Kelly sizing and kill switches functional (P1)
+- ✅ Production monitoring operational (P2)
+- ✅ Docker environment ready (P3)
+- [ ] Zero type errors in trading pipeline (P4)
+- [ ] No trading on market holidays (P5)
+- [ ] All known bugs fixed (P6)
+- [ ] Test coverage > 60% (P7)
+- [ ] runner_async.py < 1000 lines (P8)
+- [ ] No catch-all exceptions (P9)
+- [ ] CI/CD runs on every PR (P10)
 
 ---
 
