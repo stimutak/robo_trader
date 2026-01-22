@@ -21,24 +21,27 @@ env:
 jobs:
   docker-build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
     env:
       EXECUTION_MODE: paper
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      
+
       - name: Cache Docker layers
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: /tmp/.buildx-cache
           key: ${{ runner.os }}-buildx-${{ github.sha }}
           restore-keys: |
             ${{ runner.os }}-buildx-
-      
+
       - name: Build Docker image
         run: |
           docker buildx build \
@@ -47,7 +50,7 @@ jobs:
             --tag robotrader:test \
             --load \
             .
-      
+
       - name: Run Docker security scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -55,13 +58,13 @@ jobs:
           format: 'sarif'
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
-      
+
       - name: Upload Trivy results
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: 'trivy-results.sarif'
-      
+
       - name: Test Docker image
         run: |
           # Run container
@@ -71,16 +74,16 @@ jobs:
             -e LOG_LEVEL=DEBUG \
             robotrader:test \
             python -c "import time; time.sleep(30)"
-          
+
           # Wait for startup
           sleep 10
-          
+
           # Check if container is running
           docker ps | grep test-container
-          
+
           # Check logs
           docker logs test-container
-          
+
           # Run tests inside container
           docker exec test-container python -c "
           import sys
@@ -91,33 +94,33 @@ jobs:
           print('All imports successful')
           sys.exit(0)
           "
-          
+
           # Cleanup
           docker stop test-container
           docker rm test-container
-      
-      - name: Test docker-compose
+
+      - name: Test docker compose
         run: |
           # Test compose file syntax
-          docker-compose -f docker-compose.yml config
-          
+          docker compose -f docker-compose.yml config
+
           # Test production compose
-          docker-compose -f deployment/docker-compose.prod.yml config
-          
+          docker compose -f deployment/docker-compose.prod.yml config
+
           # Start services
-          docker-compose up -d postgres redis
-          
+          docker compose up -d postgres redis
+
           # Wait for services
           sleep 10
-          
+
           # Check services are healthy
-          docker-compose ps
-          docker-compose exec -T postgres pg_isready -U trader
-          docker-compose exec -T redis redis-cli ping
-          
+          docker compose ps
+          docker compose exec -T postgres pg_isready -U trader
+          docker compose exec -T redis redis-cli ping
+
           # Cleanup
-          docker-compose down -v
-      
+          docker compose down -v
+
       - name: Move cache
         run: |
           rm -rf /tmp/.buildx-cache
@@ -125,14 +128,14 @@ jobs:
 
   container-structure-test:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Build image for testing
         run: docker build -t robotrader:test .
-      
+
       - name: Run container structure tests
         uses: plexsystems/container-structure-test-action@v0.3.0
         with:
@@ -141,11 +144,11 @@ jobs:
 
   docker-compose-integration:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Create test environment file
         run: |
           cat > .env.test <<EOF
@@ -159,44 +162,44 @@ jobs:
           GRAFANA_PASSWORD=admin
           DOMAIN_NAME=localhost
           EOF
-      
+
       - name: Start full stack
         run: |
-          docker-compose \
+          docker compose \
             -f docker-compose.yml \
             --env-file .env.test \
             up -d
-      
+
       - name: Wait for services
         run: |
           echo "Waiting for services to be ready..."
-          timeout 120 bash -c 'until docker-compose ps | grep -q "healthy"; do sleep 5; done'
-      
+          timeout 120 bash -c 'until docker compose ps | grep -q "healthy"; do sleep 5; done'
+
       - name: Run integration tests
         run: |
           # Test trader service
           curl -f http://localhost:8080/health || exit 1
-          
+
           # Test dashboard
           curl -f http://localhost:5555/ || exit 1
-          
+
           # Test Prometheus
           curl -f http://localhost:9090/-/healthy || exit 1
-          
+
           # Test Grafana
           curl -f http://localhost:3000/api/health || exit 1
-      
+
       - name: Check logs for errors
         if: always()
         run: |
-          docker-compose logs --tail=100
-          
+          docker compose logs --tail=100
+
           # Check for critical errors
-          if docker-compose logs | grep -i "error\|exception\|fatal"; then
+          if docker compose logs | grep -i "error\|exception\|fatal"; then
             echo "Errors found in logs"
             exit 1
           fi
-      
+
       - name: Cleanup
         if: always()
-        run: docker-compose down -v
+        run: docker compose down -v
