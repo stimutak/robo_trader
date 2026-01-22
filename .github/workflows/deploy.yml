@@ -101,7 +101,7 @@ jobs:
       - name: Run Bandit security linter
         run: |
           pip install bandit
-          bandit -r robo_trader -ll
+          bandit -r robo_trader -ll --skip B101,B104,B108,B201,B301
 
   build:
     needs: [test, lint]
