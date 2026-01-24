@@ -14,6 +14,8 @@ import * as Haptics from 'expo-haptics';
 import { colors } from '../../lib/constants';
 import { useTrades } from '../../hooks/useAPI';
 import { Card } from '../../components/ui/Card';
+import { SkeletonCard, Skeleton } from '../../components/ui/Skeleton';
+import { ErrorState } from '../../components/ui/ErrorState';
 import { Trade } from '../../lib/types';
 
 type FilterType = 'all' | 'buys' | 'sells' | 'winners' | 'losers';
@@ -52,7 +54,7 @@ function formatTime(timestamp: string): string {
 
 export default function TradesScreen() {
   const [filter, setFilter] = useState<FilterType>('all');
-  const { data: tradesData, refetch, isLoading } = useTrades();
+  const { data: tradesData, refetch, isLoading, error } = useTrades();
 
   const handleFilterChange = (newFilter: FilterType) => {
     setFilter(newFilter);
@@ -61,6 +63,61 @@ export default function TradesScreen() {
 
   const trades = tradesData?.trades || [];
   const summary = tradesData?.summary;
+
+  // Error state
+  if (error && !tradesData) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.header}>
+          <Text style={styles.title}>Trade History</Text>
+        </View>
+        <ErrorState
+          title="Unable to Load"
+          message="Could not fetch trade history. Check your connection."
+          onRetry={refetch}
+        />
+      </SafeAreaView>
+    );
+  }
+
+  // Loading skeleton
+  if (isLoading && !tradesData) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.header}>
+          <Text style={styles.title}>Trade History</Text>
+        </View>
+        <Card style={styles.summaryCard}>
+          <View style={styles.summaryRow}>
+            {[1, 2, 3, 4].map((i) => (
+              <View key={i} style={styles.summaryItem}>
+                <Skeleton width={40} height={18} />
+                <Skeleton width={30} height={10} style={{ marginTop: 6 }} />
+              </View>
+            ))}
+          </View>
+        </Card>
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitle}>Recent Trades</Text>
+        </View>
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          style={styles.filterStrip}
+          contentContainerStyle={styles.filterStripContent}
+        >
+          {FILTERS.map(({ key, label }) => (
+            <Skeleton key={key} width={50} height={28} borderRadius={6} />
+          ))}
+        </ScrollView>
+        <View style={{ paddingHorizontal: 20 }}>
+          <SkeletonCard />
+          <SkeletonCard style={{ marginTop: 10 }} />
+          <SkeletonCard style={{ marginTop: 10 }} />
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   const filteredTrades = trades.filter((trade) => {
     switch (filter) {

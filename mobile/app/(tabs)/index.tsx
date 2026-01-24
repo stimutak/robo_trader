@@ -15,6 +15,8 @@ import { useStatus, usePnL, usePositions, usePerformance, useMLStatus } from '..
 import { useTradingStore } from '../../stores/trading';
 import { Card } from '../../components/ui/Card';
 import { StatusDot } from '../../components/ui/StatusDot';
+import { Skeleton, SkeletonCard } from '../../components/ui/Skeleton';
+import { ErrorState } from '../../components/ui/ErrorState';
 import { Position } from '../../lib/types';
 
 function formatCurrency(value: number, showSign = false): string {
@@ -54,11 +56,14 @@ function formatDateTime(): string {
 export default function HomeScreen() {
   const router = useRouter();
 
-  const { data: statusData, refetch: refetchStatus, isLoading: statusLoading } = useStatus();
-  const { data: pnlData, refetch: refetchPnL } = usePnL();
-  const { data: positionsData, refetch: refetchPositions } = usePositions();
+  const { data: statusData, refetch: refetchStatus, isLoading: statusLoading, error: statusError } = useStatus();
+  const { data: pnlData, refetch: refetchPnL, error: pnlError } = usePnL();
+  const { data: positionsData, refetch: refetchPositions, isLoading: positionsLoading, error: positionsError } = usePositions();
   const { data: perfData, refetch: refetchPerf } = usePerformance();
   const { data: mlData, refetch: refetchML } = useMLStatus();
+
+  const isLoading = statusLoading || positionsLoading;
+  const hasError = statusError || pnlError || positionsError;
 
   const setStatus = useTradingStore((s) => s.setStatus);
   const setPnL = useTradingStore((s) => s.setPnL);
@@ -120,6 +125,55 @@ export default function HomeScreen() {
   const winRate = (perfData?.summary?.win_rate || 0) * 100;
   const sharpe = perfData?.summary?.total_sharpe || perfData?.all?.sharpe || 0;
 
+  // Show error state if all primary data failed
+  if (hasError && !statusData && !positionsData) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.header}>
+          <Text style={styles.greeting}>Portfolio</Text>
+        </View>
+        <ErrorState
+          title="Unable to Connect"
+          message="Could not reach the trading server. Make sure the backend is running."
+          onRetry={handleRefresh}
+        />
+      </SafeAreaView>
+    );
+  }
+
+  // Show loading skeleton on initial load
+  if (isLoading && !statusData && !positionsData) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.header}>
+          <View>
+            <Text style={styles.greeting}>Portfolio</Text>
+            <Skeleton width={100} height={12} style={{ marginTop: 4 }} />
+          </View>
+          <Skeleton width={70} height={28} borderRadius={10} />
+        </View>
+        <View style={styles.portfolioHero}>
+          <Skeleton width={80} height={12} />
+          <Skeleton width={200} height={42} style={{ marginTop: 8 }} />
+          <Skeleton width={100} height={28} borderRadius={6} style={{ marginTop: 12 }} />
+        </View>
+        <ScrollView horizontal style={styles.statsStrip} contentContainerStyle={styles.statsStripContent}>
+          {[1, 2, 3, 4].map((i) => (
+            <Skeleton key={i} width={88} height={52} borderRadius={10} />
+          ))}
+        </ScrollView>
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitle}>Active Positions</Text>
+        </View>
+        <View style={{ paddingHorizontal: 20 }}>
+          <SkeletonCard />
+          <SkeletonCard style={{ marginTop: 10 }} />
+          <SkeletonCard style={{ marginTop: 10 }} />
+        </View>
+      </SafeAreaView>
+    );
+  }
+
   return (
     <SafeAreaView style={styles.container}>
       <ScrollView
@@ -152,6 +206,13 @@ export default function HomeScreen() {
             </Text>
           </View>
         </View>
+
+        {/* Error Banner (partial failure) */}
+        {hasError && (statusData || positionsData) && (
+          <View style={{ paddingHorizontal: 20, marginBottom: 12 }}>
+            <ErrorState compact title="Some data unavailable" onRetry={handleRefresh} />
+          </View>
+        )}
 
         {/* Portfolio Hero */}
         <View style={styles.portfolioHero}>

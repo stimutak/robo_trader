@@ -102,6 +102,12 @@ export interface PredictionsResponse {
 
 export interface TradesResponse {
   trades: Trade[];
+  summary?: {
+    total_trades: number;
+    buy_trades: number;
+    sell_trades: number;
+    total_volume: number;
+  };
 }
 
 export interface EquityCurveResponse {

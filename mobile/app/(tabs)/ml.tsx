@@ -10,17 +10,74 @@ import Ionicons from '@expo/vector-icons/Ionicons';
 import { colors } from '../../lib/constants';
 import { useMLStatus, usePredictions } from '../../hooks/useAPI';
 import { Card } from '../../components/ui/Card';
+import { Skeleton, SkeletonCard } from '../../components/ui/Skeleton';
+import { ErrorState } from '../../components/ui/ErrorState';
 import { Prediction } from '../../lib/types';
 
 export default function MLScreen() {
-  const { data: mlData, refetch: refetchML, isLoading } = useMLStatus();
-  const { data: predsData, refetch: refetchPreds } = usePredictions();
+  const { data: mlData, refetch: refetchML, isLoading, error: mlError } = useMLStatus();
+  const { data: predsData, refetch: refetchPreds, error: predsError } = usePredictions();
 
   const handleRefresh = async () => {
     await Promise.all([refetchML(), refetchPreds()]);
   };
 
   const predictions = predsData?.predictions || [];
+  const hasError = mlError || predsError;
+
+  // Error state
+  if (hasError && !mlData && !predsData) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.header}>
+          <Text style={styles.title}>ML Engine</Text>
+        </View>
+        <ErrorState
+          title="Unable to Load"
+          message="Could not fetch ML status. Check your connection."
+          onRetry={handleRefresh}
+        />
+      </SafeAreaView>
+    );
+  }
+
+  // Loading skeleton
+  if (isLoading && !mlData && !predsData) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.header}>
+          <Text style={styles.title}>ML Engine</Text>
+        </View>
+        <Card style={styles.statusCard}>
+          <View style={styles.statusTop}>
+            <View style={styles.mlIndicator}>
+              <Skeleton width={40} height={40} borderRadius={10} />
+              <View>
+                <Skeleton width={80} height={14} />
+                <Skeleton width={60} height={10} style={{ marginTop: 4 }} />
+              </View>
+            </View>
+            <Skeleton width={50} height={36} />
+          </View>
+          <View style={styles.mlStats}>
+            {[1, 2, 3].map((i) => (
+              <View key={i} style={[styles.mlStat, { backgroundColor: colors.bg.elevated }]}>
+                <Skeleton width={30} height={15} />
+                <Skeleton width={50} height={10} style={{ marginTop: 4 }} />
+              </View>
+            ))}
+          </View>
+        </Card>
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitle}>Current Predictions</Text>
+        </View>
+        <View style={{ paddingHorizontal: 20 }}>
+          <SkeletonCard />
+          <SkeletonCard style={{ marginTop: 10 }} />
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.container}>

@@ -10,6 +10,8 @@ import { colors } from '../../lib/constants';
 import { usePerformance, useEquityCurve } from '../../hooks/useAPI';
 import { Card } from '../../components/ui/Card';
 import { EquityChart } from '../../components/charts';
+import { Skeleton, SkeletonChart } from '../../components/ui/Skeleton';
+import { ErrorState } from '../../components/ui/ErrorState';
 
 function formatCurrency(value: number): string {
   const absValue = Math.abs(value);
@@ -25,12 +27,14 @@ function formatPercent(value: number): string {
 }
 
 export default function AnalyticsScreen() {
-  const { data: perfData, refetch: refetchPerf, isLoading } = usePerformance();
-  const { data: equityData, refetch: refetchEquity } = useEquityCurve();
+  const { data: perfData, refetch: refetchPerf, isLoading, error: perfError } = usePerformance();
+  const { data: equityData, refetch: refetchEquity, error: equityError } = useEquityCurve();
 
   const handleRefresh = async () => {
     await Promise.all([refetchPerf(), refetchEquity()]);
   };
+
+  const hasError = perfError || equityError;
 
   // Map API fields to display values
   const sharpeRatio = perfData?.summary?.total_sharpe ?? perfData?.all?.sharpe ?? 0;
@@ -40,6 +44,48 @@ export default function AnalyticsScreen() {
   const totalTrades = perfData?.summary?.total_trades ?? perfData?.all?.trades ?? 0;
   const winningTrades = perfData?.summary?.winning_trades ?? 0;
   const losingTrades = perfData?.summary?.losing_trades ?? 0;
+
+  // Error state
+  if (hasError && !perfData && !equityData) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.header}>
+          <Text style={styles.title}>Analytics</Text>
+        </View>
+        <ErrorState
+          title="Unable to Load"
+          message="Could not fetch performance data. Check your connection."
+          onRetry={handleRefresh}
+        />
+      </SafeAreaView>
+    );
+  }
+
+  // Loading skeleton
+  if (isLoading && !perfData && !equityData) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.header}>
+          <Text style={styles.title}>Analytics</Text>
+        </View>
+        <View style={{ paddingHorizontal: 20 }}>
+          <SkeletonChart />
+        </View>
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitle}>Performance Metrics</Text>
+        </View>
+        <View style={styles.metricsGrid}>
+          {[1, 2, 3, 4, 5, 6].map((i) => (
+            <Card key={i} style={styles.metricCard}>
+              <Skeleton width={60} height={10} />
+              <Skeleton width={50} height={20} style={{ marginTop: 8 }} />
+              <Skeleton width={70} height={10} style={{ marginTop: 6 }} />
+            </Card>
+          ))}
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.container}>
