@@ -11,11 +11,21 @@ import {
 } from './types';
 
 async function fetchAPI<T>(endpoint: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${endpoint}`);
-  if (!res.ok) {
-    throw new Error(`API Error: ${res.status} ${res.statusText}`);
+  const url = `${API_BASE}${endpoint}`;
+  console.log(`[API] Fetching: ${url}`);
+  try {
+    const res = await fetch(url);
+    console.log(`[API] Response status: ${res.status} for ${endpoint}`);
+    if (!res.ok) {
+      throw new Error(`API Error: ${res.status} ${res.statusText}`);
+    }
+    const data = await res.json();
+    console.log(`[API] Data received for ${endpoint}:`, JSON.stringify(data).slice(0, 200));
+    return data;
+  } catch (error) {
+    console.error(`[API] Error fetching ${endpoint}:`, error);
+    throw error;
   }
-  return res.json();
 }
 
 export const api = {

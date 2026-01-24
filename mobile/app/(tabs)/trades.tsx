@@ -60,6 +60,7 @@ export default function TradesScreen() {
   };
 
   const trades = tradesData?.trades || [];
+  const summary = tradesData?.summary;
 
   const filteredTrades = trades.filter((trade) => {
     switch (filter) {
@@ -81,7 +82,7 @@ export default function TradesScreen() {
     []
   );
 
-  const keyExtractor = useCallback((item: Trade) => item.id, []);
+  const keyExtractor = useCallback((item: Trade) => String(item.id), []);
 
   return (
     <SafeAreaView style={styles.container}>
@@ -89,6 +90,32 @@ export default function TradesScreen() {
       <View style={styles.header}>
         <Text style={styles.title}>Trade History</Text>
       </View>
+
+      {/* Summary Card */}
+      {summary && (
+        <Card style={styles.summaryCard}>
+          <View style={styles.summaryRow}>
+            <View style={styles.summaryItem}>
+              <Text style={styles.summaryValue}>{summary.total_trades}</Text>
+              <Text style={styles.summaryLabel}>Total</Text>
+            </View>
+            <View style={styles.summaryItem}>
+              <Text style={[styles.summaryValue, styles.summaryBuy]}>{summary.buy_trades}</Text>
+              <Text style={styles.summaryLabel}>Buys</Text>
+            </View>
+            <View style={styles.summaryItem}>
+              <Text style={[styles.summaryValue, styles.summarySell]}>{summary.sell_trades}</Text>
+              <Text style={styles.summaryLabel}>Sells</Text>
+            </View>
+            <View style={styles.summaryItem}>
+              <Text style={styles.summaryValue}>
+                ${(summary.total_volume / 1000).toFixed(0)}K
+              </Text>
+              <Text style={styles.summaryLabel}>Volume</Text>
+            </View>
+          </View>
+        </Card>
+      )}
 
       {/* Section Header with Filter */}
       <View style={styles.sectionHeader}>
@@ -210,6 +237,38 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: colors.text.primary,
   },
+  summaryCard: {
+    marginHorizontal: 20,
+    marginBottom: 16,
+    padding: 16,
+  },
+  summaryRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  summaryItem: {
+    alignItems: 'center',
+  },
+  summaryValue: {
+    fontSize: 18,
+    fontWeight: '600',
+    fontFamily: 'JetBrains Mono',
+    color: colors.text.primary,
+    marginBottom: 4,
+  },
+  summaryBuy: {
+    color: colors.signal.gain,
+  },
+  summarySell: {
+    color: colors.signal.loss,
+  },
+  summaryLabel: {
+    fontSize: 10,
+    fontWeight: '600',
+    color: colors.text.muted,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
   sectionHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -235,11 +294,13 @@ const styles = StyleSheet.create({
     color: colors.signal.active,
   },
   filterStrip: {
+    maxHeight: 40,
     marginBottom: 12,
   },
   filterStripContent: {
     paddingHorizontal: 20,
     gap: 6,
+    alignItems: 'center',
   },
   filterChip: {
     paddingHorizontal: 12,
@@ -248,6 +309,8 @@ const styles = StyleSheet.create({
     borderRadius: 6,
     borderWidth: 1,
     borderColor: 'transparent',
+    height: 28,
+    justifyContent: 'center',
   },
   filterChipActive: {
     backgroundColor: colors.bg.deep,

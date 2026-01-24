@@ -23,13 +23,17 @@ export interface Position {
   entry_time?: string;
 }
 
-// Trade data
+// Trade data (matches API response)
 export interface Trade {
-  id: string;
+  id: number;
   symbol: string;
   side: 'BUY' | 'SELL';
   quantity: number;
   price: number;
+  notional?: number;
+  cash_impact?: number;
+  commission?: number;
+  slippage?: number;
   pnl?: number;
   timestamp: string;
 }

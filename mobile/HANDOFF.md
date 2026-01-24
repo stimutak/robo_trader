@@ -1,6 +1,6 @@
 # Mobile App Handoff
 
-**Date:** 2026-01-23
+**Date:** 2026-01-24
 **Branch:** `feature/mobile-app`
 **Location:** `/Users/oliver/robo_trader-mobile/mobile/`
 
@@ -8,60 +8,118 @@
 
 ## Current State
 
-The mobile app is **built and ready to run**. All screens are implemented.
+The mobile app is **fully functional** with real data from the backend API.
 
-### Completed Screens
+### Completed Features
 
-| Screen | File | Status |
-|--------|------|--------|
-| Log Viewer | `app/(tabs)/logs.tsx` | ✅ Complete - WebSocket streaming, filters, search |
-| Home | `app/(tabs)/index.tsx` | ✅ Complete - Portfolio, positions, system status |
-| Analytics | `app/(tabs)/analytics.tsx` | ✅ Complete - Metrics grid (chart placeholder) |
-| ML | `app/(tabs)/ml.tsx` | ✅ Complete - Model status, predictions |
-| Trades | `app/(tabs)/trades.tsx` | ✅ Complete - Trade history with filters |
-| Position Detail | `app/position/[symbol].tsx` | ✅ Complete |
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Home Screen | ✅ Working | Portfolio, positions, system status |
+| Analytics | ✅ Working | SVG equity curve, performance metrics |
+| Trades | ✅ Working | Summary card, filters, trade list |
+| ML Screen | ✅ Working | Model status, predictions |
+| Logs Screen | ⚠️ Partial | UI works, needs backend runner for data |
+| Position Detail | ✅ Scaffold | Route exists, needs implementation |
 
-### Project Structure
+---
 
-```
-mobile/
-├── app/                    # Screens (Expo Router)
-│   ├── (tabs)/            # Tab screens
-│   ├── position/          # Position detail
-│   └── _layout.tsx        # Root layout with providers
-├── components/            # Reusable components
-│   ├── ui/               # Card, Badge, StatusDot
-│   └── logs/             # LogEntry, LogFilter, LogSearch
-├── hooks/                 # useAPI, useWebSocket
-├── stores/                # Zustand stores (logs, trading)
-├── lib/                   # API client, types, constants
-└── app.json              # Expo config (dark theme set)
-```
+## Session 2026-01-24 Changes
+
+### Backend Changes (robo_trader repo)
+
+1. **CORS Support** - Mobile app can now fetch API data
+   - Added `flask-cors` package
+   - File: `app.py` - `CORS(app)` enabled
+
+2. **WebSocket Binding** - Changed from `localhost` to `0.0.0.0`
+   - File: `robo_trader/websocket_server.py`
+
+### Mobile App Changes
+
+1. **Equity Chart** - Complete rewrite with SVG
+   - Smooth bezier curve with gradient fill
+   - Red/green coloring based on value
+   - Fixed percentage to show displayed period change (not all-time)
+   - File: `components/charts/EquityChart.tsx`
+
+2. **Trade Summary Card** - Added at top of trades screen
+   - Shows: Total, Buys, Sells, Volume
+   - File: `app/(tabs)/trades.tsx`
+
+3. **Filter Chips Fix** - Were stretching to full height
+   - Added explicit height constraints
+   - File: `app/(tabs)/trades.tsx`
+
+4. **API Debugging** - Added console logging
+   - File: `lib/api.ts`
 
 ---
 
 ## To Run
 
+### Start Backend
 ```bash
-cd /Users/oliver/robo_trader-mobile/mobile
-npx expo start
+cd /Users/oliver/robo_trader
+./START_TRADER.sh
 ```
 
-Then:
-- Press `i` → iOS Simulator
-- Press `w` → Web browser
-- **iPhone:** Open Expo Go app → Scan QR Code
+### Start Mobile App
+```bash
+cd /Users/oliver/robo_trader-mobile/mobile
+npx expo start --lan
+```
+
+Then scan QR code with iPhone camera (not Expo Go app directly).
+
+---
+
+## Configuration
+
+### API Endpoints (`lib/constants.ts`)
+```typescript
+const DEV_HOST = '192.168.1.166';  // Mac's local IP - UPDATE IF CHANGED
+export const API_BASE = __DEV__ ? `http://${DEV_HOST}:5555` : 'http://localhost:5555';
+export const WS_URL = __DEV__ ? `ws://${DEV_HOST}:8765` : 'ws://localhost:8765';
+```
+
+**Note:** If Mac's IP changes, update `DEV_HOST`.
+
+---
+
+## Known Issues
+
+1. **Logs "Disconnected"** - WebSocket connects but no logs because runner not active
+2. **Trade P&L = $0.00** - API returns `pnl: null` for trades
+3. **Winners/Losers filters** - Don't work due to missing P&L data
+
+---
+
+## Future Work
+
+### High Priority
+1. **WebSocket log streaming** - Backend needs to send logs (see `handoff/HANDOFF_WEBSOCKET_LOG_STREAMING.md`)
+2. **Per-trade P&L** - Backend should calculate P&L for trades
+3. **Production build** - EAS Build for TestFlight
+
+### Medium Priority
+4. **Position detail screen** - Implement chart and actions
+5. **Trade detail view** - Tap for full details
+6. **Push notifications** - Trade alerts
+
+### Low Priority
+7. **Offline caching**
+8. **Biometric auth**
+9. **iOS widget**
 
 ---
 
 ## Git Setup
 
-This is a **git worktree** linked to the main robo_trader repo:
+This is a **git worktree**:
+- **Main repo:** `/Users/oliver/robo_trader` (branch: `main`)
+- **Worktree:** `/Users/oliver/robo_trader-mobile` (branch: `feature/mobile-app`)
 
-- **Main repo:** `/Users/oliver/robo_trader` (on `main` branch - untouched)
-- **Worktree:** `/Users/oliver/robo_trader-mobile` (on `feature/mobile-app`)
-
-To merge mobile app into main repo later:
+To merge into main:
 ```bash
 cd /Users/oliver/robo_trader
 git merge feature/mobile-app
@@ -69,46 +127,15 @@ git merge feature/mobile-app
 
 ---
 
-## Known Issues
-
-1. ~~**Victory Native charts** - Placeholder only, chart not implemented yet~~ ✅ FIXED (2026-01-23)
-2. **WebSocket log streaming** - Needs backend enhancement (see `handoff/HANDOFF_WEBSOCKET_LOG_STREAMING.md`)
-
----
-
-## Next Steps
-
-1. Start Expo and verify it runs on iOS/web
-2. Start robo_trader backend (`./START_TRADER.sh` in main repo) to test API
-3. Add Victory Native equity curve chart
-4. Enhance backend WebSocket to stream logs
-
----
-
-## API Endpoints Used
-
-All endpoints are on `http://localhost:5000`:
-
-- `GET /api/status` - System status
-- `GET /api/pnl` - P&L data
-- `GET /api/positions` - Current positions
-- `GET /api/performance` - Performance metrics
-- `GET /api/ml/status` - ML system status
-- `GET /api/ml/predictions` - ML predictions
-- `GET /api/trades` - Trade history
-
-WebSocket: `ws://localhost:8765`
-
----
-
 ## Tech Stack
 
-- React Native + Expo (SDK 54)
+- React Native + Expo SDK 54
 - Expo Router (file-based routing)
-- Zustand (state management)
+- react-native-svg (charts)
 - TanStack Query (data fetching)
+- Zustand (state management)
 - TypeScript
 
 ---
 
-**Ready to run. Start with `npx expo start`.**
+**Ready to use. Data flows from backend API to mobile app.**

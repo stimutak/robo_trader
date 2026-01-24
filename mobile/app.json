@@ -16,7 +16,13 @@
     },
     "ios": {
       "supportsTablet": true,
-      "backgroundColor": "#08080a"
+      "backgroundColor": "#08080a",
+      "infoPlist": {
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true,
+          "NSAllowsLocalNetworking": true
+        }
+      }
     },
     "android": {
       "adaptiveIcon": {

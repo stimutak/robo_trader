@@ -113,9 +113,10 @@ export default function HomeScreen() {
     .sort((a, b) => Math.abs(b.unrealized_pnl || 0) - Math.abs(a.unrealized_pnl || 0))
     .slice(0, 5);
 
-  const equity = pnlData?.equity || 0;
-  const dailyPnL = pnlData?.daily || 0;
-  const unrealized = pnlData?.unrealized || 0;
+  // Calculate equity from positions (sum of market values)
+  const equity = positions.reduce((sum, p) => sum + (p.market_value || 0), 0);
+  const unrealized = positions.reduce((sum, p) => sum + (p.unrealized_pnl || 0), 0);
+  const dailyPnL = pnlData?.daily || unrealized; // Fallback to unrealized if daily not available
   const winRate = (perfData?.summary?.win_rate || 0) * 100;
   const sharpe = perfData?.summary?.total_sharpe || perfData?.all?.sharpe || 0;
 
