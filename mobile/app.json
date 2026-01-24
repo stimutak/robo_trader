@@ -45,6 +45,13 @@
     ],
     "experiments": {
       "typedRoutes": true
-    }
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "fd537c8b-759a-4a4c-9ce7-60e9009bcdd4"
+      }
+    },
+    "owner": "stimu"
   }
 }
