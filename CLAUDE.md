@@ -106,6 +106,59 @@ pkill -f "IB Gateway"
 - API permissions are configured in your IBKR account settings
 - System uses **readonly** connections (no order placement via API)
 
+## Mobile App & Parallel Development
+
+### Repository Structure
+
+| Location | Branch | Purpose |
+|----------|--------|---------|
+| `/Users/oliver/robo_trader` | `main` | Backend, API, Web Dashboard |
+| `/Users/oliver/robo_trader-mobile` | `feature/mobile-app` | React Native Mobile App |
+
+The mobile app lives in a **git worktree** linked to this repo.
+
+### Parallel Development Rules
+
+**CRITICAL: Follow these rules to avoid conflicts**
+
+1. **Backend changes → THIS repo (main branch)**
+   - API endpoints (`app.py`)
+   - WebSocket server (`robo_trader/websocket_server.py`)
+   - Database (`robo_trader/database_async.py`)
+   - Any `robo_trader/*.py` files
+
+2. **Mobile-only changes → worktree (feature/mobile-app)**
+   - React Native code (`mobile/**`)
+   - Mobile UI components
+   - Mobile-specific configs
+
+3. **Never edit the same file in both branches simultaneously**
+
+### Syncing Between Repos
+
+```bash
+# After making backend changes here, sync to mobile worktree:
+cd /Users/oliver/robo_trader-mobile
+git fetch origin main
+git merge origin/main
+
+# When mobile app is ready to merge:
+cd /Users/oliver/robo_trader
+git merge feature/mobile-app
+```
+
+### Mobile App Status
+
+See `mobile/HANDOFF.md` and `mobile/IMPLEMENTATION_PLAN.md` in the worktree for current status.
+
+**Quick start mobile dev:**
+```bash
+cd /Users/oliver/robo_trader-mobile/mobile
+npx expo start --lan
+```
+
+---
+
 ## Key Project Files
 - `IMPLEMENTATION_PLAN.md` - The active project roadmap
 - `handoff/LATEST_HANDOFF.md` - Latest session handoff document
