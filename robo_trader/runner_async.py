@@ -1602,7 +1602,9 @@ class AsyncRunner:
             strategy_name = (
                 "ML_ENHANCED"
                 if self.use_ml_enhanced
-                else "ML_ENSEMBLE" if self.use_ml_strategy else "SMA_CROSSOVER"
+                else "ML_ENSEMBLE"
+                if self.use_ml_strategy
+                else "SMA_CROSSOVER"
             )
             await self.db.record_signal(
                 symbol,
@@ -2196,6 +2198,19 @@ class AsyncRunner:
             cash=cash_float,
             equity=equity_float,
             daily_pnl=self.daily_pnl,
+            realized_pnl=realized_pnl_float,
+            unrealized_pnl=unrealized_float,
+        )
+
+        # Save daily equity snapshot for portfolio value tracking (industry standard)
+        positions_value = sum(
+            float(pos.quantity) * market_prices.get(symbol, float(pos.avg_price))
+            for symbol, pos in self.positions.items()
+        )
+        await self.db.save_equity_snapshot(
+            equity=equity_float,
+            cash=cash_float,
+            positions_value=positions_value,
             realized_pnl=realized_pnl_float,
             unrealized_pnl=unrealized_float,
         )

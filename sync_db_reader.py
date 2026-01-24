@@ -213,3 +213,24 @@ class SyncDatabaseReader:
         except Exception as e:
             print(f"Error getting signals: {e}")
             return []
+
+    def get_equity_history(self, days: int = 365) -> List[Dict]:
+        """Get equity history for charting portfolio value over time.
+
+        Returns list of daily snapshots ordered by date ascending (oldest first).
+        This is the industry standard for tracking portfolio performance.
+        """
+        try:
+            rows = self._fetch_all(
+                """
+                SELECT date, equity, cash, positions_value, realized_pnl, unrealized_pnl, timestamp
+                FROM equity_history
+                ORDER BY date ASC
+                LIMIT ?
+                """,
+                (days,),
+            )
+            return [dict(row) for row in rows]
+        except Exception as e:
+            print(f"Error getting equity history: {e}")
+            return []

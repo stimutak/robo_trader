@@ -273,6 +273,22 @@ class AsyncTradingDatabase:
             """
             )
 
+            # Equity history table for portfolio value over time
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS equity_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL UNIQUE,
+                    equity REAL NOT NULL,
+                    cash REAL DEFAULT 0,
+                    positions_value REAL DEFAULT 0,
+                    realized_pnl REAL DEFAULT 0,
+                    unrealized_pnl REAL DEFAULT 0,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """
+            )
+
             # Market data table
             await conn.execute(
                 """
@@ -615,6 +631,65 @@ class AsyncTradingDatabase:
                     "low": row[3],
                     "close": row[4],
                     "volume": row[5],
+                }
+                for row in rows
+            ]
+
+    async def save_equity_snapshot(
+        self,
+        equity: float,
+        cash: float = 0.0,
+        positions_value: float = 0.0,
+        realized_pnl: float = 0.0,
+        unrealized_pnl: float = 0.0,
+        snapshot_date: Optional[str] = None,
+    ) -> None:
+        """Save a daily equity snapshot for portfolio value tracking.
+
+        This is the industry standard approach for tracking portfolio value over time.
+        Called at end of each trading day or when account summary is updated.
+        """
+        if snapshot_date is None:
+            snapshot_date = datetime.now().strftime("%Y-%m-%d")
+
+        async with self.get_connection() as conn:
+            # Use INSERT OR REPLACE to update if date already exists
+            await conn.execute(
+                """
+                INSERT OR REPLACE INTO equity_history
+                (date, equity, cash, positions_value, realized_pnl, unrealized_pnl, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+                (snapshot_date, equity, cash, positions_value, realized_pnl, unrealized_pnl),
+            )
+            await conn.commit()
+            logger.debug(f"Saved equity snapshot: {snapshot_date} equity={equity:.2f}")
+
+    async def get_equity_history(self, days: int = 365) -> List[Dict]:
+        """Get equity history for the specified number of days.
+
+        Returns list of daily snapshots ordered by date ascending (oldest first).
+        """
+        async with self.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT date, equity, cash, positions_value, realized_pnl, unrealized_pnl, timestamp
+                FROM equity_history
+                ORDER BY date ASC
+                LIMIT ?
+            """,
+                (days,),
+            )
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "date": row[0],
+                    "equity": row[1],
+                    "cash": row[2],
+                    "positions_value": row[3],
+                    "realized_pnl": row[4],
+                    "unrealized_pnl": row[5],
+                    "timestamp": row[6],
                 }
                 for row in rows
             ]

@@ -115,7 +115,9 @@ pkill -f "IB Gateway"
   - `subprocess_manager.py` - IBKR subprocess health monitoring
 - `robo_trader/exceptions.py` - Custom exception hierarchy (Phase 4 P9)
 - `robo_trader/data_providers/` - Data provider abstraction (Polygon.io ready)
-- `app.py` - Dashboard with monitoring interface
+- `robo_trader/database_async.py` - Async database with equity_history table for portfolio tracking
+- `sync_db_reader.py` - Sync database reader for dashboard access
+- `app.py` - Dashboard with comprehensive professional overview
 - `robo_trader/websocket_server.py` - WebSocket server for real-time updates
 - `robo_trader/features/` - Feature engineering pipeline (Phase 2 - COMPLETE)
 - `robo_trader/ml/` - ML model training & selection (Phase 2 - COMPLETE)
@@ -213,6 +215,56 @@ python3 test_safety_features.py
 15. ✅ **Market Close Time Wrong - FIXED (2025-12-29)** - Was 4:30 PM, now 4:00 PM
 16. ✅ **Int/Datetime Comparison Error - FIXED (2026-01-15)** - Added try/except fallback in correlation.py
 17. ✅ **Missing Market Holidays - FIXED (2026-01-15)** - Added MLK, Presidents, Good Friday, Memorial, Labor, Thanksgiving, Juneteenth
+18. ✅ **Dashboard Overview Redesign - IMPLEMENTED (2026-01-24)** - Professional-grade overview with all key metrics
+19. ✅ **Equity History Tracking - IMPLEMENTED (2026-01-24)** - Daily portfolio snapshots in `equity_history` table
+
+## Dashboard Overview (2026-01-24)
+
+The dashboard overview now shows comprehensive professional trading metrics:
+
+**Hero Row:**
+- Total Equity (prominent, with % return since inception)
+- Today's P&L ($ and %)
+- Unrealized P&L (open positions)
+- Realized P&L (closed trades)
+
+**Risk Row:**
+- Positions Value, Cash Available, Exposure %, Current Drawdown, Max Drawdown, Buying Power
+
+**Main Row:**
+- 30-day Portfolio Value chart (uses `equity_history` table)
+- Position Summary (count, winners/losers, best/worst, avg size)
+
+**Strategy Row:**
+- Win Rate, Profit Factor, Sharpe Ratio, Total Trades
+- Avg Win, Avg Loss, Best Trade, Worst Trade
+- Recent Trades list
+
+**Status Row:**
+- Gateway connection, Market status, Next open/close, Last update, Cycle interval
+
+## Equity History Tracking (2026-01-24)
+
+Portfolio value is tracked daily using the `equity_history` table (industry standard approach).
+
+**Table Schema:**
+```sql
+CREATE TABLE equity_history (
+    date TEXT NOT NULL UNIQUE,
+    equity REAL NOT NULL,
+    cash REAL DEFAULT 0,
+    positions_value REAL DEFAULT 0,
+    realized_pnl REAL DEFAULT 0,
+    unrealized_pnl REAL DEFAULT 0,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+```
+
+**How it works:**
+- Snapshots saved at end of each trading cycle via `save_equity_snapshot()`
+- One snapshot per day (updates if same day)
+- Used by `/api/equity-curve` endpoint for portfolio value chart
+- Accessible via `SyncDatabaseReader.get_equity_history()`
 
 ## AI-Driven Symbol Discovery (2026-01-14)
 
