@@ -20,7 +20,7 @@ logger = get_logger(__name__)
 class WebSocketManager:
     """Manages WebSocket connections and broadcasts updates."""
 
-    def __init__(self, host: str = "localhost", port: int = 8765):
+    def __init__(self, host: str = "0.0.0.0", port: int = 8765):
         self.host = host
         self.port = port
         self.clients: Set[WebSocketServerProtocol] = set()
@@ -257,9 +257,39 @@ class WebSocketManager:
 
         self.message_queue.put(message)
 
+    def send_log_message(
+        self,
+        level: str,
+        source: str,
+        message: str,
+        context: Optional[Dict[str, Any]] = None,
+    ):
+        """Queue a log message for broadcast to connected clients.
+
+        Args:
+            level: Log level (DEBUG, INFO, WARNING, ERROR)
+            source: Module or component name
+            message: The log message text
+            context: Optional structured data (symbol, price, etc.)
+        """
+        log_message = {
+            "type": "log",
+            "level": level.upper(),
+            "source": source,
+            "message": message,
+            "context": context or {},
+            "timestamp": datetime.now().isoformat(),
+        }
+        self.message_queue.put(log_message)
+
 
 # Global WebSocket manager instance
 ws_manager = WebSocketManager()
+
+# Register with logger for log streaming (late binding to avoid circular import)
+from robo_trader.logger import WebSocketLogProcessor  # noqa: E402
+
+WebSocketLogProcessor.set_ws_manager(ws_manager)
 
 
 if __name__ == "__main__":

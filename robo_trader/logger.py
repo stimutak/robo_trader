@@ -63,6 +63,46 @@ class LogEvent(str, Enum):
     PNL_UPDATE = "pnl.update"
 
 
+class WebSocketLogProcessor:
+    """Structlog processor that forwards logs to WebSocket for real-time streaming.
+
+    Uses late binding to avoid circular imports - the ws_manager is set after
+    the websocket_server module loads.
+    """
+
+    _ws_manager = None
+
+    @classmethod
+    def set_ws_manager(cls, ws_manager):
+        """Set the WebSocket manager instance for log streaming."""
+        cls._ws_manager = ws_manager
+
+    def __call__(self, logger, method_name, event_dict):
+        """Forward log message to WebSocket if manager is configured."""
+        if self._ws_manager is None:
+            return event_dict
+
+        level = method_name.upper()
+
+        # Only stream INFO and above to avoid flooding clients
+        if level in ("INFO", "WARNING", "ERROR", "CRITICAL"):
+            try:
+                self._ws_manager.send_log_message(
+                    level=level,
+                    source=event_dict.get("logger", "robo_trader"),
+                    message=event_dict.get("event", str(event_dict)),
+                    context={
+                        k: v
+                        for k, v in event_dict.items()
+                        if k not in ("event", "logger", "timestamp", "level")
+                    },
+                )
+            except Exception:
+                pass  # Don't let log streaming failures break logging
+
+        return event_dict
+
+
 def add_timestamp(logger, method_name, event_dict):
     """Add timestamp to all log entries."""
     # Use local timezone instead of UTC
@@ -122,6 +162,8 @@ def setup_structlog():
                 CallsiteParameter.LINENO,
             ]
         ),
+        # WebSocket log streaming (before final renderer)
+        WebSocketLogProcessor(),
     ]
 
     # Format-specific processors
@@ -421,4 +463,5 @@ __all__ = [
     "create_audit_logger",
     "create_performance_logger",
     "LogContext",
+    "WebSocketLogProcessor",
 ]
