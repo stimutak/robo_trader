@@ -650,9 +650,9 @@ HTML_TEMPLATE = """
 
             <!-- Two Column Layout -->
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px;">
-                <!-- Left: Equity Curve -->
+                <!-- Left: P&L History -->
                 <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
-                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 12px; text-transform: uppercase;">Equity Curve</h4>
+                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 12px; text-transform: uppercase;">P&L History</h4>
                     <div style="height: 140px;">
                         <canvas id="overview-equity-chart"></canvas>
                     </div>
@@ -855,9 +855,9 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- Equity Curve Chart -->
+            <!-- P&L History & Portfolio Value Chart -->
             <div class="table-container" style="padding: 12px; margin-bottom: 15px;">
-                <h3 style="margin-bottom: 10px; font-size: 14px;">Equity Curve (Realized P&L)</h3>
+                <h3 style="margin-bottom: 10px; font-size: 14px;">P&L History & Portfolio Value</h3>
                 <div style="height: 220px; position: relative;">
                     <canvas id="equity-chart-canvas"></canvas>
                 </div>
@@ -1939,38 +1939,68 @@ HTML_TEMPLATE = """
                 gradient.addColorStop(1, 'rgba(255, 107, 107, 0)');
             }
 
+            // Calculate portfolio value: current equity - last P&L + each P&L point
+            // This shows how portfolio value changed over time
+            const currentEquity = parseFloat(document.getElementById('ov-portfolio')?.textContent?.replace(/[$,]/g, '') || 0);
+            const portfolioValues = data.values.map(pnl => {
+                // Portfolio value = current equity - (last P&L - this P&L)
+                return currentEquity - (lastValue - pnl);
+            });
+
             equityChart = new Chart(ctx, {
                 type: 'line',
                 data: {
                     labels: data.labels,
                     datasets: [{
-                        label: 'Cumulative P&L',
+                        label: 'P&L',
                         data: data.values,
                         borderColor: lastValue >= 0 ? '#4ade80' : '#ff6b6b',
-                        backgroundColor: gradient,
-                        fill: true,
+                        backgroundColor: 'transparent',
+                        fill: false,
                         tension: 0.3,
                         pointRadius: 0,
                         pointHoverRadius: 4,
-                        borderWidth: 2
+                        borderWidth: 2,
+                        yAxisID: 'y'
+                    }, {
+                        label: 'Portfolio Value',
+                        data: portfolioValues,
+                        borderColor: '#3b82f6',
+                        backgroundColor: 'transparent',
+                        fill: false,
+                        tension: 0.3,
+                        pointRadius: 0,
+                        pointHoverRadius: 4,
+                        borderWidth: 2,
+                        borderDash: [5, 5],
+                        yAxisID: 'y1'
                     }]
                 },
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
                     plugins: {
-                        legend: { display: false },
+                        legend: {
+                            display: true,
+                            position: 'top',
+                            labels: { color: '#888', font: { size: 10 }, boxWidth: 12 }
+                        },
                         tooltip: {
                             mode: 'index',
                             intersect: false,
                             backgroundColor: '#1a1a2e',
                             titleColor: '#fff',
-                            bodyColor: '#4ade80',
+                            bodyColor: '#fff',
                             borderColor: '#333',
                             borderWidth: 1,
                             callbacks: {
                                 label: function(context) {
-                                    return '$' + context.parsed.y.toFixed(2);
+                                    const label = context.dataset.label || '';
+                                    const value = context.parsed.y;
+                                    if (label === 'Portfolio Value') {
+                                        return label + ': $' + value.toLocaleString(undefined, {maximumFractionDigits: 0});
+                                    }
+                                    return label + ': $' + value.toFixed(2);
                                 }
                             }
                         }
@@ -1983,12 +2013,25 @@ HTML_TEMPLATE = """
                         },
                         y: {
                             display: true,
+                            position: 'left',
                             grid: { color: '#222' },
                             ticks: {
-                                color: '#666',
+                                color: lastValue >= 0 ? '#4ade80' : '#ff6b6b',
                                 font: { size: 10 },
-                                callback: function(value) { return '$' + value; }
-                            }
+                                callback: function(value) { return '$' + value.toLocaleString(); }
+                            },
+                            title: { display: true, text: 'P&L', color: '#666', font: { size: 10 } }
+                        },
+                        y1: {
+                            display: true,
+                            position: 'right',
+                            grid: { drawOnChartArea: false },
+                            ticks: {
+                                color: '#3b82f6',
+                                font: { size: 10 },
+                                callback: function(value) { return '$' + (value/1000).toFixed(0) + 'k'; }
+                            },
+                            title: { display: true, text: 'Portfolio', color: '#666', font: { size: 10 } }
                         }
                     },
                     interaction: { mode: 'nearest', axis: 'x', intersect: false }
