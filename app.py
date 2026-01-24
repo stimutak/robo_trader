@@ -1267,6 +1267,13 @@ HTML_TEMPLATE = """
                     </button>
                 </div>
             </div>
+            <div style="display: flex; gap: 8px; margin-bottom: 10px;">
+                <button onclick="setLogFilter('ALL')" id="log-filter-ALL" class="log-filter-btn active" style="background: #3b82f6; border: none; color: #fff; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: bold;">ALL</button>
+                <button onclick="setLogFilter('DEBUG')" id="log-filter-DEBUG" class="log-filter-btn" style="background: #333; border: 1px solid #555; color: #6b7280; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">DEBUG</button>
+                <button onclick="setLogFilter('INFO')" id="log-filter-INFO" class="log-filter-btn" style="background: #333; border: 1px solid #555; color: #3b82f6; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">INFO</button>
+                <button onclick="setLogFilter('WARNING')" id="log-filter-WARNING" class="log-filter-btn" style="background: #333; border: 1px solid #555; color: #f59e0b; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">WARN</button>
+                <button onclick="setLogFilter('ERROR')" id="log-filter-ERROR" class="log-filter-btn" style="background: #333; border: 1px solid #555; color: #ef4444; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">ERROR</button>
+            </div>
             <div class="log-container" id="log-container">
                 <div class="log-entry">
                     <span class="log-time">00:00:00</span>
@@ -2679,6 +2686,37 @@ HTML_TEMPLATE = """
             }
         }
 
+        let currentLogFilter = 'ALL';
+
+        function setLogFilter(level) {
+            currentLogFilter = level;
+            // Update button styles
+            document.querySelectorAll('.log-filter-btn').forEach(btn => {
+                btn.style.background = '#333';
+                btn.style.border = '1px solid #555';
+            });
+            const activeBtn = document.getElementById('log-filter-' + level);
+            if (activeBtn) {
+                activeBtn.style.background = '#3b82f6';
+                activeBtn.style.border = 'none';
+            }
+            // Apply filter to existing logs
+            applyLogFilter();
+        }
+
+        function applyLogFilter() {
+            const container = document.getElementById('log-container');
+            if (!container) return;
+            container.querySelectorAll('.log-entry').forEach(entry => {
+                const logLevel = entry.dataset.level;
+                if (currentLogFilter === 'ALL' || logLevel === currentLogFilter || !logLevel) {
+                    entry.style.display = '';
+                } else {
+                    entry.style.display = 'none';
+                }
+            });
+        }
+
         function clearLogs() {
             const container = document.getElementById('log-container');
             if (container) {
@@ -2783,6 +2821,7 @@ HTML_TEMPLATE = """
             const container = document.getElementById('log-container');
             const entry = document.createElement('div');
             entry.className = 'log-entry';
+            entry.dataset.level = data.level || 'INFO';
 
             // Parse timestamp or use current time
             let time;
@@ -2810,6 +2849,12 @@ HTML_TEMPLATE = """
             const source = data.source ? `<span style="color: #888;">${data.source}:</span> ` : '';
 
             entry.innerHTML = `<span class="log-time">${time}</span> ${levelBadge} ${source}<span>${data.message}</span>`;
+
+            // Apply current filter
+            if (currentLogFilter !== 'ALL' && data.level !== currentLogFilter) {
+                entry.style.display = 'none';
+            }
+
             container.appendChild(entry);
 
             // Auto-scroll if enabled
