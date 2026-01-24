@@ -16,6 +16,7 @@
     },
     "ios": {
       "supportsTablet": true,
+      "bundleIdentifier": "com.stimutak.robotrader",
       "backgroundColor": "#08080a",
       "infoPlist": {
         "NSAppTransportSecurity": {
@@ -25,6 +26,7 @@
       }
     },
     "android": {
+      "package": "com.stimutak.robotrader",
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "backgroundColor": "#08080a"

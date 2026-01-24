@@ -1,8 +1,13 @@
 // API Configuration
 // Use Mac's IP for iPhone access (localhost won't work on device)
 const DEV_HOST = '192.168.1.166';
-export const API_BASE = __DEV__ ? `http://${DEV_HOST}:5555` : 'http://localhost:5555';
-export const WS_URL = __DEV__ ? `ws://${DEV_HOST}:8765` : 'ws://localhost:8765';
+
+// EAS build injects these via eas.json env config
+// Falls back to dev values for local development
+export const API_BASE = process.env.EXPO_PUBLIC_API_URL
+  || (__DEV__ ? `http://${DEV_HOST}:5555` : 'http://localhost:5555');
+export const WS_URL = process.env.EXPO_PUBLIC_WS_URL
+  || (__DEV__ ? `ws://${DEV_HOST}:8765` : 'ws://localhost:8765');
 export const POLL_INTERVAL = 5000;
 export const LOG_BUFFER_SIZE = 500;
 
