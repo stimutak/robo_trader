@@ -31,18 +31,20 @@
 
 **CRITICAL: Follow these rules to avoid conflicts**
 
-1. **Mobile-only changes → HERE (feature/mobile-app)**
+1. **Mobile app ONLY → HERE (feature/mobile-app)**
    - React Native code (`mobile/**`)
    - Mobile UI components, screens
-   - Mobile-specific configs
-   - Mobile handoffs and docs (`mobile/*.md`)
+   - Mobile-specific configs (`mobile/lib/constants.ts`)
+   - Mobile docs (`mobile/*.md`)
 
-2. **Backend changes → MAIN REPO (main branch)**
-   - Do NOT edit `app.py`, `robo_trader/*.py` here
-   - Go to `/Users/oliver/robo_trader` for backend work
+2. **EVERYTHING ELSE → MAIN REPO (main branch)**
+   - Trading system (`robo_trader/`)
+   - Web dashboard (`app.py`)
+   - Scripts, configs, documentation
+   - Go to `/Users/oliver/robo_trader` for non-mobile work
    - Then sync back: `git merge origin/main`
 
-3. **Never edit backend files in this worktree**
+3. **Never edit non-mobile files in this worktree**
 
 ### Syncing From Main
 
