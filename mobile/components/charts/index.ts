@@ -1,0 +1,1 @@
+export { EquityChart } from './EquityChart';

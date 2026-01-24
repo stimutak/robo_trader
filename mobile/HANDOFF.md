@@ -71,8 +71,8 @@ git merge feature/mobile-app
 
 ## Known Issues
 
-1. **Victory Native charts** - Placeholder only, chart not implemented yet
-2. **WebSocket log streaming** - Needs backend enhancement to send structured log messages
+1. ~~**Victory Native charts** - Placeholder only, chart not implemented yet~~ ✅ FIXED (2026-01-23)
+2. **WebSocket log streaming** - Needs backend enhancement (see `handoff/HANDOFF_WEBSOCKET_LOG_STREAMING.md`)
 
 ---
 

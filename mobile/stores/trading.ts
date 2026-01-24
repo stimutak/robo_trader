@@ -23,9 +23,10 @@ interface TradingState {
   winRate: number;
   sharpeRatio: number;
   maxDrawdown: number;
-  profitFactor: number;
-  avgWin: number;
-  avgLoss: number;
+  totalPerfPnL: number;
+  totalTrades: number;
+  winningTrades: number;
+  losingTrades: number;
 
   // ML
   modelsCount: number;
@@ -55,11 +56,12 @@ interface TradingState {
   setPositions: (positions: Position[]) => void;
   setPerformance: (perf: {
     win_rate: number;
-    sharpe_ratio: number;
-    max_drawdown: number;
-    profit_factor: number;
-    avg_win: number;
-    avg_loss: number;
+    total_sharpe: number;
+    total_drawdown: number;
+    total_pnl: number;
+    total_trades: number;
+    winning_trades: number;
+    losing_trades: number;
   }) => void;
   setMLStatus: (ml: {
     models_trained: number;
@@ -90,9 +92,10 @@ export const useTradingStore = create<TradingState>((set) => ({
   winRate: 0,
   sharpeRatio: 0,
   maxDrawdown: 0,
-  profitFactor: 0,
-  avgWin: 0,
-  avgLoss: 0,
+  totalPerfPnL: 0,
+  totalTrades: 0,
+  winningTrades: 0,
+  losingTrades: 0,
 
   modelsCount: 0,
   featureCount: 0,
@@ -126,11 +129,12 @@ export const useTradingStore = create<TradingState>((set) => ({
   setPerformance: (perf) =>
     set({
       winRate: perf.win_rate,
-      sharpeRatio: perf.sharpe_ratio,
-      maxDrawdown: perf.max_drawdown,
-      profitFactor: perf.profit_factor,
-      avgWin: perf.avg_win,
-      avgLoss: perf.avg_loss,
+      sharpeRatio: perf.total_sharpe,
+      maxDrawdown: perf.total_drawdown,
+      totalPerfPnL: perf.total_pnl,
+      totalTrades: perf.total_trades,
+      winningTrades: perf.winning_trades,
+      losingTrades: perf.losing_trades,
     }),
 
   setMLStatus: (ml) =>

@@ -52,9 +52,9 @@ export default function PositionDetailScreen() {
     );
   }
 
-  const pnl = position.pnl || 0;
-  const pnlPct = position.pnl_pct || 0;
-  const value = position.quantity * position.market_price;
+  const pnl = position.unrealized_pnl || 0;
+  const pnlPct = position.unrealized_pnl_pct || 0;
+  const value = position.market_value || position.quantity * position.current_price;
   const isWin = pnl > 0;
   const isLoss = pnl < 0;
 
@@ -71,8 +71,8 @@ export default function PositionDetailScreen() {
         style={styles.scrollView}
         contentContainerStyle={styles.scrollContent}
       >
-        {/* Sector */}
-        <Text style={styles.sector}>{position.sector || 'Unknown Sector'}</Text>
+        {/* Strategy */}
+        <Text style={styles.sector}>{position.strategy || 'Unknown Strategy'}</Text>
 
         {/* P&L Hero */}
         <View style={styles.pnlHero}>
@@ -99,8 +99,8 @@ export default function PositionDetailScreen() {
         {/* Position Details */}
         <Card style={styles.detailsCard}>
           <DetailRow label="Shares" value={position.quantity.toString()} />
-          <DetailRow label="Avg Cost" value={`$${position.avg_cost.toFixed(2)}`} />
-          <DetailRow label="Current Price" value={`$${position.market_price.toFixed(2)}`} />
+          <DetailRow label="Avg Cost" value={`$${(position.entry_price || 0).toFixed(2)}`} />
+          <DetailRow label="Current Price" value={`$${(position.current_price || 0).toFixed(2)}`} />
           <DetailRow label="Market Value" value={formatCurrency(value)} />
         </Card>
 

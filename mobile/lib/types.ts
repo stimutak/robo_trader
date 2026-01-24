@@ -8,15 +8,19 @@ export interface LogEntry {
   context?: Record<string, any>;
 }
 
-// Position data
+// Position data (matches API response)
 export interface Position {
   symbol: string;
   quantity: number;
-  avg_cost: number;
-  market_price: number;
-  pnl: number;
-  pnl_pct: number;
-  sector?: string;
+  entry_price: number;
+  current_price: number;
+  unrealized_pnl: number;
+  unrealized_pnl_pct: number;
+  market_value: number;
+  ml_signal?: string;
+  side?: string;
+  strategy?: string;
+  entry_time?: string;
 }
 
 // Trade data
@@ -64,11 +68,20 @@ export interface PositionsResponse {
 export interface PerformanceResponse {
   summary: {
     win_rate: number;
-    sharpe_ratio: number;
+    total_sharpe: number;
+    total_drawdown: number;
+    total_pnl: number;
+    total_return: number;
+    total_trades: number;
+    winning_trades: number;
+    losing_trades: number;
+  };
+  all?: {
+    sharpe: number;
     max_drawdown: number;
-    profit_factor: number;
-    avg_win: number;
-    avg_loss: number;
+    pnl: number;
+    return_pct: number;
+    trades: number;
   };
 }
 

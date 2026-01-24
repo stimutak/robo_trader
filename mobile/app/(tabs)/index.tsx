@@ -110,14 +110,14 @@ export default function HomeScreen() {
   const status = statusData?.trading_status;
   const positions = positionsData?.positions || [];
   const sortedPositions = [...positions]
-    .sort((a, b) => Math.abs(b.pnl || 0) - Math.abs(a.pnl || 0))
+    .sort((a, b) => Math.abs(b.unrealized_pnl || 0) - Math.abs(a.unrealized_pnl || 0))
     .slice(0, 5);
 
   const equity = pnlData?.equity || 0;
   const dailyPnL = pnlData?.daily || 0;
   const unrealized = pnlData?.unrealized || 0;
   const winRate = (perfData?.summary?.win_rate || 0) * 100;
-  const sharpe = perfData?.summary?.sharpe_ratio || 0;
+  const sharpe = perfData?.summary?.total_sharpe || perfData?.all?.sharpe || 0;
 
   return (
     <SafeAreaView style={styles.container}>
@@ -282,8 +282,8 @@ export default function HomeScreen() {
 }
 
 function PositionCard({ position, onPress }: { position: Position; onPress: () => void }) {
-  const pnl = position.pnl || 0;
-  const pnlPct = position.pnl_pct || 0;
+  const pnl = position.unrealized_pnl || 0;
+  const pnlPct = position.unrealized_pnl_pct || 0;
   const isWin = pnl > 0;
   const isLoss = pnl < 0;
 
@@ -312,7 +312,7 @@ function PositionCard({ position, onPress }: { position: Position; onPress: () =
             </View>
             <View>
               <Text style={styles.symName}>{position.symbol}</Text>
-              <Text style={styles.symMeta}>{position.sector || 'Unknown'}</Text>
+              <Text style={styles.symMeta}>{position.strategy || 'Unknown'}</Text>
             </View>
           </View>
           <View style={styles.posPnl}>
@@ -336,13 +336,13 @@ function PositionCard({ position, onPress }: { position: Position; onPress: () =
           <View style={styles.posDetail}>
             <Text style={styles.posDetailLabel}>Avg Cost</Text>
             <Text style={styles.posDetailValue}>
-              ${position.avg_cost.toFixed(2)}
+              ${(position.entry_price ?? 0).toFixed(2)}
             </Text>
           </View>
           <View style={styles.posDetail}>
             <Text style={styles.posDetailLabel}>Current</Text>
             <Text style={styles.posDetailValue}>
-              ${position.market_price.toFixed(2)}
+              ${(position.current_price ?? 0).toFixed(2)}
             </Text>
           </View>
         </View>

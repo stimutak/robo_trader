@@ -9,6 +9,7 @@ import {
 import { colors } from '../../lib/constants';
 import { usePerformance, useEquityCurve } from '../../hooks/useAPI';
 import { Card } from '../../components/ui/Card';
+import { EquityChart } from '../../components/charts';
 
 function formatCurrency(value: number): string {
   const absValue = Math.abs(value);
@@ -31,14 +32,14 @@ export default function AnalyticsScreen() {
     await Promise.all([refetchPerf(), refetchEquity()]);
   };
 
-  const summary = perfData?.summary ?? {
-    sharpe_ratio: 0,
-    max_drawdown: 0,
-    win_rate: 0,
-    profit_factor: 0,
-    avg_win: 0,
-    avg_loss: 0,
-  };
+  // Map API fields to display values
+  const sharpeRatio = perfData?.summary?.total_sharpe ?? perfData?.all?.sharpe ?? 0;
+  const maxDrawdown = perfData?.summary?.total_drawdown ?? perfData?.all?.max_drawdown ?? 0;
+  const winRate = perfData?.summary?.win_rate ?? 0;
+  const totalPnl = perfData?.summary?.total_pnl ?? perfData?.all?.pnl ?? 0;
+  const totalTrades = perfData?.summary?.total_trades ?? perfData?.all?.trades ?? 0;
+  const winningTrades = perfData?.summary?.winning_trades ?? 0;
+  const losingTrades = perfData?.summary?.losing_trades ?? 0;
 
   return (
     <SafeAreaView style={styles.container}>
@@ -58,14 +59,13 @@ export default function AnalyticsScreen() {
           <Text style={styles.title}>Analytics</Text>
         </View>
 
-        {/* Equity Curve Placeholder */}
+        {/* Equity Curve Chart */}
         <Card style={styles.chartCard}>
-          <View style={styles.chartPlaceholder}>
-            <Text style={styles.chartPlaceholderText}>Equity Curve Chart</Text>
-            <Text style={styles.chartPlaceholderSubtext}>
-              Victory Native chart coming soon
-            </Text>
-          </View>
+          <EquityChart
+            labels={equityData?.labels ?? []}
+            values={equityData?.values ?? []}
+            height={160}
+          />
         </Card>
 
         {/* Section Header */}
@@ -77,35 +77,36 @@ export default function AnalyticsScreen() {
         <View style={styles.metricsGrid}>
           <MetricCard
             label="Sharpe Ratio"
-            value={(summary.sharpe_ratio || 0).toFixed(2)}
+            value={sharpeRatio.toFixed(2)}
             sub="Risk-adjusted return"
           />
           <MetricCard
             label="Max Drawdown"
-            value={formatPercent(summary.max_drawdown || 0)}
+            value={formatPercent(maxDrawdown)}
             sub="Peak to trough"
             variant="loss"
           />
           <MetricCard
             label="Win Rate"
-            value={formatPercent(summary.win_rate || 0)}
+            value={formatPercent(winRate)}
             sub="Winning trades"
           />
           <MetricCard
-            label="Profit Factor"
-            value={(summary.profit_factor || 0).toFixed(2)}
-            sub="Gross P / Gross L"
+            label="Total P&L"
+            value={formatCurrency(totalPnl)}
+            sub={`${totalTrades} trades`}
+            variant={totalPnl >= 0 ? 'gain' : 'loss'}
           />
           <MetricCard
-            label="Avg Win"
-            value={formatCurrency(summary.avg_win || 0)}
-            sub="Per winning trade"
+            label="Wins"
+            value={winningTrades.toString()}
+            sub="Winning trades"
             variant="gain"
           />
           <MetricCard
-            label="Avg Loss"
-            value={formatCurrency(summary.avg_loss || 0)}
-            sub="Per losing trade"
+            label="Losses"
+            value={losingTrades.toString()}
+            sub="Losing trades"
             variant="loss"
           />
         </View>
@@ -165,21 +166,7 @@ const styles = StyleSheet.create({
   chartCard: {
     marginHorizontal: 20,
     marginBottom: 16,
-    height: 200,
-  },
-  chartPlaceholder: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  chartPlaceholderText: {
-    fontSize: 14,
-    color: colors.text.tertiary,
-  },
-  chartPlaceholderSubtext: {
-    fontSize: 12,
-    color: colors.text.muted,
-    marginTop: 4,
+    padding: 16,
   },
   sectionHeader: {
     paddingHorizontal: 20,
