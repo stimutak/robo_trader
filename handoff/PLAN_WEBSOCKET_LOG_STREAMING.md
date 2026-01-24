@@ -136,9 +136,9 @@ interface LogMessage {
 - [x] Add `WebSocketLogProcessor` class to `logger.py`
 - [x] Add processor to structlog chain in `setup_structlog()`
 - [x] Register ws_manager with processor in `websocket_server.py`
-- [ ] Test with wscat
+- [x] Test with wscat
 - [x] Export `WebSocketLogProcessor` in `__all__`
 
 ---
 
-**Status:** IMPLEMENTED - Ready for testing.
+**Status:** COMPLETE - Verified 2026-01-23
