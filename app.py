@@ -2773,6 +2773,49 @@ HTML_TEMPLATE = """
                 case 'performance':
                     updateMetrics(data.metrics);
                     break;
+                case 'log':
+                    handleLogMessage(data);
+                    break;
+            }
+        }
+
+        function handleLogMessage(data) {
+            const container = document.getElementById('log-container');
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+
+            // Parse timestamp or use current time
+            let time;
+            if (data.timestamp) {
+                try {
+                    time = new Date(data.timestamp).toLocaleTimeString();
+                } catch (e) {
+                    time = new Date().toLocaleTimeString();
+                }
+            } else {
+                time = new Date().toLocaleTimeString();
+            }
+
+            // Color based on log level
+            const levelColors = {
+                'DEBUG': '#6b7280',
+                'INFO': '#3b82f6',
+                'WARNING': '#f59e0b',
+                'ERROR': '#ef4444'
+            };
+            const levelColor = levelColors[data.level] || '#888';
+
+            // Format: time [LEVEL] source: message
+            const levelBadge = `<span style="color: ${levelColor}; font-weight: bold;">[${data.level}]</span>`;
+            const source = data.source ? `<span style="color: #888;">${data.source}:</span> ` : '';
+
+            entry.innerHTML = `<span class="log-time">${time}</span> ${levelBadge} ${source}<span>${data.message}</span>`;
+            container.appendChild(entry);
+
+            // Auto-scroll if enabled
+            const autoScrollEnabled = document.getElementById('auto-scroll-toggle')?.checked;
+            if (autoScrollEnabled) {
+                container.scrollTop = container.scrollHeight;
             }
         }
         
