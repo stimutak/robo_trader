@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template_string, request, send_file
+from flask_cors import CORS
 
 load_dotenv()
 
@@ -40,6 +41,24 @@ from robo_trader.ml.model_trainer import ModelTrainer  # noqa: E402
 
 logger = get_logger(__name__)
 app = Flask(__name__)
+
+# Configure CORS with whitelisted origins
+# Set CORS_ORIGINS env var for production, or it defaults to allowing local development
+cors_origins = os.getenv("CORS_ORIGINS", "").strip()
+if cors_origins:
+    # Production: use explicit whitelist from environment
+    allowed_origins = [origin.strip() for origin in cors_origins.split(",")]
+else:
+    # Development: allow localhost and common local network patterns
+    allowed_origins = [
+        "http://localhost:*",
+        "http://127.0.0.1:*",
+        "http://192.168.*.*:*",  # Local network
+        "http://10.*.*.*:*",  # Private network
+        "exp://*",  # Expo development (React Native)
+    ]
+
+CORS(app, origins=allowed_origins, supports_credentials=True)
 server = app  # For Gunicorn compatibility
 
 # Configuration
@@ -612,112 +631,194 @@ HTML_TEMPLATE = """
         </div>
         
         <div id="overview-tab" class="tab-content">
-            <!-- Top Stats Row -->
-            <div style="display: grid; grid-template-columns: repeat(8, 1fr); gap: 8px; margin-bottom: 12px;">
-                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #60a5fa;">
-                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Portfolio</div>
-                    <div style="font-size: 16px; font-weight: bold;" id="ov-portfolio">$100,000</div>
+            <!-- HERO ROW: The Big Numbers -->
+            <div style="display: grid; grid-template-columns: 2fr 1fr 1fr 1fr; gap: 10px; margin-bottom: 10px;">
+                <!-- Total Equity - Hero Card -->
+                <div style="background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); padding: 16px; border-radius: 10px; border: 1px solid #334155;">
+                    <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+                        <div>
+                            <div style="color: #94a3b8; font-size: 11px; text-transform: uppercase; letter-spacing: 1px;">Total Equity</div>
+                            <div style="font-size: 28px; font-weight: bold; color: #fff;" id="ov-portfolio">$0</div>
+                            <div style="font-size: 12px; margin-top: 4px;" id="ov-total-return-pct">
+                                <span style="color: #4ade80;">+0%</span> <span style="color: #64748b;">all time</span>
+                            </div>
+                        </div>
+                        <div style="text-align: right;">
+                            <div style="color: #64748b; font-size: 10px;">Starting Capital</div>
+                            <div style="color: #94a3b8; font-size: 14px;">$100,000</div>
+                        </div>
+                    </div>
                 </div>
-                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #4ade80;">
-                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Today P&L</div>
-                    <div style="font-size: 16px; font-weight: bold;" id="ov-today-pnl">$0</div>
+                <!-- Today's P&L -->
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 14px; border-radius: 8px; border-left: 3px solid #4ade80;">
+                    <div style="color: #888; font-size: 10px; text-transform: uppercase;">Today's P&L</div>
+                    <div style="font-size: 20px; font-weight: bold;" id="ov-today-pnl">$0</div>
+                    <div style="font-size: 11px; color: #64748b;" id="ov-today-pnl-pct">0%</div>
                 </div>
-                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #fbbf24;">
-                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Total P&L</div>
-                    <div style="font-size: 16px; font-weight: bold;" id="ov-total-pnl">$0</div>
+                <!-- Unrealized P&L -->
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 14px; border-radius: 8px; border-left: 3px solid #fbbf24;">
+                    <div style="color: #888; font-size: 10px; text-transform: uppercase;">Unrealized P&L</div>
+                    <div style="font-size: 20px; font-weight: bold;" id="ov-unrealized-pnl">$0</div>
+                    <div style="font-size: 11px; color: #64748b;" id="ov-unrealized-pct">open positions</div>
                 </div>
-                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #a78bfa;">
-                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Cash</div>
-                    <div style="font-size: 16px; font-weight: bold;" id="ov-cash">$0</div>
-                </div>
-                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #f472b6;">
-                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Positions</div>
-                    <div style="font-size: 16px; font-weight: bold;" id="ov-positions">0</div>
-                </div>
-                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #34d399;">
-                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Win Rate</div>
-                    <div style="font-size: 16px; font-weight: bold;" id="ov-win-rate">0%</div>
-                </div>
-                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #fb923c;">
-                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Trades</div>
-                    <div style="font-size: 16px; font-weight: bold;" id="ov-trades">0</div>
-                </div>
-                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 10px; border-radius: 8px; border-left: 3px solid #38bdf8;">
-                    <div style="color: #888; font-size: 9px; text-transform: uppercase;">Connection</div>
-                    <div style="font-size: 14px; font-weight: bold;" id="tws-status">...</div>
+                <!-- Realized P&L -->
+                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 14px; border-radius: 8px; border-left: 3px solid #a78bfa;">
+                    <div style="color: #888; font-size: 10px; text-transform: uppercase;">Realized P&L</div>
+                    <div style="font-size: 20px; font-weight: bold;" id="ov-total-pnl">$0</div>
+                    <div style="font-size: 11px; color: #64748b;" id="ov-realized-trades">from closed trades</div>
                 </div>
             </div>
 
-            <!-- Two Column Layout -->
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px;">
-                <!-- Left: Equity Curve -->
+            <!-- RISK ROW: Capital & Risk Metrics -->
+            <div style="display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; margin-bottom: 10px;">
+                <div style="background: #161b22; padding: 10px; border-radius: 6px; text-align: center; border: 1px solid #21262d;">
+                    <div style="font-size: 9px; color: #8b949e; text-transform: uppercase;">Positions Value</div>
+                    <div style="font-size: 15px; font-weight: bold; color: #60a5fa;" id="ov-positions-value">$0</div>
+                </div>
+                <div style="background: #161b22; padding: 10px; border-radius: 6px; text-align: center; border: 1px solid #21262d;">
+                    <div style="font-size: 9px; color: #8b949e; text-transform: uppercase;">Cash Available</div>
+                    <div style="font-size: 15px; font-weight: bold; color: #34d399;" id="ov-cash">$0</div>
+                </div>
+                <div style="background: #161b22; padding: 10px; border-radius: 6px; text-align: center; border: 1px solid #21262d;">
+                    <div style="font-size: 9px; color: #8b949e; text-transform: uppercase;">Exposure %</div>
+                    <div style="font-size: 15px; font-weight: bold; color: #fbbf24;" id="ov-exposure">0%</div>
+                </div>
+                <div style="background: #161b22; padding: 10px; border-radius: 6px; text-align: center; border: 1px solid #21262d;">
+                    <div style="font-size: 9px; color: #8b949e; text-transform: uppercase;">Current DD</div>
+                    <div style="font-size: 15px; font-weight: bold; color: #f87171;" id="ov-current-dd">0%</div>
+                </div>
+                <div style="background: #161b22; padding: 10px; border-radius: 6px; text-align: center; border: 1px solid #21262d;">
+                    <div style="font-size: 9px; color: #8b949e; text-transform: uppercase;">Max Drawdown</div>
+                    <div style="font-size: 15px; font-weight: bold; color: #f87171;" id="max-dd">0%</div>
+                </div>
+                <div style="background: #161b22; padding: 10px; border-radius: 6px; text-align: center; border: 1px solid #21262d;">
+                    <div style="font-size: 9px; color: #8b949e; text-transform: uppercase;">Buying Power</div>
+                    <div style="font-size: 15px; font-weight: bold; color: #4ade80;" id="ov-buying-power">$0</div>
+                </div>
+            </div>
+
+            <!-- MAIN ROW: Chart + Position Summary -->
+            <div style="display: grid; grid-template-columns: 1.5fr 1fr; gap: 10px; margin-bottom: 10px;">
+                <!-- Equity Curve (30-day) -->
                 <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
-                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 12px; text-transform: uppercase;">Equity Curve</h4>
-                    <div style="height: 140px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                        <h4 style="color: #58a6ff; margin: 0; font-size: 11px; text-transform: uppercase;">Portfolio Value (30 Days)</h4>
+                        <div style="font-size: 10px; color: #64748b;" id="ov-chart-range">—</div>
+                    </div>
+                    <div style="height: 120px;">
                         <canvas id="overview-equity-chart"></canvas>
                     </div>
                 </div>
 
-                <!-- Right: Top Positions -->
+                <!-- Position Summary -->
                 <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
-                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 12px; text-transform: uppercase;">Top Positions by P&L</h4>
-                    <div id="top-positions-list" style="font-size: 11px;">
-                        <div style="color: #666; text-align: center; padding: 20px;">Loading...</div>
+                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 11px; text-transform: uppercase;">Position Summary</h4>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px;">
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Open Positions</div>
+                            <div style="font-size: 18px; font-weight: bold;" id="ov-positions">0</div>
+                        </div>
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Winners / Losers</div>
+                            <div style="font-size: 14px; font-weight: bold;"><span style="color: #4ade80;" id="ov-winners">0</span> / <span style="color: #f87171;" id="ov-losers">0</span></div>
+                        </div>
+                    </div>
+                    <div style="font-size: 11px;">
+                        <div style="display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #21262d;">
+                            <span style="color: #8b949e;">Best Position</span>
+                            <span style="color: #4ade80;" id="ov-best-pos">—</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #21262d;">
+                            <span style="color: #8b949e;">Worst Position</span>
+                            <span style="color: #f87171;" id="ov-worst-pos">—</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; padding: 4px 0;">
+                            <span style="color: #8b949e;">Avg Position Size</span>
+                            <span style="color: #94a3b8;" id="ov-avg-pos-size">—</span>
+                        </div>
                     </div>
                 </div>
             </div>
 
-            <!-- Bottom Row: Key Metrics + Recent Trades -->
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
-                <!-- Left: Key Metrics -->
+            <!-- STRATEGY ROW: Performance Metrics + Recent Trades -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
+                <!-- Strategy Metrics -->
                 <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
-                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 12px; text-transform: uppercase;">Key Metrics</h4>
-                    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 11px; text-transform: uppercase;">Strategy Performance</h4>
+                    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;">
                         <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
-                            <div style="font-size: 9px; color: #8b949e;">Sharpe</div>
-                            <div style="font-size: 14px; font-weight: bold;" id="sharpe">0.00</div>
-                        </div>
-                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
-                            <div style="font-size: 9px; color: #8b949e;">Max DD</div>
-                            <div style="font-size: 14px; font-weight: bold; color: #f87171;" id="max-dd">0%</div>
+                            <div style="font-size: 9px; color: #8b949e;">Win Rate</div>
+                            <div style="font-size: 14px; font-weight: bold; color: #4ade80;" id="ov-win-rate">0%</div>
                         </div>
                         <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
                             <div style="font-size: 9px; color: #8b949e;">Profit Factor</div>
                             <div style="font-size: 14px; font-weight: bold;" id="profit-factor">0.00</div>
                         </div>
                         <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
-                            <div style="font-size: 9px; color: #8b949e;">Correlation</div>
-                            <div style="font-size: 14px; font-weight: bold;" id="avg-correlation">0.00</div>
+                            <div style="font-size: 9px; color: #8b949e;">Sharpe Ratio</div>
+                            <div style="font-size: 14px; font-weight: bold;" id="sharpe">0.00</div>
+                        </div>
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Total Trades</div>
+                            <div style="font-size: 14px; font-weight: bold;" id="ov-trades">0</div>
                         </div>
                     </div>
-                    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 8px;">
+                    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 6px;">
                         <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
-                            <div style="font-size: 9px; color: #8b949e;">Daily P&L</div>
-                            <div style="font-size: 14px; font-weight: bold;" id="daily-pnl">$0</div>
+                            <div style="font-size: 9px; color: #8b949e;">Avg Win</div>
+                            <div style="font-size: 13px; font-weight: bold; color: #4ade80;" id="ov-avg-win">$0</div>
                         </div>
                         <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
-                            <div style="font-size: 9px; color: #8b949e;">Daily %</div>
-                            <div style="font-size: 14px; font-weight: bold;" id="daily-change">0%</div>
+                            <div style="font-size: 9px; color: #8b949e;">Avg Loss</div>
+                            <div style="font-size: 13px; font-weight: bold; color: #f87171;" id="ov-avg-loss">$0</div>
                         </div>
                         <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
-                            <div style="font-size: 9px; color: #8b949e;">Pos Value</div>
-                            <div style="font-size: 14px; font-weight: bold;" id="position-value">$0</div>
+                            <div style="font-size: 9px; color: #8b949e;">Best Trade</div>
+                            <div style="font-size: 13px; font-weight: bold; color: #4ade80;" id="ov-best-trade">$0</div>
                         </div>
                         <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
-                            <div style="font-size: 9px; color: #8b949e;">Pos Count</div>
-                            <div style="font-size: 14px; font-weight: bold;" id="position-count">0</div>
+                            <div style="font-size: 9px; color: #8b949e;">Worst Trade</div>
+                            <div style="font-size: 13px; font-weight: bold; color: #f87171;" id="ov-worst-trade">$0</div>
                         </div>
                     </div>
                 </div>
 
-                <!-- Right: Recent Trades -->
+                <!-- Recent Activity -->
                 <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
-                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 12px; text-transform: uppercase;">Recent Trades</h4>
-                    <div id="recent-trades-list" style="font-size: 11px; max-height: 130px; overflow-y: auto;">
+                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 11px; text-transform: uppercase;">Recent Trades</h4>
+                    <div id="recent-trades-list" style="font-size: 11px; max-height: 110px; overflow-y: auto;">
                         <div style="color: #666; text-align: center; padding: 20px;">Loading...</div>
                     </div>
                 </div>
             </div>
+
+            <!-- STATUS ROW: System Health -->
+            <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px;">
+                <div style="background: #161b22; padding: 10px; border-radius: 6px; display: flex; align-items: center; gap: 8px; border: 1px solid #21262d;">
+                    <div style="width: 8px; height: 8px; border-radius: 50%; background: #4ade80;" id="ov-conn-dot"></div>
+                    <div>
+                        <div style="font-size: 9px; color: #8b949e;">Gateway</div>
+                        <div style="font-size: 12px; font-weight: bold;" id="tws-status">...</div>
+                    </div>
+                </div>
+                <div style="background: #161b22; padding: 10px; border-radius: 6px; border: 1px solid #21262d;">
+                    <div style="font-size: 9px; color: #8b949e;">Market</div>
+                    <div style="font-size: 12px; font-weight: bold;" id="ov-market-status">—</div>
+                </div>
+                <div style="background: #161b22; padding: 10px; border-radius: 6px; border: 1px solid #21262d;">
+                    <div style="font-size: 9px; color: #8b949e;">Next Open/Close</div>
+                    <div style="font-size: 12px; font-weight: bold;" id="ov-market-time">—</div>
+                </div>
+                <div style="background: #161b22; padding: 10px; border-radius: 6px; border: 1px solid #21262d;">
+                    <div style="font-size: 9px; color: #8b949e;">Last Update</div>
+                    <div style="font-size: 12px; font-weight: bold;" id="ov-last-update">—</div>
+                </div>
+                <div style="background: #161b22; padding: 10px; border-radius: 6px; border: 1px solid #21262d;">
+                    <div style="font-size: 9px; color: #8b949e;">Cycle Interval</div>
+                    <div style="font-size: 12px; font-weight: bold;" id="ov-cycle-interval">15s</div>
+                </div>
+            </div>
+
             <!-- Hidden elements for backward compat -->
             <div style="display: none;">
                 <span id="portfolio-change"></span>
@@ -725,6 +826,12 @@ HTML_TEMPLATE = """
                 <span id="positions-value-text"></span>
                 <span id="pnl-change"></span>
                 <span id="tws-detail"></span>
+                <span id="daily-pnl"></span>
+                <span id="daily-change"></span>
+                <span id="position-value"></span>
+                <span id="position-count"></span>
+                <span id="avg-correlation"></span>
+                <span id="top-positions-list"></span>
             </div>
         </div>
         
@@ -855,9 +962,9 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- Equity Curve Chart -->
+            <!-- P&L History & Portfolio Value Chart -->
             <div class="table-container" style="padding: 12px; margin-bottom: 15px;">
-                <h3 style="margin-bottom: 10px; font-size: 14px;">Equity Curve (Realized P&L)</h3>
+                <h3 style="margin-bottom: 10px; font-size: 14px;">P&L History & Portfolio Value</h3>
                 <div style="height: 220px; position: relative;">
                     <canvas id="equity-chart-canvas"></canvas>
                 </div>
@@ -1267,6 +1374,13 @@ HTML_TEMPLATE = """
                     </button>
                 </div>
             </div>
+            <div style="display: flex; gap: 8px; margin-bottom: 10px;">
+                <button onclick="setLogFilter('ALL')" id="log-filter-ALL" class="log-filter-btn active" style="background: #3b82f6; border: none; color: #fff; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: bold;">ALL</button>
+                <button onclick="setLogFilter('DEBUG')" id="log-filter-DEBUG" class="log-filter-btn" style="background: #333; border: 1px solid #555; color: #6b7280; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">DEBUG</button>
+                <button onclick="setLogFilter('INFO')" id="log-filter-INFO" class="log-filter-btn" style="background: #333; border: 1px solid #555; color: #3b82f6; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">INFO</button>
+                <button onclick="setLogFilter('WARNING')" id="log-filter-WARNING" class="log-filter-btn" style="background: #333; border: 1px solid #555; color: #f59e0b; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">WARN</button>
+                <button onclick="setLogFilter('ERROR')" id="log-filter-ERROR" class="log-filter-btn" style="background: #333; border: 1px solid #555; color: #ef4444; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">ERROR</button>
+            </div>
             <div class="log-container" id="log-container">
                 <div class="log-entry">
                     <span class="log-time">00:00:00</span>
@@ -1362,97 +1476,186 @@ HTML_TEMPLATE = """
         }
 
         let overviewEquityChart = null;
+        const STARTING_CAPITAL = 100000;
+
         async function loadOverviewData() {
             try {
                 // Load all data in parallel
-                const [equityResp, posResp, tradesResp, strategiesResp, perfResp] = await Promise.all([
+                const [equityResp, posResp, tradesResp, perfResp, pnlResp, marketResp] = await Promise.all([
                     fetch('/api/equity-curve'),
                     fetch('/api/positions'),
-                    fetch('/api/trades?days=30'),
-                    fetch('/api/strategies/status'),
-                    fetch('/api/performance')
+                    fetch('/api/trades?days=365'),
+                    fetch('/api/performance'),
+                    fetch('/api/pnl'),
+                    fetch('/api/market/status')
                 ]);
 
-                // Equity curve
-                if (equityResp.ok) {
-                    const data = await equityResp.json();
-                    renderOverviewEquityChart(data);
-                }
+                let positions = [];
+                let positionsValue = 0;
+                let unrealizedPnl = 0;
+                let winners = 0;
+                let losers = 0;
+                let bestPos = null;
+                let worstPos = null;
 
-                // Positions - update count and top positions list
+                // POSITIONS: Calculate all position-related metrics
                 if (posResp.ok) {
                     const data = await posResp.json();
-                    const positions = data.positions || [];
+                    positions = data.positions || [];
                     document.getElementById('ov-positions').textContent = positions.length;
 
-                    // Calculate total value and unrealized P&L from positions
-                    let totalValue = 0;
-                    let totalUnrealizedPnl = 0;
                     positions.forEach(p => {
-                        totalValue += parseFloat(p.market_value || p.value || 0);
-                        totalUnrealizedPnl += parseFloat(p.unrealized_pnl || 0);
+                        const qty = parseFloat(p.quantity || 0);
+                        const currentPrice = parseFloat(p.current_price || p.market_price || 0);
+                        const entryPrice = parseFloat(p.entry_price || p.avg_cost || currentPrice);
+                        const marketValue = qty * currentPrice;
+                        const pnl = (currentPrice - entryPrice) * qty;
+                        const pnlPct = entryPrice > 0 ? ((currentPrice - entryPrice) / entryPrice) * 100 : 0;
+
+                        positionsValue += marketValue;
+                        unrealizedPnl += pnl;
+
+                        if (pnl >= 0) winners++;
+                        else losers++;
+
+                        if (!bestPos || pnl > bestPos.pnl) bestPos = { symbol: p.symbol, pnl, pnlPct };
+                        if (!worstPos || pnl < worstPos.pnl) worstPos = { symbol: p.symbol, pnl, pnlPct };
                     });
 
-                    // Cash = starting capital - cost basis of positions
-                    const costBasis = totalValue - totalUnrealizedPnl;
-                    const cash = 100000 - costBasis;
-                    document.getElementById('ov-cash').textContent = formatCurrency(cash > 0 ? cash : 0);
+                    // Update position summary
+                    document.getElementById('ov-positions-value').textContent = formatCurrency(positionsValue);
+                    document.getElementById('ov-winners').textContent = winners;
+                    document.getElementById('ov-losers').textContent = losers;
+                    document.getElementById('ov-avg-pos-size').textContent = positions.length > 0
+                        ? formatCurrency(positionsValue / positions.length) : '—';
+                    document.getElementById('ov-best-pos').textContent = bestPos
+                        ? `${bestPos.symbol} +${bestPos.pnlPct.toFixed(1)}%` : '—';
+                    document.getElementById('ov-worst-pos').textContent = worstPos
+                        ? `${worstPos.symbol} ${worstPos.pnlPct.toFixed(1)}%` : '—';
 
-                    renderTopPositions(positions);
+                    // Unrealized P&L
+                    const ovUnrealized = document.getElementById('ov-unrealized-pnl');
+                    ovUnrealized.textContent = formatCurrency(unrealizedPnl);
+                    ovUnrealized.style.color = unrealizedPnl >= 0 ? '#4ade80' : '#f87171';
                 }
 
-                // Trades - update count and recent trades
+                // P&L DATA: Get equity, realized P&L, cash
+                let equity = STARTING_CAPITAL;
+                let realizedPnl = 0;
+                let cash = 0;
+                if (pnlResp.ok) {
+                    const pnlData = await pnlResp.json();
+                    equity = pnlData.equity || STARTING_CAPITAL;
+                    realizedPnl = pnlData.realized_pnl || 0;
+                    cash = pnlData.cash || 0;
+                }
+
+                // PERFORMANCE: Get all trade metrics
+                let totalPnl = realizedPnl;
+                let todayPnl = 0;
+                let winRate = 0;
+                let profitFactor = 0;
+                let sharpe = 0;
+                let maxDrawdown = 0;
+                let avgWin = 0;
+                let avgLoss = 0;
+                let bestTrade = 0;
+                let worstTrade = 0;
+                let totalTrades = 0;
+
+                if (perfResp.ok) {
+                    const perfData = await perfResp.json();
+                    const summary = perfData.summary || {};
+                    const daily = perfData.daily || {};
+
+                    totalPnl = summary.total_pnl !== undefined ? summary.total_pnl : (perfData.all?.pnl || realizedPnl);
+                    todayPnl = daily.pnl || 0;
+                    winRate = summary.win_rate || 0;
+                    profitFactor = summary.profit_factor || 0;
+                    sharpe = summary.total_sharpe || summary.sharpe || 0;
+                    maxDrawdown = summary.total_drawdown || summary.max_drawdown || 0;
+                    avgWin = summary.avg_win || 0;
+                    avgLoss = summary.avg_loss || 0;
+                    bestTrade = summary.best_trade || 0;
+                    worstTrade = summary.worst_trade || 0;
+                    totalTrades = summary.total_trades || 0;
+                }
+
+                // CALCULATE DERIVED METRICS
+                const totalEquity = equity > 0 ? equity : (STARTING_CAPITAL + totalPnl + unrealizedPnl);
+                const totalReturn = totalEquity - STARTING_CAPITAL;
+                const totalReturnPct = (totalReturn / STARTING_CAPITAL) * 100;
+                const todayPnlPct = totalEquity > 0 ? (todayPnl / totalEquity) * 100 : 0;
+                const exposure = totalEquity > 0 ? (positionsValue / totalEquity) * 100 : 0;
+                const buyingPower = Math.max(0, totalEquity - positionsValue);
+                const currentDrawdown = maxDrawdown; // Would need peak tracking for accurate current DD
+
+                // UPDATE ALL UI ELEMENTS
+                // Hero row
+                document.getElementById('ov-portfolio').textContent = formatCurrency(totalEquity);
+                const totalReturnEl = document.getElementById('ov-total-return-pct');
+                totalReturnEl.innerHTML = `<span style="color: ${totalReturn >= 0 ? '#4ade80' : '#f87171'};">${totalReturn >= 0 ? '+' : ''}${totalReturnPct.toFixed(1)}%</span> <span style="color: #64748b;">all time</span>`;
+
+                const ovTodayPnl = document.getElementById('ov-today-pnl');
+                ovTodayPnl.textContent = formatCurrency(todayPnl);
+                ovTodayPnl.style.color = todayPnl >= 0 ? '#4ade80' : '#f87171';
+                document.getElementById('ov-today-pnl-pct').textContent = `${todayPnl >= 0 ? '+' : ''}${todayPnlPct.toFixed(2)}%`;
+
+                const ovTotalPnl = document.getElementById('ov-total-pnl');
+                ovTotalPnl.textContent = formatCurrency(realizedPnl);
+                ovTotalPnl.style.color = realizedPnl >= 0 ? '#4ade80' : '#f87171';
+
+                // Risk row
+                document.getElementById('ov-cash').textContent = cash > 0 ? formatCurrency(cash) : '—';
+                document.getElementById('ov-exposure').textContent = exposure.toFixed(1) + '%';
+                document.getElementById('ov-current-dd').textContent = (currentDrawdown * 100).toFixed(1) + '%';
+                document.getElementById('max-dd').textContent = (maxDrawdown * 100).toFixed(1) + '%';
+                document.getElementById('ov-buying-power').textContent = formatCurrency(buyingPower);
+
+                // Strategy metrics
+                document.getElementById('ov-win-rate').textContent = (winRate * 100).toFixed(1) + '%';
+                document.getElementById('profit-factor').textContent = profitFactor.toFixed(2);
+                document.getElementById('sharpe').textContent = sharpe.toFixed(2);
+                document.getElementById('ov-trades').textContent = totalTrades;
+                document.getElementById('ov-avg-win').textContent = formatCurrency(avgWin);
+                document.getElementById('ov-avg-loss').textContent = formatCurrency(Math.abs(avgLoss));
+                document.getElementById('ov-best-trade').textContent = formatCurrency(bestTrade);
+                document.getElementById('ov-worst-trade').textContent = formatCurrency(worstTrade);
+
+                // TRADES: Recent trades list
                 if (tradesResp.ok) {
                     const data = await tradesResp.json();
                     const trades = data.trades || [];
-                    document.getElementById('ov-trades').textContent = trades.length;
-
-                    // Filter to today's trades for recent trades display
                     const today = new Date().toISOString().split('T')[0];
                     const todayTrades = trades.filter(t => t.timestamp && t.timestamp.startsWith(today));
                     renderRecentTrades(todayTrades.length > 0 ? todayTrades : trades.slice(0, 8));
                 }
 
-                // Performance metrics - includes REAL total P&L (realized + unrealized)
-                if (perfResp.ok) {
-                    const perfData = await perfResp.json();
-                    console.log('Performance data:', perfData);
-
-                    // Use total P&L from performance API (includes realized from closed trades)
-                    let totalPnl = 0;
-                    if (perfData.summary && perfData.summary.total_pnl !== undefined) {
-                        totalPnl = perfData.summary.total_pnl;
-                    } else if (perfData.all && perfData.all.pnl !== undefined) {
-                        totalPnl = perfData.all.pnl;
+                // EQUITY CURVE: Render chart
+                if (equityResp.ok) {
+                    const data = await equityResp.json();
+                    renderOverviewEquityChart(data);
+                    // Show date range
+                    if (data.labels && data.labels.length > 0) {
+                        document.getElementById('ov-chart-range').textContent =
+                            `${data.labels[0]} → ${data.labels[data.labels.length - 1]}`;
                     }
-                    console.log('Total P&L from performance:', totalPnl);
-
-                    // Update Overview tab stats
-                    const ovTotalPnl = document.getElementById('ov-total-pnl');
-                    ovTotalPnl.textContent = formatCurrency(totalPnl);
-                    ovTotalPnl.style.color = totalPnl >= 0 ? '#4ade80' : '#f87171';
-
-                    // Portfolio value = starting capital + total P&L
-                    const portfolioValue = 100000 + totalPnl;
-                    document.getElementById('ov-portfolio').textContent = formatCurrency(portfolioValue);
-                    console.log('Portfolio value set to:', portfolioValue);
-
-                    // Today P&L from daily performance
-                    const todayPnl = perfData.daily ? perfData.daily.pnl || 0 : 0;
-                    const ovTodayPnl = document.getElementById('ov-today-pnl');
-                    ovTodayPnl.textContent = formatCurrency(todayPnl);
-                    ovTodayPnl.style.color = todayPnl >= 0 ? '#4ade80' : '#f87171';
-
-                    // Win rate from performance
-                    if (perfData.summary && perfData.summary.win_rate !== undefined) {
-                        document.getElementById('ov-win-rate').textContent = (perfData.summary.win_rate * 100).toFixed(1) + '%';
-                    }
-
-                    // Key metrics in the bottom section
-                    const metrics = perfData.summary || perfData.all || {};
-                    document.getElementById('sharpe').textContent = (metrics.total_sharpe || metrics.sharpe || 0).toFixed(2);
-                    document.getElementById('max-dd').textContent = ((metrics.total_drawdown || metrics.max_drawdown || 0) * 100).toFixed(1) + '%';
                 }
+
+                // MARKET STATUS
+                if (marketResp.ok) {
+                    const marketData = await marketResp.json();
+                    document.getElementById('ov-market-status').textContent = marketData.is_open ? 'Open' : 'Closed';
+                    document.getElementById('ov-market-status').style.color = marketData.is_open ? '#4ade80' : '#f87171';
+                    if (marketData.next_open) {
+                        document.getElementById('ov-market-time').textContent = marketData.is_open ?
+                            `Closes ${marketData.next_close || '4:00 PM'}` :
+                            `Opens ${marketData.next_open}`;
+                    }
+                }
+
+                // Last update time
+                document.getElementById('ov-last-update').textContent = new Date().toLocaleTimeString();
 
             } catch (error) {
                 console.error('Error loading overview data:', error);
@@ -1461,27 +1664,40 @@ HTML_TEMPLATE = """
 
         function renderOverviewEquityChart(data) {
             const ctx = document.getElementById('overview-equity-chart');
-            if (!ctx || !data.values || data.values.length === 0) return;
+            if (!ctx) return;
 
-            const values = data.values;
-            const labels = data.labels || values.map((_, i) => i);
+            // Use portfolio_values if available (from equity_history), otherwise calculate from P&L
+            let values = [];
+            let labels = [];
+
+            if (data.portfolio_values && data.portfolio_values.length > 0) {
+                values = data.portfolio_values;
+                labels = data.labels || values.map((_, i) => i);
+            } else if (data.values && data.values.length > 0) {
+                // Calculate portfolio values from P&L
+                values = data.values.map(pnl => STARTING_CAPITAL + pnl);
+                labels = data.labels || values.map((_, i) => i);
+            } else {
+                // No data yet
+                return;
+            }
+
+            // Calculate gain/loss from start
+            const firstValue = values[0] || STARTING_CAPITAL;
+            const lastValue = values[values.length - 1] || STARTING_CAPITAL;
+            const isPositive = lastValue >= firstValue;
 
             if (overviewEquityChart) {
                 overviewEquityChart.data.labels = labels;
                 overviewEquityChart.data.datasets[0].data = values;
+                overviewEquityChart.data.datasets[0].borderColor = isPositive ? '#4ade80' : '#f87171';
                 overviewEquityChart.update('none');
                 return;
             }
 
-            const gradient = ctx.getContext('2d').createLinearGradient(0, 0, 0, 140);
-            const lastValue = values[values.length - 1] || 0;
-            if (lastValue >= 0) {
-                gradient.addColorStop(0, 'rgba(74, 222, 128, 0.3)');
-                gradient.addColorStop(1, 'rgba(74, 222, 128, 0)');
-            } else {
-                gradient.addColorStop(0, 'rgba(248, 113, 113, 0.3)');
-                gradient.addColorStop(1, 'rgba(248, 113, 113, 0)');
-            }
+            const gradient = ctx.getContext('2d').createLinearGradient(0, 0, 0, 120);
+            gradient.addColorStop(0, isPositive ? 'rgba(74, 222, 128, 0.3)' : 'rgba(248, 113, 113, 0.3)');
+            gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
 
             overviewEquityChart = new Chart(ctx, {
                 type: 'line',
@@ -1489,7 +1705,7 @@ HTML_TEMPLATE = """
                     labels: labels,
                     datasets: [{
                         data: values,
-                        borderColor: lastValue >= 0 ? '#4ade80' : '#f87171',
+                        borderColor: isPositive ? '#4ade80' : '#f87171',
                         backgroundColor: gradient,
                         fill: true,
                         tension: 0.3,
@@ -1502,10 +1718,18 @@ HTML_TEMPLATE = """
                     maintainAspectRatio: false,
                     plugins: { legend: { display: false } },
                     scales: {
-                        x: { display: false },
+                        x: {
+                            display: true,
+                            grid: { display: false },
+                            ticks: { color: '#64748b', font: { size: 8 }, maxTicksLimit: 5 }
+                        },
                         y: {
                             grid: { color: '#21262d' },
-                            ticks: { color: '#8b949e', font: { size: 9 } }
+                            ticks: {
+                                color: '#8b949e',
+                                font: { size: 9 },
+                                callback: function(value) { return '$' + (value/1000).toFixed(0) + 'k'; }
+                            }
                         }
                     }
                 }
@@ -1908,14 +2132,17 @@ HTML_TEMPLATE = """
                 equityChart.destroy();
             }
 
-            if (!data.values || data.values.length === 0) {
+            const hasPnlData = data.values && data.values.length > 0;
+            const hasPortfolioData = data.portfolio_values && data.portfolio_values.length > 0;
+
+            if (!hasPnlData && !hasPortfolioData) {
                 ctx.parentElement.innerHTML = '<div style="display: flex; align-items: center; justify-content: center; height: 100%; color: #666;">No trade data yet</div>';
                 return;
             }
 
             // Create gradient
             const gradient = ctx.getContext('2d').createLinearGradient(0, 0, 0, 200);
-            const lastValue = data.values[data.values.length - 1];
+            const lastValue = hasPnlData ? data.values[data.values.length - 1] : 0;
             if (lastValue >= 0) {
                 gradient.addColorStop(0, 'rgba(74, 222, 128, 0.3)');
                 gradient.addColorStop(1, 'rgba(74, 222, 128, 0)');
@@ -1924,38 +2151,74 @@ HTML_TEMPLATE = """
                 gradient.addColorStop(1, 'rgba(255, 107, 107, 0)');
             }
 
+            // Use actual portfolio values from equity_history if available,
+            // otherwise calculate from starting capital + P&L
+            const STARTING_CAPITAL = 100000;
+            let portfolioValues;
+            let useHistoricalData = data.portfolio_values && data.portfolio_values.length > 0;
+
+            if (useHistoricalData) {
+                // Use actual daily portfolio snapshots (industry standard)
+                portfolioValues = data.portfolio_values;
+            } else {
+                // Fallback: calculate from P&L data
+                portfolioValues = data.values.map(pnl => STARTING_CAPITAL + pnl);
+            }
+
             equityChart = new Chart(ctx, {
                 type: 'line',
                 data: {
                     labels: data.labels,
                     datasets: [{
-                        label: 'Cumulative P&L',
+                        label: 'P&L',
                         data: data.values,
                         borderColor: lastValue >= 0 ? '#4ade80' : '#ff6b6b',
-                        backgroundColor: gradient,
-                        fill: true,
+                        backgroundColor: 'transparent',
+                        fill: false,
                         tension: 0.3,
                         pointRadius: 0,
                         pointHoverRadius: 4,
-                        borderWidth: 2
+                        borderWidth: 2,
+                        yAxisID: 'y'
+                    }, {
+                        label: 'Portfolio Value',
+                        data: portfolioValues,
+                        borderColor: '#3b82f6',
+                        backgroundColor: 'transparent',
+                        fill: false,
+                        tension: 0.3,
+                        pointRadius: 0,
+                        pointHoverRadius: 4,
+                        borderWidth: 2,
+                        borderDash: [5, 5],
+                        yAxisID: 'y1'
                     }]
                 },
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
                     plugins: {
-                        legend: { display: false },
+                        legend: {
+                            display: true,
+                            position: 'top',
+                            labels: { color: '#888', font: { size: 10 }, boxWidth: 12 }
+                        },
                         tooltip: {
                             mode: 'index',
                             intersect: false,
                             backgroundColor: '#1a1a2e',
                             titleColor: '#fff',
-                            bodyColor: '#4ade80',
+                            bodyColor: '#fff',
                             borderColor: '#333',
                             borderWidth: 1,
                             callbacks: {
                                 label: function(context) {
-                                    return '$' + context.parsed.y.toFixed(2);
+                                    const label = context.dataset.label || '';
+                                    const value = context.parsed.y;
+                                    if (label === 'Portfolio Value') {
+                                        return label + ': $' + value.toLocaleString(undefined, {maximumFractionDigits: 0});
+                                    }
+                                    return label + ': $' + value.toFixed(2);
                                 }
                             }
                         }
@@ -1968,12 +2231,25 @@ HTML_TEMPLATE = """
                         },
                         y: {
                             display: true,
+                            position: 'left',
                             grid: { color: '#222' },
                             ticks: {
-                                color: '#666',
+                                color: lastValue >= 0 ? '#4ade80' : '#ff6b6b',
                                 font: { size: 10 },
-                                callback: function(value) { return '$' + value; }
-                            }
+                                callback: function(value) { return '$' + value.toLocaleString(); }
+                            },
+                            title: { display: true, text: 'P&L', color: '#666', font: { size: 10 } }
+                        },
+                        y1: {
+                            display: true,
+                            position: 'right',
+                            grid: { drawOnChartArea: false },
+                            ticks: {
+                                color: '#3b82f6',
+                                font: { size: 10 },
+                                callback: function(value) { return '$' + (value/1000).toFixed(0) + 'k'; }
+                            },
+                            title: { display: true, text: 'Portfolio', color: '#666', font: { size: 10 } }
                         }
                     },
                     interaction: { mode: 'nearest', axis: 'x', intersect: false }
@@ -2679,6 +2955,37 @@ HTML_TEMPLATE = """
             }
         }
 
+        let currentLogFilter = 'ALL';
+
+        function setLogFilter(level) {
+            currentLogFilter = level;
+            // Update button styles
+            document.querySelectorAll('.log-filter-btn').forEach(btn => {
+                btn.style.background = '#333';
+                btn.style.border = '1px solid #555';
+            });
+            const activeBtn = document.getElementById('log-filter-' + level);
+            if (activeBtn) {
+                activeBtn.style.background = '#3b82f6';
+                activeBtn.style.border = 'none';
+            }
+            // Apply filter to existing logs
+            applyLogFilter();
+        }
+
+        function applyLogFilter() {
+            const container = document.getElementById('log-container');
+            if (!container) return;
+            container.querySelectorAll('.log-entry').forEach(entry => {
+                const logLevel = entry.dataset.level;
+                if (currentLogFilter === 'ALL' || logLevel === currentLogFilter || !logLevel) {
+                    entry.style.display = '';
+                } else {
+                    entry.style.display = 'none';
+                }
+            });
+        }
+
         function clearLogs() {
             const container = document.getElementById('log-container');
             if (container) {
@@ -2773,6 +3080,56 @@ HTML_TEMPLATE = """
                 case 'performance':
                     updateMetrics(data.metrics);
                     break;
+                case 'log':
+                    handleLogMessage(data);
+                    break;
+            }
+        }
+
+        function handleLogMessage(data) {
+            const container = document.getElementById('log-container');
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.dataset.level = data.level || 'INFO';
+
+            // Parse timestamp or use current time
+            let time;
+            if (data.timestamp) {
+                try {
+                    time = new Date(data.timestamp).toLocaleTimeString();
+                } catch (e) {
+                    time = new Date().toLocaleTimeString();
+                }
+            } else {
+                time = new Date().toLocaleTimeString();
+            }
+
+            // Color based on log level
+            const levelColors = {
+                'DEBUG': '#6b7280',
+                'INFO': '#3b82f6',
+                'WARNING': '#f59e0b',
+                'ERROR': '#ef4444'
+            };
+            const levelColor = levelColors[data.level] || '#888';
+
+            // Format: time [LEVEL] source: message
+            const levelBadge = `<span style="color: ${levelColor}; font-weight: bold;">[${data.level}]</span>`;
+            const source = data.source ? `<span style="color: #888;">${data.source}:</span> ` : '';
+
+            entry.innerHTML = `<span class="log-time">${time}</span> ${levelBadge} ${source}<span>${data.message}</span>`;
+
+            // Apply current filter
+            if (currentLogFilter !== 'ALL' && data.level !== currentLogFilter) {
+                entry.style.display = 'none';
+            }
+
+            container.appendChild(entry);
+
+            // Auto-scroll if enabled
+            const autoScrollEnabled = document.getElementById('auto-scroll-toggle')?.checked;
+            if (autoScrollEnabled) {
+                container.scrollTop = container.scrollHeight;
             }
         }
         
@@ -3716,17 +4073,35 @@ def get_pnl():
 
     market_open = check_market_open()
 
-    # When market is closed, return None instead of stale data
-    if not market_open:
-        return jsonify({"total": None, "unrealized": None, "realized": None, "daily": None})
-
     try:
         from sync_db_reader import SyncDatabaseReader
 
         db = SyncDatabaseReader()
 
-        # Get positions for P&L calculation
+        # Get positions
         positions = db.get_positions()
+
+        # Calculate total market value from positions (matches mobile app)
+        total_market_value = Decimal("0")
+        for pos in positions:
+            qty = Decimal(str(pos.get("quantity", 0) or 0))
+            price = Decimal(str(pos.get("market_price", 0) or 0))
+            total_market_value += qty * price
+
+        # Equity = market value of positions (cash tracking not reliable)
+        equity = total_market_value
+
+        # When market is closed, return equity but null P&L
+        if not market_open:
+            return jsonify(
+                {
+                    "total": None,
+                    "unrealized": None,
+                    "realized": None,
+                    "daily": None,
+                    "equity": float(equity),
+                }
+            )
 
         # Calculate total unrealized P&L from positions using Decimal
         unrealized_pnl = Decimal("0")
@@ -3800,13 +4175,14 @@ def get_pnl():
                 "unrealized": float(round(unrealized_pnl, 2)),
                 "realized": float(round(realized_pnl, 2)),
                 "daily": float(round(daily_pnl, 2)),
+                "equity": float(equity),
             }
         )
 
     except Exception as e:
         logger.error(f"Error calculating P&L: {e}")
         # Return zeros on error instead of fake data
-        return jsonify({"total": 0, "unrealized": 0, "realized": 0, "daily": 0})
+        return jsonify({"total": 0, "unrealized": 0, "realized": 0, "daily": 0, "equity": 100000})
 
     # Original database logic commented out due to persistent locking
     """
@@ -4702,17 +5078,38 @@ def performance():
 @app.route("/api/equity-curve")
 @requires_auth
 def equity_curve():
-    """Get equity curve data for charting"""
+    """Get equity curve data for charting - industry standard portfolio value tracking.
+
+    Returns:
+        - labels: dates for x-axis
+        - values: cumulative realized P&L (from trades)
+        - portfolio_values: actual portfolio value over time (from equity_history table)
+        - pnl_by_trade: individual trade P&L data
+    """
     try:
         from sync_db_reader import SyncDatabaseReader
 
         db = SyncDatabaseReader()
+
+        # Get equity history (daily portfolio value snapshots)
+        equity_history = db.get_equity_history(days=365)
+        portfolio_labels = [d["date"] for d in equity_history]
+        portfolio_values = [d["equity"] for d in equity_history]
+
+        # Also get trade-based P&L for detailed view
         all_trades = db.get_recent_trades(limit=1000)
 
         if not all_trades:
-            return jsonify({"labels": [], "values": [], "pnl_by_trade": []})
+            return jsonify(
+                {
+                    "labels": portfolio_labels,
+                    "values": [],
+                    "portfolio_values": portfolio_values,
+                    "pnl_by_trade": [],
+                }
+            )
 
-        # Build equity curve by matching BUY/SELL trades
+        # Build P&L curve by matching BUY/SELL trades
         equity_data = []
         cumulative = 0
         costs = {}
@@ -4745,13 +5142,23 @@ def equity_curve():
                 costs[symbol]["cost"] -= avg * qty
 
         # Format for Chart.js
-        labels = [d["timestamp"][:10] for d in equity_data]  # Just date
-        values = [d["cumulative"] for d in equity_data]
+        pnl_labels = [d["timestamp"][:10] for d in equity_data]  # Just date
+        pnl_values = [d["cumulative"] for d in equity_data]
 
-        return jsonify({"labels": labels, "values": values, "pnl_by_trade": equity_data})
+        # Use portfolio history labels if available, otherwise use PnL labels
+        labels = portfolio_labels if portfolio_labels else pnl_labels
+
+        return jsonify(
+            {
+                "labels": labels,
+                "values": pnl_values,
+                "portfolio_values": portfolio_values,
+                "pnl_by_trade": equity_data,
+            }
+        )
     except Exception as e:
         logger.error(f"Error getting equity curve: {e}")
-        return jsonify({"labels": [], "values": [], "pnl_by_trade": []})
+        return jsonify({"labels": [], "values": [], "portfolio_values": [], "pnl_by_trade": []})
 
 
 @app.route("/api/trades")
@@ -4796,6 +5203,7 @@ def get_trades():
                         "timestamp": trade.get("timestamp", ""),
                         "slippage": trade.get("slippage", 0),
                         "commission": trade.get("commission", 0),
+                        "pnl": trade.get("pnl"),  # Realized P&L for SELL trades
                         "notional": trade["quantity"] * trade["price"],
                         # Include all four sides (BUY, SELL, SELL_SHORT, BUY_TO_COVER)
                         "cash_impact": (
@@ -4814,6 +5222,12 @@ def get_trades():
             buy_trades = [t for t in trade_list if t["side"] in ("BUY", "BUY_TO_COVER")]
             sell_trades = [t for t in trade_list if t["side"] in ("SELL", "SELL_SHORT")]
 
+            # Calculate P&L stats (only for trades with P&L - i.e., SELL trades)
+            trades_with_pnl = [t for t in trade_list if t.get("pnl") is not None]
+            winners = [t for t in trades_with_pnl if t["pnl"] > 0]
+            losers = [t for t in trades_with_pnl if t["pnl"] < 0]
+            total_pnl = sum(t["pnl"] for t in trades_with_pnl)
+
             return jsonify(
                 {
                     "trades": trade_list,
@@ -4824,6 +5238,9 @@ def get_trades():
                         "total_volume": total_volume,
                         "total_commission": total_commission,
                         "avg_trade_size": total_volume / total_trades if total_trades > 0 else 0,
+                        "winners": len(winners),
+                        "losers": len(losers),
+                        "total_pnl": total_pnl,
                     },
                 }
             )
@@ -5775,11 +6192,11 @@ if __name__ == "__main__":
     # Initialize components
     logger.info("Starting RoboTrader Dashboard...")
 
-    # Temporarily disable WebSocket server to fix startup issues
-    # TODO: Fix WebSocket server initialization
-    # logger.info("Starting WebSocket server...")
-    # ws_manager.start()
-    # time.sleep(2)
+    # Start WebSocket server for real-time log streaming
+    from robo_trader.websocket_server import ws_manager
+
+    logger.info("Starting WebSocket server...")
+    ws_manager.start()
 
     logger.info(f"Dashboard starting on port {os.getenv('DASH_PORT', 5555)}")
 

@@ -126,20 +126,14 @@ cp config/ibc/config.ini.template config/ibc/config.ini
 ### Gateway Management Commands
 
 ```bash
-# Start trader (handles Gateway automatically)
+# THE ONLY WAY TO START THE TRADING SYSTEM:
 ./START_TRADER.sh
 
-# Start Gateway manually (for debugging)
-./scripts/start_gateway.sh paper
-
-# Check Gateway status
-python3 scripts/gateway_manager.py status
-
-# Force restart Gateway (clears all zombies)
-python3 scripts/gateway_manager.py restart
-
-# View Gateway logs
-tail -f config/ibc/logs/*.txt
+# Debugging/diagnostic commands (not for normal startup):
+./scripts/start_gateway.sh paper            # Start Gateway only (debugging)
+python3 scripts/gateway_manager.py status   # Check Gateway status
+python3 scripts/gateway_manager.py restart  # Force restart Gateway (clears zombies)
+tail -f config/ibc/logs/*.txt               # View Gateway logs
 ```
 
 ### Zombie Connections
@@ -180,6 +174,61 @@ pkill -f "IB Gateway"
 - API permissions are configured in your IBKR account settings
 - System uses **readonly** connections (no order placement via API)
 
+## Mobile App & Parallel Development
+
+### Repository Structure
+
+| Location | Branch | Purpose |
+|----------|--------|---------|
+| `/Users/oliver/robo_trader` | `main` | Backend, API, Web Dashboard |
+| `/Users/oliver/robo_trader-mobile` | `feature/mobile-app` | React Native Mobile App |
+
+The mobile app lives in a **git worktree** linked to this repo.
+
+### Parallel Development Rules
+
+**CRITICAL: Follow these rules to avoid conflicts**
+
+1. **ALL changes EXCEPT mobile → THIS repo (main branch)**
+   - Trading system (`robo_trader/`)
+   - Web dashboard (`app.py`, templates)
+   - Scripts (`scripts/`)
+   - Configuration files
+   - Documentation (`*.md`, `handoff/`)
+   - Everything that isn't in `mobile/`
+
+2. **Mobile app ONLY → worktree (feature/mobile-app)**
+   - React Native code (`mobile/**`)
+   - Mobile UI components
+   - Mobile-specific configs (`mobile/lib/constants.ts`)
+
+3. **Never edit the same file in both branches simultaneously**
+
+### Syncing Between Repos
+
+```bash
+# After making backend changes here, sync to mobile worktree:
+cd /Users/oliver/robo_trader-mobile
+git fetch origin main
+git merge origin/main
+
+# When mobile app is ready to merge:
+cd /Users/oliver/robo_trader
+git merge feature/mobile-app
+```
+
+### Mobile App Status
+
+See `mobile/HANDOFF.md` and `mobile/IMPLEMENTATION_PLAN.md` in the worktree for current status.
+
+**Quick start mobile dev:**
+```bash
+cd /Users/oliver/robo_trader-mobile/mobile
+npx expo start --lan
+```
+
+---
+
 ## Key Project Files
 - `IMPLEMENTATION_PLAN.md` - The active project roadmap
 - `handoff/LATEST_HANDOFF.md` - Latest session handoff document
@@ -189,7 +238,9 @@ pkill -f "IB Gateway"
   - `subprocess_manager.py` - IBKR subprocess health monitoring
 - `robo_trader/exceptions.py` - Custom exception hierarchy (Phase 4 P9)
 - `robo_trader/data_providers/` - Data provider abstraction (Polygon.io ready)
-- `app.py` - Dashboard with monitoring interface
+- `robo_trader/database_async.py` - Async database with equity_history table for portfolio tracking
+- `sync_db_reader.py` - Sync database reader for dashboard access
+- `app.py` - Dashboard with comprehensive professional overview
 - `robo_trader/websocket_server.py` - WebSocket server for real-time updates
 - `robo_trader/features/` - Feature engineering pipeline (Phase 2 - COMPLETE)
 - `robo_trader/ml/` - ML model training & selection (Phase 2 - COMPLETE)
@@ -211,6 +262,16 @@ pkill -f "IB Gateway"
 # Or with custom symbols:
 ./START_TRADER.sh "AAPL,NVDA,TSLA"
 ```
+
+**⚠️ IMPORTANT: Always use `./START_TRADER.sh` - NEVER start components manually!**
+
+Do NOT run these directly:
+- ❌ `python3 runner_async.py` - Use START_TRADER.sh instead
+- ❌ `scripts/start_gateway.sh` - Use START_TRADER.sh instead
+- ❌ `python3 app.py` - Use START_TRADER.sh instead
+- ❌ `python3 websocket_server.py` - Use START_TRADER.sh instead
+
+The script handles Gateway startup, zombie cleanup, connectivity testing, and proper sequencing. Starting components manually bypasses these safety checks.
 
 **What the script does:**
 1. ✅ Kills existing Python trader processes
@@ -277,6 +338,56 @@ python3 test_safety_features.py
 15. ✅ **Market Close Time Wrong - FIXED (2025-12-29)** - Was 4:30 PM, now 4:00 PM
 16. ✅ **Int/Datetime Comparison Error - FIXED (2026-01-15)** - Added try/except fallback in correlation.py
 17. ✅ **Missing Market Holidays - FIXED (2026-01-15)** - Added MLK, Presidents, Good Friday, Memorial, Labor, Thanksgiving, Juneteenth
+18. ✅ **Dashboard Overview Redesign - IMPLEMENTED (2026-01-24)** - Professional-grade overview with all key metrics
+19. ✅ **Equity History Tracking - IMPLEMENTED (2026-01-24)** - Daily portfolio snapshots in `equity_history` table
+
+## Dashboard Overview (2026-01-24)
+
+The dashboard overview now shows comprehensive professional trading metrics:
+
+**Hero Row:**
+- Total Equity (prominent, with % return since inception)
+- Today's P&L ($ and %)
+- Unrealized P&L (open positions)
+- Realized P&L (closed trades)
+
+**Risk Row:**
+- Positions Value, Cash Available, Exposure %, Current Drawdown, Max Drawdown, Buying Power
+
+**Main Row:**
+- 30-day Portfolio Value chart (uses `equity_history` table)
+- Position Summary (count, winners/losers, best/worst, avg size)
+
+**Strategy Row:**
+- Win Rate, Profit Factor, Sharpe Ratio, Total Trades
+- Avg Win, Avg Loss, Best Trade, Worst Trade
+- Recent Trades list
+
+**Status Row:**
+- Gateway connection, Market status, Next open/close, Last update, Cycle interval
+
+## Equity History Tracking (2026-01-24)
+
+Portfolio value is tracked daily using the `equity_history` table (industry standard approach).
+
+**Table Schema:**
+```sql
+CREATE TABLE equity_history (
+    date TEXT NOT NULL UNIQUE,
+    equity REAL NOT NULL,
+    cash REAL DEFAULT 0,
+    positions_value REAL DEFAULT 0,
+    realized_pnl REAL DEFAULT 0,
+    unrealized_pnl REAL DEFAULT 0,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+```
+
+**How it works:**
+- Snapshots saved at end of each trading cycle via `save_equity_snapshot()`
+- One snapshot per day (updates if same day)
+- Used by `/api/equity-curve` endpoint for portfolio value chart
+- Accessible via `SyncDatabaseReader.get_equity_history()`
 
 ## AI-Driven Symbol Discovery (2026-01-14)
 

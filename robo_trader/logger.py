@@ -66,28 +66,57 @@ class LogEvent(str, Enum):
 class WebSocketLogProcessor:
     """Structlog processor that forwards logs to WebSocket for real-time streaming.
 
-    Uses late binding to avoid circular imports - the ws_manager is set after
-    the websocket_server module loads.
+    Uses late binding to avoid circular imports. Supports two modes:
+    1. Server mode (ws_manager): When this process hosts the WebSocket server
+    2. Client mode (ws_client): When connecting to an external WebSocket server
+
+    The processor automatically falls back to client mode if the server isn't running.
     """
 
     _ws_manager = None
+    _ws_client = None
 
     @classmethod
     def set_ws_manager(cls, ws_manager):
-        """Set the WebSocket manager instance for log streaming."""
+        """Set the WebSocket manager instance for log streaming (server mode)."""
         cls._ws_manager = ws_manager
 
-    def __call__(self, logger, method_name, event_dict):
-        """Forward log message to WebSocket if manager is configured."""
-        if self._ws_manager is None:
-            return event_dict
+    @classmethod
+    def set_ws_client(cls, ws_client):
+        """Set the WebSocket client instance for log streaming (client mode)."""
+        cls._ws_client = ws_client
 
+    def __call__(self, logger, method_name, event_dict):
+        """Forward log message to WebSocket if manager or client is configured."""
         level = method_name.upper()
 
         # Only stream INFO and above to avoid flooding clients
-        if level in ("INFO", "WARNING", "ERROR", "CRITICAL"):
+        if level not in ("INFO", "WARNING", "ERROR", "CRITICAL"):
+            return event_dict
+
+        # Try server mode first (if ws_manager is running)
+        if self._ws_manager is not None:
+            thread = getattr(self._ws_manager, "thread", None)
+            if thread is not None and thread.is_alive():
+                try:
+                    self._ws_manager.send_log_message(
+                        level=level,
+                        source=event_dict.get("logger", "robo_trader"),
+                        message=event_dict.get("event", str(event_dict)),
+                        context={
+                            k: v
+                            for k, v in event_dict.items()
+                            if k not in ("event", "logger", "timestamp", "level")
+                        },
+                    )
+                    return event_dict
+                except Exception:
+                    pass  # Fall through to client mode
+
+        # Fall back to client mode (connect to external WebSocket server)
+        if self._ws_client is not None:
             try:
-                self._ws_manager.send_log_message(
+                self._ws_client.send_log_message(
                     level=level,
                     source=event_dict.get("logger", "robo_trader"),
                     message=event_dict.get("event", str(event_dict)),
