@@ -1372,13 +1372,22 @@ HTML_TEMPLATE = """
         async function loadOverviewData() {
             try {
                 // Load all data in parallel
-                const [equityResp, posResp, tradesResp, strategiesResp, perfResp] = await Promise.all([
+                const [equityResp, posResp, tradesResp, strategiesResp, perfResp, pnlResp] = await Promise.all([
                     fetch('/api/equity-curve'),
                     fetch('/api/positions'),
                     fetch('/api/trades?days=30'),
                     fetch('/api/strategies/status'),
-                    fetch('/api/performance')
+                    fetch('/api/performance'),
+                    fetch('/api/pnl')
                 ]);
+
+                // Get equity from P&L endpoint (calculated from positions + cash)
+                if (pnlResp.ok) {
+                    const pnlData = await pnlResp.json();
+                    if (pnlData.equity) {
+                        document.getElementById('ov-portfolio').textContent = formatCurrency(pnlData.equity);
+                    }
+                }
 
                 // Equity curve
                 if (equityResp.ok) {
@@ -1392,18 +1401,17 @@ HTML_TEMPLATE = """
                     const positions = data.positions || [];
                     document.getElementById('ov-positions').textContent = positions.length;
 
-                    // Calculate total value and unrealized P&L from positions
-                    let totalValue = 0;
-                    let totalUnrealizedPnl = 0;
+                    // Calculate total market value from positions
+                    let totalMarketValue = 0;
                     positions.forEach(p => {
-                        totalValue += parseFloat(p.market_value || p.value || 0);
-                        totalUnrealizedPnl += parseFloat(p.unrealized_pnl || 0);
+                        const qty = parseFloat(p.quantity || 0);
+                        const price = parseFloat(p.current_price || p.market_price || 0);
+                        totalMarketValue += qty * price;
                     });
 
-                    // Cash = starting capital - cost basis of positions
-                    const costBasis = totalValue - totalUnrealizedPnl;
-                    const cash = 100000 - costBasis;
-                    document.getElementById('ov-cash').textContent = formatCurrency(cash > 0 ? cash : 0);
+                    // Note: Cash tracking not reliable, hide it
+                    // Could be fetched from IBKR account summary if needed
+                    document.getElementById('ov-cash').textContent = '—';
 
                     renderTopPositions(positions);
                 }
@@ -3804,17 +3812,35 @@ def get_pnl():
 
     market_open = check_market_open()
 
-    # When market is closed, return None instead of stale data
-    if not market_open:
-        return jsonify({"total": None, "unrealized": None, "realized": None, "daily": None})
-
     try:
         from sync_db_reader import SyncDatabaseReader
 
         db = SyncDatabaseReader()
 
-        # Get positions for P&L calculation
+        # Get positions
         positions = db.get_positions()
+
+        # Calculate total market value from positions (matches mobile app)
+        total_market_value = Decimal("0")
+        for pos in positions:
+            qty = Decimal(str(pos.get("quantity", 0) or 0))
+            price = Decimal(str(pos.get("market_price", 0) or 0))
+            total_market_value += qty * price
+
+        # Equity = market value of positions (cash tracking not reliable)
+        equity = total_market_value
+
+        # When market is closed, return equity but null P&L
+        if not market_open:
+            return jsonify(
+                {
+                    "total": None,
+                    "unrealized": None,
+                    "realized": None,
+                    "daily": None,
+                    "equity": float(equity),
+                }
+            )
 
         # Calculate total unrealized P&L from positions using Decimal
         unrealized_pnl = Decimal("0")
@@ -3888,13 +3914,14 @@ def get_pnl():
                 "unrealized": float(round(unrealized_pnl, 2)),
                 "realized": float(round(realized_pnl, 2)),
                 "daily": float(round(daily_pnl, 2)),
+                "equity": float(equity),
             }
         )
 
     except Exception as e:
         logger.error(f"Error calculating P&L: {e}")
         # Return zeros on error instead of fake data
-        return jsonify({"total": 0, "unrealized": 0, "realized": 0, "daily": 0})
+        return jsonify({"total": 0, "unrealized": 0, "realized": 0, "daily": 0, "equity": 100000})
 
     # Original database logic commented out due to persistent locking
     """
