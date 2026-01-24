@@ -11,6 +11,72 @@
 
 **Note:** The older 9-phase plan in `archived_plans/PROJECT_PLAN_9PHASE.md` is deprecated and should NOT be used. Any references to "Phase 5", "Phase 6" etc. from older commits refer to the old plan and should be ignored.
 
+## 📱 Mobile App Development (THIS IS THE MOBILE WORKTREE)
+
+**You are in the mobile app worktree.** This is branch `feature/mobile-app`.
+
+### Repository Structure
+
+| Location | Branch | Purpose |
+|----------|--------|---------|
+| `/Users/oliver/robo_trader` | `main` | Backend, API, Web Dashboard |
+| `/Users/oliver/robo_trader-mobile` | `feature/mobile-app` | **YOU ARE HERE** - Mobile App |
+
+### Mobile App Location
+```
+/Users/oliver/robo_trader-mobile/mobile/   ← React Native app lives here
+```
+
+### Parallel Development Rules
+
+**CRITICAL: Follow these rules to avoid conflicts**
+
+1. **Mobile-only changes → HERE (feature/mobile-app)**
+   - React Native code (`mobile/**`)
+   - Mobile UI components, screens
+   - Mobile-specific configs
+   - Mobile handoffs and docs (`mobile/*.md`)
+
+2. **Backend changes → MAIN REPO (main branch)**
+   - Do NOT edit `app.py`, `robo_trader/*.py` here
+   - Go to `/Users/oliver/robo_trader` for backend work
+   - Then sync back: `git merge origin/main`
+
+3. **Never edit backend files in this worktree**
+
+### Syncing From Main
+
+```bash
+# Get latest backend changes:
+git fetch origin main
+git merge origin/main
+```
+
+### Starting Mobile Development
+
+```bash
+# Terminal 1: Start backend (in main repo)
+cd /Users/oliver/robo_trader
+./START_TRADER.sh
+
+# Terminal 2: Start mobile (here)
+cd /Users/oliver/robo_trader-mobile/mobile
+npx expo start --lan
+```
+
+### Mobile App Docs
+- `mobile/HANDOFF.md` - Current status and session notes
+- `mobile/IMPLEMENTATION_PLAN.md` - Roadmap and task breakdown
+
+### API Configuration
+The mobile app connects to backend at:
+- API: `http://192.168.1.166:5555` (Mac's local IP)
+- WebSocket: `ws://192.168.1.166:8765`
+
+If Mac's IP changes, update `mobile/lib/constants.ts`.
+
+---
+
 ## ⚠️ IBKR Gateway Management (Updated 2025-12-03)
 
 ### Automated Gateway Management via IBC
