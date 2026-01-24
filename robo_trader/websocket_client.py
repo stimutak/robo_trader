@@ -182,7 +182,37 @@ class WebSocketClient:
 
         self._queue_message_safe(message)
 
+    def send_log_message(
+        self,
+        level: str,
+        source: str,
+        message: str,
+        context: Optional[Dict[str, Any]] = None,
+    ):
+        """Queue a log message for streaming to connected clients.
+
+        Args:
+            level: Log level (DEBUG, INFO, WARNING, ERROR)
+            source: Module or component name
+            message: The log message text
+            context: Optional structured data (symbol, price, etc.)
+        """
+        log_message = {
+            "type": "log",
+            "level": level.upper(),
+            "source": source,
+            "message": message,
+            "context": context or {},
+            "timestamp": datetime.now().isoformat(),
+        }
+        self._queue_message_safe(log_message)
+
 
 # Global client instance for runner_async to use
 ws_client = WebSocketClient()
 ws_client.start()
+
+# Register with logger for log streaming (client mode for processes without WS server)
+from robo_trader.logger import WebSocketLogProcessor  # noqa: E402
+
+WebSocketLogProcessor.set_ws_client(ws_client)

@@ -41,7 +41,24 @@ from robo_trader.ml.model_trainer import ModelTrainer  # noqa: E402
 
 logger = get_logger(__name__)
 app = Flask(__name__)
-CORS(app)  # Enable CORS for mobile app access
+
+# Configure CORS with whitelisted origins
+# Set CORS_ORIGINS env var for production, or it defaults to allowing local development
+cors_origins = os.getenv("CORS_ORIGINS", "").strip()
+if cors_origins:
+    # Production: use explicit whitelist from environment
+    allowed_origins = [origin.strip() for origin in cors_origins.split(",")]
+else:
+    # Development: allow localhost and common local network patterns
+    allowed_origins = [
+        "http://localhost:*",
+        "http://127.0.0.1:*",
+        "http://192.168.*.*:*",  # Local network
+        "http://10.*.*.*:*",  # Private network
+        "exp://*",  # Expo development (React Native)
+    ]
+
+CORS(app, origins=allowed_origins, supports_credentials=True)
 server = app  # For Gunicorn compatibility
 
 # Configuration
@@ -5186,6 +5203,7 @@ def get_trades():
                         "timestamp": trade.get("timestamp", ""),
                         "slippage": trade.get("slippage", 0),
                         "commission": trade.get("commission", 0),
+                        "pnl": trade.get("pnl"),  # Realized P&L for SELL trades
                         "notional": trade["quantity"] * trade["price"],
                         # Include all four sides (BUY, SELL, SELL_SHORT, BUY_TO_COVER)
                         "cash_impact": (
@@ -5204,6 +5222,12 @@ def get_trades():
             buy_trades = [t for t in trade_list if t["side"] in ("BUY", "BUY_TO_COVER")]
             sell_trades = [t for t in trade_list if t["side"] in ("SELL", "SELL_SHORT")]
 
+            # Calculate P&L stats (only for trades with P&L - i.e., SELL trades)
+            trades_with_pnl = [t for t in trade_list if t.get("pnl") is not None]
+            winners = [t for t in trades_with_pnl if t["pnl"] > 0]
+            losers = [t for t in trades_with_pnl if t["pnl"] < 0]
+            total_pnl = sum(t["pnl"] for t in trades_with_pnl)
+
             return jsonify(
                 {
                     "trades": trade_list,
@@ -5214,6 +5238,9 @@ def get_trades():
                         "total_volume": total_volume,
                         "total_commission": total_commission,
                         "avg_trade_size": total_volume / total_trades if total_trades > 0 else 0,
+                        "winners": len(winners),
+                        "losers": len(losers),
+                        "total_pnl": total_pnl,
                     },
                 }
             )
@@ -6165,11 +6192,11 @@ if __name__ == "__main__":
     # Initialize components
     logger.info("Starting RoboTrader Dashboard...")
 
-    # Temporarily disable WebSocket server to fix startup issues
-    # TODO: Fix WebSocket server initialization
-    # logger.info("Starting WebSocket server...")
-    # ws_manager.start()
-    # time.sleep(2)
+    # Start WebSocket server for real-time log streaming
+    from robo_trader.websocket_server import ws_manager
+
+    logger.info("Starting WebSocket server...")
+    ws_manager.start()
 
     logger.info(f"Dashboard starting on port {os.getenv('DASH_PORT', 5555)}")
 

@@ -305,16 +305,18 @@ if ! $PYTHON -c "import pandas" 2>/dev/null; then
 fi
 echo ""
 
-# Step 5: Start WebSocket server
-echo "5. Starting WebSocket server..."
-$PYTHON -m robo_trader.websocket_server &
-WS_PID=$!
+# Step 5: Start dashboard (includes WebSocket server)
+echo "5. Starting dashboard with WebSocket server..."
+export DASH_PORT=5555
+$PYTHON app.py &
+DASH_PID=$!
 sleep 2
 
-if ps -p $WS_PID > /dev/null; then
-    echo "   ✓ WebSocket server started (PID: $WS_PID)"
+if ps -p $DASH_PID > /dev/null; then
+    echo "   ✓ Dashboard started (PID: $DASH_PID)"
+    echo "   ✓ WebSocket server running on ws://localhost:8765"
 else
-    echo "   ⚠️  WebSocket server may have failed to start"
+    echo "   ⚠️  Dashboard may have failed to start"
 fi
 echo ""
 
@@ -332,22 +334,8 @@ TRADER_PID=$!
 echo "   ✓ Trading system started (PID: $TRADER_PID)"
 echo ""
 
-# Step 7: Start dashboard
-echo "7. Starting dashboard..."
-export DASH_PORT=5555
-$PYTHON app.py &
-DASH_PID=$!
-sleep 2
-
-if ps -p $DASH_PID > /dev/null; then
-    echo "   ✓ Dashboard started (PID: $DASH_PID)"
-else
-    echo "   ⚠️  Dashboard may have failed to start"
-fi
-echo ""
-
-# Step 8: Monitor startup
-echo "8. Monitoring startup (10 seconds)..."
+# Step 7: Monitor startup
+echo "7. Monitoring startup (10 seconds)..."
 sleep 10
 
 if ps -p $TRADER_PID > /dev/null; then
@@ -358,15 +346,14 @@ if ps -p $TRADER_PID > /dev/null; then
     echo "=========================================="
     echo ""
     echo "Trading system is running with PID: $TRADER_PID"
-    echo "WebSocket server PID: $WS_PID"
-    echo "Dashboard PID: $DASH_PID"
+    echo "Dashboard PID: $DASH_PID (includes WebSocket server)"
     echo ""
     echo "Monitor logs: tail -f robo_trader.log"
     echo "View dashboard: http://localhost:5555"
+    echo "WebSocket: ws://localhost:8765"
     echo ""
     echo "To stop:"
     echo "  pkill -9 -f runner_async"
-    echo "  pkill -9 -f websocket_server"
     echo "  pkill -9 -f app.py"
     echo ""
 else

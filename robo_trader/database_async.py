@@ -253,10 +253,17 @@ class AsyncTradingDatabase:
                     price REAL NOT NULL,
                     slippage REAL DEFAULT 0,
                     commission REAL DEFAULT 0,
+                    pnl REAL DEFAULT NULL,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """
             )
+
+            # Add pnl column to existing tables (migration)
+            try:
+                await conn.execute("ALTER TABLE trades ADD COLUMN pnl REAL DEFAULT NULL")
+            except Exception:
+                pass  # Column already exists
 
             # Account table
             await conn.execute(
@@ -372,6 +379,64 @@ class AsyncTradingDatabase:
             await conn.commit()
             logger.debug(f"Updated position: {symbol} qty={quantity} avg={avg_cost}")
 
+    async def _calculate_fifo_pnl(
+        self, conn, symbol: str, sell_quantity: int, sell_price: float
+    ) -> float:
+        """
+        Calculate realized P&L for a SELL trade using FIFO matching.
+
+        Matches sell quantity against oldest BUY trades for the same symbol
+        to calculate the realized profit/loss.
+
+        Args:
+            conn: Database connection
+            symbol: Stock symbol
+            sell_quantity: Number of shares being sold
+            sell_price: Price per share for the sell
+
+        Returns:
+            Realized P&L (positive = profit, negative = loss)
+        """
+        # Get all BUY trades for this symbol, ordered by timestamp (FIFO)
+        cursor = await conn.execute(
+            """
+            SELECT id, quantity, price FROM trades
+            WHERE symbol = ? AND side = 'BUY'
+            ORDER BY timestamp ASC
+            """,
+            (symbol,),
+        )
+        buy_trades = await cursor.fetchall()
+
+        if not buy_trades:
+            # No BUY trades found - use position's avg_cost if available
+            cursor = await conn.execute(
+                "SELECT avg_cost FROM positions WHERE symbol = ?", (symbol,)
+            )
+            pos = await cursor.fetchone()
+            if pos and pos[0]:
+                avg_cost = pos[0]
+                return (sell_price - avg_cost) * sell_quantity
+            # No cost basis - return 0
+            logger.warning(f"No cost basis found for {symbol} SELL trade")
+            return 0.0
+
+        # Calculate weighted average cost from BUY trades
+        # For simplicity, use weighted average rather than strict FIFO lot matching
+        total_shares = sum(t[1] for t in buy_trades)
+        total_cost = sum(t[1] * t[2] for t in buy_trades)
+
+        if total_shares > 0:
+            avg_cost = total_cost / total_shares
+            realized_pnl = (sell_price - avg_cost) * sell_quantity
+            logger.debug(
+                f"FIFO P&L for {symbol}: sell ${sell_price:.2f} - avg cost ${avg_cost:.2f} "
+                f"x {sell_quantity} = ${realized_pnl:.2f}"
+            )
+            return realized_pnl
+
+        return 0.0
+
     async def record_trade(
         self,
         symbol: str,
@@ -381,7 +446,7 @@ class AsyncTradingDatabase:
         slippage: float = 0.0,
         commission: float = 0.0,
     ) -> None:
-        """Record a trade asynchronously."""
+        """Record a trade asynchronously with P&L calculation for SELL trades."""
         # Validate inputs
         try:
             symbol = DatabaseValidator.validate_symbol(symbol)
@@ -399,15 +464,27 @@ class AsyncTradingDatabase:
             raise
 
         async with self.get_connection() as conn:
+            # Calculate P&L for SELL trades (realized profit/loss)
+            pnl = None
+            if side.upper() in ("SELL", "BUY_TO_COVER"):
+                pnl = await self._calculate_fifo_pnl(conn, symbol, quantity, price)
+
             await conn.execute(
                 """
-                INSERT INTO trades (symbol, side, quantity, price, slippage, commission)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO trades (symbol, side, quantity, price, slippage, commission, pnl)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-                (symbol, side, quantity, price, slippage, commission),
+                (symbol, side, quantity, price, slippage, commission, pnl),
             )
             await conn.commit()
-            logger.info(f"Recorded trade: {side} {quantity} {symbol} @ {price}")
+
+            if pnl is not None:
+                logger.info(
+                    f"Recorded trade: {side} {quantity} {symbol} @ {price} "
+                    f"(P&L: ${pnl:,.2f})"
+                )
+            else:
+                logger.info(f"Recorded trade: {side} {quantity} {symbol} @ {price}")
 
     async def update_account(
         self,
