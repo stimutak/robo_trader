@@ -58,20 +58,14 @@ cp config/ibc/config.ini.template config/ibc/config.ini
 ### Gateway Management Commands
 
 ```bash
-# Start trader (handles Gateway automatically)
+# THE ONLY WAY TO START THE TRADING SYSTEM:
 ./START_TRADER.sh
 
-# Start Gateway manually (for debugging)
-./scripts/start_gateway.sh paper
-
-# Check Gateway status
-python3 scripts/gateway_manager.py status
-
-# Force restart Gateway (clears all zombies)
-python3 scripts/gateway_manager.py restart
-
-# View Gateway logs
-tail -f config/ibc/logs/*.txt
+# Debugging/diagnostic commands (not for normal startup):
+./scripts/start_gateway.sh paper            # Start Gateway only (debugging)
+python3 scripts/gateway_manager.py status   # Check Gateway status
+python3 scripts/gateway_manager.py restart  # Force restart Gateway (clears zombies)
+tail -f config/ibc/logs/*.txt               # View Gateway logs
 ```
 
 ### Zombie Connections
@@ -143,6 +137,16 @@ pkill -f "IB Gateway"
 # Or with custom symbols:
 ./START_TRADER.sh "AAPL,NVDA,TSLA"
 ```
+
+**⚠️ IMPORTANT: Always use `./START_TRADER.sh` - NEVER start components manually!**
+
+Do NOT run these directly:
+- ❌ `python3 runner_async.py` - Use START_TRADER.sh instead
+- ❌ `scripts/start_gateway.sh` - Use START_TRADER.sh instead
+- ❌ `python3 app.py` - Use START_TRADER.sh instead
+- ❌ `python3 websocket_server.py` - Use START_TRADER.sh instead
+
+The script handles Gateway startup, zombie cleanup, connectivity testing, and proper sequencing. Starting components manually bypasses these safety checks.
 
 **What the script does:**
 1. ✅ Kills existing Python trader processes
