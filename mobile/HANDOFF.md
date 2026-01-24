@@ -88,28 +88,97 @@ export const WS_URL = __DEV__ ? `ws://${DEV_HOST}:8765` : 'ws://localhost:8765';
 
 ## Known Issues
 
-1. **Logs "Disconnected"** - WebSocket connects but no logs because runner not active
-2. **Trade P&L = $0.00** - API returns `pnl: null` for trades
-3. **Winners/Losers filters** - Don't work due to missing P&L data
+| Issue | Cause | Fix Location |
+|-------|-------|--------------|
+| Logs "Disconnected" | WebSocket connects but no logs stream | `main` branch |
+| Trade P&L = $0.00 | API returns `pnl: null` | `main` branch |
+| Winners/Losers filters broken | No P&L data to filter | `main` branch |
 
 ---
 
-## Future Work
+## Backend Tasks (Do in main branch)
 
-### High Priority
-1. **WebSocket log streaming** - Backend needs to send logs (see `handoff/HANDOFF_WEBSOCKET_LOG_STREAMING.md`)
-2. **Per-trade P&L** - Backend should calculate P&L for trades
-3. **Production build** - EAS Build for TestFlight
+These changes need to be made in `/Users/oliver/robo_trader` on the `main` branch:
 
-### Medium Priority
-4. **Position detail screen** - Implement chart and actions
-5. **Trade detail view** - Tap for full details
-6. **Push notifications** - Trade alerts
+### 1. Per-Trade P&L Calculation (HIGH PRIORITY)
+**Files:** `robo_trader/database_async.py`, `app.py`
 
-### Low Priority
-7. **Offline caching**
-8. **Biometric auth**
-9. **iOS widget**
+```python
+# In database_async.py - add to record_trade():
+# Calculate realized P&L for SELL trades using FIFO matching
+# Store in trades table
+```
+
+**Steps:**
+1. Add `realized_pnl` column to trades table
+2. When recording SELL, match against BUY trades (FIFO)
+3. Calculate: `realized_pnl = (sell_price - avg_buy_price) * quantity`
+4. Return P&L in `/api/trades` response
+
+### 2. WebSocket Log Streaming (HIGH PRIORITY)
+**Files:** `robo_trader/websocket_server.py`, `robo_trader/logger.py`
+
+**Problem:** Logs only stream when trading runner is active
+
+**Solution:** Stream ALL application logs, not just runner logs
+
+See: `handoff/HANDOFF_WEBSOCKET_LOG_STREAMING.md`
+
+### 3. Production CORS (MEDIUM PRIORITY)
+**File:** `app.py`
+
+Currently using `CORS(app)` which allows all origins. For production:
+```python
+CORS(app, origins=['https://your-app-domain.com'])
+```
+
+---
+
+## Mobile Tasks (Do in feature/mobile-app branch)
+
+These changes go in `/Users/oliver/robo_trader-mobile/mobile/`:
+
+### 1. Position Detail Screen (HIGH PRIORITY)
+**File:** `app/position/[symbol].tsx`
+
+- Show position stats (entry, current, P&L)
+- Price chart for symbol
+- Close position button (future)
+
+### 2. Error/Loading States (HIGH PRIORITY)
+- Add error boundaries
+- Loading skeletons for all screens
+- Retry buttons on failure
+
+### 3. EAS Build Setup (MEDIUM PRIORITY)
+- Configure `eas.json`
+- Set production API URL
+- Submit to TestFlight
+
+---
+
+## Parallel Development Workflow
+
+See `IMPLEMENTATION_PLAN.md` for full details.
+
+**Quick Reference:**
+
+```bash
+# Backend work (main branch):
+cd /Users/oliver/robo_trader
+# make changes, commit, push to main
+
+# Mobile work (feature branch):
+cd /Users/oliver/robo_trader-mobile
+git merge origin/main  # sync backend changes first
+# make changes in mobile/, commit, push to feature/mobile-app
+
+# Final merge when ready:
+cd /Users/oliver/robo_trader
+git merge feature/mobile-app
+```
+
+**Key Rule:** Backend files → main branch only. Mobile files → feature branch only.
 
 ---
 
