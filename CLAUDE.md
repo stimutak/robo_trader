@@ -121,16 +121,18 @@ The mobile app lives in a **git worktree** linked to this repo.
 
 **CRITICAL: Follow these rules to avoid conflicts**
 
-1. **Backend changes → THIS repo (main branch)**
-   - API endpoints (`app.py`)
-   - WebSocket server (`robo_trader/websocket_server.py`)
-   - Database (`robo_trader/database_async.py`)
-   - Any `robo_trader/*.py` files
+1. **ALL changes EXCEPT mobile → THIS repo (main branch)**
+   - Trading system (`robo_trader/`)
+   - Web dashboard (`app.py`, templates)
+   - Scripts (`scripts/`)
+   - Configuration files
+   - Documentation (`*.md`, `handoff/`)
+   - Everything that isn't in `mobile/`
 
-2. **Mobile-only changes → worktree (feature/mobile-app)**
+2. **Mobile app ONLY → worktree (feature/mobile-app)**
    - React Native code (`mobile/**`)
    - Mobile UI components
-   - Mobile-specific configs
+   - Mobile-specific configs (`mobile/lib/constants.ts`)
 
 3. **Never edit the same file in both branches simultaneously**
 
