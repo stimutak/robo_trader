@@ -3938,17 +3938,22 @@ def status():
             )
             unrealized_pnl = total_value - total_cost
 
-            # Get account info for realized P&L
+            # Get account info for realized P&L and cash
             account = db.get_account_info()
             realized_pnl = account.get("realized_pnl", 0) or 0
             daily_pnl = account.get("daily_pnl", 0) or 0
+            cash = account.get("cash", 0) or 0
+
+            # Equity = cash + position value (not just positions)
+            equity = cash + total_value
 
             pnl_data = {
                 "daily": round(daily_pnl, 2),
                 "total": round(realized_pnl + unrealized_pnl, 2),
                 "unrealized": round(unrealized_pnl, 2),
                 "realized": round(realized_pnl, 2),
-                "equity": round(total_value, 2),
+                "equity": round(equity, 2),
+                "cash": round(cash, 2),
             }
     except Exception as e:
         logger.debug(f"Could not load P&L for status: {e}")

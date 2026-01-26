@@ -1850,6 +1850,7 @@ class AsyncRunner:
                             quantity=0,
                             executed=False,
                             message=f"Position value ${position_value:.0f} below min ${min_position_value:.0f}",
+                            data=df,
                         )
 
                     ok, msg = self.risk.validate_order(
@@ -2263,8 +2264,11 @@ class AsyncRunner:
         # Convert Decimal to float for APIs that expect float
         equity_float = float(equity)
         unrealized_float = float(unrealized)
-        # Clamp cash to 0 minimum (paper trading can have margin/negative cash)
-        cash_float = max(0.0, float(self.portfolio.cash))
+        # Handle negative cash (margin) - log warning but preserve actual value
+        raw_cash = float(self.portfolio.cash)
+        if raw_cash < 0:
+            logger.warning(f"Negative cash balance: ${raw_cash:,.2f} (margin usage)")
+        cash_float = raw_cash  # Preserve actual cash value, don't clamp
         realized_pnl_float = float(self.portfolio.realized_pnl)
 
         # Update portfolio manager capital and consider rebalancing
@@ -2324,6 +2328,10 @@ class AsyncRunner:
             kill_switch = self.advanced_risk.kill_switch
             # Use session start equity (captured after loading positions)
             starting_equity = self.session_start_equity or float(self.cfg.default_cash)
+            # Guard against division by zero - use fallback if starting_equity is 0 or negative
+            if starting_equity <= 0:
+                logger.warning(f"Invalid starting_equity={starting_equity}, using fallback 100000")
+                starting_equity = 100000.0
             if kill_switch.check_daily_loss(equity_float, starting_equity):
                 loss_pct = ((starting_equity - equity_float) / starting_equity) * 100
                 reason = (
