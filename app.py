@@ -5145,8 +5145,15 @@ def equity_curve():
         pnl_labels = [d["timestamp"][:10] for d in equity_data]  # Just date
         pnl_values = [d["cumulative"] for d in equity_data]
 
-        # Use portfolio history labels if available, otherwise use PnL labels
-        labels = portfolio_labels if portfolio_labels else pnl_labels
+        # Use PnL labels when they have more data points than equity_history
+        # This ensures the chart shows full history even if equity snapshots just started
+        if len(pnl_labels) > len(portfolio_labels):
+            labels = pnl_labels
+            # Calculate portfolio values from P&L when equity_history is sparse
+            starting_capital = 100000
+            portfolio_values = [starting_capital + pnl for pnl in pnl_values]
+        else:
+            labels = portfolio_labels if portfolio_labels else pnl_labels
 
         return jsonify(
             {
@@ -5710,13 +5717,14 @@ def get_risk_status():
         trades = db.get_recent_trades(limit=100)
 
         # Calculate win rate and consecutive losses
-        winning_trades = [t for t in trades if t.get("pnl", 0) > 0]
+        # Use (t.get("pnl") or 0) to handle None values from BUY trades
+        winning_trades = [t for t in trades if (t.get("pnl") or 0) > 0]
         win_rate = len(winning_trades) / len(trades) if trades else 0.5
 
         # Count consecutive losses
         consecutive_losses = 0
         for trade in reversed(trades):
-            if trade.get("pnl", 0) < 0:
+            if (trade.get("pnl") or 0) < 0:
                 consecutive_losses += 1
             else:
                 break
@@ -5728,7 +5736,7 @@ def get_risk_status():
             if t.get("timestamp")
             and datetime.fromisoformat(t["timestamp"]).date() == datetime.now().date()
         ]
-        daily_pnl = sum(t.get("pnl", 0) for t in today_trades)
+        daily_pnl = sum((t.get("pnl") or 0) for t in today_trades)
         daily_loss_pct = (
             abs(daily_pnl / risk_state.get("current_capital", 100000)) if daily_pnl < 0 else 0
         )
@@ -5738,7 +5746,7 @@ def get_risk_status():
         peak_pnl = 0
         max_drawdown = 0
         for trade in trades:
-            cumulative_pnl += trade.get("pnl", 0)
+            cumulative_pnl += (trade.get("pnl") or 0)
             peak_pnl = max(peak_pnl, cumulative_pnl)
             drawdown = (
                 (peak_pnl - cumulative_pnl) / risk_state.get("current_capital", 100000)
@@ -5751,13 +5759,13 @@ def get_risk_status():
         kelly_positions = {}
         for symbol in list(active_positions.keys())[:5]:  # Top 5 positions
             symbol_trades = [t for t in trades if t.get("symbol") == symbol]
-            symbol_wins = [t for t in symbol_trades if t.get("pnl", 0) > 0]
+            symbol_wins = [t for t in symbol_trades if (t.get("pnl") or 0) > 0]
             symbol_win_rate = len(symbol_wins) / len(symbol_trades) if symbol_trades else 0.5
 
             # Simple Kelly estimation
             if symbol_wins and symbol_trades:
                 avg_win = sum(t["pnl"] for t in symbol_wins) / len(symbol_wins)
-                losses = [t for t in symbol_trades if t.get("pnl", 0) <= 0]
+                losses = [t for t in symbol_trades if (t.get("pnl") or 0) <= 0]
                 avg_loss = (
                     abs(sum(t["pnl"] for t in losses) / len(losses)) if losses else avg_win * 0.5
                 )
