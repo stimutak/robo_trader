@@ -4138,8 +4138,12 @@ def get_pnl():
             price = Decimal(str(pos.get("market_price", 0) or 0))
             total_market_value += qty * price
 
-        # Equity = market value of positions (cash tracking not reliable)
-        equity = total_market_value
+        # Get cash from account
+        account = db.get_account_info()
+        cash = Decimal(str(account.get("cash", 0) or 0))
+
+        # Equity = cash + market value of positions
+        equity = cash + total_market_value
 
         # When market is closed, return equity but null P&L
         if not market_open:
