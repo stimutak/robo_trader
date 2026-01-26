@@ -6073,10 +6073,10 @@ def get_safety_thresholds():
 @app.route("/api/start", methods=["POST"])
 @requires_auth
 def start_trading():
-    """Start trading"""
+    """Start trading with proper Gateway checks and zombie cleanup."""
     global trading_status, trading_process
 
-    # Load symbols from user settings (make it global)
+    # Load symbols from user settings
     global default_symbols
     try:
         with open("user_settings.json", "r") as f:
@@ -6085,38 +6085,81 @@ def start_trading():
     except (FileNotFoundError, json.JSONDecodeError, KeyError):
         default_symbols = ["AAPL", "MSFT", "GOOGL"]
 
-    data = request.json
+    data = request.json or {}
     symbols = data.get("symbols", default_symbols)
 
     if trading_status == "running":
         return jsonify({"status": "already_running"})
 
-    # Start trading process with proper symbol format
-    cmd = ["python3", "-m", "robo_trader.runner_async", "--symbols", ",".join(symbols)]
-    trading_process = subprocess.Popen(cmd)
-    trading_status = "running"
+    # Use the start_runner.sh script for proper startup with Gateway checks
+    script_path = os.path.join(os.path.dirname(__file__), "scripts", "start_runner.sh")
+    symbols_str = ",".join(symbols) if isinstance(symbols, list) else symbols
 
-    trading_log.append(
-        f"{datetime.now().strftime('%H:%M:%S')} - Trading started for {', '.join(symbols)}"
-    )
+    try:
+        # Run the startup script and capture output
+        result = subprocess.run(
+            [script_path, symbols_str],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
 
-    return jsonify({"status": "started", "symbols": symbols})
+        if result.returncode == 0:
+            trading_status = "running"
+            trading_log.append(
+                f"{datetime.now().strftime('%H:%M:%S')} - Trading started for {symbols_str}"
+            )
+            return jsonify({
+                "status": "started",
+                "symbols": symbols_str.split(","),
+                "output": result.stdout,
+            })
+        else:
+            trading_log.append(
+                f"{datetime.now().strftime('%H:%M:%S')} - Failed to start: {result.stderr}"
+            )
+            return jsonify({
+                "status": "error",
+                "error": result.stderr or result.stdout,
+            }), 500
+
+    except subprocess.TimeoutExpired:
+        return jsonify({"status": "error", "error": "Startup timed out"}), 500
+    except Exception as e:
+        logger.error(f"Error starting trading: {e}")
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 
 @app.route("/api/stop", methods=["POST"])
 @requires_auth
 def stop_trading():
-    """Stop trading"""
+    """Stop trading - kills all runner processes."""
     global trading_status, trading_process
 
-    if trading_process:
-        trading_process.terminate()
-        trading_process = None
+    try:
+        # Kill all runner processes (more reliable than just terminating one)
+        result = subprocess.run(
+            ["pkill", "-9", "-f", "runner_async"],
+            capture_output=True,
+            text=True,
+        )
 
-    trading_status = "stopped"
-    trading_log.append(f"{datetime.now().strftime('%H:%M:%S')} - Trading stopped")
+        # Also terminate tracked process if any
+        if trading_process:
+            try:
+                trading_process.terminate()
+            except Exception:
+                pass
+            trading_process = None
 
-    return jsonify({"status": "stopped"})
+        trading_status = "stopped"
+        trading_log.append(f"{datetime.now().strftime('%H:%M:%S')} - Trading stopped")
+
+        return jsonify({"status": "stopped"})
+
+    except Exception as e:
+        logger.error(f"Error stopping trading: {e}")
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 
 @app.route("/api/logs")
