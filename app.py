@@ -6,6 +6,7 @@ Provides real-time monitoring of trading, ML models, and performance metrics
 
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 import signal
@@ -66,6 +67,7 @@ _positions_cache_lock = threading.Lock()
 
 # Configuration
 config = load_config()
+DEFAULT_CAPITAL = float(os.getenv("DEFAULT_CASH", getattr(config, "default_cash", 100000)))
 AUTH_ENABLED = os.getenv("DASH_AUTH_ENABLED", "false").lower() == "true"
 AUTH_USER = os.getenv("DASH_USER", "admin")
 AUTH_PASS_HASH = os.getenv("DASH_PASS_HASH", "")
@@ -128,13 +130,16 @@ else:
 
 # Authentication
 def check_auth(username, password):
-    """Check if username/password is valid."""
+    """Check if username/password is valid using timing-safe comparison."""
     if not AUTH_ENABLED:
         return True
     if not AUTH_PASS_HASH:
         return True
     password_hash = hashlib.sha256(password.encode()).hexdigest()
-    return username == AUTH_USER and password_hash == AUTH_PASS_HASH
+    # Use timing-safe comparison to prevent timing attacks
+    return hmac.compare_digest(username, AUTH_USER) and hmac.compare_digest(
+        password_hash, AUTH_PASS_HASH
+    )
 
 
 def authenticate():
@@ -3700,12 +3705,17 @@ def market_status():
     }
 
     if is_open:
-        # Market is open - show when it closes (4:00 PM ET)
+        # Market is open - show when it closes (handles early close days)
         from zoneinfo import ZoneInfo
+
+        from robo_trader.market_hours import _get_market_close_time
 
         et = ZoneInfo("America/New_York")
         now_et = datetime.now(et)
-        close_time = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+        close_time_obj = _get_market_close_time(now_et.date())
+        close_time = now_et.replace(
+            hour=close_time_obj.hour, minute=close_time_obj.minute, second=0, microsecond=0
+        )
         result["next_close"] = close_time.strftime("%I:%M %p")
     else:
         next_open = get_next_market_open()
@@ -4220,7 +4230,9 @@ def get_pnl():
     except Exception as e:
         logger.error(f"Error calculating P&L: {e}")
         # Return zeros on error instead of fake data
-        return jsonify({"total": 0, "unrealized": 0, "realized": 0, "daily": 0, "equity": 100000})
+        return jsonify(
+            {"total": 0, "unrealized": 0, "realized": 0, "daily": 0, "equity": DEFAULT_CAPITAL}
+        )
 
     # Original database logic commented out due to persistent locking
     """
@@ -4968,24 +4980,26 @@ def performance():
 
         # Calculate returns for different periods
         now = datetime.now()
+
+        def parse_trade_time(t):
+            """Safely parse trade timestamp, return None on error."""
+            try:
+                return datetime.fromisoformat(t["timestamp"].replace(" ", "T"))
+            except (ValueError, KeyError, TypeError):
+                return None
+
         daily_trades = [
-            t
-            for t in all_trades
-            if datetime.fromisoformat(t["timestamp"].replace(" ", "T")) > now - timedelta(days=1)
+            t for t in all_trades if (ts := parse_trade_time(t)) and ts > now - timedelta(days=1)
         ]
         weekly_trades = [
-            t
-            for t in all_trades
-            if datetime.fromisoformat(t["timestamp"].replace(" ", "T")) > now - timedelta(days=7)
+            t for t in all_trades if (ts := parse_trade_time(t)) and ts > now - timedelta(days=7)
         ]
         monthly_trades = [
-            t
-            for t in all_trades
-            if datetime.fromisoformat(t["timestamp"].replace(" ", "T")) > now - timedelta(days=30)
+            t for t in all_trades if (ts := parse_trade_time(t)) and ts > now - timedelta(days=30)
         ]
 
         # Estimate capital (position value + 20% cash buffer)
-        estimated_capital = position_value * 1.2 if position_value > 0 else 100000
+        estimated_capital = position_value * 1.2 if position_value > 0 else DEFAULT_CAPITAL
 
         # Calculate period PnL by matching trades in each period
         def calc_period_pnl(trades):
@@ -5973,7 +5987,7 @@ def get_kelly_parameters(symbol):
 
         # Load current capital from risk state
         risk_state_file = Path("data/risk_state.json")
-        current_capital = 100000  # Default
+        current_capital = DEFAULT_CAPITAL
         if risk_state_file.exists():
             with open(risk_state_file) as f:
                 risk_state = json.load(f)
@@ -6214,7 +6228,8 @@ def start_trading():
         return jsonify({"status": "error", "error": "Startup timed out"}), 500
     except Exception as e:
         logger.error(f"Error starting trading: {e}")
-        return jsonify({"status": "error", "error": str(e)}), 500
+        # Don't expose internal error details to client
+        return jsonify({"status": "error", "error": "Failed to start trading system"}), 500
 
 
 @app.route("/api/stop", methods=["POST"])

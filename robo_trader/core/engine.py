@@ -120,10 +120,18 @@ class TradingEngine:
 
     def _register_signal_handlers(self) -> None:
         """Register signal handlers for graceful shutdown."""
+        self._shutdown_requested = False
 
         def signal_handler(signum, frame):
             logger.info(f"Received signal {signum}, initiating graceful shutdown")
-            asyncio.create_task(self.shutdown())
+            self._shutdown_requested = True
+            # Use call_soon_threadsafe to safely schedule shutdown from signal handler
+            try:
+                loop = asyncio.get_running_loop()
+                loop.call_soon_threadsafe(lambda: asyncio.create_task(self.shutdown()))
+            except RuntimeError:
+                # No running loop - set flag and let main loop handle it
+                pass
 
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)

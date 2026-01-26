@@ -2005,7 +2005,8 @@ class AsyncRunner:
                         # Cancel stop-loss when closing position
                         if self.stop_loss_monitor:
                             self.stop_loss_monitor.cancel_stop(symbol)
-                        fill_price = res.fill_price or price
+                        # Use price_float for consistency (price is Decimal, fill_price is float)
+                        fill_price = res.fill_price or price_float
                         # Use atomic position update to prevent race conditions
                         success = await self._update_position_atomic(
                             symbol, pos.quantity, fill_price, "SELL"

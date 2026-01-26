@@ -1,5 +1,27 @@
 # RoboTrader Project Guidelines
 
+## 🚨 CRITICAL: NEVER DELETE USER DATA 🚨
+
+**ABSOLUTELY NEVER delete, wipe, or "clean up" database data without EXPLICIT user permission.**
+
+This includes:
+- NEVER run `DELETE FROM trades` or similar
+- NEVER "start fresh" or "nuclear option" the database
+- NEVER assume duplicate data should be removed
+- NEVER wipe equity_history, positions, or account tables
+
+**If you see data issues:**
+1. STOP and explain the problem to the user
+2. ASK what they want to do
+3. ALWAYS make a backup FIRST if any changes are needed
+4. Let the USER decide if data should be deleted
+
+**The user's trading history is IRREPLACEABLE. Deleting it destroys months of records.**
+
+Violation of this rule caused catastrophic data loss on 2026-01-26. DO NOT REPEAT THIS MISTAKE.
+
+---
+
 ## Project Phase Plan
 **IMPORTANT:** The authoritative phase plan is in `IMPLEMENTATION_PLAN.md`. This is the ML-focused 4-phase plan:
 - Phase 1: Foundation & Quick Wins (Tasks F1-F5) - COMPLETE ✅
@@ -555,6 +577,14 @@ fetch_rss_news(50 headlines) → AI finds opportunities → Adds to processing q
 ## Common Mistakes (Auto-Updated)
 
 **When Claude makes an error, add it here so it won't repeat.**
+
+### 🚨 CRITICAL - Data Destruction (NEVER DO THESE)
+| Mistake | Correct Approach | Date |
+|---------|-----------------|------|
+| Deleting trades/positions to "clean up" duplicates | ASK USER FIRST, make backup, let user decide | 2026-01-26 |
+| "Nuclear option" / "start fresh" on database | NEVER - user data is irreplaceable | 2026-01-26 |
+| Wiping equity_history to fix graphs | Add missing data, don't delete existing | 2026-01-26 |
+| Assuming bad data should be removed | Explain problem to user, let them decide | 2026-01-26 |
 
 ### Type Errors
 | Mistake | Correct Approach | Date |
