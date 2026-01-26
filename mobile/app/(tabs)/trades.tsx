@@ -56,6 +56,14 @@ export default function TradesScreen() {
   const [filter, setFilter] = useState<FilterType>('all');
   const { data: tradesData, refetch, isLoading, error } = useTrades();
 
+  // All hooks must be called before any conditional returns
+  const renderTrade = useCallback(
+    ({ item }: { item: Trade }) => <TradeCard trade={item} />,
+    []
+  );
+
+  const keyExtractor = useCallback((item: Trade) => String(item.id), []);
+
   const handleFilterChange = (newFilter: FilterType) => {
     setFilter(newFilter);
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
@@ -133,13 +141,6 @@ export default function TradesScreen() {
         return true;
     }
   });
-
-  const renderTrade = useCallback(
-    ({ item }: { item: Trade }) => <TradeCard trade={item} />,
-    []
-  );
-
-  const keyExtractor = useCallback((item: Trade) => String(item.id), []);
 
   return (
     <SafeAreaView style={styles.container}>
