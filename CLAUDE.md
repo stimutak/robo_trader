@@ -579,6 +579,11 @@ fetch_rss_news(50 headlines) → AI finds opportunities → Adds to processing q
 | `run_in_executor` with timeout for stdin | Use dedicated reader thread with queue | 2025-12-24 |
 | Cancelling futures with blocking threads | Thread continues even after cancel | 2025-12-24 |
 
+### Config Attribute Errors
+| Mistake | Correct Approach | Date |
+|---------|-----------------|------|
+| `self.cfg.portfolio.initial_capital` | Use `self.cfg.default_cash` - no portfolio.initial_capital | 2026-01-26 |
+
 ### Trading Logic Errors
 | Mistake | Correct Approach | Date |
 |---------|-----------------|------|
@@ -590,6 +595,8 @@ fetch_rss_news(50 headlines) → AI finds opportunities → Adds to processing q
 | "Already have position" = bug | This is CORRECT behavior - prevents duplicate buys | 2026-01-14 |
 | Missing dynamic market holidays | Use `_is_market_holiday()` - includes MLK, Presidents, etc. | 2026-01-15 |
 | `db.update_position(qty)` uses order qty | Use `self.positions[symbol].quantity` (accumulated) | 2026-01-16 |
+| `self.positions` not synced to Portfolio | Must sync DB positions to `self.portfolio.positions` on startup | 2026-01-26 |
+| Portfolio shows only cash, no positions | `portfolio.equity()` uses its own positions dict - sync it! | 2026-01-26 |
 
 ---
 
