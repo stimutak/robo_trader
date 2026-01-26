@@ -111,6 +111,16 @@ class RiskLimitExceededError(TradingError):
     pass
 
 
+class KillSwitchTriggeredError(TradingError):
+    """Kill switch was triggered due to excessive losses.
+
+    This is a critical safety exception that should halt all trading
+    and propagate up to the main trading loop for graceful shutdown.
+    """
+
+    pass
+
+
 # =============================================================================
 # Data Errors
 # =============================================================================

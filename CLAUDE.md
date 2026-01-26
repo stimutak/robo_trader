@@ -579,6 +579,13 @@ fetch_rss_news(50 headlines) → AI finds opportunities → Adds to processing q
 | `run_in_executor` with timeout for stdin | Use dedicated reader thread with queue | 2025-12-24 |
 | Cancelling futures with blocking threads | Thread continues even after cancel | 2025-12-24 |
 
+### Database Performance Errors
+| Mistake | Correct Approach | Date |
+|---------|-----------------|------|
+| Querying DB per-item in loop (N+1 queries) | Batch fetch all data once, then loop over dict | 2026-01-26 |
+| `/api/positions` made 198 DB queries | Use `market_price` from positions table + batch signals | 2026-01-26 |
+| No caching on frequently-hit API endpoints | Add 2-3 second cache to avoid DB contention | 2026-01-26 |
+
 ### Config Attribute Errors
 | Mistake | Correct Approach | Date |
 |---------|-----------------|------|
@@ -597,6 +604,10 @@ fetch_rss_news(50 headlines) → AI finds opportunities → Adds to processing q
 | `db.update_position(qty)` uses order qty | Use `self.positions[symbol].quantity` (accumulated) | 2026-01-16 |
 | `self.positions` not synced to Portfolio | Must sync DB positions to `self.portfolio.positions` on startup | 2026-01-26 |
 | Portfolio shows only cash, no positions | `portfolio.equity()` uses its own positions dict - sync it! | 2026-01-26 |
+| Parallel BUY race condition - duplicate buys | Use `_pending_orders` set with lock before `symbol not in positions` check | 2026-01-26 |
+| API `get_recent_trades(limit=1000)` misses old trades | Use `limit=5000` to ensure ALL trades included in P&L calc | 2026-01-26 |
+| SELL trades with NULL pnl column | Update NULL pnls with estimated value from avg buy price | 2026-01-26 |
+| P&L API recalculating instead of using stored values | Use stored `pnl` column from trades table, not FIFO recalc | 2026-01-26 |
 
 ---
 
@@ -612,33 +623,64 @@ fetch_rss_news(50 headlines) → AI finds opportunities → Adds to processing q
 
 ---
 
-## Slash Commands (Boris Cherny Style)
+## Parallel Claude Workflow (5 Terminal Tabs)
 
-Run these with `/command` in Claude Code:
+See `docs/PARALLEL_CLAUDE_SETUP.md` for full setup guide.
 
-| Command | Purpose |
-|---------|---------|
-| `/review` | Multi-subagent code review (4 reviewers + 2 verifiers) |
-| `/test-and-commit` | Run tests, fix if failing, then commit |
-| `/verify-trading` | Check Gateway, zombies, risk params, logs |
-| `/pr` | Full PR workflow with tests and linting |
-| `/commit` | Quick commit with proper format |
-| `/code-simplifier` | Review and simplify recent code |
-| `/oncall-debug` | Debug production issues systematically |
+### Terminal Layout
 
----
+| Tab | Name | Purpose | Key Command |
+|-----|------|---------|-------------|
+| 1 | MAIN | Primary development | (work happens here) |
+| 2 | TEST | Continuous testing | `/test-and-commit` |
+| 3 | REVIEW | Code review | `/review` |
+| 4 | DOCS | Research/documentation | (research) |
+| 5 | HOTFIX | Quick fixes | (emergency fixes) |
 
-## Two-Phase Development Loop
+### Standard Workflow
 
-**Phase 1: Planning**
-1. Enter Plan Mode: `Shift+Tab` twice
-2. Iterate on the plan until satisfied
-3. A good plan is critical for success
+```
+Tab 1 (MAIN):   Implement changes
+Tab 3 (REVIEW): /review         → 6 subagents check code
+Tab 1 (MAIN):   Fix issues found
+Tab 2 (TEST):   /test-and-commit → Tests pass? → Commit
+User:           git push
+```
 
-**Phase 2: Execution**
-1. Switch to auto-accept mode
-2. Claude executes the plan
-3. Use verification loops to ensure quality
+### Slash Commands
+
+| Command | What It Does | Commits? |
+|---------|--------------|----------|
+| `/review` | 6 parallel subagents review for bugs, security, style | NO |
+| `/test-and-commit` | Run pytest, fix failures, then commit | YES |
+| `/commit` | Quick commit with proper message format | YES |
+| `/pr` | Full PR workflow (tests + lint + PR) | YES |
+| `/verify-trading` | Check Gateway, zombies, risk params | NO |
+| `/oncall-debug` | Systematic production debugging | NO |
+| `/code-simplifier` | Review and simplify recent code | NO |
+
+### CRITICAL: DO NOT Auto-Commit
+
+**After completing work, Claude must:**
+1. Report what was changed
+2. Say: "Run `/review` in REVIEW tab, then `/test-and-commit` in TEST tab"
+3. **STOP** - wait for user to run the slash commands
+
+**Claude CAN commit only when:**
+- User runs `/commit` or `/test-and-commit`
+- User explicitly says "commit" or "commit and push"
+- User runs `/pr`
+
+### Handoff Between Instances
+
+When one Claude instance needs to share context with another:
+```bash
+# Source Claude writes:
+handoff/HANDOFF_<date>_<topic>.md
+
+# Target Claude reads:
+Read handoff/LATEST_HANDOFF.md
+```
 
 ---
 

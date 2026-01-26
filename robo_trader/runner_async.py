@@ -43,6 +43,7 @@ except ImportError:
     ws_client = None
     WEBSOCKET_ENABLED = False
 from .circuit_breaker import CircuitBreaker
+from .exceptions import KillSwitchTriggeredError
 from .portfolio import Portfolio, PositionSnapshot  # Import Portfolio class from portfolio.py file
 from .portfolio_pkg.portfolio_manager import AllocationMethod, MultiStrategyPortfolioManager
 from .risk.advanced_risk import AdvancedRiskManager, risk_monitor_task
@@ -160,6 +161,7 @@ class AsyncRunner:
         self.latest_prices: Dict[str, float] = {}
         self.daily_pnl = 0.0
         self.daily_executed_notional = 0.0
+        self.session_start_equity: Optional[float] = None  # Captured after loading positions
         self.monitor = PerformanceMonitor()
 
         # Production monitoring (Phase 4 P2)
@@ -171,6 +173,11 @@ class AsyncRunner:
         # Position locks to prevent race conditions
         self._position_locks: Dict[str, asyncio.Lock] = {}
         self._position_lock_manager = asyncio.Lock()
+
+        # CRITICAL: Track pending orders to prevent duplicate buys during parallel processing
+        # This set is checked before any BUY order is placed
+        self._pending_orders: set = set()
+        self._pending_orders_lock = asyncio.Lock()
 
         # Correlation components
         self.correlation_tracker = None
@@ -959,9 +966,17 @@ class AsyncRunner:
             else:
                 logger.info("No existing positions found in database")
 
+            # Capture session start equity for kill switch (after positions loaded)
+            # Build market prices from loaded positions (use avg_price as proxy at startup)
+            market_prices = {sym: float(pos.avg_price) for sym, pos in self.positions.items()}
+            self.session_start_equity = float(await self.portfolio.equity(market_prices))
+            logger.info(f"Session start equity: ${self.session_start_equity:,.2f}")
+
         except Exception as e:
             logger.error(f"Failed to load existing positions from database: {e}")
             logger.warning("Starting with empty positions - may result in duplicate trades!")
+            # Fallback to config default if load fails
+            self.session_start_equity = float(self.cfg.default_cash)
 
     async def _fetch_historical_bars(
         self,
@@ -1725,187 +1740,230 @@ class AsyncRunner:
                     message = f"Cover order failed: {res.msg}"
 
             elif symbol not in self.positions:
-                # Open long position
-                # Use advanced risk manager with Kelly sizing if enabled
-                if self.use_advanced_risk and self.advanced_risk:
-                    # Get ATR for stop loss calculation (if available)
-                    atr = df["atr"].iloc[-1] if "atr" in df.columns else None
-
-                    # Calculate position size using Kelly criterion
-                    sizing_result = await self.advanced_risk.calculate_position_size(
-                        symbol=symbol,
-                        signal_strength=abs(signal_value),  # Use signal strength from strategy
-                        current_price=price_float,  # Use float, not Decimal
-                        atr=atr,
-                    )
-
-                    if sizing_result["blocked"]:
-                        logger.warning(
-                            f"Trade blocked by kill switch for {symbol}: {sizing_result['block_reason']}"
-                        )
-                        executed = False
-                        message = f"Blocked: {sizing_result['block_reason']}"
+                # CRITICAL: Check for pending orders to prevent duplicate buys
+                # This prevents race conditions when processing symbols in parallel
+                async with self._pending_orders_lock:
+                    if symbol in self._pending_orders:
+                        logger.warning(f"DUPLICATE BUY BLOCKED: {symbol} already has pending order")
                         return SymbolResult(
-                            symbol, signal_value, price_float, 0, executed, message, df
+                            symbol=symbol,
+                            signal=signal_value,
+                            price=price_float,
+                            quantity=0,
+                            executed=False,
+                            message="Duplicate buy blocked: order already pending",
+                            data=df,
                         )
-
-                    qty = sizing_result["position_size"]
-
-                    # Log Kelly metrics
-                    if "kelly_metrics" in sizing_result:
-                        km = sizing_result["kelly_metrics"]
+                    # Re-check position inside lock to prevent TOCTOU race
+                    if symbol in self.positions:
                         logger.info(
-                            f"Kelly metrics for {symbol}: Win rate={km['win_rate']:.2%}, Edge={km['edge']:.3f}, Kelly fraction={sizing_result['kelly_fraction']:.3f}"
+                            f"Position already exists for {symbol} (race condition prevented)"
+                        )
+                        return SymbolResult(
+                            symbol=symbol,
+                            signal=signal_value,
+                            price=price_float,
+                            quantity=0,
+                            executed=False,
+                            message="Buy signal: Already have long position",
+                            data=df,
+                        )
+                    # Mark as pending BEFORE releasing lock
+                    self._pending_orders.add(symbol)
+                    logger.debug(f"Added {symbol} to pending orders")
+
+                try:
+                    # Open long position
+                    # Use advanced risk manager with Kelly sizing if enabled
+                    if self.use_advanced_risk and self.advanced_risk:
+                        # Get ATR for stop loss calculation (if available)
+                        atr = df["atr"].iloc[-1] if "atr" in df.columns else None
+
+                        # Calculate position size using Kelly criterion
+                        sizing_result = await self.advanced_risk.calculate_position_size(
+                            symbol=symbol,
+                            signal_strength=abs(signal_value),  # Use signal strength from strategy
+                            current_price=price_float,  # Use float, not Decimal
+                            atr=atr,
                         )
 
-                    # Log any warnings
-                    for warning in sizing_result.get("warnings", []):
-                        logger.warning(f"Risk warning for {symbol}: {warning}")
-                else:
-                    # Fallback to standard position sizing
-                    qty = self.risk.position_size(equity, price)
-
-                # Scale by portfolio manager strategy weight if available
-                if self.portfolio_manager and self.active_strategy_name:
-                    alloc = self.portfolio_manager.allocations.get(self.active_strategy_name)
-                    if alloc:
-                        qty = max(int(qty * alloc.current_weight), 0)
-
-                # Apply correlation-based position sizing if enabled
-                if self.use_correlation_sizing and self.correlation_manager:
-                    (
-                        adjusted_qty,
-                        sizing_reason,
-                    ) = await self.correlation_manager.get_adjusted_position_size(
-                        symbol=symbol,
-                        base_size=qty,
-                        current_positions=self.positions,
-                        portfolio_value=equity,
-                    )
-                    if adjusted_qty != qty:
-                        logger.info(
-                            f"Position size adjusted for {symbol}: {qty} -> {adjusted_qty} ({sizing_reason})"
-                        )
-                        qty = adjusted_qty
-
-                # Enforce minimum position value to prevent position sprawl
-                min_position_value = float(os.getenv("MIN_POSITION_VALUE", "500"))
-                position_value = qty * price_float
-                if position_value < min_position_value and qty > 0:
-                    logger.info(
-                        f"Skipping {symbol}: position value ${position_value:.0f} below minimum ${min_position_value:.0f}"
-                    )
-                    return SymbolResult(
-                        symbol=symbol,
-                        signal=signal_value,
-                        price=price_float,
-                        action="SKIP",
-                        message=f"Position value ${position_value:.0f} below min ${min_position_value:.0f}",
-                    )
-
-                ok, msg = self.risk.validate_order(
-                    symbol,
-                    qty,
-                    price,
-                    equity,
-                    self.daily_pnl,
-                    self.positions,
-                    self.daily_executed_notional,
-                )
-
-                if ok and qty > 0:
-                    # Check kill switch before order execution
-                    if self.advanced_risk and hasattr(self.advanced_risk, "kill_switch"):
-                        if self.advanced_risk.kill_switch.triggered:
-                            logger.error(f"KILL SWITCH ACTIVE - Order blocked for {symbol} BUY")
-                            message = f"Kill switch active - trading halted"
+                        if sizing_result["blocked"]:
+                            logger.warning(
+                                f"Trade blocked by kill switch for {symbol}: {sizing_result['block_reason']}"
+                            )
+                            executed = False
+                            message = f"Blocked: {sizing_result['block_reason']}"
                             return SymbolResult(
-                                symbol=symbol,
-                                signal=0,  # No signal computed when kill switch active
-                                price=price_float,
-                                quantity=0,
-                                executed=False,
-                                message=message,
-                                data=df,
+                                symbol, signal_value, price_float, 0, executed, message, df
                             )
 
-                    res = await self._place_order_with_circuit_breaker(
-                        Order(symbol=symbol, quantity=qty, side="BUY", price=price)
-                    )
-                    if res.ok:
-                        fill_price = res.fill_price if res.fill_price is not None else price_float
-                        # Use atomic position update to prevent race conditions
-                        success = await self._update_position_atomic(symbol, qty, fill_price, "BUY")
-                        if success:
-                            self.daily_executed_notional += price_float * qty
+                        qty = sizing_result["position_size"]
 
-                            # Record trade in database
-                            await self.db.record_trade(
-                                symbol,
-                                "BUY",
-                                qty,
-                                fill_price,
-                                slippage=(
-                                    (fill_price - price_float) * qty
-                                    if res.fill_price is not None
-                                    else 0
-                                ),
-                            )
-                            # Use accumulated position qty/avg from self.positions, not just this order's qty
-                            pos = self.positions[symbol]
-                            await self.db.update_position(
-                                symbol, pos.quantity, pos.avg_price, price
+                        # Log Kelly metrics
+                        if "kelly_metrics" in sizing_result:
+                            km = sizing_result["kelly_metrics"]
+                            logger.info(
+                                f"Kelly metrics for {symbol}: Win rate={km['win_rate']:.2%}, Edge={km['edge']:.3f}, Kelly fraction={sizing_result['kelly_fraction']:.3f}"
                             )
 
-                            self.monitor.record_order_placed(symbol, qty)
-                            self.monitor.record_trade_executed(symbol, "BUY", qty)
-
-                            # Record metrics to ProductionMonitor (Phase 4 P2)
-                            if self.production_monitor:
-                                latency_ms = 10  # Simulated latency for paper trading
-                                self.production_monitor.record_order(symbol, True, latency_ms)
-                                # No PnL yet for opening position
-                                self.production_monitor.record_trade(symbol, 0, True)
-
-                            executed = True
-                            quantity = qty
-                            message = f"Opened long: Bought {qty} shares at ${fill_price:.2f}"
-
-                            # Add stop-loss order for the new position
-                            if self.stop_loss_monitor and self.enable_stop_loss:
-                                try:
-                                    # Create position object for stop-loss
-                                    new_position = Position(
-                                        symbol=symbol,
-                                        quantity=qty,
-                                        avg_price=fill_price,
-                                        entry_time=datetime.now(),
-                                    )
-                                    await self.stop_loss_monitor.add_stop_loss(
-                                        symbol=symbol,
-                                        position=new_position,
-                                        stop_percent=self.stop_loss_percent,
-                                        stop_type=StopType.FIXED,
-                                    )
-                                    logger.info(
-                                        f"Stop-loss order added for {symbol} at {self.stop_loss_percent:.1%}"
-                                    )
-                                except Exception as e:
-                                    logger.error(f"Failed to add stop-loss for {symbol}: {e}")
-
-                            # Send trade update via WebSocket
-                            if WEBSOCKET_ENABLED and ws_client:
-                                try:
-                                    ws_client.send_trade_update(symbol, "BUY", qty, fill_price)
-                                except Exception as e:
-                                    logger.debug(f"Could not send trade WebSocket update: {e}")
-                        else:
-                            logger.error(f"Failed to update position for {symbol} BUY order")
-                            message = f"Buy order failed: atomic update error"
+                        # Log any warnings
+                        for warning in sizing_result.get("warnings", []):
+                            logger.warning(f"Risk warning for {symbol}: {warning}")
                     else:
-                        message = f"Buy order failed: {res.msg}"
-                else:
-                    message = f"Buy signal rejected: {msg}"
+                        # Fallback to standard position sizing
+                        qty = self.risk.position_size(equity, price)
+
+                    # Scale by portfolio manager strategy weight if available
+                    if self.portfolio_manager and self.active_strategy_name:
+                        alloc = self.portfolio_manager.allocations.get(self.active_strategy_name)
+                        if alloc:
+                            qty = max(int(qty * alloc.current_weight), 0)
+
+                    # Apply correlation-based position sizing if enabled
+                    if self.use_correlation_sizing and self.correlation_manager:
+                        (
+                            adjusted_qty,
+                            sizing_reason,
+                        ) = await self.correlation_manager.get_adjusted_position_size(
+                            symbol=symbol,
+                            base_size=qty,
+                            current_positions=self.positions,
+                            portfolio_value=equity,
+                        )
+                        if adjusted_qty != qty:
+                            logger.info(
+                                f"Position size adjusted for {symbol}: {qty} -> {adjusted_qty} ({sizing_reason})"
+                            )
+                            qty = adjusted_qty
+
+                    # Enforce minimum position value to prevent position sprawl
+                    min_position_value = float(os.getenv("MIN_POSITION_VALUE", "500"))
+                    position_value = qty * price_float
+                    if position_value < min_position_value and qty > 0:
+                        logger.info(
+                            f"Skipping {symbol}: position value ${position_value:.0f} below minimum ${min_position_value:.0f}"
+                        )
+                        return SymbolResult(
+                            symbol=symbol,
+                            signal=signal_value,
+                            price=price_float,
+                            quantity=0,
+                            executed=False,
+                            message=f"Position value ${position_value:.0f} below min ${min_position_value:.0f}",
+                        )
+
+                    ok, msg = self.risk.validate_order(
+                        symbol,
+                        qty,
+                        price,
+                        equity,
+                        self.daily_pnl,
+                        self.positions,
+                        self.daily_executed_notional,
+                    )
+
+                    if ok and qty > 0:
+                        # Check kill switch before order execution
+                        if self.advanced_risk and hasattr(self.advanced_risk, "kill_switch"):
+                            if self.advanced_risk.kill_switch.triggered:
+                                logger.error(f"KILL SWITCH ACTIVE - Order blocked for {symbol} BUY")
+                                message = f"Kill switch active - trading halted"
+                                return SymbolResult(
+                                    symbol=symbol,
+                                    signal=0,  # No signal computed when kill switch active
+                                    price=price_float,
+                                    quantity=0,
+                                    executed=False,
+                                    message=message,
+                                    data=df,
+                                )
+
+                        res = await self._place_order_with_circuit_breaker(
+                            Order(symbol=symbol, quantity=qty, side="BUY", price=price)
+                        )
+                        if res.ok:
+                            fill_price = (
+                                res.fill_price if res.fill_price is not None else price_float
+                            )
+                            # Use atomic position update to prevent race conditions
+                            success = await self._update_position_atomic(
+                                symbol, qty, fill_price, "BUY"
+                            )
+                            if success:
+                                self.daily_executed_notional += price_float * qty
+
+                                # Record trade in database
+                                await self.db.record_trade(
+                                    symbol,
+                                    "BUY",
+                                    qty,
+                                    fill_price,
+                                    slippage=(
+                                        (fill_price - price_float) * qty
+                                        if res.fill_price is not None
+                                        else 0
+                                    ),
+                                )
+                                # Use accumulated position qty/avg from self.positions, not just this order's qty
+                                pos = self.positions[symbol]
+                                await self.db.update_position(
+                                    symbol, pos.quantity, pos.avg_price, price
+                                )
+
+                                self.monitor.record_order_placed(symbol, qty)
+                                self.monitor.record_trade_executed(symbol, "BUY", qty)
+
+                                # Record metrics to ProductionMonitor (Phase 4 P2)
+                                if self.production_monitor:
+                                    latency_ms = 10  # Simulated latency for paper trading
+                                    self.production_monitor.record_order(symbol, True, latency_ms)
+                                    # No PnL yet for opening position
+                                    self.production_monitor.record_trade(symbol, 0, True)
+
+                                executed = True
+                                quantity = qty
+                                message = f"Opened long: Bought {qty} shares at ${fill_price:.2f}"
+
+                                # Add stop-loss order for the new position
+                                if self.stop_loss_monitor and self.enable_stop_loss:
+                                    try:
+                                        # Create position object for stop-loss
+                                        new_position = Position(
+                                            symbol=symbol,
+                                            quantity=qty,
+                                            avg_price=fill_price,
+                                            entry_time=datetime.now(),
+                                        )
+                                        await self.stop_loss_monitor.add_stop_loss(
+                                            symbol=symbol,
+                                            position=new_position,
+                                            stop_percent=self.stop_loss_percent,
+                                            stop_type=StopType.FIXED,
+                                        )
+                                        logger.info(
+                                            f"Stop-loss order added for {symbol} at {self.stop_loss_percent:.1%}"
+                                        )
+                                    except Exception as e:
+                                        logger.error(f"Failed to add stop-loss for {symbol}: {e}")
+
+                                # Send trade update via WebSocket
+                                if WEBSOCKET_ENABLED and ws_client:
+                                    try:
+                                        ws_client.send_trade_update(symbol, "BUY", qty, fill_price)
+                                    except Exception as e:
+                                        logger.debug(f"Could not send trade WebSocket update: {e}")
+                            else:
+                                logger.error(f"Failed to update position for {symbol} BUY order")
+                                message = f"Buy order failed: atomic update error"
+                        else:
+                            message = f"Buy order failed: {res.msg}"
+                    else:
+                        message = f"Buy signal rejected: {msg}"
+                finally:
+                    # CRITICAL: Always remove from pending orders when done
+                    async with self._pending_orders_lock:
+                        self._pending_orders.discard(symbol)
+                        logger.debug(f"Removed {symbol} from pending orders")
             else:
                 message = "Buy signal: Already have long position"
 
@@ -2205,7 +2263,8 @@ class AsyncRunner:
         # Convert Decimal to float for APIs that expect float
         equity_float = float(equity)
         unrealized_float = float(unrealized)
-        cash_float = float(self.portfolio.cash)
+        # Clamp cash to 0 minimum (paper trading can have margin/negative cash)
+        cash_float = max(0.0, float(self.portfolio.cash))
         realized_pnl_float = float(self.portfolio.realized_pnl)
 
         # Update portfolio manager capital and consider rebalancing
@@ -2263,14 +2322,18 @@ class AsyncRunner:
         # Check kill switch conditions after updating account
         if self.advanced_risk and hasattr(self.advanced_risk, "kill_switch"):
             kill_switch = self.advanced_risk.kill_switch
-            # Check daily loss limit (starting equity is initial capital/default_cash)
-            starting_equity = float(self.cfg.default_cash)
+            # Use session start equity (captured after loading positions)
+            starting_equity = self.session_start_equity or float(self.cfg.default_cash)
             if kill_switch.check_daily_loss(equity_float, starting_equity):
-                logger.critical(
-                    f"KILL SWITCH TRIGGERED: Daily loss exceeded. "
-                    f"Current: ${equity_float:,.2f}, Started: ${starting_equity:,.2f}, "
-                    f"Loss: {((starting_equity - equity_float) / starting_equity) * 100:.1f}%"
+                loss_pct = ((starting_equity - equity_float) / starting_equity) * 100
+                reason = (
+                    f"Daily loss {loss_pct:.1f}% exceeded limit. "
+                    f"Current: ${equity_float:,.2f}, Started: ${starting_equity:,.2f}"
                 )
+                logger.critical(f"KILL SWITCH TRIGGERED: {reason}")
+                # Trigger the kill switch and halt trading
+                kill_switch.trigger(reason)
+                raise KillSwitchTriggeredError(reason)
 
     async def run(self, symbols: Optional[List[str]] = None):
         """Main run method - process all symbols and update account."""
@@ -2853,6 +2916,11 @@ async def run_continuous(
 
             except asyncio.CancelledError:
                 logger.info("Trading loop cancelled")
+                break
+            except KillSwitchTriggeredError as e:
+                # Kill switch triggered - graceful shutdown
+                logger.critical(f"KILL SWITCH: Shutting down trading system - {e}")
+                shutdown_flag = True
                 break
             except Exception as e:
                 logger.error(f"Error in trading cycle: {e}")

@@ -1546,7 +1546,7 @@ HTML_TEMPLATE = """
                 if (pnlResp.ok) {
                     const pnlData = await pnlResp.json();
                     equity = pnlData.equity || STARTING_CAPITAL;
-                    realizedPnl = pnlData.realized_pnl || 0;
+                    realizedPnl = pnlData.realized || pnlData.realized_pnl || 0;
                     cash = pnlData.cash || 0;
                 }
 
@@ -3696,12 +3696,20 @@ def market_status():
         "status_text": session.replace("-", " ").title(),
     }
 
-    if not is_open:
+    if is_open:
+        # Market is open - show when it closes (4:00 PM ET)
+        from zoneinfo import ZoneInfo
+
+        et = ZoneInfo("America/New_York")
+        now_et = datetime.now(et)
+        close_time = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+        result["next_close"] = close_time.strftime("%I:%M %p")
+    else:
         next_open = get_next_market_open()
         seconds_until = seconds_until_market_open()
         result.update(
             {
-                "next_open": next_open.isoformat(),
+                "next_open": next_open.strftime("%a %I:%M %p"),
                 "seconds_until_open": seconds_until,
                 "time_until_open": f"{seconds_until // 3600}h {(seconds_until % 3600) // 60}m",
             }
@@ -3908,6 +3916,43 @@ def status():
     # is_trading = True ONLY when runner is running AND market is open AND gateway available
     is_actually_trading = runner_running and market_open and (gateway_available or tws_available)
 
+    # Get real P&L and positions count from database (using cached sync reader)
+    pnl_data = None
+    positions_count = 0
+    try:
+        from sync_db_reader import SyncDatabaseReader
+
+        db = SyncDatabaseReader()
+        positions = db.get_positions()
+        positions_count = len([p for p in positions if p.get("quantity", 0) != 0])
+
+        # Calculate P&L from positions
+        if positions:
+            total_cost = sum(
+                p["quantity"] * p["avg_cost"] for p in positions if p.get("quantity", 0) > 0
+            )
+            total_value = sum(
+                p["quantity"] * (p.get("market_price") or p["avg_cost"])
+                for p in positions
+                if p.get("quantity", 0) > 0
+            )
+            unrealized_pnl = total_value - total_cost
+
+            # Get account info for realized P&L
+            account = db.get_account_info()
+            realized_pnl = account.get("realized_pnl", 0) or 0
+            daily_pnl = account.get("daily_pnl", 0) or 0
+
+            pnl_data = {
+                "daily": round(daily_pnl, 2),
+                "total": round(realized_pnl + unrealized_pnl, 2),
+                "unrealized": round(unrealized_pnl, 2),
+                "realized": round(realized_pnl, 2),
+                "equity": round(total_value, 2),
+            }
+    except Exception as e:
+        logger.debug(f"Could not load P&L for status: {e}")
+
     return jsonify(
         {
             "trading_status": {
@@ -3926,10 +3971,10 @@ def status():
                 "gateway_running": gateway_running,  # Gateway status (backwards compat)
                 "symbols_count": symbols_count,  # Number of symbols being traded
             },
-            "pnl": None,  # No fake data - will be populated when runner connects
-            "metrics": None,  # No fake data - will be populated when runner connects
-            "positions_count": 0,  # No fake data - will be populated when runner connects
-            "ml_status": None,  # No fake data - will be populated when runner connects
+            "pnl": pnl_data,
+            "metrics": None,  # Will be populated from runner metrics
+            "positions_count": positions_count,
+            "ml_status": None,  # Will be populated from ML status
         }
     )
 
@@ -4113,57 +4158,31 @@ def get_pnl():
                 if avg_cost > 0:
                     unrealized_pnl += (market_price - avg_cost) * qty
 
-        # Get trades for realized P&L using proper position tracking
-        trades = db.get_recent_trades(limit=1000)
+        # Get trades for realized P&L - USE STORED PNL VALUES from database
+        # The database already tracks accurate P&L per trade
+        # Use limit=5000 to ensure we get ALL trades for accurate total P&L
+        trades = db.get_recent_trades(limit=5000)
         today = datetime.now().date()
 
-        # Track positions to calculate actual realized P&L (FIFO cost basis)
-        position_tracker: Dict[str, Dict] = {}
         realized_pnl = Decimal("0")
         daily_pnl = Decimal("0")
 
-        # Sort trades chronologically for correct cost basis tracking
-        sorted_trades = sorted(trades, key=lambda x: x.get("timestamp", ""))
+        for trade in trades:
+            # Use the stored pnl value from the database (already calculated correctly)
+            stored_pnl = trade.get("pnl")
+            if stored_pnl is not None:
+                profit = Decimal(str(stored_pnl))
+                realized_pnl += profit
 
-        for trade in sorted_trades:
-            symbol = trade.get("symbol", "")
-            side = trade.get("side", "")
-            qty = Decimal(str(trade.get("quantity", 0)))
-            price = Decimal(str(trade.get("price", 0)))
-            trade_time = trade.get("timestamp", "")
-
-            if not symbol:
-                continue
-
-            # Initialize position tracker for this symbol
-            if symbol not in position_tracker:
-                position_tracker[symbol] = {"quantity": Decimal("0"), "avg_cost": Decimal("0")}
-
-            pos = position_tracker[symbol]
-
-            if side == "BUY":
-                # Update average cost using weighted average
-                total_cost = pos["avg_cost"] * pos["quantity"] + price * qty
-                pos["quantity"] += qty
-                if pos["quantity"] > 0:
-                    pos["avg_cost"] = total_cost / pos["quantity"]
-
-            elif side == "SELL":
-                # Calculate realized profit on this sale
-                if pos["quantity"] > 0 and pos["avg_cost"] > 0:
-                    sell_qty = min(qty, pos["quantity"])
-                    profit = (price - pos["avg_cost"]) * sell_qty
-                    realized_pnl += profit
-                    pos["quantity"] -= sell_qty
-
-                    # Track daily P&L
-                    if trade_time:
-                        try:
-                            trade_date = datetime.fromisoformat(trade_time.replace(" ", "T")).date()
-                            if trade_date == today:
-                                daily_pnl += profit
-                        except ValueError:
-                            pass  # Skip if timestamp parsing fails
+                # Track daily P&L
+                trade_time = trade.get("timestamp", "")
+                if trade_time:
+                    try:
+                        trade_date = datetime.fromisoformat(trade_time.replace(" ", "T")).date()
+                        if trade_date == today:
+                            daily_pnl += profit
+                    except ValueError:
+                        pass  # Skip if timestamp parsing fails
 
         # Total P&L is unrealized + realized
         total_pnl = unrealized_pnl + realized_pnl
@@ -4446,45 +4465,42 @@ def get_pnl_OLD():
 @app.route("/api/positions")
 @requires_auth
 def get_positions():
-    """Get current positions from real database"""
+    """Get current positions from real database - optimized to avoid DB lock"""
+    # Return cached positions if available and recent (within 2 seconds)
+    current_time = time.time()
+    if hasattr(app, "_positions_cache") and hasattr(app, "_positions_cache_time"):
+        if current_time - app._positions_cache_time < 2:  # 2 second cache
+            return jsonify({"positions": app._positions_cache})
+
     try:
         from sync_db_reader import SyncDatabaseReader
 
         db = SyncDatabaseReader()
         real_positions = db.get_positions()
 
-        # Get latest market data for each position
+        # Batch fetch: Get all signals once (not per-position!)
+        try:
+            all_signals = db.get_signals(hours=1)
+            # Build lookup dict by symbol
+            signal_by_symbol = {}
+            for s in all_signals:
+                sym = s["symbol"]
+                if sym not in signal_by_symbol:
+                    signal_by_symbol[sym] = s["signal_type"]
+        except Exception as e:
+            logger.debug(f"Could not load signals: {e}")
+            signal_by_symbol = {}
+
+        # Enrich positions using market_price from positions table (already fetched)
         enriched_positions = []
-
-        # Sample price variations for P&L display (simulate market movement)
-        import random
-
-        random.seed(42)  # Consistent random for same symbols
-
         for pos in real_positions:
-            # Get latest price from market data
-            try:
-                market_data = db.get_latest_market_data(pos["symbol"], limit=1)
+            # Use market_price from positions table (updated by runner)
+            # Explicit None check to handle 0 as valid price (e.g. halted stocks)
+            market_price = pos.get("market_price")
+            current_price = market_price if market_price is not None else pos.get("avg_cost", 100)
 
-                if market_data:
-                    current_price = market_data[0]["close"]
-                else:
-                    # Simulate price movement: +/- 5% from avg_cost
-                    avg_cost = pos.get("avg_cost", 100)
-                    random.seed(hash(pos["symbol"]) % 1000)  # Consistent per symbol
-                    variation = random.uniform(-0.05, 0.05)
-                    current_price = avg_cost * (1 + variation)
-            except Exception:
-                # Fallback to avg_cost if market data fails
-                current_price = pos.get("avg_cost", 100)
-
-            # Get latest signal
-            try:
-                signals = db.get_signals(hours=1)
-                pos_signals = [s for s in signals if s["symbol"] == pos["symbol"]]
-                ml_signal = pos_signals[0]["signal_type"] if pos_signals else "hold"
-            except Exception:
-                ml_signal = "hold"
+            # Look up signal from pre-fetched dict
+            ml_signal = signal_by_symbol.get(pos["symbol"], "hold")
 
             # Calculate P&L
             entry_price = pos.get("avg_cost", current_price)
@@ -4510,6 +4526,10 @@ def get_positions():
                     "ml_signal": ml_signal,
                 }
             )
+
+        # Cache the result
+        app._positions_cache = enriched_positions
+        app._positions_cache_time = time.time()
 
         return jsonify({"positions": enriched_positions})
     except Exception as e:
@@ -4852,7 +4872,7 @@ def performance():
         db = SyncDatabaseReader()
 
         # Get all trades and positions for calculations
-        all_trades = db.get_recent_trades(limit=1000)
+        all_trades = db.get_recent_trades(limit=5000)
         positions = db.get_positions()
 
         if not all_trades and not positions:
@@ -4971,7 +4991,11 @@ def performance():
         monthly_pnl = calc_period_pnl(monthly_trades)
 
         # Build equity curve for volatility/sharpe/drawdown calculations
+        # Also track individual trade PnLs for statistics
         equity_curve = []
+        trade_pnls = []  # List of all individual trade PnLs
+        wins = []  # Winning trade PnLs
+        losses = []  # Losing trade PnLs
         cumulative = 0
         costs = {}
         for trade in sorted(all_trades, key=lambda x: x["timestamp"]):
@@ -4989,8 +5013,22 @@ def performance():
                 trade_pnl = (price - avg) * sell_qty
                 cumulative += trade_pnl
                 equity_curve.append(cumulative)
+                trade_pnls.append(trade_pnl)
+                if trade_pnl > 0:
+                    wins.append(trade_pnl)
+                else:
+                    losses.append(trade_pnl)
                 costs[symbol]["qty"] -= sell_qty
                 costs[symbol]["cost"] -= avg * sell_qty
+
+        # Calculate trade statistics
+        avg_win = sum(wins) / len(wins) if wins else 0
+        avg_loss = sum(losses) / len(losses) if losses else 0
+        best_trade = max(trade_pnls) if trade_pnls else 0
+        worst_trade = min(trade_pnls) if trade_pnls else 0
+        total_wins = sum(wins)
+        total_losses = abs(sum(losses))
+        profit_factor = total_wins / total_losses if total_losses > 0 else 0
 
         # Calculate metrics from equity curve
         if len(equity_curve) > 1:
@@ -5000,10 +5038,12 @@ def performance():
             volatility = std_return
             sharpe = (avg_return * np.sqrt(252)) / std_return if std_return > 0 else 0
 
-            # Max drawdown
-            peak = equity_curve[0]
+            # Max drawdown - calculate based on equity curve with starting capital
+            starting_capital = estimated_capital
+            equity_values = [starting_capital + ec for ec in equity_curve]
+            peak = equity_values[0]
             max_dd = 0
-            for val in equity_curve:
+            for val in equity_values:
                 if val > peak:
                     peak = val
                 dd = (val - peak) / peak if peak > 0 else 0
@@ -5020,10 +5060,16 @@ def performance():
                     "total_pnl": round(total_pnl, 2),
                     "total_sharpe": round(sharpe, 2),
                     "total_drawdown": round(max_dd, 4),
+                    "max_drawdown": round(abs(max_dd), 4),
                     "win_rate": round(win_rate, 3),
                     "total_trades": len(all_trades),
                     "winning_trades": winning_count,
                     "losing_trades": losing_count,
+                    "avg_win": round(avg_win, 2),
+                    "avg_loss": round(avg_loss, 2),
+                    "best_trade": round(best_trade, 2),
+                    "worst_trade": round(worst_trade, 2),
+                    "profit_factor": round(profit_factor, 2),
                 },
                 "daily": {
                     "return_pct": round(daily_pnl / estimated_capital, 4)
@@ -5150,7 +5196,8 @@ def equity_curve():
         if len(pnl_labels) > len(portfolio_labels):
             labels = pnl_labels
             # Calculate portfolio values from P&L when equity_history is sparse
-            starting_capital = 100000
+            # config is a Pydantic model, not a dict - use attribute access
+            starting_capital = float(os.getenv("DEFAULT_CASH", config.default_cash))
             portfolio_values = [starting_capital + pnl for pnl in pnl_values]
         else:
             labels = portfolio_labels if portfolio_labels else pnl_labels
@@ -5381,6 +5428,12 @@ def get_trades_OLD():
 @requires_auth
 def strategies_status():
     """Get real status of all active strategies"""
+    # Return cached status if available and recent (within 3 seconds)
+    current_time = time.time()
+    if hasattr(app, "_strategies_cache") and hasattr(app, "_strategies_cache_time"):
+        if current_time - app._strategies_cache_time < 3:  # 3 second cache
+            return jsonify(app._strategies_cache)
+
     try:
         import json
         from pathlib import Path
@@ -5438,60 +5491,65 @@ def strategies_status():
         avg_slippage = sum(slippages) / len(slippages) if slippages else 0
         avg_slippage_bps = avg_slippage * 10000  # Convert to basis points
 
-        return jsonify(
-            {
-                "active_strategies": {
-                    "ml_enhanced": {
-                        "enabled": True,
-                        "regime": ml_regime,
-                        "confidence": round(ml_confidence, 3),
-                        "positions": len(active_positions),
-                        "symbols_tracked": len(active_positions),  # Actual tracked symbols
-                    },
-                    "microstructure": {
-                        "enabled": False,  # S4 complete but not actively running
-                        "ofi": 0.0,
-                        "spread_bps": 0.0,
-                        "tick_momentum": 0.0,
-                        "ensemble_score": 0.0,
-                    },
-                    "portfolio_manager": {
-                        "enabled": True,
-                        "allocation_method": "Equal Weight",  # Current implementation
-                        "positions_count": len(active_positions),
-                        "strategies_count": 4,  # ML Enhanced, Mean Reversion, Momentum, Pairs
-                        "max_positions": int(os.getenv("RISK_MAX_OPEN_POSITIONS", 30)),
-                        "rebalance_due": False,
-                    },
-                    "smart_execution": {
-                        "enabled": True,
-                        "algorithm": "Market Orders",  # Current implementation
-                        "orders_pending": 0,  # Not tracking pending orders yet
-                        "avg_slippage_bps": round(avg_slippage_bps, 2),
-                        "total_trades": len(trades),
-                    },
+        # Build data dict (cache this, not the Response object)
+        strategies_data = {
+            "active_strategies": {
+                "ml_enhanced": {
+                    "enabled": True,
+                    "regime": ml_regime,
+                    "confidence": round(ml_confidence, 3),
+                    "positions": len(active_positions),
+                    "symbols_tracked": len(active_positions),  # Actual tracked symbols
                 },
-                "performance_by_strategy": {
-                    "ml_enhanced": {
-                        "pnl": round(total_pnl, 2),
-                        "win_rate": round(winning_positions / watchlist_position_count, 3)
-                        if watchlist_position_count > 0
-                        else 0,
-                        "total_trades": len(trades),
-                        "winning_positions": winning_positions,
-                    },
-                    "microstructure": {"pnl": 0.0, "win_rate": 0.0},  # Not active
-                    "smart_execution": {
-                        "saved_bps": round(
-                            max(0, 5 - avg_slippage_bps), 2
-                        ),  # Estimate vs 5bps baseline
-                        "fills": len(trades),
-                        "avg_slippage_bps": round(avg_slippage_bps, 2),
-                    },
+                "microstructure": {
+                    "enabled": False,  # S4 complete but not actively running
+                    "ofi": 0.0,
+                    "spread_bps": 0.0,
+                    "tick_momentum": 0.0,
+                    "ensemble_score": 0.0,
                 },
-                "last_updated": datetime.now().isoformat(),
-            }
-        )
+                "portfolio_manager": {
+                    "enabled": True,
+                    "allocation_method": "Equal Weight",  # Current implementation
+                    "positions_count": len(active_positions),
+                    "strategies_count": 4,  # ML Enhanced, Mean Reversion, Momentum, Pairs
+                    "max_positions": int(os.getenv("RISK_MAX_OPEN_POSITIONS", 30)),
+                    "rebalance_due": False,
+                },
+                "smart_execution": {
+                    "enabled": True,
+                    "algorithm": "Market Orders",  # Current implementation
+                    "orders_pending": 0,  # Not tracking pending orders yet
+                    "avg_slippage_bps": round(avg_slippage_bps, 2),
+                    "total_trades": len(trades),
+                },
+            },
+            "performance_by_strategy": {
+                "ml_enhanced": {
+                    "pnl": round(total_pnl, 2),
+                    "win_rate": round(winning_positions / watchlist_position_count, 3)
+                    if watchlist_position_count > 0
+                    else 0,
+                    "total_trades": len(trades),
+                    "winning_positions": winning_positions,
+                },
+                "microstructure": {"pnl": 0.0, "win_rate": 0.0},  # Not active
+                "smart_execution": {
+                    "saved_bps": round(
+                        max(0, 5 - avg_slippage_bps), 2
+                    ),  # Estimate vs 5bps baseline
+                    "fills": len(trades),
+                    "avg_slippage_bps": round(avg_slippage_bps, 2),
+                },
+            },
+            "last_updated": datetime.now().isoformat(),
+        }
+
+        # Cache the data dict, not the Response object
+        app._strategies_cache = strategies_data
+        app._strategies_cache_time = time.time()
+
+        return jsonify(strategies_data)
     except Exception as e:
         logger.error(f"Error getting strategy status: {e}")
         # Return minimal real data on error
@@ -5746,7 +5804,7 @@ def get_risk_status():
         peak_pnl = 0
         max_drawdown = 0
         for trade in trades:
-            cumulative_pnl += (trade.get("pnl") or 0)
+            cumulative_pnl += trade.get("pnl") or 0
             peak_pnl = max(peak_pnl, cumulative_pnl)
             drawdown = (
                 (peak_pnl - cumulative_pnl) / risk_state.get("current_capital", 100000)
@@ -6074,7 +6132,7 @@ def get_safety_thresholds():
 @requires_auth
 def start_trading():
     """Start trading with proper Gateway checks and zombie cleanup."""
-    global trading_status, trading_process
+    global trading_status
 
     # Load symbols from user settings
     global default_symbols
@@ -6109,19 +6167,26 @@ def start_trading():
             trading_log.append(
                 f"{datetime.now().strftime('%H:%M:%S')} - Trading started for {symbols_str}"
             )
-            return jsonify({
-                "status": "started",
-                "symbols": symbols_str.split(","),
-                "output": result.stdout,
-            })
+            return jsonify(
+                {
+                    "status": "started",
+                    "symbols": symbols_str.split(","),
+                    "output": result.stdout,
+                }
+            )
         else:
             trading_log.append(
                 f"{datetime.now().strftime('%H:%M:%S')} - Failed to start: {result.stderr}"
             )
-            return jsonify({
-                "status": "error",
-                "error": result.stderr or result.stdout,
-            }), 500
+            return (
+                jsonify(
+                    {
+                        "status": "error",
+                        "error": result.stderr or result.stdout,
+                    }
+                ),
+                500,
+            )
 
     except subprocess.TimeoutExpired:
         return jsonify({"status": "error", "error": "Startup timed out"}), 500

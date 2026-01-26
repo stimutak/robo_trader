@@ -249,7 +249,7 @@ class _ConnectFileLock:
     ) -> None:
         # Allow configuration via environment variable
         self.lock_path = lock_path or os.environ.get(
-            "IBKR_LOCK_FILE_PATH", "/tmp/ibkr_connect.lock"
+            "IBKR_LOCK_FILE_PATH", "/tmp/ibkr_connect.lock"  # nosec B108 - configurable via env
         )
         # Timeout in seconds (default 30s, configurable via env)
         self.timeout = float(timeout or os.environ.get("IBKR_LOCK_TIMEOUT", "30"))
@@ -678,7 +678,7 @@ class RobustConnectionManager:
                             raise ConnectionError(
                                 "Gateway-owned zombie connections detected. "
                                 "Automatic restart failed. Please restart Gateway manually: "
-                                "python3 scripts/gateway_manager.py restart"
+                                "./START_TRADER.sh"
                             )
                         logger.info("✅ Gateway restarted - zombies cleared")
                     else:

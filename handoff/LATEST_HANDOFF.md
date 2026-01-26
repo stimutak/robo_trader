@@ -1,1 +1,1 @@
-HANDOFF_2026-01-23_websocket_log_streaming.md
+HANDOFF_2026-01-26_pnl_tracking_fixes.md

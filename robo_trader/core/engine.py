@@ -111,7 +111,7 @@ class TradingEngine:
 
         # Market hours (EST/EDT)
         self.market_open = time(9, 30)  # 9:30 AM
-        self.market_close = time(16, 30)  # 4:30 PM
+        self.market_close = time(16, 0)  # 4:00 PM
         self.premarket_open = time(4, 0)  # 4:00 AM
         self.aftermarket_close = time(20, 0)  # 8:00 PM
 
