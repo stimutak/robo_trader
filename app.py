@@ -61,6 +61,9 @@ else:
 CORS(app, origins=allowed_origins, supports_credentials=True)
 server = app  # For Gunicorn compatibility
 
+# Thread-safe cache for positions endpoint
+_positions_cache_lock = threading.Lock()
+
 # Configuration
 config = load_config()
 AUTH_ENABLED = os.getenv("DASH_AUTH_ENABLED", "false").lower() == "true"
@@ -4192,6 +4195,13 @@ def get_pnl():
                             daily_pnl += profit
                     except ValueError:
                         pass  # Skip if timestamp parsing fails
+            elif trade.get("side", "").upper() == "SELL":
+                # Log warning for SELL trades with missing P&L - these should have pnl calculated
+                logger.warning(
+                    f"SELL trade missing pnl value: {trade.get('symbol')} "
+                    f"qty={trade.get('quantity')} price={trade.get('price')} "
+                    f"timestamp={trade.get('timestamp')}"
+                )
 
         # Total P&L is unrealized + realized
         total_pnl = unrealized_pnl + realized_pnl
@@ -4476,10 +4486,12 @@ def get_pnl_OLD():
 def get_positions():
     """Get current positions from real database - optimized to avoid DB lock"""
     # Return cached positions if available and recent (within 2 seconds)
+    # Use lock for thread-safe cache access
     current_time = time.time()
-    if hasattr(app, "_positions_cache") and hasattr(app, "_positions_cache_time"):
-        if current_time - app._positions_cache_time < 2:  # 2 second cache
-            return jsonify({"positions": app._positions_cache})
+    with _positions_cache_lock:
+        if hasattr(app, "_positions_cache") and hasattr(app, "_positions_cache_time"):
+            if current_time - app._positions_cache_time < 2:  # 2 second cache
+                return jsonify({"positions": app._positions_cache})
 
     try:
         from sync_db_reader import SyncDatabaseReader
@@ -4536,9 +4548,10 @@ def get_positions():
                 }
             )
 
-        # Cache the result
-        app._positions_cache = enriched_positions
-        app._positions_cache_time = time.time()
+        # Cache the result (thread-safe)
+        with _positions_cache_lock:
+            app._positions_cache = enriched_positions
+            app._positions_cache_time = time.time()
 
         return jsonify({"positions": enriched_positions})
     except Exception as e:

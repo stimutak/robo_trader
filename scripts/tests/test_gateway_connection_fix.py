@@ -53,6 +53,7 @@ async def test_direct_minimal_connection():
     ib = None
     try:
         from ib_async import IB
+
         from robo_trader.utils.ibkr_safe import safe_disconnect
 
         ib = IB()
@@ -78,12 +79,15 @@ async def test_direct_minimal_connection():
             print(f"PASS: Direct connection successful in {total_time:.2f}s")
             return True
         else:
-            print(f"FAIL: Connection incomplete (serverVersion={server_version}, accounts={accounts})")
+            print(
+                f"FAIL: Connection incomplete (serverVersion={server_version}, accounts={accounts})"
+            )
             return False
 
     except Exception as e:
         print(f"FAIL: Direct connection failed: {e}")
         import traceback
+
         traceback.print_exc()
         return False
     finally:
@@ -91,6 +95,7 @@ async def test_direct_minimal_connection():
         if ib is not None:
             try:
                 from robo_trader.utils.ibkr_safe import safe_disconnect
+
                 safe_disconnect(ib, context="test_direct_minimal_connection")
                 print("Disconnected cleanly via safe_disconnect")
             except Exception as e:
@@ -110,8 +115,8 @@ async def test_worker_process_direct():
             "port": 4002,
             "client_id": 889,
             "readonly": True,
-            "timeout": 30.0
-        }
+            "timeout": 30.0,
+        },
     }
 
     print(f"Sending command: {json.dumps(test_cmd)}")
@@ -120,11 +125,13 @@ async def test_worker_process_direct():
     try:
         # Run worker directly
         process = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "robo_trader.clients.ibkr_subprocess_worker",
+            sys.executable,
+            "-m",
+            "robo_trader.clients.ibkr_subprocess_worker",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=Path(__file__).parent
+            cwd=Path(__file__).parent,
         )
 
         # Send command with timeout
@@ -132,7 +139,7 @@ async def test_worker_process_direct():
         try:
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(cmd_json.encode()),
-                timeout=90.0  # Generous timeout for full handshake
+                timeout=90.0,  # Generous timeout for full handshake
             )
         except asyncio.TimeoutError:
             process.kill()
@@ -148,7 +155,7 @@ async def test_worker_process_direct():
         # Print stderr (debug output)
         if stderr:
             print("\n--- Worker Debug Output (stderr) ---")
-            for line in stderr.decode().strip().split('\n'):
+            for line in stderr.decode().strip().split("\n"):
                 print(f"  {line}")
             print("--- End Debug Output ---\n")
 
@@ -157,8 +164,9 @@ async def test_worker_process_direct():
             stdout_text = stdout.decode().strip()
 
             # Filter out any non-JSON lines (e.g., ib_async log messages)
-            json_lines = [line for line in stdout_text.split('\n')
-                         if line.strip().startswith('{"status":')]
+            json_lines = [
+                line for line in stdout_text.split("\n") if line.strip().startswith('{"status":')
+            ]
 
             if not json_lines:
                 print(f"FAIL: No valid JSON response found")
@@ -176,7 +184,9 @@ async def test_worker_process_direct():
                     accounts = data.get("accounts", [])
                     server_version = data.get("server_version")
 
-                    print(f"Response: connected={connected}, accounts={accounts}, serverVersion={server_version}")
+                    print(
+                        f"Response: connected={connected}, accounts={accounts}, serverVersion={server_version}"
+                    )
 
                     if connected and accounts and server_version:
                         print(f"PASS: Worker connection successful in {duration:.2f}s")
@@ -201,6 +211,7 @@ async def test_worker_process_direct():
     except Exception as e:
         print(f"FAIL: Worker test failed: {e}")
         import traceback
+
         traceback.print_exc()
         return False
 
@@ -223,11 +234,7 @@ async def test_subprocess_client():
         start_time = time.time()
 
         connected = await client.connect(
-            host="127.0.0.1",
-            port=4002,
-            client_id=890,
-            readonly=True,
-            timeout=30.0
+            host="127.0.0.1", port=4002, client_id=890, readonly=True, timeout=30.0
         )
 
         duration = time.time() - start_time
@@ -251,6 +258,7 @@ async def test_subprocess_client():
     except Exception as e:
         print(f"FAIL: SubprocessIBKRClient test failed: {e}")
         import traceback
+
         traceback.print_exc()
         return False
     finally:
@@ -271,11 +279,15 @@ async def check_zombies():
             ["lsof", "-nP", "-iTCP:4002", "-sTCP:CLOSE_WAIT"],
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=5,
         )
 
         if result.stdout.strip():
-            lines = [l for l in result.stdout.split('\n') if l.strip() and not l.startswith('COMMAND')]
+            lines = [
+                line
+                for line in result.stdout.split("\n")
+                if line.strip() and not line.startswith("COMMAND")
+            ]
             if lines:
                 print(f"WARNING: Found {len(lines)} zombie connection(s)!")
                 for line in lines:

@@ -2328,10 +2328,13 @@ class AsyncRunner:
             kill_switch = self.advanced_risk.kill_switch
             # Use session start equity (captured after loading positions)
             starting_equity = self.session_start_equity or float(self.cfg.default_cash)
-            # Guard against division by zero - use fallback if starting_equity is 0 or negative
+            # Guard against division by zero - use config default if starting_equity is 0 or negative
             if starting_equity <= 0:
-                logger.warning(f"Invalid starting_equity={starting_equity}, using fallback 100000")
-                starting_equity = 100000.0
+                fallback = float(self.cfg.default_cash)
+                logger.warning(
+                    f"Invalid starting_equity={starting_equity}, using config default {fallback}"
+                )
+                starting_equity = fallback
             if kill_switch.check_daily_loss(equity_float, starting_equity):
                 loss_pct = ((starting_equity - equity_float) / starting_equity) * 100
                 reason = (
