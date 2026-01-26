@@ -43,7 +43,7 @@ except ImportError:
     ws_client = None
     WEBSOCKET_ENABLED = False
 from .circuit_breaker import CircuitBreaker
-from .portfolio import Portfolio  # Import Portfolio class from portfolio.py file
+from .portfolio import Portfolio, PositionSnapshot  # Import Portfolio class from portfolio.py file
 from .portfolio_pkg.portfolio_manager import AllocationMethod, MultiStrategyPortfolioManager
 from .risk.advanced_risk import AdvancedRiskManager, risk_monitor_task
 from .risk_manager import Position, RiskManager
@@ -911,8 +911,24 @@ class AsyncRunner:
         logger.info("AsyncRunner setup complete")
 
     async def load_existing_positions(self):
-        """Load existing positions from database on startup to prevent duplicate buying."""
+        """Load existing positions and account state from database on startup."""
+        from decimal import Decimal
+
         try:
+            # Load account state (cash, realized_pnl) from database
+            account_info = await self.db.get_account_info()
+            if account_info:
+                db_cash = account_info.get("cash")
+                db_realized_pnl = account_info.get("realized_pnl", 0.0)
+                if db_cash is not None:
+                    self.portfolio.cash = Decimal(str(db_cash))
+                    self.portfolio.realized_pnl = Decimal(str(db_realized_pnl or 0.0))
+                    logger.info(
+                        f"Loaded account state: cash=${db_cash:,.2f}, "
+                        f"realized_pnl=${db_realized_pnl or 0:,.2f}"
+                    )
+
+            # Load positions from database
             positions_data = await self.db.get_positions()
             for pos in positions_data:
                 quantity = pos.get("quantity", 0)
@@ -922,8 +938,16 @@ class AsyncRunner:
                 symbol = pos["symbol"]
                 avg_cost = pos.get("avg_cost", pos.get("price", 0))
 
-                # Create Position object and add to positions dict
+                # Create Position object and add to runner's positions dict
                 self.positions[symbol] = Position(symbol, quantity, avg_cost)
+
+                # CRITICAL: Also sync to Portfolio object for equity calculation
+                # Portfolio uses PositionSnapshot with Decimal avg_price
+                avg_price_decimal = Decimal(str(avg_cost))
+                self.portfolio.positions[symbol] = PositionSnapshot(
+                    symbol, quantity, avg_price_decimal
+                )
+
                 logger.info(
                     f"Loaded existing position: {symbol} qty={quantity} avg_cost=${avg_cost:.2f}"
                 )
@@ -2235,6 +2259,18 @@ class AsyncRunner:
             f"Daily P&L: ${self.daily_pnl:,.2f}, "
             f"Positions: {len(self.positions)}"
         )
+
+        # Check kill switch conditions after updating account
+        if self.advanced_risk and hasattr(self.advanced_risk, "kill_switch"):
+            kill_switch = self.advanced_risk.kill_switch
+            # Check daily loss limit (starting equity is initial capital/default_cash)
+            starting_equity = float(self.cfg.default_cash)
+            if kill_switch.check_daily_loss(equity_float, starting_equity):
+                logger.critical(
+                    f"KILL SWITCH TRIGGERED: Daily loss exceeded. "
+                    f"Current: ${equity_float:,.2f}, Started: ${starting_equity:,.2f}, "
+                    f"Loss: {((starting_equity - equity_float) / starting_equity) * 100:.1f}%"
+                )
 
     async def run(self, symbols: Optional[List[str]] = None):
         """Main run method - process all symbols and update account."""
