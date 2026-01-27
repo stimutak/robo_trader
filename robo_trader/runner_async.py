@@ -179,6 +179,11 @@ class AsyncRunner:
         self._pending_orders: set = set()
         self._pending_orders_lock = asyncio.Lock()
 
+        # ADDITIONAL PROTECTION: Track symbols that have executed BUY orders this cycle
+        # This is a more aggressive duplicate prevention mechanism
+        self._cycle_executed_buys: set = set()
+        self._cycle_executed_buys_lock = asyncio.Lock()
+
         # Correlation components
         self.correlation_tracker = None
         self.position_sizer = None
@@ -1671,6 +1676,26 @@ class AsyncRunner:
         quantity = 0
 
         if signal_value == 1:  # Buy signal
+            # FIRST CHECK: Has this symbol already had a BUY attempted/executed this cycle?
+            # Use combined lock check for maximum protection
+            async with self._cycle_executed_buys_lock:
+                if symbol in self._cycle_executed_buys:
+                    logger.warning(
+                        f"DUPLICATE BUY BLOCKED: {symbol} already had BUY attempted this cycle"
+                    )
+                    return SymbolResult(
+                        symbol=symbol,
+                        signal=signal_value,
+                        price=price_float,
+                        quantity=0,
+                        executed=False,
+                        message="Duplicate buy blocked: already attempted this cycle",
+                        data=df,
+                    )
+                # CRITICAL: Mark as attempted IMMEDIATELY to prevent any other task from proceeding
+                self._cycle_executed_buys.add(symbol)
+                logger.info(f"Marked {symbol} for BUY processing this cycle")
+
             if symbol in self.positions and self.positions[symbol].quantity < 0:
                 # Cover short position first
                 pos = self.positions[symbol]
@@ -1771,6 +1796,31 @@ class AsyncRunner:
                     # Mark as pending BEFORE releasing lock
                     self._pending_orders.add(symbol)
                     logger.debug(f"Added {symbol} to pending orders")
+
+                    # CRITICAL: Check DATABASE for existing position (prevents cross-cycle duplicates)
+                    db_positions = await self.db.get_positions()
+                    db_position = next(
+                        (
+                            p
+                            for p in db_positions
+                            if p.get("symbol") == symbol and p.get("quantity", 0) > 0
+                        ),
+                        None,
+                    )
+                    if db_position:
+                        logger.warning(
+                            f"DUPLICATE BUY BLOCKED: {symbol} already has DB position (qty={db_position.get('quantity')})"
+                        )
+                        self._pending_orders.discard(symbol)
+                        return SymbolResult(
+                            symbol=symbol,
+                            signal=signal_value,
+                            price=price_float,
+                            quantity=0,
+                            executed=False,
+                            message=f"Duplicate buy blocked: DB position exists (qty={db_position.get('quantity')})",
+                            data=df,
+                        )
 
                 try:
                     # Open long position

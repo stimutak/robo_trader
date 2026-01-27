@@ -16,6 +16,7 @@ Features:
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from decimal import Decimal
 from enum import Enum
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -186,10 +187,16 @@ class StopLossMonitor:
             raise
 
         # Calculate stop price based on position direction
+        # Convert avg_price to float if it's a Decimal to avoid type mismatch
+        avg_price_float = (
+            float(position.avg_price)
+            if isinstance(position.avg_price, Decimal)
+            else position.avg_price
+        )
         if position.quantity > 0:  # Long position
-            stop_price = position.avg_price * (1 - stop_percent)
+            stop_price = avg_price_float * (1 - stop_percent)
         else:  # Short position
-            stop_price = position.avg_price * (1 + stop_percent)
+            stop_price = avg_price_float * (1 + stop_percent)
 
         # Create stop-loss order
         stop_order = StopLossOrder(

@@ -158,11 +158,11 @@ async def train_models(
         config: Configuration object
     """
     # Initialize model trainer
-    model_trainer = ModelTrainer(config=config, model_dir=Path("trained_models"))
+    model_trainer = ModelTrainer(config=config, model_dir=Path("models"))
 
-    # Prepare data for training
-    X = features_df[feature_columns].values
-    y = targets_df.values
+    # Prepare data for training - keep as DataFrame/Series
+    X = features_df[feature_columns]
+    y = targets_df
 
     # Train different model types
     model_types = [ModelType.RANDOM_FOREST, ModelType.XGBOOST, ModelType.LIGHTGBM]
@@ -173,35 +173,33 @@ async def train_models(
         logger.info(f"\nTraining {model_type.value} model...")
 
         try:
-            # Train model
-            model, metrics = await model_trainer.train_model(
-                X=X,
-                y=y,
+            # Train model - returns dict with 'model' and 'metrics'
+            model_info = await model_trainer.train_model(
+                features=X,
+                target=y,
                 model_type=model_type,
                 prediction_type=PredictionType.CLASSIFICATION,
-                hyperparameter_tuning=False,  # Set to True for better models (slower)
+                tune_hyperparams=False,  # Set to True for better models (slower)
             )
 
-            trained_models[model_type.value] = {"model": model, "metrics": metrics}
+            trained_models[model_type.value] = {
+                "model": model_info["model"],
+                "metrics": model_info["metrics"],
+            }
 
+            metrics = model_info["metrics"]
             logger.info(f"  {model_type.value} metrics:")
             logger.info(f"    Train Score: {metrics.get('train_score', 0):.4f}")
             logger.info(f"    Test Score: {metrics.get('test_score', 0):.4f}")
-            logger.info(f"    Cross-Val Score: {metrics.get('cv_score', 0):.4f}")
 
-            # Save model
-            model_path = Path("trained_models") / f"{model_type.value}_model.pkl"
-            await model_trainer.save_model(
-                model=model,
-                model_type=model_type,
-                metrics=metrics,
-                feature_columns=feature_columns,
-                model_path=model_path,
-            )
-            logger.info(f"  Saved model to {model_path}")
+            # Model is auto-saved by train_model
+            logger.info(f"  Model saved to models/{model_info.get('filename', 'unknown')}")
 
         except Exception as e:
             logger.error(f"  Failed to train {model_type.value}: {e}")
+            import traceback
+
+            traceback.print_exc()
 
     return trained_models
 

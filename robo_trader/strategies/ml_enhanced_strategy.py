@@ -91,6 +91,11 @@ class MLEnhancedStrategy(Strategy):
         self.min_alignment_score = 0.4  # Lowered from 0.5
         self.max_correlation_positions = 3
 
+        # Adaptive threshold parameters (for ML/MTF disagreement resolution)
+        self._model_test_score: float = 0.55  # Default, updated when model loaded
+        self.disagreement_threshold_margin = 0.10  # threshold = test_score + margin
+        self.range_bound_threshold_margin = 0.05  # Lower margin in range-bound markets
+
         # Multi-timeframe settings
         self.timeframes = {
             "1m": 1,
@@ -275,6 +280,11 @@ class MLEnhancedStrategy(Strategy):
             model_data = self.model_selector.available_models[model_name]
         model = model_data["model"]
 
+        # Capture model's actual test_score for adaptive threshold calculation
+        model_metrics = model_data.get("metrics", {})
+        self._model_test_score = model_metrics.get("test_score", 0.55)
+        logger.debug(f"Using model with test_score={self._model_test_score:.3f} for {symbol}")
+
         # Prepare features
         feature_names = model_data["features"]
         X = latest_features[feature_names].values
@@ -404,13 +414,51 @@ class MLEnhancedStrategy(Strategy):
     def _combine_signals(
         self, ml_signal: SimpleSignal, mtf_signal: MultiTimeframeSignal, regime: RegimeState
     ) -> Optional[SimpleSignal]:
-        """Combine ML and multi-timeframe signals with regime awareness."""
+        """Combine ML and multi-timeframe signals with regime awareness.
+
+        Uses adaptive thresholds based on:
+        1. Model's actual test_score (not arbitrary 0.8)
+        2. Market regime (lower threshold in range-bound markets where MTF is noisy)
+        3. Kelly-inspired expected value thinking
+        """
+        # Calculate adaptive disagreement threshold based on model performance
+        # A 55% accurate model with 65% confidence is performing well for that model
+        base_threshold = self._model_test_score + self.disagreement_threshold_margin
+
+        # Regime-aware threshold adjustment
+        if regime.trend_regime == MarketRegime.RANGE_BOUND:
+            # In range-bound markets, MTF trend signals are inherently noisy
+            # Lower the bar significantly - trust ML more
+            disagreement_threshold = self._model_test_score + self.range_bound_threshold_margin
+            logger.debug(
+                f"Range-bound regime: using lower disagreement threshold {disagreement_threshold:.2f}"
+            )
+        elif regime.trend_regime in [MarketRegime.STRONG_BULL, MarketRegime.STRONG_BEAR]:
+            # In strong trends, MTF is more reliable - require higher ML confidence
+            disagreement_threshold = min(base_threshold + 0.05, 0.75)
+        else:
+            # Normal conditions
+            disagreement_threshold = min(base_threshold, 0.70)
+
         # Check if signals agree
         if ml_signal.action != mtf_signal.combined_signal.action:
-            # Signals disagree - use ML if high confidence
-            if ml_signal.confidence > 0.8:
+            # Signals disagree - use adaptive threshold instead of fixed 0.8
+            if ml_signal.confidence > disagreement_threshold:
+                logger.info(
+                    f"ML/MTF disagree for {ml_signal.symbol}: ML={ml_signal.action} "
+                    f"(conf={ml_signal.confidence:.2f}), MTF={mtf_signal.combined_signal.action} "
+                    f"(align={mtf_signal.alignment_score:.2f}). "
+                    f"Using ML signal (threshold={disagreement_threshold:.2f}, "
+                    f"model_score={self._model_test_score:.2f}, regime={regime.trend_regime.value})"
+                )
                 final_signal = ml_signal
+                final_signal.features["signal_resolution"] = "ml_override_disagreement"
+                final_signal.features["disagreement_threshold"] = disagreement_threshold
             else:
+                logger.debug(
+                    f"Signal rejected for {ml_signal.symbol}: ML/MTF disagree, "
+                    f"ML conf {ml_signal.confidence:.2f} < threshold {disagreement_threshold:.2f}"
+                )
                 return None
         else:
             # Signals agree - combine confidence
@@ -425,6 +473,7 @@ class MLEnhancedStrategy(Strategy):
                     "mtf_alignment": mtf_signal.alignment_score,
                     "regime": regime.trend_regime.value,
                     "regime_confidence": regime.confidence,
+                    "signal_resolution": "ml_mtf_agreement",
                 },
             )
 
