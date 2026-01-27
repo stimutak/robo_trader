@@ -289,7 +289,7 @@ python3 test_safety_features.py
 12. ✅ **Subprocess Pipe Blocking - FIXED (2025-12-24)** - See below
 13. ✅ **Near Real-Time Trading - IMPLEMENTED (2025-12-24)** - See below
 14. ✅ **Decimal/Float Type Mismatch - FIXED (2025-12-29, enhanced 2026-01-15)** - See below
-15. ✅ **Market Close Time Wrong - FIXED (2025-12-29)** - Was 4:30 PM, now 4:00 PM
+15. ✅ **Extended Hours Trading - ENABLED (2026-01-27)** - Set `ENABLE_EXTENDED_HOURS=true` in .env to trade 4:00-8:00 PM
 16. ✅ **Int/Datetime Comparison Error - FIXED (2026-01-15)** - Added try/except fallback in correlation.py
 17. ✅ **Missing Market Holidays - FIXED (2026-01-15)** - Added MLK, Presidents, Good Friday, Memorial, Labor, Thanksgiving, Juneteenth
 18. ✅ **Dashboard Overview Redesign - IMPLEMENTED (2026-01-24)** - Professional-grade overview with all key metrics
@@ -494,6 +494,29 @@ fetch_rss_news(50 headlines) → AI finds opportunities → Adds to processing q
 - If equity looks wrong, compare trades table totals vs positions table
 
 **See:** `handoff/HANDOFF_2026-01-27_position_db_rebuild.md`
+
+### Extended Hours Trading (2026-01-27) ✅
+
+**User preference:** Trade during after-hours session (4:00 PM - 8:00 PM ET).
+
+**Configuration:**
+```bash
+# In .env
+ENABLE_EXTENDED_HOURS=true   # Set to true to trade after 4:00 PM
+```
+
+**How it works:**
+- NYSE regular hours: 9:30 AM - 4:00 PM ET
+- After-hours: 4:00 PM - 8:00 PM ET
+- Pre-market: 4:00 AM - 9:30 AM ET
+- When `ENABLE_EXTENDED_HOURS=true`, the system treats after-hours and pre-market as valid trading time
+- Uses `is_trading_allowed()` function which checks both `is_market_open()` and `is_extended_hours()`
+
+**Files Modified:**
+- `.env`: Added `ENABLE_EXTENDED_HOURS=true`
+- `robo_trader/runner_async.py`: Added `is_trading_allowed()` helper, replaced `is_market_open()` checks
+
+**IMPORTANT:** IBKR must have extended hours trading enabled in account settings for this to work.
 
 ### Near Real-Time Trading System (2025-12-24) ✅
 
@@ -728,6 +751,8 @@ fetch_rss_news(50 headlines) → AI finds opportunities → Adds to processing q
 | Parallel BUY race condition - duplicate buys | Use 3-layer protection: cycle set + pending lock + DB check (see fix 2026-01-27) | 2026-01-27 |
 | In-memory duplicate checks reset each cycle | Add DATABASE check inside lock - `await self.db.get_positions()` | 2026-01-27 |
 | API `get_recent_trades(limit=1000)` misses old trades | Use `limit=5000` to ensure ALL trades included in P&L calc | 2026-01-26 |
+| Market shows "closed" at 4:00 PM when user wants to trade | Set `ENABLE_EXTENDED_HOURS=true` in .env - uses `is_trading_allowed()` | 2026-01-27 |
+| Using `is_market_open()` for trading checks | Use `is_trading_allowed()` which includes extended hours when enabled | 2026-01-27 |
 | SELL trades with NULL pnl column | Update NULL pnls with estimated value from avg buy price | 2026-01-26 |
 | P&L API recalculating instead of using stored values | Use stored `pnl` column from trades table, not FIFO recalc | 2026-01-26 |
 | Fixed 0.8 confidence threshold for ML/MTF disagreement | Use adaptive threshold: `model_test_score + margin`, lower in range-bound | 2026-01-27 |

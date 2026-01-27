@@ -29,7 +29,12 @@ from .correlation import CorrelationTracker
 from .database_async import AsyncTradingDatabase
 from .execution import Order, PaperExecutor
 from .logger import get_logger
-from .market_hours import get_market_session, is_market_open, seconds_until_market_open
+from .market_hours import (
+    get_market_session,
+    is_extended_hours,
+    is_market_open,
+    seconds_until_market_open,
+)
 from .monitoring.performance import PerformanceMonitor, Timer
 from .monitoring.production_monitor import ProductionMonitor
 from .utils.robust_connection import CircuitBreakerConfig, connect_ibkr_robust
@@ -92,6 +97,19 @@ class SymbolResult:
     executed: bool
     message: str
     data: Optional[pd.DataFrame] = None
+
+
+# Check if extended hours trading is enabled
+ENABLE_EXTENDED_HOURS = os.getenv("ENABLE_EXTENDED_HOURS", "false").lower() in ("true", "1", "yes")
+
+
+def is_trading_allowed() -> bool:
+    """Check if trading is currently allowed (regular hours or extended hours if enabled)."""
+    if is_market_open():
+        return True
+    if ENABLE_EXTENDED_HOURS and is_extended_hours():
+        return True
+    return False
 
 
 class AsyncRunner:
@@ -1206,7 +1224,7 @@ class AsyncRunner:
     async def fetch_and_store_data(self, symbol: str) -> Optional[pd.DataFrame]:
         """Fetch market data for a symbol and store in database."""
         # Check if market is open before fetching data
-        if not is_market_open():
+        if not is_trading_allowed():
             session = get_market_session()
             logger.debug(f"Market is {session}, skipping data fetch for {symbol}")
             return None
@@ -2402,7 +2420,7 @@ class AsyncRunner:
         await self.setup()
         try:
             # Check market status
-            if not is_market_open():
+            if not is_trading_allowed():
                 session = get_market_session()
                 seconds_to_open = seconds_until_market_open()
                 hours_to_open = seconds_to_open / 3600
@@ -2417,7 +2435,7 @@ class AsyncRunner:
 
             # AI Opportunity Scanner - find new stocks to buy from news
             ai_opportunities = []
-            if self.ai_analyst and AI_ANALYST_AVAILABLE and is_market_open():
+            if self.ai_analyst and AI_ANALYST_AVAILABLE and is_trading_allowed():
                 try:
                     # Get current positions to exclude
                     owned_symbols = list(self.positions.keys())
@@ -2907,11 +2925,12 @@ async def run_continuous(
             current_time = datetime.now(eastern)
 
             # Check market status and adjust polling frequency
-            if not is_market_open() and not force_connect:
+            if not is_trading_allowed() and not force_connect:
                 session = get_market_session()
                 seconds_to_open = seconds_until_market_open()
 
-                # Extended hours: slower polling (2 min) - market data still available
+                # Extended hours: slower polling (2 min) - but only if extended hours trading is DISABLED
+                # If ENABLE_EXTENDED_HOURS=true, is_trading_allowed() returns true and we won't reach here
                 if session in ["after-hours", "pre-market"]:
                     wait_time = 120  # 2 minutes during extended hours
                     logger.info(f"Extended hours ({session}). Polling every 2 minutes...")
@@ -2934,7 +2953,7 @@ async def run_continuous(
                     )
                     await asyncio.sleep(wait_time)
                     continue
-            elif force_connect and not is_market_open():
+            elif force_connect and not is_trading_allowed():
                 logger.warning(
                     "⚠️ Force-connect enabled - connecting to IBKR despite market being closed"
                 )
@@ -2970,7 +2989,7 @@ async def run_continuous(
                 runner = None
 
                 # Wait before next iteration
-                if not shutdown_flag and is_market_open():
+                if not shutdown_flag and is_trading_allowed():
                     logger.info(
                         f"Waiting {interval_seconds/60:.1f} minutes before next iteration..."
                     )
