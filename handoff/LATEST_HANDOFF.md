@@ -1,1 +1,1 @@
-HANDOFF_2026-01-26_pnl_tracking_fixes.md
+HANDOFF_2026-01-27_position_db_rebuild.md

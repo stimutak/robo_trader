@@ -294,6 +294,73 @@ python3 test_safety_features.py
 17. ✅ **Missing Market Holidays - FIXED (2026-01-15)** - Added MLK, Presidents, Good Friday, Memorial, Labor, Thanksgiving, Juneteenth
 18. ✅ **Dashboard Overview Redesign - IMPLEMENTED (2026-01-24)** - Professional-grade overview with all key metrics
 19. ✅ **Equity History Tracking - IMPLEMENTED (2026-01-24)** - Daily portfolio snapshots in `equity_history` table
+20. ✅ **Duplicate BUY Race Condition - FIXED (2026-01-27)** - Database-level check before buying prevents cross-cycle duplicates
+21. ✅ **sklearn Version Mismatch Warnings - FIXED (2026-01-27)** - Re-serialized 82 models with sklearn 1.7.2
+22. ✅ **Risk Status API Error - FIXED (2026-01-27)** - Added None guards for pnl calculations in `/api/risk/status`
+23. ✅ **ML/MTF Disagreement Threshold Too Strict - FIXED (2026-01-27)** - Adaptive threshold based on model test_score + regime awareness
+
+## ML/MTF Disagreement Threshold Fix (2026-01-27)
+
+**Problem:** When ML signal and Multi-Timeframe (MTF) signal disagreed, system required ML confidence > 0.8 to proceed. But ML model only has ~55% accuracy - it can't reliably produce 0.8+ confidence.
+
+**Root Cause:**
+- Fixed 0.8 threshold in `_combine_signals()` was unrealistic for a 55% accurate model
+- Most stocks showed "range_bound" regime where MTF trend signals are inherently noisy
+- Result: ~99% of disagreement signals rejected → falls back to AI analyst → few trades
+
+**Solution (Adaptive Threshold):**
+```python
+# OLD: Fixed threshold
+if ml_signal.confidence > 0.8:  # Too strict!
+
+# NEW: Adaptive based on model performance + regime
+base_threshold = model_test_score + 0.10  # e.g., 0.55 + 0.10 = 0.65
+
+if regime == RANGE_BOUND:
+    threshold = model_test_score + 0.05  # = 0.60 (MTF is noise)
+elif regime in [STRONG_BULL, STRONG_BEAR]:
+    threshold = min(base_threshold + 0.05, 0.75)  # = 0.70
+else:
+    threshold = min(base_threshold, 0.70)  # = 0.65
+```
+
+**Key insight:** In range-bound markets, MTF trend signals are unreliable by design. Disagreement is expected, not a failure signal.
+
+**See:** `docs/SIGNAL_FLOW_AND_KELLY.md` for complete signal flow documentation.
+
+## Duplicate BUY Race Condition Fix (2026-01-27)
+
+**Problem:** Multiple BUY orders for the same symbol executed simultaneously due to race conditions in parallel processing.
+
+**Root Cause:**
+- New `AsyncRunner` created each cycle with fresh `_pending_orders` set
+- In-memory checks didn't persist across cycles
+- Parallel tasks could bypass position checks before DB was updated
+
+**Solution (3-layer protection):**
+1. **Cycle-level set** (`_cycle_executed_buys`): Marks symbols immediately on BUY signal within a cycle
+2. **Pending orders lock** (`_pending_orders_lock`): Prevents parallel tasks from buying same symbol
+3. **Database check**: Queries DB for existing position BEFORE placing order (catches cross-cycle duplicates)
+
+**Key code in `runner_async.py`:**
+```python
+# Layer 1: Cycle-level check
+async with self._cycle_executed_buys_lock:
+    if symbol in self._cycle_executed_buys:
+        return  # Block duplicate
+    self._cycle_executed_buys.add(symbol)
+
+# Layer 2: Pending orders check (inside lock)
+async with self._pending_orders_lock:
+    if symbol in self._pending_orders:
+        return  # Block duplicate
+    self._pending_orders.add(symbol)
+
+    # Layer 3: DATABASE check (most reliable)
+    db_positions = await self.db.get_positions()
+    if any(p["symbol"] == symbol and p["quantity"] > 0 for p in db_positions):
+        return  # Block duplicate
+```
 
 ## Dashboard Overview (2026-01-24)
 
@@ -403,6 +470,30 @@ fetch_rss_news(50 headlines) → AI finds opportunities → Adds to processing q
 - See `DECIMAL_PRECISION_FIX.md` for details
 
 ## Major Fixes Completed
+
+### Position Database Rebuild (2026-01-27) ✅
+
+**Problem:** Positions table had stale quantities despite trades being recorded correctly. Caused equity calculation to show ~$201K instead of actual ~$2.66M.
+
+**Root Cause:** `db.update_position()` was receiving order quantity instead of accumulated position quantity, causing positions to not accumulate properly.
+
+**Fix:** Rebuilt all positions from trades table using FIFO accounting:
+```sql
+-- For each symbol, iterate through trades chronologically
+-- BUY: quantity += trade_qty, total_cost += trade_qty * price
+-- SELL: quantity -= trade_qty, realized_pnl = (sell_price - avg_cost) * qty
+```
+
+**Result:**
+- 108 positions correctly tracked
+- Total value: $2,479,627.06
+- Account equity: $2,665,050.82
+
+**Prevention:** Added entries to Common Mistakes table:
+- Always verify `db.update_position()` receives accumulated quantity
+- If equity looks wrong, compare trades table totals vs positions table
+
+**See:** `handoff/HANDOFF_2026-01-27_position_db_rebuild.md`
 
 ### Near Real-Time Trading System (2025-12-24) ✅
 
@@ -634,10 +725,20 @@ fetch_rss_news(50 headlines) → AI finds opportunities → Adds to processing q
 | `db.update_position(qty)` uses order qty | Use `self.positions[symbol].quantity` (accumulated) | 2026-01-16 |
 | `self.positions` not synced to Portfolio | Must sync DB positions to `self.portfolio.positions` on startup | 2026-01-26 |
 | Portfolio shows only cash, no positions | `portfolio.equity()` uses its own positions dict - sync it! | 2026-01-26 |
-| Parallel BUY race condition - duplicate buys | Use `_pending_orders` set with lock before `symbol not in positions` check | 2026-01-26 |
+| Parallel BUY race condition - duplicate buys | Use 3-layer protection: cycle set + pending lock + DB check (see fix 2026-01-27) | 2026-01-27 |
+| In-memory duplicate checks reset each cycle | Add DATABASE check inside lock - `await self.db.get_positions()` | 2026-01-27 |
 | API `get_recent_trades(limit=1000)` misses old trades | Use `limit=5000` to ensure ALL trades included in P&L calc | 2026-01-26 |
 | SELL trades with NULL pnl column | Update NULL pnls with estimated value from avg buy price | 2026-01-26 |
 | P&L API recalculating instead of using stored values | Use stored `pnl` column from trades table, not FIFO recalc | 2026-01-26 |
+| Fixed 0.8 confidence threshold for ML/MTF disagreement | Use adaptive threshold: `model_test_score + margin`, lower in range-bound | 2026-01-27 |
+| Ignoring market regime in signal resolution | Range-bound regime → MTF trend signals are noise, trust ML more | 2026-01-27 |
+| Kelly only used for sizing, not filtering | Kelly can filter via `should_skip_trade()` based on expected value | 2026-01-27 |
+| Positions table not accumulating quantities | Check `db.update_position()` receives accumulated qty, not order qty | 2026-01-27 |
+| Stale positions → wrong equity calculation | Rebuild positions from trades if mismatch detected | 2026-01-27 |
+| `/api/pnl` missing `cash` field | Add `cash` to all return paths (market-open, closed, error) | 2026-01-27 |
+| `/api/equity-curve` overrides equity_history with P&L calc | Prefer equity_history when available, fallback only when empty | 2026-01-27 |
+| Database lock causes `update_position` to fail silently | Monitor position/trade mismatches, add retry logic | 2026-01-27 |
+| Runner stalls with no output for 25+ min | Restart with `./START_TRADER.sh`, check IBKR connection | 2026-01-27 |
 
 ---
 

@@ -46,9 +46,17 @@ app = Flask(__name__)
 # Configure CORS with whitelisted origins
 # Set CORS_ORIGINS env var for production, or it defaults to allowing local development
 cors_origins = os.getenv("CORS_ORIGINS", "").strip()
+is_production = (
+    os.getenv("FLASK_ENV", "").lower() == "production"
+    or os.getenv("PRODUCTION", "").lower() == "true"
+)
 if cors_origins:
     # Production: use explicit whitelist from environment
     allowed_origins = [origin.strip() for origin in cors_origins.split(",")]
+elif is_production:
+    # Production without CORS_ORIGINS set: restrict to localhost only (safe default)
+    logger.warning("PRODUCTION mode without CORS_ORIGINS set - restricting to localhost only")
+    allowed_origins = ["http://localhost:5555", "http://127.0.0.1:5555"]
 else:
     # Development: allow localhost and common local network patterns
     allowed_origins = [
@@ -64,6 +72,7 @@ server = app  # For Gunicorn compatibility
 
 # Thread-safe cache for positions endpoint
 _positions_cache_lock = threading.Lock()
+_strategies_cache_lock = threading.Lock()
 
 # Configuration
 config = load_config()
@@ -1421,7 +1430,9 @@ HTML_TEMPLATE = """
             currentTab = tab;
             
             // Load tab-specific data
-            if (tab === 'ml') {
+            if (tab === 'overview') {
+                loadOverviewData();
+            } else if (tab === 'ml') {
                 loadMLData();
             } else if (tab === 'performance') {
                 loadPerformanceData();
@@ -4167,6 +4178,7 @@ def get_pnl():
                     "realized": None,
                     "daily": None,
                     "equity": float(equity),
+                    "cash": float(cash),
                 }
             )
 
@@ -4224,6 +4236,7 @@ def get_pnl():
                 "realized": float(round(realized_pnl, 2)),
                 "daily": float(round(daily_pnl, 2)),
                 "equity": float(equity),
+                "cash": float(cash),
             }
         )
 
@@ -4231,7 +4244,14 @@ def get_pnl():
         logger.error(f"Error calculating P&L: {e}")
         # Return zeros on error instead of fake data
         return jsonify(
-            {"total": 0, "unrealized": 0, "realized": 0, "daily": 0, "equity": DEFAULT_CAPITAL}
+            {
+                "total": 0,
+                "unrealized": 0,
+                "realized": 0,
+                "daily": 0,
+                "equity": DEFAULT_CAPITAL,
+                "cash": DEFAULT_CAPITAL,
+            }
         )
 
     # Original database logic commented out due to persistent locking
@@ -5075,15 +5095,17 @@ def performance():
             sharpe = (avg_return * np.sqrt(252)) / std_return if std_return > 0 else 0
 
             # Max drawdown - calculate based on equity curve with starting capital
+            # Note: worst_dd tracks the most negative drawdown (worst case)
             starting_capital = estimated_capital
             equity_values = [starting_capital + ec for ec in equity_curve]
             peak = equity_values[0]
-            max_dd = 0
+            worst_dd = 0  # Drawdowns are negative, so 0 is the "best" (no drawdown)
             for val in equity_values:
                 if val > peak:
                     peak = val
-                dd = (val - peak) / peak if peak > 0 else 0
-                max_dd = min(max_dd, dd)
+                dd = (val - peak) / peak if peak > 0 else 0  # dd is negative or zero
+                worst_dd = min(worst_dd, dd)  # Track most negative (worst) drawdown
+            max_dd = worst_dd  # Alias for backward compatibility
         else:
             volatility, sharpe, max_dd = 0, 0, 0
 
@@ -5227,16 +5249,19 @@ def equity_curve():
         pnl_labels = [d["timestamp"][:10] for d in equity_data]  # Just date
         pnl_values = [d["cumulative"] for d in equity_data]
 
-        # Use PnL labels when they have more data points than equity_history
-        # This ensures the chart shows full history even if equity snapshots just started
-        if len(pnl_labels) > len(portfolio_labels):
+        # Prefer equity_history data (accurate portfolio values) over P&L calculation
+        # Only fall back to P&L calculation if NO equity_history exists
+        if portfolio_labels and portfolio_values:
+            # Use actual equity snapshots - this is the accurate data
+            labels = portfolio_labels
+            # portfolio_values already set from equity_history
+        elif pnl_labels:
+            # Fallback: calculate from P&L when no equity_history exists
             labels = pnl_labels
-            # Calculate portfolio values from P&L when equity_history is sparse
-            # config is a Pydantic model, not a dict - use attribute access
             starting_capital = float(os.getenv("DEFAULT_CASH", config.default_cash))
             portfolio_values = [starting_capital + pnl for pnl in pnl_values]
         else:
-            labels = portfolio_labels if portfolio_labels else pnl_labels
+            labels = []
 
         return jsonify(
             {
@@ -5465,10 +5490,12 @@ def get_trades_OLD():
 def strategies_status():
     """Get real status of all active strategies"""
     # Return cached status if available and recent (within 3 seconds)
+    # Thread-safe cache access
     current_time = time.time()
-    if hasattr(app, "_strategies_cache") and hasattr(app, "_strategies_cache_time"):
-        if current_time - app._strategies_cache_time < 3:  # 3 second cache
-            return jsonify(app._strategies_cache)
+    with _strategies_cache_lock:
+        if hasattr(app, "_strategies_cache") and hasattr(app, "_strategies_cache_time"):
+            if current_time - app._strategies_cache_time < 3:  # 3 second cache
+                return jsonify(app._strategies_cache)
 
     try:
         import json
@@ -5581,9 +5608,10 @@ def strategies_status():
             "last_updated": datetime.now().isoformat(),
         }
 
-        # Cache the data dict, not the Response object
-        app._strategies_cache = strategies_data
-        app._strategies_cache_time = time.time()
+        # Cache the data dict, not the Response object (thread-safe)
+        with _strategies_cache_lock:
+            app._strategies_cache = strategies_data
+            app._strategies_cache_time = time.time()
 
         return jsonify(strategies_data)
     except Exception as e:
@@ -5858,10 +5886,12 @@ def get_risk_status():
 
             # Simple Kelly estimation
             if symbol_wins and symbol_trades:
-                avg_win = sum(t["pnl"] for t in symbol_wins) / len(symbol_wins)
-                losses = [t for t in symbol_trades if (t.get("pnl") or 0) <= 0]
+                avg_win = sum((t.get("pnl") or 0) for t in symbol_wins) / len(symbol_wins)
+                losses = [t for t in symbol_trades if (t.get("pnl") or 0) < 0]
                 avg_loss = (
-                    abs(sum(t["pnl"] for t in losses) / len(losses)) if losses else avg_win * 0.5
+                    abs(sum((t.get("pnl") or 0) for t in losses) / len(losses))
+                    if losses
+                    else avg_win * 0.5
                 )
                 edge = symbol_win_rate * avg_win - (1 - symbol_win_rate) * avg_loss
                 kelly_fraction = min(0.25, max(0, (edge / avg_win) if avg_win > 0 else 0))
@@ -5938,6 +5968,15 @@ def get_risk_status():
 @requires_auth
 def get_kelly_parameters(symbol):
     """Get Kelly parameters for a specific symbol from actual trade history"""
+    import re
+
+    # Validate symbol format (1-5 uppercase letters, common stock symbol format)
+    if not symbol or not re.match(r"^[A-Z]{1,5}$", symbol.upper()):
+        return jsonify({"error": "Invalid symbol format. Must be 1-5 uppercase letters."}), 400
+
+    # Normalize to uppercase
+    symbol = symbol.upper()
+
     try:
         from sync_db_reader import SyncDatabaseReader
 
@@ -5967,12 +6006,12 @@ def get_kelly_parameters(symbol):
             )
 
         # Calculate win/loss statistics
-        wins = [t for t in symbol_trades if t.get("pnl", 0) > 0]
-        losses = [t for t in symbol_trades if t.get("pnl", 0) <= 0]
+        wins = [t for t in symbol_trades if (t.get("pnl") or 0) > 0]
+        losses = [t for t in symbol_trades if (t.get("pnl") or 0) < 0]
 
         win_rate = len(wins) / len(symbol_trades)
-        avg_win = sum(t["pnl"] for t in wins) / len(wins) if wins else 0
-        avg_loss = abs(sum(t["pnl"] for t in losses) / len(losses)) if losses else 0
+        avg_win = sum((t.get("pnl") or 0) for t in wins) / len(wins) if wins else 0
+        avg_loss = abs(sum((t.get("pnl") or 0) for t in losses) / len(losses)) if losses else 0
 
         # Calculate Kelly fraction
         if avg_loss > 0 and avg_win > 0:
@@ -5985,13 +6024,23 @@ def get_kelly_parameters(symbol):
         # Calculate edge
         edge = win_rate * avg_win - (1 - win_rate) * avg_loss
 
-        # Load current capital from risk state
+        # Load current capital from risk state with type validation
         risk_state_file = Path("data/risk_state.json")
         current_capital = DEFAULT_CAPITAL
         if risk_state_file.exists():
-            with open(risk_state_file) as f:
-                risk_state = json.load(f)
-                current_capital = risk_state.get("current_capital", 100000)
+            try:
+                with open(risk_state_file) as f:
+                    risk_state = json.load(f)
+                    raw_capital = risk_state.get("current_capital", DEFAULT_CAPITAL)
+                    # Type validation: ensure it's a valid number
+                    if isinstance(raw_capital, (int, float)) and raw_capital > 0:
+                        current_capital = float(raw_capital)
+                    else:
+                        logger.warning(
+                            f"Invalid current_capital in risk_state.json: {raw_capital}, using default"
+                        )
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.warning(f"Failed to parse risk_state.json: {e}, using default capital")
 
         # Calculate recommended position size
         recommended_size = current_capital * kelly * 0.5  # Half Kelly
