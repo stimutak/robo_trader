@@ -3700,19 +3700,29 @@ def market_status():
     from robo_trader.market_hours import (
         get_market_session,
         get_next_market_open,
+        is_extended_hours,
         is_market_open,
         seconds_until_market_open,
     )
 
+    # Check if extended hours trading is enabled
+    enable_extended = os.getenv("ENABLE_EXTENDED_HOURS", "false").lower() in ("true", "1", "yes")
+
     current_time = datetime.now()
     is_open = is_market_open()
     session = get_market_session()
+
+    # Consider extended hours as "open" if enabled
+    if enable_extended and is_extended_hours():
+        is_open = True
+        session = "extended-hours"
 
     result = {
         "is_open": is_open,
         "session": session,
         "current_time": current_time.isoformat(),
         "status_text": session.replace("-", " ").title(),
+        "extended_hours_enabled": enable_extended,
     }
 
     if is_open:
@@ -3879,9 +3889,16 @@ def status():
     is_weekday = now.weekday() < 5
 
     # Use the centralized market hours logic
+    from robo_trader.market_hours import is_extended_hours
     from robo_trader.market_hours import is_market_open as check_market_open
 
+    # Check if extended hours trading is enabled
+    enable_extended = os.getenv("ENABLE_EXTENDED_HOURS", "false").lower() in ("true", "1", "yes")
+
     market_open = check_market_open()
+    # Consider extended hours as "open" if enabled
+    if enable_extended and is_extended_hours():
+        market_open = True
 
     # Build clear status message
     runner_running = runner_actually_running
