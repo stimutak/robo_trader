@@ -480,8 +480,7 @@ class AsyncTradingDatabase:
 
             if pnl is not None:
                 logger.info(
-                    f"Recorded trade: {side} {quantity} {symbol} @ {price} "
-                    f"(P&L: ${pnl:,.2f})"
+                    f"Recorded trade: {side} {quantity} {symbol} @ {price} " f"(P&L: ${pnl:,.2f})"
                 )
             else:
                 logger.info(f"Recorded trade: {side} {quantity} {symbol} @ {price}")
@@ -624,6 +623,32 @@ class AsyncTradingDatabase:
                 }
                 for row in rows
             ]
+
+    async def has_recent_buy_trade(self, symbol: str, seconds: int = 60) -> bool:
+        """
+        Check if a BUY trade for the symbol exists within the last N seconds.
+
+        Used to prevent duplicate BUY trades across strategy systems (main + pairs).
+
+        Args:
+            symbol: Stock symbol to check
+            seconds: Time window in seconds (default 60)
+
+        Returns:
+            True if a BUY trade exists within the time window
+        """
+        async with self.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT COUNT(*) FROM trades
+                WHERE symbol = ?
+                AND side = 'BUY'
+                AND timestamp > datetime('now', ? || ' seconds')
+                """,
+                (symbol, f"-{seconds}"),
+            )
+            row = await cursor.fetchone()
+            return row[0] > 0 if row else False
 
     async def get_recent_trades(self, limit: int = 100, symbol: Optional[str] = None) -> List[Dict]:
         """Get recent trades, optionally filtered by symbol."""

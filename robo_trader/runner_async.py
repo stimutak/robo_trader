@@ -1840,6 +1840,24 @@ class AsyncRunner:
                             data=df,
                         )
 
+                    # ADDITIONAL CHECK: Look for recent BUY trades (handles race conditions)
+                    # Position might not be updated yet if trade just happened
+                    recent_buy = await self.db.has_recent_buy_trade(symbol, seconds=120)
+                    if recent_buy:
+                        logger.warning(
+                            f"DUPLICATE BUY BLOCKED: {symbol} has recent BUY trade in last 120 seconds"
+                        )
+                        self._pending_orders.discard(symbol)
+                        return SymbolResult(
+                            symbol=symbol,
+                            signal=signal_value,
+                            price=price_float,
+                            quantity=0,
+                            executed=False,
+                            message="Duplicate buy blocked: recent BUY trade exists",
+                            data=df,
+                        )
+
                 try:
                     # Open long position
                     # Use advanced risk manager with Kelly sizing if enabled
@@ -2546,18 +2564,35 @@ class AsyncRunner:
                                 if pair and len(pair) == 2:
                                     symbol_a, symbol_b = pair[0], pair[1]
                                     # Skip if we already have significant positions in these symbols
+                                    # Check for existing positions (qty > 0, not > 100)
                                     has_position_a = (
                                         symbol_a in self.positions
-                                        and self.positions[symbol_a].quantity > 100
+                                        and self.positions[symbol_a].quantity > 0
                                     )
                                     has_position_b = (
                                         symbol_b in self.positions
-                                        and self.positions[symbol_b].quantity > 100
+                                        and self.positions[symbol_b].quantity > 0
                                     )
 
                                     if has_position_a or has_position_b:
                                         logger.info(
                                             f"Skipping pairs trade for {symbol_a}-{symbol_b}: already have positions"
+                                        )
+                                        continue
+
+                                    # CRITICAL: Check DB for recent BUY trades to prevent duplicates
+                                    # This catches trades from main strategy or previous pairs cycles
+                                    recent_buy_a = await self.db.has_recent_buy_trade(
+                                        symbol_a, seconds=120
+                                    )
+                                    recent_buy_b = await self.db.has_recent_buy_trade(
+                                        symbol_b, seconds=120
+                                    )
+
+                                    if recent_buy_a or recent_buy_b:
+                                        logger.warning(
+                                            f"DUPLICATE BLOCKED: Skipping pairs trade for {symbol_a}-{symbol_b}: "
+                                            f"recent BUY exists (A={recent_buy_a}, B={recent_buy_b})"
                                         )
                                         continue
 

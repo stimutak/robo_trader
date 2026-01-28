@@ -764,6 +764,9 @@ ENABLE_EXTENDED_HOURS=true   # Set to true to trade after 4:00 PM
 | `/api/equity-curve` overrides equity_history with P&L calc | Prefer equity_history when available, fallback only when empty | 2026-01-27 |
 | Database lock causes `update_position` to fail silently | Monitor position/trade mismatches, add retry logic | 2026-01-27 |
 | Runner stalls with no output for 25+ min | Restart with `./START_TRADER.sh`, check IBKR connection | 2026-01-27 |
+| Pairs trading bypasses duplicate protection | Add `has_recent_buy_trade()` check before pairs BUY orders | 2026-01-28 |
+| Pairs trading position check `> 100` instead of `> 0` | Check `quantity > 0` to block any existing position | 2026-01-28 |
+| Fresh AsyncRunner each cycle resets in-memory protection | Use DB-level checks (`has_recent_buy_trade`) that persist | 2026-01-28 |
 
 ---
 
