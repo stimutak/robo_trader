@@ -248,7 +248,7 @@ class AsyncTradingDatabase:
                 CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
-                    side TEXT NOT NULL,
+                    action TEXT NOT NULL,
                     quantity INTEGER NOT NULL,
                     price REAL NOT NULL,
                     slippage REAL DEFAULT 0,
@@ -401,7 +401,7 @@ class AsyncTradingDatabase:
         cursor = await conn.execute(
             """
             SELECT id, quantity, price FROM trades
-            WHERE symbol = ? AND side = 'BUY'
+            WHERE symbol = ? AND action = 'BUY'
             ORDER BY timestamp ASC
             """,
             (symbol,),
@@ -469,12 +469,13 @@ class AsyncTradingDatabase:
             if side.upper() in ("SELL", "BUY_TO_COVER"):
                 pnl = await self._calculate_fifo_pnl(conn, symbol, quantity, price)
 
+            notional = quantity * price
             await conn.execute(
                 """
-                INSERT INTO trades (symbol, side, quantity, price, slippage, commission, pnl)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO trades (symbol, action, quantity, price, notional, slippage, commission, pnl)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-                (symbol, side, quantity, price, slippage, commission, pnl),
+                (symbol, side, quantity, price, notional, slippage, commission, pnl),
             )
             await conn.commit()
 
@@ -655,7 +656,7 @@ class AsyncTradingDatabase:
                 """
                 SELECT COUNT(*) FROM trades
                 WHERE symbol = ?
-                AND side = 'BUY'
+                AND action = 'BUY'
                 AND timestamp > datetime('now', ? || ' seconds')
                 """,
                 (symbol, f"-{seconds}"),
@@ -669,7 +670,7 @@ class AsyncTradingDatabase:
             if symbol:
                 cursor = await conn.execute(
                     """
-                    SELECT symbol, side, quantity, price, slippage, commission, timestamp
+                    SELECT symbol, action, quantity, price, slippage, commission, timestamp
                     FROM trades
                     WHERE symbol = ?
                     ORDER BY timestamp DESC
@@ -680,7 +681,7 @@ class AsyncTradingDatabase:
             else:
                 cursor = await conn.execute(
                     """
-                    SELECT symbol, side, quantity, price, slippage, commission, timestamp
+                    SELECT symbol, action, quantity, price, slippage, commission, timestamp
                     FROM trades
                     ORDER BY timestamp DESC
                     LIMIT ?

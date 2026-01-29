@@ -5421,31 +5421,31 @@ def get_trades_OLD():
             async with db.get_connection() as conn:
                 if symbol:
                     query = """
-                        SELECT id, symbol, side, quantity, price, timestamp, 
-                               slippage, commission, 
+                        SELECT id, symbol, action, quantity, price, timestamp,
+                               slippage, commission,
                                quantity * price as notional,
-                               CASE 
-                                   WHEN side = 'BUY' THEN -quantity * price - commission
-                                   WHEN side = 'SELL' THEN quantity * price - commission
+                               CASE
+                                   WHEN action = 'BUY' THEN -quantity * price - commission
+                                   WHEN action = 'SELL' THEN quantity * price - commission
                                    ELSE 0
                                END as cash_impact
-                        FROM trades 
-                        WHERE symbol = ? 
+                        FROM trades
+                        WHERE symbol = ?
                         AND timestamp >= datetime('now', '-' || ? || ' days')
                         ORDER BY timestamp DESC
                     """
                     cursor = await conn.execute(query, (symbol, days))
                 else:
                     query = """
-                        SELECT id, symbol, side, quantity, price, timestamp, 
+                        SELECT id, symbol, action, quantity, price, timestamp,
                                slippage, commission,
                                quantity * price as notional,
-                               CASE 
-                                   WHEN side = 'BUY' THEN -quantity * price - commission
-                                   WHEN side = 'SELL' THEN quantity * price - commission
+                               CASE
+                                   WHEN action = 'BUY' THEN -quantity * price - commission
+                                   WHEN action = 'SELL' THEN quantity * price - commission
                                    ELSE 0
                                END as cash_impact
-                        FROM trades 
+                        FROM trades
                         WHERE timestamp >= datetime('now', '-' || ? || ' days')
                         ORDER BY timestamp DESC
                     """
