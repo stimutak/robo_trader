@@ -13,6 +13,7 @@ Validate trading-specific logic:
 ## Trading Logic Checks
 
 ### Risk Management
+Files: `robo_trader/risk/advanced_risk.py`, `robo_trader/risk/kelly_sizing.py`
 - Kelly criterion calculations
 - Position sizing within MAX_OPEN_POSITIONS
 - Stop loss percentage validation
@@ -20,10 +21,10 @@ Validate trading-specific logic:
 - Exposure percentage calculations
 
 ### Order Execution
-- Duplicate buy protection (4-layer check)
+- Duplicate buy protection (3-layer: cycle set + pending lock + DB check)
 - Order quantity validation
 - Price reasonableness checks
-- Extended hours handling
+- Extended hours handling (check `ENABLE_EXTENDED_HOURS` setting)
 
 ### Position Management
 - Position quantity accuracy (DB vs in-memory)

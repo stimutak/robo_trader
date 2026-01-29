@@ -24,8 +24,7 @@ Ensures code follows Python and project-specific style guidelines.
 
 ### Project-Specific Rules (from CLAUDE.md)
 - Always use `python3` not `python` on macOS
-- No `socket.connect_ex()` (creates zombies)
-- Use `lsof` for port checking
+- Use `lsof` for port checking (not socket.connect_ex)
 - Convert Decimal to float before database operations
 - Use `is_trading_allowed()` not `is_market_open()`
 
@@ -35,6 +34,9 @@ Ensures code follows Python and project-specific style guidelines.
 - No hardcoded credentials
 - No magic numbers without comments
 - No TODO comments in merged code
+- No `socket.connect_ex()` (creates zombie connections)
+- No `shell=True` in subprocess calls
+- No `os.system()` (use subprocess module)
 
 ## Output Format
 

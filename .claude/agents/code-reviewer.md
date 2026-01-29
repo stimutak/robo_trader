@@ -22,9 +22,11 @@ You are a senior code reviewer checking for:
 ### Security
 - No hardcoded credentials or API keys
 - SQL injection prevention (parameterized queries)
-- Command injection in subprocess calls
+- Command injection prevention (use `subprocess.run([...], shell=False)`)
+- No `shell=True` in subprocess calls
 - Input validation at system boundaries
 - Sensitive data masked in logs
+- No `socket.connect_ex()` for port checking (creates zombie connections)
 
 ### Performance
 - Efficient async patterns (no blocking in async code)

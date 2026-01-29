@@ -42,6 +42,11 @@ Creates detailed implementation plans before coding.
 
 ### Rollback Plan
 [How to undo if something goes wrong]
+
+**Trading-specific rollback:**
+- Database changes: Restore from backup made before migration
+- Position drift: Rebuild positions from trades table (see handoff docs)
+- Config changes: Revert .env and restart via `./START_TRADER.sh`
 ```
 
 ## Trading-Specific Planning
