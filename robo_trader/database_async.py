@@ -251,6 +251,7 @@ class AsyncTradingDatabase:
                     action TEXT NOT NULL,
                     quantity INTEGER NOT NULL,
                     price REAL NOT NULL,
+                    notional REAL DEFAULT 0,
                     slippage REAL DEFAULT 0,
                     commission REAL DEFAULT 0,
                     pnl REAL DEFAULT NULL,
@@ -259,11 +260,16 @@ class AsyncTradingDatabase:
             """
             )
 
-            # Add pnl column to existing tables (migration)
-            try:
-                await conn.execute("ALTER TABLE trades ADD COLUMN pnl REAL DEFAULT NULL")
-            except Exception:
-                pass  # Column already exists
+            # Migrations for existing tables
+            migrations = [
+                "ALTER TABLE trades ADD COLUMN pnl REAL DEFAULT NULL",
+                "ALTER TABLE trades ADD COLUMN notional REAL DEFAULT 0",
+            ]
+            for migration in migrations:
+                try:
+                    await conn.execute(migration)
+                except Exception:
+                    pass  # Column already exists
 
             # Account table
             await conn.execute(
@@ -383,10 +389,11 @@ class AsyncTradingDatabase:
         self, conn, symbol: str, sell_quantity: int, sell_price: float
     ) -> float:
         """
-        Calculate realized P&L for a SELL trade using FIFO matching.
+        Calculate realized P&L for a SELL trade using weighted average cost.
 
-        Matches sell quantity against oldest BUY trades for the same symbol
-        to calculate the realized profit/loss.
+        Note: Despite the name, this uses weighted average cost basis (not strict
+        FIFO lot matching) for simplicity. The average cost is calculated across
+        all BUY trades for the symbol.
 
         Args:
             conn: Database connection
@@ -469,7 +476,8 @@ class AsyncTradingDatabase:
             if side.upper() in ("SELL", "BUY_TO_COVER"):
                 pnl = await self._calculate_fifo_pnl(conn, symbol, quantity, price)
 
-            notional = quantity * price
+            # Ensure consistent float type for SQLite storage
+            notional = float(quantity) * float(price)
             await conn.execute(
                 """
                 INSERT INTO trades (symbol, action, quantity, price, notional, slippage, commission, pnl)
@@ -666,11 +674,15 @@ class AsyncTradingDatabase:
 
     async def get_recent_trades(self, limit: int = 100, symbol: Optional[str] = None) -> List[Dict]:
         """Get recent trades, optionally filtered by symbol."""
+        # Validate symbol if provided
+        if symbol:
+            symbol = DatabaseValidator.validate_symbol(symbol)
+
         async with self.get_connection() as conn:
             if symbol:
                 cursor = await conn.execute(
                     """
-                    SELECT symbol, action, quantity, price, slippage, commission, timestamp
+                    SELECT symbol, action, quantity, price, notional, slippage, commission, pnl, timestamp
                     FROM trades
                     WHERE symbol = ?
                     ORDER BY timestamp DESC
@@ -681,7 +693,7 @@ class AsyncTradingDatabase:
             else:
                 cursor = await conn.execute(
                     """
-                    SELECT symbol, action, quantity, price, slippage, commission, timestamp
+                    SELECT symbol, action, quantity, price, notional, slippage, commission, pnl, timestamp
                     FROM trades
                     ORDER BY timestamp DESC
                     LIMIT ?
@@ -693,12 +705,14 @@ class AsyncTradingDatabase:
             return [
                 {
                     "symbol": row[0],
-                    "side": row[1],
+                    "side": row[1],  # API uses 'side' for backward compatibility
                     "quantity": row[2],
                     "price": row[3],
-                    "slippage": row[4],
-                    "commission": row[5],
-                    "timestamp": row[6],
+                    "notional": row[4],
+                    "slippage": row[5],
+                    "commission": row[6],
+                    "pnl": row[7],
+                    "timestamp": row[8],
                 }
                 for row in rows
             ]
