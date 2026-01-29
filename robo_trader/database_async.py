@@ -631,12 +631,25 @@ class AsyncTradingDatabase:
         Used to prevent duplicate BUY trades across strategy systems (main + pairs).
 
         Args:
-            symbol: Stock symbol to check
-            seconds: Time window in seconds (default 60)
+            symbol: Stock symbol to check (validated against symbol format)
+            seconds: Time window in seconds (default 60, must be 1-86400)
 
         Returns:
             True if a BUY trade exists within the time window
+
+        Raises:
+            ValidationError: If symbol format is invalid
+            ValueError: If seconds is not a positive integer in valid range
         """
+        # Validate symbol for consistency with other methods
+        symbol = DatabaseValidator.validate_symbol(symbol)
+
+        # Validate seconds parameter - must be positive int in reasonable range
+        if not isinstance(seconds, int):
+            raise ValueError(f"seconds must be int, got {type(seconds).__name__}")
+        if seconds <= 0 or seconds > 86400:  # Max 24 hours
+            raise ValueError(f"seconds must be between 1 and 86400, got {seconds}")
+
         async with self.get_connection() as conn:
             cursor = await conn.execute(
                 """
