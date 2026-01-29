@@ -2564,6 +2564,19 @@ class AsyncRunner:
                                         )
                                         continue
 
+                                    # Check MAX_OPEN_POSITIONS limit before opening pairs trades
+                                    # Pairs trades open 2 positions, so check if we have room
+                                    current_position_count = len(
+                                        [p for p in self.positions.values() if p.quantity > 0]
+                                    )
+                                    max_positions = self.cfg.risk.max_open_positions
+                                    if current_position_count + 2 > max_positions:
+                                        logger.warning(
+                                            f"POSITION LIMIT: Skipping pairs trade for {symbol_a}-{symbol_b}: "
+                                            f"would exceed max positions ({current_position_count}+2 > {max_positions})"
+                                        )
+                                        continue
+
                                     # CRITICAL: Check DB for recent BUY trades to prevent duplicates
                                     # This catches trades from main strategy or previous pairs cycles
                                     recent_buy_a = await self.db.has_recent_buy_trade(
@@ -2577,6 +2590,21 @@ class AsyncRunner:
                                         logger.warning(
                                             f"DUPLICATE BLOCKED: Skipping pairs trade for {symbol_a}-{symbol_b}: "
                                             f"recent BUY exists (A={recent_buy_a}, B={recent_buy_b})"
+                                        )
+                                        continue
+
+                                    # Also check for recent SELL trades to prevent rapid position churn
+                                    recent_sell_a = await self.db.has_recent_sell_trade(
+                                        symbol_a, seconds=120
+                                    )
+                                    recent_sell_b = await self.db.has_recent_sell_trade(
+                                        symbol_b, seconds=120
+                                    )
+
+                                    if recent_sell_a or recent_sell_b:
+                                        logger.warning(
+                                            f"DUPLICATE BLOCKED: Skipping pairs trade for {symbol_a}-{symbol_b}: "
+                                            f"recent SELL exists (A={recent_sell_a}, B={recent_sell_b})"
                                         )
                                         continue
 

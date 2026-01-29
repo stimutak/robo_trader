@@ -767,6 +767,9 @@ ENABLE_EXTENDED_HOURS=true   # Set to true to trade after 4:00 PM
 | Pairs trading bypasses duplicate protection | Add `has_recent_buy_trade()` check before pairs BUY orders | 2026-01-28 |
 | Pairs trading position check `> 100` instead of `> 0` | Check `quantity > 0` to block any existing position | 2026-01-28 |
 | Fresh AsyncRunner each cycle resets in-memory protection | Use DB-level checks (`has_recent_buy_trade`) that persist | 2026-01-28 |
+| DB column `action` vs `side` mismatch | `trading_data.db` uses `side`, not `action` - check schema first | 2026-01-29 |
+| Pairs trading bypasses MAX_OPEN_POSITIONS | Add position count check before opening pairs trades | 2026-01-29 |
+| Missing parameter validation on new DB methods | Add symbol validation + seconds bounds check (1-86400) | 2026-01-29 |
 
 ---
 
