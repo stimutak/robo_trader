@@ -825,12 +825,36 @@ User:           git push
 | `/shared-knowledge` | Update CLAUDE.md with new learnings | YES |
 | `/retrospective` | Extract session learnings, update CLAUDE.md | YES |
 
+### When to Suggest Commands (Proactive Guidance)
+
+**Claude should proactively suggest these commands at the right time:**
+
+| Trigger | Suggest | Why |
+|---------|---------|-----|
+| After implementing a feature | `/verify` | Catch bugs before review |
+| After fixing a bug | `/verify` | Confirm fix works |
+| Before committing significant changes | `/review` or `/two-phase-review` | Quality gate |
+| After a session with errors/fixes | `/retrospective` | Capture learnings |
+| User says "commit" or "done" | `/test-and-commit` | Tests + proper commit |
+| Starting trading system | `/verify-trading` | Ensure system health |
+| After debugging production issue | `/oncall-debug` then `/retrospective` | Document findings |
+
+**Example suggestions:**
+
+After implementing: *"I've completed the feature. Run `/verify` to validate, then `/review` for a quality check."*
+
+After fixing bug: *"Fixed the issue. Run `/verify` to confirm the fix works."*
+
+Session with mistakes: *"We encountered some issues this session. Consider running `/retrospective` to capture learnings for CLAUDE.md."*
+
 ### CRITICAL: DO NOT Auto-Commit
 
 **After completing work, Claude must:**
 1. Report what was changed
-2. Say: "Run `/review` in REVIEW tab, then `/test-and-commit` in TEST tab"
-3. **STOP** - wait for user to run the slash commands
+2. Suggest verification: "Run `/verify` to validate the changes"
+3. Suggest review: "Then run `/review` (or `/two-phase-review` for thorough check)"
+4. Suggest commit: "Finally `/test-and-commit` when ready"
+5. **STOP** - wait for user to run the slash commands
 
 **Claude CAN commit only when:**
 - User runs `/commit` or `/test-and-commit`
