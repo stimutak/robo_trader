@@ -7,6 +7,26 @@ from typing import Optional, Tuple
 
 import pytz
 
+# Eastern timezone constant
+_EASTERN = pytz.timezone("US/Eastern")
+
+
+def _normalize_to_eastern(dt: Optional[datetime]) -> datetime:
+    """Normalize datetime to Eastern timezone.
+
+    Args:
+        dt: Datetime to normalize (None returns current Eastern time)
+
+    Returns:
+        Timezone-aware datetime in US/Eastern
+    """
+    if dt is None:
+        return datetime.now(_EASTERN)
+    if dt.tzinfo is None:
+        return _EASTERN.localize(dt)
+    return dt.astimezone(_EASTERN)
+
+
 # Early close days (1:00 PM ET) - month, day tuples
 # Note: These vary by year - check NYSE calendar for specifics
 EARLY_CLOSE_DAYS = [
@@ -228,14 +248,7 @@ def is_market_open(dt: Optional[datetime] = None) -> bool:
     Returns:
         True if market is open, False otherwise
     """
-    if dt is None:
-        dt = datetime.now(pytz.timezone("US/Eastern"))
-    elif dt.tzinfo is None:
-        # Assume naive datetime is in Eastern time
-        dt = pytz.timezone("US/Eastern").localize(dt)
-    else:
-        # Convert to Eastern time
-        dt = dt.astimezone(pytz.timezone("US/Eastern"))
+    dt = _normalize_to_eastern(dt)
 
     # Check if it's a weekday (Monday=0, Sunday=6)
     if dt.weekday() >= 5:  # Saturday or Sunday
@@ -266,12 +279,7 @@ def is_extended_hours(dt: Optional[datetime] = None) -> bool:
     Returns:
         True if in extended hours, False otherwise
     """
-    if dt is None:
-        dt = datetime.now(pytz.timezone("US/Eastern"))
-    elif dt.tzinfo is None:
-        dt = pytz.timezone("US/Eastern").localize(dt)
-    else:
-        dt = dt.astimezone(pytz.timezone("US/Eastern"))
+    dt = _normalize_to_eastern(dt)
 
     # Check if it's a weekday
     if dt.weekday() >= 5:  # Weekend
@@ -307,12 +315,7 @@ def get_market_session(dt: Optional[datetime] = None) -> str:
     Returns:
         One of: "regular", "pre-market", "after-hours", "closed"
     """
-    if dt is None:
-        dt = datetime.now(pytz.timezone("US/Eastern"))
-    elif dt.tzinfo is None:
-        dt = pytz.timezone("US/Eastern").localize(dt)
-    else:
-        dt = dt.astimezone(pytz.timezone("US/Eastern"))
+    dt = _normalize_to_eastern(dt)
 
     # Check weekend
     if dt.weekday() >= 5:

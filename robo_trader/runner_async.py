@@ -105,11 +105,7 @@ ENABLE_EXTENDED_HOURS = os.getenv("ENABLE_EXTENDED_HOURS", "false").lower() in (
 
 def is_trading_allowed() -> bool:
     """Check if trading is currently allowed (regular hours or extended hours if enabled)."""
-    if is_market_open():
-        return True
-    if ENABLE_EXTENDED_HOURS and is_extended_hours():
-        return True
-    return False
+    return is_market_open() or (ENABLE_EXTENDED_HOURS and is_extended_hours())
 
 
 class AsyncRunner:
@@ -1305,6 +1301,28 @@ class AsyncRunner:
             del self.market_data_cache[oldest_symbol]
             logger.debug(f"Evicted {oldest_symbol} from market data cache")
 
+    def _blocked_result(
+        self,
+        symbol: str,
+        signal: int,
+        price: float,
+        message: str,
+        df: Optional[pd.DataFrame] = None,
+    ) -> SymbolResult:
+        """Create a SymbolResult for blocked/skipped trades.
+
+        Centralizes the creation of "no action" results to reduce code duplication.
+        """
+        return SymbolResult(
+            symbol=symbol,
+            signal=signal,
+            price=price,
+            quantity=0,
+            executed=False,
+            message=message,
+            data=df,
+        )
+
     async def process_symbol(self, symbol: str) -> SymbolResult:
         """Process a single symbol - fetch data, generate signal, execute if needed."""
         # Fetch and store market data
@@ -1701,14 +1719,12 @@ class AsyncRunner:
                     logger.warning(
                         f"DUPLICATE BUY BLOCKED: {symbol} already had BUY attempted this cycle"
                     )
-                    return SymbolResult(
-                        symbol=symbol,
-                        signal=signal_value,
-                        price=price_float,
-                        quantity=0,
-                        executed=False,
-                        message="Duplicate buy blocked: already attempted this cycle",
-                        data=df,
+                    return self._blocked_result(
+                        symbol,
+                        signal_value,
+                        price_float,
+                        "Duplicate buy blocked: already attempted this cycle",
+                        df,
                     )
                 # CRITICAL: Mark as attempted IMMEDIATELY to prevent any other task from proceeding
                 self._cycle_executed_buys.add(symbol)
@@ -1725,15 +1741,8 @@ class AsyncRunner:
                         logger.error(
                             f"KILL SWITCH ACTIVE - Order blocked for {symbol} BUY_TO_COVER"
                         )
-                        message = f"Kill switch active - trading halted"
-                        return SymbolResult(
-                            symbol=symbol,
-                            signal=0,  # No signal computed when kill switch active
-                            price=price_float,
-                            quantity=0,
-                            executed=False,
-                            message=message,
-                            data=df,
+                        return self._blocked_result(
+                            symbol, 0, price_float, "Kill switch active - trading halted", df
                         )
 
                 res = await self._place_order_with_circuit_breaker(
@@ -1788,28 +1797,24 @@ class AsyncRunner:
                 async with self._pending_orders_lock:
                     if symbol in self._pending_orders:
                         logger.warning(f"DUPLICATE BUY BLOCKED: {symbol} already has pending order")
-                        return SymbolResult(
-                            symbol=symbol,
-                            signal=signal_value,
-                            price=price_float,
-                            quantity=0,
-                            executed=False,
-                            message="Duplicate buy blocked: order already pending",
-                            data=df,
+                        return self._blocked_result(
+                            symbol,
+                            signal_value,
+                            price_float,
+                            "Duplicate buy blocked: order already pending",
+                            df,
                         )
                     # Re-check position inside lock to prevent TOCTOU race
                     if symbol in self.positions:
                         logger.info(
                             f"Position already exists for {symbol} (race condition prevented)"
                         )
-                        return SymbolResult(
-                            symbol=symbol,
-                            signal=signal_value,
-                            price=price_float,
-                            quantity=0,
-                            executed=False,
-                            message="Buy signal: Already have long position",
-                            data=df,
+                        return self._blocked_result(
+                            symbol,
+                            signal_value,
+                            price_float,
+                            "Buy signal: Already have long position",
+                            df,
                         )
                     # Mark as pending BEFORE releasing lock
                     self._pending_orders.add(symbol)
@@ -1830,14 +1835,12 @@ class AsyncRunner:
                             f"DUPLICATE BUY BLOCKED: {symbol} already has DB position (qty={db_position.get('quantity')})"
                         )
                         self._pending_orders.discard(symbol)
-                        return SymbolResult(
-                            symbol=symbol,
-                            signal=signal_value,
-                            price=price_float,
-                            quantity=0,
-                            executed=False,
-                            message=f"Duplicate buy blocked: DB position exists (qty={db_position.get('quantity')})",
-                            data=df,
+                        return self._blocked_result(
+                            symbol,
+                            signal_value,
+                            price_float,
+                            f"Duplicate buy blocked: DB position exists (qty={db_position.get('quantity')})",
+                            df,
                         )
 
                     # ADDITIONAL CHECK: Look for recent BUY trades (handles race conditions)
@@ -1848,14 +1851,12 @@ class AsyncRunner:
                             f"DUPLICATE BUY BLOCKED: {symbol} has recent BUY trade in last 120 seconds"
                         )
                         self._pending_orders.discard(symbol)
-                        return SymbolResult(
-                            symbol=symbol,
-                            signal=signal_value,
-                            price=price_float,
-                            quantity=0,
-                            executed=False,
-                            message="Duplicate buy blocked: recent BUY trade exists",
-                            data=df,
+                        return self._blocked_result(
+                            symbol,
+                            signal_value,
+                            price_float,
+                            "Duplicate buy blocked: recent BUY trade exists",
+                            df,
                         )
 
                 try:
@@ -1877,10 +1878,12 @@ class AsyncRunner:
                             logger.warning(
                                 f"Trade blocked by kill switch for {symbol}: {sizing_result['block_reason']}"
                             )
-                            executed = False
-                            message = f"Blocked: {sizing_result['block_reason']}"
-                            return SymbolResult(
-                                symbol, signal_value, price_float, 0, executed, message, df
+                            return self._blocked_result(
+                                symbol,
+                                signal_value,
+                                price_float,
+                                f"Blocked: {sizing_result['block_reason']}",
+                                df,
                             )
 
                         qty = sizing_result["position_size"]
@@ -1929,14 +1932,12 @@ class AsyncRunner:
                         logger.info(
                             f"Skipping {symbol}: position value ${position_value:.0f} below minimum ${min_position_value:.0f}"
                         )
-                        return SymbolResult(
-                            symbol=symbol,
-                            signal=signal_value,
-                            price=price_float,
-                            quantity=0,
-                            executed=False,
-                            message=f"Position value ${position_value:.0f} below min ${min_position_value:.0f}",
-                            data=df,
+                        return self._blocked_result(
+                            symbol,
+                            signal_value,
+                            price_float,
+                            f"Position value ${position_value:.0f} below min ${min_position_value:.0f}",
+                            df,
                         )
 
                     ok, msg = self.risk.validate_order(
@@ -1954,15 +1955,12 @@ class AsyncRunner:
                         if self.advanced_risk and hasattr(self.advanced_risk, "kill_switch"):
                             if self.advanced_risk.kill_switch.triggered:
                                 logger.error(f"KILL SWITCH ACTIVE - Order blocked for {symbol} BUY")
-                                message = f"Kill switch active - trading halted"
-                                return SymbolResult(
-                                    symbol=symbol,
-                                    signal=0,  # No signal computed when kill switch active
-                                    price=price_float,
-                                    quantity=0,
-                                    executed=False,
-                                    message=message,
-                                    data=df,
+                                return self._blocked_result(
+                                    symbol,
+                                    0,
+                                    price_float,
+                                    "Kill switch active - trading halted",
+                                    df,
                                 )
 
                         res = await self._place_order_with_circuit_breaker(
@@ -2073,15 +2071,8 @@ class AsyncRunner:
                     if self.advanced_risk and hasattr(self.advanced_risk, "kill_switch"):
                         if self.advanced_risk.kill_switch.triggered:
                             logger.error(f"KILL SWITCH ACTIVE - Order blocked for {symbol} SELL")
-                            message = f"Kill switch active - trading halted"
-                            return SymbolResult(
-                                symbol=symbol,
-                                signal=0,  # No signal computed when kill switch active
-                                price=price_float,
-                                quantity=0,
-                                executed=False,
-                                message=message,
-                                data=df,
+                            return self._blocked_result(
+                                symbol, 0, price_float, "Kill switch active - trading halted", df
                             )
 
                     res = await self._place_order_with_circuit_breaker(
@@ -2181,15 +2172,8 @@ class AsyncRunner:
                             logger.error(
                                 f"KILL SWITCH ACTIVE - Order blocked for {symbol} SELL_SHORT"
                             )
-                            message = f"Kill switch active - trading halted"
-                            return SymbolResult(
-                                symbol=symbol,
-                                signal=0,  # No signal computed when kill switch active
-                                price=price_float,
-                                quantity=0,
-                                executed=False,
-                                message=message,
-                                data=df,
+                            return self._blocked_result(
+                                symbol, 0, price_float, "Kill switch active - trading halted", df
                             )
 
                     res = await self._place_order_with_circuit_breaker(
