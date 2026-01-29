@@ -2,6 +2,8 @@
 
 Based on Boris Cherny's workflow for maximum coding efficiency.
 
+> **See also:** [MULTI_AGENT_WORKFLOW.md](./MULTI_AGENT_WORKFLOW.md) for comprehensive workflow patterns, slash commands, and verification strategies.
+
 ## Overview
 
 Run 5+ Claude Code instances in parallel to dramatically increase development speed. While one agent runs tests, another refactors code, and a third reviews changes.
@@ -213,3 +215,61 @@ If Claude seems confused about recent changes:
 - Check git status in that terminal
 - Refresh with `/clear` command
 - Re-read relevant files
+
+---
+
+## Hooks Configuration (Advanced)
+
+Add to `.claude/settings.json` for automation:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "command": "venv/bin/python3 -m black \"$FILE_PATH\" --quiet || true"
+      }
+    ],
+    "Stop": [
+      {
+        "command": "echo 'Done.' && venv/bin/python3 -m pytest tests/ -q --tb=no || true"
+      }
+    ]
+  }
+}
+```
+
+### Hook Events
+
+| Event | When It Fires | Use Case |
+|-------|---------------|----------|
+| `PreToolUse` | Before tool calls | Block dangerous commands |
+| `PostToolUse` | After tool calls | Auto-format, auto-lint |
+| `Stop` | When agent finishes | Final verification |
+| `SubagentStop` | When subagent finishes | Quality gates |
+
+---
+
+## Context Management
+
+### Document & Clear Pattern
+
+For complex, multi-step tasks:
+
+1. Have Claude dump progress to `handoff/HANDOFF_<date>_<topic>.md`
+2. Use `/clear` to reset context
+3. New session reads the handoff and continues
+
+### When to Clear
+
+- Starting a new, unrelated task
+- Context feels stale or confused
+- After completing a major feature
+
+---
+
+## Further Reading
+
+- [MULTI_AGENT_WORKFLOW.md](./MULTI_AGENT_WORKFLOW.md) - Comprehensive workflow patterns
+- [Boris Cherny's Workflow](https://paddo.dev/blog/how-boris-uses-claude-code/)
