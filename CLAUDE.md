@@ -814,6 +814,8 @@ User:           git push
 | Command | What It Does | Commits? |
 |---------|--------------|----------|
 | `/review` | 6 parallel subagents review for bugs, security, style | NO |
+| `/two-phase-review` | Review + challenger phase (filters 20-40% false positives) | NO |
+| `/verify` | Run verification loop (tests, lint, trading checks) | NO |
 | `/test-and-commit` | Run pytest, fix failures, then commit | YES |
 | `/commit` | Quick commit with proper message format | YES |
 | `/pr` | Full PR workflow (tests + lint + PR) | YES |
@@ -821,6 +823,7 @@ User:           git push
 | `/oncall-debug` | Systematic production debugging | NO |
 | `/code-simplifier` | Review and simplify recent code | NO |
 | `/shared-knowledge` | Update CLAUDE.md with new learnings | YES |
+| `/retrospective` | Extract session learnings, update CLAUDE.md | YES |
 
 ### CRITICAL: DO NOT Auto-Commit
 
@@ -877,6 +880,8 @@ This project uses a Boris Cherny-inspired multi-agent workflow with trading-spec
 | Command | Purpose |
 |---------|---------|
 | `/review` | Multi-agent code review (6 parallel subagents) |
+| `/two-phase-review` | Review + challenge phase (Boris Cherny method, filters false positives) |
+| `/verify` | Verification loop (2-3x quality improvement) |
 | `/test-and-commit` | Run tests, then commit if passing |
 | `/commit` | Quick commit with proper format |
 | `/pr` | Full PR workflow |
@@ -884,6 +889,13 @@ This project uses a Boris Cherny-inspired multi-agent workflow with trading-spec
 | `/oncall-debug` | Production debugging workflow |
 | `/code-simplifier` | Post-implementation cleanup |
 | `/shared-knowledge` | Update CLAUDE.md with new learnings |
+| `/retrospective` | Extract session learnings, update common mistakes |
+
+### Skills (`.claude/skills/`)
+
+| Skill | Purpose |
+|-------|---------|
+| `verify-trading` | Full verification with Python script for automated checks |
 
 ### Two-Phase Review Loop
 
@@ -901,11 +913,32 @@ Phase 2: Challenge (Filter)
 
 ### Recommended Workflows
 
-**New Features:** `/plan` → implement → `/verify-trading` → `/review` → `/test-and-commit`
+**New Features:**
+```
+/plan → implement → /verify → /two-phase-review → /test-and-commit
+```
 
-**Bug Fixes:** fix → `/verify-trading` → `/review` → `/test-and-commit`
+**Bug Fixes:**
+```
+fix → /verify → /review → /test-and-commit
+```
 
-**Code Quality:** `/review` → fix issues → `/shared-knowledge` → `/commit`
+**Code Quality:**
+```
+/two-phase-review → fix confirmed issues → /retrospective → /commit
+```
+
+**Fast Iteration:**
+```
+/test-and-commit  # Parallel verify + auto-commit if passing
+```
+
+### Hooks (Auto-Run)
+
+| Hook | Trigger | Action |
+|------|---------|--------|
+| `PostToolUse` | After Edit/Write | Auto-format with black + isort |
+| `Stop` | Agent finishes | Run pytest verification |
 
 ### Advanced Patterns (Beyond Standard Guides)
 
