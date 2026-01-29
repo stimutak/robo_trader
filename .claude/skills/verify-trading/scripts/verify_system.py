@@ -12,8 +12,26 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Change to project root
-PROJECT_ROOT = Path(__file__).parent.parent.parent.parent.parent
+
+# Find project root by searching for marker files
+def find_project_root() -> Path:
+    """Find project root by looking for marker files (.git, pyproject.toml, CLAUDE.md)."""
+    current = Path(__file__).resolve().parent
+    markers = [".git", "pyproject.toml", "CLAUDE.md"]
+
+    for _ in range(10):  # Max 10 levels up
+        for marker in markers:
+            if (current / marker).exists():
+                return current
+        if current.parent == current:  # Reached filesystem root
+            break
+        current = current.parent
+
+    # Fallback to old method if markers not found
+    return Path(__file__).parent.parent.parent.parent.parent
+
+
+PROJECT_ROOT = find_project_root()
 os.chdir(PROJECT_ROOT)
 
 # Add project root to Python path
@@ -65,8 +83,8 @@ def check_zombies() -> dict:
     code, output = run_cmd("lsof -nP -iTCP:4002 -sTCP:CLOSE_WAIT 2>/dev/null | wc -l")
 
     try:
-        count = int(output.strip())
-    except ValueError:
+        count = int(output.strip()) if output and output.strip() else 0
+    except (ValueError, AttributeError):
         count = 0
 
     return {"status": "pass" if count == 0 else "fail", "count": count}
@@ -79,9 +97,13 @@ def check_risk_params() -> dict:
     if not env_path.exists():
         return {"status": "fail", "error": ".env file not found"}
 
-    env_content = env_path.read_text()
+    try:
+        env_content = env_path.read_text()
+    except (PermissionError, UnicodeDecodeError, OSError) as e:
+        return {"status": "fail", "error": f"Cannot read .env: {e}"}
 
-    required = ["MAX_OPEN_POSITIONS", "STOP_LOSS_PERCENT", "EXECUTION_MODE"]
+    # Use actual env var names from .env file
+    required = ["RISK_MAX_OPEN_POSITIONS", "STOP_LOSS_PERCENT", "EXECUTION_MODE"]
     found = {}
 
     for param in required:
