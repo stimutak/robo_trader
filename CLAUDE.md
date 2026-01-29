@@ -817,6 +817,7 @@ User:           git push
 | `/verify-trading` | Check Gateway, zombies, risk params | NO |
 | `/oncall-debug` | Systematic production debugging | NO |
 | `/code-simplifier` | Review and simplify recent code | NO |
+| `/shared-knowledge` | Update CLAUDE.md with new learnings | YES |
 
 ### CRITICAL: DO NOT Auto-Commit
 
@@ -840,6 +841,75 @@ handoff/HANDOFF_<date>_<topic>.md
 # Target Claude reads:
 Read handoff/LATEST_HANDOFF.md
 ```
+
+---
+
+## Multi-Agent Development Environment
+
+This project uses a Boris Cherny-inspired multi-agent workflow with trading-specific adaptations.
+
+### Philosophy
+
+1. **Parallel beats Sequential** - Run multiple agents simultaneously for faster review
+2. **Specialization beats Generalization** - Each agent focuses on one concern
+3. **Verification is Critical** - Always give Claude a way to verify its work
+4. **Two-Phase Loop** - Initial review + challenger filters false positives
+5. **Shared Knowledge** - Update CLAUDE.md when mistakes are discovered
+
+### Available Subagents (`.claude/agents/`)
+
+| Agent | Purpose |
+|-------|---------|
+| `code-reviewer` | Quality, security, maintainability reviews |
+| `bug-finder` | Bugs, edge cases, race conditions |
+| `style-checker` | Style guide compliance (PEP 8 + project rules) |
+| `verifier` | End-to-end verification and testing |
+| `trading-validator` | Trading logic, risk management, position tracking |
+| `verification-challenger` | Filters false positives from other agents |
+| `planner` | Implementation planning before coding |
+| `parallel-coordinator` | Multi-agent orchestration |
+
+### Slash Commands (`.claude/commands/`)
+
+| Command | Purpose |
+|---------|---------|
+| `/review` | Multi-agent code review (6 parallel subagents) |
+| `/test-and-commit` | Run tests, then commit if passing |
+| `/commit` | Quick commit with proper format |
+| `/pr` | Full PR workflow |
+| `/verify-trading` | Trading system health check |
+| `/oncall-debug` | Production debugging workflow |
+| `/code-simplifier` | Post-implementation cleanup |
+| `/shared-knowledge` | Update CLAUDE.md with new learnings |
+
+### Two-Phase Review Loop
+
+```
+Phase 1: Fan-Out (Parallel)
+├── code-reviewer       → Quality findings
+├── bug-finder          → Bug findings
+├── style-checker       → Style findings
+├── trading-validator   → Trading logic findings
+└── verifier            → Test execution
+
+Phase 2: Challenge (Filter)
+└── verification-challenger → Confirms real issues, removes false positives
+```
+
+### Recommended Workflows
+
+**New Features:** `/plan` → implement → `/verify-trading` → `/review` → `/test-and-commit`
+
+**Bug Fixes:** fix → `/verify-trading` → `/review` → `/test-and-commit`
+
+**Code Quality:** `/review` → fix issues → `/shared-knowledge` → `/commit`
+
+### Advanced Patterns (Beyond Standard Guides)
+
+1. **Atomic Handoff**: Date-stamped topic-specific handoffs prevent context loss
+2. **Common Mistakes Table**: RAG-like pattern prevents repeated errors
+3. **Prohibition vs Permission Model**: Three-tier action classification survives prompt injection
+4. **Regime-Aware Decisions**: Trading logic adapts to market context
 
 ---
 
