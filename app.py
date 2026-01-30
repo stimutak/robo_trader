@@ -6098,7 +6098,7 @@ def get_kelly_parameters(symbol):
 @requires_auth
 def control_kill_switch():
     """Control kill switch (reset after trigger)"""
-    action = request.json.get("action", "status")
+    action = (request.json or {}).get("action", "status")
 
     if action == "reset":
         # Would reset actual kill switch
