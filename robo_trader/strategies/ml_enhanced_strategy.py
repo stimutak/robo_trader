@@ -440,6 +440,20 @@ class MLEnhancedStrategy(Strategy):
             # Normal conditions
             disagreement_threshold = min(base_threshold, 0.70)
 
+        # Check if MTF has a valid combined signal
+        if mtf_signal.combined_signal is None:
+            # MTF couldn't determine direction (evenly split signals)
+            # Fall back to ML signal if confidence is high enough
+            if ml_signal.confidence > disagreement_threshold:
+                logger.info(
+                    f"MTF undecided for {ml_signal.symbol}, using ML signal "
+                    f"(conf={ml_signal.confidence:.2f})"
+                )
+                final_signal = ml_signal
+                final_signal.features["signal_resolution"] = "ml_only_mtf_undecided"
+                return final_signal
+            return None
+
         # Check if signals agree
         if ml_signal.action != mtf_signal.combined_signal.action:
             # Signals disagree - use adaptive threshold instead of fixed 0.8

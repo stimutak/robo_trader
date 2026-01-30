@@ -296,6 +296,10 @@ class CointegrationPairsStrategy:
 
             # Calculate current spread and z-score
             current_spread = price_a - pair_stats.hedge_ratio * price_b
+            # Guard against division by zero when spread is constant
+            if pair_stats.spread_std == 0 or pair_stats.spread_std < 1e-10:
+                logger.warning(f"Spread std is zero for {pair_key}, skipping")
+                continue
             z_score = (current_spread - pair_stats.spread_mean) / pair_stats.spread_std
 
             # Check for signals with ML enhancement

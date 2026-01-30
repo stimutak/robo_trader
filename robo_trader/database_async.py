@@ -405,10 +405,11 @@ class AsyncTradingDatabase:
             Realized P&L (positive = profit, negative = loss)
         """
         # Get all BUY trades for this symbol, ordered by timestamp (FIFO)
+        # Note: column is 'action' not 'side' per schema definition
         cursor = await conn.execute(
             """
             SELECT id, quantity, price FROM trades
-            WHERE symbol = ? AND side = 'BUY'
+            WHERE symbol = ? AND action = 'BUY'
             ORDER BY timestamp ASC
             """,
             (symbol,),

@@ -8,12 +8,15 @@ and API key management for secure access to trading operations.
 import hashlib
 import hmac
 import json
+import logging
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Set
+
+logger = logging.getLogger(__name__)
 
 try:
     import jwt
@@ -280,10 +283,22 @@ class AuthManager:
         return user
 
     def verify_totp(self, secret: str, code: str) -> bool:
-        """Verify TOTP code (simplified - use pyotp in production)."""
-        # This is a placeholder - use pyotp library in production
-        # For now, accept any 6-digit code for testing
-        return len(code) == 6 and code.isdigit()
+        """Verify TOTP code using pyotp library."""
+        if not code or len(code) != 6 or not code.isdigit():
+            return False
+
+        try:
+            import pyotp
+
+            totp = pyotp.TOTP(secret)
+            # valid_window=1 allows 1 period (30s) before/after for clock drift
+            return totp.verify(code, valid_window=1)
+        except ImportError:
+            logger.error("pyotp not installed - TOTP verification unavailable")
+            return False
+        except Exception as e:
+            logger.error(f"TOTP verification error: {e}")
+            return False
 
     def create_token(self, user: User) -> str:
         """Create JWT token for user."""

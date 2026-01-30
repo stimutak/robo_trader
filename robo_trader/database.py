@@ -50,7 +50,7 @@ class TradingDatabase:
 
     def save_market_data(self, symbol: str, data: Dict[str, Any]):
         """Save market data."""
-        return self._run_async(self.async_db.save_market_data(symbol, data))
+        return self._run_async(self.async_db.store_market_data(symbol, data))
 
     def get_latest_market_data(self, symbol: str, limit: int = 100) -> List[Dict]:
         """Get latest market data."""
@@ -58,7 +58,7 @@ class TradingDatabase:
 
     def save_trade(self, trade_data: Dict[str, Any]):
         """Save a trade."""
-        return self._run_async(self.async_db.save_trade(trade_data))
+        return self._run_async(self.async_db.record_trade(**trade_data))
 
     def get_positions(self) -> List[Dict]:
         """Get all positions."""
@@ -74,7 +74,7 @@ class TradingDatabase:
 
     def update_account_info(self, account_data: Dict[str, Any]):
         """Update account info."""
-        return self._run_async(self.async_db.update_account_info(account_data))
+        return self._run_async(self.async_db.update_account(**account_data))
 
     def __enter__(self):
         """Context manager entry."""
