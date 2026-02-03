@@ -1366,15 +1366,16 @@ HTML_TEMPLATE = """
                             <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Qty</th>
                             <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Price</th>
                             <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Notional</th>
+                            <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">P&L</th>
                         </tr>
                     </thead>
                     <tbody id="trades-table">
-                        <tr><td colspan="6" style="padding: 20px; text-align: center; color: #666;">Loading...</td></tr>
+                        <tr><td colspan="7" style="padding: 20px; text-align: center; color: #666;">Loading...</td></tr>
                     </tbody>
                 </table>
             </div>
         </div>
-        
+
         <div id="logs-tab" class="tab-content" style="display: none;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
                 <h3 style="color: #ffa500; margin: 0;">📋 System Logs</h3>
@@ -1934,6 +1935,10 @@ HTML_TEMPLATE = """
                         }
                         const sideColor = trade.side === 'BUY' ? '#4ade80' : '#f87171';
                         const sideBg = trade.side === 'BUY' ? '#238636' : '#da3633';
+                        // P&L display - only show for SELL trades (BUY has no realized P&L)
+                        const pnl = trade.pnl || 0;
+                        const pnlColor = pnl >= 0 ? '#4ade80' : '#f87171';
+                        const pnlDisplay = trade.side === 'SELL' ? `<span style="color: ${pnlColor}; font-weight: 500;">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(0)}</span>` : '<span style="color: #6b7280;">-</span>';
                         return `
                             <tr style="border-bottom: 1px solid #21262d;">
                                 <td style="padding: 6px 10px; color: #8b949e;">${time}</td>
@@ -1942,16 +1947,17 @@ HTML_TEMPLATE = """
                                 <td style="padding: 6px 10px; text-align: right;">${trade.quantity}</td>
                                 <td style="padding: 6px 10px; text-align: right;">$${trade.price.toFixed(2)}</td>
                                 <td style="padding: 6px 10px; text-align: right;">$${trade.notional.toFixed(0)}</td>
+                                <td style="padding: 6px 10px; text-align: right;">${pnlDisplay}</td>
                             </tr>
                         `;
                     }).join('');
                 } else {
-                    tbody.innerHTML = '<tr><td colspan="6" style="padding: 20px; text-align: center; color: #666;">No trades found</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="7" style="padding: 20px; text-align: center; color: #666;">No trades found</td></tr>';
                 }
             } catch (error) {
                 console.error('Error loading trades:', error);
                 document.getElementById('trades-table').innerHTML =
-                    '<tr><td colspan="6" style="padding: 20px; text-align: center; color: #f87171;">Error loading trades</td></tr>';
+                    '<tr><td colspan="7" style="padding: 20px; text-align: center; color: #f87171;">Error loading trades</td></tr>';
             }
         }
         

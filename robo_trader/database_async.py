@@ -248,7 +248,7 @@ class AsyncTradingDatabase:
                 CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
-                    action TEXT NOT NULL,
+                    side TEXT NOT NULL,
                     quantity INTEGER NOT NULL,
                     price REAL NOT NULL,
                     notional REAL DEFAULT 0,
@@ -405,11 +405,10 @@ class AsyncTradingDatabase:
             Realized P&L (positive = profit, negative = loss)
         """
         # Get all BUY trades for this symbol, ordered by timestamp (FIFO)
-        # Note: column is 'action' not 'side' per schema definition
         cursor = await conn.execute(
             """
             SELECT id, quantity, price FROM trades
-            WHERE symbol = ? AND action = 'BUY'
+            WHERE symbol = ? AND side = 'BUY'
             ORDER BY timestamp ASC
             """,
             (symbol,),
@@ -481,7 +480,7 @@ class AsyncTradingDatabase:
             notional = float(quantity) * float(price)
             await conn.execute(
                 """
-                INSERT INTO trades (symbol, action, quantity, price, notional, slippage, commission, pnl)
+                INSERT INTO trades (symbol, side, quantity, price, notional, slippage, commission, pnl)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (symbol, side, quantity, price, notional, slippage, commission, pnl),
@@ -722,7 +721,7 @@ class AsyncTradingDatabase:
             if symbol:
                 cursor = await conn.execute(
                     """
-                    SELECT symbol, action, quantity, price, notional, slippage, commission, pnl, timestamp
+                    SELECT symbol, side, quantity, price, notional, slippage, commission, pnl, timestamp
                     FROM trades
                     WHERE symbol = ?
                     ORDER BY timestamp DESC
@@ -733,7 +732,7 @@ class AsyncTradingDatabase:
             else:
                 cursor = await conn.execute(
                     """
-                    SELECT symbol, action, quantity, price, notional, slippage, commission, pnl, timestamp
+                    SELECT symbol, side, quantity, price, notional, slippage, commission, pnl, timestamp
                     FROM trades
                     ORDER BY timestamp DESC
                     LIMIT ?
