@@ -158,6 +158,12 @@ class RiskConfig(BaseModel):
     take_profit_pct: float = Field(
         default=0.05, gt=0, le=0.2, description="Default take profit percentage"
     )
+    use_trailing_stop: bool = Field(
+        default=True, description="Use trailing stops instead of fixed stops"
+    )
+    trailing_stop_pct: float = Field(
+        default=0.05, gt=0, le=0.2, description="Trailing stop percentage (follows price up)"
+    )
 
     # New risk parameters for enhanced control
     max_order_notional: Optional[float] = Field(
@@ -203,10 +209,8 @@ class RiskConfig(BaseModel):
     position_sizing_method: str = Field(
         default="fixed", description="Position sizing method: fixed, atr, kelly"
     )
-    use_trailing_stop: bool = Field(default=False, description="Enable trailing stop losses")
-    trailing_stop_pct: float = Field(
-        default=0.015, gt=0, le=0.1, description="Trailing stop percentage"
-    )
+    # NOTE: use_trailing_stop and trailing_stop_pct are defined above at lines 161-166
+    # Do not duplicate them here!
 
 
 class DataConfig(BaseModel):
@@ -464,7 +468,8 @@ def load_config_from_env() -> Config:
                 "RISK_MAX_SECTOR_EXPOSURE", 0.3
             ),
             "max_leverage": validator.validate_leverage("RISK_MAX_LEVERAGE", 2.0),
-            "stop_loss_pct": validator.validate_stop_loss("RISK_STOP_LOSS_PCT", 0.02),
+            # Use STOP_LOSS_PERCENT from .env (value is in %, convert to decimal)
+            "stop_loss_pct": float(os.getenv("STOP_LOSS_PERCENT", "2.0")) / 100,
             "take_profit_pct": validator.validate_percentage("RISK_TAKE_PROFIT_PCT", 0.05),
             # Validated notional limits
             "max_order_notional": (
@@ -479,8 +484,11 @@ def load_config_from_env() -> Config:
             ),
             "max_open_positions": validator.validate_position_limit("RISK_MAX_OPEN_POSITIONS", 20),
             "position_sizing_method": os.getenv("RISK_POSITION_SIZING", "fixed"),
-            "use_trailing_stop": os.getenv("RISK_USE_TRAILING_STOP", "false").lower() == "true",
-            "trailing_stop_pct": float(os.getenv("RISK_TRAILING_STOP_PCT", "0.015")),
+            # Use same env var names as .env file (USE_TRAILING_STOP, TRAILING_STOP_PERCENT)
+            "use_trailing_stop": os.getenv("USE_TRAILING_STOP", "true").lower()
+            in ("true", "1", "yes", "on"),
+            "trailing_stop_pct": float(os.getenv("TRAILING_STOP_PERCENT", "5.0"))
+            / 100,  # Convert from % to decimal
         },
         "data": {
             "provider": os.getenv("DATA_PROVIDER", "IBKR"),

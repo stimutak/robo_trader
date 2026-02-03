@@ -1,1 +1,1 @@
-HANDOFF_2026-02-03_pairs_trading_fixes.md
+HANDOFF_2026-02-03_trailing_stops.md

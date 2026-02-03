@@ -215,6 +215,18 @@ Edit `.env` file to configure:
 - Risk limits
 - Symbol lists
 
+### Key Risk Settings
+
+```bash
+# Trailing Stops (Recommended - lets winners run!)
+USE_TRAILING_STOP=true          # Enable trailing stops
+TRAILING_STOP_PERCENT=5.0       # 5% below high water mark
+
+# Fixed Stops (Alternative)
+USE_TRAILING_STOP=false         # Disable trailing
+STOP_LOSS_PERCENT=2.0           # Fixed 2% stop
+```
+
 Default symbols are in `user_settings.json`
 
 ---

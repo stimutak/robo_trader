@@ -207,9 +207,12 @@ class AsyncRunner:
         self.ml_strategy = None
 
         # Stop-loss monitoring
+        # NOTE: These are defaults; actual values loaded from self.cfg in setup()
         self.stop_loss_monitor = None
         self.enable_stop_loss = True  # Always enabled for safety
-        self.stop_loss_percent = 0.02  # Default 2% stop-loss
+        self.stop_loss_percent = 0.02  # Default 2%, updated from config in setup()
+        self.use_trailing_stop = True  # Default to trailing, updated from config in setup()
+        self.trailing_stop_pct = 0.05  # Default 5%, updated from config in setup()
         self.ml_enhanced_strategy = None
         self.active_strategy_name: Optional[str] = None
         self._ml_predictions: Dict[str, Dict] = {}  # Track ML predictions for dashboard
@@ -518,6 +521,15 @@ class AsyncRunner:
 
         self.cfg = load_config()
 
+        # Load stop-loss settings from validated config
+        self.stop_loss_percent = self.cfg.risk.stop_loss_pct
+        self.use_trailing_stop = self.cfg.risk.use_trailing_stop
+        self.trailing_stop_pct = self.cfg.risk.trailing_stop_pct
+        logger.info(
+            f"Stop-loss config loaded: trailing={self.use_trailing_stop}, "
+            f"trailing_pct={self.trailing_stop_pct:.1%}, fixed_pct={self.stop_loss_percent:.1%}"
+        )
+
         # CRITICAL PRE-FLIGHT CHECK: Test IBKR connection before proceeding
         # This prevents the system from starting without a working connection
         logger.info("=" * 60)
@@ -716,7 +728,13 @@ class AsyncRunner:
                 emergency_shutdown_callback=emergency_shutdown_callback,
             )
             await self.stop_loss_monitor.start_monitoring()
-            logger.info(f"Stop-loss monitoring enabled with {self.stop_loss_percent:.1%} threshold")
+            if self.use_trailing_stop:
+                logger.info(
+                    f"TRAILING STOP enabled at {self.trailing_stop_pct:.1%} - "
+                    f"stops follow price up, lock in profits!"
+                )
+            else:
+                logger.info(f"Fixed stop-loss enabled at {self.stop_loss_percent:.1%}")
 
         # Initialize portfolio
         starting_cash = (
@@ -994,18 +1012,32 @@ class AsyncRunner:
                             avg_price=float(pos.avg_price),
                             entry_time=pos.entry_time,
                         )
-                        await self.stop_loss_monitor.add_stop_loss(
-                            symbol=symbol,
-                            position=float_pos,
-                            stop_percent=self.stop_loss_percent,
-                            stop_type=StopType.FIXED,
-                        )
                         entry_price = float(pos.avg_price)
-                        stop_price = entry_price * (1 - self.stop_loss_percent)
-                        logger.info(
-                            f"Stop-loss created for existing position {symbol} at {self.stop_loss_percent:.1%} "
-                            f"(entry=${entry_price:.2f}, stop=${stop_price:.2f})"
-                        )
+                        if self.use_trailing_stop:
+                            await self.stop_loss_monitor.add_stop_loss(
+                                symbol=symbol,
+                                position=float_pos,
+                                stop_percent=self.trailing_stop_pct,
+                                stop_type=StopType.TRAILING_PERCENT,
+                                trailing_percent=self.trailing_stop_pct,
+                            )
+                            stop_price = entry_price * (1 - self.trailing_stop_pct)
+                            logger.info(
+                                f"Trailing stop created for existing position {symbol} at {self.trailing_stop_pct:.1%} "
+                                f"(entry=${entry_price:.2f}, initial stop=${stop_price:.2f})"
+                            )
+                        else:
+                            await self.stop_loss_monitor.add_stop_loss(
+                                symbol=symbol,
+                                position=float_pos,
+                                stop_percent=self.stop_loss_percent,
+                                stop_type=StopType.FIXED,
+                            )
+                            stop_price = entry_price * (1 - self.stop_loss_percent)
+                            logger.info(
+                                f"Fixed stop-loss created for existing position {symbol} at {self.stop_loss_percent:.1%} "
+                                f"(entry=${entry_price:.2f}, stop=${stop_price:.2f})"
+                            )
                     except Exception as e:
                         logger.error(
                             f"Failed to create stop-loss for existing position {symbol}: {e}"
@@ -2052,15 +2084,27 @@ class AsyncRunner:
                                             avg_price=fill_price,
                                             entry_time=datetime.now(),
                                         )
-                                        await self.stop_loss_monitor.add_stop_loss(
-                                            symbol=symbol,
-                                            position=new_position,
-                                            stop_percent=self.stop_loss_percent,
-                                            stop_type=StopType.FIXED,
-                                        )
-                                        logger.info(
-                                            f"Stop-loss order added for {symbol} at {self.stop_loss_percent:.1%}"
-                                        )
+                                        if self.use_trailing_stop:
+                                            await self.stop_loss_monitor.add_stop_loss(
+                                                symbol=symbol,
+                                                position=new_position,
+                                                stop_percent=self.trailing_stop_pct,
+                                                stop_type=StopType.TRAILING_PERCENT,
+                                                trailing_percent=self.trailing_stop_pct,
+                                            )
+                                            logger.info(
+                                                f"Trailing stop added for {symbol} at {self.trailing_stop_pct:.1%}"
+                                            )
+                                        else:
+                                            await self.stop_loss_monitor.add_stop_loss(
+                                                symbol=symbol,
+                                                position=new_position,
+                                                stop_percent=self.stop_loss_percent,
+                                                stop_type=StopType.FIXED,
+                                            )
+                                            logger.info(
+                                                f"Fixed stop-loss added for {symbol} at {self.stop_loss_percent:.1%}"
+                                            )
                                     except Exception as e:
                                         logger.error(f"Failed to add stop-loss for {symbol}: {e}")
 
@@ -2223,15 +2267,27 @@ class AsyncRunner:
                                     avg_price=fill_price,
                                     entry_time=datetime.now(),
                                 )
-                                await self.stop_loss_monitor.add_stop_loss(
-                                    symbol=symbol,
-                                    position=short_position,
-                                    stop_percent=self.stop_loss_percent,
-                                    stop_type=StopType.FIXED,
-                                )
-                                logger.info(
-                                    f"Stop-loss order added for SHORT {symbol} at {self.stop_loss_percent:.1%}"
-                                )
+                                if self.use_trailing_stop:
+                                    await self.stop_loss_monitor.add_stop_loss(
+                                        symbol=symbol,
+                                        position=short_position,
+                                        stop_percent=self.trailing_stop_pct,
+                                        stop_type=StopType.TRAILING_PERCENT,
+                                        trailing_percent=self.trailing_stop_pct,
+                                    )
+                                    logger.info(
+                                        f"Trailing stop added for SHORT {symbol} at {self.trailing_stop_pct:.1%}"
+                                    )
+                                else:
+                                    await self.stop_loss_monitor.add_stop_loss(
+                                        symbol=symbol,
+                                        position=short_position,
+                                        stop_percent=self.stop_loss_percent,
+                                        stop_type=StopType.FIXED,
+                                    )
+                                    logger.info(
+                                        f"Fixed stop-loss added for SHORT {symbol} at {self.stop_loss_percent:.1%}"
+                                    )
                             except Exception as e:
                                 logger.error(f"Failed to add stop-loss for short {symbol}: {e}")
 
@@ -2757,15 +2813,27 @@ class AsyncRunner:
                                                             avg_price=fill_a,
                                                             entry_time=datetime.now(),
                                                         )
-                                                        await self.stop_loss_monitor.add_stop_loss(
-                                                            symbol=symbol_a,
-                                                            position=new_pos,
-                                                            stop_percent=self.stop_loss_percent,
-                                                            stop_type=StopType.FIXED,
-                                                        )
-                                                        logger.info(
-                                                            f"Stop-loss added for pairs position {symbol_a}"
-                                                        )
+                                                        if self.use_trailing_stop:
+                                                            await self.stop_loss_monitor.add_stop_loss(
+                                                                symbol=symbol_a,
+                                                                position=new_pos,
+                                                                stop_percent=self.trailing_stop_pct,
+                                                                stop_type=StopType.TRAILING_PERCENT,
+                                                                trailing_percent=self.trailing_stop_pct,
+                                                            )
+                                                            logger.info(
+                                                                f"Trailing stop added for pairs position {symbol_a}"
+                                                            )
+                                                        else:
+                                                            await self.stop_loss_monitor.add_stop_loss(
+                                                                symbol=symbol_a,
+                                                                position=new_pos,
+                                                                stop_percent=self.stop_loss_percent,
+                                                                stop_type=StopType.FIXED,
+                                                            )
+                                                            logger.info(
+                                                                f"Fixed stop-loss added for pairs position {symbol_a}"
+                                                            )
                                                     except Exception as e:
                                                         logger.error(
                                                             f"Failed to add stop-loss for pairs {symbol_a}: {e}"
@@ -2845,15 +2913,27 @@ class AsyncRunner:
                                                             avg_price=fill_b,
                                                             entry_time=datetime.now(),
                                                         )
-                                                        await self.stop_loss_monitor.add_stop_loss(
-                                                            symbol=symbol_b,
-                                                            position=new_pos,
-                                                            stop_percent=self.stop_loss_percent,
-                                                            stop_type=StopType.FIXED,
-                                                        )
-                                                        logger.info(
-                                                            f"Stop-loss added for pairs position {symbol_b}"
-                                                        )
+                                                        if self.use_trailing_stop:
+                                                            await self.stop_loss_monitor.add_stop_loss(
+                                                                symbol=symbol_b,
+                                                                position=new_pos,
+                                                                stop_percent=self.trailing_stop_pct,
+                                                                stop_type=StopType.TRAILING_PERCENT,
+                                                                trailing_percent=self.trailing_stop_pct,
+                                                            )
+                                                            logger.info(
+                                                                f"Trailing stop added for pairs position {symbol_b}"
+                                                            )
+                                                        else:
+                                                            await self.stop_loss_monitor.add_stop_loss(
+                                                                symbol=symbol_b,
+                                                                position=new_pos,
+                                                                stop_percent=self.stop_loss_percent,
+                                                                stop_type=StopType.FIXED,
+                                                            )
+                                                            logger.info(
+                                                                f"Fixed stop-loss added for pairs position {symbol_b}"
+                                                            )
                                                     except Exception as e:
                                                         logger.error(
                                                             f"Failed to add stop-loss for pairs {symbol_b}: {e}"

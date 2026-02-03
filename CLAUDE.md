@@ -198,10 +198,41 @@ python3 test_safety_features.py  # Test safety features
 
 | Setting | Purpose |
 |---------|---------|
-| `STOP_LOSS_PERCENT=2.0` | Stop-loss at 2% loss |
+| `USE_TRAILING_STOP=true` | **Trailing stops enabled** - lets winners run! |
+| `TRAILING_STOP_PERCENT=5.0` | Trailing stop at 5% below high water mark |
+| `STOP_LOSS_PERCENT=2.0` | Fixed stop-loss (only used if trailing disabled) |
 | `ENABLE_EXTENDED_HOURS=true` | Trade 4AM-8PM ET (pre/after market) |
 | `MAX_OPEN_POSITIONS` | Limit concurrent positions |
 | `SYMBOLS=` | Base watchlist (AI discovers more) |
+
+### Trailing Stops (Added 2026-02-03)
+
+**Problem solved:** System was selling at loss with avg loss $718 vs avg win $444. Losses were 60% bigger than wins.
+
+**Solution:** Trailing stops that follow price UP:
+- Initial stop at 5% below entry price
+- As price rises, stop rises with it (ratchets up)
+- Never moves down - only up
+- Locks in profits while letting winners run
+
+**Example:**
+```
+Buy at $100 → initial stop at $95 (5% below)
+Price rises to $120 → stop moves to $114 (5% below $120)
+Price drops to $114 → SELL triggered at $114 (locked in $14 profit!)
+```
+
+**Configuration:**
+```bash
+USE_TRAILING_STOP=true          # Enable trailing (recommended)
+TRAILING_STOP_PERCENT=5.0       # 5% trail (adjust based on volatility)
+```
+
+**Disable trailing (use fixed stops):**
+```bash
+USE_TRAILING_STOP=false
+STOP_LOSS_PERCENT=2.0           # Fixed 2% stop
+```
 
 ---
 

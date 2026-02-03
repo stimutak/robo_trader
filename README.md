@@ -47,6 +47,7 @@ See `IMPLEMENTATION_PLAN.md` for the complete 16-week roadmap.
 - 🚧 **Smart Execution**: TWAP, VWAP, Iceberg algorithms (in progress)
 
 ### Risk Management
+- **Trailing Stops**: Follows price up, locks in profits (5% default)
 - **Position Sizing**: Fixed, ATR-based, or Kelly Criterion
 - **Portfolio Heat**: Maximum 6% risk exposure
 - **Emergency Shutdown**: Auto-triggers on violations
@@ -242,6 +243,9 @@ ENVIRONMENT=dev              # dev, staging, or production
 RISK_MAX_POSITION_PCT=0.02   # 2% per position
 RISK_MAX_DAILY_LOSS_PCT=0.005 # 0.5% daily stop
 RISK_MAX_LEVERAGE=2.0        # Maximum leverage
+USE_TRAILING_STOP=true       # Enable trailing stops (recommended)
+TRAILING_STOP_PERCENT=5.0    # 5% below high water mark
+STOP_LOSS_PERCENT=2.0        # Fixed stop (if trailing disabled)
 
 # ML Configuration
 ML_FEATURE_LOOKBACK=60       # Days of history for features
