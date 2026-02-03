@@ -135,6 +135,54 @@ get_log_age_seconds() {
     echo $((now - newest_time))
 }
 
+get_last_cycle_age_seconds() {
+    # Check for ACTUAL trading cycle completion, not just log spam
+    # This catches connect/disconnect loops that don't produce real trading
+    # Returns: age in seconds, or -1 if no cycle found (use file mtime as fallback)
+    if [ ! -f "$LOG_FILE" ]; then
+        echo "-1"  # Sentinel: no log file, caller should use file mtime
+        return
+    fi
+
+    # Look for "Trading cycle complete" or "Cycle complete" in last 1000 lines
+    local last_cycle_line=$(tail -1000 "$LOG_FILE" 2>/dev/null | grep -E "(Trading cycle complete|Cycle complete)" | tail -1)
+
+    if [ -z "$last_cycle_line" ]; then
+        echo "-1"  # Sentinel: no cycle found in recent logs, caller should use file mtime
+        return
+    fi
+
+    # Extract timestamp from JSON log line
+    local timestamp=$(echo "$last_cycle_line" | grep -o '"timestamp": "[^"]*"' | head -1 | cut -d'"' -f4)
+
+    if [ -z "$timestamp" ]; then
+        log "WARNING: Found cycle line but failed to extract timestamp, using file mtime"
+        get_log_age_seconds
+        return
+    fi
+
+    # Parse ISO timestamp (2026-02-03T16:43:50.332356)
+    # Convert to epoch
+    local date_part=$(echo "$timestamp" | cut -dT -f1)
+    local time_part=$(echo "$timestamp" | cut -dT -f2 | cut -d. -f1)
+
+    local cycle_epoch=$(date -j -f "%Y-%m-%d %H:%M:%S" "$date_part $time_part" +%s 2>/dev/null)
+
+    if [ -z "$cycle_epoch" ]; then
+        # macOS date format fallback
+        cycle_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${date_part}T${time_part}" +%s 2>/dev/null)
+    fi
+
+    if [ -z "$cycle_epoch" ]; then
+        log "WARNING: Failed to parse timestamp '$timestamp', using file mtime"
+        get_log_age_seconds
+        return
+    fi
+
+    local now=$(date +%s)
+    echo $((now - cycle_epoch))
+}
+
 is_runner_alive() {
     pgrep -f "python.*runner_async" > /dev/null 2>&1
 }
@@ -161,13 +209,38 @@ log "=========================================="
 while true; do
     if is_trading_time; then
         if is_runner_alive; then
-            age_seconds=$(get_log_age_seconds)
-            # Use ceiling division to avoid off-by-one
-            age_minutes=$(( (age_seconds + 59) / 60 ))
+            # Check for actual trading cycles, not just log file modification
+            cycle_age_seconds=$(get_last_cycle_age_seconds)
 
-            if [ "$age_minutes" -ge "$STALE_MINUTES" ]; then
-                log "STALL DETECTED: No log activity for ${age_seconds}s (~${age_minutes} min, threshold: ${STALE_MINUTES})"
-                restart_trader
+            # Also check log modification as a fallback
+            log_age_seconds=$(get_log_age_seconds)
+
+            # Handle sentinel value: -1 means no cycle found, fall back to file mtime
+            if [ "$cycle_age_seconds" -eq -1 ]; then
+                # No cycle completion found - use file mtime instead
+                # This handles first startup or if cycle messages aren't in recent logs
+                age_seconds="$log_age_seconds"
+                age_minutes=$(( ("$age_seconds" + 59) / 60 ))
+
+                if [ "$age_minutes" -ge "$STALE_MINUTES" ]; then
+                    log "STALL DETECTED: No log activity for ${age_seconds}s (~${age_minutes} min, threshold: ${STALE_MINUTES})"
+                    log "Note: No 'Trading cycle complete' messages found in recent logs"
+                    restart_trader
+                fi
+            else
+                # We have cycle completion timestamps - use them for more accurate detection
+                cycle_age_minutes=$(( ("$cycle_age_seconds" + 59) / 60 ))
+
+                if [ "$cycle_age_minutes" -ge "$STALE_MINUTES" ]; then
+                    # Detect connect/disconnect spam vs actual stall
+                    if [ "$log_age_seconds" -lt 60 ] && [ "$cycle_age_seconds" -gt 300 ]; then
+                        log "STALL DETECTED: Log updating but NO TRADING CYCLES for ${cycle_age_seconds}s (~${cycle_age_minutes} min)"
+                        log "This indicates a connect/disconnect loop - restarting..."
+                    else
+                        log "STALL DETECTED: No trading cycles for ${cycle_age_seconds}s (~${cycle_age_minutes} min, threshold: ${STALE_MINUTES})"
+                    fi
+                    restart_trader
+                fi
             fi
         else
             log "Runner not running during trading hours - starting..."

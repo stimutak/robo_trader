@@ -14,7 +14,12 @@ import asyncio
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+
+# Load .env EARLY before any os.getenv() calls at module level
+from dotenv import load_dotenv  # isort:skip
+
+load_dotenv()  # noqa: E402 - must run before imports that use os.getenv()
+from dataclasses import dataclass  # isort:skip  # noqa: E402
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -1285,9 +1290,12 @@ class AsyncRunner:
     async def fetch_and_store_data(self, symbol: str) -> Optional[pd.DataFrame]:
         """Fetch market data for a symbol and store in database."""
         # Check if market is open before fetching data
-        if not is_trading_allowed():
+        trading_allowed = is_trading_allowed()
+        if not trading_allowed:
             session = get_market_session()
-            logger.debug(f"Market is {session}, skipping data fetch for {symbol}")
+            logger.info(
+                f"⏸️ Market is {session}, trading_allowed={trading_allowed}, ENABLE_EXTENDED_HOURS={ENABLE_EXTENDED_HOURS}, skipping data fetch for {symbol}"
+            )
             return None
 
         # Check connection health and reconnect if needed
@@ -2578,11 +2586,12 @@ class AsyncRunner:
             # Process symbols in parallel
             results = await self.run_parallel(symbols_to_process)
 
-            # Run pairs trading analysis if enabled
+            # Run pairs trading analysis if enabled AND market is open
             if (
                 MEAN_REVERSION_AVAILABLE
                 and self.pairs_strategy
                 and len(self.market_data_cache) >= 2
+                and is_trading_allowed()  # CRITICAL: Don't trade outside market hours!
             ):
                 try:
                     logger.info("Running pairs trading analysis...")
