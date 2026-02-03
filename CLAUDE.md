@@ -31,13 +31,13 @@ Violation of this rule caused catastrophic data loss on 2026-01-26. DO NOT REPEA
 
 **Current Status:** Phase 4 IN PROGRESS - P1-P7, P9-P10 complete (80%), P8 in progress
 
-**Note:** The older 9-phase plan in `archived_plans/PROJECT_PLAN_9PHASE.md` is deprecated and should NOT be used. Any references to "Phase 5", "Phase 6" etc. from older commits refer to the old plan and should be ignored.
+---
 
-## ⚠️ IBKR Gateway Management (Updated 2025-12-03)
+## ⚠️ IBKR Gateway Management
 
 ### Automated Gateway Management via IBC
 
-The system now uses **IBC (IB Controller)** for automated Gateway management. Gateway restarts are **fully automated** when zombie connections are detected.
+The system uses **IBC (IB Controller)** for automated Gateway management. Gateway restarts are **fully automated** when zombie connections are detected.
 
 **How it works:**
 - `START_TRADER.sh` automatically starts Gateway via IBC if not running
@@ -49,186 +49,62 @@ The system now uses **IBC (IB Controller)** for automated Gateway management. Ga
 **IBC Configuration:**
 - Config file: `config/ibc/config.ini` (gitignored - contains credentials)
 - Template: `config/ibc/config.ini.template`
-- IBC scripts: `IBCMacos-3/` (macOS) or `IBCWin-3/` (Windows)
 
-### Gateway Startup Flow
-
-1. `./START_TRADER.sh` is the **only command you need**
-2. If Gateway not running → starts via IBC automatically
-3. If zombies detected → kills Python zombies, restarts Gateway if needed
-4. Tests API connectivity with actual handshake
-5. Retries up to 3 times if connection fails
-6. Only proceeds when API is confirmed working
-
-### What You Need to Do
-
-**First-time setup:**
-```bash
-cp config/ibc/config.ini.template config/ibc/config.ini
-# Edit config.ini with your IBKR credentials:
-#   IbLoginId=YOUR_USERNAME
-#   IbPassword=YOUR_PASSWORD
-```
-
-**Starting the trader:**
-```bash
-./START_TRADER.sh
-# Watch for 2FA prompt on your IBKR Mobile app
-# The script handles everything else automatically
-```
-
-### Gateway Management Commands
+### Gateway Commands
 
 ```bash
 # THE ONLY WAY TO START THE TRADING SYSTEM:
 ./START_TRADER.sh
 
-# Debugging/diagnostic commands (not for normal startup):
-./scripts/start_gateway.sh paper            # Start Gateway only (debugging)
+# Debugging/diagnostic commands:
 python3 scripts/gateway_manager.py status   # Check Gateway status
-python3 scripts/gateway_manager.py restart  # Force restart Gateway (clears zombies)
+python3 scripts/gateway_manager.py restart  # Force restart Gateway
+lsof -nP -iTCP:4002 -sTCP:CLOSE_WAIT        # Check for zombies
 tail -f config/ibc/logs/*.txt               # View Gateway logs
 ```
 
-### Zombie Connections
-
-**What are zombies?**
-- CLOSE_WAIT connections from failed/incomplete API handshakes
-- They block ALL future API connections until cleared
-- Gateway-owned zombies require Gateway restart to clear
-
-**The startup script handles this automatically:**
-1. Detects zombie connections via `lsof`
-2. Kills Python-owned zombies
-3. If Gateway-owned zombies remain → restarts Gateway
-4. Verifies API works before proceeding
-
-**Manual zombie check:**
-```bash
-lsof -nP -iTCP:4002 -sTCP:CLOSE_WAIT
-```
-
-### Safe Process Management
-
-**Kill Python processes (always safe):**
+### Kill Processes (Safe)
 ```bash
 pkill -9 -f "runner_async" && pkill -9 -f "app.py" && pkill -9 -f "websocket_server"
-```
-
-**Kill Gateway (triggers auto-restart on next START_TRADER.sh):**
-```bash
-pkill -f "IB Gateway"
+pkill -f "IB Gateway"  # Triggers auto-restart on next START_TRADER.sh
 ```
 
 ### Gateway API Notes
-
 - **Port 4002**: Paper trading API
 - **Port 4001**: Live trading API
-- ActiveX/Socket Clients is **permanently enabled** in IB Gateway (cannot be disabled)
-- API permissions are configured in your IBKR account settings
 - System uses **readonly** connections (no order placement via API)
 
-## Watchdog Auto-Restarter (Added 2026-02-03)
+---
 
-The system includes an automatic watchdog that detects stalls and restarts the trader.
-
-### How It Works
+## Watchdog Auto-Restarter
 
 - Monitors log file modification time every 60 seconds
 - If no log activity for 5+ minutes during market hours → auto-restart
 - Respects `ENABLE_EXTENDED_HOURS` setting (monitors 4 AM - 8 PM if enabled)
 - Runs as macOS launchd service (survives reboot)
 
-### Watchdog Files
-
-| File | Purpose |
-|------|---------|
-| `scripts/watchdog.sh` | Main watchdog script |
-| `scripts/com.robotrader.watchdog.plist` | macOS service config |
-| `watchdog.log` | Watchdog activity log |
-
-### Management Commands
-
+### Watchdog Commands
 ```bash
-# Check if running
-launchctl list | grep robotrader
-
-# View watchdog log
-tail -f watchdog.log
-
-# Stop watchdog
-launchctl unload ~/Library/LaunchAgents/com.robotrader.watchdog.plist
-
-# Start watchdog
-launchctl load ~/Library/LaunchAgents/com.robotrader.watchdog.plist
-
-# Reinstall after changes
-cp scripts/com.robotrader.watchdog.plist ~/Library/LaunchAgents/
-launchctl unload ~/Library/LaunchAgents/com.robotrader.watchdog.plist
-launchctl load ~/Library/LaunchAgents/com.robotrader.watchdog.plist
+launchctl list | grep robotrader                                    # Check if running
+tail -f watchdog.log                                                # View log
+launchctl unload ~/Library/LaunchAgents/com.robotrader.watchdog.plist  # Stop
+launchctl load ~/Library/LaunchAgents/com.robotrader.watchdog.plist    # Start
 ```
 
-### Configuration
-
-Edit the plist to change threshold (default 5 minutes):
-```xml
-<array>
-    <string>/Users/oliver/robo_trader/scripts/watchdog.sh</string>
-    <string>5</string>  <!-- minutes -->
-</array>
-```
+---
 
 ## Mobile App & Parallel Development
-
-### Repository Structure
 
 | Location | Branch | Purpose |
 |----------|--------|---------|
 | `/Users/oliver/robo_trader` | `main` | Backend, API, Web Dashboard |
 | `/Users/oliver/robo_trader-mobile` | `feature/mobile-app` | React Native Mobile App |
 
-The mobile app lives in a **git worktree** linked to this repo.
-
-### Parallel Development Rules
-
-**CRITICAL: Follow these rules to avoid conflicts**
-
-1. **ALL changes EXCEPT mobile → THIS repo (main branch)**
-   - Trading system (`robo_trader/`)
-   - Web dashboard (`app.py`, templates)
-   - Scripts (`scripts/`)
-   - Configuration files
-   - Documentation (`*.md`, `handoff/`)
-   - Everything that isn't in `mobile/`
-
-2. **Mobile app ONLY → worktree (feature/mobile-app)**
-   - React Native code (`mobile/**`)
-   - Mobile UI components
-   - Mobile-specific configs (`mobile/lib/constants.ts`)
-
-3. **Never edit the same file in both branches simultaneously**
-
-### Syncing Between Repos
+**CRITICAL:** Never edit the same file in both branches simultaneously.
 
 ```bash
-# After making backend changes here, sync to mobile worktree:
-cd /Users/oliver/robo_trader-mobile
-git fetch origin main
-git merge origin/main
-
-# When mobile app is ready to merge:
-cd /Users/oliver/robo_trader
-git merge feature/mobile-app
-```
-
-### Mobile App Status
-
-See `mobile/HANDOFF.md` and `mobile/IMPLEMENTATION_PLAN.md` in the worktree for current status.
-
-**Quick start mobile dev:**
-```bash
-cd /Users/oliver/robo_trader-mobile/mobile
-npx expo start --lan
+# Sync to mobile worktree after backend changes:
+cd /Users/oliver/robo_trader-mobile && git fetch origin main && git merge origin/main
 ```
 
 ---
@@ -237,29 +113,19 @@ npx expo start --lan
 - `IMPLEMENTATION_PLAN.md` - The active project roadmap
 - `handoff/LATEST_HANDOFF.md` - Latest session handoff document
 - `robo_trader/runner_async.py` - Main trading system with async parallel processing
-- `robo_trader/runner/` - Extracted runner modules (Phase 4 P8 - IN PROGRESS)
-  - `data_fetcher.py` - Market data retrieval and caching
-  - `subprocess_manager.py` - IBKR subprocess health monitoring
-- `robo_trader/exceptions.py` - Custom exception hierarchy (Phase 4 P9)
-- `robo_trader/data_providers/` - Data provider abstraction (Polygon.io ready)
-- `robo_trader/database_async.py` - Async database with equity_history table for portfolio tracking
-- `sync_db_reader.py` - Sync database reader for dashboard access
+- `robo_trader/database_async.py` - Async database with equity_history table
+- `robo_trader/stop_loss_monitor.py` - Stop-loss protection (recreated on startup)
 - `app.py` - Dashboard with comprehensive professional overview
 - `robo_trader/websocket_server.py` - WebSocket server for real-time updates
-- `robo_trader/features/` - Feature engineering pipeline (Phase 2 - COMPLETE)
-- `robo_trader/ml/` - ML model training & selection (Phase 2 - COMPLETE)
-- `robo_trader/analytics/` - Performance analytics (Phase 2 - COMPLETE)
-- `robo_trader/backtesting/` - Walk-forward backtesting (Phase 2 - COMPLETE)
 - `scripts/gateway_manager.py` - Cross-platform Gateway management
-- `scripts/start_gateway.sh` - Gateway launcher script
 - `config/ibc/config.ini` - IBC credentials (gitignored)
 
 ## IMPORTANT: Python Command on macOS
 **ALWAYS USE `python3` NOT `python` - THIS SYSTEM USES macOS WITH NO `python` COMMAND**
 
-## Starting the Trading System
+---
 
-### The Only Command You Need
+## Starting the Trading System
 
 ```bash
 ./START_TRADER.sh
@@ -270,224 +136,55 @@ npx expo start --lan
 **⚠️ IMPORTANT: Always use `./START_TRADER.sh` - NEVER start components manually!**
 
 Do NOT run these directly:
-- ❌ `python3 runner_async.py` - Use START_TRADER.sh instead
-- ❌ `scripts/start_gateway.sh` - Use START_TRADER.sh instead
-- ❌ `python3 app.py` - Use START_TRADER.sh instead
-- ❌ `python3 websocket_server.py` - Use START_TRADER.sh instead
-
-The script handles Gateway startup, zombie cleanup, connectivity testing, and proper sequencing. Starting components manually bypasses these safety checks.
-
-**What the script does:**
-1. ✅ Kills existing Python trader processes
-2. ✅ Starts Gateway via IBC if not running
-3. ✅ Detects and cleans up zombie connections
-4. ✅ Restarts Gateway automatically if zombies block API
-5. ✅ Tests actual API connectivity (not just port open)
-6. ✅ Retries up to 3 times on failure
-7. ✅ Starts WebSocket server, trading system, and dashboard
-8. ✅ Monitors startup for 10 seconds
-
-### Default Symbols (from user_settings.json)
-```
-AAPL,NVDA,TSLA,IXHL,NUAI,BZAI,ELTP,OPEN,CEG,VRT,PLTR,UPST,TEM,HTFL,SDGR,APLD,SOFI,CORZ,WULF
-```
+- ❌ `python3 runner_async.py`
+- ❌ `python3 app.py`
+- ❌ `scripts/start_gateway.sh`
 
 ### Diagnostic Commands
-
 ```bash
-# Check Gateway status
-python3 scripts/gateway_manager.py status
-
-# Check for zombie connections
-lsof -nP -iTCP:4002 -sTCP:CLOSE_WAIT
-
-# View trader logs
-tail -f robo_trader.log
-
-# View Gateway/IBC logs
-tail -f config/ibc/logs/*.txt
+python3 scripts/gateway_manager.py status    # Gateway status
+lsof -nP -iTCP:4002 -sTCP:CLOSE_WAIT         # Check zombies
+tail -f robo_trader.log                       # Trader logs
 ```
 
 ### Testing Commands
-
 ```bash
-# Activate virtual environment first
-source .venv/bin/activate
-
-# Run tests
-pytest
-
-# Test ML pipeline
-python3 test_ml_pipeline.py
-
-# Test safety features
-python3 test_safety_features.py
+pytest                           # Run tests
+python3 test_ml_pipeline.py      # Test ML pipeline
+python3 test_safety_features.py  # Test safety features
 ```
+
+---
 
 ## Current Issues Status
-1. ✅ WebSocket connection handler signature error - FIXED
-2. ✅ JSON serialization error with ServerConnection object - FIXED
-3. ✅ Phase 1 F2: Upgrade config to Pydantic - COMPLETED
-4. ✅ WebSocket stability - Fixed with client/server separation
-5. ✅ TWS API Connection Issues - RESOLVED with subprocess approach
-6. ✅ Zombie connection cleanup - AUTOMATED with Gateway restart (2025-12-03)
-7. ✅ Gateway connectivity testing - BUILT INTO startup script with auto-restart
-8. ✅ Subprocess worker connection failure - RESOLVED (2025-11-24)
-9. ✅ IBC Integration - Gateway auto-start and zombie handling (2025-12-03)
-10. ✅ **Socket Zombie Creation Bug - FIXED (2025-12-06)** - See below
-11. ✅ **Dashboard Connection Status Accuracy - IMPROVED (2025-12-10)** - See below
-12. ✅ **Subprocess Pipe Blocking - FIXED (2025-12-24)** - See below
-13. ✅ **Near Real-Time Trading - IMPLEMENTED (2025-12-24)** - See below
-14. ✅ **Decimal/Float Type Mismatch - FIXED (2025-12-29, enhanced 2026-01-15)** - See below
-15. ✅ **Extended Hours Trading - ENABLED (2026-01-27)** - Set `ENABLE_EXTENDED_HOURS=true` in .env to trade 4:00-8:00 PM
-16. ✅ **Int/Datetime Comparison Error - FIXED (2026-01-15)** - Added try/except fallback in correlation.py
-17. ✅ **Missing Market Holidays - FIXED (2026-01-15)** - Added MLK, Presidents, Good Friday, Memorial, Labor, Thanksgiving, Juneteenth
-18. ✅ **Dashboard Overview Redesign - IMPLEMENTED (2026-01-24)** - Professional-grade overview with all key metrics
-19. ✅ **Equity History Tracking - IMPLEMENTED (2026-01-24)** - Daily portfolio snapshots in `equity_history` table
-20. ✅ **Duplicate BUY Race Condition - FIXED (2026-01-27)** - Database-level check before buying prevents cross-cycle duplicates
-21. ✅ **sklearn Version Mismatch Warnings - FIXED (2026-01-27)** - Re-serialized 82 models with sklearn 1.7.2
-22. ✅ **Risk Status API Error - FIXED (2026-01-27)** - Added None guards for pnl calculations in `/api/risk/status`
-23. ✅ **ML/MTF Disagreement Threshold Too Strict - FIXED (2026-01-27)** - Adaptive threshold based on model test_score + regime awareness
+1. ✅ WebSocket stability - Fixed with client/server separation
+2. ✅ TWS API Connection Issues - RESOLVED with subprocess approach
+3. ✅ Zombie connection cleanup - AUTOMATED with Gateway restart
+4. ✅ Socket Zombie Creation Bug - FIXED (use lsof not socket.connect_ex)
+5. ✅ Subprocess Pipe Blocking - FIXED (dedicated stdin reader thread)
+6. ✅ Near Real-Time Trading - IMPLEMENTED (15-second cycles)
+7. ✅ Decimal/Float Type Mismatch - FIXED (use price_float)
+8. ✅ Extended Hours Trading - ENABLED (`ENABLE_EXTENDED_HOURS=true`)
+9. ✅ Dashboard Overview Redesign - IMPLEMENTED
+10. ✅ Equity History Tracking - IMPLEMENTED (`equity_history` table)
+11. ✅ Duplicate BUY Race Condition - FIXED (3-layer protection)
+12. ✅ ML/MTF Disagreement Threshold - FIXED (adaptive threshold)
+13. ✅ Stop-losses on restart - FIXED (recreated from DB positions)
 
-## ML/MTF Disagreement Threshold Fix (2026-01-27)
+---
 
-**Problem:** When ML signal and Multi-Timeframe (MTF) signal disagreed, system required ML confidence > 0.8 to proceed. But ML model only has ~55% accuracy - it can't reliably produce 0.8+ confidence.
-
-**Root Cause:**
-- Fixed 0.8 threshold in `_combine_signals()` was unrealistic for a 55% accurate model
-- Most stocks showed "range_bound" regime where MTF trend signals are inherently noisy
-- Result: ~99% of disagreement signals rejected → falls back to AI analyst → few trades
-
-**Solution (Adaptive Threshold):**
-```python
-# OLD: Fixed threshold
-if ml_signal.confidence > 0.8:  # Too strict!
-
-# NEW: Adaptive based on model performance + regime
-base_threshold = model_test_score + 0.10  # e.g., 0.55 + 0.10 = 0.65
-
-if regime == RANGE_BOUND:
-    threshold = model_test_score + 0.05  # = 0.60 (MTF is noise)
-elif regime in [STRONG_BULL, STRONG_BEAR]:
-    threshold = min(base_threshold + 0.05, 0.75)  # = 0.70
-else:
-    threshold = min(base_threshold, 0.70)  # = 0.65
-```
-
-**Key insight:** In range-bound markets, MTF trend signals are unreliable by design. Disagreement is expected, not a failure signal.
-
-**See:** `docs/SIGNAL_FLOW_AND_KELLY.md` for complete signal flow documentation.
-
-## Duplicate BUY Race Condition Fix (2026-01-27)
-
-**Problem:** Multiple BUY orders for the same symbol executed simultaneously due to race conditions in parallel processing.
-
-**Root Cause:**
-- New `AsyncRunner` created each cycle with fresh `_pending_orders` set
-- In-memory checks didn't persist across cycles
-- Parallel tasks could bypass position checks before DB was updated
-
-**Solution (3-layer protection):**
-1. **Cycle-level set** (`_cycle_executed_buys`): Marks symbols immediately on BUY signal within a cycle
-2. **Pending orders lock** (`_pending_orders_lock`): Prevents parallel tasks from buying same symbol
-3. **Database check**: Queries DB for existing position BEFORE placing order (catches cross-cycle duplicates)
-
-**Key code in `runner_async.py`:**
-```python
-# Layer 1: Cycle-level check
-async with self._cycle_executed_buys_lock:
-    if symbol in self._cycle_executed_buys:
-        return  # Block duplicate
-    self._cycle_executed_buys.add(symbol)
-
-# Layer 2: Pending orders check (inside lock)
-async with self._pending_orders_lock:
-    if symbol in self._pending_orders:
-        return  # Block duplicate
-    self._pending_orders.add(symbol)
-
-    # Layer 3: DATABASE check (most reliable)
-    db_positions = await self.db.get_positions()
-    if any(p["symbol"] == symbol and p["quantity"] > 0 for p in db_positions):
-        return  # Block duplicate
-```
-
-## Dashboard Overview (2026-01-24)
-
-The dashboard overview now shows comprehensive professional trading metrics:
-
-**Hero Row:**
-- Total Equity (prominent, with % return since inception)
-- Today's P&L ($ and %)
-- Unrealized P&L (open positions)
-- Realized P&L (closed trades)
-
-**Risk Row:**
-- Positions Value, Cash Available, Exposure %, Current Drawdown, Max Drawdown, Buying Power
-
-**Main Row:**
-- 30-day Portfolio Value chart (uses `equity_history` table)
-- Position Summary (count, winners/losers, best/worst, avg size)
-
-**Strategy Row:**
-- Win Rate, Profit Factor, Sharpe Ratio, Total Trades
-- Avg Win, Avg Loss, Best Trade, Worst Trade
-- Recent Trades list
-
-**Status Row:**
-- Gateway connection, Market status, Next open/close, Last update, Cycle interval
-
-## Equity History Tracking (2026-01-24)
-
-Portfolio value is tracked daily using the `equity_history` table (industry standard approach).
-
-**Table Schema:**
-```sql
-CREATE TABLE equity_history (
-    date TEXT NOT NULL UNIQUE,
-    equity REAL NOT NULL,
-    cash REAL DEFAULT 0,
-    positions_value REAL DEFAULT 0,
-    realized_pnl REAL DEFAULT 0,
-    unrealized_pnl REAL DEFAULT 0,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-)
-```
-
-**How it works:**
-- Snapshots saved at end of each trading cycle via `save_equity_snapshot()`
-- One snapshot per day (updates if same day)
-- Used by `/api/equity-curve` endpoint for portfolio value chart
-- Accessible via `SyncDatabaseReader.get_equity_history()`
-
-## AI-Driven Symbol Discovery (2026-01-14)
+## AI-Driven Symbol Discovery
 
 **The system discovers new trading opportunities from news - DO NOT manually expand symbol lists.**
 
 ### How It Works
-1. **Base Symbols** in `.env` `SYMBOLS=` - Your watchlist (20 stocks)
+1. **Base Symbols** in `.env` `SYMBOLS=` - Your watchlist
 2. **Existing Positions** - Automatically added for SELL signal monitoring
 3. **AI Discovery** - Scans 50+ news headlines per cycle, finds new opportunities
-
-### News Sources (12 RSS feeds)
-- Yahoo Finance (top stories + tech)
-- Reuters (markets + business)
-- CNBC (top + investing)
-- MarketWatch (top + market pulse)
-- Seeking Alpha (currents + news)
-- TechCrunch, Benzinga
-
-### AI Discovery Flow
-```
-fetch_rss_news(50 headlines) → AI finds opportunities → Adds to processing queue
-```
-
-**Example discoveries:** OKTA (Cantor upgrade), SNPS (Loop Capital AI bullish)
 
 ### Important Behavior
 - **"Already have long position"** = CORRECT behavior, not a bug
 - System prevents duplicate positions in same stock
-- New positions only opened for stocks NOT already owned
 - AI confidence threshold: 50%+ required
 
 ### DO NOT
@@ -495,239 +192,27 @@ fetch_rss_news(50 headlines) → AI finds opportunities → Adds to processing q
 - Expand symbol list without AI/news basis
 - Confuse "no new buys" with "system broken" (may already own those stocks)
 
-## Critical Safety Features (2025-09-27) ✅
-**Added to address audit findings:**
+---
+
+## Key Configuration (.env)
+
+| Setting | Purpose |
+|---------|---------|
+| `STOP_LOSS_PERCENT=2.0` | Stop-loss at 2% loss |
+| `ENABLE_EXTENDED_HOURS=true` | Trade 4AM-8PM ET (pre/after market) |
+| `MAX_OPEN_POSITIONS` | Limit concurrent positions |
+| `SYMBOLS=` | Base watchlist (AI discovers more) |
+
+---
+
+## Critical Safety Features
 - **Order Management** (`order_manager.py`) - Full lifecycle tracking with retry logic
 - **Data Validation** (`data_validator.py`) - Market data quality checks
 - **Circuit Breaker** (`circuit_breaker.py`) - Fault tolerance system
-- **Safety configs in `.env`** - MAX_OPEN_POSITIONS, STOP_LOSS_PERCENT, etc.
-- Run `python3 test_safety_features.py` to validate all safety features
+- **Stop-Loss Monitor** - Recreated on startup for ALL existing positions
+- **Decimal Precision** - Portfolio uses `Decimal` for all financial math
 
-## Security Enhancements (2025-09-28) ✅
-**Critical security vulnerability fixed:**
-- **Secure Configuration** (`utils/secure_config.py`) - Validates and masks sensitive data
-- **API Key Masking** - All sensitive values masked in logs (shows `1234****` instead of full value)
-- **Required Config Validation** - Fails fast if critical configs missing
-- **Port/Mode Consistency** - Prevents accidental live trading with paper ports
-- All IBKR client IDs, accounts, and API keys now properly secured
-
-## Decimal Precision Fix (2025-09-28) ✅
-**PR #39 merged - Float precision errors eliminated:**
-- **Portfolio** uses `Decimal` for cash, realized_pnl, avg_price
-- **RiskManager** uses `Decimal` for position calculations
-- **PrecisePricing** utilities handle all financial arithmetic
-- Eliminates order rejections due to float precision errors
-- See `DECIMAL_PRECISION_FIX.md` for details
-
-## Major Fixes Completed
-
-### Position Database Rebuild (2026-01-27) ✅
-
-**Problem:** Positions table had stale quantities despite trades being recorded correctly. Caused equity calculation to show ~$201K instead of actual ~$2.66M.
-
-**Root Cause:** `db.update_position()` was receiving order quantity instead of accumulated position quantity, causing positions to not accumulate properly.
-
-**Fix:** Rebuilt all positions from trades table using FIFO accounting:
-```sql
--- For each symbol, iterate through trades chronologically
--- BUY: quantity += trade_qty, total_cost += trade_qty * price
--- SELL: quantity -= trade_qty, realized_pnl = (sell_price - avg_cost) * qty
-```
-
-**Result:**
-- 108 positions correctly tracked
-- Total value: $2,479,627.06
-- Account equity: $2,665,050.82
-
-**Prevention:** Added entries to Common Mistakes table:
-- Always verify `db.update_position()` receives accumulated quantity
-- If equity looks wrong, compare trades table totals vs positions table
-
-**See:** `handoff/HANDOFF_2026-01-27_position_db_rebuild.md`
-
-### Extended Hours Trading (2026-01-27) ✅
-
-**User preference:** Trade during after-hours session (4:00 PM - 8:00 PM ET).
-
-**Configuration:**
-```bash
-# In .env
-ENABLE_EXTENDED_HOURS=true   # Set to true to trade after 4:00 PM
-```
-
-**How it works:**
-- NYSE regular hours: 9:30 AM - 4:00 PM ET
-- After-hours: 4:00 PM - 8:00 PM ET
-- Pre-market: 4:00 AM - 9:30 AM ET
-- When `ENABLE_EXTENDED_HOURS=true`, the system treats after-hours and pre-market as valid trading time
-- Uses `is_trading_allowed()` function which checks both `is_market_open()` and `is_extended_hours()`
-
-**Files Modified:**
-- `.env`: Added `ENABLE_EXTENDED_HOURS=true`
-- `robo_trader/runner_async.py`: Added `is_trading_allowed()` helper, replaced `is_market_open()` checks
-
-**IMPORTANT:** IBKR must have extended hours trading enabled in account settings for this to work.
-
-### Near Real-Time Trading System (2025-12-24) ✅
-
-**System now runs with ~15-second latency during market hours.**
-
-**Polling Intervals by Market State:**
-| Market State | Polling Interval | Notes |
-|-------------|------------------|-------|
-| **Market Open** | 15 seconds | Near real-time with 1-minute bars |
-| **Pre/After Hours** | 2 minutes | Extended hours data still available |
-| **Near Open (<1hr)** | 5 minutes | Preparing for market open |
-| **Closed (overnight/weekend)** | 30 minutes max | Conserve resources |
-
-**Configuration Changes:**
-- `bar_size`: 30 min → **1 minute** (finer granularity)
-- `duration`: 10 days → **1 day** (faster data fetch)
-- `interval_seconds`: 300 → **15** (near real-time)
-
-**Files Modified:** `robo_trader/runner_async.py`
-
-**Future Enhancement:** True streaming with `reqMktData()` for <1 second latency (Phase 2 planned)
-
-### Trading Bug Fixes (2025-12-29) ✅
-
-**Fixed two critical bugs preventing trade execution:**
-
-1. **Decimal/Float Type Mismatch**
-   - **File:** `runner_async.py` line 1656
-   - **Error:** `unsupported operand type(s) for /: 'float' and 'decimal.Decimal'`
-   - **Fix:** Changed `current_price=price` to `current_price=price_float`
-
-2. **Market Close Time Wrong**
-   - **File:** `market_hours.py` line 36
-   - **Error:** Market showing as "open" after 4:00 PM
-   - **Fix:** Changed `time(16, 30)` to `time(16, 0)` (4:30 PM → 4:00 PM)
-
-**Known Issue (Open):**
-- **Int/Datetime Comparison Error** affecting GM/GOLD symbols
-- Error: `'>=' not supported between instances of 'int' and 'datetime.datetime'`
-- Needs further investigation
-
-**See:** `handoff/HANDOFF_2025-12-29_trading_bugs_fixed.md`
-
-### Subprocess Pipe Blocking Fix (2025-12-24) ✅
-
-**CRITICAL FIX:** Resolved race condition where data fetch commands were lost.
-
-**Root Cause:** Worker used `run_in_executor` with timeout for `stdin.readline()`. When timeout fired, asyncio cancelled the future BUT the thread pool thread continued blocking. Next iteration spawned another thread, causing orphaned threads to consume data that was never returned.
-
-**Fix:**
-- Worker: Dedicated stdin reader thread with queue (no race condition)
-- Parent: Direct `stdin.write()` without executor wrapper
-
-**Files Modified:**
-- `robo_trader/clients/ibkr_subprocess_worker.py` - Added `_stdin_reader()` thread
-- `robo_trader/clients/subprocess_ibkr_client.py` - Direct stdin writes
-
-**See:** `handoff/HANDOFF_2025-12-24_subprocess_pipe_fix_complete.md`
-
-### Dashboard Connection Status Accuracy (2025-12-10) ✅
-
-**Issue:** Dashboard showed "Connected" when Gateway was merely listening, even if no active API session existed.
-
-**Fix:** Enhanced `check_ibkr_connection()` to distinguish between:
-- **Gateway available** (port listening) - Gateway is running and can accept connections
-- **API connected** (ESTABLISHED socket) - Runner has an active API session
-
-**New Status Messages:**
-- `✅ Market Open - API Connected` - Active IBKR API connection
-- `🔄 Market Open - Waiting for cycle` - Gateway available, runner uses per-cycle connections
-- `⚠️ Market Open - No Gateway` - Gateway/TWS not detected
-
-**API Response Changes:**
-- `connected` now means actual ESTABLISHED socket (was: just port listening)
-- `api_connected` - explicit field for active connection status
-- `gateway_available` - Gateway is listening and can accept connections
-
-**File Modified:** `app.py` - `check_ibkr_connection()` function
-
-### Socket Zombie Creation Bug Fix (2025-12-06) ✅
-
-**CRITICAL FIX:** System now stable for 1+ hour continuous IBKR connection.
-
-**Root Cause:** Three code locations used `socket.connect_ex()` to check if Gateway port was open. This creates a full TCP 3-way handshake, and when the socket is closed without completing the IBKR API handshake, Gateway sees it as an improperly disconnected client, creating CLOSE_WAIT zombie connections that block ALL future API connections.
-
-**Fix:** Replaced `socket.connect_ex()` with `lsof -nP -iTCP:PORT -sTCP:LISTEN` which queries the kernel's socket table without creating any TCP connections.
-
-**Files Fixed:**
-- `app.py` - `check_ibkr_connection()` function (lines 2983-3041)
-- `robo_trader/runner_async.py` - `test_port_open_lsof()` function (lines 460-497)
-- `robo_trader/utils/tws_health.py` - `is_port_listening()` function (lines 141-180)
-- `robo_trader/runner_async.py` - Fixed Python 3.12+ variable scoping error (removed redundant Path import)
-
-**See:** `handoff/HANDOFF_2025-12-06_ZOMBIE_FIX.md` for complete details.
-
-### IBC Gateway Integration (2025-12-03) ✅
-
-**Automated Gateway Management:**
-- `START_TRADER.sh` now handles everything automatically
-- Gateway started via IBC with credentials from `config/ibc/config.ini`
-- Zombie connections detected and Gateway restarted automatically
-- API connectivity verified before proceeding
-- Up to 3 retry attempts on failure
-
-**Files Added/Modified:**
-- `config/ibc/config.ini.template` - IBC config template
-- `scripts/gateway_manager.py` - Cross-platform Gateway management
-- `scripts/start_gateway.sh` - Gateway launcher
-- `START_TRADER.sh` - Full auto-start with retry logic
-- `IBCMacos-3/gatewaystartmacos.sh` - Environment variable support
-
-### TWS API Connection Resolution ✅
-**Problem:** Async context (`patchAsyncio()`) caused TWS API handshake timeouts and stuck connections
-**Solution:** Implemented subprocess-based IBKR operations for complete async isolation
-
-**Key Changes:**
-- Created `SyncIBKRWrapper` class for thread-based operations
-- Implemented subprocess approach for complete process isolation
-- Fixed connection pooling complexity (removed, simplified to direct connections)
-- Enhanced client ID management (unique timestamp + PID based IDs)
-- Comprehensive error handling and cleanup
-
-### Library Migration Notes (2025-09-27)
-- **MIGRATION COMPLETE:** Successfully migrated from `ib_insync` to `ib_async` v2.0.1
-- ib_insync author passed away early 2024, library archived March 2024
-- ib_async is the community-maintained fork, drop-in replacement
-- All imports updated: `from ib_insync` → `from ib_async`
-- Old ib_insync library has been uninstalled
-- System tested and running successfully with ib_async
-
-### Subprocess Worker Connection Fix (2025-11-24) ✅
-
-**CRITICAL FIX COMPLETED**: Resolved timing race condition in subprocess worker that caused connection failures.
-
-**Problem Resolved:**
-- **Issue**: Worker responded `{"connected": false, "accounts": []}` in ~163ms before handshake completed
-- **Root Cause**: Subprocess client read response before worker finished IBKR connection process
-- **Impact**: 0% connection success rate, system unable to start
-
-**Solution Implemented:**
-- **Synchronization Fix**: Added explicit `ib.isConnected()` polling loop with 2.0s stabilization wait
-- **Zombie Prevention**: Pre-connection check detects CLOSE_WAIT zombies and aborts with clear instructions
-- **Enhanced Debugging**: Worker stderr captured to `/tmp/worker_debug.log` for troubleshooting
-- **Response Filtering**: JSON response filtering prevents ib_async log pollution
-
-**Documentation:** See `docs/SUBPROCESS_WORKER_CONNECTION_FIX.md` for complete technical details.
-
-### Gateway API Notes
-
-- ActiveX/Socket Clients is **permanently enabled** in IB Gateway ≥10.41 and cannot be disabled
-- System uses **READONLY mode** for TWS connections (no order placement via API)
-- PaperExecutor handles orders separately
-- No TWS security dialog popups with read-only connections
-
-## WebSocket Fix Notes (2025-08-28)
-- Fixed handler signature by adding `path` parameter
-- Fixed JSON serialization by using structlog properly
-- Disabled websockets library debug logging to prevent ServerConnection serialization
-- Set MONITORING_LOG_FORMAT=plain when running dashboard to avoid JSON issues
-- Created WebSocket client (`websocket_client.py`) for proper client/server separation
-- Runner now uses client to connect to existing server instead of direct import
+---
 
 ## Development Guidelines
 - Always refer to IMPLEMENTATION_PLAN.md for phase objectives
@@ -791,35 +276,33 @@ ENABLE_EXTENDED_HOURS=true   # Set to true to trade after 4:00 PM
 | Float precision in position sizing | Use `Decimal` for all financial math | 2025-09-28 |
 | Hardcoding market hours | Use `MarketHours` class | 2025-12-29 |
 | Assuming fixed % profit on sells | Track cost basis with position tracker (FIFO) | 2026-01-06 |
-| P&L dashboard using float | Use `Decimal` for all P&L calculations | 2026-01-06 |
 | Arbitrarily expanding symbol list | Let AI discover from news, don't add random stocks | 2026-01-14 |
 | "Already have position" = bug | This is CORRECT behavior - prevents duplicate buys | 2026-01-14 |
 | Missing dynamic market holidays | Use `_is_market_holiday()` - includes MLK, Presidents, etc. | 2026-01-15 |
 | `db.update_position(qty)` uses order qty | Use `self.positions[symbol].quantity` (accumulated) | 2026-01-16 |
 | `self.positions` not synced to Portfolio | Must sync DB positions to `self.portfolio.positions` on startup | 2026-01-26 |
 | Portfolio shows only cash, no positions | `portfolio.equity()` uses its own positions dict - sync it! | 2026-01-26 |
-| Parallel BUY race condition - duplicate buys | Use 3-layer protection: cycle set + pending lock + DB check (see fix 2026-01-27) | 2026-01-27 |
+| Parallel BUY race condition - duplicate buys | Use 3-layer protection: cycle set + pending lock + DB check | 2026-01-27 |
+| Pairs trading records trades but not positions | After pairs BUY: update `self.positions` AND `db.update_position()` | 2026-02-03 |
+| Pairs trading `has_recent_buy` uses 120s | Use 600s (10 min) to catch trades across multiple cycles | 2026-02-03 |
+| Pairs trading missing `portfolio.update_fill()` | Call `await self.portfolio.update_fill()` after pairs BUY | 2026-02-03 |
+| Pairs trading missing stop-loss creation | Add stop-loss via `stop_loss_monitor.add_stop_loss()` after pairs BUY | 2026-02-03 |
+| `db.get_positions()` inside pairs loop (N+1) | Fetch once before loop into `db_positions_list`, reuse inside | 2026-02-03 |
 | In-memory duplicate checks reset each cycle | Add DATABASE check inside lock - `await self.db.get_positions()` | 2026-01-27 |
-| API `get_recent_trades(limit=1000)` misses old trades | Use `limit=5000` to ensure ALL trades included in P&L calc | 2026-01-26 |
-| Market shows "closed" at 4:00 PM when user wants to trade | Set `ENABLE_EXTENDED_HOURS=true` in .env - uses `is_trading_allowed()` | 2026-01-27 |
-| Using `is_market_open()` for trading checks | Use `is_trading_allowed()` which includes extended hours when enabled | 2026-01-27 |
-| SELL trades with NULL pnl column | Update NULL pnls with estimated value from avg buy price | 2026-01-26 |
-| P&L API recalculating instead of using stored values | Use stored `pnl` column from trades table, not FIFO recalc | 2026-01-26 |
+| Market shows "closed" at 4:00 PM when user wants to trade | Set `ENABLE_EXTENDED_HOURS=true` in .env | 2026-01-27 |
+| Using `is_market_open()` for trading checks | Use `is_trading_allowed()` which includes extended hours | 2026-01-27 |
 | Fixed 0.8 confidence threshold for ML/MTF disagreement | Use adaptive threshold: `model_test_score + margin`, lower in range-bound | 2026-01-27 |
 | Ignoring market regime in signal resolution | Range-bound regime → MTF trend signals are noise, trust ML more | 2026-01-27 |
-| Kelly only used for sizing, not filtering | Kelly can filter via `should_skip_trade()` based on expected value | 2026-01-27 |
 | Positions table not accumulating quantities | Check `db.update_position()` receives accumulated qty, not order qty | 2026-01-27 |
 | Stale positions → wrong equity calculation | Rebuild positions from trades if mismatch detected | 2026-01-27 |
-| `/api/pnl` missing `cash` field | Add `cash` to all return paths (market-open, closed, error) | 2026-01-27 |
-| `/api/equity-curve` overrides equity_history with P&L calc | Prefer equity_history when available, fallback only when empty | 2026-01-27 |
-| Database lock causes `update_position` to fail silently | Monitor position/trade mismatches, add retry logic | 2026-01-27 |
-| Runner stalls with no output for 25+ min | Restart with `./START_TRADER.sh`, check IBKR connection | 2026-01-27 |
 | Pairs trading bypasses duplicate protection | Add `has_recent_buy_trade()` check before pairs BUY orders | 2026-01-28 |
 | Pairs trading position check `> 100` instead of `> 0` | Check `quantity > 0` to block any existing position | 2026-01-28 |
 | Fresh AsyncRunner each cycle resets in-memory protection | Use DB-level checks (`has_recent_buy_trade`) that persist | 2026-01-28 |
 | DB column `action` vs `side` mismatch | `trading_data.db` uses `side`, not `action` - check schema first | 2026-01-29 |
 | Pairs trading bypasses MAX_OPEN_POSITIONS | Add position count check before opening pairs trades | 2026-01-29 |
 | Missing parameter validation on new DB methods | Add symbol validation + seconds bounds check (1-86400) | 2026-01-29 |
+| Stop-losses not created for existing positions on restart | `load_existing_positions()` must call `stop_loss_monitor.add_stop_loss()` for each loaded position | 2026-02-03 |
+| In-memory stop-loss orders lost on restart | Stop-losses are ephemeral - ALWAYS recreate on startup from DB positions | 2026-02-03 |
 
 ---
 
@@ -829,7 +312,6 @@ ENABLE_EXTENDED_HOURS=true   # Set to true to trade after 4:00 PM
 - [ ] `python3 -m pytest tests/` passes
 - [ ] `python3 -m black --check .` passes
 - [ ] `python3 -m flake8 .` passes
-- [ ] `./scripts/run_bugbot.sh` finds no critical issues
 - [ ] `lsof -nP -iTCP:4002 -sTCP:CLOSE_WAIT` shows no zombies
 - [ ] Manual test of affected functionality
 
@@ -841,68 +323,43 @@ See `docs/PARALLEL_CLAUDE_SETUP.md` for full setup guide.
 
 ### Terminal Layout
 
-| Tab | Name | Purpose | Key Command |
-|-----|------|---------|-------------|
-| 1 | MAIN | Primary development | (work happens here) |
-| 2 | TEST | Continuous testing | `/test-and-commit` |
-| 3 | REVIEW | Code review | `/review` |
-| 4 | DOCS | Research/documentation | (research) |
-| 5 | HOTFIX | Quick fixes | (emergency fixes) |
-
-### Standard Workflow
-
-```
-Tab 1 (MAIN):   Implement changes
-Tab 3 (REVIEW): /review         → 6 subagents check code
-Tab 1 (MAIN):   Fix issues found
-Tab 2 (TEST):   /test-and-commit → Tests pass? → Commit
-User:           git push
-```
+| Tab | Name | Purpose |
+|-----|------|---------|
+| 1 | MAIN | Primary development |
+| 2 | TEST | Continuous testing (`/test-and-commit`) |
+| 3 | REVIEW | Code review (`/review`) |
+| 4 | DOCS | Research/documentation |
+| 5 | HOTFIX | Quick fixes |
 
 ### Slash Commands
 
 | Command | What It Does | Commits? |
 |---------|--------------|----------|
 | `/review` | 6 parallel subagents review for bugs, security, style | NO |
-| `/two-phase-review` | Review + challenger phase (filters 20-40% false positives) | NO |
+| `/two-phase-review` | Review + challenger phase (filters false positives) | NO |
 | `/verify` | Run verification loop (tests, lint, trading checks) | NO |
 | `/test-and-commit` | Run pytest, fix failures, then commit | YES |
 | `/commit` | Quick commit with proper message format | YES |
 | `/pr` | Full PR workflow (tests + lint + PR) | YES |
 | `/verify-trading` | Check Gateway, zombies, risk params | NO |
-| `/oncall-debug` | Systematic production debugging | NO |
-| `/code-simplifier` | Review and simplify recent code | NO |
-| `/shared-knowledge` | Update CLAUDE.md with new learnings | YES |
 | `/retrospective` | Extract session learnings, update CLAUDE.md | YES |
 
-### When to Suggest Commands (Proactive Guidance)
+### When to Suggest Commands
 
-**Claude should proactively suggest these commands at the right time:**
-
-| Trigger | Suggest | Why |
-|---------|---------|-----|
-| After implementing a feature | `/verify` | Catch bugs before review |
-| After fixing a bug | `/verify` | Confirm fix works |
-| Before committing significant changes | `/review` or `/two-phase-review` | Quality gate |
-| After a session with errors/fixes | `/retrospective` | Capture learnings |
-| User says "commit" or "done" | `/test-and-commit` | Tests + proper commit |
-| Starting trading system | `/verify-trading` | Ensure system health |
-| After debugging production issue | `/oncall-debug` then `/retrospective` | Document findings |
-
-**Example suggestions:**
-
-After implementing: *"I've completed the feature. Run `/verify` to validate, then `/review` for a quality check."*
-
-After fixing bug: *"Fixed the issue. Run `/verify` to confirm the fix works."*
-
-Session with mistakes: *"We encountered some issues this session. Consider running `/retrospective` to capture learnings for CLAUDE.md."*
+| Trigger | Suggest |
+|---------|---------|
+| After implementing a feature | `/verify` then `/review` |
+| After fixing a bug | `/verify` |
+| Before committing significant changes | `/review` or `/two-phase-review` |
+| User says "commit" or "done" | `/test-and-commit` |
+| Session with errors/fixes | `/retrospective` |
 
 ### CRITICAL: DO NOT Auto-Commit
 
 **After completing work, Claude must:**
 1. Report what was changed
-2. Suggest verification: "Run `/verify` to validate the changes"
-3. Suggest review: "Then run `/review` (or `/two-phase-review` for thorough check)"
+2. Suggest verification: "Run `/verify` to validate"
+3. Suggest review: "Then run `/review`"
 4. Suggest commit: "Finally `/test-and-commit` when ready"
 5. **STOP** - wait for user to run the slash commands
 
@@ -913,7 +370,6 @@ Session with mistakes: *"We encountered some issues this session. Consider runni
 
 ### Handoff Between Instances
 
-When one Claude instance needs to share context with another:
 ```bash
 # Source Claude writes:
 handoff/HANDOFF_<date>_<topic>.md
@@ -924,112 +380,9 @@ Read handoff/LATEST_HANDOFF.md
 
 ---
 
-## Multi-Agent Development Environment
-
-This project uses a Boris Cherny-inspired multi-agent workflow with trading-specific adaptations.
-
-### Philosophy
-
-1. **Parallel beats Sequential** - Run multiple agents simultaneously for faster review
-2. **Specialization beats Generalization** - Each agent focuses on one concern
-3. **Verification is Critical** - Always give Claude a way to verify its work
-4. **Two-Phase Loop** - Initial review + challenger filters false positives
-5. **Shared Knowledge** - Update CLAUDE.md when mistakes are discovered
-
-### Available Subagents (`.claude/agents/`)
-
-| Agent | Purpose |
-|-------|---------|
-| `code-reviewer` | Quality, security, maintainability reviews |
-| `bug-finder` | Bugs, edge cases, race conditions |
-| `style-checker` | Style guide compliance (PEP 8 + project rules) |
-| `verifier` | End-to-end verification and testing |
-| `trading-validator` | Trading logic, risk management, position tracking |
-| `verification-challenger` | Filters false positives from other agents |
-| `planner` | Implementation planning before coding |
-| `parallel-coordinator` | Multi-agent orchestration |
-
-### Slash Commands (`.claude/commands/`)
-
-| Command | Purpose |
-|---------|---------|
-| `/review` | Multi-agent code review (6 parallel subagents) |
-| `/two-phase-review` | Review + challenge phase (Boris Cherny method, filters false positives) |
-| `/verify` | Verification loop (2-3x quality improvement) |
-| `/test-and-commit` | Run tests, then commit if passing |
-| `/commit` | Quick commit with proper format |
-| `/pr` | Full PR workflow |
-| `/verify-trading` | Trading system health check |
-| `/oncall-debug` | Production debugging workflow |
-| `/code-simplifier` | Post-implementation cleanup |
-| `/shared-knowledge` | Update CLAUDE.md with new learnings |
-| `/retrospective` | Extract session learnings, update common mistakes |
-
-### Skills (`.claude/skills/`)
-
-| Skill | Purpose |
-|-------|---------|
-| `verify-trading` | Full verification with Python script for automated checks |
-
-### Two-Phase Review Loop
-
-```
-Phase 1: Fan-Out (Parallel)
-├── code-reviewer       → Quality findings
-├── bug-finder          → Bug findings
-├── style-checker       → Style findings
-├── trading-validator   → Trading logic findings
-└── verifier            → Test execution
-
-Phase 2: Challenge (Filter)
-└── verification-challenger → Confirms real issues, removes false positives
-```
-
-### Recommended Workflows
-
-**New Features:**
-```
-/plan → implement → /verify → /two-phase-review → /test-and-commit
-```
-
-**Bug Fixes:**
-```
-fix → /verify → /review → /test-and-commit
-```
-
-**Code Quality:**
-```
-/two-phase-review → fix confirmed issues → /retrospective → /commit
-```
-
-**Fast Iteration:**
-```
-/test-and-commit  # Parallel verify + auto-commit if passing
-```
-
-### Hooks (Auto-Run)
-
-| Hook | Trigger | Action |
-|------|---------|--------|
-| `PostToolUse` | After Edit/Write | Auto-format with black + isort |
-| `Stop` | Agent finishes | Run pytest verification |
-
-### Advanced Patterns (Beyond Standard Guides)
-
-1. **Atomic Handoff**: Date-stamped topic-specific handoffs prevent context loss
-2. **Common Mistakes Table**: RAG-like pattern prevents repeated errors
-3. **Prohibition vs Permission Model**: Three-tier action classification survives prompt injection
-4. **Regime-Aware Decisions**: Trading logic adapts to market context
-
----
-
 ## Adding New Mistakes
 
 When Claude makes an error:
-
 1. **Identify the root cause**
-2. **Add to table above** with:
-   - What went wrong
-   - Correct approach
-   - Date discovered
+2. **Add to table above** with date
 3. **Commit the update** so all future sessions learn

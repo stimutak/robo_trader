@@ -978,6 +978,39 @@ class AsyncRunner:
                     f"Loaded existing position: {symbol} qty={quantity} avg_cost=${avg_cost:.2f}"
                 )
 
+            # CRITICAL FIX: Create stop-loss orders for existing positions
+            # Without this, positions opened in previous sessions have NO stop-loss protection!
+            if self.positions and self.stop_loss_monitor:
+                logger.info(
+                    f"Creating stop-loss orders for {len(self.positions)} existing positions..."
+                )
+                for symbol, pos in self.positions.items():
+                    try:
+                        # Create a position with float avg_price for stop-loss monitor
+                        # (stop_loss_monitor uses float math internally)
+                        float_pos = Position(
+                            symbol=pos.symbol,
+                            quantity=pos.quantity,
+                            avg_price=float(pos.avg_price),
+                            entry_time=pos.entry_time,
+                        )
+                        await self.stop_loss_monitor.add_stop_loss(
+                            symbol=symbol,
+                            position=float_pos,
+                            stop_percent=self.stop_loss_percent,
+                            stop_type=StopType.FIXED,
+                        )
+                        entry_price = float(pos.avg_price)
+                        stop_price = entry_price * (1 - self.stop_loss_percent)
+                        logger.info(
+                            f"Stop-loss created for existing position {symbol} at {self.stop_loss_percent:.1%} "
+                            f"(entry=${entry_price:.2f}, stop=${stop_price:.2f})"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to create stop-loss for existing position {symbol}: {e}"
+                        )
+
             if self.positions:
                 logger.info(
                     f"Loaded {len(self.positions)} existing positions from database: {list(self.positions.keys())}"
@@ -2530,6 +2563,9 @@ class AsyncRunner:
                             list(self.pairs_strategy.pair_stats.keys()), current_prices
                         )
 
+                        # Fetch DB positions ONCE before loop (avoid N+1 query pattern)
+                        db_positions_list = await self.db.get_positions()
+
                         for signal in pairs_signals:
                             logger.info(
                                 "pairs_signal",
@@ -2560,7 +2596,32 @@ class AsyncRunner:
 
                                     if has_position_a or has_position_b:
                                         logger.info(
-                                            f"Skipping pairs trade for {symbol_a}-{symbol_b}: already have positions"
+                                            f"Skipping pairs trade for {symbol_a}-{symbol_b}: already have positions (in-memory)"
+                                        )
+                                        continue
+
+                                    # CRITICAL: Also check DB positions in case in-memory is out of sync
+                                    # (uses db_positions_list fetched once before loop)
+                                    db_pos_a = next(
+                                        (
+                                            p
+                                            for p in db_positions_list
+                                            if p["symbol"] == symbol_a and p.get("quantity", 0) > 0
+                                        ),
+                                        None,
+                                    )
+                                    db_pos_b = next(
+                                        (
+                                            p
+                                            for p in db_positions_list
+                                            if p["symbol"] == symbol_b and p.get("quantity", 0) > 0
+                                        ),
+                                        None,
+                                    )
+                                    if db_pos_a or db_pos_b:
+                                        logger.warning(
+                                            f"DUPLICATE BLOCKED: Skipping pairs trade for {symbol_a}-{symbol_b}: "
+                                            f"DB position exists (A={db_pos_a is not None}, B={db_pos_b is not None})"
                                         )
                                         continue
 
@@ -2579,11 +2640,12 @@ class AsyncRunner:
 
                                     # CRITICAL: Check DB for recent BUY trades to prevent duplicates
                                     # This catches trades from main strategy or previous pairs cycles
+                                    # Use 600 seconds (10 min) to catch trades across multiple cycles
                                     recent_buy_a = await self.db.has_recent_buy_trade(
-                                        symbol_a, seconds=120
+                                        symbol_a, seconds=600
                                     )
                                     recent_buy_b = await self.db.has_recent_buy_trade(
-                                        symbol_b, seconds=120
+                                        symbol_b, seconds=600
                                     )
 
                                     if recent_buy_a or recent_buy_b:
@@ -2661,16 +2723,53 @@ class AsyncRunner:
                                                 order_a
                                             )
                                             if res_a.ok:
+                                                fill_a = res_a.fill_price or price_a
                                                 await self.db.record_trade(
                                                     symbol_a,
                                                     "BUY",
                                                     qty_a,
-                                                    res_a.fill_price or price_a,
+                                                    fill_a,
                                                     0,
                                                 )
-                                                logger.info(
-                                                    f"Pairs trade: Bought {qty_a} {symbol_a} at ${price_a:.2f}"
+                                                # CRITICAL: Update positions to prevent duplicate buys
+                                                self.positions[symbol_a] = Position(
+                                                    symbol_a, qty_a, fill_a
                                                 )
+                                                await self.db.update_position(
+                                                    symbol_a, qty_a, fill_a, fill_a
+                                                )
+                                                # Sync to Portfolio for equity calculation
+                                                await self.portfolio.update_fill(
+                                                    symbol_a, "BUY", qty_a, fill_a
+                                                )
+                                                logger.info(
+                                                    f"Pairs trade: Bought {qty_a} {symbol_a} at ${fill_a:.2f}"
+                                                )
+                                                # Track trade count
+                                                if hasattr(self, "trades_executed"):
+                                                    self.trades_executed += 1
+                                                # Add stop-loss for pairs position
+                                                if self.stop_loss_monitor and self.enable_stop_loss:
+                                                    try:
+                                                        new_pos = Position(
+                                                            symbol=symbol_a,
+                                                            quantity=qty_a,
+                                                            avg_price=fill_a,
+                                                            entry_time=datetime.now(),
+                                                        )
+                                                        await self.stop_loss_monitor.add_stop_loss(
+                                                            symbol=symbol_a,
+                                                            position=new_pos,
+                                                            stop_percent=self.stop_loss_percent,
+                                                            stop_type=StopType.FIXED,
+                                                        )
+                                                        logger.info(
+                                                            f"Stop-loss added for pairs position {symbol_a}"
+                                                        )
+                                                    except Exception as e:
+                                                        logger.error(
+                                                            f"Failed to add stop-loss for pairs {symbol_a}: {e}"
+                                                        )
 
                                             # Short symbol_b (if shorting enabled, otherwise skip)
                                             if self.cfg.execution.enable_short_selling:
@@ -2713,18 +2812,52 @@ class AsyncRunner:
                                                 order_b
                                             )
                                             if res_b.ok:
+                                                fill_b = res_b.fill_price or price_b
                                                 await self.db.record_trade(
                                                     symbol_b,
                                                     "BUY",
                                                     qty_b,
-                                                    res_b.fill_price or price_b,
+                                                    fill_b,
                                                     0,
                                                 )
+                                                # CRITICAL: Update positions to prevent duplicate buys
+                                                self.positions[symbol_b] = Position(
+                                                    symbol_b, qty_b, fill_b
+                                                )
+                                                await self.db.update_position(
+                                                    symbol_b, qty_b, fill_b, fill_b
+                                                )
+                                                # Sync to Portfolio for equity calculation
+                                                await self.portfolio.update_fill(
+                                                    symbol_b, "BUY", qty_b, fill_b
+                                                )
                                                 logger.info(
-                                                    f"Pairs trade: Bought {qty_b} {symbol_b} at ${price_b:.2f}"
+                                                    f"Pairs trade: Bought {qty_b} {symbol_b} at ${fill_b:.2f}"
                                                 )
                                                 if hasattr(self, "trades_executed"):
                                                     self.trades_executed += 1
+                                                # Add stop-loss for pairs position
+                                                if self.stop_loss_monitor and self.enable_stop_loss:
+                                                    try:
+                                                        new_pos = Position(
+                                                            symbol=symbol_b,
+                                                            quantity=qty_b,
+                                                            avg_price=fill_b,
+                                                            entry_time=datetime.now(),
+                                                        )
+                                                        await self.stop_loss_monitor.add_stop_loss(
+                                                            symbol=symbol_b,
+                                                            position=new_pos,
+                                                            stop_percent=self.stop_loss_percent,
+                                                            stop_type=StopType.FIXED,
+                                                        )
+                                                        logger.info(
+                                                            f"Stop-loss added for pairs position {symbol_b}"
+                                                        )
+                                                    except Exception as e:
+                                                        logger.error(
+                                                            f"Failed to add stop-loss for pairs {symbol_b}: {e}"
+                                                        )
 
                                             # Short symbol_a (if shorting enabled, otherwise skip)
                                             if self.cfg.execution.enable_short_selling:

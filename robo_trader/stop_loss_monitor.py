@@ -203,7 +203,7 @@ class StopLossMonitor:
             symbol=symbol,
             position_qty=position.quantity,
             stop_price=stop_price,
-            entry_price=position.avg_price,
+            entry_price=avg_price_float,  # Use float, not Decimal
             stop_type=stop_type,
             created_at=datetime.now(),
             trailing_amount=trailing_amount,

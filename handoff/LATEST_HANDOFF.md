@@ -1,1 +1,1 @@
-HANDOFF_2026-01-29_code_review_fixes.md
+HANDOFF_2026-02-03_pairs_trading_fixes.md
