@@ -24,9 +24,16 @@ PORT=4002
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MAX_GATEWAY_RETRIES=3
 
-# Parse arguments
-SYMBOLS="AAPL,NVDA,TSLA"
+# Load defaults from .env if present
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    # Source only SYMBOLS to avoid polluting environment
+    SYMBOLS=$(grep "^SYMBOLS=" "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+fi
 
+# Fallback default if .env doesn't have SYMBOLS
+SYMBOLS="${SYMBOLS:-AAPL,NVDA,TSLA}"
+
+# Parse arguments (override .env if provided)
 for arg in "$@"; do
     case $arg in
         *)

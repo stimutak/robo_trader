@@ -128,6 +128,56 @@ pkill -f "IB Gateway"
 - API permissions are configured in your IBKR account settings
 - System uses **readonly** connections (no order placement via API)
 
+## Watchdog Auto-Restarter (Added 2026-02-03)
+
+The system includes an automatic watchdog that detects stalls and restarts the trader.
+
+### How It Works
+
+- Monitors log file modification time every 60 seconds
+- If no log activity for 5+ minutes during market hours → auto-restart
+- Respects `ENABLE_EXTENDED_HOURS` setting (monitors 4 AM - 8 PM if enabled)
+- Runs as macOS launchd service (survives reboot)
+
+### Watchdog Files
+
+| File | Purpose |
+|------|---------|
+| `scripts/watchdog.sh` | Main watchdog script |
+| `scripts/com.robotrader.watchdog.plist` | macOS service config |
+| `watchdog.log` | Watchdog activity log |
+
+### Management Commands
+
+```bash
+# Check if running
+launchctl list | grep robotrader
+
+# View watchdog log
+tail -f watchdog.log
+
+# Stop watchdog
+launchctl unload ~/Library/LaunchAgents/com.robotrader.watchdog.plist
+
+# Start watchdog
+launchctl load ~/Library/LaunchAgents/com.robotrader.watchdog.plist
+
+# Reinstall after changes
+cp scripts/com.robotrader.watchdog.plist ~/Library/LaunchAgents/
+launchctl unload ~/Library/LaunchAgents/com.robotrader.watchdog.plist
+launchctl load ~/Library/LaunchAgents/com.robotrader.watchdog.plist
+```
+
+### Configuration
+
+Edit the plist to change threshold (default 5 minutes):
+```xml
+<array>
+    <string>/Users/oliver/robo_trader/scripts/watchdog.sh</string>
+    <string>5</string>  <!-- minutes -->
+</array>
+```
+
 ## Mobile App & Parallel Development
 
 ### Repository Structure

@@ -146,6 +146,8 @@ Investigate → Fix      # Direct fix
 tail -f robo_trader.log  # Monitor startup
 ```
 
+**Note:** The watchdog service auto-restarts the trader if stalled for 5+ minutes during market hours. Check `watchdog.log` for restart history. See CLAUDE.md for watchdog management commands.
+
 ### Production Debug Workflow
 
 ```
