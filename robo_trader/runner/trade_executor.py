@@ -434,7 +434,47 @@ class TradeExecutor:
 
     async def _close_long(self, symbol: str, price: float, pos: Position) -> ExecutionResult:
         """Close a long position."""
-        logger.info(f"Attempting to SELL {pos.quantity} shares of {symbol} at ${price:.2f}")
+        # PRO TRADER RULE: Only sell on signal if position is profitable
+        # If at a loss, let the stop-loss handle the exit (don't panic sell)
+        entry_price = float(pos.avg_price)
+
+        # Guard against division by zero (corrupt data edge case)
+        if entry_price <= 0:
+            logger.error(f"Invalid entry_price for {symbol}: {entry_price} - skipping sell")
+            return ExecutionResult(
+                symbol=symbol,
+                executed=False,
+                quantity=0,
+                fill_price=price,
+                side="SELL",
+                message=f"Invalid entry price: {entry_price}",
+            )
+
+        pnl_percent = ((price - entry_price) / entry_price) * 100
+
+        if price < entry_price:
+            # Position is at a loss - don't sell on ML signal
+            loss_amount = (entry_price - price) * pos.quantity
+            message = (
+                f"SELL signal IGNORED for {symbol}: position at loss "
+                f"(entry ${entry_price:.2f}, current ${price:.2f}, "
+                f"P&L {pnl_percent:.1f}% = -${loss_amount:.2f}). "
+                f"Letting stop-loss handle exit."
+            )
+            logger.warning(message)
+            return ExecutionResult(
+                symbol=symbol,
+                executed=False,
+                quantity=0,
+                fill_price=price,
+                side="SELL",
+                message=message,
+            )
+
+        logger.info(
+            f"Attempting to SELL {pos.quantity} shares of {symbol} at ${price:.2f} "
+            f"(profit: {pnl_percent:.1f}%)"
+        )
 
         if self._check_kill_switch():
             return ExecutionResult(

@@ -1918,7 +1918,7 @@ class AsyncRunner:
 
                     # ADDITIONAL CHECK: Look for recent BUY trades (handles race conditions)
                     # Position might not be updated yet if trade just happened
-                    recent_buy = await self.db.has_recent_buy_trade(symbol, seconds=120)
+                    recent_buy = await self.db.has_recent_buy_trade(symbol, seconds=600)
                     if recent_buy:
                         logger.warning(
                             f"DUPLICATE BUY BLOCKED: {symbol} has recent BUY trade in last 120 seconds"
@@ -1929,6 +1929,22 @@ class AsyncRunner:
                             signal_value,
                             price_float,
                             "Duplicate buy blocked: recent BUY trade exists",
+                            df,
+                        )
+
+                    # ANTI-CHURN CHECK: Block re-buying a symbol recently sold
+                    # Prevents rapid BUY→SELL→BUY cycling (whipsawing)
+                    recent_sell = await self.db.has_recent_sell_trade(symbol, seconds=600)
+                    if recent_sell:
+                        logger.warning(
+                            f"CHURN BLOCKED: {symbol} was sold in last 10 minutes - waiting for cooldown"
+                        )
+                        self._pending_orders.discard(symbol)
+                        return self._blocked_result(
+                            symbol,
+                            signal_value,
+                            price_float,
+                            "Churn blocked: recently sold - 10 min cooldown",
                             df,
                         )
 
@@ -2148,8 +2164,36 @@ class AsyncRunner:
                 pos = self.positions[symbol]
 
                 if pos.quantity > 0:  # Closing long position
+                    # PRO TRADER RULE: Only sell on signal if position is profitable
+                    # If at a loss, let the stop-loss handle the exit (don't panic sell)
+                    entry_price = float(pos.avg_price)
+
+                    # Guard against division by zero (corrupt data edge case)
+                    if entry_price <= 0:
+                        logger.error(
+                            f"Invalid entry_price for {symbol}: {entry_price} - skipping sell check"
+                        )
+                        return self._blocked_result(
+                            symbol, 0, price_float, f"Invalid entry price: {entry_price}", df
+                        )
+
+                    pnl_percent = ((price_float - entry_price) / entry_price) * 100
+
+                    if price_float < entry_price:
+                        # Position is at a loss - don't sell on ML signal
+                        loss_amount = (entry_price - price_float) * pos.quantity
+                        message = (
+                            f"SELL signal IGNORED for {symbol}: position at loss "
+                            f"(entry ${entry_price:.2f}, current ${price_float:.2f}, "
+                            f"P&L {pnl_percent:.1f}% = -${loss_amount:.2f}). "
+                            f"Letting stop-loss handle exit."
+                        )
+                        logger.warning(message)
+                        return self._blocked_result(symbol, 0, price_float, message, df)
+
                     logger.info(
-                        f"Attempting to SELL {pos.quantity} shares of {symbol} at ${price_float:.2f}"
+                        f"Attempting to SELL {pos.quantity} shares of {symbol} at ${price_float:.2f} "
+                        f"(profit: {pnl_percent:.1f}%)"
                     )
 
                     # Check kill switch before order execution
@@ -2722,10 +2766,10 @@ class AsyncRunner:
 
                                     # Also check for recent SELL trades to prevent rapid position churn
                                     recent_sell_a = await self.db.has_recent_sell_trade(
-                                        symbol_a, seconds=120
+                                        symbol_a, seconds=600
                                     )
                                     recent_sell_b = await self.db.has_recent_sell_trade(
-                                        symbol_b, seconds=120
+                                        symbol_b, seconds=600
                                     )
 
                                     if recent_sell_a or recent_sell_b:

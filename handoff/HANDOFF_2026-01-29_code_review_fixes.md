@@ -1,99 +1,119 @@
-# Handoff: Code Review Fixes - 2026-01-29
+# Handoff: Watchdog Auto-Restarter
+
+**Date:** 2026-02-03
+**Session Focus:** Implement automatic stall detection and restart for the trading system
+
+---
 
 ## Summary
 
-Ran multi-subagent code review on recent duplicate BUY protection changes. Found and fixed several issues including a critical database column mismatch bug.
+Created a watchdog service that monitors the trading system and automatically restarts it if stalled during market hours.
 
-## Changes Made
+## Problem Solved
 
-### 1. Fixed Database Column Mismatch (CRITICAL)
-**Files:** `robo_trader/database_async.py`
+- Trader was stalling with no log activity (last logs at 12:18, discovered at 13:12)
+- No automatic recovery mechanism existed
+- Manual intervention required to restart
 
-**Problem:** New methods `has_recent_buy_trade()` and `has_recent_sell_trade()` used `action` column but `trading_data.db` uses `side` column.
+## Files Created
 
-**Error seen:**
-```
-Connection error: no such column: action
-```
+### 1. `scripts/watchdog.sh`
+Bash script that:
+- Monitors log file modification time
+- Detects stalls (no activity for 5+ minutes)
+- Auto-restarts via `./START_TRADER.sh`
+- Only active during market hours (respects `ENABLE_EXTENDED_HOURS`)
+- Logs to `watchdog.log`
 
-**Fix:** Changed queries from `AND action = 'BUY'` to `AND side = 'BUY'` (and same for SELL).
-
-**Root cause:** Two databases exist with different schemas:
-- `trading.db` uses `action` column
-- `trading_data.db` uses `side` column (this is the production DB)
-
-### 2. Added MAX_OPEN_POSITIONS Check for Pairs Trading (HIGH)
-**File:** `robo_trader/runner_async.py` (lines 2567-2578)
-
-**Problem:** Pairs trading could exceed position limits since it bypassed the `can_open_position()` check.
-
-**Fix:** Added check before opening pairs trades:
-```python
-current_position_count = len([p for p in self.positions.values() if p.quantity > 0])
-max_positions = self.cfg.risk.max_open_positions
-if current_position_count + 2 > max_positions:
-    logger.warning(f"POSITION LIMIT: Skipping pairs trade...")
-    continue
-```
-
-### 3. Added Parameter Validation (MEDIUM)
-**File:** `robo_trader/database_async.py`
-
-Added validation to `has_recent_buy_trade()` and `has_recent_sell_trade()`:
-- Symbol validation via `DatabaseValidator.validate_symbol()`
-- Type check: `seconds` must be `int`
-- Bounds check: `seconds` must be 1-86400 (max 24 hours)
-
-### 4. Added Recent SELL Check for Pairs Trading (LOW)
-**File:** `robo_trader/runner_async.py` (lines 2596-2610)
-
-Added `has_recent_sell_trade()` check to prevent rapid position churn in pairs trading.
-
-### 5. Added `has_recent_sell_trade()` Method
-**File:** `robo_trader/database_async.py` (lines 675-712)
-
-New method mirrors `has_recent_buy_trade()` but checks for SELL trades.
-
-## Code Review Summary
-
-| Priority | Issue | Status |
-|----------|-------|--------|
-| CRITICAL | DB column mismatch (`action` vs `side`) | ✅ Fixed |
-| HIGH | Missing MAX_OPEN_POSITIONS for pairs | ✅ Fixed |
-| MEDIUM | Missing parameter validation | ✅ Fixed |
-| MEDIUM | Inconsistent symbol validation | ✅ Fixed |
-| LOW | Missing recent SELL check | ✅ Fixed |
-
-## Testing
-
-- All pytest tests pass (94 tests)
-- Trader restarted and running without database errors
-- Signals now processing correctly
+### 2. `scripts/com.robotrader.watchdog.plist`
+macOS launchd service configuration:
+- Runs at login
+- Keeps alive (auto-restarts if watchdog crashes)
+- Installed to `~/Library/LaunchAgents/`
 
 ## Files Modified
 
-1. `robo_trader/database_async.py`
-   - Fixed `side` vs `action` column names
-   - Added parameter validation
-   - Added `has_recent_sell_trade()` method
+### `START_TRADER.sh`
+- Now reads `SYMBOLS=` from `.env` by default
+- Falls back to `AAPL,NVDA,TSLA` if not set
+- Command-line argument still overrides
 
-2. `robo_trader/runner_async.py`
-   - Added MAX_OPEN_POSITIONS check for pairs trading
-   - Added recent SELL trade check for pairs trading
+**Before:**
+```bash
+SYMBOLS="AAPL,NVDA,TSLA"
+```
 
-3. `CLAUDE.md`
-   - Added 3 new entries to Common Mistakes table
+**After:**
+```bash
+# Load defaults from .env if present
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    SYMBOLS=$(grep "^SYMBOLS=" "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+fi
+SYMBOLS="${SYMBOLS:-AAPL,NVDA,TSLA}"
+```
 
-## Lessons Learned
+## Installation
 
-1. **Always check database schema before writing queries** - Different DBs in the project use different column names
-2. **Code review catches bugs** - The 6-subagent review found the pairs trading position limit gap
-3. **Validation is important** - Even internal methods should validate inputs for defensive programming
+Watchdog installed as macOS service:
+```bash
+cp scripts/com.robotrader.watchdog.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.robotrader.watchdog.plist
+```
 
-## Current System State
+## Configuration
 
-- Trader running with 65 positions
-- Session equity: $4,034,992.96
-- Processing 69 symbols
-- No database errors
-- AI discovering opportunities (JNJ, NKE, TXN found this cycle)
+| Setting | Value | Location |
+|---------|-------|----------|
+| Stale threshold | 5 minutes | `watchdog.sh` arg or plist |
+| Check interval | 60 seconds | `watchdog.sh` |
+| Symbols | From `.env` | `SYMBOLS=...` |
+| Extended hours | From `.env` | `ENABLE_EXTENDED_HOURS=true` |
+
+## Management Commands
+
+```bash
+# Check status
+launchctl list | grep robotrader
+
+# View watchdog log
+tail -f watchdog.log
+
+# Stop watchdog
+launchctl unload ~/Library/LaunchAgents/com.robotrader.watchdog.plist
+
+# Start watchdog
+launchctl load ~/Library/LaunchAgents/com.robotrader.watchdog.plist
+
+# Change threshold (edit plist, then reload)
+```
+
+## How It Works
+
+1. Every 60 seconds, watchdog checks:
+   - Is it market hours (or extended hours if enabled)?
+   - Is runner_async process alive?
+   - Has log file been modified in last 5 minutes?
+
+2. If stall detected:
+   - Kills existing runner_async and websocket_server
+   - Calls `./START_TRADER.sh` (reads symbols from .env)
+   - Logs restart to `watchdog.log`
+
+3. Outside market hours:
+   - No monitoring (conserves resources)
+
+## Other Findings
+
+- User has 65 open positions but `RISK_MAX_OPEN_POSITIONS=20`
+- This blocks all new BUY signals (duplicate protection working correctly)
+- User may want to increase position limit in `.env`
+
+## Next Steps
+
+- [ ] Consider increasing `RISK_MAX_OPEN_POSITIONS` if more buys desired
+- [ ] Monitor `watchdog.log` for restart frequency
+- [ ] Optionally add Slack/email notification on restart
+
+---
+
+**Watchdog Status:** ✅ Installed and running (PID in `launchctl list`)

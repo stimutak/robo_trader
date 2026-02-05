@@ -334,6 +334,9 @@ STOP_LOSS_PERCENT=2.0           # Fixed 2% stop
 | Missing parameter validation on new DB methods | Add symbol validation + seconds bounds check (1-86400) | 2026-01-29 |
 | Stop-losses not created for existing positions on restart | `load_existing_positions()` must call `stop_loss_monitor.add_stop_loss()` for each loaded position | 2026-02-03 |
 | In-memory stop-loss orders lost on restart | Stop-losses are ephemeral - ALWAYS recreate on startup from DB positions | 2026-02-03 |
+| Main BUY flow allows re-buy right after SELL (churn) | Add `has_recent_sell_trade(symbol, 600)` check - 10 min cooldown after SELL | 2026-02-03 |
+| ML SELL signal executes even when position at loss | PRO RULE: Only execute SELL if profitable, let stop-loss handle losses | 2026-02-04 |
+| Stop-loss has no price data on restart → ML sells first | Stop-loss needs `update_price()` calls; ML sell blocked by profit check | 2026-02-04 |
 
 ---
 
