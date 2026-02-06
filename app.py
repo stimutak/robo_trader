@@ -1731,6 +1731,8 @@ HTML_TEMPLATE = """
                 // UPDATE ALL UI ELEMENTS
                 // Hero row
                 document.getElementById('ov-portfolio').textContent = formatCurrency(totalEquity);
+                // Also update header portfolio equity to stay in sync
+                document.getElementById('portfolio-quick-equity').textContent = formatCurrency(totalEquity);
                 const totalReturnEl = document.getElementById('ov-total-return-pct');
                 totalReturnEl.innerHTML = `<span style="color: ${totalReturn >= 0 ? '#4ade80' : '#f87171'};">${totalReturn >= 0 ? '+' : ''}${totalReturnPct.toFixed(1)}%</span> <span style="color: #64748b;">all time</span>`;
 
@@ -4360,14 +4362,18 @@ def get_pnl():
         # Equity = cash + market value of positions
         equity = cash + total_market_value
 
-        # When market is closed, return equity but null P&L
+        # When market is closed, still return historical realized P&L from account
+        # Only unrealized and daily are "live" data that shouldn't show when closed
         if not market_open:
+            # Get stored realized P&L from account (historical, always valid)
+            stored_realized = account.get("realized_pnl", 0) or 0
             return jsonify(
                 {
-                    "total": None,
-                    "unrealized": None,
-                    "realized": None,
-                    "daily": None,
+                    "total": float(stored_realized),
+                    "unrealized": None,  # Live data, null when closed
+                    "realized": float(stored_realized),
+                    "realized_pnl": float(stored_realized),  # Alias for JS compatibility
+                    "daily": None,  # Live data, null when closed
                     "equity": float(equity),
                     "cash": float(cash),
                 }
