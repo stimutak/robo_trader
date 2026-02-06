@@ -1614,7 +1614,7 @@ HTML_TEMPLATE = """
         }
 
         let overviewEquityChart = null;
-        const STARTING_CAPITAL = 100000;
+        let STARTING_CAPITAL = 100000;  // Will be updated from API
 
         async function loadOverviewData() {
             try {
@@ -1677,7 +1677,7 @@ HTML_TEMPLATE = """
                     ovUnrealized.style.color = unrealizedPnl >= 0 ? '#4ade80' : '#f87171';
                 }
 
-                // P&L DATA: Get equity, realized P&L, cash
+                // P&L DATA: Get equity, realized P&L, cash, and starting capital
                 let equity = STARTING_CAPITAL;
                 let realizedPnl = 0;
                 let cash = 0;
@@ -1686,6 +1686,10 @@ HTML_TEMPLATE = """
                     equity = pnlData.equity || STARTING_CAPITAL;
                     realizedPnl = pnlData.realized || pnlData.realized_pnl || 0;
                     cash = pnlData.cash || 0;
+                    // Update starting capital from portfolio config
+                    if (pnlData.starting_cash) {
+                        STARTING_CAPITAL = pnlData.starting_cash;
+                    }
                 }
 
                 // PERFORMANCE: Get all trade metrics
@@ -1719,6 +1723,16 @@ HTML_TEMPLATE = """
                     totalTrades = summary.total_trades || 0;
                 }
 
+                // EQUITY CURVE: Get peak for drawdown calculation
+                let peakEquity = STARTING_CAPITAL;
+                let equityData = null;
+                if (equityResp.ok) {
+                    equityData = await equityResp.json();
+                    if (equityData.portfolio_values && equityData.portfolio_values.length > 0) {
+                        peakEquity = Math.max(...equityData.portfolio_values);
+                    }
+                }
+
                 // CALCULATE DERIVED METRICS
                 const totalEquity = equity > 0 ? equity : (STARTING_CAPITAL + totalPnl + unrealizedPnl);
                 const totalReturn = totalEquity - STARTING_CAPITAL;
@@ -1726,7 +1740,8 @@ HTML_TEMPLATE = """
                 const todayPnlPct = totalEquity > 0 ? (todayPnl / totalEquity) * 100 : 0;
                 const exposure = totalEquity > 0 ? (positionsValue / totalEquity) * 100 : 0;
                 const buyingPower = Math.max(0, totalEquity - positionsValue);
-                const currentDrawdown = maxDrawdown; // Would need peak tracking for accurate current DD
+                // Current drawdown = (peak - current) / peak (as a positive percentage)
+                const currentDrawdown = peakEquity > 0 ? Math.max(0, (peakEquity - totalEquity) / peakEquity) : 0;
 
                 // UPDATE ALL UI ELEMENTS
                 // Hero row
@@ -1771,14 +1786,13 @@ HTML_TEMPLATE = """
                     renderRecentTrades(todayTrades.length > 0 ? todayTrades : trades.slice(0, 8));
                 }
 
-                // EQUITY CURVE: Render chart
-                if (equityResp.ok) {
-                    const data = await equityResp.json();
-                    renderOverviewEquityChart(data);
+                // EQUITY CURVE: Render chart (use already-parsed equityData)
+                if (equityData) {
+                    renderOverviewEquityChart(equityData);
                     // Show date range
-                    if (data.labels && data.labels.length > 0) {
+                    if (equityData.labels && equityData.labels.length > 0) {
                         document.getElementById('ov-chart-range').textContent =
-                            `${data.labels[0]} → ${data.labels[data.labels.length - 1]}`;
+                            `${equityData.labels[0]} → ${equityData.labels[equityData.labels.length - 1]}`;
                     }
                 }
 
@@ -4345,6 +4359,13 @@ def get_pnl():
         db = SyncDatabaseReader()
         portfolio_id = request.args.get("portfolio_id", "default")
 
+        # Get portfolio config for starting_cash
+        portfolios = db.get_portfolios()
+        portfolio_config = next((p for p in portfolios if p.get("id") == portfolio_id), None)
+        starting_cash = (
+            portfolio_config.get("starting_cash", 100000) if portfolio_config else 100000
+        )
+
         # Get positions
         positions = db.get_positions(portfolio_id=portfolio_id)
 
@@ -4376,6 +4397,7 @@ def get_pnl():
                     "daily": None,  # Live data, null when closed
                     "equity": float(equity),
                     "cash": float(cash),
+                    "starting_cash": float(starting_cash),
                 }
             )
 
@@ -4434,6 +4456,7 @@ def get_pnl():
                 "daily": float(round(daily_pnl, 2)),
                 "equity": float(equity),
                 "cash": float(cash),
+                "starting_cash": float(starting_cash),
             }
         )
 
@@ -4448,6 +4471,7 @@ def get_pnl():
                 "daily": 0,
                 "equity": DEFAULT_CAPITAL,
                 "cash": DEFAULT_CAPITAL,
+                "starting_cash": DEFAULT_CAPITAL,
             }
         )
 
