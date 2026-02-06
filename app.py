@@ -1831,8 +1831,18 @@ HTML_TEMPLATE = """
                 // Calculate portfolio values from P&L
                 values = data.values.map(pnl => STARTING_CAPITAL + pnl);
                 labels = data.labels || values.map((_, i) => i);
-            } else {
-                // No data yet
+            }
+
+            // Need at least 2 data points to draw a line
+            if (values.length < 2) {
+                // Destroy existing chart and show message
+                if (overviewEquityChart) {
+                    overviewEquityChart.destroy();
+                    overviewEquityChart = null;
+                }
+                document.getElementById('ov-chart-range').textContent = values.length === 0
+                    ? 'No data yet'
+                    : 'Need more history';
                 return;
             }
 
@@ -1841,12 +1851,10 @@ HTML_TEMPLATE = """
             const lastValue = values[values.length - 1] || STARTING_CAPITAL;
             const isPositive = lastValue >= firstValue;
 
+            // Destroy and recreate chart when switching portfolios for clean state
             if (overviewEquityChart) {
-                overviewEquityChart.data.labels = labels;
-                overviewEquityChart.data.datasets[0].data = values;
-                overviewEquityChart.data.datasets[0].borderColor = isPositive ? '#4ade80' : '#f87171';
-                overviewEquityChart.update('none');
-                return;
+                overviewEquityChart.destroy();
+                overviewEquityChart = null;
             }
 
             const gradient = ctx.getContext('2d').createLinearGradient(0, 0, 0, 120);
