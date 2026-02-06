@@ -35,8 +35,11 @@ _PORTFOLIO_SCOPED_METHODS = frozenset({
     "get_account_info",
     "save_equity_snapshot",
     "get_equity_history",
-    "upsert_portfolio",
 })
+
+# Methods that are portfolio-related but DON'T take portfolio_id as a kwarg
+# (e.g., upsert_portfolio takes portfolio_data dict with id inside)
+# These pass through unchanged.
 
 
 class PortfolioScopedDB:
