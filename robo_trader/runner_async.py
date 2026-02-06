@@ -133,7 +133,9 @@ class AsyncRunner:
         use_ml_enhanced: bool = None,  # Auto-detect if None
         use_smart_execution: bool = None,  # Auto-detect if None
         use_advanced_risk: bool = None,  # Auto-detect if None
+        portfolio_id: str = "default",  # Multi-portfolio support
     ):
+        self.portfolio_id = portfolio_id
         self.duration = duration
         self.bar_size = bar_size
         self.sma_fast = sma_fast
@@ -659,8 +661,13 @@ class AsyncRunner:
             sys.exit(1)
 
         # Initialize async database with context manager
-        self.db = AsyncTradingDatabase()
-        await self.db.initialize()
+        self._raw_db = AsyncTradingDatabase()
+        await self._raw_db.initialize()
+
+        # Wrap DB with portfolio-scoped proxy if using non-default portfolio
+        from .multiuser.db_proxy import PortfolioScopedDB
+        self.db = PortfolioScopedDB(self._raw_db, portfolio_id=self.portfolio_id)
+        logger.info(f"Database initialized for portfolio: {self.portfolio_id}")
 
         # Initialize risk manager
         self.risk = RiskManager(
@@ -3276,30 +3283,55 @@ async def run_continuous(
                     f"Starting trading cycle at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
                 )
 
-                # Create fresh runner each cycle for stability (disconnect between cycles)
-                # This avoids connection timeouts and subprocess health check issues
-                logger.info("Creating fresh runner for this cycle...")
-                runner = AsyncRunner(
-                    duration=duration,
-                    bar_size=bar_size,
-                    sma_fast=sma_fast,
-                    sma_slow=sma_slow,
-                    slippage_bps=slippage_bps,
-                    max_order_notional=max_order_notional,
-                    max_daily_notional=max_daily_notional,
-                    default_cash=default_cash,
-                    max_concurrent_symbols=max_concurrent,
-                    use_correlation_sizing=True,  # FIXED: Enabled M5 correlation integration
-                    use_ml_strategy=use_ml_strategy,
-                    use_smart_execution=use_smart_execution,
+                # Load portfolio configurations
+                from .multiuser.portfolio_config import PortfolioConfig, load_portfolio_configs
+                try:
+                    portfolio_configs = load_portfolio_configs()
+                except Exception as pc_err:
+                    logger.warning(f"Failed to load portfolio configs: {pc_err}, using default")
+                    portfolio_configs = [PortfolioConfig(id="default", name="Default Portfolio",
+                                                         starting_cash=default_cash or 100000,
+                                                         symbols=symbols or [])]
+
+                active_portfolios = [pc for pc in portfolio_configs if pc.active]
+                logger.info(
+                    f"Processing {len(active_portfolios)} active portfolio(s): "
+                    f"{[p.id for p in active_portfolios]}"
                 )
 
-                await runner.run(symbols)
+                for portfolio_cfg in active_portfolios:
+                    # Determine symbols for this portfolio
+                    portfolio_symbols = portfolio_cfg.symbols if portfolio_cfg.symbols else symbols
 
-                # Clean up connection after each cycle (more stable for long-running)
-                logger.info("Cleaning up runner after cycle...")
-                await runner.cleanup()
-                runner = None
+                    logger.info(
+                        f"── Portfolio '{portfolio_cfg.id}' ({portfolio_cfg.name}): "
+                        f"{len(portfolio_symbols or [])} symbols ──"
+                    )
+
+                    # Create fresh runner each cycle for stability (disconnect between cycles)
+                    # This avoids connection timeouts and subprocess health check issues
+                    runner = AsyncRunner(
+                        duration=duration,
+                        bar_size=bar_size,
+                        sma_fast=sma_fast,
+                        sma_slow=sma_slow,
+                        slippage_bps=slippage_bps,
+                        max_order_notional=max_order_notional,
+                        max_daily_notional=max_daily_notional,
+                        default_cash=portfolio_cfg.starting_cash,
+                        max_concurrent_symbols=max_concurrent,
+                        use_correlation_sizing=True,  # FIXED: Enabled M5 correlation integration
+                        use_ml_strategy=use_ml_strategy,
+                        use_smart_execution=use_smart_execution,
+                        portfolio_id=portfolio_cfg.id,
+                    )
+
+                    await runner.run(portfolio_symbols)
+
+                    # Clean up connection after each portfolio (more stable for long-running)
+                    logger.info(f"Cleaning up runner for portfolio '{portfolio_cfg.id}'...")
+                    await runner.cleanup()
+                    runner = None
 
                 # Wait before next iteration
                 if not shutdown_flag and is_trading_allowed():

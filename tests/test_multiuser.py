@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 import pytest
 
+from robo_trader.database_async import AsyncTradingDatabase
+from robo_trader.multiuser.db_proxy import PortfolioScopedDB
 from robo_trader.multiuser.migration import MultiuserMigration
 from robo_trader.multiuser.portfolio_config import PortfolioConfig, load_portfolio_configs
 
@@ -434,3 +436,225 @@ class TestMultiuserMigration:
         migration = MultiuserMigration(temp_db)
         result = await migration.migrate()
         assert result is False
+
+
+# ──────────────────────────────────────────────
+# AsyncTradingDatabase Multi-Portfolio Tests
+# ──────────────────────────────────────────────
+
+class TestAsyncDatabaseMultiPortfolio:
+    """Test that all DB methods correctly scope by portfolio_id."""
+
+    @pytest.fixture
+    async def db(self, temp_db):
+        """Create an initialized async database."""
+        database = AsyncTradingDatabase(db_path=temp_db)
+        await database.initialize()
+        yield database
+        await database.close()
+
+    @pytest.mark.asyncio
+    async def test_positions_scoped_by_portfolio(self, db):
+        """Positions are isolated per portfolio."""
+        await db.update_position("AAPL", 100, 180.0, portfolio_id="portfolio_a")
+        await db.update_position("AAPL", 50, 190.0, portfolio_id="portfolio_b")
+
+        pos_a = await db.get_positions(portfolio_id="portfolio_a")
+        pos_b = await db.get_positions(portfolio_id="portfolio_b")
+
+        assert len(pos_a) == 1
+        assert pos_a[0]["quantity"] == 100
+        assert pos_a[0]["avg_cost"] == 180.0
+
+        assert len(pos_b) == 1
+        assert pos_b[0]["quantity"] == 50
+        assert pos_b[0]["avg_cost"] == 190.0
+
+    @pytest.mark.asyncio
+    async def test_close_position_only_affects_portfolio(self, db):
+        """Closing position in one portfolio doesn't affect another."""
+        await db.update_position("AAPL", 100, 180.0, portfolio_id="portfolio_a")
+        await db.update_position("AAPL", 50, 190.0, portfolio_id="portfolio_b")
+
+        # Close AAPL in portfolio_a
+        await db.update_position("AAPL", 0, 0, portfolio_id="portfolio_a")
+
+        pos_a = await db.get_positions(portfolio_id="portfolio_a")
+        pos_b = await db.get_positions(portfolio_id="portfolio_b")
+
+        assert len(pos_a) == 0  # Closed
+        assert len(pos_b) == 1  # Still open
+
+    @pytest.mark.asyncio
+    async def test_trades_scoped_by_portfolio(self, db):
+        """Trades are isolated per portfolio."""
+        await db.record_trade("AAPL", "BUY", 100, 180.0, portfolio_id="portfolio_a")
+        await db.record_trade("MSFT", "BUY", 50, 300.0, portfolio_id="portfolio_b")
+
+        trades_a = await db.get_recent_trades(portfolio_id="portfolio_a")
+        trades_b = await db.get_recent_trades(portfolio_id="portfolio_b")
+
+        assert len(trades_a) == 1
+        assert trades_a[0]["symbol"] == "AAPL"
+
+        assert len(trades_b) == 1
+        assert trades_b[0]["symbol"] == "MSFT"
+
+    @pytest.mark.asyncio
+    async def test_has_recent_buy_trade_scoped(self, db):
+        """Recent buy check is scoped to portfolio."""
+        await db.record_trade("AAPL", "BUY", 100, 180.0, portfolio_id="portfolio_a")
+
+        assert await db.has_recent_buy_trade("AAPL", 600, portfolio_id="portfolio_a") is True
+        assert await db.has_recent_buy_trade("AAPL", 600, portfolio_id="portfolio_b") is False
+
+    @pytest.mark.asyncio
+    async def test_account_scoped_by_portfolio(self, db):
+        """Account info is isolated per portfolio."""
+        await db.update_account(50000, 55000, portfolio_id="portfolio_a")
+        await db.update_account(80000, 82000, portfolio_id="portfolio_b")
+
+        acct_a = await db.get_account_info(portfolio_id="portfolio_a")
+        acct_b = await db.get_account_info(portfolio_id="portfolio_b")
+
+        assert acct_a["cash"] == 50000
+        assert acct_a["equity"] == 55000
+
+        assert acct_b["cash"] == 80000
+        assert acct_b["equity"] == 82000
+
+    @pytest.mark.asyncio
+    async def test_equity_history_scoped_by_portfolio(self, db):
+        """Equity history is isolated per portfolio."""
+        await db.save_equity_snapshot(55000, 50000, 5000, portfolio_id="portfolio_a")
+        await db.save_equity_snapshot(82000, 80000, 2000, portfolio_id="portfolio_b")
+
+        hist_a = await db.get_equity_history(portfolio_id="portfolio_a")
+        hist_b = await db.get_equity_history(portfolio_id="portfolio_b")
+
+        assert len(hist_a) == 1
+        assert hist_a[0]["equity"] == 55000
+
+        assert len(hist_b) == 1
+        assert hist_b[0]["equity"] == 82000
+
+    @pytest.mark.asyncio
+    async def test_default_portfolio_backward_compat(self, db):
+        """Calling without portfolio_id uses 'default' portfolio."""
+        await db.update_position("AAPL", 100, 180.0)  # No portfolio_id = 'default'
+        pos = await db.get_positions()  # No portfolio_id = 'default'
+
+        assert len(pos) == 1
+        assert pos[0]["symbol"] == "AAPL"
+
+    @pytest.mark.asyncio
+    async def test_get_portfolios(self, db):
+        """get_portfolios returns all portfolio definitions."""
+        await db.upsert_portfolio({"id": "aggressive", "name": "Aggressive Growth", "starting_cash": 50000, "symbols": "NVDA,TSLA"})
+        await db.upsert_portfolio({"id": "conservative", "name": "Conservative", "starting_cash": 50000, "symbols": "AAPL,MSFT"})
+
+        portfolios = await db.get_portfolios()
+        ids = {p["id"] for p in portfolios}
+        assert "default" in ids
+        assert "aggressive" in ids
+        assert "conservative" in ids
+
+    @pytest.mark.asyncio
+    async def test_signals_scoped_by_portfolio(self, db):
+        """Signals are scoped to portfolio."""
+        await db.record_signal("AAPL", "momentum", "BUY", 0.8, portfolio_id="portfolio_a")
+        await db.record_signal("MSFT", "ml_enhanced", "SELL", 0.7, portfolio_id="portfolio_b")
+
+        # Signals are in the signals table but filtered by portfolio
+        # We can verify by reading from DB directly
+        import aiosqlite
+        async with aiosqlite.connect(db._db.db_path if hasattr(db, '_db') else db.db_path) as conn:
+            cursor = await conn.execute(
+                "SELECT portfolio_id, symbol FROM signals ORDER BY symbol"
+            )
+            rows = await cursor.fetchall()
+            assert len(rows) == 2
+            assert rows[0] == ("portfolio_a", "AAPL")
+            assert rows[1] == ("portfolio_b", "MSFT")
+
+
+# ──────────────────────────────────────────────
+# PortfolioScopedDB Proxy Tests
+# ──────────────────────────────────────────────
+
+class TestPortfolioScopedDB:
+    """Test the portfolio-scoped DB proxy."""
+
+    @pytest.fixture
+    async def raw_db(self, temp_db):
+        """Create a raw async database."""
+        database = AsyncTradingDatabase(db_path=temp_db)
+        await database.initialize()
+        yield database
+        await database.close()
+
+    @pytest.mark.asyncio
+    async def test_proxy_auto_injects_portfolio_id(self, raw_db):
+        """Proxy automatically injects portfolio_id into scoped methods."""
+        proxy = PortfolioScopedDB(raw_db, portfolio_id="aggressive")
+
+        # Write via proxy (should use portfolio_id="aggressive")
+        await proxy.update_position("NVDA", 100, 450.0)
+        await proxy.record_trade("NVDA", "BUY", 100, 450.0)
+        await proxy.update_account(50000, 55000)
+
+        # Read via proxy (should filter to portfolio_id="aggressive")
+        pos = await proxy.get_positions()
+        assert len(pos) == 1
+        assert pos[0]["symbol"] == "NVDA"
+
+        trades = await proxy.get_recent_trades()
+        assert len(trades) == 1
+        assert trades[0]["symbol"] == "NVDA"
+
+        acct = await proxy.get_account_info()
+        assert acct["cash"] == 50000
+
+    @pytest.mark.asyncio
+    async def test_proxy_isolation_between_portfolios(self, raw_db):
+        """Two proxies with different portfolio_ids are isolated."""
+        proxy_a = PortfolioScopedDB(raw_db, portfolio_id="aggressive")
+        proxy_b = PortfolioScopedDB(raw_db, portfolio_id="conservative")
+
+        await proxy_a.update_position("NVDA", 100, 450.0)
+        await proxy_b.update_position("AAPL", 50, 180.0)
+
+        pos_a = await proxy_a.get_positions()
+        pos_b = await proxy_b.get_positions()
+
+        assert len(pos_a) == 1
+        assert pos_a[0]["symbol"] == "NVDA"
+
+        assert len(pos_b) == 1
+        assert pos_b[0]["symbol"] == "AAPL"
+
+    @pytest.mark.asyncio
+    async def test_proxy_passes_through_global_methods(self, raw_db):
+        """Non-scoped methods pass through to underlying DB."""
+        proxy = PortfolioScopedDB(raw_db, portfolio_id="aggressive")
+
+        # health_check is a global method (not portfolio-scoped)
+        result = await proxy.health_check()
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_proxy_explicit_portfolio_id_overrides(self, raw_db):
+        """Explicitly passing portfolio_id overrides the proxy default."""
+        proxy = PortfolioScopedDB(raw_db, portfolio_id="aggressive")
+
+        # Write to a different portfolio explicitly
+        await proxy.update_position("MSFT", 200, 400.0, portfolio_id="other")
+
+        # Proxy's default portfolio should have nothing
+        pos_default = await proxy.get_positions()
+        assert len(pos_default) == 0
+
+        # The explicit portfolio should have the position
+        pos_other = await proxy.get_positions(portfolio_id="other")
+        assert len(pos_other) == 1
+        assert pos_other[0]["symbol"] == "MSFT"

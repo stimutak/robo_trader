@@ -3569,6 +3569,48 @@ def api_health():
     return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
 
+@app.route("/api/portfolios")
+@requires_auth
+def get_portfolios():
+    """Get all portfolio definitions with summary stats.
+
+    Returns list of portfolios with their account summary.
+    """
+    try:
+        from sync_db_reader import SyncDatabaseReader
+
+        db = SyncDatabaseReader()
+        portfolios = db.get_portfolios()
+
+        # Enrich each portfolio with account summary
+        result = []
+        for p in portfolios:
+            pid = p.get("id", "default")
+            account = db.get_account_info(portfolio_id=pid)
+            positions = db.get_positions(portfolio_id=pid)
+
+            result.append({
+                "id": pid,
+                "name": p.get("name", pid),
+                "starting_cash": p.get("starting_cash", 100000),
+                "active": bool(p.get("active", 1)),
+                "symbols": p.get("symbols", ""),
+                "account": {
+                    "cash": account.get("cash", 0),
+                    "equity": account.get("equity", 0),
+                    "realized_pnl": account.get("realized_pnl", 0),
+                    "unrealized_pnl": account.get("unrealized_pnl", 0),
+                    "daily_pnl": account.get("daily_pnl", 0),
+                },
+                "positions_count": len([p for p in positions if p.get("quantity", 0) != 0]),
+            })
+
+        return jsonify({"portfolios": result})
+    except Exception as e:
+        logger.error(f"Error getting portfolios: {e}")
+        return jsonify({"portfolios": [{"id": "default", "name": "Default Portfolio", "active": True}]})
+
+
 @app.route("/api/database/health")
 @requires_auth
 def database_health():
@@ -3970,7 +4012,8 @@ def status():
         from sync_db_reader import SyncDatabaseReader
 
         db = SyncDatabaseReader()
-        positions = db.get_positions()
+        portfolio_id = request.args.get("portfolio_id", "default")
+        positions = db.get_positions(portfolio_id=portfolio_id)
         positions_count = len([p for p in positions if p.get("quantity", 0) != 0])
 
         # Calculate P&L from positions
@@ -3986,7 +4029,7 @@ def status():
             unrealized_pnl = total_value - total_cost
 
             # Get account info for realized P&L and cash
-            account = db.get_account_info()
+            account = db.get_account_info(portfolio_id=portfolio_id)
             realized_pnl = account.get("realized_pnl", 0) or 0
             daily_pnl = account.get("daily_pnl", 0) or 0
             cash = account.get("cash", 0) or 0
@@ -4174,9 +4217,10 @@ def get_pnl():
         from sync_db_reader import SyncDatabaseReader
 
         db = SyncDatabaseReader()
+        portfolio_id = request.args.get("portfolio_id", "default")
 
         # Get positions
-        positions = db.get_positions()
+        positions = db.get_positions(portfolio_id=portfolio_id)
 
         # Calculate total market value from positions (matches mobile app)
         total_market_value = Decimal("0")
@@ -4186,7 +4230,7 @@ def get_pnl():
             total_market_value += qty * price
 
         # Get cash from account
-        account = db.get_account_info()
+        account = db.get_account_info(portfolio_id=portfolio_id)
         cash = Decimal(str(account.get("cash", 0) or 0))
 
         # Equity = cash + market value of positions
@@ -4218,7 +4262,7 @@ def get_pnl():
         # Get trades for realized P&L - USE STORED PNL VALUES from database
         # The database already tracks accurate P&L per trade
         # Use limit=5000 to ensure we get ALL trades for accurate total P&L
-        trades = db.get_recent_trades(limit=5000)
+        trades = db.get_recent_trades(limit=5000, portfolio_id=portfolio_id)
         today = datetime.now().date()
 
         realized_pnl = Decimal("0")
@@ -4552,11 +4596,12 @@ def get_positions():
         from sync_db_reader import SyncDatabaseReader
 
         db = SyncDatabaseReader()
-        real_positions = db.get_positions()
+        portfolio_id = request.args.get("portfolio_id", "default")
+        real_positions = db.get_positions(portfolio_id=portfolio_id)
 
         # Batch fetch: Get all signals once (not per-position!)
         try:
-            all_signals = db.get_signals(hours=1)
+            all_signals = db.get_signals(hours=1, portfolio_id=portfolio_id)
             # Build lookup dict by symbol
             signal_by_symbol = {}
             for s in all_signals:
@@ -5217,14 +5262,15 @@ def equity_curve():
         from sync_db_reader import SyncDatabaseReader
 
         db = SyncDatabaseReader()
+        portfolio_id = request.args.get("portfolio_id", "default")
 
         # Get equity history (daily portfolio value snapshots)
-        equity_history = db.get_equity_history(days=365)
+        equity_history = db.get_equity_history(days=365, portfolio_id=portfolio_id)
         portfolio_labels = [d["date"] for d in equity_history]
         portfolio_values = [d["equity"] for d in equity_history]
 
         # Also get trade-based P&L for detailed view
-        all_trades = db.get_recent_trades(limit=1000)
+        all_trades = db.get_recent_trades(limit=1000, portfolio_id=portfolio_id)
 
         if not all_trades:
             return jsonify(
@@ -5325,7 +5371,8 @@ def get_trades():
         trade_limit = int(os.getenv("DASHBOARD_TRADE_LIMIT", "1000"))
         trade_limit = min(max(trade_limit, 10), 5000)  # Clamp between 10 and 5000
 
-        trades = db.get_recent_trades(limit=trade_limit, symbol=symbol, days=days)
+        portfolio_id = request.args.get("portfolio_id", "default")
+        trades = db.get_recent_trades(limit=trade_limit, symbol=symbol, days=days, portfolio_id=portfolio_id)
 
         if trades:
             # Convert to expected format

@@ -5,6 +5,7 @@ This implements Phase 1 F3: Async Database Operations
 - Converts all SQLite operations to async using aiosqlite
 - Implements connection pooling for database access
 - Ensures no event loop blocking
+- Multi-portfolio support: all user-scoped tables partitioned by portfolio_id
 """
 
 import asyncio
@@ -22,6 +23,9 @@ from robo_trader.logger import get_logger
 logger = get_logger(__name__)
 
 DB_PATH = Path("trading_data.db")
+
+# Default portfolio ID for backward compatibility
+DEFAULT_PORTFOLIO_ID = "default"
 
 
 class AsyncTradingDatabase:
@@ -159,27 +163,84 @@ class AsyncTradingDatabase:
                 await self._available.put(conn)
 
     async def _init_database(self) -> None:
-        """Create tables if they don't exist."""
+        """Create tables if they don't exist.
+
+        Tables with portfolio_id (user-scoped):
+            positions, trades, account, equity_history, signals
+        Tables without portfolio_id (global/shared):
+            ticks, features, market_data
+        """
         async with aiosqlite.connect(self.db_path) as conn:
             # Set WAL and busy timeout on the initializer connection too, to avoid rollback journal usage
             await conn.execute("PRAGMA journal_mode=WAL")
             await conn.execute("PRAGMA busy_timeout=5000")
-            # Positions table
+
+            # Portfolios table (multi-portfolio support)
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS portfolios (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    starting_cash REAL NOT NULL DEFAULT 100000,
+                    symbols TEXT NOT NULL DEFAULT '',
+                    active INTEGER NOT NULL DEFAULT 1,
+                    max_position_pct REAL,
+                    max_daily_loss_pct REAL,
+                    max_open_positions INTEGER,
+                    stop_loss_pct REAL,
+                    trailing_stop_pct REAL,
+                    use_trailing_stop INTEGER,
+                    enabled_strategies TEXT,
+                    min_confidence REAL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """
+            )
+
+            # Insert default portfolio if not exists
+            await conn.execute(
+                """
+                INSERT OR IGNORE INTO portfolios (id, name, starting_cash)
+                VALUES ('default', 'Default Portfolio', 100000)
+            """
+            )
+
+            # Schema migrations table
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    description TEXT NOT NULL,
+                    applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """
+            )
+
+            # Positions table (portfolio-scoped)
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS positions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    portfolio_id TEXT NOT NULL DEFAULT 'default',
                     symbol TEXT NOT NULL,
                     quantity INTEGER NOT NULL,
                     avg_cost REAL NOT NULL,
                     market_price REAL,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(symbol)
+                    UNIQUE(portfolio_id, symbol)
                 )
             """
             )
 
-            # Tick data table
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_positions_portfolio
+                ON positions (portfolio_id)
+            """
+            )
+
+            # Tick data table (global - shared across portfolios)
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS ticks (
@@ -205,7 +266,7 @@ class AsyncTradingDatabase:
             """
             )
 
-            # Features table
+            # Features table (global - shared across portfolios)
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS features (
@@ -242,11 +303,12 @@ class AsyncTradingDatabase:
             """
             )
 
-            # Trades table
+            # Trades table (portfolio-scoped)
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    portfolio_id TEXT NOT NULL DEFAULT 'default',
                     symbol TEXT NOT NULL,
                     side TEXT NOT NULL,
                     quantity INTEGER NOT NULL,
@@ -260,10 +322,26 @@ class AsyncTradingDatabase:
             """
             )
 
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_trades_portfolio
+                ON trades (portfolio_id)
+            """
+            )
+
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_trades_portfolio_symbol
+                ON trades (portfolio_id, symbol, timestamp DESC)
+            """
+            )
+
             # Migrations for existing tables
             migrations = [
                 "ALTER TABLE trades ADD COLUMN pnl REAL DEFAULT NULL",
                 "ALTER TABLE trades ADD COLUMN notional REAL DEFAULT 0",
+                "ALTER TABLE trades ADD COLUMN portfolio_id TEXT DEFAULT 'default'",
+                "ALTER TABLE positions ADD COLUMN portfolio_id TEXT DEFAULT 'default'",
             ]
             for migration in migrations:
                 try:
@@ -271,11 +349,11 @@ class AsyncTradingDatabase:
                 except Exception:
                     pass  # Column already exists
 
-            # Account table
+            # Account table (portfolio-scoped, keyed by portfolio_id)
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS account (
-                    id INTEGER PRIMARY KEY,
+                    portfolio_id TEXT PRIMARY KEY DEFAULT 'default',
                     cash REAL NOT NULL,
                     equity REAL NOT NULL,
                     daily_pnl REAL DEFAULT 0,
@@ -286,23 +364,32 @@ class AsyncTradingDatabase:
             """
             )
 
-            # Equity history table for portfolio value over time
+            # Equity history table for portfolio value over time (portfolio-scoped)
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS equity_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date TEXT NOT NULL UNIQUE,
+                    portfolio_id TEXT NOT NULL DEFAULT 'default',
+                    date TEXT NOT NULL,
                     equity REAL NOT NULL,
                     cash REAL DEFAULT 0,
                     positions_value REAL DEFAULT 0,
                     realized_pnl REAL DEFAULT 0,
                     unrealized_pnl REAL DEFAULT 0,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(portfolio_id, date)
                 )
             """
             )
 
-            # Market data table
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_equity_history_portfolio
+                ON equity_history (portfolio_id, date)
+            """
+            )
+
+            # Market data table (global - shared across portfolios)
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS market_data (
@@ -319,11 +406,12 @@ class AsyncTradingDatabase:
             """
             )
 
-            # Strategy signals table
+            # Strategy signals table (portfolio-scoped)
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS signals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    portfolio_id TEXT NOT NULL DEFAULT 'default',
                     symbol TEXT NOT NULL,
                     strategy TEXT NOT NULL,
                     signal_type TEXT NOT NULL,
@@ -334,11 +422,18 @@ class AsyncTradingDatabase:
             """
             )
 
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_signals_portfolio
+                ON signals (portfolio_id)
+            """
+            )
+
             # Insert default account if not exists
             await conn.execute(
                 """
-                INSERT OR IGNORE INTO account (id, cash, equity)
-                VALUES (1, 100000, 100000)
+                INSERT OR IGNORE INTO account (portfolio_id, cash, equity)
+                VALUES ('default', 100000, 100000)
             """
             )
 
@@ -350,6 +445,7 @@ class AsyncTradingDatabase:
         quantity: int,
         avg_cost: float,
         market_price: Optional[float] = None,
+        portfolio_id: str = DEFAULT_PORTFOLIO_ID,
     ) -> None:
         """Update or insert a position asynchronously."""
         # Validate inputs
@@ -370,62 +466,68 @@ class AsyncTradingDatabase:
         async with self.get_connection() as conn:
             if quantity == 0:
                 # Close position - delete from database
-                await conn.execute("DELETE FROM positions WHERE symbol = ?", (symbol,))
-                logger.info(f"Closed position for {symbol}")
+                await conn.execute(
+                    "DELETE FROM positions WHERE portfolio_id = ? AND symbol = ?",
+                    (portfolio_id, symbol),
+                )
+                logger.info(f"Closed position for {symbol} (portfolio={portfolio_id})")
             else:
                 # Update or insert position
                 await conn.execute(
                     """
-                    INSERT OR REPLACE INTO positions (symbol, quantity, avg_cost, market_price)
-                    VALUES (?, ?, ?, ?)
+                    INSERT OR REPLACE INTO positions (portfolio_id, symbol, quantity, avg_cost, market_price)
+                    VALUES (?, ?, ?, ?, ?)
                 """,
-                    (symbol, quantity, avg_cost, market_price),
+                    (portfolio_id, symbol, quantity, avg_cost, market_price),
                 )
 
             await conn.commit()
-            logger.debug(f"Updated position: {symbol} qty={quantity} avg={avg_cost}")
+            logger.debug(f"Updated position: {symbol} qty={quantity} avg={avg_cost} (portfolio={portfolio_id})")
 
     async def _calculate_fifo_pnl(
-        self, conn, symbol: str, sell_quantity: int, sell_price: float
+        self, conn, symbol: str, sell_quantity: int, sell_price: float,
+        portfolio_id: str = DEFAULT_PORTFOLIO_ID,
     ) -> float:
         """
         Calculate realized P&L for a SELL trade using weighted average cost.
 
         Note: Despite the name, this uses weighted average cost basis (not strict
         FIFO lot matching) for simplicity. The average cost is calculated across
-        all BUY trades for the symbol.
+        all BUY trades for the symbol within this portfolio.
 
         Args:
             conn: Database connection
             symbol: Stock symbol
             sell_quantity: Number of shares being sold
             sell_price: Price per share for the sell
+            portfolio_id: Portfolio to scope the calculation to
 
         Returns:
             Realized P&L (positive = profit, negative = loss)
         """
-        # Get all BUY trades for this symbol, ordered by timestamp (FIFO)
+        # Get all BUY trades for this symbol in this portfolio, ordered by timestamp (FIFO)
         cursor = await conn.execute(
             """
             SELECT id, quantity, price FROM trades
-            WHERE symbol = ? AND side = 'BUY'
+            WHERE portfolio_id = ? AND symbol = ? AND side = 'BUY'
             ORDER BY timestamp ASC
             """,
-            (symbol,),
+            (portfolio_id, symbol),
         )
         buy_trades = await cursor.fetchall()
 
         if not buy_trades:
             # No BUY trades found - use position's avg_cost if available
             cursor = await conn.execute(
-                "SELECT avg_cost FROM positions WHERE symbol = ?", (symbol,)
+                "SELECT avg_cost FROM positions WHERE portfolio_id = ? AND symbol = ?",
+                (portfolio_id, symbol),
             )
             pos = await cursor.fetchone()
             if pos and pos[0]:
                 avg_cost = pos[0]
                 return (sell_price - avg_cost) * sell_quantity
             # No cost basis - return 0
-            logger.warning(f"No cost basis found for {symbol} SELL trade")
+            logger.warning(f"No cost basis found for {symbol} SELL trade (portfolio={portfolio_id})")
             return 0.0
 
         # Calculate weighted average cost from BUY trades
@@ -452,6 +554,7 @@ class AsyncTradingDatabase:
         price: float,
         slippage: float = 0.0,
         commission: float = 0.0,
+        portfolio_id: str = DEFAULT_PORTFOLIO_ID,
     ) -> None:
         """Record a trade asynchronously with P&L calculation for SELL trades."""
         # Validate inputs
@@ -474,25 +577,26 @@ class AsyncTradingDatabase:
             # Calculate P&L for SELL trades (realized profit/loss)
             pnl = None
             if side.upper() in ("SELL", "BUY_TO_COVER"):
-                pnl = await self._calculate_fifo_pnl(conn, symbol, quantity, price)
+                pnl = await self._calculate_fifo_pnl(conn, symbol, quantity, price, portfolio_id)
 
             # Ensure consistent float type for SQLite storage
             notional = float(quantity) * float(price)
             await conn.execute(
                 """
-                INSERT INTO trades (symbol, side, quantity, price, notional, slippage, commission, pnl)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO trades (portfolio_id, symbol, side, quantity, price, notional, slippage, commission, pnl)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-                (symbol, side, quantity, price, notional, slippage, commission, pnl),
+                (portfolio_id, symbol, side, quantity, price, notional, slippage, commission, pnl),
             )
             await conn.commit()
 
             if pnl is not None:
                 logger.info(
-                    f"Recorded trade: {side} {quantity} {symbol} @ {price} " f"(P&L: ${pnl:,.2f})"
+                    f"Recorded trade: {side} {quantity} {symbol} @ {price} "
+                    f"(P&L: ${pnl:,.2f}, portfolio={portfolio_id})"
                 )
             else:
-                logger.info(f"Recorded trade: {side} {quantity} {symbol} @ {price}")
+                logger.info(f"Recorded trade: {side} {quantity} {symbol} @ {price} (portfolio={portfolio_id})")
 
     async def update_account(
         self,
@@ -501,6 +605,7 @@ class AsyncTradingDatabase:
         daily_pnl: float = 0.0,
         realized_pnl: float = 0.0,
         unrealized_pnl: float = 0.0,
+        portfolio_id: str = DEFAULT_PORTFOLIO_ID,
     ) -> None:
         """Update account values asynchronously."""
         # Validate inputs
@@ -525,15 +630,14 @@ class AsyncTradingDatabase:
         async with self.get_connection() as conn:
             await conn.execute(
                 """
-                UPDATE account
-                SET cash = ?, equity = ?, daily_pnl = ?,
-                    realized_pnl = ?, unrealized_pnl = ?, timestamp = CURRENT_TIMESTAMP
-                WHERE id = 1
+                INSERT OR REPLACE INTO account
+                    (portfolio_id, cash, equity, daily_pnl, realized_pnl, unrealized_pnl, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """,
-                (cash, equity, daily_pnl, realized_pnl, unrealized_pnl),
+                (portfolio_id, cash, equity, daily_pnl, realized_pnl, unrealized_pnl),
             )
             await conn.commit()
-            logger.debug(f"Updated account: cash={cash:.2f} equity={equity:.2f}")
+            logger.debug(f"Updated account: cash={cash:.2f} equity={equity:.2f} (portfolio={portfolio_id})")
 
     async def record_signal(
         self,
@@ -542,18 +646,19 @@ class AsyncTradingDatabase:
         signal_type: str,
         strength: float = 0.0,
         metadata: str = "",
+        portfolio_id: str = DEFAULT_PORTFOLIO_ID,
     ) -> None:
         """Record a strategy signal asynchronously."""
         async with self.get_connection() as conn:
             await conn.execute(
                 """
-                INSERT INTO signals (symbol, strategy, signal_type, strength, metadata)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO signals (portfolio_id, symbol, strategy, signal_type, strength, metadata)
+                VALUES (?, ?, ?, ?, ?, ?)
             """,
-                (symbol, strategy, signal_type, strength, metadata),
+                (portfolio_id, symbol, strategy, signal_type, strength, metadata),
             )
             await conn.commit()
-            logger.debug(f"Recorded signal: {strategy} {signal_type} for {symbol}")
+            logger.debug(f"Recorded signal: {strategy} {signal_type} for {symbol} (portfolio={portfolio_id})")
 
     async def store_market_data(
         self,
@@ -591,16 +696,16 @@ class AsyncTradingDatabase:
             await conn.commit()
             logger.debug(f"Stored {len(data)} market data bars")
 
-    async def get_position(self, symbol: str) -> Optional[Dict]:
-        """Get position for a specific symbol."""
+    async def get_position(self, symbol: str, portfolio_id: str = DEFAULT_PORTFOLIO_ID) -> Optional[Dict]:
+        """Get position for a specific symbol in a portfolio."""
         async with self.get_connection() as conn:
             cursor = await conn.execute(
                 """
                 SELECT symbol, quantity, avg_cost, market_price
                 FROM positions
-                WHERE symbol = ? AND quantity != 0
+                WHERE portfolio_id = ? AND symbol = ? AND quantity != 0
             """,
-                (symbol,),
+                (portfolio_id, symbol),
             )
             row = await cursor.fetchone()
             if row:
@@ -612,15 +717,16 @@ class AsyncTradingDatabase:
                 }
             return None
 
-    async def get_positions(self) -> List[Dict]:
-        """Get all current positions."""
+    async def get_positions(self, portfolio_id: str = DEFAULT_PORTFOLIO_ID) -> List[Dict]:
+        """Get all current positions for a portfolio."""
         async with self.get_connection() as conn:
             cursor = await conn.execute(
                 """
                 SELECT symbol, quantity, avg_cost, market_price
                 FROM positions
-                WHERE quantity != 0
-            """
+                WHERE portfolio_id = ? AND quantity != 0
+            """,
+                (portfolio_id,),
             )
             rows = await cursor.fetchall()
             return [
@@ -633,7 +739,31 @@ class AsyncTradingDatabase:
                 for row in rows
             ]
 
-    async def has_recent_buy_trade(self, symbol: str, seconds: int = 60) -> bool:
+    async def get_all_positions(self) -> List[Dict]:
+        """Get all current positions across ALL portfolios."""
+        async with self.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT portfolio_id, symbol, quantity, avg_cost, market_price
+                FROM positions
+                WHERE quantity != 0
+            """
+            )
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "portfolio_id": row[0],
+                    "symbol": row[1],
+                    "quantity": row[2],
+                    "avg_cost": row[3],
+                    "market_price": row[4],
+                }
+                for row in rows
+            ]
+
+    async def has_recent_buy_trade(
+        self, symbol: str, seconds: int = 60, portfolio_id: str = DEFAULT_PORTFOLIO_ID,
+    ) -> bool:
         """
         Check if a BUY trade for the symbol exists within the last N seconds.
 
@@ -642,6 +772,7 @@ class AsyncTradingDatabase:
         Args:
             symbol: Stock symbol to check (validated against symbol format)
             seconds: Time window in seconds (default 60, must be 1-86400)
+            portfolio_id: Portfolio to scope the check to
 
         Returns:
             True if a BUY trade exists within the time window
@@ -663,16 +794,19 @@ class AsyncTradingDatabase:
             cursor = await conn.execute(
                 """
                 SELECT COUNT(*) FROM trades
-                WHERE symbol = ?
+                WHERE portfolio_id = ?
+                AND symbol = ?
                 AND side = 'BUY'
                 AND timestamp > datetime('now', ? || ' seconds')
                 """,
-                (symbol, f"-{seconds}"),
+                (portfolio_id, symbol, f"-{seconds}"),
             )
             row = await cursor.fetchone()
             return row[0] > 0 if row else False
 
-    async def has_recent_sell_trade(self, symbol: str, seconds: int = 60) -> bool:
+    async def has_recent_sell_trade(
+        self, symbol: str, seconds: int = 60, portfolio_id: str = DEFAULT_PORTFOLIO_ID,
+    ) -> bool:
         """
         Check if a SELL trade for the symbol exists within the last N seconds.
 
@@ -681,6 +815,7 @@ class AsyncTradingDatabase:
         Args:
             symbol: Stock symbol to check (validated against symbol format)
             seconds: Time window in seconds (default 60, must be 1-86400)
+            portfolio_id: Portfolio to scope the check to
 
         Returns:
             True if a SELL trade exists within the time window
@@ -702,17 +837,21 @@ class AsyncTradingDatabase:
             cursor = await conn.execute(
                 """
                 SELECT COUNT(*) FROM trades
-                WHERE symbol = ?
+                WHERE portfolio_id = ?
+                AND symbol = ?
                 AND side = 'SELL'
                 AND timestamp > datetime('now', ? || ' seconds')
                 """,
-                (symbol, f"-{seconds}"),
+                (portfolio_id, symbol, f"-{seconds}"),
             )
             row = await cursor.fetchone()
             return row[0] > 0 if row else False
 
-    async def get_recent_trades(self, limit: int = 100, symbol: Optional[str] = None) -> List[Dict]:
-        """Get recent trades, optionally filtered by symbol."""
+    async def get_recent_trades(
+        self, limit: int = 100, symbol: Optional[str] = None,
+        portfolio_id: str = DEFAULT_PORTFOLIO_ID,
+    ) -> List[Dict]:
+        """Get recent trades, optionally filtered by symbol, scoped to portfolio."""
         # Validate symbol if provided
         if symbol:
             symbol = DatabaseValidator.validate_symbol(symbol)
@@ -723,21 +862,22 @@ class AsyncTradingDatabase:
                     """
                     SELECT symbol, side, quantity, price, notional, slippage, commission, pnl, timestamp
                     FROM trades
-                    WHERE symbol = ?
+                    WHERE portfolio_id = ? AND symbol = ?
                     ORDER BY timestamp DESC
                     LIMIT ?
                 """,
-                    (symbol, limit),
+                    (portfolio_id, symbol, limit),
                 )
             else:
                 cursor = await conn.execute(
                     """
                     SELECT symbol, side, quantity, price, notional, slippage, commission, pnl, timestamp
                     FROM trades
+                    WHERE portfolio_id = ?
                     ORDER BY timestamp DESC
                     LIMIT ?
                 """,
-                    (limit,),
+                    (portfolio_id, limit),
                 )
 
             rows = await cursor.fetchall()
@@ -756,15 +896,16 @@ class AsyncTradingDatabase:
                 for row in rows
             ]
 
-    async def get_account_info(self) -> Dict:
-        """Get current account information."""
+    async def get_account_info(self, portfolio_id: str = DEFAULT_PORTFOLIO_ID) -> Dict:
+        """Get current account information for a portfolio."""
         async with self.get_connection() as conn:
             cursor = await conn.execute(
                 """
                 SELECT cash, equity, daily_pnl, realized_pnl, unrealized_pnl, timestamp
                 FROM account
-                WHERE id = 1
-            """
+                WHERE portfolio_id = ?
+            """,
+                (portfolio_id,),
             )
             row = await cursor.fetchone()
             if row:
@@ -812,6 +953,7 @@ class AsyncTradingDatabase:
         realized_pnl: float = 0.0,
         unrealized_pnl: float = 0.0,
         snapshot_date: Optional[str] = None,
+        portfolio_id: str = DEFAULT_PORTFOLIO_ID,
     ) -> None:
         """Save a daily equity snapshot for portfolio value tracking.
 
@@ -822,19 +964,21 @@ class AsyncTradingDatabase:
             snapshot_date = datetime.now().strftime("%Y-%m-%d")
 
         async with self.get_connection() as conn:
-            # Use INSERT OR REPLACE to update if date already exists
+            # Use INSERT OR REPLACE to update if date already exists for this portfolio
             await conn.execute(
                 """
                 INSERT OR REPLACE INTO equity_history
-                (date, equity, cash, positions_value, realized_pnl, unrealized_pnl, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                (portfolio_id, date, equity, cash, positions_value, realized_pnl, unrealized_pnl, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """,
-                (snapshot_date, equity, cash, positions_value, realized_pnl, unrealized_pnl),
+                (portfolio_id, snapshot_date, equity, cash, positions_value, realized_pnl, unrealized_pnl),
             )
             await conn.commit()
-            logger.debug(f"Saved equity snapshot: {snapshot_date} equity={equity:.2f}")
+            logger.debug(f"Saved equity snapshot: {snapshot_date} equity={equity:.2f} (portfolio={portfolio_id})")
 
-    async def get_equity_history(self, days: int = 365) -> List[Dict]:
+    async def get_equity_history(
+        self, days: int = 365, portfolio_id: str = DEFAULT_PORTFOLIO_ID,
+    ) -> List[Dict]:
         """Get equity history for the specified number of days.
 
         Returns list of daily snapshots ordered by date ascending (oldest first).
@@ -844,10 +988,11 @@ class AsyncTradingDatabase:
                 """
                 SELECT date, equity, cash, positions_value, realized_pnl, unrealized_pnl, timestamp
                 FROM equity_history
+                WHERE portfolio_id = ?
                 ORDER BY date ASC
                 LIMIT ?
             """,
-                (days,),
+                (portfolio_id, days),
             )
             rows = await cursor.fetchall()
             return [
@@ -862,6 +1007,75 @@ class AsyncTradingDatabase:
                 }
                 for row in rows
             ]
+
+    # ── Portfolio management methods ──
+
+    async def get_portfolios(self) -> List[Dict]:
+        """Get all portfolio definitions."""
+        async with self.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT id, name, starting_cash, symbols, active,
+                       max_position_pct, max_daily_loss_pct, max_open_positions,
+                       stop_loss_pct, trailing_stop_pct, use_trailing_stop,
+                       enabled_strategies, min_confidence,
+                       created_at, updated_at
+                FROM portfolios
+                ORDER BY created_at ASC
+            """
+            )
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "id": row[0],
+                    "name": row[1],
+                    "starting_cash": row[2],
+                    "symbols": row[3],
+                    "active": bool(row[4]),
+                    "max_position_pct": row[5],
+                    "max_daily_loss_pct": row[6],
+                    "max_open_positions": row[7],
+                    "stop_loss_pct": row[8],
+                    "trailing_stop_pct": row[9],
+                    "use_trailing_stop": bool(row[10]) if row[10] is not None else None,
+                    "enabled_strategies": row[11],
+                    "min_confidence": row[12],
+                    "created_at": row[13],
+                    "updated_at": row[14],
+                }
+                for row in rows
+            ]
+
+    async def upsert_portfolio(self, portfolio_data: Dict) -> None:
+        """Insert or update a portfolio definition."""
+        async with self.get_connection() as conn:
+            await conn.execute(
+                """
+                INSERT OR REPLACE INTO portfolios
+                    (id, name, starting_cash, symbols, active,
+                     max_position_pct, max_daily_loss_pct, max_open_positions,
+                     stop_loss_pct, trailing_stop_pct, use_trailing_stop,
+                     enabled_strategies, min_confidence, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+                (
+                    portfolio_data["id"],
+                    portfolio_data.get("name", portfolio_data["id"]),
+                    portfolio_data.get("starting_cash", 100000),
+                    portfolio_data.get("symbols", ""),
+                    1 if portfolio_data.get("active", True) else 0,
+                    portfolio_data.get("max_position_pct"),
+                    portfolio_data.get("max_daily_loss_pct"),
+                    portfolio_data.get("max_open_positions"),
+                    portfolio_data.get("stop_loss_pct"),
+                    portfolio_data.get("trailing_stop_pct"),
+                    1 if portfolio_data.get("use_trailing_stop") else (0 if portfolio_data.get("use_trailing_stop") is False else None),
+                    portfolio_data.get("enabled_strategies"),
+                    portfolio_data.get("min_confidence"),
+                ),
+            )
+            await conn.commit()
+            logger.info(f"Upserted portfolio: {portfolio_data['id']}")
 
     async def cleanup_old_data(self, days_to_keep: int = 30) -> None:
         """Clean up old data from the database."""

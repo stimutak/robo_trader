@@ -13,8 +13,15 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 
+DEFAULT_PORTFOLIO_ID = "default"
+
+
 class SyncDatabaseReader:
-    """Simple sync database reader to avoid locking issues"""
+    """Simple sync database reader to avoid locking issues.
+
+    Supports multi-portfolio queries via portfolio_id parameter.
+    Default portfolio_id='default' for backward compatibility.
+    """
 
     def __init__(self, db_path="trading_data.db"):
         self.db_path = db_path
@@ -98,23 +105,40 @@ class SyncDatabaseReader:
         rows = self._fetch_all(sql, params, retries)
         return rows[0] if rows else None
 
-    def get_positions(self) -> List[Dict]:
-        """Get all current positions"""
+    def get_positions(self, portfolio_id: str = DEFAULT_PORTFOLIO_ID) -> List[Dict]:
+        """Get all current positions for a portfolio."""
         try:
             rows = self._fetch_all(
                 """
                 SELECT symbol, quantity, avg_cost, market_price, timestamp
                 FROM positions
-                WHERE quantity != 0
-                """
+                WHERE portfolio_id = ? AND quantity != 0
+                """,
+                (portfolio_id,),
             )
             return [dict(row) for row in rows]
         except Exception as e:
             print(f"Error getting positions: {e}")
             return []
 
+    def get_all_positions(self) -> List[Dict]:
+        """Get all positions across ALL portfolios."""
+        try:
+            rows = self._fetch_all(
+                """
+                SELECT portfolio_id, symbol, quantity, avg_cost, market_price, timestamp
+                FROM positions
+                WHERE quantity != 0
+                """
+            )
+            return [dict(row) for row in rows]
+        except Exception as e:
+            print(f"Error getting all positions: {e}")
+            return []
+
     def get_recent_trades(
-        self, limit: int = 100, symbol: Optional[str] = None, days: Optional[int] = None
+        self, limit: int = 100, symbol: Optional[str] = None, days: Optional[int] = None,
+        portfolio_id: str = DEFAULT_PORTFOLIO_ID,
     ) -> List[Dict]:
         """Get recent trades, optionally filtered by symbol and recent days.
 
@@ -122,11 +146,12 @@ class SyncDatabaseReader:
             limit: Maximum number of rows to return ordered by timestamp DESC
             symbol: If provided, only return trades for this symbol
             days: If provided, include only trades with timestamp within the past N days
+            portfolio_id: Portfolio to scope the query to
         """
         try:
             # Build WHERE clauses dynamically
-            where_clauses = []
-            params: Tuple = ()
+            where_clauses = ["portfolio_id = ?"]
+            params: Tuple = (portfolio_id,)
 
             if symbol:
                 where_clauses.append("symbol = ?")
@@ -136,7 +161,7 @@ class SyncDatabaseReader:
                 where_clauses.append("timestamp >= datetime('now', '-' || ? || ' days')")
                 params += (days,)
 
-            where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+            where_sql = " WHERE " + " AND ".join(where_clauses)
 
             sql = (
                 "SELECT * FROM trades" + where_sql + " ORDER BY timestamp DESC LIMIT ?"
@@ -150,15 +175,16 @@ class SyncDatabaseReader:
             print(f"Error getting trades: {e}")
             return []
 
-    def get_account_info(self) -> Dict:
-        """Get current account information"""
+    def get_account_info(self, portfolio_id: str = DEFAULT_PORTFOLIO_ID) -> Dict:
+        """Get current account information for a portfolio."""
         try:
             row = self._fetch_one(
                 """
                 SELECT cash, equity, daily_pnl, realized_pnl, unrealized_pnl, timestamp
                 FROM account
-                WHERE id = 1
-                """
+                WHERE portfolio_id = ?
+                """,
+                (portfolio_id,),
             )
             if row:
                 return dict(row)
@@ -197,24 +223,24 @@ class SyncDatabaseReader:
             print(f"Error getting market data: {e}")
             return []
 
-    def get_signals(self, hours: int = 1) -> List[Dict]:
-        """Get recent signals"""
+    def get_signals(self, hours: int = 1, portfolio_id: str = DEFAULT_PORTFOLIO_ID) -> List[Dict]:
+        """Get recent signals for a portfolio."""
         try:
             rows = self._fetch_all(
                 """
                 SELECT symbol, strategy, signal_type, strength, metadata, timestamp
                 FROM signals
-                WHERE timestamp >= datetime('now', '-' || ? || ' hour')
+                WHERE portfolio_id = ? AND timestamp >= datetime('now', '-' || ? || ' hour')
                 ORDER BY timestamp DESC
                 """,
-                (hours,),
+                (portfolio_id, hours),
             )
             return [dict(row) for row in rows]
         except Exception as e:
             print(f"Error getting signals: {e}")
             return []
 
-    def get_equity_history(self, days: int = 365) -> List[Dict]:
+    def get_equity_history(self, days: int = 365, portfolio_id: str = DEFAULT_PORTFOLIO_ID) -> List[Dict]:
         """Get equity history for charting portfolio value over time.
 
         Returns list of daily snapshots ordered by date ascending (oldest first).
@@ -225,12 +251,28 @@ class SyncDatabaseReader:
                 """
                 SELECT date, equity, cash, positions_value, realized_pnl, unrealized_pnl, timestamp
                 FROM equity_history
+                WHERE portfolio_id = ?
                 ORDER BY date ASC
                 LIMIT ?
                 """,
-                (days,),
+                (portfolio_id, days),
             )
             return [dict(row) for row in rows]
         except Exception as e:
             print(f"Error getting equity history: {e}")
             return []
+
+    def get_portfolios(self) -> List[Dict]:
+        """Get all portfolio definitions."""
+        try:
+            rows = self._fetch_all(
+                """
+                SELECT id, name, starting_cash, symbols, active, created_at
+                FROM portfolios
+                ORDER BY created_at ASC
+                """
+            )
+            return [dict(row) for row in rows]
+        except Exception as e:
+            print(f"Error getting portfolios: {e}")
+            return [{"id": "default", "name": "Default Portfolio", "starting_cash": 100000, "active": 1}]

@@ -210,11 +210,13 @@ class WebSocketManager:
         )
 
     def send_trade_update(
-        self, symbol: str, side: str, quantity: int, price: float, status: str = "executed"
+        self, symbol: str, side: str, quantity: int, price: float, status: str = "executed",
+        portfolio_id: str = "default",
     ):
         """Queue a trade update for broadcast."""
         message = {
             "type": "trade",
+            "portfolio_id": portfolio_id,
             "symbol": symbol,
             "side": side,
             "quantity": quantity,
@@ -225,20 +227,22 @@ class WebSocketManager:
 
         self.message_queue.put(message)
 
-    def send_position_update(self, positions: Dict[str, Any]):
+    def send_position_update(self, positions: Dict[str, Any], portfolio_id: str = "default"):
         """Queue a position update for broadcast."""
         message = {
             "type": "positions",
+            "portfolio_id": portfolio_id,
             "positions": positions,
             "timestamp": datetime.now().isoformat(),
         }
 
         self.message_queue.put(message)
 
-    def send_signal_update(self, symbol: str, signal: str, strength: float):
+    def send_signal_update(self, symbol: str, signal: str, strength: float, portfolio_id: str = "default"):
         """Queue a trading signal update for broadcast."""
         message = {
             "type": "signal",
+            "portfolio_id": portfolio_id,
             "symbol": symbol,
             "signal": signal,
             "strength": strength,
@@ -247,10 +251,11 @@ class WebSocketManager:
 
         self.message_queue.put(message)
 
-    def send_performance_update(self, metrics: Dict[str, Any]):
+    def send_performance_update(self, metrics: Dict[str, Any], portfolio_id: str = "default"):
         """Queue a performance metrics update for broadcast."""
         message = {
             "type": "performance",
+            "portfolio_id": portfolio_id,
             "metrics": metrics,
             "timestamp": datetime.now().isoformat(),
         }

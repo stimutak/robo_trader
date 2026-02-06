@@ -392,6 +392,12 @@ class Config(BaseModel):
         default=100_000, gt=0, description="Starting cash for paper trading"
     )
 
+    # Multi-portfolio configuration (loaded from PORTFOLIOS env var or auto-created)
+    portfolio_configs: List[dict] = Field(
+        default_factory=list,
+        description="List of portfolio configurations (populated at runtime)",
+    )
+
     @field_validator("symbols")
     @classmethod
     def validate_symbols(cls, v: List[str]) -> List[str]:
@@ -588,7 +594,25 @@ def load_config_from_env() -> Config:
             f"Use port 7496 (TWS) or 4001 (Gateway) for live trading. BE CAREFUL!"
         )
 
-    return Config(**config_dict)
+    config = Config(**config_dict)
+
+    # Load multi-portfolio configurations
+    try:
+        from .multiuser.portfolio_config import load_portfolio_configs
+        portfolio_configs = load_portfolio_configs()
+        config.portfolio_configs = [pc.to_dict() for pc in portfolio_configs]
+    except Exception as e:
+        logger.warning(f"Could not load portfolio configs: {e}")
+        # Fall back to single default portfolio
+        config.portfolio_configs = [{
+            "id": "default",
+            "name": "Default Portfolio",
+            "starting_cash": config.default_cash,
+            "symbols": ",".join(config.symbols),
+            "active": True,
+        }]
+
+    return config
 
 
 def load_config() -> Config:

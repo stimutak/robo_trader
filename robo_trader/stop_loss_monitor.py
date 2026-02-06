@@ -57,6 +57,7 @@ class StopLossOrder:
     stop_type: StopType
     created_at: datetime
     status: StopStatus = StopStatus.PENDING
+    portfolio_id: str = "default"  # Multi-portfolio support
 
     # For trailing stops
     trailing_amount: Optional[float] = None  # Dollar amount for trailing
@@ -111,7 +112,8 @@ class StopLossMonitor:
     automatically executing stop-loss orders when price thresholds are breached.
     """
 
-    def __init__(self, executor, risk_manager, emergency_shutdown_callback=None):
+    def __init__(self, executor, risk_manager, emergency_shutdown_callback=None,
+                 portfolio_id: str = "default"):
         """
         Initialize stop-loss monitor.
 
@@ -119,10 +121,12 @@ class StopLossMonitor:
             executor: Order executor for placing stop orders
             risk_manager: Risk manager for validation and limits
             emergency_shutdown_callback: Callback for emergency shutdown
+            portfolio_id: Portfolio this monitor is scoped to
         """
         self.executor = executor
         self.risk_manager = risk_manager
         self.emergency_shutdown = emergency_shutdown_callback
+        self.portfolio_id = portfolio_id
 
         # Active stop-loss orders by symbol
         self.active_stops: Dict[str, StopLossOrder] = {}
@@ -206,6 +210,7 @@ class StopLossMonitor:
             entry_price=avg_price_float,  # Use float, not Decimal
             stop_type=stop_type,
             created_at=datetime.now(),
+            portfolio_id=self.portfolio_id,
             trailing_amount=trailing_amount,
             trailing_percent=trailing_percent,
         )
