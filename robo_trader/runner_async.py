@@ -666,6 +666,7 @@ class AsyncRunner:
 
         # Wrap DB with portfolio-scoped proxy if using non-default portfolio
         from .multiuser.db_proxy import PortfolioScopedDB
+
         self.db = PortfolioScopedDB(self._raw_db, portfolio_id=self.portfolio_id)
         logger.info(f"Database initialized for portfolio: {self.portfolio_id}")
 
@@ -1929,7 +1930,7 @@ class AsyncRunner:
                     recent_buy = await self.db.has_recent_buy_trade(symbol, seconds=600)
                     if recent_buy:
                         logger.warning(
-                            f"DUPLICATE BUY BLOCKED: {symbol} has recent BUY trade in last 120 seconds"
+                            f"DUPLICATE BUY BLOCKED: {symbol} has recent BUY trade in last 10 minutes"
                         )
                         self._pending_orders.discard(symbol)
                         return self._blocked_result(
@@ -3286,13 +3287,19 @@ async def run_continuous(
 
                 # Load portfolio configurations
                 from .multiuser.portfolio_config import PortfolioConfig, load_portfolio_configs
+
                 try:
                     portfolio_configs = load_portfolio_configs()
                 except Exception as pc_err:
                     logger.warning(f"Failed to load portfolio configs: {pc_err}, using default")
-                    portfolio_configs = [PortfolioConfig(id="default", name="Default Portfolio",
-                                                         starting_cash=default_cash or 100000,
-                                                         symbols=symbols or [])]
+                    portfolio_configs = [
+                        PortfolioConfig(
+                            id="default",
+                            name="Default Portfolio",
+                            starting_cash=default_cash or 100000,
+                            symbols=symbols or [],
+                        )
+                    ]
 
                 active_portfolios = [pc for pc in portfolio_configs if pc.active]
                 logger.info(

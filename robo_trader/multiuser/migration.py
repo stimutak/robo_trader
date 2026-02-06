@@ -10,7 +10,9 @@ This migration is safe and backward-compatible:
 - Existing single-portfolio usage continues to work unchanged
 """
 
+import asyncio
 import shutil
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -38,7 +40,7 @@ class MultiuserMigration:
             )
             row = await cursor.fetchone()
             return row[0] if row else 0
-        except Exception:
+        except sqlite3.OperationalError:
             # Table doesn't exist yet
             return 0
 
@@ -48,7 +50,7 @@ class MultiuserMigration:
             current = await self.get_migration_version(conn)
             return current < MIGRATION_VERSION
 
-    def _create_backup(self) -> Optional[Path]:
+    async def _create_backup(self) -> Optional[Path]:
         """Create a backup of the database before migration.
 
         Returns:
@@ -59,7 +61,8 @@ class MultiuserMigration:
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_path = self.db_path.with_suffix(f".backup_premultiuser_{timestamp}.db")
-        shutil.copy2(self.db_path, backup_path)
+        # Use asyncio.to_thread to avoid blocking the event loop
+        await asyncio.to_thread(shutil.copy2, self.db_path, backup_path)
         logger.info(f"Created database backup at: {backup_path}")
         return backup_path
 
@@ -87,7 +90,7 @@ class MultiuserMigration:
                 return False
 
             # Create backup BEFORE any changes
-            backup_path = self._create_backup()
+            backup_path = await self._create_backup()
             logger.info(f"Starting multiuser migration (v{current_version} → v{MIGRATION_VERSION})")
 
             try:
@@ -96,28 +99,31 @@ class MultiuserMigration:
                 logger.info("Multiuser migration completed successfully")
                 return True
 
-            except Exception as e:
+            except (sqlite3.Error, aiosqlite.Error) as e:
                 logger.error(f"Migration failed: {e}")
                 await conn.rollback()
                 if backup_path and backup_path.exists():
                     logger.info(f"Restoring from backup: {backup_path}")
-                    shutil.copy2(backup_path, self.db_path)
+                    await asyncio.to_thread(shutil.copy2, backup_path, self.db_path)
                 raise
 
     async def _apply_migration_v1(self, conn: aiosqlite.Connection, default_cash: float):
         """Apply migration version 1: Add multi-portfolio support."""
 
         # 1. Create schema_migrations table
-        await conn.execute("""
+        await conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 version INTEGER PRIMARY KEY,
                 description TEXT NOT NULL,
                 applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
-        """)
+        """
+        )
 
         # 2. Create portfolios table
-        await conn.execute("""
+        await conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS portfolios (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -135,13 +141,17 @@ class MultiuserMigration:
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
-        """)
+        """
+        )
 
         # 3. Insert 'default' portfolio if not exists
-        await conn.execute("""
+        await conn.execute(
+            """
             INSERT OR IGNORE INTO portfolios (id, name, starting_cash)
             VALUES ('default', 'Default Portfolio', ?)
-        """, (default_cash,))
+        """,
+            (default_cash,),
+        )
 
         # 4. Migrate positions table: add portfolio_id, change unique constraint
         await self._migrate_table_add_portfolio_id(
@@ -218,7 +228,7 @@ class MultiuserMigration:
                 INSERT INTO account_new (portfolio_id, cash, equity, daily_pnl, realized_pnl, unrealized_pnl, timestamp)
                 SELECT 'default', cash, equity, daily_pnl, realized_pnl, unrealized_pnl, timestamp
                 FROM account
-                WHERE id = 1
+                ORDER BY id ASC LIMIT 1
             """,
             index_sql=[],
         )
@@ -278,10 +288,16 @@ class MultiuserMigration:
         )
 
         # 9. Record migration
-        await conn.execute("""
+        await conn.execute(
+            """
             INSERT INTO schema_migrations (version, description)
             VALUES (?, ?)
-        """, (MIGRATION_VERSION, "Add multi-portfolio support: portfolio_id on positions, trades, account, equity_history, signals"))
+        """,
+            (
+                MIGRATION_VERSION,
+                "Add multi-portfolio support: portfolio_id on positions, trades, account, equity_history, signals",
+            ),
+        )
 
         logger.info("Migration v1 applied: multi-portfolio schema ready")
 
@@ -323,7 +339,8 @@ class MultiuserMigration:
             return
 
         # Count existing rows for logging
-        cursor = await conn.execute(f"SELECT COUNT(*) FROM {table_name}")
+        # nosec B608 - table_name comes from hardcoded strings in this file, not user input
+        cursor = await conn.execute(f"SELECT COUNT(*) FROM {table_name}")  # nosec B608
         row_count = (await cursor.fetchone())[0]
 
         # Create new table

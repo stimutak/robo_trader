@@ -83,10 +83,20 @@ class PortfolioConfig:
         elif not strategies:
             strategies = None
 
+        # Validate starting_cash with meaningful error
+        try:
+            starting_cash = float(data.get("starting_cash", 100_000))
+            if starting_cash <= 0:
+                raise ValueError(f"starting_cash must be positive, got {starting_cash}")
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"Invalid starting_cash for portfolio '{data.get('id', 'unknown')}': {e}"
+            ) from e
+
         return cls(
             id=data["id"],
             name=data.get("name", data["id"]),
-            starting_cash=float(data.get("starting_cash", 100_000)),
+            starting_cash=starting_cash,
             symbols=symbols,
             active=bool(data.get("active", True)),
             max_position_pct=data.get("max_position_pct"),

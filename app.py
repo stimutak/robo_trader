@@ -229,6 +229,55 @@ HTML_TEMPLATE = """
             gap: 15px;
         }
 
+        .portfolio-selector {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 4px 12px;
+            background: #161b22;
+            border-radius: 8px;
+            border: 1px solid #30363d;
+        }
+
+        .portfolio-selector label {
+            font-size: 11px;
+            color: #8b949e;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .portfolio-selector select {
+            background: #0d1117;
+            color: #e6edf3;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 6px 28px 6px 10px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%238b949e' viewBox='0 0 16 16'%3E%3Cpath d='M7.247 11.14L2.451 5.658C1.885 5.013 2.345 4 3.204 4h9.592a1 1 0 0 1 .753 1.659l-4.796 5.48a1 1 0 0 1-1.506 0z'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 8px center;
+            min-width: 140px;
+        }
+
+        .portfolio-selector select:hover {
+            border-color: #58a6ff;
+        }
+
+        .portfolio-selector select:focus {
+            outline: none;
+            border-color: #58a6ff;
+            box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.3);
+        }
+
+        .portfolio-equity {
+            font-size: 12px;
+            color: #4ade80;
+            font-weight: 600;
+        }
+
         .header-right {
             display: flex;
             align-items: center;
@@ -618,6 +667,13 @@ HTML_TEMPLATE = """
         <header>
             <div class="logo">RoboTrader</div>
             <div class="header-center">
+                <div class="portfolio-selector">
+                    <label>Portfolio</label>
+                    <select id="portfolio-select" onchange="switchPortfolio(this.value)">
+                        <option value="default">Loading...</option>
+                    </select>
+                    <span class="portfolio-equity" id="portfolio-quick-equity"></span>
+                </div>
                 <div class="status-indicator">
                     <div class="status-dot" id="status-dot"></div>
                     <span id="status-text">Disconnected</span>
@@ -1410,7 +1466,69 @@ HTML_TEMPLATE = """
     
     <script>
         let currentTab = 'overview';
-        
+        let currentPortfolio = 'default';
+        let portfolioList = [];
+
+        // Load available portfolios on startup
+        async function loadPortfolios() {
+            try {
+                const resp = await fetch('/api/portfolios');
+                const data = await resp.json();
+                portfolioList = data.portfolios || [];
+                console.log('Loaded portfolios:', portfolioList);
+
+                const select = document.getElementById('portfolio-select');
+                select.innerHTML = '';
+
+                portfolioList.forEach(p => {
+                    const opt = document.createElement('option');
+                    opt.value = p.id;
+                    opt.textContent = p.name;
+                    if (p.id === currentPortfolio) opt.selected = true;
+                    select.appendChild(opt);
+                });
+
+                // Update quick equity display
+                const current = portfolioList.find(p => p.id === currentPortfolio);
+                console.log('Current portfolio:', currentPortfolio, 'found:', current);
+                if (current && current.account) {
+                    const equityEl = document.getElementById('portfolio-quick-equity');
+                    const equity = current.account.equity || 0;
+                    console.log('Setting equity to:', equity);
+                    equityEl.textContent = formatCurrency(equity);
+                }
+            } catch (e) {
+                console.error('Failed to load portfolios:', e);
+            }
+        }
+
+        function switchPortfolio(portfolioId) {
+            currentPortfolio = portfolioId;
+            // Save to localStorage for persistence
+            localStorage.setItem('selectedPortfolio', portfolioId);
+
+            // Update quick equity display
+            const current = portfolioList.find(p => p.id === portfolioId);
+            if (current && current.account) {
+                document.getElementById('portfolio-quick-equity').textContent = formatCurrency(current.account.equity || 0);
+            }
+
+            // Reload all data for the new portfolio
+            refreshData();
+        }
+
+        // Helper to add portfolio_id to API URLs
+        function withPortfolio(url) {
+            const separator = url.includes('?') ? '&' : '?';
+            return `${url}${separator}portfolio_id=${encodeURIComponent(currentPortfolio)}`;
+        }
+
+        // Restore saved portfolio on load
+        (function() {
+            const saved = localStorage.getItem('selectedPortfolio');
+            if (saved) currentPortfolio = saved;
+        })();
+
         function switchTab(tab, element) {
             // Hide all tabs
             document.querySelectorAll('.tab-content').forEach(content => {
@@ -1500,13 +1618,13 @@ HTML_TEMPLATE = """
 
         async function loadOverviewData() {
             try {
-                // Load all data in parallel
+                // Load all data in parallel (with portfolio_id)
                 const [equityResp, posResp, tradesResp, perfResp, pnlResp, marketResp] = await Promise.all([
-                    fetch('/api/equity-curve'),
-                    fetch('/api/positions'),
-                    fetch('/api/trades?days=365'),
-                    fetch('/api/performance'),
-                    fetch('/api/pnl'),
+                    fetch(withPortfolio('/api/equity-curve')),
+                    fetch(withPortfolio('/api/positions')),
+                    fetch(withPortfolio('/api/trades?days=365')),
+                    fetch(withPortfolio('/api/performance')),
+                    fetch(withPortfolio('/api/pnl')),
                     fetch('/api/market/status')
                 ]);
 
@@ -1837,45 +1955,45 @@ HTML_TEMPLATE = """
         
         async function loadPnL() {
             try {
-                const response = await fetch('/api/pnl');
+                const response = await fetch(withPortfolio('/api/pnl'));
                 const data = await response.json();
                 updatePnL(data);
             } catch (error) {
                 console.error('Error loading P&L:', error);
             }
         }
-        
+
         async function loadWatchlist() {
             try {
-                const response = await fetch('/api/watchlist');
+                const response = await fetch(withPortfolio('/api/watchlist'));
                 const data = await response.json();
                 updateWatchlistTable(data.watchlist);
             } catch (error) {
                 console.error('Error loading watchlist:', error);
             }
         }
-        
+
         async function loadPositions() {
             try {
-                const response = await fetch('/api/positions');
+                const response = await fetch(withPortfolio('/api/positions'));
                 const data = await response.json();
                 updatePositionsTable(data.positions);
             } catch (error) {
                 console.error('Error loading positions:', error);
             }
         }
-        
+
         async function loadTrades() {
             try {
                 const symbolFilter = document.getElementById('trade-symbol-filter').value;
                 const daysFilter = document.getElementById('trade-days-filter').value;
-                
+
                 let url = `/api/trades?days=${daysFilter}`;
                 if (symbolFilter) {
                     url += `&symbol=${symbolFilter}`;
                 }
-                
-                const response = await fetch(url);
+
+                const response = await fetch(withPortfolio(url));
                 const data = await response.json();
                 
                 // Update summary stats
@@ -2133,10 +2251,10 @@ HTML_TEMPLATE = """
 
         async function loadPerformanceData() {
             try {
-                // Load performance metrics and equity curve in parallel
+                // Load performance metrics and equity curve in parallel (with portfolio_id)
                 const [perfResponse, equityResponse] = await Promise.all([
-                    fetch('/api/performance'),
-                    fetch('/api/equity-curve')
+                    fetch(withPortfolio('/api/performance')),
+                    fetch(withPortfolio('/api/equity-curve'))
                 ]);
                 const data = await perfResponse.json();
                 const equityData = await equityResponse.json();
@@ -3214,12 +3332,12 @@ HTML_TEMPLATE = """
         // Refresh strategies tab data
         async function refreshStrategies() {
             try {
-                // Fetch all data in parallel
+                // Fetch all data in parallel (with portfolio_id where applicable)
                 const [strategiesResp, allocResp, execResp, riskResp] = await Promise.all([
-                    fetch('/api/strategies/status'),
-                    fetch('/api/portfolio/allocation'),
+                    fetch(withPortfolio('/api/strategies/status')),
+                    fetch(withPortfolio('/api/portfolio/allocation')),
                     fetch('/api/execution/status'),
-                    fetch('/api/risk/status')
+                    fetch(withPortfolio('/api/risk/status'))
                 ]);
 
                 let strategiesData = null;
@@ -3514,7 +3632,8 @@ HTML_TEMPLATE = """
         }
         
         // Initialize on load
-        window.onload = () => {
+        window.onload = async () => {
+            await loadPortfolios(); // Load portfolio list first
             refreshData();
             refreshStrategies();
             updateSafetyMonitoring(); // Load safety monitoring on startup
@@ -3526,6 +3645,7 @@ HTML_TEMPLATE = """
             setInterval(updateSafetyMonitoring, 10000); // Update safety monitoring every 10 seconds
             setInterval(loadLogs, 2000); // Update logs every 2 seconds
             setInterval(updateMarketStatus, 60000); // Update market status every minute
+            setInterval(loadPortfolios, 30000); // Refresh portfolio list every 30 seconds
         };
     </script>
 </body>
@@ -3589,26 +3709,30 @@ def get_portfolios():
             account = db.get_account_info(portfolio_id=pid)
             positions = db.get_positions(portfolio_id=pid)
 
-            result.append({
-                "id": pid,
-                "name": p.get("name", pid),
-                "starting_cash": p.get("starting_cash", 100000),
-                "active": bool(p.get("active", 1)),
-                "symbols": p.get("symbols", ""),
-                "account": {
-                    "cash": account.get("cash", 0),
-                    "equity": account.get("equity", 0),
-                    "realized_pnl": account.get("realized_pnl", 0),
-                    "unrealized_pnl": account.get("unrealized_pnl", 0),
-                    "daily_pnl": account.get("daily_pnl", 0),
-                },
-                "positions_count": len([p for p in positions if p.get("quantity", 0) != 0]),
-            })
+            result.append(
+                {
+                    "id": pid,
+                    "name": p.get("name", pid),
+                    "starting_cash": p.get("starting_cash", 100000),
+                    "active": bool(p.get("active", 1)),
+                    "symbols": p.get("symbols", ""),
+                    "account": {
+                        "cash": account.get("cash", 0),
+                        "equity": account.get("equity", 0),
+                        "realized_pnl": account.get("realized_pnl", 0),
+                        "unrealized_pnl": account.get("unrealized_pnl", 0),
+                        "daily_pnl": account.get("daily_pnl", 0),
+                    },
+                    "positions_count": len([p for p in positions if p.get("quantity", 0) != 0]),
+                }
+            )
 
         return jsonify({"portfolios": result})
     except Exception as e:
         logger.error(f"Error getting portfolios: {e}")
-        return jsonify({"portfolios": [{"id": "default", "name": "Default Portfolio", "active": True}]})
+        return jsonify(
+            {"portfolios": [{"id": "default", "name": "Default Portfolio", "active": True}]}
+        )
 
 
 @app.route("/api/database/health")
@@ -5378,7 +5502,9 @@ def get_trades():
         trade_limit = min(max(trade_limit, 10), 5000)  # Clamp between 10 and 5000
 
         portfolio_id = request.args.get("portfolio_id", "default")
-        trades = db.get_recent_trades(limit=trade_limit, symbol=symbol, days=days, portfolio_id=portfolio_id)
+        trades = db.get_recent_trades(
+            limit=trade_limit, symbol=symbol, days=days, portfolio_id=portfolio_id
+        )
 
         if trades:
             # Convert to expected format

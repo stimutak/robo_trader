@@ -54,6 +54,9 @@ class DatabaseValidator:
     # Valid symbol pattern: 1-5 uppercase letters, optionally followed by dot and 1-2 letters
     SYMBOL_PATTERN = re.compile(r"^[A-Z]{1,5}(\.[A-Z]{1,2})?$")
 
+    # Valid portfolio_id pattern: alphanumeric + underscore/hyphen, 1-50 chars
+    PORTFOLIO_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,50}$")
+
     # Maximum reasonable values for sanity checks
     MAX_PRICE = 1_000_000.0  # $1M per share max
     MIN_PRICE = 0.0001  # $0.0001 min (penny stocks)
@@ -100,6 +103,45 @@ class DatabaseValidator:
             raise ValidationError("Invalid characters in symbol")
 
         return symbol
+
+    @staticmethod
+    def validate_portfolio_id(portfolio_id: Any) -> str:
+        """
+        Validate a portfolio ID.
+
+        Args:
+            portfolio_id: The portfolio ID to validate
+
+        Returns:
+            str: The validated portfolio ID
+
+        Raises:
+            ValidationError: If portfolio_id is invalid
+        """
+        if not portfolio_id:
+            raise ValidationError("Portfolio ID cannot be empty")
+
+        if not isinstance(portfolio_id, str):
+            raise ValidationError(
+                f"Portfolio ID must be a string, got {type(portfolio_id).__name__}"
+            )
+
+        portfolio_id = portfolio_id.strip()
+
+        if not DatabaseValidator.PORTFOLIO_ID_PATTERN.match(portfolio_id):
+            raise ValidationError(
+                f"Invalid portfolio_id format: '{portfolio_id}'. "
+                "Must be 1-50 alphanumeric characters, underscores, or hyphens."
+            )
+
+        # Check for SQL injection attempts
+        if any(
+            char in portfolio_id for char in ["'", '"', ";", "--", "/*", "*/", "DROP", "DELETE"]
+        ):
+            logger.error(f"Potential SQL injection attempt in portfolio_id: {portfolio_id}")
+            raise ValidationError("Invalid characters in portfolio_id")
+
+        return portfolio_id
 
     @staticmethod
     def validate_price(

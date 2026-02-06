@@ -112,8 +112,13 @@ class StopLossMonitor:
     automatically executing stop-loss orders when price thresholds are breached.
     """
 
-    def __init__(self, executor, risk_manager, emergency_shutdown_callback=None,
-                 portfolio_id: str = "default"):
+    def __init__(
+        self,
+        executor,
+        risk_manager,
+        emergency_shutdown_callback=None,
+        portfolio_id: str = "default",
+    ):
         """
         Initialize stop-loss monitor.
 
@@ -128,7 +133,7 @@ class StopLossMonitor:
         self.emergency_shutdown = emergency_shutdown_callback
         self.portfolio_id = portfolio_id
 
-        # Active stop-loss orders by symbol
+        # Active stop-loss orders by portfolio:symbol key (supports multi-portfolio)
         self.active_stops: Dict[str, StopLossOrder] = {}
 
         # Historical stops for analysis
@@ -152,7 +157,11 @@ class StopLossMonitor:
         self.max_execution_retries = 3
         self.emergency_shutdown_on_failure = True
 
-        logger.info("Stop-loss monitor initialized")
+        logger.info(f"Stop-loss monitor initialized for portfolio={self.portfolio_id}")
+
+    def _stop_key(self, symbol: str) -> str:
+        """Generate composite key for stop-loss storage (portfolio:symbol)."""
+        return f"{self.portfolio_id}:{symbol}"
 
     async def add_stop_loss(
         self,
@@ -216,14 +225,17 @@ class StopLossMonitor:
         )
 
         # Cancel existing stop for this symbol if any
-        if symbol in self.active_stops:
-            old_stop = self.active_stops[symbol]
+        stop_key = self._stop_key(symbol)
+        if stop_key in self.active_stops:
+            old_stop = self.active_stops[stop_key]
             old_stop.status = StopStatus.CANCELLED
             self.stop_history.append(old_stop)
-            logger.info(f"Cancelled existing stop-loss for {symbol}")
+            logger.info(
+                f"Cancelled existing stop-loss for {symbol} (portfolio={self.portfolio_id})"
+            )
 
         # Add new stop
-        self.active_stops[symbol] = stop_order
+        self.active_stops[stop_key] = stop_order
         self.metrics.total_stops += 1
         self.metrics.active_stops = len(self.active_stops)
 
@@ -255,8 +267,9 @@ class StopLossMonitor:
         self.price_update_times[symbol] = datetime.now()
 
         # Update trailing stops if needed
-        if symbol in self.active_stops:
-            stop = self.active_stops[symbol]
+        stop_key = self._stop_key(symbol)
+        if stop_key in self.active_stops:
+            stop = self.active_stops[stop_key]
             if stop.stop_type in [StopType.TRAILING, StopType.TRAILING_PERCENT]:
                 await self._update_trailing_stop(stop, price)
 
@@ -413,8 +426,9 @@ class StopLossMonitor:
                         self.metrics.largest_prevented_loss, prevented_loss
                     )
 
-                    # Remove from active stops
-                    del self.active_stops[stop.symbol]
+                    # Remove from active stops (use composite key)
+                    stop_key = self._stop_key(stop.symbol)
+                    del self.active_stops[stop_key]
                     self.stop_history.append(stop)
                     self.metrics.active_stops = len(self.active_stops)
 
@@ -512,7 +526,7 @@ class StopLossMonitor:
 
     def get_stop_for_symbol(self, symbol: str) -> Optional[StopLossOrder]:
         """
-        Get active stop-loss order for a symbol.
+        Get active stop-loss order for a symbol in this portfolio.
 
         Args:
             symbol: Trading symbol
@@ -520,7 +534,7 @@ class StopLossMonitor:
         Returns:
             Stop-loss order if exists
         """
-        return self.active_stops.get(symbol)
+        return self.active_stops.get(self._stop_key(symbol))
 
     def cancel_stop(self, symbol: str) -> bool:
         """
@@ -532,13 +546,14 @@ class StopLossMonitor:
         Returns:
             True if stop was cancelled
         """
-        if symbol in self.active_stops:
-            stop = self.active_stops[symbol]
+        stop_key = self._stop_key(symbol)
+        if stop_key in self.active_stops:
+            stop = self.active_stops[stop_key]
             stop.status = StopStatus.CANCELLED
-            del self.active_stops[symbol]
+            del self.active_stops[stop_key]
             self.stop_history.append(stop)
             self.metrics.active_stops = len(self.active_stops)
-            logger.info(f"Stop-loss cancelled for {symbol}")
+            logger.info(f"Stop-loss cancelled for {symbol} (portfolio={self.portfolio_id})")
             return True
 
         return False
