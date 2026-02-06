@@ -4587,16 +4587,18 @@ def get_positions():
     # Return cached positions if available and recent (within 2 seconds)
     # Use lock for thread-safe cache access
     current_time = time.time()
+    portfolio_id = request.args.get("portfolio_id", "default")
+    cache_key = f"_positions_cache_{portfolio_id}"
+    cache_time_key = f"_positions_cache_time_{portfolio_id}"
     with _positions_cache_lock:
-        if hasattr(app, "_positions_cache") and hasattr(app, "_positions_cache_time"):
-            if current_time - app._positions_cache_time < 2:  # 2 second cache
-                return jsonify({"positions": app._positions_cache})
+        if hasattr(app, cache_key) and hasattr(app, cache_time_key):
+            if current_time - getattr(app, cache_time_key) < 2:  # 2 second cache
+                return jsonify({"positions": getattr(app, cache_key)})
 
     try:
         from sync_db_reader import SyncDatabaseReader
 
         db = SyncDatabaseReader()
-        portfolio_id = request.args.get("portfolio_id", "default")
         real_positions = db.get_positions(portfolio_id=portfolio_id)
 
         # Batch fetch: Get all signals once (not per-position!)
@@ -4648,10 +4650,10 @@ def get_positions():
                 }
             )
 
-        # Cache the result (thread-safe)
+        # Cache the result (thread-safe, keyed by portfolio_id)
         with _positions_cache_lock:
-            app._positions_cache = enriched_positions
-            app._positions_cache_time = time.time()
+            setattr(app, cache_key, enriched_positions)
+            setattr(app, cache_time_key, time.time())
 
         return jsonify({"positions": enriched_positions})
     except Exception as e:
@@ -4667,9 +4669,12 @@ def get_watchlist():
     """Get watchlist with latest prices - optimized for speed"""
     # Return cached watchlist if available and recent (within 3 seconds)
     current_time = time.time()
-    if hasattr(app, "_watchlist_cache") and hasattr(app, "_watchlist_cache_time"):
-        if current_time - app._watchlist_cache_time < 3:  # 3 second cache
-            return jsonify({"watchlist": app._watchlist_cache})
+    portfolio_id = request.args.get("portfolio_id", "default")
+    wl_cache_key = f"_watchlist_cache_{portfolio_id}"
+    wl_cache_time_key = f"_watchlist_cache_time_{portfolio_id}"
+    if hasattr(app, wl_cache_key) and hasattr(app, wl_cache_time_key):
+        if current_time - getattr(app, wl_cache_time_key) < 3:  # 3 second cache
+            return jsonify({"watchlist": getattr(app, wl_cache_key)})
 
     # Define the watchlist symbols
     watchlist_symbols = [
@@ -4702,8 +4707,8 @@ def get_watchlist():
 
         db = SyncDatabaseReader()
 
-        # Get all positions
-        positions = db.get_positions()
+        # Get all positions for this portfolio
+        positions = db.get_positions(portfolio_id=portfolio_id)
         position_map = {p["symbol"]: p for p in positions}
 
         # Get latest prices and positions for each symbol
@@ -4732,9 +4737,9 @@ def get_watchlist():
                 }
             )
 
-        # Cache the result
-        app._watchlist_cache = watchlist_data
-        app._watchlist_cache_time = current_time
+        # Cache the result (keyed by portfolio_id)
+        setattr(app, wl_cache_key, watchlist_data)
+        setattr(app, wl_cache_time_key, current_time)
 
     except Exception as e:
         logger.error(f"Error fetching watchlist: {e}")
@@ -4992,10 +4997,11 @@ def performance():
         from sync_db_reader import SyncDatabaseReader
 
         db = SyncDatabaseReader()
+        portfolio_id = request.args.get("portfolio_id", "default")
 
         # Get all trades and positions for calculations
-        all_trades = db.get_recent_trades(limit=5000)
-        positions = db.get_positions()
+        all_trades = db.get_recent_trades(limit=5000, portfolio_id=portfolio_id)
+        positions = db.get_positions(portfolio_id=portfolio_id)
 
         if not all_trades and not positions:
             return jsonify({"error": "No trades or positions found", "summary": {}})
@@ -5562,10 +5568,13 @@ def strategies_status():
     # Return cached status if available and recent (within 3 seconds)
     # Thread-safe cache access
     current_time = time.time()
+    portfolio_id = request.args.get("portfolio_id", "default")
+    strat_cache_key = f"_strategies_cache_{portfolio_id}"
+    strat_cache_time_key = f"_strategies_cache_time_{portfolio_id}"
     with _strategies_cache_lock:
-        if hasattr(app, "_strategies_cache") and hasattr(app, "_strategies_cache_time"):
-            if current_time - app._strategies_cache_time < 3:  # 3 second cache
-                return jsonify(app._strategies_cache)
+        if hasattr(app, strat_cache_key) and hasattr(app, strat_cache_time_key):
+            if current_time - getattr(app, strat_cache_time_key) < 3:  # 3 second cache
+                return jsonify(getattr(app, strat_cache_key))
 
     try:
         import json
@@ -5576,11 +5585,11 @@ def strategies_status():
         db = SyncDatabaseReader()
 
         # Get real position count
-        positions = db.get_positions()
+        positions = db.get_positions(portfolio_id=portfolio_id)
         active_positions = [p for p in positions if p.get("quantity", 0) > 0]
 
         # Get recent trades to calculate strategy performance
-        trades = db.get_recent_trades(limit=100)
+        trades = db.get_recent_trades(limit=100, portfolio_id=portfolio_id)
 
         # Check for ML predictions file
         predictions_file = Path("ml_predictions.json")
@@ -5678,10 +5687,10 @@ def strategies_status():
             "last_updated": datetime.now().isoformat(),
         }
 
-        # Cache the data dict, not the Response object (thread-safe)
+        # Cache the data dict, not the Response object (thread-safe, keyed by portfolio_id)
         with _strategies_cache_lock:
-            app._strategies_cache = strategies_data
-            app._strategies_cache_time = time.time()
+            setattr(app, strat_cache_key, strategies_data)
+            setattr(app, strat_cache_time_key, time.time())
 
         return jsonify(strategies_data)
     except Exception as e:

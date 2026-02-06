@@ -738,6 +738,7 @@ class AsyncRunner:
                 executor=self.executor,
                 risk_manager=self.risk,
                 emergency_shutdown_callback=emergency_shutdown_callback,
+                portfolio_id=self.portfolio_id,
             )
             await self.stop_loss_monitor.start_monitoring()
             if self.use_trailing_stop:

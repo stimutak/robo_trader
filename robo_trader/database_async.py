@@ -1088,7 +1088,7 @@ class AsyncTradingDatabase:
                 (datetime.fromtimestamp(cutoff_date),),
             )
 
-            # Clean up old signals
+            # Clean up old signals (global across all portfolios - old signals have no value)
             await conn.execute(
                 "DELETE FROM signals WHERE timestamp < ?",
                 (datetime.fromtimestamp(cutoff_date),),
