@@ -890,6 +890,10 @@ HTML_TEMPLATE = """
                     <div style="font-size: 9px; color: #8b949e;">Cycle Interval</div>
                     <div style="font-size: 12px; font-weight: bold;" id="ov-cycle-interval">15s</div>
                 </div>
+                <div style="background: #161b22; padding: 10px; border-radius: 6px; border: 1px solid #21262d;">
+                    <div style="font-size: 9px; color: #8b949e;">Data Source</div>
+                    <div style="font-size: 12px; font-weight: bold; color: #58a6ff;" id="ov-data-source">—</div>
+                </div>
             </div>
 
             <!-- Hidden elements for backward compat -->
@@ -1057,7 +1061,7 @@ HTML_TEMPLATE = """
                     </div>
                     <div style="text-align: center; padding: 6px; background: #1a1a2e; border-radius: 4px;">
                         <div style="font-size: 10px; color: #888;">Profit Factor</div>
-                        <div style="font-size: 13px;" id="profit-factor">0</div>
+                        <div style="font-size: 13px;" id="perf-profit-factor">0</div>
                     </div>
                     <div style="text-align: center; padding: 6px; background: #1a1a2e; border-radius: 4px;">
                         <div style="font-size: 10px; color: #888;">Expectancy</div>
@@ -1503,6 +1507,7 @@ HTML_TEMPLATE = """
         }
 
         function switchPortfolio(portfolioId) {
+            console.log('[Portfolio] Switching from', currentPortfolio, 'to', portfolioId);
             currentPortfolio = portfolioId;
             // Save to localStorage for persistence
             localStorage.setItem('selectedPortfolio', portfolioId);
@@ -1526,7 +1531,9 @@ HTML_TEMPLATE = """
         // Restore saved portfolio on load
         (function() {
             const saved = localStorage.getItem('selectedPortfolio');
+            console.log('[Portfolio] Saved portfolio from localStorage:', saved);
             if (saved) currentPortfolio = saved;
+            console.log('[Portfolio] Using portfolio:', currentPortfolio);
         })();
 
         function switchTab(tab, element) {
@@ -1709,6 +1716,7 @@ HTML_TEMPLATE = """
                     const perfData = await perfResp.json();
                     const summary = perfData.summary || {};
                     const daily = perfData.daily || {};
+                    console.log('[Overview] Performance data:', summary);
 
                     totalPnl = summary.total_pnl !== undefined ? summary.total_pnl : (perfData.all?.pnl || realizedPnl);
                     todayPnl = daily.pnl || 0;
@@ -1721,6 +1729,9 @@ HTML_TEMPLATE = """
                     bestTrade = summary.best_trade || 0;
                     worstTrade = summary.worst_trade || 0;
                     totalTrades = summary.total_trades || 0;
+                    console.log('[Overview] Parsed: winRate=', winRate, 'profitFactor=', profitFactor, 'sharpe=', sharpe, 'maxDrawdown=', maxDrawdown);
+                } else {
+                    console.error('[Overview] Performance API failed:', perfResp.status);
                 }
 
                 // EQUITY CURVE: Get peak for drawdown calculation
@@ -1728,9 +1739,13 @@ HTML_TEMPLATE = """
                 let equityData = null;
                 if (equityResp.ok) {
                     equityData = await equityResp.json();
+                    console.log('[Overview] Equity data:', equityData.portfolio_values?.length, 'points');
                     if (equityData.portfolio_values && equityData.portfolio_values.length > 0) {
                         peakEquity = Math.max(...equityData.portfolio_values);
+                        console.log('[Overview] Peak equity:', peakEquity);
                     }
+                } else {
+                    console.error('[Overview] Equity curve API failed:', equityResp.status);
                 }
 
                 // CALCULATE DERIVED METRICS
@@ -1808,8 +1823,9 @@ HTML_TEMPLATE = """
                     }
                 }
 
-                // Last update time
+                // Last update time and data source
                 document.getElementById('ov-last-update').textContent = new Date().toLocaleTimeString();
+                document.getElementById('ov-data-source').textContent = currentPortfolio;
 
             } catch (error) {
                 console.error('Error loading overview data:', error);
@@ -1817,8 +1833,12 @@ HTML_TEMPLATE = """
         }
 
         function renderOverviewEquityChart(data) {
+            console.log('[Chart] renderOverviewEquityChart called with', data?.portfolio_values?.length, 'values');
             const ctx = document.getElementById('overview-equity-chart');
-            if (!ctx) return;
+            if (!ctx) {
+                console.error('[Chart] Canvas element not found!');
+                return;
+            }
 
             // Use portfolio_values if available (from equity_history), otherwise calculate from P&L
             let values = [];
@@ -1835,6 +1855,7 @@ HTML_TEMPLATE = """
 
             // Need at least 2 data points to draw a line
             if (values.length < 2) {
+                console.log('[Chart] Not enough data points:', values.length);
                 // Destroy existing chart and show message
                 if (overviewEquityChart) {
                     overviewEquityChart.destroy();
@@ -1845,6 +1866,7 @@ HTML_TEMPLATE = """
                     : 'Need more history';
                 return;
             }
+            console.log('[Chart] Creating chart with', values.length, 'points, range:', Math.min(...values), '-', Math.max(...values));
 
             // Calculate gain/loss from start
             const firstValue = values[0] || STARTING_CAPITAL;
