@@ -63,7 +63,8 @@ echo "4. Starting runner..."
 echo "   Symbols: $SYMBOLS"
 
 export LOG_FILE="$SCRIPT_DIR/robo_trader.log"
-$PYTHON -m robo_trader.runner_async --symbols "$SYMBOLS" --force-connect &
+# Redirect output to log file so subprocess.run can complete
+$PYTHON -m robo_trader.runner_async --symbols "$SYMBOLS" --force-connect >> "$LOG_FILE" 2>&1 &
 RUNNER_PID=$!
 
 sleep 3
