@@ -1,3 +1,7 @@
+---
+description: Systematic production debugging workflow
+---
+
 # On-Call Debug Workflow
 
 Systematic debugging for production issues in the trading system.

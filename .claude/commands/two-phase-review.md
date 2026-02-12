@@ -1,3 +1,7 @@
+---
+description: Parallel review with false-positive challenger phase
+---
+
 # Two-Phase Review (Boris Cherny Method)
 
 Run a parallel code review with challenger phase to filter false positives.

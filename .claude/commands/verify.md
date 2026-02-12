@@ -1,3 +1,7 @@
+---
+description: Run full verification loop: tests, lint, types, trading checks
+---
+
 # Verification Loop
 
 Run a complete verification loop on recent changes. This is the single most important practice for quality.

@@ -1,6 +1,8 @@
-# Test and Commit Workflow
+---
+description: Run tests, fix failures, then commit
+---
 
-Run tests, then commit if passing. Fix issues if failing.
+# Test and Commit
 
 ## Step 1: Run Tests
 
@@ -8,53 +10,17 @@ Run tests, then commit if passing. Fix issues if failing.
 python3 -m pytest tests/ -x --tb=short -q
 ```
 
-## Step 2: Evaluate Results
+If tests fail: analyze, fix, and re-run until passing.
 
-### If ALL tests pass:
-1. Run linting checks:
-   ```bash
-   python3 -m black --check .
-   python3 -m isort --check-only .
-   python3 -m flake8 .
-   ```
+## Step 2: Lint Check
 
-2. If linting passes, proceed to commit:
-   ```bash
-   git add -A
-   git status
-   ```
-
-3. Generate commit message based on changes:
-   - Look at staged files
-   - Summarize the "why" not the "what"
-   - Use conventional commit format (feat:, fix:, refactor:, etc.)
-
-4. Create commit with generated message
-
-### If tests FAIL:
-1. Analyze the failure output
-2. Identify root cause
-3. Fix the issue
-4. Re-run tests
-5. Repeat until passing
-6. Then proceed to commit
-
-## Commit Message Format
-
-```
-<type>: <short description>
-
-<longer description if needed>
-
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
-
-Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+```bash
+python3 -m black --check .
+python3 -m flake8 .
 ```
 
-## Types
-- `feat`: New feature
-- `fix`: Bug fix
-- `refactor`: Code restructuring
-- `test`: Adding/updating tests
-- `docs`: Documentation only
-- `chore`: Maintenance tasks
+## Step 3: Commit
+
+Stage specific files (never `git add -A`) and commit with conventional format.
+
+Types: `feat`, `fix`, `refactor`, `test`, `docs`, `chore`

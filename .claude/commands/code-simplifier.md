@@ -1,3 +1,7 @@
+---
+description: Simplify recently written code while preserving functionality
+---
+
 # Code Simplifier
 
 Review recently written code and simplify it while maintaining functionality.

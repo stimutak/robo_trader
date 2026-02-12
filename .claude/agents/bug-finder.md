@@ -1,3 +1,9 @@
+---
+name: bug-finder
+description: Identifies bugs, edge cases, and potential issues in Python trading systems.
+model: sonnet
+---
+
 # Bug Finder Agent
 
 Specialized in identifying bugs, edge cases, and potential issues in Python trading systems.

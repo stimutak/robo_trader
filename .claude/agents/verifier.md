@@ -1,3 +1,9 @@
+---
+name: verifier
+description: End-to-end verification and testing specialist for trading systems.
+model: sonnet
+---
+
 # Verifier Agent
 
 End-to-end verification and testing specialist for trading systems.

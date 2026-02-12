@@ -1,3 +1,9 @@
+---
+name: verification-challenger
+description: Second-phase agent that filters false positives from other reviewers.
+model: sonnet
+---
+
 # Verification Challenger Agent
 
 Second-phase agent that filters false positives from other reviewers.
