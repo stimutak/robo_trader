@@ -103,27 +103,58 @@ class MultiuserMigration:
                 logger.error(f"Migration failed: {e}")
                 await conn.rollback()
                 if backup_path and backup_path.exists():
-                    logger.info(f"Restoring from backup: {backup_path}")
-                    await asyncio.to_thread(shutil.copy2, backup_path, self.db_path)
+                    await self._restore_from_backup(backup_path)
                 raise
+
+    async def _restore_from_backup(self, backup_path: Path) -> None:
+        """Restore database from backup after a failed migration.
+
+        Verifies integrity of the restored database. If the restore itself
+        fails, raises RuntimeError with the backup path so the user can
+        recover manually.
+        """
+        try:
+            logger.info(f"Restoring database from backup: {backup_path}")
+            await asyncio.to_thread(shutil.copy2, backup_path, self.db_path)
+
+            # Verify restored database integrity
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA integrity_check")
+                result = cursor.fetchone()
+                if result[0] != "ok":
+                    raise RuntimeError(f"Restored database failed integrity check: {result[0]}")
+            finally:
+                conn.close()
+
+            logger.info("Database restored successfully from backup")
+
+        except Exception as restore_error:
+            logger.critical(
+                f"FAILED to restore database from backup: {restore_error}. "
+                f"Manual recovery required. Backup file: {backup_path}"
+            )
+            raise RuntimeError(
+                f"Migration failed AND backup restore failed. "
+                f"Manual recovery required. Copy this backup over the database: "
+                f"{backup_path}"
+            ) from restore_error
 
     async def _apply_migration_v1(self, conn: aiosqlite.Connection, default_cash: float):
         """Apply migration version 1: Add multi-portfolio support."""
 
         # 1. Create schema_migrations table
-        await conn.execute(
-            """
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 version INTEGER PRIMARY KEY,
                 description TEXT NOT NULL,
                 applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
-        """
-        )
+        """)
 
         # 2. Create portfolios table
-        await conn.execute(
-            """
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS portfolios (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -141,8 +172,7 @@ class MultiuserMigration:
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
-        """
-        )
+        """)
 
         # 3. Insert 'default' portfolio if not exists
         await conn.execute(

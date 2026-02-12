@@ -10,18 +10,21 @@ from unittest.mock import patch
 import pytest
 
 from robo_trader.database_async import AsyncTradingDatabase
+from robo_trader.database_validator import DatabaseValidator, ValidationError
 from robo_trader.multiuser.db_proxy import PortfolioScopedDB
 from robo_trader.multiuser.migration import MultiuserMigration
 from robo_trader.multiuser.portfolio_config import PortfolioConfig, load_portfolio_configs
-
 
 # ──────────────────────────────────────────────
 # PortfolioConfig Tests
 # ──────────────────────────────────────────────
 
+
 class TestPortfolioConfig:
     def test_basic_creation(self):
-        cfg = PortfolioConfig(id="test", name="Test Portfolio", starting_cash=50000, symbols=["AAPL", "MSFT"])
+        cfg = PortfolioConfig(
+            id="test", name="Test Portfolio", starting_cash=50000, symbols=["AAPL", "MSFT"]
+        )
         assert cfg.id == "test"
         assert cfg.name == "Test Portfolio"
         assert cfg.starting_cash == 50000
@@ -82,8 +85,18 @@ class TestLoadPortfolioConfigs:
 
     def test_multi_portfolio_from_json(self):
         portfolios = [
-            {"id": "aggressive", "name": "Aggressive", "starting_cash": 50000, "symbols": "NVDA,TSLA"},
-            {"id": "conservative", "name": "Conservative", "starting_cash": 50000, "symbols": "AAPL,MSFT"},
+            {
+                "id": "aggressive",
+                "name": "Aggressive",
+                "starting_cash": 50000,
+                "symbols": "NVDA,TSLA",
+            },
+            {
+                "id": "conservative",
+                "name": "Conservative",
+                "starting_cash": 50000,
+                "symbols": "AAPL,MSFT",
+            },
         ]
         env = {"PORTFOLIOS": json.dumps(portfolios)}
         with patch.dict(os.environ, env, clear=True):
@@ -127,6 +140,7 @@ class TestLoadPortfolioConfigs:
 # ──────────────────────────────────────────────
 # Migration Tests
 # ──────────────────────────────────────────────
+
 
 @pytest.fixture
 def temp_db():
@@ -238,9 +252,7 @@ async def create_legacy_schema(db_path: Path):
             "INSERT INTO trades (symbol, side, quantity, price, notional) VALUES (?, ?, ?, ?, ?)",
             ("AAPL", "BUY", 100, 180.50, 18050.0),
         )
-        await conn.execute(
-            "INSERT INTO account (id, cash, equity) VALUES (1, 80000, 100000)"
-        )
+        await conn.execute("INSERT INTO account (id, cash, equity) VALUES (1, 80000, 100000)")
         await conn.execute(
             "INSERT INTO equity_history (date, equity, cash, positions_value) VALUES (?, ?, ?, ?)",
             ("2026-02-05", 100000, 80000, 20000),
@@ -423,7 +435,9 @@ class TestMultiuserMigration:
             )
             await conn.commit()
 
-            cursor = await conn.execute("SELECT portfolio_id, symbol, quantity FROM positions WHERE symbol = 'AAPL'")
+            cursor = await conn.execute(
+                "SELECT portfolio_id, symbol, quantity FROM positions WHERE symbol = 'AAPL'"
+            )
             rows = await cursor.fetchall()
             assert len(rows) == 2
             portfolios = {row[0] for row in rows}
@@ -441,6 +455,7 @@ class TestMultiuserMigration:
 # ──────────────────────────────────────────────
 # AsyncTradingDatabase Multi-Portfolio Tests
 # ──────────────────────────────────────────────
+
 
 class TestAsyncDatabaseMultiPortfolio:
     """Test that all DB methods correctly scope by portfolio_id."""
@@ -550,8 +565,22 @@ class TestAsyncDatabaseMultiPortfolio:
     @pytest.mark.asyncio
     async def test_get_portfolios(self, db):
         """get_portfolios returns all portfolio definitions."""
-        await db.upsert_portfolio({"id": "aggressive", "name": "Aggressive Growth", "starting_cash": 50000, "symbols": "NVDA,TSLA"})
-        await db.upsert_portfolio({"id": "conservative", "name": "Conservative", "starting_cash": 50000, "symbols": "AAPL,MSFT"})
+        await db.upsert_portfolio(
+            {
+                "id": "aggressive",
+                "name": "Aggressive Growth",
+                "starting_cash": 50000,
+                "symbols": "NVDA,TSLA",
+            }
+        )
+        await db.upsert_portfolio(
+            {
+                "id": "conservative",
+                "name": "Conservative",
+                "starting_cash": 50000,
+                "symbols": "AAPL,MSFT",
+            }
+        )
 
         portfolios = await db.get_portfolios()
         ids = {p["id"] for p in portfolios}
@@ -568,10 +597,9 @@ class TestAsyncDatabaseMultiPortfolio:
         # Signals are in the signals table but filtered by portfolio
         # We can verify by reading from DB directly
         import aiosqlite
-        async with aiosqlite.connect(db._db.db_path if hasattr(db, '_db') else db.db_path) as conn:
-            cursor = await conn.execute(
-                "SELECT portfolio_id, symbol FROM signals ORDER BY symbol"
-            )
+
+        async with aiosqlite.connect(db._db.db_path if hasattr(db, "_db") else db.db_path) as conn:
+            cursor = await conn.execute("SELECT portfolio_id, symbol FROM signals ORDER BY symbol")
             rows = await cursor.fetchall()
             assert len(rows) == 2
             assert rows[0] == ("portfolio_a", "AAPL")
@@ -581,6 +609,7 @@ class TestAsyncDatabaseMultiPortfolio:
 # ──────────────────────────────────────────────
 # PortfolioScopedDB Proxy Tests
 # ──────────────────────────────────────────────
+
 
 class TestPortfolioScopedDB:
     """Test the portfolio-scoped DB proxy."""
@@ -664,6 +693,7 @@ class TestPortfolioScopedDB:
 # Extended Database Isolation Tests
 # ──────────────────────────────────────────────
 
+
 class TestDatabaseIsolationEdgeCases:
     """Edge cases for cross-portfolio data isolation."""
 
@@ -716,8 +746,12 @@ class TestDatabaseIsolationEdgeCases:
     async def test_equity_snapshots_same_date_different_portfolios(self, db):
         """Two portfolios can save equity for the same date independently."""
         date = "2026-02-06"
-        await db.save_equity_snapshot(55000, 50000, 5000, snapshot_date=date, portfolio_id="portfolio_a")
-        await db.save_equity_snapshot(82000, 80000, 2000, snapshot_date=date, portfolio_id="portfolio_b")
+        await db.save_equity_snapshot(
+            55000, 50000, 5000, snapshot_date=date, portfolio_id="portfolio_a"
+        )
+        await db.save_equity_snapshot(
+            82000, 80000, 2000, snapshot_date=date, portfolio_id="portfolio_b"
+        )
 
         hist_a = await db.get_equity_history(portfolio_id="portfolio_a")
         hist_b = await db.get_equity_history(portfolio_id="portfolio_b")
@@ -734,8 +768,12 @@ class TestDatabaseIsolationEdgeCases:
     async def test_equity_snapshot_upsert_same_date_same_portfolio(self, db):
         """Saving equity twice for same date+portfolio replaces the old value."""
         date = "2026-02-06"
-        await db.save_equity_snapshot(50000, 48000, 2000, snapshot_date=date, portfolio_id="portfolio_a")
-        await db.save_equity_snapshot(52000, 48000, 4000, snapshot_date=date, portfolio_id="portfolio_a")
+        await db.save_equity_snapshot(
+            50000, 48000, 2000, snapshot_date=date, portfolio_id="portfolio_a"
+        )
+        await db.save_equity_snapshot(
+            52000, 48000, 4000, snapshot_date=date, portfolio_id="portfolio_a"
+        )
 
         hist = await db.get_equity_history(portfolio_id="portfolio_a")
         assert len(hist) == 1
@@ -826,8 +864,87 @@ class TestDatabaseIsolationEdgeCases:
 
 
 # ──────────────────────────────────────────────
+# Portfolio Existence Check Tests (#65)
+# ──────────────────────────────────────────────
+
+
+class TestPortfolioExists:
+    """Test AsyncTradingDatabase.portfolio_exists() method."""
+
+    @pytest.fixture
+    async def db(self, temp_db):
+        database = AsyncTradingDatabase(db_path=temp_db)
+        await database.initialize()
+        yield database
+        await database.close()
+
+    @pytest.mark.asyncio
+    async def test_default_portfolio_exists(self, db):
+        """'default' portfolio exists after DB init (account row inserted)."""
+        assert await db.portfolio_exists("default") is True
+
+    @pytest.mark.asyncio
+    async def test_nonexistent_portfolio(self, db):
+        """Querying a portfolio that has never been created returns False."""
+        assert await db.portfolio_exists("nonexistent") is False
+
+    @pytest.mark.asyncio
+    async def test_portfolio_exists_after_account_insert(self, db):
+        """Portfolio exists after inserting account data."""
+        await db.update_account(50000, 55000, portfolio_id="aggressive")
+        assert await db.portfolio_exists("aggressive") is True
+
+    @pytest.mark.asyncio
+    async def test_portfolio_exists_after_upsert_definition(self, db):
+        """Portfolio exists if only a portfolio definition row exists (no account data)."""
+        await db.upsert_portfolio(
+            {
+                "id": "conservative",
+                "name": "Conservative Income",
+                "starting_cash": 50000,
+                "symbols": "AAPL,MSFT",
+            }
+        )
+        assert await db.portfolio_exists("conservative") is True
+
+    @pytest.mark.asyncio
+    async def test_portfolio_exists_with_positions_only(self, db):
+        """Portfolio with only position data (no account row) is found via portfolios table fallback."""
+        # Insert position data but no account row - portfolio_exists checks account first,
+        # then portfolios table. Without a portfolios definition, this returns False.
+        await db.update_position("AAPL", 100, 180.0, portfolio_id="orphan")
+        # No account row and no portfolios definition = not found
+        assert await db.portfolio_exists("orphan") is False
+
+    @pytest.mark.asyncio
+    async def test_portfolio_exists_via_proxy(self, db):
+        """portfolio_exists works through PortfolioScopedDB proxy."""
+        proxy = PortfolioScopedDB(db, portfolio_id="alpha")
+
+        # alpha doesn't exist yet
+        assert await proxy.portfolio_exists() is False
+
+        # Create account data for alpha
+        await proxy.update_account(50000, 55000)
+
+        # Now it exists
+        assert await proxy.portfolio_exists() is True
+
+    @pytest.mark.asyncio
+    async def test_portfolio_exists_multiple_portfolios(self, db):
+        """Check existence across multiple portfolios."""
+        await db.update_account(50000, 55000, portfolio_id="alpha")
+        await db.update_account(80000, 82000, portfolio_id="beta")
+
+        assert await db.portfolio_exists("alpha") is True
+        assert await db.portfolio_exists("beta") is True
+        assert await db.portfolio_exists("gamma") is False
+
+
+# ──────────────────────────────────────────────
 # Non-Existent Portfolio Query Tests
 # ──────────────────────────────────────────────
+
 
 class TestNonExistentPortfolioQueries:
     """Verify graceful behavior when querying a portfolio that has no data."""
@@ -886,6 +1003,7 @@ class TestNonExistentPortfolioQueries:
 # Extended PortfolioScopedDB Tests
 # ──────────────────────────────────────────────
 
+
 class TestPortfolioScopedDBExtended:
     """Test all scoped methods via the proxy."""
 
@@ -929,10 +1047,9 @@ class TestPortfolioScopedDBExtended:
 
         # Verify isolation via raw DB query
         import aiosqlite
+
         async with aiosqlite.connect(raw_db.db_path) as conn:
-            cursor = await conn.execute(
-                "SELECT portfolio_id, symbol FROM signals ORDER BY symbol"
-            )
+            cursor = await conn.execute("SELECT portfolio_id, symbol FROM signals ORDER BY symbol")
             rows = await cursor.fetchall()
             assert len(rows) == 2
             assert rows[0] == ("alpha", "AAPL")
@@ -961,12 +1078,14 @@ class TestPortfolioScopedDBExtended:
         proxy = PortfolioScopedDB(raw_db, portfolio_id="alpha")
 
         # upsert_portfolio takes portfolio_data dict (id is inside dict, not a kwarg)
-        await proxy.upsert_portfolio({
-            "id": "alpha",
-            "name": "Alpha Portfolio",
-            "starting_cash": 75000,
-            "symbols": "AAPL,NVDA",
-        })
+        await proxy.upsert_portfolio(
+            {
+                "id": "alpha",
+                "name": "Alpha Portfolio",
+                "starting_cash": 75000,
+                "symbols": "AAPL,NVDA",
+            }
+        )
 
         portfolios = await raw_db.get_portfolios()
         alpha = [p for p in portfolios if p["id"] == "alpha"]
@@ -1029,6 +1148,7 @@ class TestPortfolioScopedDBExtended:
 # Portfolio Config Validation Edge Cases
 # ──────────────────────────────────────────────
 
+
 class TestPortfolioConfigEdgeCases:
     """Edge cases for portfolio configuration."""
 
@@ -1071,21 +1191,25 @@ class TestPortfolioConfigEdgeCases:
 
     def test_from_dict_strategy_string_split(self):
         """enabled_strategies as comma-separated string is split correctly."""
-        cfg = PortfolioConfig.from_dict({
-            "id": "test",
-            "name": "T",
-            "enabled_strategies": "momentum, ml_enhanced , pairs",
-        })
+        cfg = PortfolioConfig.from_dict(
+            {
+                "id": "test",
+                "name": "T",
+                "enabled_strategies": "momentum, ml_enhanced , pairs",
+            }
+        )
         assert cfg.enabled_strategies == ["momentum", "ml_enhanced", "pairs"]
 
     def test_from_dict_extra_fields_ignored(self):
         """Unknown fields in dict don't cause errors."""
-        cfg = PortfolioConfig.from_dict({
-            "id": "test",
-            "name": "T",
-            "unknown_field": "value",
-            "future_feature": True,
-        })
+        cfg = PortfolioConfig.from_dict(
+            {
+                "id": "test",
+                "name": "T",
+                "unknown_field": "value",
+                "future_feature": True,
+            }
+        )
         assert cfg.id == "test"
         assert not hasattr(cfg, "unknown_field")
 
@@ -1133,6 +1257,7 @@ class TestPortfolioConfigEdgeCases:
 # Upsert Portfolio Tests
 # ──────────────────────────────────────────────
 
+
 class TestUpsertPortfolio:
     """Test portfolio definition insert and update behavior."""
 
@@ -1146,13 +1271,15 @@ class TestUpsertPortfolio:
     @pytest.mark.asyncio
     async def test_upsert_creates_new_portfolio(self, db):
         """upsert_portfolio creates a new portfolio definition."""
-        await db.upsert_portfolio({
-            "id": "new_portfolio",
-            "name": "New Portfolio",
-            "starting_cash": 75000,
-            "symbols": "AAPL,NVDA",
-            "active": True,
-        })
+        await db.upsert_portfolio(
+            {
+                "id": "new_portfolio",
+                "name": "New Portfolio",
+                "starting_cash": 75000,
+                "symbols": "AAPL,NVDA",
+                "active": True,
+            }
+        )
 
         portfolios = await db.get_portfolios()
         new = [p for p in portfolios if p["id"] == "new_portfolio"]
@@ -1163,20 +1290,24 @@ class TestUpsertPortfolio:
     @pytest.mark.asyncio
     async def test_upsert_updates_existing_portfolio(self, db):
         """upsert_portfolio updates an existing portfolio definition."""
-        await db.upsert_portfolio({
-            "id": "evolving",
-            "name": "Version 1",
-            "starting_cash": 50000,
-            "symbols": "AAPL",
-        })
+        await db.upsert_portfolio(
+            {
+                "id": "evolving",
+                "name": "Version 1",
+                "starting_cash": 50000,
+                "symbols": "AAPL",
+            }
+        )
 
         # Update it
-        await db.upsert_portfolio({
-            "id": "evolving",
-            "name": "Version 2",
-            "starting_cash": 75000,
-            "symbols": "AAPL,NVDA,TSLA",
-        })
+        await db.upsert_portfolio(
+            {
+                "id": "evolving",
+                "name": "Version 2",
+                "starting_cash": 75000,
+                "symbols": "AAPL,NVDA,TSLA",
+            }
+        )
 
         portfolios = await db.get_portfolios()
         evolving = [p for p in portfolios if p["id"] == "evolving"]
@@ -1187,17 +1318,19 @@ class TestUpsertPortfolio:
     @pytest.mark.asyncio
     async def test_upsert_preserves_risk_overrides(self, db):
         """upsert_portfolio preserves risk override fields."""
-        await db.upsert_portfolio({
-            "id": "risky",
-            "name": "Risky",
-            "max_position_pct": 0.08,
-            "max_daily_loss_pct": 0.02,
-            "max_open_positions": 10,
-            "stop_loss_pct": 5.0,
-            "trailing_stop_pct": 7.0,
-            "use_trailing_stop": True,
-            "min_confidence": 0.4,
-        })
+        await db.upsert_portfolio(
+            {
+                "id": "risky",
+                "name": "Risky",
+                "max_position_pct": 0.08,
+                "max_daily_loss_pct": 0.02,
+                "max_open_positions": 10,
+                "stop_loss_pct": 5.0,
+                "trailing_stop_pct": 7.0,
+                "use_trailing_stop": True,
+                "min_confidence": 0.4,
+            }
+        )
 
         portfolios = await db.get_portfolios()
         risky = [p for p in portfolios if p["id"] == "risky"][0]
@@ -1219,6 +1352,7 @@ class TestUpsertPortfolio:
 # Migration Edge Cases
 # ──────────────────────────────────────────────
 
+
 class TestMigrationEdgeCases:
     """Additional migration edge cases."""
 
@@ -1232,9 +1366,7 @@ class TestMigrationEdgeCases:
         await migration.migrate()
 
         async with aiosqlite.connect(temp_db) as conn:
-            cursor = await conn.execute(
-                "SELECT version, description FROM schema_migrations"
-            )
+            cursor = await conn.execute("SELECT version, description FROM schema_migrations")
             rows = await cursor.fetchall()
             assert len(rows) == 1
             assert rows[0][0] == 1  # Version 1
@@ -1284,9 +1416,7 @@ class TestMigrationEdgeCases:
         await migration.migrate()
 
         async with aiosqlite.connect(temp_db) as conn:
-            cursor = await conn.execute(
-                "SELECT symbol, side, pnl FROM trades WHERE side = 'SELL'"
-            )
+            cursor = await conn.execute("SELECT symbol, side, pnl FROM trades WHERE side = 'SELL'")
             row = await cursor.fetchone()
             assert row[0] == "AAPL"
             assert row[2] == 750.0  # PnL preserved
@@ -1348,6 +1478,7 @@ class TestMigrationEdgeCases:
 # SyncDatabaseReader Portfolio Scoping Tests
 # ──────────────────────────────────────────────
 
+
 class TestSyncDatabaseReaderPortfolioScoping:
     """Test that SyncDatabaseReader correctly scopes queries by portfolio_id."""
 
@@ -1362,19 +1493,27 @@ class TestSyncDatabaseReaderPortfolioScoping:
         await database.update_position("NVDA", 50, 450.0, portfolio_id="portfolio_a")
         await database.record_trade("AAPL", "BUY", 100, 180.0, portfolio_id="portfolio_a")
         await database.update_account(50000, 55000, portfolio_id="portfolio_a")
-        await database.save_equity_snapshot(55000, 50000, 5000, snapshot_date="2026-02-06", portfolio_id="portfolio_a")
+        await database.save_equity_snapshot(
+            55000, 50000, 5000, snapshot_date="2026-02-06", portfolio_id="portfolio_a"
+        )
         await database.record_signal("AAPL", "momentum", "BUY", 0.8, portfolio_id="portfolio_a")
 
         # Portfolio B data
         await database.update_position("MSFT", 200, 300.0, portfolio_id="portfolio_b")
         await database.record_trade("MSFT", "BUY", 200, 300.0, portfolio_id="portfolio_b")
         await database.update_account(80000, 82000, portfolio_id="portfolio_b")
-        await database.save_equity_snapshot(82000, 80000, 2000, snapshot_date="2026-02-06", portfolio_id="portfolio_b")
+        await database.save_equity_snapshot(
+            82000, 80000, 2000, snapshot_date="2026-02-06", portfolio_id="portfolio_b"
+        )
         await database.record_signal("MSFT", "ml_enhanced", "SELL", 0.7, portfolio_id="portfolio_b")
 
         # Portfolio definitions
-        await database.upsert_portfolio({"id": "portfolio_a", "name": "Portfolio A", "symbols": "AAPL,NVDA"})
-        await database.upsert_portfolio({"id": "portfolio_b", "name": "Portfolio B", "symbols": "MSFT"})
+        await database.upsert_portfolio(
+            {"id": "portfolio_a", "name": "Portfolio A", "symbols": "AAPL,NVDA"}
+        )
+        await database.upsert_portfolio(
+            {"id": "portfolio_b", "name": "Portfolio B", "symbols": "MSFT"}
+        )
 
         await database.close()
         yield temp_db
@@ -1382,6 +1521,7 @@ class TestSyncDatabaseReaderPortfolioScoping:
     def test_get_positions_scoped(self, populated_db):
         """SyncDatabaseReader.get_positions scoped to portfolio."""
         from sync_db_reader import SyncDatabaseReader
+
         reader = SyncDatabaseReader(db_path=str(populated_db))
 
         pos_a = reader.get_positions(portfolio_id="portfolio_a")
@@ -1397,6 +1537,7 @@ class TestSyncDatabaseReaderPortfolioScoping:
     def test_get_all_positions_cross_portfolio(self, populated_db):
         """SyncDatabaseReader.get_all_positions returns all portfolios."""
         from sync_db_reader import SyncDatabaseReader
+
         reader = SyncDatabaseReader(db_path=str(populated_db))
 
         all_pos = reader.get_all_positions()
@@ -1408,6 +1549,7 @@ class TestSyncDatabaseReaderPortfolioScoping:
     def test_get_recent_trades_scoped(self, populated_db):
         """SyncDatabaseReader.get_recent_trades scoped to portfolio."""
         from sync_db_reader import SyncDatabaseReader
+
         reader = SyncDatabaseReader(db_path=str(populated_db))
 
         trades_a = reader.get_recent_trades(portfolio_id="portfolio_a")
@@ -1422,6 +1564,7 @@ class TestSyncDatabaseReaderPortfolioScoping:
     def test_get_account_info_scoped(self, populated_db):
         """SyncDatabaseReader.get_account_info scoped to portfolio."""
         from sync_db_reader import SyncDatabaseReader
+
         reader = SyncDatabaseReader(db_path=str(populated_db))
 
         acct_a = reader.get_account_info(portfolio_id="portfolio_a")
@@ -1433,6 +1576,7 @@ class TestSyncDatabaseReaderPortfolioScoping:
     def test_get_equity_history_scoped(self, populated_db):
         """SyncDatabaseReader.get_equity_history scoped to portfolio."""
         from sync_db_reader import SyncDatabaseReader
+
         reader = SyncDatabaseReader(db_path=str(populated_db))
 
         hist_a = reader.get_equity_history(portfolio_id="portfolio_a")
@@ -1447,6 +1591,7 @@ class TestSyncDatabaseReaderPortfolioScoping:
     def test_get_signals_scoped(self, populated_db):
         """SyncDatabaseReader.get_signals scoped to portfolio."""
         from sync_db_reader import SyncDatabaseReader
+
         reader = SyncDatabaseReader(db_path=str(populated_db))
 
         signals_a = reader.get_signals(hours=24, portfolio_id="portfolio_a")
@@ -1461,6 +1606,7 @@ class TestSyncDatabaseReaderPortfolioScoping:
     def test_get_portfolios_returns_all(self, populated_db):
         """SyncDatabaseReader.get_portfolios returns all portfolios."""
         from sync_db_reader import SyncDatabaseReader
+
         reader = SyncDatabaseReader(db_path=str(populated_db))
 
         portfolios = reader.get_portfolios()
@@ -1472,6 +1618,7 @@ class TestSyncDatabaseReaderPortfolioScoping:
     def test_default_portfolio_backward_compat(self, populated_db):
         """SyncDatabaseReader defaults to 'default' portfolio when no portfolio_id."""
         from sync_db_reader import SyncDatabaseReader
+
         reader = SyncDatabaseReader(db_path=str(populated_db))
 
         # No data in 'default' portfolio, should return empty
@@ -1481,6 +1628,7 @@ class TestSyncDatabaseReaderPortfolioScoping:
     def test_nonexistent_portfolio_returns_empty(self, populated_db):
         """SyncDatabaseReader returns empty for non-existent portfolio."""
         from sync_db_reader import SyncDatabaseReader
+
         reader = SyncDatabaseReader(db_path=str(populated_db))
 
         pos = reader.get_positions(portfolio_id="nonexistent")
@@ -1495,6 +1643,7 @@ class TestSyncDatabaseReaderPortfolioScoping:
 # ──────────────────────────────────────────────
 # Portfolio ID Edge Cases
 # ──────────────────────────────────────────────
+
 
 class TestPortfolioIdEdgeCases:
     """Test edge cases for portfolio_id values."""
@@ -1565,6 +1714,7 @@ class TestPortfolioIdEdgeCases:
 # Concurrent Cross-Portfolio Operations
 # ──────────────────────────────────────────────
 
+
 class TestConcurrentCrossPortfolio:
     """Test concurrent operations across multiple portfolios."""
 
@@ -1579,8 +1729,7 @@ class TestConcurrentCrossPortfolio:
     async def test_concurrent_position_writes(self, db):
         """Concurrent position writes to different portfolios succeed."""
         tasks = [
-            db.update_position("AAPL", 100, 180.0, portfolio_id=f"portfolio_{i}")
-            for i in range(10)
+            db.update_position("AAPL", 100, 180.0, portfolio_id=f"portfolio_{i}") for i in range(10)
         ]
         await asyncio.gather(*tasks)
 
@@ -1619,15 +1768,13 @@ class TestConcurrentCrossPortfolio:
     @pytest.mark.asyncio
     async def test_concurrent_mixed_operations(self, db):
         """Concurrent mixed operations (positions, trades, account) across portfolios."""
+
         async def portfolio_operations(pid, qty, price):
             await db.update_position("AAPL", qty, price, portfolio_id=pid)
             await db.record_trade("AAPL", "BUY", qty, price, portfolio_id=pid)
             await db.update_account(100000 - qty * price, 100000, portfolio_id=pid)
 
-        tasks = [
-            portfolio_operations(f"portfolio_{i}", 10 * (i + 1), 180.0)
-            for i in range(5)
-        ]
+        tasks = [portfolio_operations(f"portfolio_{i}", 10 * (i + 1), 180.0) for i in range(5)]
         await asyncio.gather(*tasks)
 
         for i in range(5):
@@ -1640,3 +1787,326 @@ class TestConcurrentCrossPortfolio:
             assert pos[0]["quantity"] == 10 * (i + 1)
             assert len(trades) == 1
             assert acct is not None
+
+
+# ──────────────────────────────────────────────
+# Scope-Leak Detection Tests (#60)
+# ──────────────────────────────────────────────
+
+
+class TestScopeLeakDetection:
+    """Test that PortfolioScopedDB warns about potential scope leaks."""
+
+    @pytest.fixture
+    async def raw_db(self, temp_db):
+        database = AsyncTradingDatabase(db_path=temp_db)
+        await database.initialize()
+        yield database
+        await database.close()
+
+    def test_no_warning_for_scoped_methods(self, raw_db, caplog):
+        """Accessing known-scoped methods should NOT log a warning."""
+        import logging
+        from robo_trader.multiuser.db_proxy import _warned_methods
+
+        _warned_methods.clear()
+
+        proxy = PortfolioScopedDB(raw_db, portfolio_id="test")
+        with caplog.at_level(logging.WARNING):
+            # Access a scoped method -- should wrap, not warn
+            method = proxy.get_positions
+            assert callable(method)
+
+        assert "SCOPE LEAK" not in caplog.text
+
+    def test_no_warning_for_known_global_methods(self, raw_db, caplog):
+        """Accessing known-global methods should NOT log a warning."""
+        import logging
+        from robo_trader.multiuser.db_proxy import _warned_methods
+
+        _warned_methods.clear()
+
+        proxy = PortfolioScopedDB(raw_db, portfolio_id="test")
+        with caplog.at_level(logging.WARNING):
+            method = proxy.get_all_positions
+            assert callable(method)
+
+        assert "SCOPE LEAK" not in caplog.text
+
+    def test_warning_for_unlisted_method_with_portfolio_id(self, raw_db, caplog):
+        """A method with portfolio_id in its signature but not in the scoped set triggers a warning."""
+        import logging
+        from robo_trader.multiuser.db_proxy import _warned_methods
+
+        _warned_methods.clear()
+
+        # Monkey-patch a new method onto the DB with portfolio_id param
+        async def fake_get_foo(portfolio_id="default"):
+            return []
+
+        raw_db.fake_get_foo = fake_get_foo
+
+        proxy = PortfolioScopedDB(raw_db, portfolio_id="aggressive")
+        with caplog.at_level(logging.WARNING):
+            method = proxy.fake_get_foo
+            assert callable(method)
+
+        assert "SCOPE LEAK" in caplog.text
+        assert "fake_get_foo" in caplog.text
+
+        # Cleanup
+        del raw_db.fake_get_foo
+
+    def test_warning_only_logged_once(self, raw_db, caplog):
+        """Scope-leak warning for same method only fires once (no log spam)."""
+        import logging
+        from robo_trader.multiuser.db_proxy import _warned_methods
+
+        _warned_methods.clear()
+
+        async def fake_leaky(portfolio_id="default"):
+            return []
+
+        raw_db.fake_leaky = fake_leaky
+
+        proxy = PortfolioScopedDB(raw_db, portfolio_id="test")
+        with caplog.at_level(logging.WARNING):
+            _ = proxy.fake_leaky
+            _ = proxy.fake_leaky
+            _ = proxy.fake_leaky
+
+        assert caplog.text.count("SCOPE LEAK") == 1
+
+        del raw_db.fake_leaky
+
+    def test_no_warning_for_method_without_portfolio_id(self, raw_db, caplog):
+        """A method WITHOUT portfolio_id in its signature should NOT trigger a warning."""
+        import logging
+        from robo_trader.multiuser.db_proxy import _warned_methods
+
+        _warned_methods.clear()
+
+        async def safe_global_method(symbol):
+            return []
+
+        raw_db.safe_global_method = safe_global_method
+
+        proxy = PortfolioScopedDB(raw_db, portfolio_id="test")
+        with caplog.at_level(logging.WARNING):
+            method = proxy.safe_global_method
+            assert callable(method)
+
+        assert "SCOPE LEAK" not in caplog.text
+
+        del raw_db.safe_global_method
+
+
+# ──────────────────────────────────────────────
+# Migration Restore Error Handling Tests (#61)
+# ──────────────────────────────────────────────
+
+
+class TestMigrationRestoreErrorHandling:
+    """Test that migration backup restore handles failures safely."""
+
+    @pytest.mark.asyncio
+    async def test_restore_verifies_integrity(self, temp_db):
+        """After restoring from backup, the database integrity is verified."""
+        await create_legacy_schema(temp_db)
+        migration = MultiuserMigration(temp_db)
+
+        # Create backup manually and verify _restore_from_backup works
+        backup_path = await migration._create_backup()
+        assert backup_path.exists()
+
+        # Corrupt the main DB
+        temp_db.write_bytes(b"not a database")
+
+        # Restore should succeed and fix the DB
+        await migration._restore_from_backup(backup_path)
+
+        # Verify restored DB is valid
+        import aiosqlite
+
+        async with aiosqlite.connect(temp_db) as conn:
+            cursor = await conn.execute("SELECT COUNT(*) FROM positions")
+            count = (await cursor.fetchone())[0]
+            assert count == 2  # Original test data
+
+    @pytest.mark.asyncio
+    async def test_restore_raises_on_missing_backup(self, temp_db):
+        """Restore raises RuntimeError when backup file doesn't exist."""
+        await create_legacy_schema(temp_db)
+        migration = MultiuserMigration(temp_db)
+
+        fake_backup = temp_db.with_suffix(".fake_backup.db")
+        with pytest.raises(RuntimeError, match="backup restore failed"):
+            await migration._restore_from_backup(fake_backup)
+
+    @pytest.mark.asyncio
+    async def test_restore_raises_on_corrupted_backup(self, temp_db):
+        """Restore raises RuntimeError when backup is corrupted."""
+        await create_legacy_schema(temp_db)
+        migration = MultiuserMigration(temp_db)
+
+        # Create a fake corrupted backup
+        corrupted_backup = temp_db.with_suffix(".corrupted.db")
+        corrupted_backup.write_bytes(b"corrupted data that is not sqlite")
+
+        with pytest.raises(RuntimeError, match="backup restore failed"):
+            await migration._restore_from_backup(corrupted_backup)
+
+        corrupted_backup.unlink(missing_ok=True)
+
+    @pytest.mark.asyncio
+    async def test_failed_migration_triggers_restore(self, temp_db):
+        """When migration fails, it automatically restores from backup."""
+        import aiosqlite
+
+        await create_legacy_schema(temp_db)
+        migration = MultiuserMigration(temp_db)
+
+        # Patch _apply_migration_v1 to raise an error mid-migration
+        original_apply = migration._apply_migration_v1
+
+        async def failing_apply(conn, default_cash):
+            # Create the schema_migrations table so it looks like we started
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    description TEXT NOT NULL,
+                    applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            raise aiosqlite.Error("Simulated migration failure")
+
+        migration._apply_migration_v1 = failing_apply
+
+        with pytest.raises(aiosqlite.Error, match="Simulated migration failure"):
+            await migration.migrate()
+
+        # Verify the DB was restored to pre-migration state (no portfolio_id column)
+        async with aiosqlite.connect(temp_db) as conn:
+            cursor = await conn.execute("PRAGMA table_info(positions)")
+            columns = [col[1] for col in await cursor.fetchall()]
+            assert "portfolio_id" not in columns  # Restored to legacy schema
+
+            # Data should be intact
+            cursor = await conn.execute("SELECT COUNT(*) FROM positions")
+            count = (await cursor.fetchone())[0]
+            assert count == 2
+
+
+# ──────────────────────────────────────────────
+# Portfolio ID Validation Tests (#66)
+# ──────────────────────────────────────────────
+
+
+class TestPortfolioIdValidation:
+    """Test DatabaseValidator.validate_portfolio_id and DB method integration."""
+
+    # ── Direct validator tests ──
+
+    def test_valid_portfolio_ids(self):
+        """Valid portfolio IDs pass validation."""
+        valid_ids = ["default", "aggressive", "my-portfolio", "port_1", "A", "abc123"]
+        for pid in valid_ids:
+            result = DatabaseValidator.validate_portfolio_id(pid)
+            assert result == pid
+
+    def test_empty_string_rejected(self):
+        """Empty string portfolio_id is rejected."""
+        with pytest.raises(ValidationError, match="cannot be empty"):
+            DatabaseValidator.validate_portfolio_id("")
+
+    def test_none_rejected(self):
+        """None portfolio_id is rejected."""
+        with pytest.raises(ValidationError, match="cannot be empty"):
+            DatabaseValidator.validate_portfolio_id(None)
+
+    def test_non_string_rejected(self):
+        """Non-string portfolio_id is rejected."""
+        with pytest.raises(ValidationError, match="must be a string"):
+            DatabaseValidator.validate_portfolio_id(123)
+
+    def test_special_chars_rejected(self):
+        """Portfolio IDs with special characters are rejected."""
+        invalid_ids = ["bad!id", "no spaces", "semi;colon", "quote'mark", "dot.dot"]
+        for pid in invalid_ids:
+            with pytest.raises(ValidationError):
+                DatabaseValidator.validate_portfolio_id(pid)
+
+    def test_sql_injection_rejected(self):
+        """SQL injection attempts in portfolio_id are rejected."""
+        injections = [
+            "'; DROP TABLE trades; --",
+            "1 OR 1=1",
+            "default' UNION SELECT * FROM account --",
+        ]
+        for injection in injections:
+            with pytest.raises(ValidationError):
+                DatabaseValidator.validate_portfolio_id(injection)
+
+    def test_too_long_rejected(self):
+        """Portfolio IDs exceeding 64 characters are rejected."""
+        long_id = "a" * 65
+        with pytest.raises(ValidationError, match="Invalid portfolio_id format"):
+            DatabaseValidator.validate_portfolio_id(long_id)
+
+    def test_max_length_accepted(self):
+        """Portfolio ID at exactly 64 characters is accepted."""
+        max_id = "a" * 64
+        result = DatabaseValidator.validate_portfolio_id(max_id)
+        assert result == max_id
+
+    def test_whitespace_stripped(self):
+        """Leading/trailing whitespace is stripped before validation."""
+        result = DatabaseValidator.validate_portfolio_id("  my_portfolio  ")
+        assert result == "my_portfolio"
+
+    # ── DB integration tests ──
+
+    @pytest.fixture
+    async def db(self, temp_db):
+        database = AsyncTradingDatabase(db_path=temp_db)
+        await database.initialize()
+        yield database
+        await database.close()
+
+    @pytest.mark.asyncio
+    async def test_record_trade_rejects_invalid_portfolio_id(self, db):
+        """record_trade raises ValidationError for invalid portfolio_id."""
+        with pytest.raises(ValidationError, match="portfolio_id"):
+            await db.record_trade("AAPL", "BUY", 100, 180.0, portfolio_id="bad!id")
+
+    @pytest.mark.asyncio
+    async def test_record_trade_rejects_empty_portfolio_id(self, db):
+        """record_trade raises ValidationError for empty portfolio_id."""
+        with pytest.raises(ValidationError, match="cannot be empty"):
+            await db.record_trade("AAPL", "BUY", 100, 180.0, portfolio_id="")
+
+    @pytest.mark.asyncio
+    async def test_update_position_rejects_invalid_portfolio_id(self, db):
+        """update_position raises ValidationError for invalid portfolio_id."""
+        with pytest.raises(ValidationError, match="portfolio_id"):
+            await db.update_position("AAPL", 100, 180.0, portfolio_id="bad!id")
+
+    @pytest.mark.asyncio
+    async def test_update_position_rejects_empty_portfolio_id(self, db):
+        """update_position raises ValidationError for empty portfolio_id."""
+        with pytest.raises(ValidationError, match="cannot be empty"):
+            await db.update_position("AAPL", 100, 180.0, portfolio_id="")
+
+    @pytest.mark.asyncio
+    async def test_record_trade_accepts_valid_portfolio_id(self, db):
+        """record_trade succeeds with valid portfolio_id."""
+        await db.record_trade("AAPL", "BUY", 100, 180.0, portfolio_id="my-portfolio_1")
+        trades = await db.get_recent_trades(portfolio_id="my-portfolio_1")
+        assert len(trades) == 1
+
+    @pytest.mark.asyncio
+    async def test_update_position_accepts_valid_portfolio_id(self, db):
+        """update_position succeeds with valid portfolio_id."""
+        await db.update_position("AAPL", 100, 180.0, portfolio_id="port_1")
+        pos = await db.get_positions(portfolio_id="port_1")
+        assert len(pos) == 1

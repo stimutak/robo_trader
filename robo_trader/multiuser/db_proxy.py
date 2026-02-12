@@ -18,28 +18,48 @@ Usage:
     await scoped_db.store_market_data(...)    # → db.store_market_data(...)
 """
 
+import inspect
+
+from ..logger import get_logger
 from robo_trader.database_async import DEFAULT_PORTFOLIO_ID
 
+logger = get_logger(__name__)
 
 # Methods that accept portfolio_id parameter
-_PORTFOLIO_SCOPED_METHODS = frozenset({
-    "update_position",
-    "record_trade",
-    "update_account",
-    "record_signal",
-    "get_position",
-    "get_positions",
-    "has_recent_buy_trade",
-    "has_recent_sell_trade",
-    "get_recent_trades",
-    "get_account_info",
-    "save_equity_snapshot",
-    "get_equity_history",
-})
+_PORTFOLIO_SCOPED_METHODS = frozenset(
+    {
+        "update_position",
+        "record_trade",
+        "update_account",
+        "record_signal",
+        "get_position",
+        "get_positions",
+        "has_recent_buy_trade",
+        "has_recent_sell_trade",
+        "get_recent_trades",
+        "get_account_info",
+        "save_equity_snapshot",
+        "get_equity_history",
+        "portfolio_exists",
+    }
+)
 
-# Methods that are portfolio-related but DON'T take portfolio_id as a kwarg
-# (e.g., upsert_portfolio takes portfolio_data dict with id inside)
-# These pass through unchanged.
+# Methods that are known-global (no portfolio_id) -- skip warnings for these.
+# upsert_portfolio takes portfolio_data dict with id inside, not a kwarg.
+_KNOWN_GLOBAL_METHODS = frozenset(
+    {
+        "initialize",
+        "get_connection",
+        "store_market_data",
+        "get_latest_market_data",
+        "get_all_positions",
+        "get_portfolios",
+        "upsert_portfolio",
+    }
+)
+
+# Cache for methods we've already warned about (avoid log spam)
+_warned_methods: set = set()
 
 
 class PortfolioScopedDB:
@@ -47,6 +67,11 @@ class PortfolioScopedDB:
 
     For global methods (market_data, ticks, features, etc.), calls pass through
     to the underlying database unchanged.
+
+    IMPORTANT: When adding a new method to AsyncTradingDatabase that takes
+    portfolio_id, you MUST also add it to _PORTFOLIO_SCOPED_METHODS above.
+    Otherwise calls through this proxy will silently skip scoping, leaking
+    data across portfolios.
     """
 
     def __init__(self, db, portfolio_id: str = DEFAULT_PORTFOLIO_ID):
@@ -62,6 +87,24 @@ class PortfolioScopedDB:
                 if "portfolio_id" not in kwargs:
                     kwargs["portfolio_id"] = self.portfolio_id
                 return await attr(*args, **kwargs)
+
             return scoped_method
+
+        # Scope-leak detection: warn if a callable has portfolio_id in its
+        # signature but isn't in the scoped set (and isn't known-global).
+        if callable(attr) and name not in _KNOWN_GLOBAL_METHODS:
+            if name not in _warned_methods:
+                try:
+                    sig = inspect.signature(attr)
+                    if "portfolio_id" in sig.parameters:
+                        logger.warning(
+                            f"SCOPE LEAK: Method '{name}' accepts portfolio_id but is NOT in "
+                            f"_PORTFOLIO_SCOPED_METHODS. Calls through PortfolioScopedDB will "
+                            f"use the default portfolio, not '{self.portfolio_id}'. "
+                            f"Add '{name}' to _PORTFOLIO_SCOPED_METHODS in db_proxy.py."
+                        )
+                        _warned_methods.add(name)
+                except (ValueError, TypeError):
+                    pass  # Can't inspect (e.g. built-in) -- skip
 
         return attr

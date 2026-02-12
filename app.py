@@ -34,6 +34,7 @@ from robo_trader.config import load_config  # noqa: E402
 
 # Lazy imports to avoid blocking startup
 from robo_trader.database_async import AsyncTradingDatabase  # noqa: E402
+from robo_trader.database_validator import DatabaseValidator, ValidationError  # noqa: E402
 from robo_trader.features.feature_pipeline import FeaturePipeline  # noqa: E402
 from robo_trader.logger import get_logger  # noqa: E402
 from robo_trader.ml.model_trainer import ModelTrainer  # noqa: E402
@@ -170,6 +171,51 @@ def requires_auth(f):
         auth = request.authorization
         if not auth or not check_auth(auth.username, auth.password):
             return authenticate()
+        return f(*args, **kwargs)
+
+    return decorated
+
+
+# Portfolio ID validation instance
+_portfolio_validator = DatabaseValidator()
+
+
+def validate_portfolio(f):
+    """Decorator to validate portfolio_id query parameter on API endpoints."""
+
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        portfolio_id = request.args.get("portfolio_id", "default")
+        try:
+            _portfolio_validator.validate_portfolio_id(portfolio_id)
+        except ValidationError as e:
+            return jsonify({"error": str(e)}), 400
+        # Check if non-default portfolio actually exists
+        if portfolio_id != "default":
+            import sqlite3
+
+            try:
+                with sqlite3.connect(str(Path("trading_data.db"))) as conn:
+                    conn.execute("PRAGMA busy_timeout=5000")
+                    # Check account table first, then portfolios definition table
+                    cursor = conn.execute(
+                        "SELECT COUNT(*) FROM account WHERE portfolio_id = ?",
+                        (portfolio_id,),
+                    )
+                    count = cursor.fetchone()[0]
+                    if count == 0:
+                        cursor = conn.execute(
+                            "SELECT COUNT(*) FROM portfolios WHERE id = ?",
+                            (portfolio_id,),
+                        )
+                        count = cursor.fetchone()[0]
+                if count == 0:
+                    return (
+                        jsonify({"error": f"Portfolio '{portfolio_id}' not found"}),
+                        404,
+                    )
+            except sqlite3.OperationalError:
+                pass  # DB not ready yet, skip existence check
         return f(*args, **kwargs)
 
     return decorated
@@ -659,10 +705,33 @@ HTML_TEMPLATE = """
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             transition: width 0.3s ease;
         }
+
+        .error-banner {
+            display: none;
+            position: fixed;
+            top: 16px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 9999;
+            background: #3d1f1f;
+            border: 1px solid #f87171;
+            color: #fca5a5;
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-size: 13px;
+            max-width: 500px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+        }
+
+        .portfolio-selector.loading select {
+            opacity: 0.5;
+            pointer-events: none;
+        }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
+    <div class="error-banner" id="error-banner"></div>
     <div class="container">
         <header>
             <div class="logo">RoboTrader</div>
@@ -1506,10 +1575,12 @@ HTML_TEMPLATE = """
             }
         }
 
-        function switchPortfolio(portfolioId) {
-            console.log('[Portfolio] Switching from', currentPortfolio, 'to', portfolioId);
+        async function switchPortfolio(portfolioId) {
+            const previousPortfolio = currentPortfolio;
+            const selector = document.querySelector('.portfolio-selector');
+            console.log('[Portfolio] Switching from', previousPortfolio, 'to', portfolioId);
+
             currentPortfolio = portfolioId;
-            // Save to localStorage for persistence
             localStorage.setItem('selectedPortfolio', portfolioId);
 
             // Update quick equity display
@@ -1518,8 +1589,35 @@ HTML_TEMPLATE = """
                 document.getElementById('portfolio-quick-equity').textContent = formatCurrency(current.account.equity || 0);
             }
 
-            // Reload all data for the new portfolio
-            refreshData();
+            // Show loading state
+            selector.classList.add('loading');
+            ['positions-table', 'watchlist-table', 'trades-table'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.innerHTML = '<tr><td colspan="10" style="text-align:center;color:#8b949e;">Loading...</td></tr>';
+            });
+
+            try {
+                await refreshData();
+            } catch (e) {
+                console.error('[Portfolio] Switch failed:', e);
+                // Revert to previous portfolio
+                currentPortfolio = previousPortfolio;
+                localStorage.setItem('selectedPortfolio', previousPortfolio);
+                document.getElementById('portfolio-select').value = previousPortfolio;
+                showError('Failed to load portfolio data. Reverted to previous portfolio.');
+                // Reload previous portfolio data
+                try { await refreshData(); } catch (_) {}
+            } finally {
+                selector.classList.remove('loading');
+            }
+        }
+
+        function showError(message) {
+            const banner = document.getElementById('error-banner');
+            banner.textContent = message;
+            banner.style.display = 'block';
+            clearTimeout(banner._hideTimer);
+            banner._hideTimer = setTimeout(() => { banner.style.display = 'none'; }, 5000);
         }
 
         // Helper to add portfolio_id to API URLs
@@ -3769,7 +3867,9 @@ def get_portfolios():
                         "unrealized_pnl": account.get("unrealized_pnl", 0),
                         "daily_pnl": account.get("daily_pnl", 0),
                     },
-                    "positions_count": len([p for p in positions if p.get("quantity", 0) != 0]),
+                    "positions_count": len(
+                        [pos for pos in positions if pos.get("quantity", 0) != 0]
+                    ),
                 }
             )
 
@@ -4069,6 +4169,7 @@ def check_ibkr_connection():
 
 @app.route("/api/status")
 @requires_auth
+@validate_portfolio
 def status():
     """Get current system status from database"""
     global trading_status, trading_process
@@ -4375,6 +4476,7 @@ def status():
 
 @app.route("/api/pnl")
 @requires_auth
+@validate_portfolio
 def get_pnl():
     """Get P&L data from actual positions"""
     # Check if market is open - don't show stale data when closed
@@ -4766,6 +4868,7 @@ def get_pnl_OLD():
 
 @app.route("/api/positions")
 @requires_auth
+@validate_portfolio
 def get_positions():
     """Get current positions from real database - optimized to avoid DB lock"""
     # Return cached positions if available and recent (within 2 seconds)
@@ -4849,6 +4952,7 @@ def get_positions():
 
 @app.route("/api/watchlist")
 @requires_auth
+@validate_portfolio
 def get_watchlist():
     """Get watchlist with latest prices - optimized for speed"""
     # Return cached watchlist if available and recent (within 3 seconds)
@@ -5163,11 +5267,11 @@ def ml_predictions():
                 "buy": buy_signals,
                 "sell": sell_signals,
                 "hold": hold_signals,
-                "avg_confidence": round(
-                    sum(p["confidence"] for p in predictions_list) / len(predictions_list), 3
-                )
-                if predictions_list
-                else 0,
+                "avg_confidence": (
+                    round(sum(p["confidence"] for p in predictions_list) / len(predictions_list), 3)
+                    if predictions_list
+                    else 0
+                ),
             },
         }
     )
@@ -5175,6 +5279,7 @@ def ml_predictions():
 
 @app.route("/api/performance")
 @requires_auth
+@validate_portfolio
 def performance():
     """Get real performance metrics from trading data"""
     try:
@@ -5370,9 +5475,9 @@ def performance():
         return jsonify(
             {
                 "summary": {
-                    "total_return": round(total_pnl / estimated_capital, 4)
-                    if estimated_capital > 0
-                    else 0,
+                    "total_return": (
+                        round(total_pnl / estimated_capital, 4) if estimated_capital > 0 else 0
+                    ),
                     "total_pnl": round(total_pnl, 2),
                     "total_sharpe": round(sharpe, 2),
                     "total_drawdown": round(max_dd, 4),
@@ -5388,9 +5493,9 @@ def performance():
                     "profit_factor": round(profit_factor, 2),
                 },
                 "daily": {
-                    "return_pct": round(daily_pnl / estimated_capital, 4)
-                    if estimated_capital > 0
-                    else 0,
+                    "return_pct": (
+                        round(daily_pnl / estimated_capital, 4) if estimated_capital > 0 else 0
+                    ),
                     "pnl": round(daily_pnl, 2),
                     "trades": len(daily_trades),
                     "volatility": round(volatility, 4),
@@ -5398,9 +5503,9 @@ def performance():
                     "max_drawdown": round(max_dd, 4),
                 },
                 "weekly": {
-                    "return_pct": round(weekly_pnl / estimated_capital, 4)
-                    if estimated_capital > 0
-                    else 0,
+                    "return_pct": (
+                        round(weekly_pnl / estimated_capital, 4) if estimated_capital > 0 else 0
+                    ),
                     "pnl": round(weekly_pnl, 2),
                     "trades": len(weekly_trades),
                     "volatility": round(volatility, 4),
@@ -5408,9 +5513,9 @@ def performance():
                     "max_drawdown": round(max_dd, 4),
                 },
                 "monthly": {
-                    "return_pct": round(monthly_pnl / estimated_capital, 4)
-                    if estimated_capital > 0
-                    else 0,
+                    "return_pct": (
+                        round(monthly_pnl / estimated_capital, 4) if estimated_capital > 0 else 0
+                    ),
                     "pnl": round(monthly_pnl, 2),
                     "trades": len(monthly_trades),
                     "volatility": round(volatility, 4),
@@ -5418,9 +5523,9 @@ def performance():
                     "max_drawdown": round(max_dd, 4),
                 },
                 "all": {
-                    "return_pct": round(total_pnl / estimated_capital, 4)
-                    if estimated_capital > 0
-                    else 0,
+                    "return_pct": (
+                        round(total_pnl / estimated_capital, 4) if estimated_capital > 0 else 0
+                    ),
                     "pnl": round(total_pnl, 2),
                     "trades": len(all_trades),
                     "volatility": round(volatility, 4),
@@ -5439,6 +5544,7 @@ def performance():
 
 @app.route("/api/equity-curve")
 @requires_auth
+@validate_portfolio
 def equity_curve():
     """Get equity curve data for charting - industry standard portfolio value tracking.
 
@@ -5537,6 +5643,7 @@ def equity_curve():
 
 @app.route("/api/trades")
 @requires_auth
+@validate_portfolio
 def get_trades():
     """Get trade history from database"""
     try:
@@ -5749,6 +5856,7 @@ def get_trades_OLD():
 
 @app.route("/api/strategies/status")
 @requires_auth
+@validate_portfolio
 def strategies_status():
     """Get real status of all active strategies"""
     # Return cached status if available and recent (within 3 seconds)
@@ -5855,9 +5963,11 @@ def strategies_status():
             "performance_by_strategy": {
                 "ml_enhanced": {
                     "pnl": round(total_pnl, 2),
-                    "win_rate": round(winning_positions / watchlist_position_count, 3)
-                    if watchlist_position_count > 0
-                    else 0,
+                    "win_rate": (
+                        round(winning_positions / watchlist_position_count, 3)
+                        if watchlist_position_count > 0
+                        else 0
+                    ),
                     "total_trades": len(trades),
                     "winning_positions": winning_positions,
                 },

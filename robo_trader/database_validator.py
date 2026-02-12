@@ -54,8 +54,8 @@ class DatabaseValidator:
     # Valid symbol pattern: 1-5 uppercase letters, optionally followed by dot and 1-2 letters
     SYMBOL_PATTERN = re.compile(r"^[A-Z]{1,5}(\.[A-Z]{1,2})?$")
 
-    # Valid portfolio_id pattern: alphanumeric + underscore/hyphen, 1-50 chars
-    PORTFOLIO_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,50}$")
+    # Valid portfolio_id pattern: alphanumeric + underscore/hyphen, 1-64 chars
+    PORTFOLIO_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
     # Maximum reasonable values for sanity checks
     MAX_PRICE = 1_000_000.0  # $1M per share max
@@ -131,7 +131,7 @@ class DatabaseValidator:
         if not DatabaseValidator.PORTFOLIO_ID_PATTERN.match(portfolio_id):
             raise ValidationError(
                 f"Invalid portfolio_id format: '{portfolio_id}'. "
-                "Must be 1-50 alphanumeric characters, underscores, or hyphens."
+                "Must be 1-64 alphanumeric characters, underscores, or hyphens."
             )
 
         # Check for SQL injection attempts
