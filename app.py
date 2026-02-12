@@ -214,8 +214,12 @@ def validate_portfolio(f):
                         jsonify({"error": f"Portfolio '{portfolio_id}' not found"}),
                         404,
                     )
-            except sqlite3.OperationalError:
-                pass  # DB not ready yet, skip existence check
+            except sqlite3.OperationalError as e:
+                if "no such table" in str(e).lower():
+                    pass  # Tables not created yet, skip existence check
+                else:
+                    logger.error(f"DB error validating portfolio '{portfolio_id}': {e}")
+                    return jsonify({"error": "Database temporarily unavailable"}), 503
         return f(*args, **kwargs)
 
     return decorated
@@ -1572,6 +1576,7 @@ HTML_TEMPLATE = """
                 }
             } catch (e) {
                 console.error('Failed to load portfolios:', e);
+                showError('Failed to load portfolios. Dashboard data may be stale.');
             }
         }
 
@@ -1606,7 +1611,10 @@ HTML_TEMPLATE = """
                 document.getElementById('portfolio-select').value = previousPortfolio;
                 showError('Failed to load portfolio data. Reverted to previous portfolio.');
                 // Reload previous portfolio data
-                try { await refreshData(); } catch (_) {}
+                try { await refreshData(); } catch (revertErr) {
+                    console.error('[Portfolio] Revert also failed:', revertErr);
+                    showError('Portfolio switch failed and could not revert. Please refresh the page.');
+                }
             } finally {
                 selector.classList.remove('loading');
             }
@@ -3876,9 +3884,7 @@ def get_portfolios():
         return jsonify({"portfolios": result})
     except Exception as e:
         logger.error(f"Error getting portfolios: {e}")
-        return jsonify(
-            {"portfolios": [{"id": "default", "name": "Default Portfolio", "active": True}]}
-        )
+        return jsonify({"error": "Failed to load portfolios"}), 500
 
 
 @app.route("/api/database/health")

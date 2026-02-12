@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import os
 import subprocess
 import sys
@@ -625,8 +626,8 @@ class AsyncRunner:
         # delivering stale data from a prior session that used the same id.
         base_client_id = self.cfg.ibkr.client_id
         if self.portfolio_id != "default":
-            # Deterministic offset: hash portfolio_id to stay within 0-999
-            offset = hash(self.portfolio_id) % 900 + 100
+            # Deterministic offset: use hashlib (not hash()) for cross-process stability
+            offset = int(hashlib.md5(self.portfolio_id.encode()).hexdigest(), 16) % 900 + 100
             self._client_id = (base_client_id + offset) % 1000
         else:
             self._client_id = base_client_id
