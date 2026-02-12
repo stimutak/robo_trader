@@ -621,8 +621,19 @@ class AsyncRunner:
         else:
             logger.info("✓ No zombie connections found")
 
+        # Derive a unique client_id per portfolio to prevent IBKR from
+        # delivering stale data from a prior session that used the same id.
+        base_client_id = self.cfg.ibkr.client_id
+        if self.portfolio_id != "default":
+            # Deterministic offset: hash portfolio_id to stay within 0-999
+            offset = hash(self.portfolio_id) % 900 + 100
+            self._client_id = (base_client_id + offset) % 1000
+        else:
+            self._client_id = base_client_id
+        client_id = self._client_id
+
         # Log connection details with secure masking
-        client_id_masked = SecureConfig.mask_value(self.cfg.ibkr.client_id)
+        client_id_masked = SecureConfig.mask_value(client_id)
         logger.info(
             f"Initializing robust connection to {host}:{port} with client_id: {client_id_masked}"
         )
@@ -639,7 +650,7 @@ class AsyncRunner:
             self.ib = await connect_ibkr_robust(
                 host=host,
                 port=port,
-                client_id=self.cfg.ibkr.client_id,
+                client_id=client_id,
                 readonly=self.cfg.ibkr.readonly,
                 timeout=self.cfg.ibkr.timeout,
                 max_retries=2,  # Reduced from 5 to prevent zombie connection accumulation
@@ -1275,12 +1286,13 @@ class AsyncRunner:
                 success_threshold=2,
             )
 
-            # Reconnect
+            # Reconnect with the same portfolio-specific client_id
+            client_id = getattr(self, "_client_id", self.cfg.ibkr.client_id)
             logger.info(f"Reconnecting to IBKR at {host}:{port}")
             self.ib = await connect_ibkr_robust(
                 host=host,
                 port=port,
-                client_id=self.cfg.ibkr.client_id,
+                client_id=client_id,
                 readonly=self.cfg.ibkr.readonly,
                 timeout=self.cfg.ibkr.timeout,
                 max_retries=3,  # More retries
@@ -1764,9 +1776,7 @@ class AsyncRunner:
             strategy_name = (
                 "ML_ENHANCED"
                 if self.use_ml_enhanced
-                else "ML_ENSEMBLE"
-                if self.use_ml_strategy
-                else "SMA_CROSSOVER"
+                else "ML_ENSEMBLE" if self.use_ml_strategy else "SMA_CROSSOVER"
             )
             await self.db.record_signal(
                 symbol,
@@ -2457,6 +2467,23 @@ class AsyncRunner:
             for symbol, position in self.positions.items():
                 if symbol in market_prices:
                     current_price = market_prices[symbol]
+                    # Reject suspicious price moves vs previous known price.
+                    # Compare against last DB market_price (or avg_cost as fallback).
+                    db_pos = await self.db.get_position(symbol)
+                    prev_price = None
+                    if db_pos:
+                        prev_price = db_pos.get("market_price") or db_pos.get("avg_cost")
+                    if not prev_price:
+                        prev_price = float(position.avg_price)
+                    if prev_price and prev_price > 0:
+                        ratio = current_price / prev_price
+                        if ratio > 10.0 or ratio < 0.1:
+                            logger.warning(
+                                f"Rejecting suspicious price for {symbol}: "
+                                f"${current_price:.4f} vs prev ${prev_price:.4f} "
+                                f"({ratio:.1f}x move)"
+                            )
+                            continue
                     # Update position in database with current market price
                     await self.db.update_position(
                         symbol,
