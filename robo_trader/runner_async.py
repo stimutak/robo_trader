@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import os
 import subprocess
 import sys
@@ -133,7 +134,9 @@ class AsyncRunner:
         use_ml_enhanced: bool = None,  # Auto-detect if None
         use_smart_execution: bool = None,  # Auto-detect if None
         use_advanced_risk: bool = None,  # Auto-detect if None
+        portfolio_id: str = "default",  # Multi-portfolio support
     ):
+        self.portfolio_id = portfolio_id
         self.duration = duration
         self.bar_size = bar_size
         self.sma_fast = sma_fast
@@ -619,8 +622,19 @@ class AsyncRunner:
         else:
             logger.info("✓ No zombie connections found")
 
+        # Derive a unique client_id per portfolio to prevent IBKR from
+        # delivering stale data from a prior session that used the same id.
+        base_client_id = self.cfg.ibkr.client_id
+        if self.portfolio_id != "default":
+            # Deterministic offset: use hashlib (not hash()) for cross-process stability
+            offset = int(hashlib.md5(self.portfolio_id.encode()).hexdigest(), 16) % 900 + 100
+            self._client_id = (base_client_id + offset) % 1000
+        else:
+            self._client_id = base_client_id
+        client_id = self._client_id
+
         # Log connection details with secure masking
-        client_id_masked = SecureConfig.mask_value(self.cfg.ibkr.client_id)
+        client_id_masked = SecureConfig.mask_value(client_id)
         logger.info(
             f"Initializing robust connection to {host}:{port} with client_id: {client_id_masked}"
         )
@@ -637,7 +651,7 @@ class AsyncRunner:
             self.ib = await connect_ibkr_robust(
                 host=host,
                 port=port,
-                client_id=self.cfg.ibkr.client_id,
+                client_id=client_id,
                 readonly=self.cfg.ibkr.readonly,
                 timeout=self.cfg.ibkr.timeout,
                 max_retries=2,  # Reduced from 5 to prevent zombie connection accumulation
@@ -659,8 +673,14 @@ class AsyncRunner:
             sys.exit(1)
 
         # Initialize async database with context manager
-        self.db = AsyncTradingDatabase()
-        await self.db.initialize()
+        self._raw_db = AsyncTradingDatabase()
+        await self._raw_db.initialize()
+
+        # Wrap DB with portfolio-scoped proxy if using non-default portfolio
+        from .multiuser.db_proxy import PortfolioScopedDB
+
+        self.db = PortfolioScopedDB(self._raw_db, portfolio_id=self.portfolio_id)
+        logger.info(f"Database initialized for portfolio: {self.portfolio_id}")
 
         # Initialize risk manager
         self.risk = RiskManager(
@@ -731,6 +751,7 @@ class AsyncRunner:
                 executor=self.executor,
                 risk_manager=self.risk,
                 emergency_shutdown_callback=emergency_shutdown_callback,
+                portfolio_id=self.portfolio_id,
             )
             await self.stop_loss_monitor.start_monitoring()
             if self.use_trailing_stop:
@@ -1266,12 +1287,13 @@ class AsyncRunner:
                 success_threshold=2,
             )
 
-            # Reconnect
+            # Reconnect with the same portfolio-specific client_id
+            client_id = getattr(self, "_client_id", self.cfg.ibkr.client_id)
             logger.info(f"Reconnecting to IBKR at {host}:{port}")
             self.ib = await connect_ibkr_robust(
                 host=host,
                 port=port,
-                client_id=self.cfg.ibkr.client_id,
+                client_id=client_id,
                 readonly=self.cfg.ibkr.readonly,
                 timeout=self.cfg.ibkr.timeout,
                 max_retries=3,  # More retries
@@ -1755,9 +1777,7 @@ class AsyncRunner:
             strategy_name = (
                 "ML_ENHANCED"
                 if self.use_ml_enhanced
-                else "ML_ENSEMBLE"
-                if self.use_ml_strategy
-                else "SMA_CROSSOVER"
+                else "ML_ENSEMBLE" if self.use_ml_strategy else "SMA_CROSSOVER"
             )
             await self.db.record_signal(
                 symbol,
@@ -1921,7 +1941,7 @@ class AsyncRunner:
                     recent_buy = await self.db.has_recent_buy_trade(symbol, seconds=600)
                     if recent_buy:
                         logger.warning(
-                            f"DUPLICATE BUY BLOCKED: {symbol} has recent BUY trade in last 120 seconds"
+                            f"DUPLICATE BUY BLOCKED: {symbol} has recent BUY trade in last 10 minutes"
                         )
                         self._pending_orders.discard(symbol)
                         return self._blocked_result(
@@ -2448,6 +2468,23 @@ class AsyncRunner:
             for symbol, position in self.positions.items():
                 if symbol in market_prices:
                     current_price = market_prices[symbol]
+                    # Reject suspicious price moves vs previous known price.
+                    # Compare against last DB market_price (or avg_cost as fallback).
+                    db_pos = await self.db.get_position(symbol)
+                    prev_price = None
+                    if db_pos:
+                        prev_price = db_pos.get("market_price") or db_pos.get("avg_cost")
+                    if not prev_price:
+                        prev_price = float(position.avg_price)
+                    if prev_price and prev_price > 0:
+                        ratio = current_price / prev_price
+                        if ratio > 10.0 or ratio < 0.1:
+                            logger.warning(
+                                f"Rejecting suspicious price for {symbol}: "
+                                f"${current_price:.4f} vs prev ${prev_price:.4f} "
+                                f"({ratio:.1f}x move)"
+                            )
+                            continue
                     # Update position in database with current market price
                     await self.db.update_position(
                         symbol,
@@ -3276,30 +3313,61 @@ async def run_continuous(
                     f"Starting trading cycle at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
                 )
 
-                # Create fresh runner each cycle for stability (disconnect between cycles)
-                # This avoids connection timeouts and subprocess health check issues
-                logger.info("Creating fresh runner for this cycle...")
-                runner = AsyncRunner(
-                    duration=duration,
-                    bar_size=bar_size,
-                    sma_fast=sma_fast,
-                    sma_slow=sma_slow,
-                    slippage_bps=slippage_bps,
-                    max_order_notional=max_order_notional,
-                    max_daily_notional=max_daily_notional,
-                    default_cash=default_cash,
-                    max_concurrent_symbols=max_concurrent,
-                    use_correlation_sizing=True,  # FIXED: Enabled M5 correlation integration
-                    use_ml_strategy=use_ml_strategy,
-                    use_smart_execution=use_smart_execution,
+                # Load portfolio configurations
+                from .multiuser.portfolio_config import PortfolioConfig, load_portfolio_configs
+
+                try:
+                    portfolio_configs = load_portfolio_configs()
+                except Exception as pc_err:
+                    logger.warning(f"Failed to load portfolio configs: {pc_err}, using default")
+                    portfolio_configs = [
+                        PortfolioConfig(
+                            id="default",
+                            name="Default Portfolio",
+                            starting_cash=default_cash or 100000,
+                            symbols=symbols or [],
+                        )
+                    ]
+
+                active_portfolios = [pc for pc in portfolio_configs if pc.active]
+                logger.info(
+                    f"Processing {len(active_portfolios)} active portfolio(s): "
+                    f"{[p.id for p in active_portfolios]}"
                 )
 
-                await runner.run(symbols)
+                for portfolio_cfg in active_portfolios:
+                    # Determine symbols for this portfolio
+                    portfolio_symbols = portfolio_cfg.symbols if portfolio_cfg.symbols else symbols
 
-                # Clean up connection after each cycle (more stable for long-running)
-                logger.info("Cleaning up runner after cycle...")
-                await runner.cleanup()
-                runner = None
+                    logger.info(
+                        f"── Portfolio '{portfolio_cfg.id}' ({portfolio_cfg.name}): "
+                        f"{len(portfolio_symbols or [])} symbols ──"
+                    )
+
+                    # Create fresh runner each cycle for stability (disconnect between cycles)
+                    # This avoids connection timeouts and subprocess health check issues
+                    runner = AsyncRunner(
+                        duration=duration,
+                        bar_size=bar_size,
+                        sma_fast=sma_fast,
+                        sma_slow=sma_slow,
+                        slippage_bps=slippage_bps,
+                        max_order_notional=max_order_notional,
+                        max_daily_notional=max_daily_notional,
+                        default_cash=portfolio_cfg.starting_cash,
+                        max_concurrent_symbols=max_concurrent,
+                        use_correlation_sizing=True,  # FIXED: Enabled M5 correlation integration
+                        use_ml_strategy=use_ml_strategy,
+                        use_smart_execution=use_smart_execution,
+                        portfolio_id=portfolio_cfg.id,
+                    )
+
+                    await runner.run(portfolio_symbols)
+
+                    # Clean up connection after each portfolio (more stable for long-running)
+                    logger.info(f"Cleaning up runner for portfolio '{portfolio_cfg.id}'...")
+                    await runner.cleanup()
+                    runner = None
 
                 # Wait before next iteration
                 if not shutdown_flag and is_trading_allowed():

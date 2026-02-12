@@ -1,3 +1,7 @@
+---
+description: Multi-agent parallel code review
+---
+
 # Multi-Subagent Code Review
 
 Review the current changes using multiple parallel perspectives, then verify findings.

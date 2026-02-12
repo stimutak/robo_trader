@@ -162,7 +162,10 @@ def check_recent_errors() -> dict:
     except ValueError:
         count = 0
 
-    return {"status": "pass" if count < 5 else "warn" if count < 20 else "fail", "count": count}
+    return {
+        "status": "pass" if count < 5 else "warn" if count < 20 else "fail",
+        "count": count,
+    }
 
 
 def main():

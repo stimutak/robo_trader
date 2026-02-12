@@ -1,3 +1,9 @@
+---
+name: style-checker
+description: Ensures code follows Python PEP 8 and project-specific style guidelines.
+model: haiku
+---
+
 # Style Checker Agent
 
 Ensures code follows Python and project-specific style guidelines.

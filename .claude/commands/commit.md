@@ -1,61 +1,22 @@
-# Quick Commit Workflow
+---
+description: Quick conventional commit of staged changes
+---
 
-Fast commit with proper message format.
+# Quick Commit
 
-## Steps
-
-1. Check current changes:
+1. Check changes:
 ```bash
 git status
 git diff --stat
 ```
 
-2. Stage changes:
+2. Stage specific files (never `git add -A`):
 ```bash
-git add -A
+git add <relevant files>
 ```
 
-3. Generate commit message based on:
-- What files changed
-- What the changes accomplish
-- Why the changes were made
+3. Generate commit message:
+   - Summarize the "why" not the "what"
+   - Use conventional format: `<type>: <short description>`
 
-4. Commit with proper format:
-```bash
-git commit -m "$(cat <<'EOF'
-<type>: <short description>
-
-<optional longer description>
-
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
-
-Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
-EOF
-)"
-```
-
-## Commit Types
-
-| Type | When to Use |
-|------|-------------|
-| `feat` | New feature or functionality |
-| `fix` | Bug fix |
-| `refactor` | Code restructuring, no behavior change |
-| `test` | Adding or updating tests |
-| `docs` | Documentation changes |
-| `chore` | Maintenance, dependencies, configs |
-| `perf` | Performance improvements |
-| `style` | Formatting, no code change |
-
-## Examples
-
-```bash
-# Feature
-git commit -m "feat: add multi-subagent code review command"
-
-# Bug fix
-git commit -m "fix: correct market close time to 4:00 PM"
-
-# Refactor
-git commit -m "refactor: simplify position sizing calculation"
-```
+Types: `feat`, `fix`, `refactor`, `test`, `docs`, `chore`, `perf`, `style`

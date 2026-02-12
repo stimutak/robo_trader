@@ -1,3 +1,9 @@
+---
+name: parallel-coordinator
+description: Orchestrates multiple agents working simultaneously for maximum review efficiency.
+model: sonnet
+---
+
 # Parallel Coordinator Agent
 
 Orchestrates multiple agents working simultaneously for maximum efficiency.

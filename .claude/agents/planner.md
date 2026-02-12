@@ -1,3 +1,9 @@
+---
+name: planner
+description: Creates detailed implementation plans before coding with risk analysis and rollback strategies.
+model: sonnet
+---
+
 # Planner Agent
 
 Creates detailed implementation plans before coding.

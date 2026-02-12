@@ -113,10 +113,12 @@ cd /Users/oliver/robo_trader-mobile && git fetch origin main && git merge origin
 - `IMPLEMENTATION_PLAN.md` - The active project roadmap
 - `handoff/LATEST_HANDOFF.md` - Latest session handoff document
 - `robo_trader/runner_async.py` - Main trading system with async parallel processing
-- `robo_trader/database_async.py` - Async database with equity_history table
+- `robo_trader/database_async.py` - Async database with multi-portfolio support
 - `robo_trader/stop_loss_monitor.py` - Stop-loss protection (recreated on startup)
 - `app.py` - Dashboard with comprehensive professional overview
 - `robo_trader/websocket_server.py` - WebSocket server for real-time updates
+- `robo_trader/multiuser/` - Multi-portfolio support (config, migration, DB proxy)
+- `docs/MULTIUSER_PLAN.md` - Multi-portfolio architecture plan
 - `scripts/gateway_manager.py` - Cross-platform Gateway management
 - `config/ibc/config.ini` - IBC credentials (gitignored)
 
@@ -194,10 +196,60 @@ python3 test_safety_features.py  # Test safety features
 
 ---
 
+## Multi-Portfolio Support (Added 2026-02-06)
+
+The system supports multiple independent portfolios trading through a shared IBKR Gateway connection.
+
+### Architecture
+- **Single IBKR connection** shared across all portfolios (port 4002)
+- **Database partitioned by `portfolio_id`** - positions, trades, account, equity_history, signals all scoped per portfolio
+- **Backward compatible** - if no `PORTFOLIOS` env var, uses single `default` portfolio identical to previous behavior
+- Two portfolios CAN hold the same stock independently (different quantities, costs)
+
+### Enabling Multi-Portfolio
+
+Add to `.env`:
+```bash
+PORTFOLIOS='[{"id":"aggressive","name":"Aggressive Growth","starting_cash":50000,"symbols":"NVDA,TSLA,AMD"},{"id":"conservative","name":"Conservative Income","starting_cash":50000,"symbols":"AAPL,MSFT,JNJ,PG"}]'
+```
+
+Each portfolio object supports:
+- `id` (required): Unique identifier
+- `name`: Display name
+- `starting_cash`: Initial cash balance
+- `symbols`: Comma-separated watchlist
+- `active`: true/false to enable/disable
+- Risk overrides: `max_position_pct`, `max_open_positions`, `trailing_stop_pct`, `use_trailing_stop`, etc.
+
+### Dashboard API
+All endpoints accept `?portfolio_id=<id>` query parameter:
+```
+GET /api/positions?portfolio_id=aggressive
+GET /api/pnl?portfolio_id=conservative
+GET /api/trades?portfolio_id=aggressive
+GET /api/equity-curve?portfolio_id=conservative
+GET /api/portfolios                          # List all portfolios with stats
+```
+
+### Database Migration
+On first run with multi-portfolio code, existing data migrates automatically:
+- All existing data gets `portfolio_id='default'`
+- Migration creates backup before any changes
+- Migration is idempotent (safe to run multiple times)
+
+### Key Files
+- `robo_trader/multiuser/portfolio_config.py` - PortfolioConfig dataclass and loader
+- `robo_trader/multiuser/migration.py` - Schema migration for portfolio_id columns
+- `robo_trader/multiuser/db_proxy.py` - PortfolioScopedDB auto-injects portfolio_id
+- `docs/MULTIUSER_PLAN.md` - Full architecture plan
+
+---
+
 ## Key Configuration (.env)
 
 | Setting | Purpose |
 |---------|---------|
+| `PORTFOLIOS=` | **Multi-portfolio** JSON array (see above). If unset, uses single default. |
 | `USE_TRAILING_STOP=true` | **Trailing stops enabled** - lets winners run! |
 | `TRAILING_STOP_PERCENT=5.0` | Trailing stop at 5% below high water mark |
 | `STOP_LOSS_PERCENT=2.0` | Fixed stop-loss (only used if trailing disabled) |

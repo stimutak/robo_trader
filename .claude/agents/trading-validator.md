@@ -1,3 +1,9 @@
+---
+name: trading-validator
+description: Validates trading logic, risk management, and order execution flow.
+model: sonnet
+---
+
 # Trading Validator Agent
 
 Specialized agent for validating trading logic and risk management.
@@ -43,7 +49,7 @@ Files: `robo_trader/risk/advanced_risk.py`, `robo_trader/risk/kelly_sizing.py`
 ### Before Trade
 - [ ] Symbol is valid
 - [ ] No existing position (for BUY)
-- [ ] No recent BUY in last 120 seconds
+- [ ] No recent BUY in last 600 seconds (10 min cooldown)
 - [ ] Position size within limits
 - [ ] Sufficient buying power
 

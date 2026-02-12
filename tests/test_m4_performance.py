@@ -27,9 +27,10 @@ from robo_trader.analytics.strategy_performance import (
 )
 
 
-def generate_strategy_returns(n_days=252, strategy_type="momentum"):
+def generate_strategy_returns(n_days=252, strategy_type="momentum", dates=None):
     """Generate synthetic strategy returns for testing."""
-    dates = pd.date_range(end=datetime.now(), periods=n_days, freq="D")
+    if dates is None:
+        dates = pd.date_range(end=datetime.now(), periods=n_days, freq="D")
 
     if strategy_type == "momentum":
         # Momentum strategy: higher returns, higher volatility
@@ -252,7 +253,7 @@ async def test_ml_performance():
     # Simulate classification predictions (buy/sell signals)
     predictions = pd.Series(np.random.choice([0, 1], n_days, p=[0.45, 0.55]), index=dates)
 
-    actual_returns = generate_strategy_returns(n_days, "ml_ensemble")
+    actual_returns = generate_strategy_returns(n_days, "ml_ensemble", dates=dates)
     positions = generate_positions(dates)
 
     # Simulate feature importance

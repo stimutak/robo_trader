@@ -1,3 +1,7 @@
+---
+description: Capture patterns and bugs as CLAUDE.md rules
+---
+
 # Update Shared Knowledge
 
 When Claude makes a mistake or discovers an important pattern, update CLAUDE.md so all future sessions learn from it.

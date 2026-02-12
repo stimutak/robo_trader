@@ -34,6 +34,7 @@ from robo_trader.config import load_config  # noqa: E402
 
 # Lazy imports to avoid blocking startup
 from robo_trader.database_async import AsyncTradingDatabase  # noqa: E402
+from robo_trader.database_validator import DatabaseValidator, ValidationError  # noqa: E402
 from robo_trader.features.feature_pipeline import FeaturePipeline  # noqa: E402
 from robo_trader.logger import get_logger  # noqa: E402
 from robo_trader.ml.model_trainer import ModelTrainer  # noqa: E402
@@ -175,6 +176,55 @@ def requires_auth(f):
     return decorated
 
 
+# Portfolio ID validation instance
+_portfolio_validator = DatabaseValidator()
+
+
+def validate_portfolio(f):
+    """Decorator to validate portfolio_id query parameter on API endpoints."""
+
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        portfolio_id = request.args.get("portfolio_id", "default")
+        try:
+            portfolio_id = _portfolio_validator.validate_portfolio_id(portfolio_id)
+        except ValidationError as e:
+            return jsonify({"error": str(e)}), 400
+        # Check if non-default portfolio actually exists
+        if portfolio_id != "default":
+            import sqlite3
+
+            try:
+                with sqlite3.connect(str(Path("trading_data.db"))) as conn:
+                    conn.execute("PRAGMA busy_timeout=5000")
+                    # Check account table first, then portfolios definition table
+                    cursor = conn.execute(
+                        "SELECT COUNT(*) FROM account WHERE portfolio_id = ?",
+                        (portfolio_id,),
+                    )
+                    count = cursor.fetchone()[0]
+                    if count == 0:
+                        cursor = conn.execute(
+                            "SELECT COUNT(*) FROM portfolios WHERE id = ?",
+                            (portfolio_id,),
+                        )
+                        count = cursor.fetchone()[0]
+                if count == 0:
+                    return (
+                        jsonify({"error": f"Portfolio '{portfolio_id}' not found"}),
+                        404,
+                    )
+            except sqlite3.OperationalError as e:
+                if "no such table" in str(e).lower():
+                    pass  # Tables not created yet, skip existence check
+                else:
+                    logger.error(f"DB error validating portfolio '{portfolio_id}': {e}")
+                    return jsonify({"error": "Database temporarily unavailable"}), 503
+        return f(*args, **kwargs)
+
+    return decorated
+
+
 # HTML Template - Clean, modern design
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -227,6 +277,55 @@ HTML_TEMPLATE = """
             display: flex;
             align-items: center;
             gap: 15px;
+        }
+
+        .portfolio-selector {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 4px 12px;
+            background: #161b22;
+            border-radius: 8px;
+            border: 1px solid #30363d;
+        }
+
+        .portfolio-selector label {
+            font-size: 11px;
+            color: #8b949e;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .portfolio-selector select {
+            background: #0d1117;
+            color: #e6edf3;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 6px 28px 6px 10px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%238b949e' viewBox='0 0 16 16'%3E%3Cpath d='M7.247 11.14L2.451 5.658C1.885 5.013 2.345 4 3.204 4h9.592a1 1 0 0 1 .753 1.659l-4.796 5.48a1 1 0 0 1-1.506 0z'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 8px center;
+            min-width: 140px;
+        }
+
+        .portfolio-selector select:hover {
+            border-color: #58a6ff;
+        }
+
+        .portfolio-selector select:focus {
+            outline: none;
+            border-color: #58a6ff;
+            box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.3);
+        }
+
+        .portfolio-equity {
+            font-size: 12px;
+            color: #4ade80;
+            font-weight: 600;
         }
 
         .header-right {
@@ -610,14 +709,44 @@ HTML_TEMPLATE = """
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             transition: width 0.3s ease;
         }
+
+        .error-banner {
+            display: none;
+            position: fixed;
+            top: 16px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 9999;
+            background: #3d1f1f;
+            border: 1px solid #f87171;
+            color: #fca5a5;
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-size: 13px;
+            max-width: 500px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+        }
+
+        .portfolio-selector.loading select {
+            opacity: 0.5;
+            pointer-events: none;
+        }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
+    <div class="error-banner" id="error-banner"></div>
     <div class="container">
         <header>
             <div class="logo">RoboTrader</div>
             <div class="header-center">
+                <div class="portfolio-selector">
+                    <label>Portfolio</label>
+                    <select id="portfolio-select" onchange="switchPortfolio(this.value)">
+                        <option value="default">Loading...</option>
+                    </select>
+                    <span class="portfolio-equity" id="portfolio-quick-equity"></span>
+                </div>
                 <div class="status-indicator">
                     <div class="status-dot" id="status-dot"></div>
                     <span id="status-text">Disconnected</span>
@@ -834,6 +963,10 @@ HTML_TEMPLATE = """
                     <div style="font-size: 9px; color: #8b949e;">Cycle Interval</div>
                     <div style="font-size: 12px; font-weight: bold;" id="ov-cycle-interval">15s</div>
                 </div>
+                <div style="background: #161b22; padding: 10px; border-radius: 6px; border: 1px solid #21262d;">
+                    <div style="font-size: 9px; color: #8b949e;">Data Source</div>
+                    <div style="font-size: 12px; font-weight: bold; color: #58a6ff;" id="ov-data-source">—</div>
+                </div>
             </div>
 
             <!-- Hidden elements for backward compat -->
@@ -1001,7 +1134,7 @@ HTML_TEMPLATE = """
                     </div>
                     <div style="text-align: center; padding: 6px; background: #1a1a2e; border-radius: 4px;">
                         <div style="font-size: 10px; color: #888;">Profit Factor</div>
-                        <div style="font-size: 13px;" id="profit-factor">0</div>
+                        <div style="font-size: 13px;" id="perf-profit-factor">0</div>
                     </div>
                     <div style="text-align: center; padding: 6px; background: #1a1a2e; border-radius: 4px;">
                         <div style="font-size: 10px; color: #888;">Expectancy</div>
@@ -1410,7 +1543,105 @@ HTML_TEMPLATE = """
     
     <script>
         let currentTab = 'overview';
-        
+        let currentPortfolio = 'default';
+        let portfolioList = [];
+
+        // Load available portfolios on startup
+        async function loadPortfolios() {
+            try {
+                const resp = await fetch('/api/portfolios');
+                const data = await resp.json();
+                portfolioList = data.portfolios || [];
+                console.log('Loaded portfolios:', portfolioList);
+
+                const select = document.getElementById('portfolio-select');
+                select.innerHTML = '';
+
+                portfolioList.forEach(p => {
+                    const opt = document.createElement('option');
+                    opt.value = p.id;
+                    opt.textContent = p.name;
+                    if (p.id === currentPortfolio) opt.selected = true;
+                    select.appendChild(opt);
+                });
+
+                // Update quick equity display
+                const current = portfolioList.find(p => p.id === currentPortfolio);
+                console.log('Current portfolio:', currentPortfolio, 'found:', current);
+                if (current && current.account) {
+                    const equityEl = document.getElementById('portfolio-quick-equity');
+                    const equity = current.account.equity || 0;
+                    console.log('Setting equity to:', equity);
+                    equityEl.textContent = formatCurrency(equity);
+                }
+            } catch (e) {
+                console.error('Failed to load portfolios:', e);
+                showError('Failed to load portfolios. Dashboard data may be stale.');
+            }
+        }
+
+        async function switchPortfolio(portfolioId) {
+            const previousPortfolio = currentPortfolio;
+            const selector = document.querySelector('.portfolio-selector');
+            console.log('[Portfolio] Switching from', previousPortfolio, 'to', portfolioId);
+
+            currentPortfolio = portfolioId;
+            localStorage.setItem('selectedPortfolio', portfolioId);
+
+            // Update quick equity display
+            const current = portfolioList.find(p => p.id === portfolioId);
+            if (current && current.account) {
+                document.getElementById('portfolio-quick-equity').textContent = formatCurrency(current.account.equity || 0);
+            }
+
+            // Show loading state
+            selector.classList.add('loading');
+            ['positions-table', 'watchlist-table', 'trades-table'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.innerHTML = '<tr><td colspan="10" style="text-align:center;color:#8b949e;">Loading...</td></tr>';
+            });
+
+            try {
+                await refreshData();
+            } catch (e) {
+                console.error('[Portfolio] Switch failed:', e);
+                // Revert to previous portfolio
+                currentPortfolio = previousPortfolio;
+                localStorage.setItem('selectedPortfolio', previousPortfolio);
+                document.getElementById('portfolio-select').value = previousPortfolio;
+                showError('Failed to load portfolio data. Reverted to previous portfolio.');
+                // Reload previous portfolio data
+                try { await refreshData(); } catch (revertErr) {
+                    console.error('[Portfolio] Revert also failed:', revertErr);
+                    showError('Portfolio switch failed and could not revert. Please refresh the page.');
+                }
+            } finally {
+                selector.classList.remove('loading');
+            }
+        }
+
+        function showError(message) {
+            const banner = document.getElementById('error-banner');
+            banner.textContent = message;
+            banner.style.display = 'block';
+            clearTimeout(banner._hideTimer);
+            banner._hideTimer = setTimeout(() => { banner.style.display = 'none'; }, 5000);
+        }
+
+        // Helper to add portfolio_id to API URLs
+        function withPortfolio(url) {
+            const separator = url.includes('?') ? '&' : '?';
+            return `${url}${separator}portfolio_id=${encodeURIComponent(currentPortfolio)}`;
+        }
+
+        // Restore saved portfolio on load
+        (function() {
+            const saved = localStorage.getItem('selectedPortfolio');
+            console.log('[Portfolio] Saved portfolio from localStorage:', saved);
+            if (saved) currentPortfolio = saved;
+            console.log('[Portfolio] Using portfolio:', currentPortfolio);
+        })();
+
         function switchTab(tab, element) {
             // Hide all tabs
             document.querySelectorAll('.tab-content').forEach(content => {
@@ -1496,17 +1727,17 @@ HTML_TEMPLATE = """
         }
 
         let overviewEquityChart = null;
-        const STARTING_CAPITAL = 100000;
+        let STARTING_CAPITAL = 100000;  // Will be updated from API
 
         async function loadOverviewData() {
             try {
-                // Load all data in parallel
+                // Load all data in parallel (with portfolio_id)
                 const [equityResp, posResp, tradesResp, perfResp, pnlResp, marketResp] = await Promise.all([
-                    fetch('/api/equity-curve'),
-                    fetch('/api/positions'),
-                    fetch('/api/trades?days=365'),
-                    fetch('/api/performance'),
-                    fetch('/api/pnl'),
+                    fetch(withPortfolio('/api/equity-curve')),
+                    fetch(withPortfolio('/api/positions')),
+                    fetch(withPortfolio('/api/trades?days=365')),
+                    fetch(withPortfolio('/api/performance')),
+                    fetch(withPortfolio('/api/pnl')),
                     fetch('/api/market/status')
                 ]);
 
@@ -1559,7 +1790,7 @@ HTML_TEMPLATE = """
                     ovUnrealized.style.color = unrealizedPnl >= 0 ? '#4ade80' : '#f87171';
                 }
 
-                // P&L DATA: Get equity, realized P&L, cash
+                // P&L DATA: Get equity, realized P&L, cash, and starting capital
                 let equity = STARTING_CAPITAL;
                 let realizedPnl = 0;
                 let cash = 0;
@@ -1568,6 +1799,10 @@ HTML_TEMPLATE = """
                     equity = pnlData.equity || STARTING_CAPITAL;
                     realizedPnl = pnlData.realized || pnlData.realized_pnl || 0;
                     cash = pnlData.cash || 0;
+                    // Update starting capital from portfolio config
+                    if (pnlData.starting_cash) {
+                        STARTING_CAPITAL = pnlData.starting_cash;
+                    }
                 }
 
                 // PERFORMANCE: Get all trade metrics
@@ -1587,6 +1822,7 @@ HTML_TEMPLATE = """
                     const perfData = await perfResp.json();
                     const summary = perfData.summary || {};
                     const daily = perfData.daily || {};
+                    console.log('[Overview] Performance data:', summary);
 
                     totalPnl = summary.total_pnl !== undefined ? summary.total_pnl : (perfData.all?.pnl || realizedPnl);
                     todayPnl = daily.pnl || 0;
@@ -1599,6 +1835,23 @@ HTML_TEMPLATE = """
                     bestTrade = summary.best_trade || 0;
                     worstTrade = summary.worst_trade || 0;
                     totalTrades = summary.total_trades || 0;
+                    console.log('[Overview] Parsed: winRate=', winRate, 'profitFactor=', profitFactor, 'sharpe=', sharpe, 'maxDrawdown=', maxDrawdown);
+                } else {
+                    console.error('[Overview] Performance API failed:', perfResp.status);
+                }
+
+                // EQUITY CURVE: Get peak for drawdown calculation
+                let peakEquity = STARTING_CAPITAL;
+                let equityData = null;
+                if (equityResp.ok) {
+                    equityData = await equityResp.json();
+                    console.log('[Overview] Equity data:', equityData.portfolio_values?.length, 'points');
+                    if (equityData.portfolio_values && equityData.portfolio_values.length > 0) {
+                        peakEquity = Math.max(...equityData.portfolio_values);
+                        console.log('[Overview] Peak equity:', peakEquity);
+                    }
+                } else {
+                    console.error('[Overview] Equity curve API failed:', equityResp.status);
                 }
 
                 // CALCULATE DERIVED METRICS
@@ -1608,11 +1861,14 @@ HTML_TEMPLATE = """
                 const todayPnlPct = totalEquity > 0 ? (todayPnl / totalEquity) * 100 : 0;
                 const exposure = totalEquity > 0 ? (positionsValue / totalEquity) * 100 : 0;
                 const buyingPower = Math.max(0, totalEquity - positionsValue);
-                const currentDrawdown = maxDrawdown; // Would need peak tracking for accurate current DD
+                // Current drawdown = (peak - current) / peak (as a positive percentage)
+                const currentDrawdown = peakEquity > 0 ? Math.max(0, (peakEquity - totalEquity) / peakEquity) : 0;
 
                 // UPDATE ALL UI ELEMENTS
                 // Hero row
                 document.getElementById('ov-portfolio').textContent = formatCurrency(totalEquity);
+                // Also update header portfolio equity to stay in sync
+                document.getElementById('portfolio-quick-equity').textContent = formatCurrency(totalEquity);
                 const totalReturnEl = document.getElementById('ov-total-return-pct');
                 totalReturnEl.innerHTML = `<span style="color: ${totalReturn >= 0 ? '#4ade80' : '#f87171'};">${totalReturn >= 0 ? '+' : ''}${totalReturnPct.toFixed(1)}%</span> <span style="color: #64748b;">all time</span>`;
 
@@ -1651,14 +1907,13 @@ HTML_TEMPLATE = """
                     renderRecentTrades(todayTrades.length > 0 ? todayTrades : trades.slice(0, 8));
                 }
 
-                // EQUITY CURVE: Render chart
-                if (equityResp.ok) {
-                    const data = await equityResp.json();
-                    renderOverviewEquityChart(data);
+                // EQUITY CURVE: Render chart (use already-parsed equityData)
+                if (equityData) {
+                    renderOverviewEquityChart(equityData);
                     // Show date range
-                    if (data.labels && data.labels.length > 0) {
+                    if (equityData.labels && equityData.labels.length > 0) {
                         document.getElementById('ov-chart-range').textContent =
-                            `${data.labels[0]} → ${data.labels[data.labels.length - 1]}`;
+                            `${equityData.labels[0]} → ${equityData.labels[equityData.labels.length - 1]}`;
                     }
                 }
 
@@ -1674,8 +1929,9 @@ HTML_TEMPLATE = """
                     }
                 }
 
-                // Last update time
+                // Last update time and data source
                 document.getElementById('ov-last-update').textContent = new Date().toLocaleTimeString();
+                document.getElementById('ov-data-source').textContent = currentPortfolio;
 
             } catch (error) {
                 console.error('Error loading overview data:', error);
@@ -1683,8 +1939,12 @@ HTML_TEMPLATE = """
         }
 
         function renderOverviewEquityChart(data) {
+            console.log('[Chart] renderOverviewEquityChart called with', data?.portfolio_values?.length, 'values');
             const ctx = document.getElementById('overview-equity-chart');
-            if (!ctx) return;
+            if (!ctx) {
+                console.error('[Chart] Canvas element not found!');
+                return;
+            }
 
             // Use portfolio_values if available (from equity_history), otherwise calculate from P&L
             let values = [];
@@ -1697,22 +1957,32 @@ HTML_TEMPLATE = """
                 // Calculate portfolio values from P&L
                 values = data.values.map(pnl => STARTING_CAPITAL + pnl);
                 labels = data.labels || values.map((_, i) => i);
-            } else {
-                // No data yet
+            }
+
+            // Need at least 2 data points to draw a line
+            if (values.length < 2) {
+                console.log('[Chart] Not enough data points:', values.length);
+                // Destroy existing chart and show message
+                if (overviewEquityChart) {
+                    overviewEquityChart.destroy();
+                    overviewEquityChart = null;
+                }
+                document.getElementById('ov-chart-range').textContent = values.length === 0
+                    ? 'No data yet'
+                    : 'Need more history';
                 return;
             }
+            console.log('[Chart] Creating chart with', values.length, 'points, range:', Math.min(...values), '-', Math.max(...values));
 
             // Calculate gain/loss from start
             const firstValue = values[0] || STARTING_CAPITAL;
             const lastValue = values[values.length - 1] || STARTING_CAPITAL;
             const isPositive = lastValue >= firstValue;
 
+            // Destroy and recreate chart when switching portfolios for clean state
             if (overviewEquityChart) {
-                overviewEquityChart.data.labels = labels;
-                overviewEquityChart.data.datasets[0].data = values;
-                overviewEquityChart.data.datasets[0].borderColor = isPositive ? '#4ade80' : '#f87171';
-                overviewEquityChart.update('none');
-                return;
+                overviewEquityChart.destroy();
+                overviewEquityChart = null;
             }
 
             const gradient = ctx.getContext('2d').createLinearGradient(0, 0, 0, 120);
@@ -1837,45 +2107,45 @@ HTML_TEMPLATE = """
         
         async function loadPnL() {
             try {
-                const response = await fetch('/api/pnl');
+                const response = await fetch(withPortfolio('/api/pnl'));
                 const data = await response.json();
                 updatePnL(data);
             } catch (error) {
                 console.error('Error loading P&L:', error);
             }
         }
-        
+
         async function loadWatchlist() {
             try {
-                const response = await fetch('/api/watchlist');
+                const response = await fetch(withPortfolio('/api/watchlist'));
                 const data = await response.json();
                 updateWatchlistTable(data.watchlist);
             } catch (error) {
                 console.error('Error loading watchlist:', error);
             }
         }
-        
+
         async function loadPositions() {
             try {
-                const response = await fetch('/api/positions');
+                const response = await fetch(withPortfolio('/api/positions'));
                 const data = await response.json();
                 updatePositionsTable(data.positions);
             } catch (error) {
                 console.error('Error loading positions:', error);
             }
         }
-        
+
         async function loadTrades() {
             try {
                 const symbolFilter = document.getElementById('trade-symbol-filter').value;
                 const daysFilter = document.getElementById('trade-days-filter').value;
-                
+
                 let url = `/api/trades?days=${daysFilter}`;
                 if (symbolFilter) {
                     url += `&symbol=${symbolFilter}`;
                 }
-                
-                const response = await fetch(url);
+
+                const response = await fetch(withPortfolio(url));
                 const data = await response.json();
                 
                 // Update summary stats
@@ -2133,10 +2403,10 @@ HTML_TEMPLATE = """
 
         async function loadPerformanceData() {
             try {
-                // Load performance metrics and equity curve in parallel
+                // Load performance metrics and equity curve in parallel (with portfolio_id)
                 const [perfResponse, equityResponse] = await Promise.all([
-                    fetch('/api/performance'),
-                    fetch('/api/equity-curve')
+                    fetch(withPortfolio('/api/performance')),
+                    fetch(withPortfolio('/api/equity-curve'))
                 ]);
                 const data = await perfResponse.json();
                 const equityData = await equityResponse.json();
@@ -3214,12 +3484,12 @@ HTML_TEMPLATE = """
         // Refresh strategies tab data
         async function refreshStrategies() {
             try {
-                // Fetch all data in parallel
+                // Fetch all data in parallel (with portfolio_id where applicable)
                 const [strategiesResp, allocResp, execResp, riskResp] = await Promise.all([
-                    fetch('/api/strategies/status'),
-                    fetch('/api/portfolio/allocation'),
+                    fetch(withPortfolio('/api/strategies/status')),
+                    fetch(withPortfolio('/api/portfolio/allocation')),
                     fetch('/api/execution/status'),
-                    fetch('/api/risk/status')
+                    fetch(withPortfolio('/api/risk/status'))
                 ]);
 
                 let strategiesData = null;
@@ -3514,7 +3784,8 @@ HTML_TEMPLATE = """
         }
         
         // Initialize on load
-        window.onload = () => {
+        window.onload = async () => {
+            await loadPortfolios(); // Load portfolio list first
             refreshData();
             refreshStrategies();
             updateSafetyMonitoring(); // Load safety monitoring on startup
@@ -3526,6 +3797,7 @@ HTML_TEMPLATE = """
             setInterval(updateSafetyMonitoring, 10000); // Update safety monitoring every 10 seconds
             setInterval(loadLogs, 2000); // Update logs every 2 seconds
             setInterval(updateMarketStatus, 60000); // Update market status every minute
+            setInterval(loadPortfolios, 30000); // Refresh portfolio list every 30 seconds
         };
     </script>
 </body>
@@ -3567,6 +3839,52 @@ def health():
 def api_health():
     """Health check endpoint for API monitoring"""
     return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
+
+
+@app.route("/api/portfolios")
+@requires_auth
+def get_portfolios():
+    """Get all portfolio definitions with summary stats.
+
+    Returns list of portfolios with their account summary.
+    """
+    try:
+        from sync_db_reader import SyncDatabaseReader
+
+        db = SyncDatabaseReader()
+        portfolios = db.get_portfolios()
+
+        # Enrich each portfolio with account summary
+        result = []
+        for p in portfolios:
+            pid = p.get("id", "default")
+            account = db.get_account_info(portfolio_id=pid)
+            positions = db.get_positions(portfolio_id=pid)
+
+            result.append(
+                {
+                    "id": pid,
+                    "name": p.get("name", pid),
+                    "starting_cash": p.get("starting_cash", 100000),
+                    "active": bool(p.get("active", 1)),
+                    "symbols": p.get("symbols", ""),
+                    "account": {
+                        "cash": account.get("cash", 0),
+                        "equity": account.get("equity", 0),
+                        "realized_pnl": account.get("realized_pnl", 0),
+                        "unrealized_pnl": account.get("unrealized_pnl", 0),
+                        "daily_pnl": account.get("daily_pnl", 0),
+                    },
+                    "positions_count": len(
+                        [pos for pos in positions if pos.get("quantity", 0) != 0]
+                    ),
+                }
+            )
+
+        return jsonify({"portfolios": result})
+    except Exception as e:
+        logger.error(f"Error getting portfolios: {e}")
+        return jsonify({"error": "Failed to load portfolios"}), 500
 
 
 @app.route("/api/database/health")
@@ -3857,6 +4175,7 @@ def check_ibkr_connection():
 
 @app.route("/api/status")
 @requires_auth
+@validate_portfolio
 def status():
     """Get current system status from database"""
     global trading_status, trading_process
@@ -3970,7 +4289,8 @@ def status():
         from sync_db_reader import SyncDatabaseReader
 
         db = SyncDatabaseReader()
-        positions = db.get_positions()
+        portfolio_id = request.args.get("portfolio_id", "default")
+        positions = db.get_positions(portfolio_id=portfolio_id)
         positions_count = len([p for p in positions if p.get("quantity", 0) != 0])
 
         # Calculate P&L from positions
@@ -3986,7 +4306,7 @@ def status():
             unrealized_pnl = total_value - total_cost
 
             # Get account info for realized P&L and cash
-            account = db.get_account_info()
+            account = db.get_account_info(portfolio_id=portfolio_id)
             realized_pnl = account.get("realized_pnl", 0) or 0
             daily_pnl = account.get("daily_pnl", 0) or 0
             cash = account.get("cash", 0) or 0
@@ -4162,6 +4482,7 @@ def status():
 
 @app.route("/api/pnl")
 @requires_auth
+@validate_portfolio
 def get_pnl():
     """Get P&L data from actual positions"""
     # Check if market is open - don't show stale data when closed
@@ -4174,9 +4495,17 @@ def get_pnl():
         from sync_db_reader import SyncDatabaseReader
 
         db = SyncDatabaseReader()
+        portfolio_id = request.args.get("portfolio_id", "default")
+
+        # Get portfolio config for starting_cash
+        portfolios = db.get_portfolios()
+        portfolio_config = next((p for p in portfolios if p.get("id") == portfolio_id), None)
+        starting_cash = (
+            portfolio_config.get("starting_cash", 100000) if portfolio_config else 100000
+        )
 
         # Get positions
-        positions = db.get_positions()
+        positions = db.get_positions(portfolio_id=portfolio_id)
 
         # Calculate total market value from positions (matches mobile app)
         total_market_value = Decimal("0")
@@ -4186,22 +4515,27 @@ def get_pnl():
             total_market_value += qty * price
 
         # Get cash from account
-        account = db.get_account_info()
+        account = db.get_account_info(portfolio_id=portfolio_id)
         cash = Decimal(str(account.get("cash", 0) or 0))
 
         # Equity = cash + market value of positions
         equity = cash + total_market_value
 
-        # When market is closed, return equity but null P&L
+        # When market is closed, still return historical realized P&L from account
+        # Only unrealized and daily are "live" data that shouldn't show when closed
         if not market_open:
+            # Get stored realized P&L from account (historical, always valid)
+            stored_realized = account.get("realized_pnl", 0) or 0
             return jsonify(
                 {
-                    "total": None,
-                    "unrealized": None,
-                    "realized": None,
-                    "daily": None,
+                    "total": float(stored_realized),
+                    "unrealized": None,  # Live data, null when closed
+                    "realized": float(stored_realized),
+                    "realized_pnl": float(stored_realized),  # Alias for JS compatibility
+                    "daily": None,  # Live data, null when closed
                     "equity": float(equity),
                     "cash": float(cash),
+                    "starting_cash": float(starting_cash),
                 }
             )
 
@@ -4218,7 +4552,7 @@ def get_pnl():
         # Get trades for realized P&L - USE STORED PNL VALUES from database
         # The database already tracks accurate P&L per trade
         # Use limit=5000 to ensure we get ALL trades for accurate total P&L
-        trades = db.get_recent_trades(limit=5000)
+        trades = db.get_recent_trades(limit=5000, portfolio_id=portfolio_id)
         today = datetime.now().date()
 
         realized_pnl = Decimal("0")
@@ -4260,6 +4594,7 @@ def get_pnl():
                 "daily": float(round(daily_pnl, 2)),
                 "equity": float(equity),
                 "cash": float(cash),
+                "starting_cash": float(starting_cash),
             }
         )
 
@@ -4274,6 +4609,7 @@ def get_pnl():
                 "daily": 0,
                 "equity": DEFAULT_CAPITAL,
                 "cash": DEFAULT_CAPITAL,
+                "starting_cash": DEFAULT_CAPITAL,
             }
         )
 
@@ -4538,25 +4874,29 @@ def get_pnl_OLD():
 
 @app.route("/api/positions")
 @requires_auth
+@validate_portfolio
 def get_positions():
     """Get current positions from real database - optimized to avoid DB lock"""
     # Return cached positions if available and recent (within 2 seconds)
     # Use lock for thread-safe cache access
     current_time = time.time()
+    portfolio_id = request.args.get("portfolio_id", "default")
+    cache_key = f"_positions_cache_{portfolio_id}"
+    cache_time_key = f"_positions_cache_time_{portfolio_id}"
     with _positions_cache_lock:
-        if hasattr(app, "_positions_cache") and hasattr(app, "_positions_cache_time"):
-            if current_time - app._positions_cache_time < 2:  # 2 second cache
-                return jsonify({"positions": app._positions_cache})
+        if hasattr(app, cache_key) and hasattr(app, cache_time_key):
+            if current_time - getattr(app, cache_time_key) < 2:  # 2 second cache
+                return jsonify({"positions": getattr(app, cache_key)})
 
     try:
         from sync_db_reader import SyncDatabaseReader
 
         db = SyncDatabaseReader()
-        real_positions = db.get_positions()
+        real_positions = db.get_positions(portfolio_id=portfolio_id)
 
         # Batch fetch: Get all signals once (not per-position!)
         try:
-            all_signals = db.get_signals(hours=1)
+            all_signals = db.get_signals(hours=1, portfolio_id=portfolio_id)
             # Build lookup dict by symbol
             signal_by_symbol = {}
             for s in all_signals:
@@ -4603,10 +4943,10 @@ def get_positions():
                 }
             )
 
-        # Cache the result (thread-safe)
+        # Cache the result (thread-safe, keyed by portfolio_id)
         with _positions_cache_lock:
-            app._positions_cache = enriched_positions
-            app._positions_cache_time = time.time()
+            setattr(app, cache_key, enriched_positions)
+            setattr(app, cache_time_key, time.time())
 
         return jsonify({"positions": enriched_positions})
     except Exception as e:
@@ -4618,13 +4958,17 @@ def get_positions():
 
 @app.route("/api/watchlist")
 @requires_auth
+@validate_portfolio
 def get_watchlist():
     """Get watchlist with latest prices - optimized for speed"""
     # Return cached watchlist if available and recent (within 3 seconds)
     current_time = time.time()
-    if hasattr(app, "_watchlist_cache") and hasattr(app, "_watchlist_cache_time"):
-        if current_time - app._watchlist_cache_time < 3:  # 3 second cache
-            return jsonify({"watchlist": app._watchlist_cache})
+    portfolio_id = request.args.get("portfolio_id", "default")
+    wl_cache_key = f"_watchlist_cache_{portfolio_id}"
+    wl_cache_time_key = f"_watchlist_cache_time_{portfolio_id}"
+    if hasattr(app, wl_cache_key) and hasattr(app, wl_cache_time_key):
+        if current_time - getattr(app, wl_cache_time_key) < 3:  # 3 second cache
+            return jsonify({"watchlist": getattr(app, wl_cache_key)})
 
     # Define the watchlist symbols
     watchlist_symbols = [
@@ -4657,8 +5001,8 @@ def get_watchlist():
 
         db = SyncDatabaseReader()
 
-        # Get all positions
-        positions = db.get_positions()
+        # Get all positions for this portfolio
+        positions = db.get_positions(portfolio_id=portfolio_id)
         position_map = {p["symbol"]: p for p in positions}
 
         # Get latest prices and positions for each symbol
@@ -4687,9 +5031,9 @@ def get_watchlist():
                 }
             )
 
-        # Cache the result
-        app._watchlist_cache = watchlist_data
-        app._watchlist_cache_time = current_time
+        # Cache the result (keyed by portfolio_id)
+        setattr(app, wl_cache_key, watchlist_data)
+        setattr(app, wl_cache_time_key, current_time)
 
     except Exception as e:
         logger.error(f"Error fetching watchlist: {e}")
@@ -4929,11 +5273,11 @@ def ml_predictions():
                 "buy": buy_signals,
                 "sell": sell_signals,
                 "hold": hold_signals,
-                "avg_confidence": round(
-                    sum(p["confidence"] for p in predictions_list) / len(predictions_list), 3
-                )
-                if predictions_list
-                else 0,
+                "avg_confidence": (
+                    round(sum(p["confidence"] for p in predictions_list) / len(predictions_list), 3)
+                    if predictions_list
+                    else 0
+                ),
             },
         }
     )
@@ -4941,16 +5285,18 @@ def ml_predictions():
 
 @app.route("/api/performance")
 @requires_auth
+@validate_portfolio
 def performance():
     """Get real performance metrics from trading data"""
     try:
         from sync_db_reader import SyncDatabaseReader
 
         db = SyncDatabaseReader()
+        portfolio_id = request.args.get("portfolio_id", "default")
 
         # Get all trades and positions for calculations
-        all_trades = db.get_recent_trades(limit=5000)
-        positions = db.get_positions()
+        all_trades = db.get_recent_trades(limit=5000, portfolio_id=portfolio_id)
+        positions = db.get_positions(portfolio_id=portfolio_id)
 
         if not all_trades and not positions:
             return jsonify({"error": "No trades or positions found", "summary": {}})
@@ -5135,9 +5481,9 @@ def performance():
         return jsonify(
             {
                 "summary": {
-                    "total_return": round(total_pnl / estimated_capital, 4)
-                    if estimated_capital > 0
-                    else 0,
+                    "total_return": (
+                        round(total_pnl / estimated_capital, 4) if estimated_capital > 0 else 0
+                    ),
                     "total_pnl": round(total_pnl, 2),
                     "total_sharpe": round(sharpe, 2),
                     "total_drawdown": round(max_dd, 4),
@@ -5153,9 +5499,9 @@ def performance():
                     "profit_factor": round(profit_factor, 2),
                 },
                 "daily": {
-                    "return_pct": round(daily_pnl / estimated_capital, 4)
-                    if estimated_capital > 0
-                    else 0,
+                    "return_pct": (
+                        round(daily_pnl / estimated_capital, 4) if estimated_capital > 0 else 0
+                    ),
                     "pnl": round(daily_pnl, 2),
                     "trades": len(daily_trades),
                     "volatility": round(volatility, 4),
@@ -5163,9 +5509,9 @@ def performance():
                     "max_drawdown": round(max_dd, 4),
                 },
                 "weekly": {
-                    "return_pct": round(weekly_pnl / estimated_capital, 4)
-                    if estimated_capital > 0
-                    else 0,
+                    "return_pct": (
+                        round(weekly_pnl / estimated_capital, 4) if estimated_capital > 0 else 0
+                    ),
                     "pnl": round(weekly_pnl, 2),
                     "trades": len(weekly_trades),
                     "volatility": round(volatility, 4),
@@ -5173,9 +5519,9 @@ def performance():
                     "max_drawdown": round(max_dd, 4),
                 },
                 "monthly": {
-                    "return_pct": round(monthly_pnl / estimated_capital, 4)
-                    if estimated_capital > 0
-                    else 0,
+                    "return_pct": (
+                        round(monthly_pnl / estimated_capital, 4) if estimated_capital > 0 else 0
+                    ),
                     "pnl": round(monthly_pnl, 2),
                     "trades": len(monthly_trades),
                     "volatility": round(volatility, 4),
@@ -5183,9 +5529,9 @@ def performance():
                     "max_drawdown": round(max_dd, 4),
                 },
                 "all": {
-                    "return_pct": round(total_pnl / estimated_capital, 4)
-                    if estimated_capital > 0
-                    else 0,
+                    "return_pct": (
+                        round(total_pnl / estimated_capital, 4) if estimated_capital > 0 else 0
+                    ),
                     "pnl": round(total_pnl, 2),
                     "trades": len(all_trades),
                     "volatility": round(volatility, 4),
@@ -5204,6 +5550,7 @@ def performance():
 
 @app.route("/api/equity-curve")
 @requires_auth
+@validate_portfolio
 def equity_curve():
     """Get equity curve data for charting - industry standard portfolio value tracking.
 
@@ -5217,14 +5564,15 @@ def equity_curve():
         from sync_db_reader import SyncDatabaseReader
 
         db = SyncDatabaseReader()
+        portfolio_id = request.args.get("portfolio_id", "default")
 
         # Get equity history (daily portfolio value snapshots)
-        equity_history = db.get_equity_history(days=365)
+        equity_history = db.get_equity_history(days=365, portfolio_id=portfolio_id)
         portfolio_labels = [d["date"] for d in equity_history]
         portfolio_values = [d["equity"] for d in equity_history]
 
         # Also get trade-based P&L for detailed view
-        all_trades = db.get_recent_trades(limit=1000)
+        all_trades = db.get_recent_trades(limit=1000, portfolio_id=portfolio_id)
 
         if not all_trades:
             return jsonify(
@@ -5301,6 +5649,7 @@ def equity_curve():
 
 @app.route("/api/trades")
 @requires_auth
+@validate_portfolio
 def get_trades():
     """Get trade history from database"""
     try:
@@ -5325,7 +5674,10 @@ def get_trades():
         trade_limit = int(os.getenv("DASHBOARD_TRADE_LIMIT", "1000"))
         trade_limit = min(max(trade_limit, 10), 5000)  # Clamp between 10 and 5000
 
-        trades = db.get_recent_trades(limit=trade_limit, symbol=symbol, days=days)
+        portfolio_id = request.args.get("portfolio_id", "default")
+        trades = db.get_recent_trades(
+            limit=trade_limit, symbol=symbol, days=days, portfolio_id=portfolio_id
+        )
 
         if trades:
             # Convert to expected format
@@ -5510,15 +5862,19 @@ def get_trades_OLD():
 
 @app.route("/api/strategies/status")
 @requires_auth
+@validate_portfolio
 def strategies_status():
     """Get real status of all active strategies"""
     # Return cached status if available and recent (within 3 seconds)
     # Thread-safe cache access
     current_time = time.time()
+    portfolio_id = request.args.get("portfolio_id", "default")
+    strat_cache_key = f"_strategies_cache_{portfolio_id}"
+    strat_cache_time_key = f"_strategies_cache_time_{portfolio_id}"
     with _strategies_cache_lock:
-        if hasattr(app, "_strategies_cache") and hasattr(app, "_strategies_cache_time"):
-            if current_time - app._strategies_cache_time < 3:  # 3 second cache
-                return jsonify(app._strategies_cache)
+        if hasattr(app, strat_cache_key) and hasattr(app, strat_cache_time_key):
+            if current_time - getattr(app, strat_cache_time_key) < 3:  # 3 second cache
+                return jsonify(getattr(app, strat_cache_key))
 
     try:
         import json
@@ -5529,11 +5885,11 @@ def strategies_status():
         db = SyncDatabaseReader()
 
         # Get real position count
-        positions = db.get_positions()
+        positions = db.get_positions(portfolio_id=portfolio_id)
         active_positions = [p for p in positions if p.get("quantity", 0) > 0]
 
         # Get recent trades to calculate strategy performance
-        trades = db.get_recent_trades(limit=100)
+        trades = db.get_recent_trades(limit=100, portfolio_id=portfolio_id)
 
         # Check for ML predictions file
         predictions_file = Path("ml_predictions.json")
@@ -5613,9 +5969,11 @@ def strategies_status():
             "performance_by_strategy": {
                 "ml_enhanced": {
                     "pnl": round(total_pnl, 2),
-                    "win_rate": round(winning_positions / watchlist_position_count, 3)
-                    if watchlist_position_count > 0
-                    else 0,
+                    "win_rate": (
+                        round(winning_positions / watchlist_position_count, 3)
+                        if watchlist_position_count > 0
+                        else 0
+                    ),
                     "total_trades": len(trades),
                     "winning_positions": winning_positions,
                 },
@@ -5631,10 +5989,10 @@ def strategies_status():
             "last_updated": datetime.now().isoformat(),
         }
 
-        # Cache the data dict, not the Response object (thread-safe)
+        # Cache the data dict, not the Response object (thread-safe, keyed by portfolio_id)
         with _strategies_cache_lock:
-            app._strategies_cache = strategies_data
-            app._strategies_cache_time = time.time()
+            setattr(app, strat_cache_key, strategies_data)
+            setattr(app, strat_cache_time_key, time.time())
 
         return jsonify(strategies_data)
     except Exception as e:

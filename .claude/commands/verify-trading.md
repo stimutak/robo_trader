@@ -1,3 +1,7 @@
+---
+description: Check trading system health: Gateway, zombies, risk params
+---
+
 # Verify Trading System
 
 Comprehensive verification of the trading system health and readiness.
@@ -14,11 +18,6 @@ ps aux | grep -E "(runner_async|app.py|websocket_server)" | grep -v grep
 - `app.py` - Dashboard
 
 If `runner_async` is NOT running, start it:
-```bash
-nohup python3 -m robo_trader.runner_async > robo_trader.log 2>&1 &
-```
-
-Or use the full startup script:
 ```bash
 ./START_TRADER.sh
 ```
@@ -53,11 +52,14 @@ Check `.env` for required safety configs:
 - `STOP_LOSS_PERCENT` - Should be set (default: 2.0)
 - `MAX_POSITION_SIZE` - Should be set
 - `EXECUTION_MODE` - Should be `paper` for testing
+- `USE_TRAILING_STOP` - Should be `true` (locks in profits)
+- `TRAILING_STOP_PERCENT` - Should be set (default: 5.0)
+- `ENABLE_EXTENDED_HOURS` - Set to `true` for pre/after market
 
 ## Step 5: Safety Feature Tests
 
 ```bash
-/Users/oliver/robo_trader/venv/bin/python3 -m pytest tests/test_safety_features.py -v
+.venv/bin/python3 -m pytest tests/test_safety_features.py -v
 ```
 
 All tests should pass.
