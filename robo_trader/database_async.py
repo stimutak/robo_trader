@@ -626,11 +626,7 @@ class AsyncTradingDatabase:
         portfolio_id: str = DEFAULT_PORTFOLIO_ID,
     ) -> None:
         """Record a strategy signal asynchronously."""
-        try:
-            portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
-        except ValidationError as e:
-            logger.error(f"Signal record validation failed: {e}")
-            raise ValueError(str(e)) from e
+        portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
         async with self.get_connection() as conn:
             await conn.execute(
                 """
@@ -952,11 +948,7 @@ class AsyncTradingDatabase:
         This is the industry standard approach for tracking portfolio value over time.
         Called at end of each trading day or when account summary is updated.
         """
-        try:
-            portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
-        except ValidationError as e:
-            logger.error(f"Equity snapshot validation failed: {e}")
-            raise ValueError(str(e)) from e
+        portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
 
         if snapshot_date is None:
             snapshot_date = datetime.now().strftime("%Y-%m-%d")

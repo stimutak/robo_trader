@@ -79,6 +79,9 @@ class MultiuserMigration:
             logger.info("No database found - migration will be applied on first init")
             return False
 
+        migration_error = None
+        backup_path = None
+
         async with aiosqlite.connect(self.db_path) as conn:
             await conn.execute("PRAGMA journal_mode=WAL")
             await conn.execute("PRAGMA busy_timeout=10000")
@@ -102,9 +105,13 @@ class MultiuserMigration:
             except (sqlite3.Error, aiosqlite.Error) as e:
                 logger.error(f"Migration failed: {e}")
                 await conn.rollback()
-                if backup_path and backup_path.exists():
-                    await self._restore_from_backup(backup_path)
-                raise
+                migration_error = e
+
+        # Connection is closed -- safe to restore backup by overwriting the DB file
+        if migration_error:
+            if backup_path and backup_path.exists():
+                await self._restore_from_backup(backup_path)
+            raise migration_error
 
     async def _restore_from_backup(self, backup_path: Path) -> None:
         """Restore database from backup after a failed migration.

@@ -172,9 +172,9 @@ class DatabaseValidator:
         except (InvalidOperation, ValueError, TypeError) as e:
             raise ValidationError(f"Invalid {field_name}: {price} - {e}")
 
-        if not min_val:
+        if min_val is None:
             min_val = DatabaseValidator.MIN_PRICE
-        if not max_val:
+        if max_val is None:
             max_val = DatabaseValidator.MAX_PRICE
 
         if price_float < min_val:

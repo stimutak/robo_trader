@@ -187,7 +187,7 @@ def validate_portfolio(f):
     def decorated(*args, **kwargs):
         portfolio_id = request.args.get("portfolio_id", "default")
         try:
-            _portfolio_validator.validate_portfolio_id(portfolio_id)
+            portfolio_id = _portfolio_validator.validate_portfolio_id(portfolio_id)
         except ValidationError as e:
             return jsonify({"error": str(e)}), 400
         # Check if non-default portfolio actually exists
