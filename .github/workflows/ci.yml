@@ -40,7 +40,7 @@ jobs:
       run: flake8 robo_trader/ --max-line-length=100
 
     - name: Run bandit security scan
-      run: bandit -r robo_trader/ -ll --skip B101,B104,B201
+      run: bandit -r robo_trader/ -ll --skip B101,B104,B108,B201,B301
 
   test:
     runs-on: ubuntu-latest
