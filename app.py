@@ -244,14 +244,20 @@ HTML_TEMPLATE = """
         }
         
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
             background: #0a0a0a;
             color: #e0e0e0;
             line-height: 1.6;
         }
+
+        /* Financial number typography */
+        .num, td[data-sort-type="number"], .card-value, .metric-value {
+            font-family: 'JetBrains Mono', 'SF Mono', Monaco, Menlo, monospace;
+            font-variant-numeric: tabular-nums;
+        }
         
         .container {
-            max-width: 1400px;
+            max-width: 1800px;
             margin: 0 auto;
             padding: 20px;
         }
@@ -263,6 +269,8 @@ HTML_TEMPLATE = """
             padding: 8px 0;
             border-bottom: 1px solid #21262d;
             margin-bottom: 10px;
+            flex-wrap: nowrap;
+            gap: 10px;
         }
 
         .logo {
@@ -377,6 +385,7 @@ HTML_TEMPLATE = """
             border-radius: 12px;
             font-size: 11px;
             border: 1px solid #21262d;
+            white-space: nowrap;
         }
 
         .status-dot {
@@ -731,7 +740,106 @@ HTML_TEMPLATE = """
             opacity: 0.5;
             pointer-events: none;
         }
+
+        /* Sortable table headers */
+        th.sortable {
+            cursor: pointer;
+            user-select: none;
+            position: relative;
+            padding-right: 18px !important;
+        }
+        th.sortable:hover {
+            color: #c9d1d9;
+            background: rgba(88, 166, 255, 0.05);
+        }
+        th.sortable::after {
+            content: '⇅';
+            position: absolute;
+            right: 4px;
+            font-size: 9px;
+            opacity: 0.3;
+        }
+        th.sortable.sort-asc::after {
+            content: '▲';
+            opacity: 0.8;
+            color: #58a6ff;
+        }
+        th.sortable.sort-desc::after {
+            content: '▼';
+            opacity: 0.8;
+            color: #58a6ff;
+        }
+
+        /* Risk gauge bars */
+        .risk-gauge {
+            height: 6px;
+            background: #21262d;
+            border-radius: 3px;
+            overflow: hidden;
+            margin-top: 4px;
+        }
+        .risk-gauge-fill {
+            height: 100%;
+            border-radius: 3px;
+            transition: width 0.5s ease;
+        }
+        .risk-gauge-fill.safe { background: #4ade80; }
+        .risk-gauge-fill.warning { background: #fbbf24; }
+        .risk-gauge-fill.danger { background: #f87171; }
+
+        /* Keyboard shortcut hints */
+        .kbd-hint {
+            display: inline-block;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 9px;
+            color: #6b7280;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 3px;
+            padding: 0 4px;
+            margin-left: 4px;
+            line-height: 16px;
+            vertical-align: middle;
+        }
+
+        /* P&L attribution bars */
+        .pnl-bar-container {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 0;
+        }
+        .pnl-bar-label {
+            width: 40px;
+            font-size: 10px;
+            color: #58a6ff;
+            font-weight: 600;
+            text-align: right;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .pnl-bar-track {
+            flex: 1;
+            height: 14px;
+            background: #161b22;
+            border-radius: 3px;
+            position: relative;
+            overflow: hidden;
+        }
+        .pnl-bar-fill {
+            height: 100%;
+            border-radius: 3px;
+            transition: width 0.4s ease;
+            min-width: 2px;
+        }
+        .pnl-bar-value {
+            width: 55px;
+            font-size: 10px;
+            font-family: 'JetBrains Mono', monospace;
+            text-align: right;
+        }
     </style>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
@@ -766,19 +874,20 @@ HTML_TEMPLATE = """
         </header>
 
         <div class="tabs">
-            <div class="tab active" onclick="switchTab('overview', this)">Overview</div>
-            <div class="tab" onclick="switchTab('watchlist', this)">Watchlist</div>
-            <div class="tab" onclick="switchTab('positions', this)">Positions</div>
-            <div class="tab" onclick="switchTab('strategies', this)">Strategies</div>
-            <div class="tab" onclick="switchTab('trades', this)">Trades</div>
-            <div class="tab" onclick="switchTab('ml', this)">ML</div>
-            <div class="tab" onclick="switchTab('performance', this)">Performance</div>
-            <div class="tab" onclick="switchTab('logs', this)">Logs</div>
+            <div class="tab active" onclick="switchTab('overview', this)">Overview <span class="kbd-hint">1</span></div>
+            <div class="tab" onclick="switchTab('watchlist', this)">Watchlist <span class="kbd-hint">2</span></div>
+            <div class="tab" onclick="switchTab('positions', this)">Positions <span class="kbd-hint">3</span></div>
+            <div class="tab" onclick="switchTab('strategies', this)">Strategies <span class="kbd-hint">4</span></div>
+            <div class="tab" onclick="switchTab('trades', this)">Trades <span class="kbd-hint">5</span></div>
+            <div class="tab" onclick="switchTab('ml', this)">ML <span class="kbd-hint">6</span></div>
+            <div class="tab" onclick="switchTab('performance', this)">Performance <span class="kbd-hint">7</span></div>
+            <div class="tab" onclick="switchTab('risk', this)">Risk <span class="kbd-hint">8</span></div>
+            <div class="tab" onclick="switchTab('logs', this)">Logs <span class="kbd-hint">9</span></div>
         </div>
         
         <div id="overview-tab" class="tab-content">
             <!-- HERO ROW: The Big Numbers -->
-            <div style="display: grid; grid-template-columns: 2fr 1fr 1fr 1fr; gap: 10px; margin-bottom: 10px;">
+            <div style="display: grid; grid-template-columns: 2fr 1fr 1fr 1fr; gap: 10px; margin-bottom: 10px; min-width: 0;">
                 <!-- Total Equity - Hero Card -->
                 <div style="background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); padding: 16px; border-radius: 10px; border: 1px solid #334155;">
                     <div style="display: flex; justify-content: space-between; align-items: flex-start;">
@@ -816,7 +925,7 @@ HTML_TEMPLATE = """
             </div>
 
             <!-- RISK ROW: Capital & Risk Metrics -->
-            <div style="display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; margin-bottom: 10px;">
+            <div style="display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; margin-bottom: 10px;">
                 <div style="background: #161b22; padding: 10px; border-radius: 6px; text-align: center; border: 1px solid #21262d;">
                     <div style="font-size: 9px; color: #8b949e; text-transform: uppercase;">Positions Value</div>
                     <div style="font-size: 15px; font-weight: bold; color: #60a5fa;" id="ov-positions-value">$0</div>
@@ -887,11 +996,11 @@ HTML_TEMPLATE = """
             </div>
 
             <!-- STRATEGY ROW: Performance Metrics + Recent Trades -->
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
+            <div style="display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 10px; margin-bottom: 10px;">
                 <!-- Strategy Metrics -->
                 <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
                     <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 11px; text-transform: uppercase;">Strategy Performance</h4>
-                    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;">
+                    <div style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px;">
                         <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
                             <div style="font-size: 9px; color: #8b949e;">Win Rate</div>
                             <div style="font-size: 14px; font-weight: bold; color: #4ade80;" id="ov-win-rate">0%</div>
@@ -909,7 +1018,7 @@ HTML_TEMPLATE = """
                             <div style="font-size: 14px; font-weight: bold;" id="ov-trades">0</div>
                         </div>
                     </div>
-                    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 6px;">
+                    <div style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-top: 6px;">
                         <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
                             <div style="font-size: 9px; color: #8b949e;">Avg Win</div>
                             <div style="font-size: 13px; font-weight: bold; color: #4ade80;" id="ov-avg-win">$0</div>
@@ -938,8 +1047,30 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
+            <!-- P&L + STOPS ROW: 3-column layout -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 10px;">
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 8px 0; font-size: 11px; text-transform: uppercase;">P&L by Symbol</h4>
+                    <div id="pnl-by-symbol" style="font-size: 11px;">
+                        <div style="color: #666; text-align: center; padding: 10px;">Loading...</div>
+                    </div>
+                </div>
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 8px 0; font-size: 11px; text-transform: uppercase;">Active Stop-Losses</h4>
+                    <div id="active-stops-list" style="font-size: 11px; max-height: 130px; overflow-y: auto;">
+                        <div style="color: #666; text-align: center; padding: 10px;">Loading...</div>
+                    </div>
+                </div>
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 8px 0; font-size: 11px; text-transform: uppercase;">Signal Activity</h4>
+                    <div id="signal-activity-list" style="font-size: 11px; max-height: 130px; overflow-y: auto;">
+                        <div style="color: #666; text-align: center; padding: 10px;">Loading...</div>
+                    </div>
+                </div>
+            </div>
+
             <!-- STATUS ROW: System Health -->
-            <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px;">
+            <div style="display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px;">
                 <div style="background: #161b22; padding: 10px; border-radius: 6px; display: flex; align-items: center; gap: 8px; border: 1px solid #21262d;">
                     <div style="width: 8px; height: 8px; border-radius: 50%; background: #4ade80;" id="ov-conn-dot"></div>
                     <div>
@@ -1230,21 +1361,22 @@ HTML_TEMPLATE = """
             </div>
             <!-- Positions Table -->
             <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; overflow: hidden;">
-                <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
+                <table id="positions-sortable-table" style="width: 100%; border-collapse: collapse; font-size: 12px;">
                     <thead>
                         <tr style="background: #161b22;">
-                            <th style="padding: 8px 10px; text-align: left; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Symbol</th>
-                            <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Qty</th>
-                            <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Entry</th>
-                            <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Current</th>
-                            <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">P&L</th>
-                            <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">P&L %</th>
-                            <th style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Value</th>
+                            <th class="sortable" data-sort-key="symbol" style="padding: 8px 10px; text-align: left; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Symbol</th>
+                            <th class="sortable" data-sort-key="quantity" data-sort-type="number" style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Qty</th>
+                            <th class="sortable" data-sort-key="entry_price" data-sort-type="number" style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Entry</th>
+                            <th class="sortable" data-sort-key="current_price" data-sort-type="number" style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Current</th>
+                            <th class="sortable" data-sort-key="pnl" data-sort-type="number" style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">P&L</th>
+                            <th class="sortable" data-sort-key="pnlPct" data-sort-type="number" style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">P&L %</th>
+                            <th class="sortable" data-sort-key="weight" data-sort-type="number" style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Weight</th>
+                            <th class="sortable" data-sort-key="holdDays" data-sort-type="number" style="padding: 8px 10px; text-align: right; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Hold</th>
                             <th style="padding: 8px 10px; text-align: center; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d;">Signal</th>
                         </tr>
                     </thead>
                     <tbody id="positions-table">
-                        <tr><td colspan="8" style="padding: 20px; text-align: center; color: #666;">Loading...</td></tr>
+                        <tr><td colspan="9" style="padding: 20px; text-align: center; color: #666;">Loading...</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -1420,7 +1552,7 @@ HTML_TEMPLATE = """
                 <!-- Execution Metrics -->
                 <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
                     <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 12px; text-transform: uppercase;">Execution Metrics</h4>
-                    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 8px;">
+                    <div style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-bottom: 8px;">
                         <div style="background: #161b22; padding: 6px; border-radius: 6px; text-align: center;">
                             <div style="font-size: 9px; color: #8b949e;">Slippage</div>
                             <div style="font-size: 14px; font-weight: bold; color: #4ade80;" id="exec-avg-slip">1.2 bps</div>
@@ -1511,7 +1643,7 @@ HTML_TEMPLATE = """
 
         <div id="logs-tab" class="tab-content" style="display: none;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-                <h3 style="color: #ffa500; margin: 0;">📋 System Logs</h3>
+                <h3 style="color: #ffa500; margin: 0;">System Logs</h3>
                 <div style="display: flex; gap: 10px; align-items: center;">
                     <label style="display: flex; align-items: center; gap: 5px; cursor: pointer; color: #888; font-size: 13px;">
                         <input type="checkbox" id="auto-scroll-toggle" checked style="cursor: pointer;">
@@ -1539,8 +1671,169 @@ HTML_TEMPLATE = """
                 </div>
             </div>
         </div>
+
+        <div id="risk-tab" class="tab-content" style="display: none;">
+            <!-- Kill Switch & Risk Limits -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                <!-- Kill Switch Status -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <h4 style="color: #58a6ff; margin: 0; font-size: 11px; text-transform: uppercase;">Kill Switches</h4>
+                        <span id="kill-switch-status" style="font-size: 10px; padding: 2px 8px; border-radius: 3px; background: #238636; color: #fff;">SAFE</span>
+                    </div>
+                    <div style="display: flex; flex-direction: column; gap: 10px;">
+                        <div>
+                            <div style="display: flex; justify-content: space-between; font-size: 10px; margin-bottom: 2px;">
+                                <span style="color: #8b949e;">Daily Loss</span>
+                                <span style="font-family: 'JetBrains Mono', monospace;"><span id="risk-daily-loss-current" style="color: #e0e0e0;">0%</span> / <span style="color: #6b7280;" id="risk-daily-loss-limit">5%</span></span>
+                            </div>
+                            <div class="risk-gauge"><div class="risk-gauge-fill safe" id="risk-daily-loss-bar" style="width: 0%;"></div></div>
+                        </div>
+                        <div>
+                            <div style="display: flex; justify-content: space-between; font-size: 10px; margin-bottom: 2px;">
+                                <span style="color: #8b949e;">Consecutive Losses</span>
+                                <span style="font-family: 'JetBrains Mono', monospace;"><span id="risk-consec-current" style="color: #e0e0e0;">0</span> / <span style="color: #6b7280;" id="risk-consec-limit">5</span></span>
+                            </div>
+                            <div class="risk-gauge"><div class="risk-gauge-fill safe" id="risk-consec-bar" style="width: 0%;"></div></div>
+                        </div>
+                        <div>
+                            <div style="display: flex; justify-content: space-between; font-size: 10px; margin-bottom: 2px;">
+                                <span style="color: #8b949e;">Max Drawdown</span>
+                                <span style="font-family: 'JetBrains Mono', monospace;"><span id="risk-dd-current" style="color: #e0e0e0;">0%</span> / <span style="color: #6b7280;" id="risk-dd-limit">10%</span></span>
+                            </div>
+                            <div class="risk-gauge"><div class="risk-gauge-fill safe" id="risk-dd-bar" style="width: 0%;"></div></div>
+                        </div>
+                        <div>
+                            <div style="display: flex; justify-content: space-between; font-size: 10px; margin-bottom: 2px;">
+                                <span style="color: #8b949e;">Portfolio Leverage</span>
+                                <span style="font-family: 'JetBrains Mono', monospace;" id="risk-leverage">0.00x</span>
+                            </div>
+                            <div class="risk-gauge"><div class="risk-gauge-fill safe" id="risk-leverage-bar" style="width: 0%;"></div></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Kelly Sizing -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <h4 style="color: #58a6ff; margin: 0; font-size: 11px; text-transform: uppercase;">Kelly Position Sizing</h4>
+                        <span style="font-size: 10px; color: #8b949e;">Portfolio Kelly: <span id="portfolio-kelly" style="color: #fbbf24; font-family: 'JetBrains Mono', monospace;">0%</span></span>
+                    </div>
+                    <div style="max-height: 150px; overflow-y: auto;">
+                        <table style="width: 100%; border-collapse: collapse; font-size: 11px;">
+                            <thead>
+                                <tr style="border-bottom: 1px solid #21262d;">
+                                    <th style="padding: 4px 6px; text-align: left; color: #8b949e; font-weight: 500;">Symbol</th>
+                                    <th style="padding: 4px 6px; text-align: right; color: #8b949e; font-weight: 500;">Kelly %</th>
+                                    <th style="padding: 4px 6px; text-align: right; color: #8b949e; font-weight: 500;">Win Rate</th>
+                                    <th style="padding: 4px 6px; text-align: right; color: #8b949e; font-weight: 500;">Edge</th>
+                                </tr>
+                            </thead>
+                            <tbody id="kelly-table">
+                                <tr><td colspan="4" style="text-align: center; color: #666; padding: 12px;">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Circuit Breakers & Safety Thresholds -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                <!-- Circuit Breakers -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <h4 style="color: #58a6ff; margin: 0; font-size: 11px; text-transform: uppercase;">Circuit Breakers</h4>
+                        <span id="breakers-open-count" style="font-size: 10px; padding: 2px 8px; border-radius: 3px; background: #238636; color: #fff;">0 OPEN</span>
+                    </div>
+                    <div id="circuit-breakers-grid" style="display: flex; flex-direction: column; gap: 6px;">
+                        <div style="color: #666; text-align: center; padding: 12px; font-size: 11px;">Loading...</div>
+                    </div>
+                </div>
+
+                <!-- Safety Thresholds -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 11px; text-transform: uppercase;">Safety Thresholds</h4>
+                    <div id="safety-thresholds-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px;">
+                        <div style="color: #666; text-align: center; padding: 12px; font-size: 11px; grid-column: span 2;">Loading...</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Data Validation & Risk Metrics -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                <!-- Data Validator -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 11px; text-transform: uppercase;">Data Validation</h4>
+                    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;">
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Validations</div>
+                            <div style="font-size: 14px; font-weight: bold; font-family: 'JetBrains Mono', monospace;" id="risk-total-validations">0</div>
+                        </div>
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Pass Rate</div>
+                            <div style="font-size: 14px; font-weight: bold; color: #4ade80; font-family: 'JetBrains Mono', monospace;" id="risk-pass-rate">100%</div>
+                        </div>
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Failed</div>
+                            <div style="font-size: 14px; font-weight: bold; color: #f87171; font-family: 'JetBrains Mono', monospace;" id="risk-failed-total">0</div>
+                        </div>
+                    </div>
+                    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin-top: 8px;">
+                        <div style="text-align: center; font-size: 9px;">
+                            <div style="color: #8b949e;">Stale</div>
+                            <div style="color: #fbbf24; font-family: 'JetBrains Mono', monospace;" id="risk-failed-stale">0</div>
+                        </div>
+                        <div style="text-align: center; font-size: 9px;">
+                            <div style="color: #8b949e;">Spread</div>
+                            <div style="color: #fbbf24; font-family: 'JetBrains Mono', monospace;" id="risk-failed-spread">0</div>
+                        </div>
+                        <div style="text-align: center; font-size: 9px;">
+                            <div style="color: #8b949e;">Price</div>
+                            <div style="color: #fbbf24; font-family: 'JetBrains Mono', monospace;" id="risk-failed-price">0</div>
+                        </div>
+                        <div style="text-align: center; font-size: 9px;">
+                            <div style="color: #8b949e;">Volume</div>
+                            <div style="color: #fbbf24; font-family: 'JetBrains Mono', monospace;" id="risk-failed-volume">0</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Risk Summary Metrics -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 11px; text-transform: uppercase;">Risk Metrics</h4>
+                    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;">
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Total Exposure</div>
+                            <div style="font-size: 13px; font-weight: bold; font-family: 'JetBrains Mono', monospace;" id="risk-total-exposure">$0</div>
+                        </div>
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Daily P&L</div>
+                            <div style="font-size: 13px; font-weight: bold; font-family: 'JetBrains Mono', monospace;" id="risk-daily-pnl">$0</div>
+                        </div>
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Capital</div>
+                            <div style="font-size: 13px; font-weight: bold; font-family: 'JetBrains Mono', monospace;" id="risk-current-capital">$0</div>
+                        </div>
+                    </div>
+                    <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #21262d;">
+                        <div style="display: flex; justify-content: space-between; font-size: 10px; padding: 3px 0;">
+                            <span style="color: #8b949e;">Win Rate (Overall)</span>
+                            <span style="font-family: 'JetBrains Mono', monospace;" id="risk-win-rate">—</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; font-size: 10px; padding: 3px 0;">
+                            <span style="color: #8b949e;">Total P&L</span>
+                            <span style="font-family: 'JetBrains Mono', monospace;" id="risk-total-pnl">—</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; font-size: 10px; padding: 3px 0;">
+                            <span style="color: #8b949e;">Max Drawdown (Realized)</span>
+                            <span style="font-family: 'JetBrains Mono', monospace; color: #f87171;" id="risk-max-dd">—</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
-    
+
     <script>
         let currentTab = 'overview';
         let currentPortfolio = 'default';
@@ -1674,6 +1967,10 @@ HTML_TEMPLATE = """
                 loadWatchlist();
             } else if (tab === 'trades') {
                 loadTrades();
+            } else if (tab === 'strategies') {
+                refreshStrategies();
+            } else if (tab === 'risk') {
+                loadRiskData();
             }
         }
         
@@ -1722,7 +2019,8 @@ HTML_TEMPLATE = """
                 loadMLData(),
                 loadPerformanceData(),
                 loadTrades(),
-                loadOverviewData()
+                loadOverviewData(),
+                loadRiskData()
             ]);
         }
 
@@ -2940,10 +3238,13 @@ HTML_TEMPLATE = """
             }).join('');
         }
         
+        // Store positions data for sorting
+        let _positionsData = [];
+
         function updatePositionsTable(positions) {
             const tbody = document.getElementById('positions-table');
             if (!positions || positions.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="8" style="padding: 20px; text-align: center; color: #666;">No open positions</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="9" style="padding: 20px; text-align: center; color: #666;">No open positions</td></tr>';
                 document.getElementById('position-count').textContent = '0';
                 document.getElementById('position-value').textContent = '$0.00 value';
                 // Reset summary stats
@@ -2953,6 +3254,7 @@ HTML_TEMPLATE = """
                 document.getElementById('pos-winners').textContent = '0';
                 document.getElementById('pos-losers').textContent = '0';
                 document.getElementById('pos-avg-pnl-pct').textContent = '0%';
+                _positionsData = [];
                 return;
             }
 
@@ -2960,15 +3262,44 @@ HTML_TEMPLATE = """
             let totalValue = 0, totalPnl = 0, winners = 0, losers = 0, totalPnlPct = 0;
             const posData = positions.map(pos => {
                 const pnl = (pos.current_price - pos.entry_price) * pos.quantity;
-                const pnlPct = ((pos.current_price - pos.entry_price) / pos.entry_price) * 100;
+                const pnlPct = pos.entry_price > 0
+                    ? ((pos.current_price - pos.entry_price) / pos.entry_price) * 100
+                    : 0;
                 const value = pos.current_price * pos.quantity;
                 totalValue += value;
                 totalPnl += pnl;
                 totalPnlPct += pnlPct;
                 if (pnl > 0) winners++;
                 else if (pnl < 0) losers++;
-                return { ...pos, pnl, pnlPct, value };
+
+                // Calculate hold duration
+                let holdDays = 0;
+                let holdDisplay = '—';
+                if (pos.entry_time) {
+                    try {
+                        const entryDate = new Date(pos.entry_time.replace(' ', 'T') + (pos.entry_time.includes('Z') ? '' : 'Z'));
+                        const now = new Date();
+                        const diffMs = now - entryDate;
+                        holdDays = diffMs / (1000 * 60 * 60 * 24);
+                        if (holdDays < 1) {
+                            const hours = Math.floor(diffMs / (1000 * 60 * 60));
+                            holdDisplay = hours + 'h';
+                        } else {
+                            holdDisplay = Math.floor(holdDays) + 'd';
+                        }
+                    } catch (e) { holdDisplay = '—'; }
+                }
+
+                return { ...pos, pnl, pnlPct, value, holdDays, holdDisplay };
             });
+
+            // Calculate weights after totalValue is known
+            posData.forEach(pos => {
+                pos.weight = totalValue > 0 ? (pos.value / totalValue) * 100 : 0;
+            });
+
+            // Store for sorting
+            _positionsData = posData;
 
             // Update summary stats
             document.getElementById('pos-count').textContent = positions.length;
@@ -2983,27 +3314,12 @@ HTML_TEMPLATE = """
             avgEl.textContent = avgPnlPct.toFixed(1) + '%';
             avgEl.style.color = avgPnlPct >= 0 ? '#4ade80' : '#f87171';
 
-            tbody.innerHTML = posData.map(pos => {
-                const pnlColor = pos.pnl >= 0 ? '#4ade80' : '#f87171';
-                const signalBadge = pos.ml_signal === 'buy'
-                    ? '<span style="background: #238636; color: #fff; padding: 2px 6px; border-radius: 3px; font-size: 10px;">BUY</span>'
-                    : pos.ml_signal === 'sell'
-                    ? '<span style="background: #da3633; color: #fff; padding: 2px 6px; border-radius: 3px; font-size: 10px;">SELL</span>'
-                    : '<span style="background: #30363d; color: #8b949e; padding: 2px 6px; border-radius: 3px; font-size: 10px;">HOLD</span>';
+            renderPositionsRows(posData);
 
-                return `
-                    <tr style="border-bottom: 1px solid #21262d;">
-                        <td style="padding: 6px 10px;"><strong style="color: #58a6ff;">${pos.symbol}</strong></td>
-                        <td style="padding: 6px 10px; text-align: right;">${pos.quantity}</td>
-                        <td style="padding: 6px 10px; text-align: right;">$${pos.entry_price.toFixed(2)}</td>
-                        <td style="padding: 6px 10px; text-align: right;">$${pos.current_price.toFixed(2)}</td>
-                        <td style="padding: 6px 10px; text-align: right; color: ${pnlColor};">$${pos.pnl.toFixed(2)}</td>
-                        <td style="padding: 6px 10px; text-align: right; color: ${pnlColor};">${pos.pnlPct.toFixed(1)}%</td>
-                        <td style="padding: 6px 10px; text-align: right;">$${pos.value.toFixed(0)}</td>
-                        <td style="padding: 6px 10px; text-align: center;">${signalBadge}</td>
-                    </tr>
-                `;
-            }).join('');
+            // Also render P&L by Symbol and Active Stops in overview
+            renderPnlBySymbol(posData);
+            renderActiveStops(posData).catch(err => console.error('renderActiveStops failed:', err));
+            renderSignalActivity().catch(err => console.error('renderSignalActivity failed:', err));
 
             document.getElementById('position-count').textContent = positions.length.toString();
             document.getElementById('position-value').textContent = formatCurrency(totalValue) + ' value';
@@ -3021,128 +3337,196 @@ HTML_TEMPLATE = """
                 }
             }
         }
-        
-        async function updateSafetyMonitoring() {
+
+        function renderPositionsRows(posData) {
+            const tbody = document.getElementById('positions-table');
+            tbody.innerHTML = posData.map(pos => {
+                const pnlColor = pos.pnl >= 0 ? '#4ade80' : '#f87171';
+                const signalBadge = pos.ml_signal === 'buy'
+                    ? '<span style="background: #238636; color: #fff; padding: 2px 6px; border-radius: 3px; font-size: 10px;">BUY</span>'
+                    : pos.ml_signal === 'sell'
+                    ? '<span style="background: #da3633; color: #fff; padding: 2px 6px; border-radius: 3px; font-size: 10px;">SELL</span>'
+                    : '<span style="background: #30363d; color: #8b949e; padding: 2px 6px; border-radius: 3px; font-size: 10px;">HOLD</span>';
+
+                // Weight color: green if balanced, yellow if concentrated
+                const weightColor = pos.weight > 30 ? '#fbbf24' : pos.weight > 20 ? '#e0e0e0' : '#8b949e';
+                // Hold time color: green for fresh, yellow for medium, red for stale
+                const holdColor = pos.holdDays > 30 ? '#f87171' : pos.holdDays > 7 ? '#fbbf24' : '#4ade80';
+
+                return `
+                    <tr style="border-bottom: 1px solid #21262d;" data-symbol="${pos.symbol}" data-pnl="${pos.pnl}" data-pnlpct="${pos.pnlPct}" data-value="${pos.value}" data-weight="${pos.weight}" data-hold="${pos.holdDays}">
+                        <td style="padding: 6px 10px;"><strong style="color: #58a6ff;">${pos.symbol}</strong></td>
+                        <td style="padding: 6px 10px; text-align: right; font-family: 'JetBrains Mono', monospace; font-size: 11px;">${pos.quantity}</td>
+                        <td style="padding: 6px 10px; text-align: right; font-family: 'JetBrains Mono', monospace; font-size: 11px;">$${pos.entry_price.toFixed(2)}</td>
+                        <td style="padding: 6px 10px; text-align: right; font-family: 'JetBrains Mono', monospace; font-size: 11px;">$${pos.current_price.toFixed(2)}</td>
+                        <td style="padding: 6px 10px; text-align: right; color: ${pnlColor}; font-family: 'JetBrains Mono', monospace; font-size: 11px;">$${pos.pnl.toFixed(2)}</td>
+                        <td style="padding: 6px 10px; text-align: right; color: ${pnlColor}; font-family: 'JetBrains Mono', monospace; font-size: 11px;">${pos.pnlPct.toFixed(1)}%</td>
+                        <td style="padding: 6px 10px; text-align: right; color: ${weightColor}; font-family: 'JetBrains Mono', monospace; font-size: 11px;">${pos.weight.toFixed(1)}%</td>
+                        <td style="padding: 6px 10px; text-align: right; color: ${holdColor}; font-family: 'JetBrains Mono', monospace; font-size: 11px;">${pos.holdDisplay}</td>
+                        <td style="padding: 6px 10px; text-align: center;">${signalBadge}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function renderPnlBySymbol(posData) {
+            const container = document.getElementById('pnl-by-symbol');
+            if (!container) return;
+
+            if (!posData || posData.length === 0) {
+                container.innerHTML = '<div style="color: #666; text-align: center; padding: 10px;">No positions</div>';
+                return;
+            }
+
+            // Sort by absolute P&L, show top contributors
+            const sorted = [...posData].sort((a, b) => Math.abs(b.pnl) - Math.abs(a.pnl)).slice(0, 6);
+            const maxAbsPnl = Math.max(...sorted.map(p => Math.abs(p.pnl)), 1);
+
+            container.innerHTML = sorted.map(pos => {
+                const isPositive = pos.pnl >= 0;
+                const barColor = isPositive ? '#4ade80' : '#f87171';
+                const barWidth = Math.max(2, (Math.abs(pos.pnl) / maxAbsPnl) * 100);
+                const pnlSign = isPositive ? '+' : '';
+
+                return `<div class="pnl-bar-container">
+                    <span class="pnl-bar-label">${pos.symbol}</span>
+                    <div class="pnl-bar-track">
+                        <div class="pnl-bar-fill" style="width: ${barWidth}%; background: ${barColor};"></div>
+                    </div>
+                    <span class="pnl-bar-value" style="color: ${barColor};">${pnlSign}$${Math.abs(pos.pnl).toFixed(0)}</span>
+                </div>`;
+            }).join('');
+        }
+
+        // Cache for stop-loss config from safety thresholds API (60s TTL)
+        let _stopConfig = null;
+
+        async function loadStopConfig() {
+            if (_stopConfig && (Date.now() - _stopConfig._ts < 60000)) return _stopConfig;
             try {
-                // Fetch circuit breakers
-                const breakersResponse = await fetch('/api/safety/circuit-breakers');
-                const breakers = await breakersResponse.json();
-                updateCircuitBreakers(breakers);
+                const resp = await fetch('/api/safety/thresholds');
+                const data = await resp.json();
+                const useTrailing = data.use_trailing_stop === 'true';
+                _stopConfig = {
+                    trailingPct: parseFloat(useTrailing
+                        ? (data.trailing_stop_percent || '5.0')
+                        : (data.stop_loss_percent || '2.0')),
+                    useTrailing: useTrailing,
+                    _ts: Date.now()
+                };
+            } catch (e) {
+                _stopConfig = { trailingPct: 5.0, useTrailing: true, _ts: Date.now() };
+            }
+            return _stopConfig;
+        }
 
-                // Fetch order manager
-                const ordersResponse = await fetch('/api/safety/order-manager');
-                const orders = await ordersResponse.json();
-                updateOrderManager(orders);
+        async function renderActiveStops(posData) {
+            const container = document.getElementById('active-stops-list');
+            if (!container) return;
 
-                // Fetch data validator
-                const validatorResponse = await fetch('/api/safety/data-validator');
-                const validator = await validatorResponse.json();
-                updateDataValidator(validator);
+            if (!posData || posData.length === 0) {
+                container.innerHTML = '<div style="color: #666; text-align: center; padding: 10px;">No positions</div>';
+                return;
+            }
 
-                // Fetch safety thresholds
-                const thresholdsResponse = await fetch('/api/safety/thresholds');
-                const thresholds = await thresholdsResponse.json();
-                updateSafetyThresholds(thresholds);
-            } catch (error) {
-                console.error('Error updating safety monitoring:', error);
+            const config = await loadStopConfig();
+            const trailingPct = config.trailingPct;
+            const useTrailing = config.useTrailing;
+
+            container.innerHTML = posData.map(pos => {
+                // Estimate stop level - high water mark would be max(entry, current)
+                const highWater = Math.max(pos.entry_price, pos.current_price);
+                const stopLevel = useTrailing
+                    ? highWater * (1 - trailingPct / 100)
+                    : pos.entry_price * (1 - trailingPct / 100);
+                const stopDistance = pos.current_price > 0
+                    ? ((pos.current_price - stopLevel) / pos.current_price * 100)
+                    : 0;
+                const stopColor = stopDistance < 2 ? '#f87171' : stopDistance < 3 ? '#fbbf24' : '#4ade80';
+
+                return `<div style="display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #21262d; font-size: 10px;">
+                    <span style="color: #58a6ff; font-weight: 600; width: 40px;">${pos.symbol}</span>
+                    <span style="color: #8b949e; font-family: 'JetBrains Mono', monospace;">$${stopLevel.toFixed(2)}</span>
+                    <span style="color: ${stopColor}; font-family: 'JetBrains Mono', monospace;">${stopDistance.toFixed(1)}% away</span>
+                    <span style="color: #6b7280; font-size: 9px;">${useTrailing ? 'TRAIL' : 'FIXED'}</span>
+                </div>`;
+            }).join('');
+        }
+
+        async function renderSignalActivity() {
+            const container = document.getElementById('signal-activity-list');
+            if (!container) return;
+            try {
+                const resp = await fetch('/api/ml/predictions');
+                const data = await resp.json();
+                const preds = data.predictions || [];
+                // Show BUY/SELL first, then top-confidence HOLDs
+                const actionOrder = { BUY: 0, SELL: 1, HOLD: 2 };
+                const sorted = [...preds]
+                    .sort((a, b) => (actionOrder[a.action] ?? 3) - (actionOrder[b.action] ?? 3) || b.confidence - a.confidence)
+                    .slice(0, 8);
+                if (sorted.length === 0) {
+                    container.innerHTML = '<div style="color: #666; text-align: center; padding: 10px;">No signals</div>';
+                    return;
+                }
+                container.innerHTML = sorted.map(p => {
+                    const color = p.action === 'BUY' ? '#4ade80' : p.action === 'SELL' ? '#f87171' : '#6b7280';
+                    const conf = (p.confidence * 100).toFixed(0);
+                    return `<div style="display: flex; justify-content: space-between; align-items: center; padding: 3px 0; border-bottom: 1px solid #21262d; font-size: 10px;">
+                        <span style="color: #58a6ff; font-weight: 600; width: 40px;">${p.symbol}</span>
+                        <span style="background: ${color}22; color: ${color}; padding: 1px 6px; border-radius: 3px; font-size: 9px; font-weight: 600;">${p.action}</span>
+                        <span style="color: #8b949e; font-family: 'JetBrains Mono', monospace;">${conf}%</span>
+                        <span style="color: #4a5568; font-size: 9px;">${p.source?.replace('ML_', '') || ''}</span>
+                    </div>`;
+                }).join('');
+            } catch (e) {
+                container.innerHTML = '<div style="color: #666; text-align: center; padding: 10px;">Error loading</div>';
             }
         }
 
-        function updateCircuitBreakers(breakers) {
-            const container = document.getElementById('circuit-breakers-content');
-            if (!container || !breakers) return;
+        // Table sorting
+        let _sortState = {};  // { tableId: { key, direction } }
 
-            let html = '';
-            for (const [name, stats] of Object.entries(breakers)) {
-                const stateClass = stats.state === 'closed' ? 'success' :
-                                 stats.state === 'open' ? 'danger' : 'warning';
-                const stateIcon = stats.state === 'closed' ? '✓' :
-                                stats.state === 'open' ? '✗' : '⚠';
+        function initSortableHeaders() {
+            document.querySelectorAll('th.sortable').forEach(th => {
+                th.addEventListener('click', () => {
+                    const table = th.closest('table');
+                    if (!table) return;
+                    const tableId = table.id;
+                    const sortKey = th.dataset.sortKey;
+                    const sortType = th.dataset.sortType || 'string';
 
-                html += `
-                    <div class="circuit-breaker-item">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-                            <strong>${name}</strong>
-                            <span class="badge badge-${stateClass}">${stateIcon} ${stats.state.toUpperCase()}</span>
-                        </div>
-                        <div style="font-size: 0.9em; color: #999;">
-                            Calls: ${stats.total_calls} |
-                            Failed: ${stats.failed_calls} |
-                            Success Rate: ${((stats.successful_calls / Math.max(stats.total_calls, 1)) * 100).toFixed(1)}%
-                        </div>
-                    </div>
-                `;
-            }
+                    // Toggle direction
+                    const current = _sortState[tableId];
+                    let direction = 'asc';
+                    if (current && current.key === sortKey) {
+                        direction = current.direction === 'asc' ? 'desc' : 'asc';
+                    }
+                    _sortState[tableId] = { key: sortKey, direction };
 
-            container.innerHTML = html || '<div style="color: #666;">No circuit breakers active</div>';
-        }
+                    // Update header styling
+                    table.querySelectorAll('th.sortable').forEach(h => {
+                        h.classList.remove('sort-asc', 'sort-desc');
+                    });
+                    th.classList.add(direction === 'asc' ? 'sort-asc' : 'sort-desc');
 
-        function updateOrderManager(data) {
-            if (!data) return;
-
-            // Update stats
-            document.getElementById('total-orders').textContent = data.total_orders || 0;
-            document.getElementById('active-orders').textContent = data.active_orders || 0;
-            document.getElementById('fill-rate').textContent = ((data.fill_rate || 0)).toFixed(1) + '%';
-            document.getElementById('error-rate').textContent = ((data.error_rate || 0)).toFixed(1) + '%';
-
-            // Update recent orders table
-            const tbody = document.getElementById('recent-orders-body');
-            if (!tbody) return;
-
-            if (data.recent_orders && data.recent_orders.length > 0) {
-                let html = '';
-                data.recent_orders.forEach(order => {
-                    const statusClass = order.status === 'filled' ? 'success' :
-                                      order.status === 'error' || order.status === 'rejected' ? 'danger' :
-                                      order.status === 'partial_fill' ? 'warning' : 'info';
-
-                    html += `
-                        <tr>
-                            <td>${order.symbol}</td>
-                            <td><span class="badge badge-${statusClass}">${order.status}</span></td>
-                            <td>${order.fill_percentage.toFixed(1)}%</td>
-                            <td>${order.retry_count}</td>
-                        </tr>
-                    `;
+                    // Sort positions data
+                    if (tableId === 'positions-sortable-table' && _positionsData.length > 0) {
+                        const sorted = [..._positionsData].sort((a, b) => {
+                            let va = a[sortKey], vb = b[sortKey];
+                            if (sortType === 'number') {
+                                va = parseFloat(va) || 0;
+                                vb = parseFloat(vb) || 0;
+                                return direction === 'asc' ? va - vb : vb - va;
+                            }
+                            va = String(va || '');
+                            vb = String(vb || '');
+                            return direction === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va);
+                        });
+                        renderPositionsRows(sorted);
+                    }
                 });
-                tbody.innerHTML = html;
-            } else {
-                tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: #666;">No recent orders</td></tr>';
-            }
-        }
-
-        function updateDataValidator(data) {
-            if (!data) return;
-
-            // Update validation stats
-            document.getElementById('total-validations').textContent = data.total_validations || 0;
-            document.getElementById('pass-rate').textContent = ((data.pass_rate || 0)).toFixed(1) + '%';
-            document.getElementById('failed-stale').textContent = data.failed_stale || 0;
-            document.getElementById('failed-spread').textContent = data.failed_spread || 0;
-        }
-
-        function updateSafetyThresholds(thresholds) {
-            const container = document.getElementById('safety-thresholds-content');
-            if (!container || !thresholds) return;
-
-            let html = '<div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;">';
-
-            for (const [key, value] of Object.entries(thresholds)) {
-                // Format the key for display
-                const displayKey = key.replace(/_/g, ' ').toLowerCase()
-                    .replace(/\\b\\w/g, l => l.toUpperCase());
-
-                html += `
-                    <div style="padding: 8px; background: #2a2a2a; border-radius: 4px;">
-                        <div style="font-size: 0.85em; color: #999;">${displayKey}</div>
-                        <div style="font-size: 1.1em; font-weight: bold;">${value}</div>
-                    </div>
-                `;
-            }
-
-            html += '</div>';
-            container.innerHTML = html;
+            });
         }
 
         function updatePerformanceTable(data) {
@@ -3783,18 +4167,209 @@ HTML_TEMPLATE = """
             });
         }
         
+        // Load Risk & Safety data
+        async function loadRiskData() {
+            try {
+                const [riskResp, breakersResp, thresholdsResp, validatorResp] = await Promise.all([
+                    fetch(withPortfolio('/api/risk/status')),
+                    fetch('/api/safety/circuit-breakers'),
+                    fetch('/api/safety/thresholds'),
+                    fetch('/api/safety/data-validator')
+                ]);
+
+                // Risk status (kill switches, kelly, metrics)
+                if (riskResp.ok) {
+                    const risk = await riskResp.json();
+
+                    // Kill switch status
+                    const ksEl = document.getElementById('kill-switch-status');
+                    if (risk.kill_switches?.active) {
+                        ksEl.textContent = 'TRIGGERED';
+                        ksEl.style.background = '#da3633';
+                    } else {
+                        ksEl.textContent = 'SAFE';
+                        ksEl.style.background = '#238636';
+                    }
+
+                    // Risk limit gauges
+                    if (risk.kill_switches?.limits) {
+                        const limits = risk.kill_switches.limits;
+
+                        // Daily loss
+                        const dlCurrent = (limits.daily_loss?.current || 0) * 100;
+                        const dlLimit = (limits.daily_loss?.limit || 0.05) * 100;
+                        document.getElementById('risk-daily-loss-current').textContent = dlCurrent.toFixed(2) + '%';
+                        document.getElementById('risk-daily-loss-limit').textContent = dlLimit.toFixed(0) + '%';
+                        const dlBar = document.getElementById('risk-daily-loss-bar');
+                        const dlPct = Math.min(100, (dlCurrent / dlLimit) * 100);
+                        dlBar.style.width = dlPct + '%';
+                        dlBar.className = 'risk-gauge-fill ' + (dlPct > 80 ? 'danger' : dlPct > 50 ? 'warning' : 'safe');
+
+                        // Consecutive losses
+                        const clCurrent = limits.consecutive_losses?.current || 0;
+                        const clLimit = limits.consecutive_losses?.limit || 5;
+                        document.getElementById('risk-consec-current').textContent = clCurrent;
+                        document.getElementById('risk-consec-limit').textContent = clLimit;
+                        const clBar = document.getElementById('risk-consec-bar');
+                        const clPct = Math.min(100, (clCurrent / clLimit) * 100);
+                        clBar.style.width = clPct + '%';
+                        clBar.className = 'risk-gauge-fill ' + (clPct > 80 ? 'danger' : clPct > 50 ? 'warning' : 'safe');
+
+                        // Max drawdown
+                        const ddCurrent = (limits.max_drawdown?.current || 0) * 100;
+                        const ddLimit = (limits.max_drawdown?.limit || 0.10) * 100;
+                        document.getElementById('risk-dd-current').textContent = ddCurrent.toFixed(2) + '%';
+                        document.getElementById('risk-dd-limit').textContent = ddLimit.toFixed(0) + '%';
+                        const ddBar = document.getElementById('risk-dd-bar');
+                        const ddPct = Math.min(100, (ddCurrent / ddLimit) * 100);
+                        ddBar.style.width = ddPct + '%';
+                        ddBar.className = 'risk-gauge-fill ' + (ddPct > 80 ? 'danger' : ddPct > 50 ? 'warning' : 'safe');
+                    }
+
+                    // Leverage
+                    if (risk.risk_metrics) {
+                        const leverage = risk.risk_metrics.leverage || 0;
+                        document.getElementById('risk-leverage').textContent = leverage.toFixed(2) + 'x';
+                        const levBar = document.getElementById('risk-leverage-bar');
+                        const levPct = Math.min(100, leverage * 100);
+                        levBar.style.width = levPct + '%';
+                        levBar.className = 'risk-gauge-fill ' + (leverage > 0.8 ? 'danger' : leverage > 0.5 ? 'warning' : 'safe');
+
+                        // Risk metrics summary
+                        document.getElementById('risk-total-exposure').textContent = formatCurrency(risk.risk_metrics.total_exposure || 0);
+                        const dailyPnlEl = document.getElementById('risk-daily-pnl');
+                        const dailyPnl = risk.risk_metrics.daily_pnl || 0;
+                        dailyPnlEl.textContent = formatCurrency(dailyPnl);
+                        dailyPnlEl.style.color = dailyPnl >= 0 ? '#4ade80' : '#f87171';
+                        document.getElementById('risk-current-capital').textContent = formatCurrency(risk.risk_metrics.current_capital || 0);
+                        document.getElementById('risk-max-dd').textContent = ((risk.risk_metrics.max_drawdown || 0) * 100).toFixed(2) + '%';
+                        const totalPnlEl = document.getElementById('risk-total-pnl');
+                        const totalPnl = risk.risk_metrics.total_pnl || 0;
+                        totalPnlEl.textContent = formatCurrency(totalPnl);
+                        totalPnlEl.style.color = totalPnl >= 0 ? '#4ade80' : '#f87171';
+                    }
+
+                    // Kelly sizing
+                    if (risk.kelly_sizing) {
+                        document.getElementById('portfolio-kelly').textContent =
+                            (risk.kelly_sizing.portfolio_kelly * 100).toFixed(1) + '%';
+
+                        const kellyTbody = document.getElementById('kelly-table');
+                        const positions = risk.kelly_sizing.current_positions || {};
+                        if (Object.keys(positions).length > 0) {
+                            kellyTbody.innerHTML = Object.entries(positions).map(([symbol, data]) => {
+                                const kellyColor = data.kelly_fraction > 0.1 ? '#4ade80' : data.kelly_fraction > 0.02 ? '#fbbf24' : '#f87171';
+                                const edgeColor = data.edge > 0 ? '#4ade80' : '#f87171';
+                                return `<tr style="border-bottom: 1px solid #21262d;">
+                                    <td style="padding: 4px 6px; color: #58a6ff; font-weight: 600;">${symbol}</td>
+                                    <td style="padding: 4px 6px; text-align: right; color: ${kellyColor}; font-family: 'JetBrains Mono', monospace;">${(data.kelly_fraction * 100).toFixed(1)}%</td>
+                                    <td style="padding: 4px 6px; text-align: right; font-family: 'JetBrains Mono', monospace;">${(data.win_rate * 100).toFixed(0)}%</td>
+                                    <td style="padding: 4px 6px; text-align: right; color: ${edgeColor}; font-family: 'JetBrains Mono', monospace;">${(data.edge * 100).toFixed(2)}%</td>
+                                </tr>`;
+                            }).join('');
+                        } else {
+                            kellyTbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: #666; padding: 12px;">No positions for Kelly calc</td></tr>';
+                        }
+
+                    }
+                }
+
+                // Circuit breakers
+                if (breakersResp.ok) {
+                    const breakersData = await breakersResp.json();
+                    const countEl = document.getElementById('breakers-open-count');
+                    const openCount = breakersData.open_count || 0;
+                    countEl.textContent = openCount + ' OPEN';
+                    countEl.style.background = openCount > 0 ? '#da3633' : '#238636';
+
+                    const grid = document.getElementById('circuit-breakers-grid');
+                    const breakers = breakersData.breakers || {};
+                    if (Object.keys(breakers).length > 0) {
+                        grid.innerHTML = Object.entries(breakers).map(([name, stats]) => {
+                            const stateColor = stats.state === 'closed' ? '#4ade80' : stats.state === 'open' ? '#f87171' : '#fbbf24';
+                            const stateIcon = stats.state === 'closed' ? 'CLOSED' : stats.state === 'open' ? 'OPEN' : 'HALF';
+                            const successRate = stats.total_calls > 0
+                                ? ((stats.successful_calls / stats.total_calls) * 100).toFixed(0)
+                                : '100';
+                            return `<div style="display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; background: #161b22; border-radius: 4px; font-size: 10px;">
+                                <span style="color: #c9d1d9; font-weight: 500;">${name}</span>
+                                <div style="display: flex; gap: 10px; align-items: center;">
+                                    <span style="color: #8b949e;">Calls: <span style="font-family: 'JetBrains Mono', monospace;">${stats.total_calls || 0}</span></span>
+                                    <span style="color: #8b949e;">Success: <span style="font-family: 'JetBrains Mono', monospace;">${successRate}%</span></span>
+                                    <span style="color: ${stateColor}; font-weight: 600; font-size: 9px; padding: 1px 5px; border-radius: 3px; border: 1px solid ${stateColor};">${stateIcon}</span>
+                                </div>
+                            </div>`;
+                        }).join('');
+                    } else {
+                        grid.innerHTML = '<div style="color: #666; text-align: center; padding: 12px; font-size: 11px;">No circuit breakers registered</div>';
+                    }
+                }
+
+                // Safety thresholds
+                if (thresholdsResp.ok) {
+                    const thresholds = await thresholdsResp.json();
+                    const grid = document.getElementById('safety-thresholds-grid');
+                    grid.innerHTML = Object.entries(thresholds).map(([key, value]) => {
+                        const label = key.replace(/_/g, ' ').split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+                        return `<div style="background: #161b22; padding: 6px 8px; border-radius: 4px;">
+                            <div style="font-size: 9px; color: #8b949e;">${label}</div>
+                            <div style="font-size: 12px; font-weight: 600; font-family: 'JetBrains Mono', monospace; color: #c9d1d9;">${value}</div>
+                        </div>`;
+                    }).join('');
+                }
+
+                // Data validator
+                if (validatorResp.ok) {
+                    const validator = await validatorResp.json();
+                    document.getElementById('risk-total-validations').textContent = validator.total_validations || 0;
+                    const passRate = validator.pass_rate || 100;
+                    const passRateEl = document.getElementById('risk-pass-rate');
+                    passRateEl.textContent = passRate.toFixed(1) + '%';
+                    passRateEl.style.color = passRate >= 95 ? '#4ade80' : passRate >= 80 ? '#fbbf24' : '#f87171';
+                    const failedTotal = (validator.failed_stale || 0) + (validator.failed_spread || 0) + (validator.failed_price || 0) + (validator.failed_volume || 0);
+                    document.getElementById('risk-failed-total').textContent = failedTotal;
+                    document.getElementById('risk-failed-stale').textContent = validator.failed_stale || 0;
+                    document.getElementById('risk-failed-spread').textContent = validator.failed_spread || 0;
+                    document.getElementById('risk-failed-price').textContent = validator.failed_price || 0;
+                    document.getElementById('risk-failed-volume').textContent = validator.failed_volume || 0;
+                }
+            } catch (error) {
+                console.error('Error loading risk data:', error);
+            }
+        }
+
+        // Keyboard shortcuts for tab switching
+        document.addEventListener('keydown', (e) => {
+            // Don't fire when typing in inputs
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
+
+            const tabs = ['overview', 'watchlist', 'positions', 'strategies', 'trades', 'ml', 'performance', 'risk', 'logs'];
+            const key = parseInt(e.key);
+            if (key >= 1 && key <= tabs.length) {
+                const tabName = tabs[key - 1];
+                const tabEl = document.querySelectorAll('.tab')[key - 1];
+                if (tabEl) switchTab(tabName, tabEl);
+            }
+            // R = refresh
+            if ((e.key === 'r' || e.key === 'R') && !e.ctrlKey && !e.metaKey) {
+                e.preventDefault();
+                refreshData();
+            }
+        });
+
         // Initialize on load
         window.onload = async () => {
             await loadPortfolios(); // Load portfolio list first
             refreshData();
             refreshStrategies();
-            updateSafetyMonitoring(); // Load safety monitoring on startup
+            loadRiskData(); // Load risk/safety data on startup
             loadLogs(); // Load logs immediately on startup
             updateMarketStatus(); // Load market status on startup
             connectWebSocket(); // Connect to WebSocket
+            initSortableHeaders(); // Enable table sorting
             setInterval(refreshData, 5000); // Keep polling as fallback
             setInterval(refreshStrategies, 5000); // Update strategies tab
-            setInterval(updateSafetyMonitoring, 10000); // Update safety monitoring every 10 seconds
+            setInterval(loadRiskData, 10000); // Update risk data every 10 seconds
             setInterval(loadLogs, 2000); // Update logs every 2 seconds
             setInterval(updateMarketStatus, 60000); // Update market status every minute
             setInterval(loadPortfolios, 30000); // Refresh portfolio list every 30 seconds
@@ -5133,6 +5708,11 @@ def ml_status():
 
     latest_models = {}
     for model_file in model_files:
+        try:
+            mtime = model_file.stat().st_mtime
+        except OSError:
+            continue  # Skip broken symlinks or deleted files
+
         # Handle both "high_accuracy" and single word model types
         stem_parts = model_file.stem.split("_")
         if stem_parts[0].lower() == "high" and len(stem_parts) > 1:
@@ -5142,13 +5722,10 @@ def ml_status():
 
         if model_type in model_info:
             model_info[model_type]["count"] += 1
-            if (
-                model_type not in latest_models
-                or model_file.stat().st_mtime > latest_models[model_type]["mtime"]
-            ):
+            if model_type not in latest_models or mtime > latest_models[model_type]["mtime"]:
                 latest_models[model_type] = {
                     "file": model_file,
-                    "mtime": model_file.stat().st_mtime,
+                    "mtime": mtime,
                 }
 
     # Build models list showing latest of each type
@@ -6203,6 +6780,9 @@ def get_risk_status():
         if risk_state_file.exists():
             with open(risk_state_file) as f:
                 risk_state = json.load(f)
+        # Guard against zero capital (division-by-zero protection)
+        if not risk_state.get("current_capital"):
+            risk_state["current_capital"] = 100000
 
         # Get real data from database
         from sync_db_reader import SyncDatabaseReader
@@ -6585,6 +7165,8 @@ def get_safety_thresholds():
         "max_open_positions": os.getenv("MAX_OPEN_POSITIONS", "5"),
         "max_orders_per_minute": os.getenv("MAX_ORDERS_PER_MINUTE", "10"),
         "stop_loss_percent": os.getenv("STOP_LOSS_PERCENT", "2.0"),
+        "trailing_stop_percent": os.getenv("TRAILING_STOP_PERCENT", "5.0"),
+        "use_trailing_stop": os.getenv("USE_TRAILING_STOP", "true"),
         "take_profit_percent": os.getenv("TAKE_PROFIT_PERCENT", "3.0"),
         "data_staleness_seconds": os.getenv("DATA_STALENESS_SECONDS", "60"),
         "circuit_breaker_threshold": os.getenv("CIRCUIT_BREAKER_THRESHOLD", "5"),
