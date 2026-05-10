@@ -12,8 +12,13 @@ on:
 
 jobs:
   bug-detection:
+    # Skip workflow when triggered by a fork PR to avoid running pip install on untrusted code with secret access.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    
+    permissions:
+      contents: read
+      pull-requests: write
+
     steps:
     - uses: actions/checkout@v4
     

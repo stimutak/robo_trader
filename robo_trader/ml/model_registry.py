@@ -5,7 +5,8 @@ This module provides model versioning, A/B testing, and deployment management.
 
 import asyncio
 import json
-import pickle
+import os
+import pickle  # noqa: S403
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +14,8 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import structlog
+
+from ._safe_load import sign_file, verify_file
 
 logger = structlog.get_logger(__name__)
 
@@ -110,6 +113,11 @@ class ModelRegistry:
         model_file = version_dir / "model.pkl"
         with open(model_file, "wb") as f:
             pickle.dump(model_info, f)
+        try:
+            os.chmod(model_file, 0o600)
+        except OSError:
+            pass
+        sign_file(model_file)
 
         # Create version metadata
         metadata = {
@@ -215,6 +223,11 @@ class ModelRegistry:
             logger.error(f"Model file not found: {model_file}")
             return False
 
+        try:
+            verify_file(model_file)
+        except (ValueError, RuntimeError) as e:
+            logger.error(f"Refusing to load model {model_file}: {e}")
+            return False
         with open(model_file, "rb") as f:
             # Security: Only load trusted model files from our own system
             # In production, consider using joblib or safer serialization
@@ -429,6 +442,11 @@ class ModelRegistry:
 
         model_file = self.registry_dir / model_name / version / "model.pkl"
 
+        try:
+            verify_file(model_file)
+        except (ValueError, RuntimeError) as e:
+            logger.error(f"Refusing to load model {model_file}: {e}")
+            return None
         with open(model_file, "rb") as f:
             # Security: Only load trusted model files from our own system
             try:

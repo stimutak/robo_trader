@@ -12,6 +12,7 @@ This module provides comprehensive risk controls including:
 from __future__ import annotations
 
 import asyncio
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -539,6 +540,14 @@ class RiskManager:
         # Check emergency shutdown
         if self.emergency_shutdown_triggered:
             return False, "Emergency shutdown active"
+
+        # Reject NaN / Infinity early — without this, NaN <= 0 is False and
+        # NaN comparisons silently pass every numeric gate (TC-M4).
+        try:
+            if not math.isfinite(float(price)) or not math.isfinite(float(order_qty)):
+                return False, "Non-finite price or quantity"
+        except (TypeError, ValueError):
+            return False, "Non-numeric price or quantity"
 
         # Basic validation
         if order_qty <= 0:

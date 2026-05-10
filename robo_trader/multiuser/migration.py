@@ -247,6 +247,37 @@ class MultiuserMigration:
         )
 
         # 6. Migrate account table: replace id=1 with portfolio_id
+        # Account previously had an autoincrement `id`; multiple rows may have
+        # accumulated over time. We collapse to a single 'default' row, keeping
+        # the MOST RECENT row (highest id). Warn if more than one row was found
+        # so the operator knows older snapshots are not represented in the new
+        # account table (trades/equity_history retain full history regardless).
+        try:
+            cursor = await conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='account'"
+            )
+            account_exists = await cursor.fetchone()
+            if account_exists:
+                cursor = await conn.execute("PRAGMA table_info(account)")
+                cols = [c[1] for c in await cursor.fetchall()]
+                if "portfolio_id" not in cols:
+                    cursor = await conn.execute("SELECT COUNT(*) FROM account")
+                    account_row_count = (await cursor.fetchone())[0]
+                    if account_row_count > 1:
+                        cursor = await conn.execute(
+                            "SELECT MAX(id), MIN(id) FROM account"
+                        )
+                        max_id, min_id = await cursor.fetchone()
+                        logger.warning(
+                            f"account table has {account_row_count} rows; "
+                            f"migration keeps only the most recent row "
+                            f"(id={max_id}; older rows id={min_id}..{max_id - 1} "
+                            f"will not appear in the new portfolio-scoped account table)."
+                        )
+        except Exception as e:
+            # Don't abort migration over a logging/diagnostic failure
+            logger.debug(f"Could not pre-check account row count: {e}")
+
         await self._migrate_table_add_portfolio_id(
             conn,
             table_name="account",
@@ -265,7 +296,7 @@ class MultiuserMigration:
                 INSERT INTO account_new (portfolio_id, cash, equity, daily_pnl, realized_pnl, unrealized_pnl, timestamp)
                 SELECT 'default', cash, equity, daily_pnl, realized_pnl, unrealized_pnl, timestamp
                 FROM account
-                ORDER BY id ASC LIMIT 1
+                ORDER BY id DESC LIMIT 1
             """,
             index_sql=[],
         )

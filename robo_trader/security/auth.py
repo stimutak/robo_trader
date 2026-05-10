@@ -3,6 +3,16 @@ Authentication and authorization system for RoboTrader.
 
 Implements JWT-based authentication, role-based access control,
 and API key management for secure access to trading operations.
+
+W-M3: NOTE — this module is currently dead code; ``app.py`` does not import it.
+The active dashboard auth lives in ``app.py`` (HTTP basic + CSRF). If/when this
+module is wired into a real auth flow, ``active_sessions`` (in-memory revocation
+list) must be persisted to the database — otherwise restarts silently un-revoke
+every revoked token.
+
+W-M4: bcrypt/PyJWT are required. The previous SHA-256 fallback path was unsafe
+(no salting, no work factor) and has been removed. The constructor now refuses
+to instantiate without passlib + PyJWT.
 """
 
 import hashlib
@@ -184,16 +194,17 @@ class AuthManager:
         users_file: Optional[Path] = None,
         api_keys_file: Optional[Path] = None,
     ):
+        # W-M4: refuse to start without bcrypt + PyJWT — there is no safe fallback.
+        if not JWT_AVAILABLE:
+            raise RuntimeError("passlib/bcrypt and PyJWT are required for AuthManager")
+
         self.secret_key = secret_key
         self.token_expiry_hours = token_expiry_hours
         self.max_login_attempts = max_login_attempts
         self.lockout_duration_minutes = lockout_duration_minutes
 
-        # Password hashing
-        if JWT_AVAILABLE:
-            self.pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-        else:
-            self.pwd_context = None
+        # Password hashing — bcrypt only.
+        self.pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
         # User and API key storage
         self.users: Dict[str, User] = {}
@@ -207,20 +218,16 @@ class AuthManager:
             self.load_api_keys(api_keys_file)
 
     def hash_password(self, password: str) -> str:
-        """Hash a password."""
-        if self.pwd_context:
-            return self.pwd_context.hash(password)
-        else:
-            # Fallback to SHA256 if bcrypt not available
-            return hashlib.sha256(password.encode()).hexdigest()
+        """Hash a password (bcrypt only — W-M4)."""
+        if not self.pwd_context:
+            raise RuntimeError("passlib not available")
+        return self.pwd_context.hash(password)
 
     def verify_password(self, plain_password: str, hashed_password: str) -> bool:
-        """Verify a password against its hash."""
-        if self.pwd_context:
-            return self.pwd_context.verify(plain_password, hashed_password)
-        else:
-            # Fallback to SHA256
-            return hashlib.sha256(plain_password.encode()).hexdigest() == hashed_password
+        """Verify a password against its hash (bcrypt only — W-M4)."""
+        if not self.pwd_context:
+            raise RuntimeError("passlib not available")
+        return self.pwd_context.verify(plain_password, hashed_password)
 
     def create_user(
         self,

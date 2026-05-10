@@ -291,6 +291,7 @@ class KillSwitch:
         max_consecutive_losses: int = 5,
         max_drawdown_pct: float = 0.10,  # 10% drawdown limit
         cooldown_minutes: int = 60,
+        state_path: Optional[Path] = None,
     ):
         self.max_daily_loss_pct = max_daily_loss_pct
         self.max_position_loss_pct = max_position_loss_pct
@@ -309,6 +310,14 @@ class KillSwitch:
         # Position tracking
         self.position_pnl: Dict[str, float] = {}
         self.position_entry: Dict[str, Tuple[float, datetime]] = {}
+
+        # Persistence (TC-M5): allow caller to specify a path to persist
+        # triggered state across restarts. Default path lives under data/.
+        self.state_path: Path = (
+            state_path if state_path is not None else Path("data/kill_switch_state.json")
+        )
+        # Attempt to load any persisted triggered state on construction.
+        self._load_persisted_state()
 
     def update_equity(self, equity: float) -> None:
         """Update peak equity for drawdown calculation."""
@@ -413,7 +422,14 @@ class KillSwitch:
             self.trigger(f"Invalid entry price for {symbol}", f"Entry: {entry_price}")
             return True  # Fail safe
 
-        loss_pct = (entry_price - current_price) / entry_price
+        # Side-aware loss calculation (TC-L2): for short positions, a price
+        # increase is the loss direction.
+        pos = self.positions.get(symbol) if hasattr(self, "positions") else None
+        quantity = 0
+        if isinstance(pos, dict):
+            quantity = int(pos.get("quantity", 0) or 0)
+        side_sign = 1 if quantity >= 0 else -1
+        loss_pct = ((entry_price - current_price) / entry_price) * side_sign
 
         if loss_pct > self.max_position_loss_pct:
             self.trigger(f"Position loss limit exceeded for {symbol}", f"{loss_pct:.2%} loss")
@@ -430,6 +446,55 @@ class KillSwitch:
         # Log critical event
         print(f"🚨 KILL SWITCH TRIGGERED: {self.trigger_reason}")
 
+        # Persist to disk so a watchdog auto-restart cannot silently bypass
+        # the trip (TC-M5).
+        try:
+            self._save_persisted_state()
+        except Exception as exc:  # pragma: no cover - persistence must never raise
+            print(f"⚠️  Failed to persist kill-switch state: {exc}")
+
+    def _save_persisted_state(self) -> None:
+        """Write triggered state to disk as JSON."""
+        if self.state_path is None:
+            return
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return
+        payload = {
+            "triggered": bool(self.triggered),
+            "trigger_time": self.trigger_time.isoformat() if self.trigger_time else None,
+            "trigger_reason": self.trigger_reason,
+            "consecutive_losses": int(self.consecutive_losses),
+        }
+        with open(self.state_path, "w") as f:
+            json.dump(payload, f, indent=2)
+
+    def _load_persisted_state(self) -> None:
+        """Restore triggered state from disk if present (JSON only)."""
+        if self.state_path is None or not Path(self.state_path).exists():
+            return
+        try:
+            with open(self.state_path, "r") as f:
+                payload = json.load(f)
+        except Exception as exc:
+            print(f"⚠️  Failed to load kill-switch state: {exc}")
+            return
+
+        if payload.get("triggered"):
+            self.triggered = True
+            self.trigger_reason = payload.get("trigger_reason") or "Persisted kill switch"
+            ts = payload.get("trigger_time")
+            if ts:
+                try:
+                    self.trigger_time = datetime.fromisoformat(ts)
+                except (ValueError, TypeError):
+                    self.trigger_time = get_market_time()
+            self.consecutive_losses = int(payload.get("consecutive_losses", 0))
+            print(
+                f"⚠️  Kill switch state loaded from {self.state_path}: triggered=True ({self.trigger_reason})"
+            )
+
     def reset(self) -> None:
         """Reset kill switch after cooldown period."""
         if not self.triggered:
@@ -443,6 +508,12 @@ class KillSwitch:
                 self.trigger_reason = None
                 self.consecutive_losses = 0
                 print(f"✅ Kill switch reset after {self.cooldown_minutes} minute cooldown")
+
+                # Clear persisted state so we don't reload triggered=True later.
+                try:
+                    self._save_persisted_state()
+                except Exception:
+                    pass
 
     def is_active(self) -> bool:
         """Check if kill switch is currently active."""

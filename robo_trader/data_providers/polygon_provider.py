@@ -24,6 +24,7 @@ import pandas as pd
 import structlog
 
 from robo_trader.data_providers.base import DataProvider, DataProviderType, Quote, Trade
+from robo_trader.database_validator import DatabaseValidator
 
 logger = structlog.get_logger(__name__)
 
@@ -199,14 +200,37 @@ class PolygonDataProvider(DataProvider):
             # Convert to DataFrame
             bars_data = []
             for bar in aggs:
+                bar_open = float(bar.open)
+                bar_high = float(bar.high)
+                bar_low = float(bar.low)
+                bar_close = float(bar.close)
+                bar_volume = int(bar.volume)
+                if not (
+                    DatabaseValidator.MIN_PRICE
+                    <= bar_close
+                    <= DatabaseValidator.MAX_PRICE
+                ):
+                    logger.warning(
+                        f"Polygon bar rejected: close out of range: {bar_close}"
+                    )
+                    continue
+                if bar_high < bar_low or bar_close <= 0 or bar_open <= 0:
+                    logger.warning(
+                        f"Polygon bar rejected: invalid OHLC: "
+                        f"{bar_open}/{bar_high}/{bar_low}/{bar_close}"
+                    )
+                    continue
+                if bar_volume < 0:
+                    logger.warning("Polygon bar rejected: negative volume")
+                    continue
                 bars_data.append(
                     {
                         "date": datetime.fromtimestamp(bar.timestamp / 1000),
-                        "open": float(bar.open),
-                        "high": float(bar.high),
-                        "low": float(bar.low),
-                        "close": float(bar.close),
-                        "volume": int(bar.volume),
+                        "open": bar_open,
+                        "high": bar_high,
+                        "low": bar_low,
+                        "close": bar_close,
+                        "volume": bar_volume,
                     }
                 )
 
@@ -279,14 +303,37 @@ class PolygonDataProvider(DataProvider):
 
             # Get the most recent bar
             for bar in aggs:
+                bar_close = float(bar.close)
+                bar_open = float(bar.open)
+                bar_high = float(bar.high)
+                bar_low = float(bar.low)
+                bar_volume = int(bar.volume)
+                if not (
+                    DatabaseValidator.MIN_PRICE
+                    <= bar_close
+                    <= DatabaseValidator.MAX_PRICE
+                ):
+                    logger.warning(
+                        f"Polygon bar rejected: close out of range: {bar_close}"
+                    )
+                    continue
+                if bar_high < bar_low or bar_close <= 0 or bar_open <= 0:
+                    logger.warning(
+                        f"Polygon bar rejected: invalid OHLC: "
+                        f"{bar_open}/{bar_high}/{bar_low}/{bar_close}"
+                    )
+                    continue
+                if bar_volume < 0:
+                    logger.warning("Polygon bar rejected: negative volume")
+                    continue
                 quote = Quote(
                     symbol=symbol,
                     bid=None,  # Not available on free tier
                     ask=None,
-                    last=float(bar.close),
+                    last=bar_close,
                     bid_size=None,
                     ask_size=None,
-                    volume=int(bar.volume),
+                    volume=bar_volume,
                     timestamp=datetime.fromtimestamp(bar.timestamp / 1000),
                 )
 

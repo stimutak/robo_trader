@@ -13,6 +13,9 @@
 
 set -e
 
+# Restrict permissions on any files we create (IBC config contains credentials)
+umask 077
+
 # Directory setup
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -68,6 +71,8 @@ if [ ! -f "$IBC_INI" ]; then
         echo "Creating config from template..."
         mkdir -p "$(dirname "$IBC_INI")"
         cp "$TEMPLATE" "$IBC_INI"
+        # IBC config contains plaintext IBKR credentials - restrict to user only
+        chmod 600 "$IBC_INI"
         echo ""
         echo "Config created at: $IBC_INI"
         echo "Please edit this file and set your IBKR credentials:"
@@ -80,6 +85,16 @@ if [ ! -f "$IBC_INI" ]; then
         echo "Then edit config.ini with your IBKR credentials."
     fi
     exit 1
+fi
+
+# SECURITY: Refuse to start unless Gateway is configured for read-only API access.
+# RoboTrader relies on Gateway-side ReadOnlyApi=yes as a primary safety net
+# against any code path that might attempt to submit live orders.
+if ! grep -q '^ReadOnlyApi=yes' "$IBC_INI"; then
+    echo "FATAL: $IBC_INI does not have ReadOnlyApi=yes. Refusing to start." >&2
+    echo "       RoboTrader requires Gateway-side read-only enforcement." >&2
+    echo "       To fix: set 'ReadOnlyApi=yes' in $IBC_INI and re-run." >&2
+    exit 3
 fi
 
 # Update trading mode in config

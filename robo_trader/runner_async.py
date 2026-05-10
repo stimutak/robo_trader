@@ -21,7 +21,7 @@ from dotenv import load_dotenv  # isort:skip
 
 load_dotenv()  # noqa: E402 - must run before imports that use os.getenv()
 from dataclasses import dataclass  # isort:skip  # noqa: E402
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
@@ -58,7 +58,7 @@ from .exceptions import KillSwitchTriggeredError
 from .portfolio import Portfolio, PositionSnapshot  # Import Portfolio class from portfolio.py file
 from .portfolio_pkg.portfolio_manager import AllocationMethod, MultiStrategyPortfolioManager
 from .risk.advanced_risk import AdvancedRiskManager, risk_monitor_task
-from .risk_manager import Position, RiskManager
+from .risk_manager import Position, RiskManager, create_risk_manager_from_config
 from .stop_loss_monitor import StopLossMonitor, StopType
 from .strategies import MLStrategy, sma_crossover_signals
 from .strategies.ml_enhanced_strategy import MLEnhancedStrategy
@@ -183,6 +183,11 @@ class AsyncRunner:
         self.latest_prices: Dict[str, float] = {}
         self.daily_pnl = 0.0
         self.daily_executed_notional = 0.0
+        # TC-M7: track today's starting unrealized P&L so the daily-loss check
+        # uses mark-to-market (realized + unrealized - starting_unrealized) rather
+        # than realized only.
+        self._starting_unrealized_today: float = 0.0
+        self._daily_pnl_date: Optional[date] = None
         self.session_start_equity: Optional[float] = None  # Captured after loading positions
         self.monitor = PerformanceMonitor()
 
@@ -392,6 +397,75 @@ class AsyncRunner:
                 self._position_locks[symbol] = asyncio.Lock()
             return self._position_locks[symbol]
 
+    async def _refresh_daily_pnl(self) -> float:
+        """
+        Compute mark-to-market daily P&L (TC-M7).
+
+        Daily P&L = realized_pnl + current unrealized - starting_unrealized_today.
+        Resets the starting unrealized baseline once per UTC day.
+        """
+        try:
+            today = datetime.utcnow().date()
+            if self._daily_pnl_date != today:
+                # New day: capture starting unrealized.
+                try:
+                    if self.portfolio is not None:
+                        starting_unreal = float(
+                            await self.portfolio.compute_unrealized(self.latest_prices or {})
+                        )
+                    else:
+                        starting_unreal = 0.0
+                except Exception:
+                    starting_unreal = 0.0
+                self._starting_unrealized_today = starting_unreal
+                self._daily_pnl_date = today
+
+            realized = float(self.portfolio.realized_pnl) if self.portfolio else 0.0
+            unrealized = 0.0
+            try:
+                if self.portfolio is not None:
+                    unrealized = float(
+                        await self.portfolio.compute_unrealized(self.latest_prices or {})
+                    )
+            except Exception:
+                unrealized = 0.0
+
+            self.daily_pnl = realized + unrealized - self._starting_unrealized_today
+            return self.daily_pnl
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(f"_refresh_daily_pnl failed: {exc}")
+            # Fall back to realized only if anything goes wrong
+            try:
+                self.daily_pnl = float(self.portfolio.realized_pnl) if self.portfolio else 0.0
+            except Exception:
+                pass
+            return self.daily_pnl
+
+    def _trading_blocked(self) -> Tuple[bool, str]:
+        """
+        Centralized check for any state that should block ALL outgoing orders
+        regardless of code path (BUY, SELL, BUY_TO_COVER, SELL_SHORT, pairs,
+        stop-loss execution).
+
+        Returns:
+            (True, reason) if trading should be blocked, else (False, "").
+        """
+        try:
+            if getattr(self, "risk", None) and getattr(
+                self.risk, "emergency_shutdown_triggered", False
+            ):
+                return True, "Emergency shutdown active"
+            if (
+                getattr(self, "advanced_risk", None)
+                and getattr(self.advanced_risk, "kill_switch", None)
+                and self.advanced_risk.kill_switch.triggered
+            ):
+                reason = self.advanced_risk.kill_switch.trigger_reason or "Kill switch active"
+                return True, f"Kill switch active: {reason}"
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error(f"Error in _trading_blocked: {exc}")
+        return False, ""
+
     async def _place_order_with_circuit_breaker(self, order: Order):
         """
         Execute order with circuit breaker protection.
@@ -399,6 +473,18 @@ class AsyncRunner:
         Checks circuit breaker state before execution and records
         success/failure for fault tolerance monitoring.
         """
+        # TC-M1 / TC-M6: centralized trading-blocked gate. This catches every
+        # path that places an order, including SELL/closing flows, pairs trading,
+        # and stop-loss execution. Without this, kill_switch / emergency_shutdown
+        # were only enforced inside `validate_order` — the SELL closing path
+        # and the pairs path bypassed the check entirely.
+        blocked, reason = self._trading_blocked()
+        if blocked:
+            logger.error(
+                f"Order blocked by trading_blocked gate for {order.symbol}: {reason}"
+            )
+            return SimpleNamespace(ok=False, message=f"Trading blocked: {reason}", fill_price=None)
+
         # Check if circuit breaker allows the request
         if not await self.circuit_breaker.can_proceed():
             logger.error(f"Circuit breaker OPEN - order rejected for {order.symbol}")
@@ -502,10 +588,26 @@ class AsyncRunner:
                 if self.use_advanced_risk and self.advanced_risk:
                     self.advanced_risk.update_position(symbol, quantity, price, side)
 
+                # TC-M8: full transactionality across self.positions,
+                # portfolio, advanced_risk, and the database is non-trivial to
+                # implement safely without a proper write-ahead log. The
+                # caller (DB writes) is performed *after* this method returns
+                # in the BUY/SELL branches, so a DB-write failure can leave
+                # the in-memory state ahead of persisted state. This is a
+                # known limitation; until a proper transactional layer lands,
+                # callers MUST verify DB write success and reconcile on
+                # restart from `db.get_positions()`.
+                # TODO(TC-M8): make this transactional with rollback on DB
+                # write failure (negate update_fill and advanced_risk update).
+
                 return True
 
             except Exception as e:
-                logger.error(f"Error updating position for {symbol}: {e}")
+                logger.error(
+                    f"Error updating position for {symbol}: {e} — "
+                    f"in-memory state may be inconsistent with persisted state. "
+                    f"Reconcile on next restart via load_existing_positions()."
+                )
                 return False
 
     async def setup(self):
@@ -682,16 +784,24 @@ class AsyncRunner:
         self.db = PortfolioScopedDB(self._raw_db, portfolio_id=self.portfolio_id)
         logger.info(f"Database initialized for portfolio: {self.portfolio_id}")
 
-        # Initialize risk manager
-        self.risk = RiskManager(
-            max_daily_loss=self.cfg.risk.max_daily_loss_pct,
-            max_position_risk_pct=self.cfg.risk.max_position_pct,
-            max_symbol_exposure_pct=self.cfg.risk.max_sector_exposure_pct,
-            max_leverage=self.cfg.risk.max_leverage,
-            max_order_notional=self.max_order_notional or self.cfg.risk.max_order_notional,
-            max_daily_notional=self.max_daily_notional or self.cfg.risk.max_daily_notional,
-            max_open_positions=self.cfg.risk.max_open_positions,
-        )
+        # Initialize risk manager (TC-H1).
+        # The previous direct construction passed `max_daily_loss_pct` (a fraction
+        # like 0.005) as the dollar threshold, which caused the daily-loss
+        # circuit to trip after a fraction of a cent — or fail to enforce a real
+        # cap once daily_pnl was beyond it. `create_risk_manager_from_config`
+        # multiplies the percentage by `default_cash` to produce a dollar value.
+        self.risk = create_risk_manager_from_config(self.cfg)
+        # Apply per-instance overrides that the runner passes around.
+        if self.max_order_notional:
+            self.risk.max_order_notional = float(self.max_order_notional)
+        if self.max_daily_notional:
+            self.risk.max_daily_notional = float(self.max_daily_notional)
+        # If the runner has been given a per-instance starting cash (e.g.
+        # multi-portfolio), recompute the daily-loss dollar cap from that.
+        if self.default_cash is not None:
+            self.risk.max_daily_loss = float(self.cfg.risk.max_daily_loss_pct) * float(
+                self.default_cash
+            )
 
         # Initialize advanced risk manager with Kelly sizing and kill switches
         if self.use_advanced_risk:
@@ -1420,6 +1530,37 @@ class AsyncRunner:
 
     async def process_symbol(self, symbol: str) -> SymbolResult:
         """Process a single symbol - fetch data, generate signal, execute if needed."""
+        # AI-M3: validate the symbol at the top so any unvalidated/AI-derived
+        # symbol is rejected before reaching `Stock(symbol, "SMART", "USD")` or
+        # the database. Validation is cheap and idempotent.
+        try:
+            from robo_trader.database_validator import (
+                DatabaseValidator,
+                ValidationError,
+            )
+
+            symbol = DatabaseValidator.validate_symbol(symbol)
+        except ValidationError as e:
+            logger.error(f"Rejected invalid symbol from upstream: {symbol!r}: {e}")
+            return SymbolResult(
+                symbol=str(symbol)[:32],
+                signal=0,
+                price=0.0,
+                quantity=0,
+                executed=False,
+                message="invalid symbol",
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.error(f"Symbol validation error for {symbol!r}: {e}")
+            return SymbolResult(
+                symbol=str(symbol)[:32],
+                signal=0,
+                price=0.0,
+                quantity=0,
+                executed=False,
+                message="symbol validation error",
+            )
+
         # Fetch and store market data
         df = await self.fetch_and_store_data(symbol)
         if df is None or df.empty:
@@ -1503,16 +1644,50 @@ class AsyncRunner:
                         "timestamp": datetime.now().isoformat(),
                     }
 
+                    # AI-H3: AI signals must NOT be the sole determinant of a
+                    # BUY. Require ML corroboration (which is impossible here
+                    # since this branch is only entered when ML returned no
+                    # signal) and an operator-controlled confidence threshold.
+                    # Allow override via AI_REQUIRE_ML_CONFIRMATION=false for
+                    # explicit, audited operator opt-in.
+                    ai_require_ml = (
+                        os.getenv("AI_REQUIRE_ML_CONFIRMATION", "true").lower() == "true"
+                    )
+                    try:
+                        ai_min_conf = float(os.getenv("AI_MIN_CONFIDENCE", "0.85"))
+                    except (TypeError, ValueError):
+                        ai_min_conf = 0.85
+
                     # Check if this symbol is an AI-identified opportunity (from news scan)
                     ai_opps = getattr(self, "_ai_opportunities", {})
                     if symbol in ai_opps:
                         opp = ai_opps[symbol]
-                        signal_value = 1  # BUY
-                        confidence = opp.get("confidence", 0.7)
-                        logger.info(
-                            f"🎯 AI OPPORTUNITY BUY for {symbol}: "
-                            f"conf={confidence:.0%} - {opp.get('reason', 'AI identified')}"
-                        )
+                        opp_conf = float(opp.get("confidence", 0.0))
+                        if ai_require_ml:
+                            # ML did not corroborate — refuse to BUY based on AI alone.
+                            logger.warning(
+                                f"AI OPPORTUNITY for {symbol} suppressed: ML did not "
+                                f"corroborate (ML signal=0); set "
+                                f"AI_REQUIRE_ML_CONFIRMATION=false to override. "
+                                f"AI conf={opp_conf:.0%}"
+                            )
+                            signal_value = 0
+                            confidence = 0.5
+                        elif opp_conf < ai_min_conf:
+                            logger.warning(
+                                f"AI OPPORTUNITY for {symbol} suppressed: AI conf "
+                                f"{opp_conf:.0%} < AI_MIN_CONFIDENCE {ai_min_conf:.0%}"
+                            )
+                            signal_value = 0
+                            confidence = 0.5
+                        else:
+                            signal_value = 1  # BUY
+                            confidence = opp_conf
+                            logger.info(
+                                f"🎯 AI OPPORTUNITY BUY for {symbol}: "
+                                f"conf={confidence:.0%} - {opp.get('reason', 'AI identified')} "
+                                f"(operator override AI_REQUIRE_ML_CONFIRMATION=false)"
+                            )
                     # Try AI-driven signal from news analysis
                     elif self.ai_analyst and AI_ANALYST_AVAILABLE:
                         try:
@@ -1577,12 +1752,30 @@ class AsyncRunner:
                                     },
                                 )
 
-                                # Convert AI suggestion to signal
-                                if analysis.suggested_action == "buy" and analysis.confidence > 0.5:
+                                # Convert AI suggestion to signal.
+                                # AI-H3: require ML BUY corroboration AND a
+                                # higher operator-controlled confidence floor.
+                                # This branch only runs when ML signal==0, so by
+                                # definition ML does NOT say BUY — the gate
+                                # below blocks the AI-only BUY unless operator
+                                # explicitly opted out.
+                                ai_buy = analysis.suggested_action == "buy"
+                                ai_conf_ok = analysis.confidence > ai_min_conf
+                                if ai_buy and ai_require_ml:
+                                    logger.warning(
+                                        f"AI BUY for {symbol} suppressed: ML did not "
+                                        f"corroborate (ML signal=0). AI conf="
+                                        f"{analysis.confidence:.0%}. "
+                                        f"Set AI_REQUIRE_ML_CONFIRMATION=false to override."
+                                    )
+                                    # default to HOLD; do NOT escalate to BUY
+                                elif ai_buy and ai_conf_ok:
                                     signal_value = 1
                                     confidence = analysis.confidence
                                     logger.info(
-                                        f"AI BUY signal for {symbol}: {analysis.reasoning[:80]}"
+                                        f"AI BUY signal for {symbol} "
+                                        f"(operator override AI_REQUIRE_ML_CONFIRMATION=false, "
+                                        f"conf={confidence:.0%}): {analysis.reasoning[:80]}"
                                     )
                                     # Update prediction with AI signal
                                     self._ml_predictions[symbol] = {
@@ -1592,6 +1785,12 @@ class AsyncRunner:
                                         "source": "AI_ANALYST",
                                         "timestamp": datetime.now().isoformat(),
                                     }
+                                elif ai_buy and not ai_conf_ok:
+                                    logger.warning(
+                                        f"AI BUY for {symbol} suppressed: AI conf "
+                                        f"{analysis.confidence:.0%} < AI_MIN_CONFIDENCE "
+                                        f"{ai_min_conf:.0%}"
+                                    )
                                 elif (
                                     analysis.suggested_action == "sell"
                                     and analysis.confidence > 0.5
@@ -1849,7 +2048,8 @@ class AsyncRunner:
                         symbol, qty_to_cover, fill_price, "BUY_TO_COVER"
                     )
                     if success:
-                        self.daily_pnl = float(self.portfolio.realized_pnl)
+                        # TC-M7: mark-to-market daily P&L
+                        await self._refresh_daily_pnl()
 
                         await self.db.record_trade(
                             symbol,
@@ -2238,7 +2438,8 @@ class AsyncRunner:
                             symbol, pos.quantity, fill_price, "SELL"
                         )
                         if success:
-                            self.daily_pnl = float(self.portfolio.realized_pnl)
+                            # TC-M7: mark-to-market daily P&L
+                            await self._refresh_daily_pnl()
 
                             # Record trade in database
                             await self.db.record_trade(
@@ -2413,6 +2614,15 @@ class AsyncRunner:
 
     async def run_parallel(self, symbols: List[str]) -> List[SymbolResult]:
         """Process multiple symbols in parallel with concurrency control."""
+        # TC-L4: clear cycle-level executed-buys set at the start of each cycle
+        # so the protection re-applies fresh per cycle (it accumulated across
+        # cycles previously, which prevented re-entries indefinitely).
+        try:
+            async with self._cycle_executed_buys_lock:
+                self._cycle_executed_buys.clear()
+        except Exception:
+            pass
+
         semaphore = asyncio.Semaphore(self.max_concurrent_symbols)
 
         async def process_with_semaphore(symbol: str) -> SymbolResult:
@@ -2858,6 +3068,43 @@ class AsyncRunner:
                                             and qty_a > 0
                                             and qty_b > 0
                                         ):
+                                            # TC-H3: validate against risk gates BEFORE placing the
+                                            # order. The pairs path previously bypassed validate_order,
+                                            # kill switch, and emergency_shutdown checks entirely.
+                                            ok_a, msg_a = self.risk.validate_order(
+                                                symbol_a,
+                                                qty_a,
+                                                float(price_a),
+                                                equity_float,
+                                                self.daily_pnl,
+                                                self.positions,
+                                                self.daily_executed_notional,
+                                            )
+                                            if not ok_a:
+                                                logger.warning(
+                                                    f"Pairs BUY blocked by risk for {symbol_a}: {msg_a}"
+                                                )
+                                                continue
+                                            blocked, blk_reason = self._trading_blocked()
+                                            if blocked:
+                                                logger.error(
+                                                    f"Pairs BUY blocked: {blk_reason}"
+                                                )
+                                                continue
+
+                                            # TC-M2: acquire pending-order lock and add to
+                                            # cycle-level executed set, mirroring the main
+                                            # BUY path so duplicate prevention applies.
+                                            async with self._pending_orders_lock:
+                                                if symbol_a in self._pending_orders:
+                                                    logger.warning(
+                                                        f"Pairs BUY for {symbol_a}: pending lock held, skipping"
+                                                    )
+                                                    continue
+                                                self._pending_orders.add(symbol_a)
+                                            async with self._cycle_executed_buys_lock:
+                                                self._cycle_executed_buys.add(symbol_a)
+
                                             # Buy symbol_a
                                             order_a = Order(
                                                 symbol=symbol_a,
@@ -2865,9 +3112,15 @@ class AsyncRunner:
                                                 side="BUY",
                                                 price=price_a,
                                             )
-                                            res_a = await self._place_order_with_circuit_breaker(
-                                                order_a
-                                            )
+                                            try:
+                                                res_a = (
+                                                    await self._place_order_with_circuit_breaker(
+                                                        order_a
+                                                    )
+                                                )
+                                            finally:
+                                                async with self._pending_orders_lock:
+                                                    self._pending_orders.discard(symbol_a)
                                             if res_a.ok:
                                                 fill_a = res_a.fill_price or price_a
                                                 await self.db.record_trade(
@@ -2888,6 +3141,8 @@ class AsyncRunner:
                                                 await self.portfolio.update_fill(
                                                     symbol_a, "BUY", qty_a, fill_a
                                                 )
+                                                # TC-H3: increment daily executed notional
+                                                self.daily_executed_notional += float(fill_a) * float(qty_a)
                                                 logger.info(
                                                     f"Pairs trade: Bought {qty_a} {symbol_a} at ${fill_a:.2f}"
                                                 )
@@ -2931,34 +3186,138 @@ class AsyncRunner:
 
                                             # Short symbol_b (if shorting enabled, otherwise skip)
                                             if self.cfg.execution.enable_short_selling:
-                                                order_b = Order(
-                                                    symbol=symbol_b,
-                                                    quantity=qty_b,
-                                                    side="SELL",
-                                                    price=price_b,
+                                                # TC-H3: validate short leg too
+                                                ok_b, msg_b = self.risk.validate_order(
+                                                    symbol_b,
+                                                    qty_b,
+                                                    float(price_b),
+                                                    equity_float,
+                                                    self.daily_pnl,
+                                                    self.positions,
+                                                    self.daily_executed_notional,
                                                 )
-                                                res_b = (
-                                                    await self._place_order_with_circuit_breaker(
-                                                        order_b
+                                                blocked, blk_reason = self._trading_blocked()
+                                                if not ok_b:
+                                                    logger.warning(
+                                                        f"Pairs SHORT blocked by risk for {symbol_b}: {msg_b}"
                                                     )
-                                                )
-                                                if res_b.ok:
-                                                    await self.db.record_trade(
-                                                        symbol_b,
-                                                        "SELL",
-                                                        qty_b,
-                                                        res_b.fill_price or price_b,
-                                                        0,
+                                                elif blocked:
+                                                    logger.error(
+                                                        f"Pairs SHORT blocked: {blk_reason}"
                                                     )
-                                                    logger.info(
-                                                        f"Pairs trade: Shorted {qty_b} {symbol_b} at ${price_b:.2f}"
+                                                else:
+                                                    # TC-H4: use SELL_SHORT to open a fresh short
+                                                    order_b = Order(
+                                                        symbol=symbol_b,
+                                                        quantity=qty_b,
+                                                        side="SELL_SHORT",
+                                                        price=price_b,
                                                     )
+                                                    res_b = (
+                                                        await self._place_order_with_circuit_breaker(
+                                                            order_b
+                                                        )
+                                                    )
+                                                    if res_b.ok:
+                                                        fill_b = res_b.fill_price or price_b
+                                                        await self.db.record_trade(
+                                                            symbol_b,
+                                                            "SELL_SHORT",
+                                                            qty_b,
+                                                            fill_b,
+                                                            0,
+                                                        )
+                                                        # TC-H4: track the short position
+                                                        try:
+                                                            await self._update_position_atomic(
+                                                                symbol_b,
+                                                                qty_b,
+                                                                float(fill_b),
+                                                                "SELL_SHORT",
+                                                            )
+                                                        except Exception as e:
+                                                            logger.error(
+                                                                f"Pairs SHORT _update_position_atomic failed for {symbol_b}: {e}"
+                                                            )
+                                                        try:
+                                                            await self.portfolio.update_fill(
+                                                                symbol_b,
+                                                                "SELL_SHORT",
+                                                                qty_b,
+                                                                float(fill_b),
+                                                            )
+                                                        except Exception as e:
+                                                            logger.error(
+                                                                f"Pairs SHORT portfolio.update_fill failed for {symbol_b}: {e}"
+                                                            )
+                                                        # TC-H4: register a stop-loss for the short
+                                                        if (
+                                                            self.stop_loss_monitor
+                                                            and self.enable_stop_loss
+                                                        ):
+                                                            try:
+                                                                short_pos = Position(
+                                                                    symbol=symbol_b,
+                                                                    quantity=-qty_b,
+                                                                    avg_price=fill_b,
+                                                                    entry_time=datetime.now(),
+                                                                )
+                                                                await self.stop_loss_monitor.add_stop_loss(
+                                                                    symbol=symbol_b,
+                                                                    position=short_pos,
+                                                                    stop_percent=self.stop_loss_percent,
+                                                                    stop_type=StopType.FIXED,
+                                                                )
+                                                            except Exception as e:
+                                                                logger.error(
+                                                                    f"Failed to add stop-loss for pairs SHORT {symbol_b}: {e}"
+                                                                )
+                                                        # Daily executed notional
+                                                        self.daily_executed_notional += float(
+                                                            fill_b
+                                                        ) * float(qty_b)
+                                                        logger.info(
+                                                            f"Pairs trade: Shorted {qty_b} {symbol_b} at ${fill_b:.2f}"
+                                                        )
 
                                         elif (
                                             signal_type == "long_b_short_a"
                                             and qty_a > 0
                                             and qty_b > 0
                                         ):
+                                            # TC-H3: validate the BUY leg before placing
+                                            ok_b, msg_b = self.risk.validate_order(
+                                                symbol_b,
+                                                qty_b,
+                                                float(price_b),
+                                                equity_float,
+                                                self.daily_pnl,
+                                                self.positions,
+                                                self.daily_executed_notional,
+                                            )
+                                            if not ok_b:
+                                                logger.warning(
+                                                    f"Pairs BUY blocked by risk for {symbol_b}: {msg_b}"
+                                                )
+                                                continue
+                                            blocked, blk_reason = self._trading_blocked()
+                                            if blocked:
+                                                logger.error(
+                                                    f"Pairs BUY blocked: {blk_reason}"
+                                                )
+                                                continue
+
+                                            # TC-M2: pending lock + cycle dedupe
+                                            async with self._pending_orders_lock:
+                                                if symbol_b in self._pending_orders:
+                                                    logger.warning(
+                                                        f"Pairs BUY for {symbol_b}: pending lock held, skipping"
+                                                    )
+                                                    continue
+                                                self._pending_orders.add(symbol_b)
+                                            async with self._cycle_executed_buys_lock:
+                                                self._cycle_executed_buys.add(symbol_b)
+
                                             # Buy symbol_b
                                             order_b = Order(
                                                 symbol=symbol_b,
@@ -2966,9 +3325,15 @@ class AsyncRunner:
                                                 side="BUY",
                                                 price=price_b,
                                             )
-                                            res_b = await self._place_order_with_circuit_breaker(
-                                                order_b
-                                            )
+                                            try:
+                                                res_b = (
+                                                    await self._place_order_with_circuit_breaker(
+                                                        order_b
+                                                    )
+                                                )
+                                            finally:
+                                                async with self._pending_orders_lock:
+                                                    self._pending_orders.discard(symbol_b)
                                             if res_b.ok:
                                                 fill_b = res_b.fill_price or price_b
                                                 await self.db.record_trade(
@@ -2989,6 +3354,8 @@ class AsyncRunner:
                                                 await self.portfolio.update_fill(
                                                     symbol_b, "BUY", qty_b, fill_b
                                                 )
+                                                # TC-H3: increment daily executed notional
+                                                self.daily_executed_notional += float(fill_b) * float(qty_b)
                                                 logger.info(
                                                     f"Pairs trade: Bought {qty_b} {symbol_b} at ${fill_b:.2f}"
                                                 )
@@ -3031,28 +3398,95 @@ class AsyncRunner:
 
                                             # Short symbol_a (if shorting enabled, otherwise skip)
                                             if self.cfg.execution.enable_short_selling:
-                                                order_a = Order(
-                                                    symbol=symbol_a,
-                                                    quantity=qty_a,
-                                                    side="SELL",
-                                                    price=price_a,
+                                                ok_a, msg_a = self.risk.validate_order(
+                                                    symbol_a,
+                                                    qty_a,
+                                                    float(price_a),
+                                                    equity_float,
+                                                    self.daily_pnl,
+                                                    self.positions,
+                                                    self.daily_executed_notional,
                                                 )
-                                                res_a = (
-                                                    await self._place_order_with_circuit_breaker(
-                                                        order_a
+                                                blocked, blk_reason = self._trading_blocked()
+                                                if not ok_a:
+                                                    logger.warning(
+                                                        f"Pairs SHORT blocked by risk for {symbol_a}: {msg_a}"
                                                     )
-                                                )
-                                                if res_a.ok:
-                                                    await self.db.record_trade(
-                                                        symbol_a,
-                                                        "SELL",
-                                                        qty_a,
-                                                        res_a.fill_price or price_a,
-                                                        0,
+                                                elif blocked:
+                                                    logger.error(
+                                                        f"Pairs SHORT blocked: {blk_reason}"
                                                     )
-                                                    logger.info(
-                                                        f"Pairs trade: Shorted {qty_a} {symbol_a} at ${price_a:.2f}"
+                                                else:
+                                                    # TC-H4: SELL_SHORT side + full short open path
+                                                    order_a = Order(
+                                                        symbol=symbol_a,
+                                                        quantity=qty_a,
+                                                        side="SELL_SHORT",
+                                                        price=price_a,
                                                     )
+                                                    res_a = (
+                                                        await self._place_order_with_circuit_breaker(
+                                                            order_a
+                                                        )
+                                                    )
+                                                    if res_a.ok:
+                                                        fill_a = res_a.fill_price or price_a
+                                                        await self.db.record_trade(
+                                                            symbol_a,
+                                                            "SELL_SHORT",
+                                                            qty_a,
+                                                            fill_a,
+                                                            0,
+                                                        )
+                                                        try:
+                                                            await self._update_position_atomic(
+                                                                symbol_a,
+                                                                qty_a,
+                                                                float(fill_a),
+                                                                "SELL_SHORT",
+                                                            )
+                                                        except Exception as e:
+                                                            logger.error(
+                                                                f"Pairs SHORT _update_position_atomic failed for {symbol_a}: {e}"
+                                                            )
+                                                        try:
+                                                            await self.portfolio.update_fill(
+                                                                symbol_a,
+                                                                "SELL_SHORT",
+                                                                qty_a,
+                                                                float(fill_a),
+                                                            )
+                                                        except Exception as e:
+                                                            logger.error(
+                                                                f"Pairs SHORT portfolio.update_fill failed for {symbol_a}: {e}"
+                                                            )
+                                                        if (
+                                                            self.stop_loss_monitor
+                                                            and self.enable_stop_loss
+                                                        ):
+                                                            try:
+                                                                short_pos = Position(
+                                                                    symbol=symbol_a,
+                                                                    quantity=-qty_a,
+                                                                    avg_price=fill_a,
+                                                                    entry_time=datetime.now(),
+                                                                )
+                                                                await self.stop_loss_monitor.add_stop_loss(
+                                                                    symbol=symbol_a,
+                                                                    position=short_pos,
+                                                                    stop_percent=self.stop_loss_percent,
+                                                                    stop_type=StopType.FIXED,
+                                                                )
+                                                            except Exception as e:
+                                                                logger.error(
+                                                                    f"Failed to add stop-loss for pairs SHORT {symbol_a}: {e}"
+                                                                )
+                                                        self.daily_executed_notional += float(
+                                                            fill_a
+                                                        ) * float(qty_a)
+                                                        logger.info(
+                                                            f"Pairs trade: Shorted {qty_a} {symbol_a} at ${fill_a:.2f}"
+                                                        )
 
                 except Exception as e:
                     logger.error(f"Pairs trading analysis error: {e}")
@@ -3122,8 +3556,14 @@ class AsyncRunner:
             # For paper trading, we just log the action
             logger.warning(f"Emergency shutdown: Cancelled {cancelled_count} orders")
 
-            # Clear any pending executions
-            self.positions.clear()
+            # TC-M3: do NOT clear self.positions here. Clearing the in-memory
+            # positions dict desynchronizes runner state from the database — on
+            # the very next cycle (or after a watchdog restart) the broker may
+            # still hold the position while the runner thinks it has none, so
+            # stop-losses cannot be recreated on startup and risk gates think
+            # the account is flat. Positions are reloaded from the DB on
+            # restart and stop-losses are recreated from those loaded
+            # positions; clearing here breaks that flow.
 
             return cancelled_count
         except Exception as e:

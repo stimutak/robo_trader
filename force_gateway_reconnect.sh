@@ -67,8 +67,12 @@ echo "4. Testing if Gateway accepts new API connections..."
 echo "   (This will attempt a connection with client_id=777)"
 echo ""
 
-# Create a simple Python test script that uses safe_disconnect
-cat > /tmp/test_gateway_accept.py << 'PYEOF'
+# Create a simple Python test script that uses safe_disconnect.
+# Use mktemp to avoid predictable temp paths (CWE-377).
+TMPFILE=$(mktemp -t test_gateway.XXXXXX) || { echo "mktemp failed" >&2; exit 1; }
+trap 'rm -f "$TMPFILE"' EXIT
+
+cat > "$TMPFILE" << 'PYEOF'
 import asyncio
 import os
 import sys
@@ -110,7 +114,7 @@ async def test():
 sys.exit(asyncio.run(test()))
 PYEOF
 
-python3 /tmp/test_gateway_accept.py
+python3 "$TMPFILE"
 TEST_RESULT=$?
 unset IBKR_FORCE_DISCONNECT
 echo ""
@@ -156,8 +160,7 @@ else
     echo ""
 fi
 
-# Cleanup
-rm -f /tmp/test_gateway_accept.py
+# Cleanup is handled by the EXIT trap on $TMPFILE above.
 
 exit $TEST_RESULT
 

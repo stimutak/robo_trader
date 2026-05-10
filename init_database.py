@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
-"""Initialize database with sample data for testing"""
+"""Initialize database with sample data for testing.
 
+WARNING: This script writes FAKE trades, positions, signals, and account data.
+It is intended for SAMPLE/TEST databases ONLY. It refuses to operate on the
+production trading_data.db filename and refuses to overwrite an existing file
+unless --force is passed.
+"""
+
+import argparse
 import asyncio
+import os
 import random
+import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from robo_trader.database_async import AsyncTradingDatabase
 
 
-async def init_sample_data():
-    """Initialize database with sample trading data"""
-    db = AsyncTradingDatabase()
+async def init_sample_data(db_path: Path) -> None:
+    """Initialize database with sample trading data."""
+    db = AsyncTradingDatabase(db_path=db_path)
     await db.initialize()
 
     try:
@@ -75,14 +85,15 @@ async def init_sample_data():
                     market_price=buy_price + random.uniform(-2, 5),
                 )
 
-        # Add some signals for strategy display
+        # Add some signals for strategy display.
+        # Note: metadata is validated by DatabaseValidator and rejects SQL-like
+        # tokens including double-quotes, so we keep it simple.
         for symbol in symbols[:3]:
             await db.record_signal(
                 symbol=symbol,
                 strategy="ML_Enhanced",
                 signal_type="BUY" if random.random() > 0.5 else "HOLD",
                 strength=random.uniform(0.5, 0.9),
-                metadata='{"confidence": 0.75}',
             )
 
             await db.record_signal(
@@ -90,7 +101,6 @@ async def init_sample_data():
                 strategy="OrderFlowImbalance",
                 signal_type="BUY" if random.random() > 0.5 else "SELL",
                 strength=random.uniform(0.4, 0.8),
-                metadata='{"ofi": 0.65}',
             )
 
         # Update account with sample P&L
@@ -98,7 +108,7 @@ async def init_sample_data():
             cash=95000, equity=105000, daily_pnl=500, realized_pnl=2000, unrealized_pnl=3000
         )
 
-        print("✅ Database initialized with sample data")
+        print("Database initialized with sample data")
         print("   - 5 symbols with positions")
         print("   - Both BUY and SELL trades")
         print("   - Market data for each symbol")
@@ -109,5 +119,44 @@ async def init_sample_data():
         await db.close()
 
 
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Initialize a SAMPLE database for testing.",
+    )
+    parser.add_argument(
+        "--db-path",
+        required=True,
+        help="Path to NEW database. Refuses to run if file exists (use --force to override).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow overwrite -- DANGEROUS. Will write fake trades over existing data.",
+    )
+    args = parser.parse_args()
+
+    db_path = Path(args.db_path)
+
+    # Refuse to clobber the production database name.
+    if db_path.name == "trading_data.db":
+        print(
+            "REFUSING to run: this script is for SAMPLE/TEST DBs only. "
+            "Use a different filename (e.g. sample.db).",
+            file=sys.stderr,
+        )
+        return 2
+
+    if db_path.exists() and not args.force:
+        print(
+            f"REFUSING to run: {db_path} already exists. Use --force to override "
+            "(this will write fake trades).",
+            file=sys.stderr,
+        )
+        return 2
+
+    asyncio.run(init_sample_data(db_path))
+    return 0
+
+
 if __name__ == "__main__":
-    asyncio.run(init_sample_data())
+    sys.exit(main())

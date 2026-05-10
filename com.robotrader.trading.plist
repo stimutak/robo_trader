@@ -1,40 +1,50 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Example launchd config. Do not load until you have reviewed paths. -->
+<!--
+    To install:
+        cp com.robotrader.trading.plist ~/Library/LaunchAgents/
+        launchctl load ~/Library/LaunchAgents/com.robotrader.trading.plist
+
+    Note: START_TRADER.sh starts Gateway via IBC and requires interactive
+    2FA on first launch. Loading this agent unattended will not complete
+    2FA on its own.
+-->
 <plist version="1.0">
 <dict>
     <key>Label</key>
     <string>com.robotrader.trading</string>
-    
+
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/oliver/robo_trader/venv/bin/python</string>
-        <string>/Users/oliver/robo_trader/start_ai_trading.py</string>
+        <string>/bin/bash</string>
+        <string>/Users/oliver/Projects/robo_trader/START_TRADER.sh</string>
     </array>
-    
+
     <key>WorkingDirectory</key>
-    <string>/Users/oliver/robo_trader</string>
-    
+    <string>/Users/oliver/Projects/robo_trader</string>
+
     <key>StandardOutPath</key>
-    <string>/Users/oliver/robo_trader/launchd_trading.log</string>
-    
+    <string>/Users/oliver/Projects/robo_trader/logs/launchd_trading.log</string>
+
     <key>StandardErrorPath</key>
-    <string>/Users/oliver/robo_trader/launchd_trading_error.log</string>
-    
+    <string>/Users/oliver/Projects/robo_trader/logs/launchd_trading_error.log</string>
+
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>PYTHONPATH</key>
-        <string>/Users/oliver/robo_trader</string>
+        <string>/Users/oliver/Projects/robo_trader</string>
     </dict>
-    
+
     <!-- Start after network is available -->
     <key>KeepAlive</key>
     <dict>
         <key>NetworkState</key>
         <true/>
     </dict>
-    
+
     <!-- Run every day at 9:00 AM -->
     <key>StartCalendarInterval</key>
     <dict>
@@ -43,11 +53,11 @@
         <key>Minute</key>
         <integer>0</integer>
     </dict>
-    
+
     <!-- Restart on crash -->
     <key>RunAtLoad</key>
     <false/>
-    
+
     <key>ThrottleInterval</key>
     <integer>30</integer>
 </dict>

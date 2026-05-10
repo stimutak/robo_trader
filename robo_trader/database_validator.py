@@ -126,7 +126,10 @@ class DatabaseValidator:
                 f"Portfolio ID must be a string, got {type(portfolio_id).__name__}"
             )
 
-        portfolio_id = portfolio_id.strip()
+        # Normalize to lowercase to prevent shadow-default IDs ("Default" vs "default").
+        # NOTE: Forward-only normalization. Existing portfolios in the DB with
+        # mixed-case IDs are grandfathered — no migration rewrites those rows.
+        portfolio_id = portfolio_id.strip().lower()
 
         if not DatabaseValidator.PORTFOLIO_ID_PATTERN.match(portfolio_id):
             raise ValidationError(
@@ -548,13 +551,14 @@ class DatabaseValidator:
         if len(value) > max_length:
             raise ValidationError(f"{field_name} exceeds maximum length of {max_length}")
 
-        # Check for SQL injection attempts
+        # Check for SQL injection attempts. Reject rather than silently escape —
+        # silent-escape leaves dangerous tokens like ";--" and "DROP" intact.
         dangerous_patterns = ["'", '"', ";", "--", "/*", "*/", "DROP", "DELETE", "INSERT", "UPDATE"]
+        upper_value = value.upper()
         for pattern in dangerous_patterns:
-            if pattern in value.upper():
-                logger.warning(f"Potential SQL injection in {field_name}: {value}")
-                # Escape rather than reject for non-critical fields
-                value = value.replace("'", "''").replace('"', '""')
+            if pattern in upper_value:
+                logger.error(f"Forbidden SQL keywords in {field_name}: {value!r}")
+                raise ValidationError(f"{field_name} contains forbidden SQL keywords")
 
         return value
 

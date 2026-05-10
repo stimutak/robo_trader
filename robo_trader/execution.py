@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import math
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
@@ -49,6 +50,10 @@ class BaseExecutor(AbstractExecutor):
         self.skip_execution_delays = skip_execution_delays
         self.smart_executor = None
         self._execution_cache: Dict[str, float] = {}
+        # Track when each cached reference price was last set so we can reject
+        # stale fallbacks for market orders (TC-L3).
+        self._execution_cache_ts: Dict[str, dt.datetime] = {}
+        self._execution_cache_max_age_seconds: float = 60.0
 
         # Initialize smart executor if enabled
         if use_smart_execution:
@@ -209,6 +214,15 @@ class PaperExecutor(BaseExecutor):
                     "Invalid price provided for paper order", symbol=order.symbol, price=order.price
                 )
                 return ExecutionResult(False, "Invalid price for paper execution")
+            # Reject NaN / Infinity early (TC-M4); without this slippage math
+            # silently produces NaN fills.
+            if not math.isfinite(base):
+                logger.error(
+                    "Non-finite price provided for paper order",
+                    symbol=order.symbol,
+                    price=order.price,
+                )
+                return ExecutionResult(False, "Non-finite price for paper execution")
             if base <= 0:
                 logger.error(
                     "Non-positive price provided for paper order",
@@ -217,6 +231,7 @@ class PaperExecutor(BaseExecutor):
                 )
                 return ExecutionResult(False, "Non-positive price for paper execution")
             self._execution_cache[order.symbol] = base
+            self._execution_cache_ts[order.symbol] = dt.datetime.utcnow()
         else:
             base = self._execution_cache.get(order.symbol)
             if base is None:
@@ -225,6 +240,17 @@ class PaperExecutor(BaseExecutor):
                     symbol=order.symbol,
                 )
                 return ExecutionResult(False, "No reference price for market order")
+            # Stale-price fallback guard (TC-L3): if the last cached price is
+            # older than max-age, refuse the order rather than fill at stale data.
+            ts = self._execution_cache_ts.get(order.symbol)
+            if ts is None or (
+                dt.datetime.utcnow() - ts
+            ).total_seconds() > self._execution_cache_max_age_seconds:
+                logger.error(
+                    "Stale cached reference price for market order in paper execution",
+                    symbol=order.symbol,
+                )
+                return ExecutionResult(False, "Stale reference price for market order")
 
         # Apply symmetric slippage in basis points
         slip = base * (self.slippage_bps / 10_000.0) if self.slippage_bps else 0.0

@@ -47,6 +47,20 @@ echo "RoboTrader Startup Script"
 echo "=========================================="
 echo ""
 
+# SECURITY: Verify Gateway-side read-only enforcement is configured.
+# RoboTrader relies on IBC's ReadOnlyApi=yes as a primary safety net against
+# any code path (intentional or accidental) that might attempt to submit
+# live orders. If the active config has been modified to permit writes, abort.
+IBC_INI="${SCRIPT_DIR}/config/ibc/config.ini"
+if [ -f "$IBC_INI" ] && ! grep -q '^ReadOnlyApi=yes' "$IBC_INI"; then
+    echo "FATAL: IBC config has ReadOnlyApi != yes." >&2
+    echo "       RoboTrader requires Gateway-side read-only enforcement." >&2
+    echo "       File: $IBC_INI" >&2
+    echo "       To fix: set 'ReadOnlyApi=yes' and re-run." >&2
+    exit 4
+fi
+
+
 # Step 1: Kill existing Python processes first
 echo "1. Killing existing trader processes..."
 pkill -9 -f "runner_async" 2>/dev/null && echo "   ✓ Killed runner_async" || echo "   ✓ No runner_async running"

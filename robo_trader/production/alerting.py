@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import smtplib
+import ssl
 import threading
 from collections import deque
 from dataclasses import asdict, dataclass, field
@@ -268,9 +269,12 @@ class EmailNotifier:
 
             msg.attach(MIMEText(html, "html"))
 
-            # Send email
+            # Send email — use a default SSL context (validates cert chain
+            # and uses safe defaults) for STARTTLS rather than an unverified
+            # connection.
+            ctx = ssl.create_default_context()
             with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
-                server.starttls()
+                server.starttls(context=ctx)
                 server.login(self.username, self.password)
                 server.send_message(msg)
 

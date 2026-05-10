@@ -18,8 +18,6 @@ Usage:
     await scoped_db.store_market_data(...)    # → db.store_market_data(...)
 """
 
-import inspect
-
 from ..logger import get_logger
 from robo_trader.database_async import DEFAULT_PORTFOLIO_ID
 
@@ -49,18 +47,21 @@ _PORTFOLIO_SCOPED_METHODS = frozenset(
 _KNOWN_GLOBAL_METHODS = frozenset(
     {
         "initialize",
+        "close",
+        "health_check",
+        "ensure_connection",
         "get_connection",
         "store_market_data",
+        "batch_store_market_data",
         "get_latest_market_data",
         "get_all_positions",
         "get_portfolios",
         "upsert_portfolio",
+        # cleanup_old_data is global by default; takes optional portfolio_id
+        # but is not auto-injected (intentional explicit-opt-in scoping).
+        "cleanup_old_data",
     }
 )
-
-# Cache for methods we've already warned about (avoid log spam)
-_warned_methods: set = set()
-
 
 class PortfolioScopedDB:
     """Proxy that auto-injects portfolio_id into portfolio-scoped DB methods.
@@ -81,7 +82,11 @@ class PortfolioScopedDB:
     def __getattr__(self, name):
         attr = getattr(self._db, name)
 
-        if name in _PORTFOLIO_SCOPED_METHODS and callable(attr):
+        # Non-callable attributes and dunder/private names pass through unchanged.
+        if not callable(attr) or name.startswith("_"):
+            return attr
+
+        if name in _PORTFOLIO_SCOPED_METHODS:
             # Wrap to auto-inject portfolio_id
             async def scoped_method(*args, **kwargs):
                 if "portfolio_id" not in kwargs:
@@ -90,21 +95,15 @@ class PortfolioScopedDB:
 
             return scoped_method
 
-        # Scope-leak detection: warn if a callable has portfolio_id in its
-        # signature but isn't in the scoped set (and isn't known-global).
-        if callable(attr) and name not in _KNOWN_GLOBAL_METHODS:
-            if name not in _warned_methods:
-                try:
-                    sig = inspect.signature(attr)
-                    if "portfolio_id" in sig.parameters:
-                        logger.warning(
-                            f"SCOPE LEAK: Method '{name}' accepts portfolio_id but is NOT in "
-                            f"_PORTFOLIO_SCOPED_METHODS. Calls through PortfolioScopedDB will "
-                            f"use the default portfolio, not '{self.portfolio_id}'. "
-                            f"Add '{name}' to _PORTFOLIO_SCOPED_METHODS in db_proxy.py."
-                        )
-                        _warned_methods.add(name)
-                except (ValueError, TypeError):
-                    pass  # Can't inspect (e.g. built-in) -- skip
+        if name in _KNOWN_GLOBAL_METHODS:
+            return attr
 
-        return attr
+        # Deny-by-default: any callable not explicitly listed in either set is
+        # refused to prevent silent cross-portfolio leaks. Add the method to the
+        # appropriate set in db_proxy.py if the call is intentional.
+        raise AttributeError(
+            f"PortfolioScopedDB refuses to call '{name}': not in "
+            f"_PORTFOLIO_SCOPED_METHODS or _KNOWN_GLOBAL_METHODS. "
+            f"This prevents silent cross-portfolio leaks. "
+            f"Add '{name}' to the appropriate set if intentional."
+        )

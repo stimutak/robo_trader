@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import signal
 import subprocess
 import threading
@@ -44,29 +45,14 @@ from robo_trader.ml.model_trainer import ModelTrainer  # noqa: E402
 logger = get_logger(__name__)
 app = Flask(__name__)
 
-# Configure CORS with whitelisted origins
-# Set CORS_ORIGINS env var for production, or it defaults to allowing local development
+# Configure CORS with explicit whitelisted origins only.
+# Wildcard-port patterns are unsafe with supports_credentials=True (W-M2),
+# so we require exact origins. Default keeps local dev working.
 cors_origins = os.getenv("CORS_ORIGINS", "").strip()
-is_production = (
-    os.getenv("FLASK_ENV", "").lower() == "production"
-    or os.getenv("PRODUCTION", "").lower() == "true"
-)
 if cors_origins:
-    # Production: use explicit whitelist from environment
-    allowed_origins = [origin.strip() for origin in cors_origins.split(",")]
-elif is_production:
-    # Production without CORS_ORIGINS set: restrict to localhost only (safe default)
-    logger.warning("PRODUCTION mode without CORS_ORIGINS set - restricting to localhost only")
-    allowed_origins = ["http://localhost:5555", "http://127.0.0.1:5555"]
+    allowed_origins = [origin.strip() for origin in cors_origins.split(",") if origin.strip()]
 else:
-    # Development: allow localhost and common local network patterns
-    allowed_origins = [
-        "http://localhost:*",
-        "http://127.0.0.1:*",
-        "http://192.168.*.*:*",  # Local network
-        "http://10.*.*.*:*",  # Private network
-        "exp://*",  # Expo development (React Native)
-    ]
+    allowed_origins = ["http://127.0.0.1:5555", "http://localhost:5555"]
 
 CORS(app, origins=allowed_origins, supports_credentials=True)
 server = app  # For Gunicorn compatibility
@@ -78,9 +64,24 @@ _strategies_cache_lock = threading.Lock()
 # Configuration
 config = load_config()
 DEFAULT_CAPITAL = float(os.getenv("DEFAULT_CASH", getattr(config, "default_cash", 100000)))
-AUTH_ENABLED = os.getenv("DASH_AUTH_ENABLED", "false").lower() == "true"
+# W-H1: auth on by default. Empty hash with auth enabled is a hard error.
+AUTH_ENABLED = os.getenv("DASH_AUTH_ENABLED", "true").lower() == "true"
 AUTH_USER = os.getenv("DASH_USER", "admin")
-AUTH_PASS_HASH = os.getenv("DASH_PASS_HASH", "")
+AUTH_PASS_HASH = os.getenv("DASH_PASS_HASH", "").strip()
+# Reject empty AND placeholder values. A SHA-256 hex digest is exactly 64
+# lowercase hex chars; anything else is misconfiguration.
+_PLACEHOLDER_PREFIXES = ("<", "TODO", "CHANGEME", "REPLACE")
+if AUTH_ENABLED and (
+    not AUTH_PASS_HASH
+    or AUTH_PASS_HASH.upper().startswith(_PLACEHOLDER_PREFIXES)
+    or len(AUTH_PASS_HASH) != 64
+    or not all(c in "0123456789abcdefABCDEF" for c in AUTH_PASS_HASH)
+):
+    raise SystemExit(
+        "DASH_PASS_HASH must be a 64-char SHA-256 hex digest when auth is enabled. "
+        "Run: .venv/bin/python scripts/_set_dashboard_password.py "
+        "(or set DASH_AUTH_ENABLED=false for local dev)."
+    )
 
 # Initialize components - will be loaded lazily
 db = None
@@ -143,8 +144,9 @@ def check_auth(username, password):
     """Check if username/password is valid using timing-safe comparison."""
     if not AUTH_ENABLED:
         return True
+    # W-H1: never short-circuit to True when auth is on but hash is missing.
     if not AUTH_PASS_HASH:
-        return True
+        return False
     password_hash = hashlib.sha256(password.encode()).hexdigest()
     # Use timing-safe comparison to prevent timing attacks
     return hmac.compare_digest(username, AUTH_USER) and hmac.compare_digest(
@@ -174,6 +176,71 @@ def requires_auth(f):
         return f(*args, **kwargs)
 
     return decorated
+
+
+# W-H2: CSRF (double-submit cookie) and Origin check for state-changing requests.
+def _allowed_request_origins():
+    """Whitelist of allowed Origin values for state-changing requests."""
+    host = request.host or ""
+    # request.host includes port already (e.g. "127.0.0.1:5555")
+    base = {
+        f"http://{host}",
+        f"https://{host}",
+    }
+    # Always allow loopback variants on the dashboard port.
+    port = os.getenv("DASH_PORT", "5555")
+    base.update(
+        {
+            f"http://127.0.0.1:{port}",
+            f"http://localhost:{port}",
+        }
+    )
+    extra = os.getenv("CORS_ORIGINS", "").strip()
+    if extra:
+        for origin in extra.split(","):
+            origin = origin.strip()
+            if origin:
+                base.add(origin)
+    return base
+
+
+def csrf_required(f):
+    """Enforce double-submit-cookie CSRF and Origin check on state-changing routes."""
+
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # Origin check: if browser sent Origin, it must match our whitelist.
+        origin = request.headers.get("Origin")
+        if origin and origin not in _allowed_request_origins():
+            return jsonify({"error": "csrf"}), 403
+
+        cookie_token = request.cookies.get("csrf_token", "")
+        header_token = request.headers.get("X-CSRF-Token", "")
+        if not cookie_token or not header_token:
+            return jsonify({"error": "csrf"}), 403
+        if not hmac.compare_digest(cookie_token, header_token):
+            return jsonify({"error": "csrf"}), 403
+        return f(*args, **kwargs)
+
+    return decorated
+
+
+@app.after_request
+def _set_csrf_cookie(response):
+    """Issue a CSRF token cookie on responses if one isn't set yet (W-H2)."""
+    try:
+        if request.method == "GET" and not request.cookies.get("csrf_token"):
+            token = secrets.token_urlsafe(32)
+            response.set_cookie(
+                "csrf_token",
+                token,
+                httponly=False,
+                samesite="Strict",
+                secure=request.is_secure,
+            )
+    except Exception:
+        pass
+    return response
 
 
 # Portfolio ID validation instance
@@ -1542,6 +1609,8 @@ HTML_TEMPLATE = """
     </div>
     
     <script>
+        // W-H3: escape untrusted strings before injecting via innerHTML.
+        function escHTML(s){const d=document.createElement('div');d.textContent=String(s==null?'':s);return d.innerHTML;}
         let currentTab = 'overview';
         let currentPortfolio = 'default';
         let portfolioList = [];
@@ -2048,8 +2117,8 @@ HTML_TEMPLATE = """
                 return `
                     <div style="display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #21262d;">
                         <div>
-                            <span style="color: #58a6ff; font-weight: bold;">${p.symbol}</span>
-                            <span style="color: #8b949e; margin-left: 8px;">${p.quantity} @ $${p.entry_price.toFixed(2)}</span>
+                            <span style="color: #58a6ff; font-weight: bold;">${escHTML(p.symbol)}</span>
+                            <span style="color: #8b949e; margin-left: 8px;">${escHTML(p.quantity)} @ $${p.entry_price.toFixed(2)}</span>
                         </div>
                         <div style="color: ${pnlColor}; font-weight: bold;">
                             ${arrow} $${Math.abs(p.pnl).toFixed(0)} (${p.pnlPct >= 0 ? '+' : ''}${p.pnlPct.toFixed(1)}%)
@@ -2080,11 +2149,11 @@ HTML_TEMPLATE = """
                 return `
                     <div style="display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid #21262d;">
                         <div>
-                            <span style="background: ${sideBg}; color: #fff; padding: 1px 5px; border-radius: 3px; font-size: 9px; margin-right: 6px;">${t.side}</span>
-                            <span style="color: #58a6ff; font-weight: bold;">${t.symbol}</span>
+                            <span style="background: ${sideBg}; color: #fff; padding: 1px 5px; border-radius: 3px; font-size: 9px; margin-right: 6px;">${escHTML(t.side)}</span>
+                            <span style="color: #58a6ff; font-weight: bold;">${escHTML(t.symbol)}</span>
                         </div>
                         <div style="color: #8b949e;">
-                            ${t.quantity} @ $${t.price.toFixed(2)} <span style="color: #666; margin-left: 5px;">${time}</span>
+                            ${escHTML(t.quantity)} @ $${t.price.toFixed(2)} <span style="color: #666; margin-left: 5px;">${escHTML(time)}</span>
                         </div>
                     </div>
                 `;
@@ -2211,10 +2280,10 @@ HTML_TEMPLATE = """
                         const pnlDisplay = trade.side === 'SELL' ? `<span style="color: ${pnlColor}; font-weight: 500;">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(0)}</span>` : '<span style="color: #6b7280;">-</span>';
                         return `
                             <tr style="border-bottom: 1px solid #21262d;">
-                                <td style="padding: 6px 10px; color: #8b949e;">${time}</td>
-                                <td style="padding: 6px 10px;"><strong style="color: #58a6ff;">${trade.symbol}</strong></td>
-                                <td style="padding: 6px 10px; text-align: center;"><span style="background: ${sideBg}; color: #fff; padding: 2px 8px; border-radius: 3px; font-size: 10px; font-weight: bold;">${trade.side}</span></td>
-                                <td style="padding: 6px 10px; text-align: right;">${trade.quantity}</td>
+                                <td style="padding: 6px 10px; color: #8b949e;">${escHTML(time)}</td>
+                                <td style="padding: 6px 10px;"><strong style="color: #58a6ff;">${escHTML(trade.symbol)}</strong></td>
+                                <td style="padding: 6px 10px; text-align: center;"><span style="background: ${sideBg}; color: #fff; padding: 2px 8px; border-radius: 3px; font-size: 10px; font-weight: bold;">${escHTML(trade.side)}</span></td>
+                                <td style="padding: 6px 10px; text-align: right;">${escHTML(trade.quantity)}</td>
                                 <td style="padding: 6px 10px; text-align: right;">$${trade.price.toFixed(2)}</td>
                                 <td style="padding: 6px 10px; text-align: right;">$${trade.notional.toFixed(0)}</td>
                                 <td style="padding: 6px 10px; text-align: right;">${pnlDisplay}</td>
@@ -2378,9 +2447,10 @@ HTML_TEMPLATE = """
                     // Create and append new log element
                     const logDiv = document.createElement('div');
                     logDiv.className = cssClass;
+                    // W-H3: escape user-supplied fields before HTML injection
                     logDiv.innerHTML = `
-                        <span class="log-time">${time}</span>
-                        <span>${message}</span>
+                        <span class="log-time">${escHTML(time)}</span>
+                        <span>${escHTML(message)}</span>
                     `;
                     container.appendChild(logDiv);
                 });
@@ -2769,11 +2839,12 @@ HTML_TEMPLATE = """
             // Update model table (compact format)
             if (data.models && data.models.length > 0) {
                 const tbody = document.getElementById('model-table');
+                // W-H3: escape model fields before HTML injection
                 tbody.innerHTML = data.models.map(model => `
                     <tr>
-                        <td>${model.type}</td>
+                        <td>${escHTML(model.type)}</td>
                         <td style="color: ${model.test_score >= 0.55 ? '#4ade80' : '#fff'}">${(model.test_score * 100).toFixed(1)}%</td>
-                        <td>${model.feature_count}</td>
+                        <td>${escHTML(model.feature_count)}</td>
                         <td><span style="color: ${model.status === 'active' ? '#4ade80' : '#666'};">${model.status === 'active' ? '●' : '○'}</span></td>
                     </tr>
                 `).join('');
@@ -2866,17 +2937,18 @@ HTML_TEMPLATE = """
                 return;
             }
 
+            // W-H3: escape prediction fields
             tbody.innerHTML = predictions.map(p => {
                 const actionColor = p.action === 'BUY' ? '#4ade80' : p.action === 'SELL' ? '#ff6b6b' : '#888';
                 const confColor = p.confidence >= 0.7 ? '#4ade80' : p.confidence >= 0.5 ? '#fbbf24' : '#888';
                 const time = p.timestamp ? p.timestamp.split('T')[1]?.split('.')[0] || '' : '';
                 return `
                     <tr>
-                        <td><strong>${p.symbol}</strong></td>
-                        <td style="color: ${actionColor}; font-weight: bold;">${p.action}</td>
+                        <td><strong>${escHTML(p.symbol)}</strong></td>
+                        <td style="color: ${actionColor}; font-weight: bold;">${escHTML(p.action)}</td>
                         <td style="color: ${confColor}">${(p.confidence * 100).toFixed(0)}%</td>
-                        <td style="color: #666; font-size: 10px;">${p.source}</td>
-                        <td style="color: #666; font-size: 10px;">${time}</td>
+                        <td style="color: #666; font-size: 10px;">${escHTML(p.source)}</td>
+                        <td style="color: #666; font-size: 10px;">${escHTML(time)}</td>
                     </tr>
                 `;
             }).join('');
@@ -2927,11 +2999,12 @@ HTML_TEMPLATE = """
                     ? '<span style="background: #238636; color: #fff; padding: 2px 6px; border-radius: 3px; font-size: 10px;">HOLDING</span>'
                     : '<span style="background: #30363d; color: #8b949e; padding: 2px 6px; border-radius: 3px; font-size: 10px;">WATCHING</span>';
 
+                // W-H3: escape watchlist item fields
                 return `
                     <tr style="border-bottom: 1px solid #21262d;">
-                        <td style="padding: 6px 10px;"><strong style="color: #58a6ff;">${item.symbol}</strong></td>
+                        <td style="padding: 6px 10px;"><strong style="color: #58a6ff;">${escHTML(item.symbol)}</strong></td>
                         <td style="padding: 6px 10px; text-align: right;">$${item.current_price.toFixed(2)}</td>
-                        <td style="padding: 6px 10px; text-align: right;">${item.quantity || '-'}</td>
+                        <td style="padding: 6px 10px; text-align: right;">${escHTML(item.quantity || '-')}</td>
                         <td style="padding: 6px 10px; text-align: right;">${item.avg_cost > 0 ? '$' + item.avg_cost.toFixed(2) : '-'}</td>
                         <td style="padding: 6px 10px; text-align: right; color: ${item.quantity > 0 ? pnlColor : '#8b949e'};">${pnlDisplay}</td>
                         <td style="padding: 6px 10px; text-align: center;">${statusBadge}</td>
@@ -2939,7 +3012,7 @@ HTML_TEMPLATE = """
                 `;
             }).join('');
         }
-        
+
         function updatePositionsTable(positions) {
             const tbody = document.getElementById('positions-table');
             if (!positions || positions.length === 0) {
@@ -2991,10 +3064,11 @@ HTML_TEMPLATE = """
                     ? '<span style="background: #da3633; color: #fff; padding: 2px 6px; border-radius: 3px; font-size: 10px;">SELL</span>'
                     : '<span style="background: #30363d; color: #8b949e; padding: 2px 6px; border-radius: 3px; font-size: 10px;">HOLD</span>';
 
+                // W-H3: escape position fields
                 return `
                     <tr style="border-bottom: 1px solid #21262d;">
-                        <td style="padding: 6px 10px;"><strong style="color: #58a6ff;">${pos.symbol}</strong></td>
-                        <td style="padding: 6px 10px; text-align: right;">${pos.quantity}</td>
+                        <td style="padding: 6px 10px;"><strong style="color: #58a6ff;">${escHTML(pos.symbol)}</strong></td>
+                        <td style="padding: 6px 10px; text-align: right;">${escHTML(pos.quantity)}</td>
                         <td style="padding: 6px 10px; text-align: right;">$${pos.entry_price.toFixed(2)}</td>
                         <td style="padding: 6px 10px; text-align: right;">$${pos.current_price.toFixed(2)}</td>
                         <td style="padding: 6px 10px; text-align: right; color: ${pnlColor};">$${pos.pnl.toFixed(2)}</td>
@@ -3059,15 +3133,16 @@ HTML_TEMPLATE = """
                 const stateIcon = stats.state === 'closed' ? '✓' :
                                 stats.state === 'open' ? '✗' : '⚠';
 
+                // W-H3: escape circuit breaker name and state
                 html += `
                     <div class="circuit-breaker-item">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-                            <strong>${name}</strong>
-                            <span class="badge badge-${stateClass}">${stateIcon} ${stats.state.toUpperCase()}</span>
+                            <strong>${escHTML(name)}</strong>
+                            <span class="badge badge-${stateClass}">${stateIcon} ${escHTML(String(stats.state).toUpperCase())}</span>
                         </div>
                         <div style="font-size: 0.9em; color: #999;">
-                            Calls: ${stats.total_calls} |
-                            Failed: ${stats.failed_calls} |
+                            Calls: ${escHTML(stats.total_calls)} |
+                            Failed: ${escHTML(stats.failed_calls)} |
                             Success Rate: ${((stats.successful_calls / Math.max(stats.total_calls, 1)) * 100).toFixed(1)}%
                         </div>
                     </div>
@@ -3097,12 +3172,13 @@ HTML_TEMPLATE = """
                                       order.status === 'error' || order.status === 'rejected' ? 'danger' :
                                       order.status === 'partial_fill' ? 'warning' : 'info';
 
+                    // W-H3: escape order fields before rendering
                     html += `
                         <tr>
-                            <td>${order.symbol}</td>
-                            <td><span class="badge badge-${statusClass}">${order.status}</span></td>
+                            <td>${escHTML(order.symbol)}</td>
+                            <td><span class="badge badge-${statusClass}">${escHTML(order.status)}</span></td>
                             <td>${order.fill_percentage.toFixed(1)}%</td>
-                            <td>${order.retry_count}</td>
+                            <td>${escHTML(order.retry_count)}</td>
                         </tr>
                     `;
                 });
@@ -3133,10 +3209,11 @@ HTML_TEMPLATE = """
                 const displayKey = key.replace(/_/g, ' ').toLowerCase()
                     .replace(/\\b\\w/g, l => l.toUpperCase());
 
+                // W-H3: escape threshold key/value (env-derived but user-configurable)
                 html += `
                     <div style="padding: 8px; background: #2a2a2a; border-radius: 4px;">
-                        <div style="font-size: 0.85em; color: #999;">${displayKey}</div>
-                        <div style="font-size: 1.1em; font-weight: bold;">${value}</div>
+                        <div style="font-size: 0.85em; color: #999;">${escHTML(displayKey)}</div>
+                        <div style="font-size: 1.1em; font-weight: bold;">${escHTML(value)}</div>
                     </div>
                 `;
             }
@@ -3234,7 +3311,8 @@ HTML_TEMPLATE = """
             const entry = document.createElement('div');
             entry.className = 'log-entry';
             const time = new Date().toLocaleTimeString();
-            entry.innerHTML = `<span class="log-time">${time}</span><span>${message}</span>`;
+            // W-H3: escape time and message (message comes from WS or other code paths)
+            entry.innerHTML = `<span class="log-time">${escHTML(time)}</span><span>${escHTML(message)}</span>`;
             container.appendChild(entry);
             // Auto-scroll if enabled
             const autoScrollEnabled = document.getElementById('auto-scroll-toggle')?.checked;
@@ -3408,11 +3486,11 @@ HTML_TEMPLATE = """
             };
             const levelColor = levelColors[data.level] || '#888';
 
-            // Format: time [LEVEL] source: message
-            const levelBadge = `<span style="color: ${levelColor}; font-weight: bold;">[${data.level}]</span>`;
-            const source = data.source ? `<span style="color: #888;">${data.source}:</span> ` : '';
+            // Format: time [LEVEL] source: message — W-H3: all WS-supplied fields escaped
+            const levelBadge = `<span style="color: ${levelColor}; font-weight: bold;">[${escHTML(data.level)}]</span>`;
+            const source = data.source ? `<span style="color: #888;">${escHTML(data.source)}:</span> ` : '';
 
-            entry.innerHTML = `<span class="log-time">${time}</span> ${levelBadge} ${source}<span>${data.message}</span>`;
+            entry.innerHTML = `<span class="log-time">${escHTML(time)}</span> ${levelBadge} ${source}<span>${escHTML(data.message)}</span>`;
 
             // Apply current filter
             if (currentLogFilter !== 'ALL' && data.level !== currentLogFilter) {
@@ -6460,6 +6538,7 @@ def get_kelly_parameters(symbol):
 
 @app.route("/api/risk/kill-switch", methods=["POST"])
 @requires_auth
+@csrf_required
 def control_kill_switch():
     """Control kill switch (reset after trigger)"""
     action = (request.json or {}).get("action", "status")
@@ -6596,6 +6675,7 @@ def get_safety_thresholds():
 
 @app.route("/api/start", methods=["POST"])
 @requires_auth
+@csrf_required
 def start_trading():
     """Start trading with proper Gateway checks and zombie cleanup."""
     global trading_status
@@ -6633,24 +6713,24 @@ def start_trading():
             trading_log.append(
                 f"{datetime.now().strftime('%H:%M:%S')} - Trading started for {symbols_str}"
             )
+            # W-M5: log subprocess output server-side only, do not return to client.
+            app.logger.info("start_runner stdout: %s", result.stdout)
+            if result.stderr:
+                app.logger.info("start_runner stderr: %s", result.stderr)
             return jsonify(
                 {
                     "status": "started",
                     "symbols": symbols_str.split(","),
-                    "output": result.stdout,
                 }
             )
         else:
             trading_log.append(
-                f"{datetime.now().strftime('%H:%M:%S')} - Failed to start: {result.stderr}"
+                f"{datetime.now().strftime('%H:%M:%S')} - Failed to start (rc={result.returncode})"
             )
+            app.logger.warning("start_runner failed rc=%s stdout=%s stderr=%s",
+                               result.returncode, result.stdout, result.stderr)
             return (
-                jsonify(
-                    {
-                        "status": "error",
-                        "error": result.stderr or result.stdout,
-                    }
-                ),
+                jsonify({"status": "error", "error": "start_failed"}),
                 500,
             )
 
@@ -6664,6 +6744,7 @@ def start_trading():
 
 @app.route("/api/stop", methods=["POST"])
 @requires_auth
+@csrf_required
 def stop_trading():
     """Stop trading - kills all runner processes."""
     global trading_status, trading_process
@@ -6675,6 +6756,10 @@ def stop_trading():
             capture_output=True,
             text=True,
         )
+
+        # W-M5: log subprocess output server-side, do not return it to client.
+        app.logger.info("pkill runner_async rc=%s stdout=%s stderr=%s",
+                        result.returncode, result.stdout, result.stderr)
 
         # Also terminate tracked process if any
         if trading_process:
@@ -6691,7 +6776,7 @@ def stop_trading():
 
     except Exception as e:
         logger.error(f"Error stopping trading: {e}")
-        return jsonify({"status": "error", "error": str(e)}), 500
+        return jsonify({"status": "error", "error": "stop_failed"}), 500
 
 
 @app.route("/api/logs")
@@ -6784,8 +6869,10 @@ if __name__ == "__main__":
     logger.info(f"Dashboard starting on port {os.getenv('DASH_PORT', 5555)}")
 
     # Run Flask app
+    # W-H1: bind to loopback by default. Set DASH_HOST=0.0.0.0 to expose on LAN
+    # only after putting auth + reverse proxy in front.
     app.run(
-        host="0.0.0.0",
+        host=os.getenv("DASH_HOST", "127.0.0.1"),
         port=int(os.getenv("DASH_PORT", 5555)),
         use_reloader=False,
         debug=os.getenv("FLASK_ENV") == "development",

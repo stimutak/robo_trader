@@ -67,6 +67,14 @@ secrets/
 config/*.secret
 config/*.key
 
+# IBC and local environment files (must never be baked into images)
+config/ibc/
+config/*.ini
+.env
+.env.*
+!.env.example
+!.env.template
+
 # Cache and temp
 .cache/
 temp/

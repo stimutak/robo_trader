@@ -13,6 +13,9 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from robo_trader.database_validator import DatabaseValidator, ValidationError
+from robo_trader.ml._safe_load import sign_file, verify_file
+
 logger = logging.getLogger(__name__)
 
 
@@ -505,11 +508,12 @@ class StreamingFeatureStore:
 
     def _persist_features(self, symbol: str):
         """Persist buffered features to disk."""
+        symbol = DatabaseValidator.validate_symbol(symbol)
         if symbol not in self.features_buffer or not self.features_buffer[symbol]:
             return
 
         import os
-        import pickle
+        import pickle as _pkl
 
         # Create symbol directory
         symbol_path = os.path.join(self.storage_path, symbol)
@@ -521,7 +525,13 @@ class StreamingFeatureStore:
         filepath = os.path.join(symbol_path, filename)
 
         with open(filepath, "wb") as f:
-            pickle.dump(self.features_buffer[symbol], f)
+            _pkl.dump(self.features_buffer[symbol], f)
+
+        try:
+            os.chmod(filepath, 0o600)
+        except OSError:
+            pass
+        sign_file(filepath)
 
         logger.info(f"Persisted {len(self.features_buffer[symbol])} features for {symbol}")
 
@@ -546,8 +556,9 @@ class StreamingFeatureStore:
             DataFrame of historical features
         """
         import os
-        import pickle
+        import pickle as _pkl
 
+        symbol = DatabaseValidator.validate_symbol(symbol)
         symbol_path = os.path.join(self.storage_path, symbol)
         if not os.path.exists(symbol_path):
             return pd.DataFrame()
@@ -559,8 +570,9 @@ class StreamingFeatureStore:
             if filename.startswith("features_") and filename.endswith(".pkl"):
                 filepath = os.path.join(symbol_path, filename)
 
+                verify_file(filepath)
                 with open(filepath, "rb") as f:
-                    features = pickle.load(f)
+                    features = _pkl.load(f)  # nosec B301
                     all_features.extend(features)
 
         if not all_features:

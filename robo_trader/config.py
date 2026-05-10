@@ -676,6 +676,7 @@ class LegacyConfig:
         self.ibkr_host = new_config.ibkr.host
         self.ibkr_port = new_config.ibkr.port
         self.ibkr_client_id = new_config.ibkr.client_id
+        self.ibkr_account = new_config.ibkr.account
         self.trading_mode = new_config.execution.mode.value
         self.max_daily_loss = new_config.risk.max_daily_loss_pct * new_config.default_cash
         self.max_position_risk_pct = new_config.risk.max_position_pct
@@ -683,6 +684,12 @@ class LegacyConfig:
         self.max_leverage = new_config.risk.max_leverage
         self.default_cash = new_config.default_cash
         self.symbols = new_config.symbols
+
+    def __repr__(self) -> str:
+        # Avoid leaking sensitive identifiers (client_id, account, etc.) into logs/tracebacks.
+        return "LegacyConfig(<redacted>)"
+
+    __str__ = __repr__
 
 
 # Export main config loader

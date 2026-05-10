@@ -52,6 +52,7 @@ jobs:
             .
 
       - name: Run Docker security scan
+        # TODO: pin to commit SHA
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: 'robotrader:test'
@@ -151,15 +152,18 @@ jobs:
 
       - name: Create test environment file
         run: |
+          DB_PW="$(openssl rand -hex 16)"
+          REDIS_PW="$(openssl rand -hex 16)"
+          GRAFANA_PW="$(openssl rand -hex 16)"
           cat > .env.test <<EOF
           ENVIRONMENT=test
           LOG_LEVEL=INFO
           IBKR_HOST=localhost
           IBKR_PORT=7497
-          DB_PASSWORD=testpass
-          REDIS_PASSWORD=testpass
+          DB_PASSWORD=${DB_PW}
+          REDIS_PASSWORD=${REDIS_PW}
           GRAFANA_USER=admin
-          GRAFANA_PASSWORD=admin
+          GRAFANA_PASSWORD=${GRAFANA_PW}
           DOMAIN_NAME=localhost
           EOF
 

@@ -6,6 +6,22 @@
 # 3. config.ini is gitignored - your credentials stay private
 #
 # For full documentation, see IBCMacos-3/userguide.pdf
+#
+# =============================================================================
+# SECURITY NOTICE - GATEWAY READ-ONLY ENFORCEMENT
+# =============================================================================
+# ReadOnlyApi=yes means Gateway will REJECT order placement from any API
+# client. RoboTrader uses readonly connections for all data and relies on
+# this Gateway-side guarantee as its primary safety net against any code
+# path (intentional or buggy) that might attempt to submit orders.
+#
+# To enable order placement (NOT recommended) set ReadOnlyApi=no AND
+# AllowBlindTrading=yes -- but this disables a primary safety net and the
+# system's startup self-checks (START_TRADER.sh, scripts/start_gateway.sh)
+# will refuse to launch.
+#
+# DO NOT change ReadOnlyApi from "yes" without a deliberate, audited reason.
+# =============================================================================
 
 # =============================================================================
 # Authentication Settings
@@ -35,7 +51,7 @@ AcceptNonBrokerageAccountWarning=yes
 LoginDialogDisplayTimeout=90
 MinimizeMainWindow=yes
 ExistingSessionDetectedAction=primaryoverride
-ReadOnlyApi=no
+ReadOnlyApi=yes
 AcceptIncomingConnectionAction=accept
 
 # =============================================================================
@@ -60,7 +76,7 @@ ControlFrom=127.0.0.1
 # Other Settings
 # =============================================================================
 
-AllowBlindTrading=yes
+AllowBlindTrading=no
 DismissPasswordExpiryWarning=no
 DismissNSEComplianceNotice=yes
 AcceptBidAskLastSizeDisplayUpdateNotification=accept

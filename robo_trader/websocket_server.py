@@ -3,11 +3,14 @@ WebSocket server for real-time dashboard updates.
 """
 
 import asyncio
+import hmac
 import json
+import os
 import threading
 from datetime import datetime
 from queue import Empty, Queue
 from typing import Any, Dict, Optional, Set
+from urllib.parse import parse_qs, urlsplit
 
 import websockets
 from websockets.server import WebSocketServerProtocol
@@ -17,17 +20,37 @@ from robo_trader.logger import get_logger
 logger = get_logger(__name__)
 
 
+def _allowed_ws_origins(port: int) -> Set[Optional[str]]:
+    """Whitelist of acceptable Origin header values for the WS handshake."""
+    allowed: Set[Optional[str]] = {
+        None,
+        "null",
+        f"http://localhost:{port}",
+        f"http://127.0.0.1:{port}",
+    }
+    extra = os.getenv("WS_ALLOWED_ORIGINS", "").strip()
+    if extra:
+        for origin in extra.split(","):
+            origin = origin.strip()
+            if origin:
+                allowed.add(origin)
+    return allowed
+
+
 class WebSocketManager:
     """Manages WebSocket connections and broadcasts updates."""
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 8765):
-        self.host = host
+    # W-H3: bind to loopback by default; override with WS_HOST env var.
+    def __init__(self, host: Optional[str] = None, port: int = 8765):
+        self.host = host if host is not None else os.getenv("WS_HOST", "127.0.0.1")
         self.port = port
         self.clients: Set[WebSocketServerProtocol] = set()
         self.message_queue: Queue[Dict[str, Any]] = Queue()
         self.server = None
         self.loop = None
         self.thread = None
+        # W-M1: optional shared secret for authenticating WS clients via ?token=...
+        self.auth_token = os.getenv("WS_AUTH_TOKEN", "")
 
     async def register_client(self, websocket: WebSocketServerProtocol):
         """Register a new client connection."""
@@ -65,6 +88,39 @@ class WebSocketManager:
                 ),
             )
 
+    def _authorize_handshake(self, websocket: WebSocketServerProtocol, path: str) -> bool:
+        """Validate Origin and (optionally) auth token at handshake (W-H3, W-M1)."""
+        # Origin whitelist
+        origin = None
+        try:
+            origin = websocket.request_headers.get("Origin")
+        except Exception:
+            origin = None
+        if origin not in _allowed_ws_origins(self.port):
+            logger.warning(f"WS rejected: bad Origin {origin!r}")
+            return False
+
+        # Auth: prefer token if configured; else require loopback peer.
+        if self.auth_token:
+            try:
+                query = urlsplit(path).query
+                token = (parse_qs(query).get("token") or [""])[0]
+            except Exception:
+                token = ""
+            if not token or not hmac.compare_digest(token, self.auth_token):
+                logger.warning("WS rejected: missing/invalid token")
+                return False
+        else:
+            # No token configured -> only allow connections from loopback.
+            try:
+                peer_ip = websocket.remote_address[0] if websocket.remote_address else ""
+            except Exception:
+                peer_ip = ""
+            if peer_ip not in ("127.0.0.1", "::1"):
+                logger.warning(f"WS rejected: non-loopback peer {peer_ip} without WS_AUTH_TOKEN")
+                return False
+        return True
+
     async def handle_client(self, websocket: WebSocketServerProtocol, path: str = "/"):
         """Handle a client connection.
 
@@ -72,24 +128,29 @@ class WebSocketManager:
             websocket: The WebSocket connection
             path: The request path (required by websockets library)
         """
+        # W-H3 / W-M1: enforce origin and (optional) token before accepting.
+        if not self._authorize_handshake(websocket, path):
+            try:
+                await websocket.close(code=1008, reason="unauthorized")
+            except Exception:
+                pass
+            return
+
         await self.register_client(websocket)
         try:
-            # Keep connection alive and handle any incoming messages
+            # Keep connection alive and handle any incoming messages.
+            # W-H3: do NOT rebroadcast client-supplied payloads. Trusted producers
+            # call broadcast() / send_*_update() directly via the queue.
             async for message in websocket:
                 try:
                     data = json.loads(message)
-                    logger.debug(f"Received message from client: {data.get('type', 'unknown')}")
-
-                    # Handle client messages
-                    if data.get("type") == "subscribe":
+                    msg_type = data.get("type", "unknown")
+                    if msg_type == "subscribe":
                         symbols = data.get("symbols", [])
                         logger.info(f"Client subscribed to symbols: {symbols}")
-                    # Broadcast messages from runner client to all other clients
-                    elif data.get("type") in ["market_data", "trade", "signal"]:
-                        logger.info(
-                            f"Broadcasting {data.get('type')} update for {data.get('symbol')}"
-                        )
-                        await self.broadcast(data)
+                    else:
+                        # Log only; never echo to other clients.
+                        logger.debug(f"Ignoring inbound WS message of type {msg_type}")
                 except json.JSONDecodeError:
                     logger.error(f"Invalid JSON received: {message}")
         except websockets.exceptions.ConnectionClosed:

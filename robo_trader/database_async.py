@@ -627,6 +627,17 @@ class AsyncTradingDatabase:
     ) -> None:
         """Record a strategy signal asynchronously."""
         portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
+        symbol = DatabaseValidator.validate_symbol(symbol)
+        if strategy is not None:
+            strategy = DatabaseValidator._validate_string(strategy, "strategy", max_length=64)
+        if signal_type is not None:
+            signal_type = DatabaseValidator._validate_string(
+                signal_type, "signal_type", max_length=32
+            )
+        if metadata is not None and metadata != "":
+            metadata = DatabaseValidator._validate_string(
+                metadata, "metadata", max_length=4096, allow_empty=True
+            )
         async with self.get_connection() as conn:
             await conn.execute(
                 """
@@ -680,6 +691,7 @@ class AsyncTradingDatabase:
         self, symbol: str, portfolio_id: str = DEFAULT_PORTFOLIO_ID
     ) -> Optional[Dict]:
         """Get position for a specific symbol in a portfolio."""
+        portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
         async with self.get_connection() as conn:
             cursor = await conn.execute(
                 """
@@ -701,6 +713,7 @@ class AsyncTradingDatabase:
 
     async def get_positions(self, portfolio_id: str = DEFAULT_PORTFOLIO_ID) -> List[Dict]:
         """Get all current positions for a portfolio."""
+        portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
         async with self.get_connection() as conn:
             cursor = await conn.execute(
                 """
@@ -764,6 +777,7 @@ class AsyncTradingDatabase:
             ValidationError: If symbol format is invalid
             ValueError: If seconds is not a positive integer in valid range
         """
+        portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
         # Validate symbol for consistency with other methods
         symbol = DatabaseValidator.validate_symbol(symbol)
 
@@ -810,6 +824,7 @@ class AsyncTradingDatabase:
             ValidationError: If symbol format is invalid
             ValueError: If seconds is not a positive integer in valid range
         """
+        portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
         # Validate symbol for consistency with other methods
         symbol = DatabaseValidator.validate_symbol(symbol)
 
@@ -840,6 +855,7 @@ class AsyncTradingDatabase:
         portfolio_id: str = DEFAULT_PORTFOLIO_ID,
     ) -> List[Dict]:
         """Get recent trades, optionally filtered by symbol, scoped to portfolio."""
+        portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
         # Validate symbol if provided
         if symbol:
             symbol = DatabaseValidator.validate_symbol(symbol)
@@ -886,6 +902,7 @@ class AsyncTradingDatabase:
 
     async def get_account_info(self, portfolio_id: str = DEFAULT_PORTFOLIO_ID) -> Dict:
         """Get current account information for a portfolio."""
+        portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
         async with self.get_connection() as conn:
             cursor = await conn.execute(
                 """
@@ -985,6 +1002,7 @@ class AsyncTradingDatabase:
 
         Returns list of daily snapshots ordered by date ascending (oldest first).
         """
+        portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
         async with self.get_connection() as conn:
             cursor = await conn.execute(
                 """
@@ -1022,6 +1040,10 @@ class AsyncTradingDatabase:
         Returns:
             True if the portfolio exists (has account data or a portfolio definition)
         """
+        try:
+            portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
+        except ValidationError:
+            return False
         async with self.get_connection() as conn:
             # Check account table (every portfolio should have an account row)
             cursor = await conn.execute(
@@ -1078,6 +1100,11 @@ class AsyncTradingDatabase:
 
     async def upsert_portfolio(self, portfolio_data: Dict) -> None:
         """Insert or update a portfolio definition."""
+        portfolio_data["id"] = DatabaseValidator.validate_portfolio_id(portfolio_data.get("id"))
+        if "name" in portfolio_data and portfolio_data["name"] is not None:
+            portfolio_data["name"] = DatabaseValidator._validate_string(
+                portfolio_data["name"], "name", max_length=128
+            )
         async with self.get_connection() as conn:
             await conn.execute(
                 """
@@ -1111,31 +1138,44 @@ class AsyncTradingDatabase:
             await conn.commit()
             logger.info(f"Upserted portfolio: {portfolio_data['id']}")
 
-    async def cleanup_old_data(self, days_to_keep: int = 30) -> None:
-        """Clean up old data from the database."""
+    async def cleanup_old_data(
+        self, days_to_keep: int = 30, portfolio_id: Optional[str] = None
+    ) -> None:
+        """Clean up old data from the database.
+
+        Always cleans truly-global tables (market_data, ticks). The signals table
+        is portfolio-scoped, so it is only cleaned when an explicit portfolio_id
+        is provided — never blanketly across all tenants.
+        """
         async with self.get_connection() as conn:
             cutoff_date = datetime.now().timestamp() - (days_to_keep * 86400)
+            cutoff_dt = datetime.fromtimestamp(cutoff_date)
 
-            # Clean up old market data
+            # Clean up old market data (global)
             await conn.execute(
                 "DELETE FROM market_data WHERE timestamp < ?",
-                (datetime.fromtimestamp(cutoff_date),),
+                (cutoff_dt,),
             )
 
-            # Clean up old signals (global across all portfolios - old signals have no value)
-            await conn.execute(
-                "DELETE FROM signals WHERE timestamp < ?",
-                (datetime.fromtimestamp(cutoff_date),),
-            )
-
-            # Clean up old ticks
+            # Clean up old ticks (global)
             await conn.execute(
                 "DELETE FROM ticks WHERE timestamp < ?",
-                (datetime.fromtimestamp(cutoff_date),),
+                (cutoff_dt,),
             )
 
+            # Signals are portfolio-scoped; only clean if a specific portfolio is named.
+            if portfolio_id is not None:
+                portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
+                await conn.execute(
+                    "DELETE FROM signals WHERE portfolio_id = ? AND timestamp < ?",
+                    (portfolio_id, cutoff_dt),
+                )
+
             await conn.commit()
-            logger.info(f"Cleaned up data older than {days_to_keep} days")
+            logger.info(
+                f"Cleaned up data older than {days_to_keep} days "
+                f"(portfolio={portfolio_id or 'global-only'})"
+            )
 
 
 # Backward compatibility wrapper

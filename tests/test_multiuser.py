@@ -1656,8 +1656,9 @@ class TestPortfolioIdEdgeCases:
         await database.close()
 
     @pytest.mark.asyncio
-    async def test_portfolio_id_case_sensitive(self, db):
-        """Portfolio IDs are case-sensitive."""
+    async def test_portfolio_id_case_normalized(self, db):
+        # DB-L1: portfolio_id is now lowercased to prevent shadow-default
+        # IDs like "Default" / "DEFAULT" looking distinct from "default".
         await db.update_position("AAPL", 100, 180.0, portfolio_id="Alpha")
         await db.update_position("AAPL", 50, 190.0, portfolio_id="alpha")
 
@@ -1665,10 +1666,8 @@ class TestPortfolioIdEdgeCases:
         pos_lower = await db.get_positions(portfolio_id="alpha")
 
         assert len(pos_upper) == 1
-        assert pos_upper[0]["quantity"] == 100
-
         assert len(pos_lower) == 1
-        assert pos_lower[0]["quantity"] == 50
+        assert pos_upper[0]["quantity"] == pos_lower[0]["quantity"] == 50
 
     @pytest.mark.asyncio
     async def test_portfolio_id_with_special_chars(self, db):
@@ -1795,7 +1794,11 @@ class TestConcurrentCrossPortfolio:
 
 
 class TestScopeLeakDetection:
-    """Test that PortfolioScopedDB warns about potential scope leaks."""
+    # DB-H3: PortfolioScopedDB now refuses unknown methods rather than
+    # warning-and-delegating. The previous warn-then-execute behavior was
+    # a footgun: a future scoped method added without updating the set
+    # would silently write to the default tenant. These tests now assert
+    # the deny-by-default replacement.
 
     @pytest.fixture
     async def raw_db(self, temp_db):
@@ -1804,101 +1807,44 @@ class TestScopeLeakDetection:
         yield database
         await database.close()
 
-    def test_no_warning_for_scoped_methods(self, raw_db, caplog):
-        """Accessing known-scoped methods should NOT log a warning."""
-        import logging
-        from robo_trader.multiuser.db_proxy import _warned_methods
-
-        _warned_methods.clear()
-
+    def test_scoped_methods_resolve(self, raw_db):
         proxy = PortfolioScopedDB(raw_db, portfolio_id="test")
-        with caplog.at_level(logging.WARNING):
-            # Access a scoped method -- should wrap, not warn
-            method = proxy.get_positions
-            assert callable(method)
+        method = proxy.get_positions
+        assert callable(method)
 
-        assert "SCOPE LEAK" not in caplog.text
-
-    def test_no_warning_for_known_global_methods(self, raw_db, caplog):
-        """Accessing known-global methods should NOT log a warning."""
-        import logging
-        from robo_trader.multiuser.db_proxy import _warned_methods
-
-        _warned_methods.clear()
-
+    def test_known_global_methods_resolve(self, raw_db):
         proxy = PortfolioScopedDB(raw_db, portfolio_id="test")
-        with caplog.at_level(logging.WARNING):
-            method = proxy.get_all_positions
-            assert callable(method)
+        method = proxy.get_all_positions
+        assert callable(method)
 
-        assert "SCOPE LEAK" not in caplog.text
-
-    def test_warning_for_unlisted_method_with_portfolio_id(self, raw_db, caplog):
-        """A method with portfolio_id in its signature but not in the scoped set triggers a warning."""
-        import logging
-        from robo_trader.multiuser.db_proxy import _warned_methods
-
-        _warned_methods.clear()
-
-        # Monkey-patch a new method onto the DB with portfolio_id param
+    def test_unlisted_method_raises_attribute_error(self, raw_db):
         async def fake_get_foo(portfolio_id="default"):
             return []
 
         raw_db.fake_get_foo = fake_get_foo
 
         proxy = PortfolioScopedDB(raw_db, portfolio_id="aggressive")
-        with caplog.at_level(logging.WARNING):
-            method = proxy.fake_get_foo
-            assert callable(method)
+        with pytest.raises(AttributeError, match="fake_get_foo"):
+            _ = proxy.fake_get_foo
 
-        assert "SCOPE LEAK" in caplog.text
-        assert "fake_get_foo" in caplog.text
-
-        # Cleanup
         del raw_db.fake_get_foo
 
-    def test_warning_only_logged_once(self, raw_db, caplog):
-        """Scope-leak warning for same method only fires once (no log spam)."""
-        import logging
-        from robo_trader.multiuser.db_proxy import _warned_methods
-
-        _warned_methods.clear()
-
-        async def fake_leaky(portfolio_id="default"):
-            return []
-
-        raw_db.fake_leaky = fake_leaky
-
-        proxy = PortfolioScopedDB(raw_db, portfolio_id="test")
-        with caplog.at_level(logging.WARNING):
-            _ = proxy.fake_leaky
-            _ = proxy.fake_leaky
-            _ = proxy.fake_leaky
-
-        assert caplog.text.count("SCOPE LEAK") == 1
-
-        del raw_db.fake_leaky
-
-    def test_no_warning_for_method_without_portfolio_id(self, raw_db, caplog):
-        """A method WITHOUT portfolio_id in its signature should NOT trigger a warning."""
-        import logging
-        from robo_trader.multiuser.db_proxy import _warned_methods
-
-        _warned_methods.clear()
-
+    def test_unlisted_method_without_portfolio_id_also_denied(self, raw_db):
         async def safe_global_method(symbol):
             return []
 
         raw_db.safe_global_method = safe_global_method
 
         proxy = PortfolioScopedDB(raw_db, portfolio_id="test")
-        with caplog.at_level(logging.WARNING):
-            method = proxy.safe_global_method
-            assert callable(method)
-
-        assert "SCOPE LEAK" not in caplog.text
+        with pytest.raises(AttributeError, match="safe_global_method"):
+            _ = proxy.safe_global_method
 
         del raw_db.safe_global_method
+
+    def test_dunder_attributes_pass_through(self, raw_db):
+        # Underscore-prefixed access shouldn't be denied (e.g., __class__).
+        proxy = PortfolioScopedDB(raw_db, portfolio_id="test")
+        assert proxy.__class__ is PortfolioScopedDB
 
 
 # ──────────────────────────────────────────────
@@ -2008,11 +1954,11 @@ class TestPortfolioIdValidation:
     # ── Direct validator tests ──
 
     def test_valid_portfolio_ids(self):
-        """Valid portfolio IDs pass validation."""
+        # DB-L1: validator now lowercases. Compare to lowered form.
         valid_ids = ["default", "aggressive", "my-portfolio", "port_1", "A", "abc123"]
         for pid in valid_ids:
             result = DatabaseValidator.validate_portfolio_id(pid)
-            assert result == pid
+            assert result == pid.lower()
 
     def test_empty_string_rejected(self):
         """Empty string portfolio_id is rejected."""

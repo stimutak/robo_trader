@@ -102,22 +102,33 @@ class TestConfigManager(unittest.TestCase):
 
     def test_config_validation(self):
         """Test configuration validation."""
-        manager = ConfigManager()
-        manager.environment = Environment.PRODUCTION
-        manager.config.feature_flags.enable_live_trading = True
-
-        # Missing API key should trigger error in production
-        manager.config.api_key = None
-        with self.assertRaises(ValueError) as context:
-            manager._validate_config()
-        self.assertIn("API key required", str(context.exception))
-
-        # With API key should pass
         import os
+        from unittest.mock import patch
 
-        # Security: Use environment variable or test placeholder (never a real key)
-        manager.config.api_key = os.getenv("TEST_API_KEY", "TEST_PLACEHOLDER_NOT_A_REAL_KEY")
-        manager._validate_config()  # Should not raise
+        # CFG-M6: prod env now also rejects forbidden default secrets. Set
+        # non-default values for the secret env vars so this test exercises
+        # the API-key check, not the secrets check.
+        secret_env = {
+            "GRAFANA_PASSWORD": "test-grafana-pw-not-default",
+            "DB_PASSWORD": "test-db-pw-not-default",
+            "REDIS_PASSWORD": "test-redis-pw-not-default",
+        }
+
+        with patch.dict(os.environ, secret_env):
+            manager = ConfigManager()
+            manager.environment = Environment.PRODUCTION
+            manager.config.feature_flags.enable_live_trading = True
+
+            # Missing API key should trigger error in production
+            manager.config.api_key = None
+            with self.assertRaises(ValueError) as context:
+                manager._validate_config()
+            self.assertIn("API key required", str(context.exception))
+
+            # With API key should pass
+            # Security: Use environment variable or test placeholder (never a real key)
+            manager.config.api_key = os.getenv("TEST_API_KEY", "TEST_PLACEHOLDER_NOT_A_REAL_KEY")
+            manager._validate_config()  # Should not raise
 
 
 class TestHealthMonitor(unittest.TestCase):

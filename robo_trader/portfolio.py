@@ -47,7 +47,7 @@ class Portfolio:
 
         price_d = PrecisePricing.to_decimal(price)
         side = side.upper()
-        if side not in {"BUY", "SELL"}:
+        if side not in {"BUY", "SELL", "SELL_SHORT", "BUY_TO_COVER"}:
             return
 
         pos = self.positions.get(symbol)
@@ -63,9 +63,9 @@ class Portfolio:
                 new_cost = price_d * Decimal(str(quantity))
                 new_avg = (existing_cost + new_cost) / Decimal(str(total_qty))
                 self.positions[symbol] = PositionSnapshot(symbol, total_qty, new_avg)
-        else:  # SELL
+        elif side == "SELL":
             if pos is None:
-                # Short selling not supported in this minimal model
+                # Short selling not supported here; use SELL_SHORT explicitly
                 return
 
             # Ensure we don't sell more than we have
@@ -85,6 +85,73 @@ class Portfolio:
             remaining = pos.quantity - actual_quantity
             if remaining > 0:
                 self.positions[symbol] = PositionSnapshot(symbol, remaining, pos.avg_price)
+            else:
+                self.positions.pop(symbol, None)
+        elif side == "SELL_SHORT":
+            # Opening (or adding to) a short position. Cash increases by the
+            # short sale proceeds; quantity is recorded as negative.
+            proceeds = PrecisePricing.calculate_notional(quantity, price_d)
+            self.cash += proceeds
+            if pos is None:
+                self.positions[symbol] = PositionSnapshot(symbol, -quantity, price_d)
+            elif pos.quantity < 0:
+                # Already short — average up the entry price
+                total_short = abs(pos.quantity) + quantity
+                existing_cost = pos.avg_price * Decimal(str(abs(pos.quantity)))
+                new_cost = price_d * Decimal(str(quantity))
+                new_avg = (existing_cost + new_cost) / Decimal(str(total_short))
+                self.positions[symbol] = PositionSnapshot(symbol, -total_short, new_avg)
+            else:
+                # Have a long position; SELL_SHORT in this state is ambiguous —
+                # treat as a regular SELL up to the long quantity.
+                from .logger import get_logger
+
+                logger = get_logger(__name__)
+                logger.warning(
+                    f"SELL_SHORT received for {symbol} while holding long; treating as SELL"
+                )
+                actual_quantity = min(quantity, pos.quantity)
+                sell_notional = PrecisePricing.calculate_notional(actual_quantity, price_d)
+                realized = PrecisePricing.calculate_pnl(pos.avg_price, price_d, actual_quantity)
+                # Undo the speculative cash += we did above; replace with SELL semantics
+                self.cash -= proceeds
+                self.cash += sell_notional
+                self.realized_pnl += realized
+                remaining = pos.quantity - actual_quantity
+                if remaining > 0:
+                    self.positions[symbol] = PositionSnapshot(symbol, remaining, pos.avg_price)
+                else:
+                    self.positions.pop(symbol, None)
+        else:  # BUY_TO_COVER
+            # Closing (or partially closing) a short position.
+            if pos is None or pos.quantity >= 0:
+                # Nothing to cover — log and ignore
+                from .logger import get_logger
+
+                logger = get_logger(__name__)
+                logger.warning(
+                    f"BUY_TO_COVER received for {symbol} but no short position exists"
+                )
+                return
+
+            short_qty = abs(pos.quantity)
+            actual_quantity = min(quantity, short_qty)
+            if quantity > short_qty:
+                from .logger import get_logger
+
+                logger = get_logger(__name__)
+                logger.warning(
+                    f"Attempted to cover {quantity} of {symbol}, short was only {short_qty}"
+                )
+
+            cover_cost = PrecisePricing.calculate_notional(actual_quantity, price_d)
+            self.cash -= cover_cost
+            # Profit on short = (short_entry - cover_price) * qty
+            realized = (pos.avg_price - price_d) * Decimal(str(actual_quantity))
+            self.realized_pnl += realized
+            remaining_short = short_qty - actual_quantity
+            if remaining_short > 0:
+                self.positions[symbol] = PositionSnapshot(symbol, -remaining_short, pos.avg_price)
             else:
                 self.positions.pop(symbol, None)
 

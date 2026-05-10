@@ -330,21 +330,21 @@ class StopLossMonitor:
         """
         triggered = []
 
-        for symbol, stop in list(self.active_stops.items()):
+        for stop_key, stop in list(self.active_stops.items()):
             if stop.status != StopStatus.PENDING:
                 continue
 
-            # Get current price
-            current_price = self.last_prices.get(symbol)
+            # Get current price (last_prices is keyed by bare symbol, not composite key)
+            current_price = self.last_prices.get(stop.symbol)
             if not current_price:
-                logger.warning(f"No price data for {symbol}, cannot check stop-loss")
+                logger.warning(f"No price data for {stop.symbol}, cannot check stop-loss")
                 continue
 
             # Check price freshness
-            price_age = datetime.now() - self.price_update_times.get(symbol, datetime.min)
+            price_age = datetime.now() - self.price_update_times.get(stop.symbol, datetime.min)
             if price_age.total_seconds() > self.max_price_age_seconds:
                 logger.warning(
-                    f"Stale price data for {symbol} (age: {price_age.total_seconds():.1f}s)"
+                    f"Stale price data for {stop.symbol} (age: {price_age.total_seconds():.1f}s)"
                 )
                 continue
 
@@ -355,7 +355,7 @@ class StopLossMonitor:
                 if current_price <= stop.stop_price:
                     triggered_flag = True
                     logger.warning(
-                        f"STOP-LOSS TRIGGERED for {symbol} LONG: "
+                        f"STOP-LOSS TRIGGERED for {stop.symbol} LONG: "
                         f"price ${current_price:.2f} <= stop ${stop.stop_price:.2f}"
                     )
 
@@ -363,7 +363,7 @@ class StopLossMonitor:
                 if current_price >= stop.stop_price:
                     triggered_flag = True
                     logger.warning(
-                        f"STOP-LOSS TRIGGERED for {symbol} SHORT: "
+                        f"STOP-LOSS TRIGGERED for {stop.symbol} SHORT: "
                         f"price ${current_price:.2f} >= stop ${stop.stop_price:.2f}"
                     )
 

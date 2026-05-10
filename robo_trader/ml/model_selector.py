@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import structlog
 
+from ._safe_load import sign_file, verify_file
 from .model_trainer import ModelTrainer, ModelType, PredictionType
 
 logger = structlog.get_logger(__name__)
@@ -58,6 +59,7 @@ class ModelSelector:
         improved_model_path = Path("trained_models/improved_model.pkl")
         if improved_model_path.exists():
             try:
+                verify_file(improved_model_path)
                 with open(improved_model_path, "rb") as f:
                     # Security: Only load trusted model files from our own system
                     model_info = pickle.load(f)  # nosec B301 - Trusted file from our system
@@ -78,6 +80,7 @@ class ModelSelector:
         # Then load other models
         for model_file in self.model_dir.glob("*.pkl"):
             try:
+                verify_file(model_file)
                 with open(model_file, "rb") as f:
                     # Security: Only load trusted model files from our own system
                     model_info = pickle.load(f)  # nosec B301 - Trusted file from our system

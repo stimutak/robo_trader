@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import unquote, urlparse
 
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
@@ -20,6 +21,12 @@ from dotenv import load_dotenv
 from ..logger import get_logger
 
 logger = get_logger(__name__)
+
+
+class ConfigurationError(ValueError):
+    """Raised when production configuration is invalid."""
+
+    pass
 
 
 class Environment(Enum):
@@ -201,18 +208,40 @@ class ConfigManager:
         self._validate_config()
 
     def _determine_environment(self, env: Optional[str]) -> Environment:
-        """Determine deployment environment."""
-        if env:
-            return Environment(env.lower())
+        """Determine deployment environment.
 
-        # Check environment variable
-        env_var = os.getenv("TRADING_ENV", "development").lower()
+        Strict by default: an unrecognized TRADING_ENV is a configuration error.
+        Fallback to DEVELOPMENT only when the operator opts in via
+        ALLOW_ENV_FALLBACK=1 or when running in CI.
+        """
+        if env:
+            try:
+                return Environment(env.lower())
+            except ValueError:
+                raise ConfigurationError(
+                    f"Invalid environment argument {env!r}. "
+                    f"Expected one of: {', '.join(e.value for e in Environment)}"
+                )
+
+        env_var = os.getenv("TRADING_ENV", "").lower()
+        if not env_var:
+            # No env var set at all → default to development (preserves prior
+            # behavior for fresh checkouts).
+            return Environment.DEVELOPMENT
 
         try:
             return Environment(env_var)
         except ValueError:
-            logger.warning(f"Invalid environment: {env_var}, defaulting to development")
-            return Environment.DEVELOPMENT
+            if os.environ.get("ALLOW_ENV_FALLBACK") == "1" or os.environ.get("CI"):
+                logger.warning(
+                    f"Unknown TRADING_ENV={env_var!r}, falling back to DEVELOPMENT"
+                )
+                return Environment.DEVELOPMENT
+            raise ConfigurationError(
+                f"Invalid TRADING_ENV={env_var!r}. Set explicitly to one of: "
+                f"{', '.join(e.value for e in Environment)}, or set "
+                f"ALLOW_ENV_FALLBACK=1 to relax."
+            )
 
     def _setup_secrets_provider(self) -> SecretProvider:
         """Set up appropriate secrets provider."""
@@ -366,21 +395,36 @@ class ConfigManager:
         return config
 
     def _parse_database_url(self, config: ProductionConfig, url: str) -> ProductionConfig:
-        """Parse database URL into configuration."""
-        # Format: postgresql://user:pass@host:port/database
-        if url.startswith("postgresql://"):
-            parts = url.replace("postgresql://", "").split("@")
-            if len(parts) == 2:
-                user_pass = parts[0].split(":")
-                host_port_db = parts[1].split("/")
-                host_port = host_port_db[0].split(":")
+        """Parse database URL into configuration.
 
-                config.database.db_type = "postgresql"
-                config.database.pg_username = user_pass[0] if user_pass else None
-                config.database.pg_password = user_pass[1] if len(user_pass) > 1 else None
-                config.database.pg_host = host_port[0]
-                config.database.pg_port = int(host_port[1]) if len(host_port) > 1 else 5432
-                config.database.pg_database = host_port_db[1] if len(host_port_db) > 1 else None
+        Uses urllib.parse so percent-encoded characters in passwords (e.g. ``@``,
+        ``#``, ``/``) are handled correctly. On any failure, raises
+        ConfigurationError WITHOUT including the URL itself in the message — the
+        URL contains credentials.
+        """
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme not in ("postgresql", "postgres"):
+                # Unrecognized scheme — leave config untouched (e.g. sqitlite://...)
+                return config
+
+            config.database.db_type = "postgresql"
+            # urlparse leaves percent-encoded chars in username/password; decode
+            # so callers receive the real credentials.
+            config.database.pg_username = (
+                unquote(parsed.username) if parsed.username else None
+            )
+            config.database.pg_password = (
+                unquote(parsed.password) if parsed.password else None
+            )
+            config.database.pg_host = parsed.hostname or "localhost"
+            config.database.pg_port = parsed.port or 5432
+            config.database.pg_database = (parsed.path or "/").lstrip("/") or None
+        except Exception as e:
+            # Never include the URL itself — it contains credentials.
+            raise ConfigurationError(
+                f"Invalid DATABASE_URL: {type(e).__name__}"
+            ) from None
 
         return config
 
@@ -388,6 +432,22 @@ class ConfigManager:
         """Validate configuration for production readiness."""
         errors = []
         warnings = []
+
+        # Reject placeholder credentials in production / live trading regardless
+        # of whether other production checks pass.
+        is_prod_like = (
+            self.environment == Environment.PRODUCTION
+            or os.environ.get("ENABLE_LIVE_TRADING") == "true"
+        )
+        if is_prod_like:
+            forbidden_defaults = {"changeme", "admin", "testpass", "password", ""}
+            for var in ("GRAFANA_PASSWORD", "DB_PASSWORD", "REDIS_PASSWORD"):
+                val = os.environ.get(var, "")
+                if val.lower() in forbidden_defaults:
+                    raise ConfigurationError(
+                        f"{var} has a forbidden default value in production. "
+                        f"Set a real value before enabling live trading."
+                    )
 
         # Check production requirements
         if self.environment == Environment.PRODUCTION:

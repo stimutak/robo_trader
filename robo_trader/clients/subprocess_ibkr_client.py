@@ -99,34 +99,45 @@ class SubprocessIBKRClient:
 
         logger.info("Starting IBKR subprocess worker", script=str(worker_script))
 
-        # Start subprocess using the same Python interpreter
-        # CRITICAL FIX: sys.executable might not be venv Python if runner was started
-        # via shebang or other means. Check for VIRTUAL_ENV environment variable first.
+        # Start subprocess using the same Python interpreter.
+        #
+        # SECURITY (IB-M1): Only honor VIRTUAL_ENV if it points inside the project
+        # root. A local attacker who controls the user's shell environment could
+        # otherwise set VIRTUAL_ENV to a malicious venv (e.g. via a poisoned
+        # .envrc / direnv / asdf shim) and execute arbitrary code with the
+        # worker's IBKR credentials. Anything outside the project root is rejected.
+        project_root = Path(__file__).resolve().parents[2]
+        project_venv_python = project_root / ".venv" / "bin" / "python3"
+
         python_exe = None
-
-        # Try VIRTUAL_ENV environment variable (most reliable)
-        venv_path = os.environ.get("VIRTUAL_ENV")
-        if venv_path:
-            import platform
-
-            if platform.system() == "Windows":
-                venv_python = Path(venv_path) / "Scripts" / "python.exe"
+        ve = os.environ.get("VIRTUAL_ENV")
+        if ve:
+            ve_path = Path(ve).resolve()
+            try:
+                ve_path.relative_to(project_root)
+            except ValueError:
+                logger.warning(
+                    "Ignoring VIRTUAL_ENV=%s: outside project root, refusing for security.",
+                    ve,
+                )
             else:
-                venv_python = Path(venv_path) / "bin" / "python3"
+                import platform
 
-            if venv_python.exists():
-                python_exe = str(venv_python)
-                logger.debug("Using VIRTUAL_ENV Python", python_exe=python_exe)
+                if platform.system() == "Windows":
+                    candidate = ve_path / "Scripts" / "python.exe"
+                else:
+                    candidate = ve_path / "bin" / "python3"
+                if candidate.exists():
+                    python_exe = str(candidate)
+                    logger.debug("Using VIRTUAL_ENV Python", python_exe=python_exe)
 
-        # Fallback: Try relative path from project root (legacy)
-        if not python_exe:
-            venv_python = Path(__file__).parent.parent.parent / ".venv" / "bin" / "python3"
-            if venv_python.exists():
-                python_exe = str(venv_python)
-                logger.debug("Using relative venv Python", python_exe=python_exe)
+        # Preferred: project's own .venv python
+        if python_exe is None and project_venv_python.exists():
+            python_exe = str(project_venv_python)
+            logger.debug("Using project venv Python", python_exe=python_exe)
 
-        # Last resort: Use sys.executable
-        if not python_exe:
+        # Last resort: sys.executable
+        if python_exe is None:
             python_exe = sys.executable
             logger.debug("Using sys.executable Python", python_exe=python_exe)
 
@@ -516,6 +527,21 @@ class SubprocessIBKRClient:
             server_version=server_version,
             duration_seconds=f"{time.time() - connection_start:.2f}",
         )
+
+        # Defense-in-depth: log the readonly assumption. ib_async does not
+        # expose a post-handshake "is readonly" flag, so we cannot verify
+        # programmatically here. The authoritative read-only enforcement is
+        # IBC's ReadOnlyApi=yes (verified at startup by START_TRADER.sh and
+        # scripts/start_gateway.sh). This client always passes readonly=True.
+        if self._connected:
+            logger.info(
+                "IBKR client connection: readonly flag was requested",
+                readonly_requested=readonly,
+                note=(
+                    "Gateway-side ReadOnlyApi=yes is the authoritative "
+                    "order-placement safeguard."
+                ),
+            )
 
         return self._connected
 

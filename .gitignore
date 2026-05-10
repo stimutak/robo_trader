@@ -44,6 +44,7 @@ logs/monitoring/metrics_*.jsonl
 logs/monitoring/dashboard.json
 data/risk_state.json
 data/test_risk_state.json
+data/kill_switch_state.json
 reports/production_validation.json
 ml_predictions.json
 

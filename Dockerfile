@@ -34,8 +34,15 @@ COPY --from=builder /root/.local /home/trader/.local
 # Set working directory
 WORKDIR /app
 
-# Copy application code
-COPY --chown=trader:trader . .
+# Copy application code (explicit paths to avoid sweeping in local secrets/configs).
+COPY --chown=trader:trader robo_trader/ /app/robo_trader/
+COPY --chown=trader:trader scripts/ /app/scripts/
+COPY --chown=trader:trader app.py START_TRADER.sh requirements.txt requirements-prod.txt /app/
+COPY --chown=trader:trader robotrader_favicon.ico /app/
+
+# Copy only the IBC config TEMPLATE — never the populated config.ini which
+# may contain credentials on developer machines.
+COPY --chown=trader:trader config/ibc/config.ini.template /app/config/ibc/config.ini.template
 
 # Copy entrypoint script
 COPY --chown=trader:trader deployment/entrypoint.sh /usr/local/bin/entrypoint.sh

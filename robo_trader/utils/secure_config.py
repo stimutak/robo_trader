@@ -266,12 +266,25 @@ class SecureConfig:
             if api_key:
                 all_configs[key_name.lower()] = api_key
 
-        # Webhook URLs
+        # Webhook URLs — require HTTPS to prevent leaking alerts in cleartext.
+        def _validate_webhook(u: str) -> bool:
+            if not u:
+                return False
+            if u.startswith("http://"):
+                raise ConfigValidationError(
+                    "MONITORING_ALERT_WEBHOOK: HTTP webhooks are not allowed; use HTTPS"
+                )
+            if not u.startswith("https://"):
+                raise ConfigValidationError(
+                    "MONITORING_ALERT_WEBHOOK: must start with https://"
+                )
+            return True
+
         webhook_url = cls.get_secure_config(
             "MONITORING_ALERT_WEBHOOK",
             required=False,
             mask_in_logs=True,
-            validator=lambda u: u and (u.startswith("http://") or u.startswith("https://")),
+            validator=_validate_webhook,
         )
         if webhook_url:
             all_configs["webhook_url"] = webhook_url

@@ -4,6 +4,7 @@ Works with numpy arrays without complex configuration.
 """
 
 import json
+import os
 import warnings
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,6 +13,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import joblib
 import numpy as np
 import pandas as pd
+
+from ._safe_load import sign_file, verify_file
 from sklearn.ensemble import (
     GradientBoostingClassifier,
     GradientBoostingRegressor,
@@ -411,6 +414,11 @@ class ModelRegistry:
         # Save model
         model_path = f"{self.model_dir}/{model_id}.joblib"
         joblib.dump(model, model_path)
+        try:
+            os.chmod(model_path, 0o600)
+        except OSError:
+            pass
+        sign_file(model_path)
 
         # Save metadata
         metadata["model_id"] = model_id
@@ -438,6 +446,7 @@ class ModelRegistry:
         model_path = f"{self.model_dir}/{model_id}.joblib"
         metadata_path = f"{self.model_dir}/{model_id}_metadata.json"
 
+        verify_file(model_path)
         model = joblib.load(model_path)
 
         with open(metadata_path, "r") as f:

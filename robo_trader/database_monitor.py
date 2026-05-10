@@ -9,6 +9,7 @@ This module provides:
 
 import asyncio
 import os
+import re
 import subprocess
 import time
 from datetime import datetime, timedelta
@@ -173,10 +174,24 @@ class DatabaseMonitor:
             pid = holder["pid"]
             command = holder["command"]
 
-            # Check if process is a RoboTrader process
-            if any(
-                keyword in command.lower() for keyword in ["python", "runner_async", "robo_trader"]
-            ):
+            # Check if process is a RoboTrader process. Tighten the python match
+            # to exact-token equality so we don't kill arbitrary processes whose
+            # command name happens to contain the substring "python".
+            command_lower = command.lower()
+            command_first_token = command_lower.split()[0] if command_lower.split() else ""
+            python_executables = {
+                "python",
+                "python3",
+                "python3.10",
+                "python3.11",
+                "python3.12",
+                "python3.13",
+            }
+            is_python_proc = command_first_token in python_executables
+            is_robotrader_token = any(
+                keyword in command_lower for keyword in ["runner_async", "robo_trader"]
+            )
+            if is_python_proc or is_robotrader_token:
                 logger.info(f"Found potential stale RoboTrader process: PID {pid} ({command})")
 
                 # Get process details
@@ -239,6 +254,12 @@ class DatabaseMonitor:
 
     async def _terminate_process(self, pid: str, graceful: bool = True) -> bool:
         """Terminate a process."""
+        # Defense-in-depth: refuse to send signals unless pid is a positive
+        # integer string. Reject 0 (process group), negative (kill -PID),
+        # 1 (init), and anything non-numeric (which could be a flag).
+        if not re.fullmatch(r"\d+", str(pid)) or int(pid) <= 1:
+            logger.error(f"Refusing to kill suspicious PID: {pid!r}")
+            return False
         try:
             signal_type = "TERM" if graceful else "KILL"
 

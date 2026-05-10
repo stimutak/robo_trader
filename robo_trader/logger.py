@@ -12,6 +12,7 @@ This module provides structured logging with:
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from enum import Enum
@@ -23,6 +24,36 @@ from structlog.processors import CallsiteParameter
 
 # Global flag to track configuration
 _CONFIGURED = False
+
+# Source loggers whose output must NEVER be forwarded to WebSocket clients
+# (these are authoritative/security-sensitive streams).
+WS_LOGGER_DENYLIST = (
+    "audit",
+    "security",
+    "robo_trader.production",
+    "robo_trader.security",
+)
+
+# High-entropy / known-shape secret patterns that may appear in arbitrary log
+# values. These are scrubbed in addition to key-name matching.
+_SECRET_VALUE_PATTERNS = [
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),  # GitHub tokens
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),  # AWS access keys
+    re.compile(
+        r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b"
+    ),  # JWTs
+    re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]{16,}"),
+    re.compile(r"(?i)password[=:\s]+\S{4,}"),
+]
+
+
+def _scrub_value(v: Any) -> Any:
+    """Redact known secret patterns inside string values."""
+    if not isinstance(v, str):
+        return v
+    for pat in _SECRET_VALUE_PATTERNS:
+        v = pat.sub("***REDACTED***", v)
+    return v
 
 
 class LogEvent(str, Enum):
@@ -94,6 +125,12 @@ class WebSocketLogProcessor:
         if level not in ("INFO", "WARNING", "ERROR", "CRITICAL"):
             return event_dict
 
+        # Never forward audit/security/production logs to WebSocket clients.
+        source = str(event_dict.get("logger", ""))
+        for prefix in WS_LOGGER_DENYLIST:
+            if source == prefix or source.startswith(prefix + "."):
+                return event_dict
+
         # Try server mode first (if ws_manager is running)
         if self._ws_manager is not None:
             thread = getattr(self._ws_manager, "thread", None)
@@ -155,12 +192,22 @@ def add_environment(logger, method_name, event_dict):
 
 
 def censor_sensitive(logger, method_name, event_dict):
-    """Censor sensitive information like API keys."""
+    """Censor sensitive information like API keys.
+
+    Strategy:
+    1. Redact entire values whose KEY matches a sensitive name.
+    2. Scrub VALUES of all string fields (and the message) for known secret
+       shapes — this catches secrets accidentally interpolated into log
+       messages by callers.
+    """
     sensitive_keys = ["password", "api_key", "secret", "token", "credential"]
 
     for key in list(event_dict.keys()):
         if any(sensitive in key.lower() for sensitive in sensitive_keys):
             event_dict[key] = "***REDACTED***"
+            continue
+        # Scrub value-level patterns for any string field
+        event_dict[key] = _scrub_value(event_dict[key])
 
     return event_dict
 

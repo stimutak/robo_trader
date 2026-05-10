@@ -3,10 +3,14 @@ News fetcher using RSS feeds - no API keys required.
 """
 
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Dict, List
 
 import feedparser
+
+_CTRL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_BRACE_CHARS_RE = re.compile(r"[{}\[\]<>]")
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +49,9 @@ def fetch_rss_news(max_items: int = 20) -> List[Dict]:
 
                 title = entry.title if hasattr(entry, "title") else "No title"
                 title = title.replace("&apos;", "'").replace("&quot;", '"').replace("&amp;", "&")
+                # Strip control characters and LLM-control sequence delimiters
+                title = _CTRL_CHARS_RE.sub(" ", title)
+                title = _BRACE_CHARS_RE.sub("", title)
 
                 news_item = {
                     "title": title[:100],

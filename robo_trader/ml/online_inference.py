@@ -14,6 +14,8 @@ import joblib
 import numpy as np
 import pandas as pd
 
+from ._safe_load import verify_file
+
 logger = logging.getLogger(__name__)
 
 
@@ -118,6 +120,7 @@ class OnlineModelInference:
             model_name: Name for model identification
         """
         try:
+            verify_file(model_path)
             model = joblib.load(model_path)
             self.models[model_name] = model
             logger.info(f"Loaded model {model_name} from {model_path}")

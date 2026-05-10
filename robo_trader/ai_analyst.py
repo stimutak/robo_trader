@@ -12,6 +12,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
+from robo_trader.database_validator import DatabaseValidator, ValidationError
 from robo_trader.logger import get_logger
 
 logger = get_logger(__name__)
@@ -347,17 +348,48 @@ Be specific - identify actual stock symbols from the news."""
                 opportunities = result.get("opportunities", [])
                 # Filter out excluded symbols and add action
                 valid_opps = []
+                # Optional restricted tradable universe
+                universe = os.environ.get("TRADABLE_UNIVERSE")
+                universe_set = None
+                if universe:
+                    universe_set = {
+                        s.strip().upper() for s in universe.split(",") if s.strip()
+                    }
+                # Cap discoveries per cycle
+                try:
+                    max_discoveries = int(
+                        os.environ.get("AI_MAX_DISCOVERIES_PER_CYCLE", "3")
+                    )
+                except ValueError:
+                    max_discoveries = 3
                 for opp in opportunities:
-                    symbol = opp.get("symbol", "").upper()
-                    if symbol and symbol not in exclude_symbols and opp.get("confidence", 0) > 0.5:
-                        valid_opps.append(
-                            {
-                                "symbol": symbol,
-                                "action": "buy",
-                                "confidence": opp.get("confidence", 0.7),
-                                "reason": opp.get("reason", "AI identified opportunity"),
-                            }
+                    if len(valid_opps) >= max_discoveries:
+                        break
+                    raw_symbol = opp.get("symbol", "").strip().upper()
+                    try:
+                        symbol = DatabaseValidator.validate_symbol(raw_symbol)
+                    except ValidationError:
+                        logger.warning(
+                            f"AI returned invalid symbol {raw_symbol!r}; skipping"
                         )
+                        continue
+                    if universe_set is not None and symbol not in universe_set:
+                        logger.warning(
+                            f"AI symbol {symbol} not in TRADABLE_UNIVERSE; skipping"
+                        )
+                        continue
+                    if symbol in exclude_symbols:
+                        continue
+                    if opp.get("confidence", 0) <= 0.5:
+                        continue
+                    valid_opps.append(
+                        {
+                            "symbol": symbol,
+                            "action": "buy",
+                            "confidence": opp.get("confidence", 0.7),
+                            "reason": opp.get("reason", "AI identified opportunity"),
+                        }
+                    )
                 logger.info(f"AI found {len(valid_opps)} buying opportunities")
                 return valid_opps
             return []

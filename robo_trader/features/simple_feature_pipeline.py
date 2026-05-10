@@ -9,6 +9,9 @@ from typing import Dict, List, Optional, Union
 import numpy as np
 import pandas as pd
 
+from robo_trader.database_validator import DatabaseValidator, ValidationError
+from robo_trader.ml._safe_load import sign_file, verify_file
+
 warnings.filterwarnings("ignore")
 
 
@@ -273,18 +276,26 @@ class FeatureStore:
 
     def save_features(self, symbol: str, features: pd.DataFrame, version: str = "latest") -> None:
         """Save features to store."""
+        symbol = DatabaseValidator.validate_symbol(symbol)
         key = f"{symbol}_{version}"
         self.cache[key] = features.copy()
 
         # Also save to disk (using pickle instead of parquet to avoid dependency)
-        import pickle
+        import os
+        import pickle as _pkl
 
         filepath = f"{self.cache_dir}/{key}.pkl"
         with open(filepath, "wb") as f:
-            pickle.dump(features, f)
+            _pkl.dump(features, f)
+        try:
+            os.chmod(filepath, 0o600)
+        except OSError:
+            pass
+        sign_file(filepath)
 
     def load_features(self, symbol: str, version: str = "latest") -> Optional[pd.DataFrame]:
         """Load features from store."""
+        symbol = DatabaseValidator.validate_symbol(symbol)
         key = f"{symbol}_{version}"
 
         # Check memory cache first
@@ -292,14 +303,15 @@ class FeatureStore:
             return self.cache[key].copy()
 
         # Try loading from disk
-        import pickle
+        import pickle as _pkl
 
         filepath = f"{self.cache_dir}/{key}.pkl"
         import os
 
         if os.path.exists(filepath):
+            verify_file(filepath)
             with open(filepath, "rb") as f:
-                features = pickle.load(f)
+                features = _pkl.load(f)  # nosec B301
             self.cache[key] = features
             return features
 

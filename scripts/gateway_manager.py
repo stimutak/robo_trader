@@ -405,6 +405,27 @@ def show_status():
     print(f"\nIBC Config: {IBC_CONFIG}")
     print(f"IBC Config Exists: {IBC_CONFIG.exists()}")
 
+    # SECURITY: Verify Gateway-side read-only enforcement.
+    # RoboTrader relies on IBC's ReadOnlyApi=yes to prevent any client
+    # (including buggy code) from placing orders against the Gateway.
+    if IBC_CONFIG.exists():
+        try:
+            config_text = IBC_CONFIG.read_text(errors="replace")
+            has_readonly = any(
+                line.strip() == "ReadOnlyApi=yes"
+                for line in config_text.splitlines()
+            )
+            if has_readonly:
+                print("ReadOnlyApi: yes (Gateway will reject order placement)")
+            else:
+                print(
+                    "ReadOnlyApi: WARNING - not set to 'yes'. "
+                    "Gateway may accept order placement from any API client. "
+                    "Set 'ReadOnlyApi=yes' in the config to enforce read-only safety."
+                )
+        except Exception as e:
+            print(f"ReadOnlyApi: WARNING - could not read config: {e}")
+
     # Gateway version
     version = find_gateway_version()
     print(f"Gateway Version: {version or 'NOT FOUND'}")
