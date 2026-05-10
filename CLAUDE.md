@@ -22,6 +22,18 @@ Violation of this rule caused catastrophic data loss on 2026-01-26. DO NOT REPEA
 
 ---
 
+## 🛡️ Security Audit (2026-05-10) — Outstanding TODO
+
+The full audit lives in `SECURITY_AUDIT_2026-05-10.md` (commit `e528431`). 53 of 57 findings fixed; 4 deferred with rationale. Remediation walkthrough is in `SECURITY_TEST_PLAN.md`. Fresh-machine setup is in `DEV_SETUP.md`.
+
+**Pending on this dev machine:**
+- `DASH_AUTH_ENABLED=false` for local-dev convenience. Must flip to `true` and run `scripts/_set_dashboard_password.py` BEFORE: any LAN exposure, mobile-app development, or live trading. The `.env` file has a `# TEMPORARY:` comment block above the flag — don't strip it without flipping.
+- `MODEL_SIGNING_REQUIRED=false` — flip to `true` once all model files are re-trained or signed.
+
+Adding new code? See `DEV_SETUP.md` Section 3 for the things that now fail differently than before — particularly: pairs trading goes through `validate_order`, AI BUY needs ML corroboration, `PortfolioScopedDB` is deny-by-default, and binary model deserialization must go through `robo_trader/ml/_safe_load.verify_file()`.
+
+---
+
 ## Project Phase Plan
 **IMPORTANT:** The authoritative phase plan is in `IMPLEMENTATION_PLAN.md`. This is the ML-focused 4-phase plan:
 - Phase 1: Foundation & Quick Wins (Tasks F1-F5) - COMPLETE ✅
@@ -472,3 +484,9 @@ When Claude makes an error:
 1. **Identify the root cause**
 2. **Add to table above** with date
 3. **Commit the update** so all future sessions learn
+
+
+## Git Commit Rules
+- **NEVER add "Co-Authored-By" or any AI attribution to commit messages**
+- **NEVER mention Claude, AI, or any assistant in commit messages**
+- Write commit messages as if a human wrote them — concise, descriptive, no AI fingerprints
