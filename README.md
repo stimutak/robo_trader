@@ -7,6 +7,17 @@
 >
 > All developers MUST follow the production readiness plan until completion.
 
+> ## 🛡️ Security Audit Completed 2026-05-10
+> A comprehensive multi-agent security audit (commit `e528431`) addressed 53 of 57 findings across six attack surfaces. **If you are returning to dev work or onboarding a new machine, read [DEV_SETUP.md](DEV_SETUP.md) first** — particularly **[Section 3: What CHANGED for developers post-audit](DEV_SETUP.md#3-what-changed-for-developers-post-audit)**.
+>
+> | Doc | Purpose |
+> |---|---|
+> | [DEV_SETUP.md](DEV_SETUP.md) | Per-machine setup + dev habit changes (read this first) |
+> | [SECURITY_AUDIT_2026-05-10.md](SECURITY_AUDIT_2026-05-10.md) | Full audit: 57 findings with file:line, exploit, fix, test |
+> | [SECURITY_TEST_PLAN.md](SECURITY_TEST_PLAN.md) | 7-phase validation walkthrough; run before live trading |
+>
+> **Headlines (things that now behave differently):** stop-losses actually trigger (keying bug fixed); IBKR Gateway is now read-only at the broker level; AI BUY requires ML corroboration; pairs trading goes through full risk validation; dashboard auth is fail-closed with CSRF protection; HMAC integrity verification on all model artifact loads.
+
 A production-grade algorithmic trading system with IBKR integration, featuring advanced ML infrastructure, async architecture, and comprehensive risk management. Paper trading by default with strict capital preservation controls.
 
 ## 🚀 Current Status
