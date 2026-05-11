@@ -36,6 +36,23 @@ if ! lsof -nP -iTCP:4002 -sTCP:LISTEN >/dev/null 2>&1; then
 fi
 echo "   Gateway is listening"
 
+# IBN-M3 (followup audit): the dashboard "Start" button calls this script and
+# previously bypassed the ReadOnlyApi=yes safety check that START_TRADER.sh
+# already enforces. Mirror the same anchored case-insensitive grep here. We
+# fail closed if the config is missing — the runner is read-only via the API
+# but we still want the Gateway-side enforcement as belt-and-suspenders.
+IBC_CONFIG_FILE="config/ibc/config.ini"
+if [ ! -f "$IBC_CONFIG_FILE" ]; then
+    echo "   ERROR: IBC config not found at $IBC_CONFIG_FILE"
+    exit 1
+fi
+if ! grep -Eqi '^[[:space:]]*readonlyapi[[:space:]]*=[[:space:]]*yes[[:space:]]*$' "$IBC_CONFIG_FILE"; then
+    echo "   ERROR: IBC config does not enforce ReadOnlyApi=yes."
+    echo "   Refusing to start runner. Set 'ReadOnlyApi=yes' in $IBC_CONFIG_FILE"
+    exit 1
+fi
+echo "   ReadOnlyApi=yes enforced"
+
 # Step 3: Check for zombies
 echo "3. Checking for zombie connections..."
 ZOMBIES=$(lsof -nP -iTCP:4002 -sTCP:CLOSE_WAIT 2>/dev/null | grep -v "^COMMAND" | wc -l | tr -d ' ')

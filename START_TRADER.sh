@@ -52,7 +52,11 @@ echo ""
 # any code path (intentional or accidental) that might attempt to submit
 # live orders. If the active config has been modified to permit writes, abort.
 IBC_INI="${SCRIPT_DIR}/config/ibc/config.ini"
-if [ -f "$IBC_INI" ] && ! grep -q '^ReadOnlyApi=yes' "$IBC_INI"; then
+# NEW-IB-H1.1: Use anchored, case-insensitive regex with end-anchor.
+# - Old grep ('^ReadOnlyApi=yes') matched 'ReadOnlyApi=yesno' (no end anchor)
+#   and rejected 'ReadOnlyApi=Yes' (case-sensitive) even though IBC honors it.
+# - The -E + -i flags + start/end anchors + tolerated whitespace fix all three.
+if [ -f "$IBC_INI" ] && ! grep -Eqi '^[[:space:]]*readonlyapi[[:space:]]*=[[:space:]]*yes[[:space:]]*$' "$IBC_INI"; then
     echo "FATAL: IBC config has ReadOnlyApi != yes." >&2
     echo "       RoboTrader requires Gateway-side read-only enforcement." >&2
     echo "       File: $IBC_INI" >&2

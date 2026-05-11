@@ -25,6 +25,7 @@ Environment Variables:
 import argparse
 import os
 import platform
+import re
 import signal
 import socket
 import subprocess
@@ -32,6 +33,16 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional, Tuple
+
+# NEW-IB-H1.1: Anchored, case-insensitive ReadOnlyApi=yes detector.
+# Mirrors the bash regex used in START_TRADER.sh and scripts/start_gateway.sh.
+# MULTILINE so `^`/`$` anchor each line; IGNORECASE so 'ReadOnlyApi=Yes' and
+# 'readonlyapi=YES' both match (IBC honors them); end-anchor prevents
+# 'ReadOnlyApi=yesno' from masquerading as the safety setting.
+_READONLY_API_RE = re.compile(
+    r"^[ \t]*readonlyapi[ \t]*=[ \t]*yes[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 # Determine paths based on platform
 PLATFORM = platform.system()  # 'Darwin' for macOS, 'Windows' for Windows
@@ -224,8 +235,42 @@ def start_gateway(trading_mode: str = "paper", version: Optional[str] = None) ->
         print("Run: python3 scripts/gateway_manager.py setup")
         return False
 
+    # IBN-H1 (followup audit): refuse to start the Gateway unless the IBC config
+    # has ReadOnlyApi=yes. Without this check, a misconfigured config silently
+    # opens an order-placing API. Use the same anchored case-insensitive regex
+    # as the rest of the codebase (NEW-IB-H1.1).
+    try:
+        config_text = IBC_CONFIG.read_text()
+    except OSError as exc:
+        print(f"ERROR: cannot read IBC config {IBC_CONFIG}: {exc}")
+        return False
+    if not _READONLY_API_RE.search(config_text):
+        print(
+            "ERROR: IBC config does not enforce ReadOnlyApi=yes. Refusing to "
+            "start Gateway. Set 'ReadOnlyApi=yes' in "
+            f"{IBC_CONFIG} before retrying."
+        )
+        return False
+
     # Build environment
-    env = os.environ.copy()
+    # IBN-H2 (followup audit): full os.environ.copy() propagates ALL parent-process
+    # secrets (API keys, tokens, dashboard hashes) to the IBC subprocess that
+    # doesn't need them. Build a minimal allowlist of vars IBC actually requires.
+    _IBC_ENV_ALLOWLIST = {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "DISPLAY",
+        "JAVA_HOME",
+    }
+    env = {k: v for k, v in os.environ.items() if k in _IBC_ENV_ALLOWLIST}
     env["TWS_MAJOR_VRSN"] = version
     env["IBC_INI"] = str(IBC_CONFIG)
     env["TRADING_MODE"] = trading_mode
@@ -411,10 +456,10 @@ def show_status():
     if IBC_CONFIG.exists():
         try:
             config_text = IBC_CONFIG.read_text(errors="replace")
-            has_readonly = any(
-                line.strip() == "ReadOnlyApi=yes"
-                for line in config_text.splitlines()
-            )
+            # NEW-IB-H1.1: Use the anchored, case-insensitive regex (same as
+            # the bash grep) so 'ReadOnlyApi=Yes' is accepted and
+            # 'ReadOnlyApi=yesno' is rejected.
+            has_readonly = bool(_READONLY_API_RE.search(config_text))
             if has_readonly:
                 print("ReadOnlyApi: yes (Gateway will reject order placement)")
             else:

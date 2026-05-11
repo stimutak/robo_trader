@@ -58,6 +58,11 @@ export TWOFA_TIMEOUT_ACTION=restart
 export IBC_PATH="${PROJECT_ROOT}/IBCMacos-3"
 export TWS_PATH=~/Applications
 export TWS_SETTINGS_PATH=
+# NEW-IB-L2: TODO — relocate IBC logs to ~/Library/Logs/RoboTrader/, the
+# macOS-native location for per-user app logs. Deferred from Round 2 because
+# the watchdog (scripts/com.robotrader.watchdog.plist) and any external log
+# scrapers point at this in-project path; moving it requires a coordinated
+# update of all consumers in the same commit.
 export LOG_PATH="${PROJECT_ROOT}/config/ibc/logs"
 
 # Check IBC config exists
@@ -90,7 +95,10 @@ fi
 # SECURITY: Refuse to start unless Gateway is configured for read-only API access.
 # RoboTrader relies on Gateway-side ReadOnlyApi=yes as a primary safety net
 # against any code path that might attempt to submit live orders.
-if ! grep -q '^ReadOnlyApi=yes' "$IBC_INI"; then
+# NEW-IB-H1.1: Anchored, case-insensitive regex with explicit end-anchor and
+# tolerated whitespace — prevents 'ReadOnlyApi=yesno' bypass and accepts
+# 'ReadOnlyApi=Yes' / 'readonlyapi=YES' (all of which IBC honors).
+if ! grep -Eqi '^[[:space:]]*readonlyapi[[:space:]]*=[[:space:]]*yes[[:space:]]*$' "$IBC_INI"; then
     echo "FATAL: $IBC_INI does not have ReadOnlyApi=yes. Refusing to start." >&2
     echo "       RoboTrader requires Gateway-side read-only enforcement." >&2
     echo "       To fix: set 'ReadOnlyApi=yes' in $IBC_INI and re-run." >&2
@@ -157,6 +165,16 @@ echo ""
 # Launch Gateway - run inline to preserve environment variables
 cd "$IBC_PATH"
 ./gatewaystartmacos.sh -inline
+
+# NEW-IB-M4: IBC log files contain account session details and were created
+# world/group readable by IBC's default umask. Strip group/other access on
+# both the directory and existing files. This is a no-op on a fresh install
+# (umask 077 above already covered files we created), but it's needed when
+# IBC writes logs after we've already returned, or when an older config is
+# being upgraded.
+if [ -n "${LOG_PATH:-}" ] && [ -d "$LOG_PATH" ]; then
+    chmod -R go-rwx "$LOG_PATH" 2>/dev/null || true
+fi
 
 echo ""
 echo "Gateway launch initiated."

@@ -28,6 +28,56 @@ import structlog
 logger = structlog.get_logger(__name__)
 
 
+def _find_project_root(start: Path) -> Path:
+    """
+    NEW-IB-M1.1: Locate the project root by walking up from `start` looking
+    for a marker file (`pyproject.toml` or `START_TRADER.sh`). This is more
+    robust than `Path(__file__).parents[2]` because it survives the file
+    being relocated within the package and doesn't silently break if the
+    package layout changes.
+
+    Falls back to ``parents[2]`` only if no marker is found (preserves
+    pre-fix behavior so we never raise during import).
+    """
+    cur = start.resolve()
+    # Walk up at most 8 levels to bound the search.
+    for _ in range(8):
+        if (cur / "pyproject.toml").exists() or (cur / "START_TRADER.sh").exists():
+            return cur
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    # Fallback: legacy probe.
+    return start.resolve().parents[2]
+
+
+# NEW-IB-M1.1: Allowlist of prefixes the worker interpreter may resolve to.
+# A symlink whose realpath escapes both the project root AND these system
+# locations is rejected. Order matters only for log clarity.
+_INTERPRETER_PREFIX_ALLOWLIST: tuple[Path, ...] = (
+    Path("/usr/bin"),
+    Path("/usr/local/bin"),
+    Path("/opt/homebrew"),
+    Path("/Library/Frameworks/Python.framework"),
+)
+
+
+def _is_interpreter_path_safe(resolved: Path, project_root: Path) -> bool:
+    """Return True if a resolved interpreter path is acceptable for exec."""
+    try:
+        resolved.relative_to(project_root)
+        return True
+    except ValueError:
+        pass
+    for prefix in _INTERPRETER_PREFIX_ALLOWLIST:
+        try:
+            resolved.relative_to(prefix)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 class SubprocessCrashError(Exception):
     """Raised when subprocess crashes or becomes unresponsive"""
 
@@ -101,12 +151,23 @@ class SubprocessIBKRClient:
 
         # Start subprocess using the same Python interpreter.
         #
-        # SECURITY (IB-M1): Only honor VIRTUAL_ENV if it points inside the project
-        # root. A local attacker who controls the user's shell environment could
-        # otherwise set VIRTUAL_ENV to a malicious venv (e.g. via a poisoned
-        # .envrc / direnv / asdf shim) and execute arbitrary code with the
-        # worker's IBKR credentials. Anything outside the project root is rejected.
-        project_root = Path(__file__).resolve().parents[2]
+        # SECURITY (IB-M1 + NEW-IB-M1.1):
+        # - IB-M1: Only honor VIRTUAL_ENV if it points inside the project root.
+        #   A local attacker who controls the user's shell environment could
+        #   otherwise set VIRTUAL_ENV to a malicious venv (e.g. via a poisoned
+        #   .envrc / direnv / asdf shim) and execute arbitrary code with the
+        #   worker's IBKR credentials.
+        # - NEW-IB-M1.1: Validating the venv directory alone is not enough —
+        #   the candidate interpreter path is often a symlink. We resolve the
+        #   final realpath and require it to live under the project root or
+        #   one of a small set of trusted system prefixes
+        #   (/usr/bin, /usr/local/bin, /opt/homebrew,
+        #   /Library/Frameworks/Python.framework). A symlink that resolves
+        #   outside the allowlist is rejected.
+        # - NEW-IB-M1.1: Project root is now found via marker-file probing
+        #   (pyproject.toml / START_TRADER.sh) instead of fragile
+        #   parents[2] indexing — this stays correct if the file moves.
+        project_root = _find_project_root(Path(__file__))
         project_venv_python = project_root / ".venv" / "bin" / "python3"
 
         python_exe = None
@@ -128,18 +189,61 @@ class SubprocessIBKRClient:
                 else:
                     candidate = ve_path / "bin" / "python3"
                 if candidate.exists():
-                    python_exe = str(candidate)
-                    logger.debug("Using VIRTUAL_ENV Python", python_exe=python_exe)
+                    # NEW-IB-M1.1: resolve symlink and validate realpath.
+                    candidate_resolved = candidate.resolve()
+                    if _is_interpreter_path_safe(candidate_resolved, project_root):
+                        python_exe = str(candidate)
+                        logger.debug(
+                            "Using VIRTUAL_ENV Python",
+                            python_exe=python_exe,
+                            resolved=str(candidate_resolved),
+                        )
+                    else:
+                        logger.warning(
+                            "Refusing VIRTUAL_ENV interpreter: realpath outside allowlist.",
+                            candidate=str(candidate),
+                            resolved=str(candidate_resolved),
+                        )
 
         # Preferred: project's own .venv python
         if python_exe is None and project_venv_python.exists():
-            python_exe = str(project_venv_python)
-            logger.debug("Using project venv Python", python_exe=python_exe)
+            project_venv_resolved = project_venv_python.resolve()
+            if _is_interpreter_path_safe(project_venv_resolved, project_root):
+                python_exe = str(project_venv_python)
+                logger.debug(
+                    "Using project venv Python",
+                    python_exe=python_exe,
+                    resolved=str(project_venv_resolved),
+                )
+            else:
+                logger.warning(
+                    "Project venv Python resolves outside allowlist - skipping.",
+                    candidate=str(project_venv_python),
+                    resolved=str(project_venv_resolved),
+                )
 
-        # Last resort: sys.executable
+        # Last resort: sys.executable (still validated against allowlist)
         if python_exe is None:
-            python_exe = sys.executable
-            logger.debug("Using sys.executable Python", python_exe=python_exe)
+            sys_exe_resolved = Path(sys.executable).resolve()
+            if _is_interpreter_path_safe(sys_exe_resolved, project_root):
+                python_exe = sys.executable
+                logger.debug(
+                    "Using sys.executable Python",
+                    python_exe=python_exe,
+                    resolved=str(sys_exe_resolved),
+                )
+            else:
+                # No safe interpreter available — refuse rather than exec
+                # an interpreter from an untrusted location.
+                raise RuntimeError(
+                    "No safe Python interpreter found. sys.executable "
+                    f"({sys.executable}) resolves to {sys_exe_resolved}, "
+                    "which is outside both the project root and the trusted "
+                    "system prefix allowlist (/usr/bin, /usr/local/bin, "
+                    "/opt/homebrew, /Library/Frameworks/Python.framework). "
+                    "This blocks IBKR worker startup as a defense against "
+                    "PATH/symlink hijacking (NEW-IB-M1.1)."
+                )
 
         # DEBUGGING FIX: Create debug log file for worker stderr capture
         # Use try/finally to ensure cleanup even if subprocess/thread startup fails
@@ -727,11 +831,21 @@ class SubprocessIBKRClient:
 
         Raises:
             SubprocessCrashError: If reconnection fails
+
+        NEW-IB-L1 — Reconnect idempotency assumption:
+            We assume that an IB reconnect cannot cause duplicate orders
+            because this client always connects in ``readonly=True`` mode and
+            the Gateway side enforces ``ReadOnlyApi=yes`` (verified at
+            startup by ``START_TRADER.sh`` and ``scripts/start_gateway.sh``,
+            see also ``connect()`` below). If this client is ever extended
+            to place orders, the reconnect path MUST be revisited — repeating
+            an order command after a transient disconnect could double-fill.
         """
         if not await self.health_check():
             if self._gateway_api_down_detail:
                 raise GatewayRequiresRestartError(self._gateway_api_down_detail)
             logger.warning("Connection unhealthy, attempting reconnection...")
+            # NEW-IB-L1: Idempotent because this client is read-only end-to-end.
             await self.stop()
             await self.start()
             # Note: Caller needs to call connect() with appropriate params

@@ -15,6 +15,15 @@
     <key>Label</key>
     <string>com.robotrader.trading</string>
 
+    <!-- NEW-IB-M3: Restrict to the GUI (Aqua) session of the explicit user.
+         If you deploy on a machine where the username is not 'oliver',
+         change UserName below to match. -->
+    <key>UserName</key>
+    <string>oliver</string>
+
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
