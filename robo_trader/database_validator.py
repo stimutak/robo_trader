@@ -551,14 +551,25 @@ class DatabaseValidator:
         if len(value) > max_length:
             raise ValidationError(f"{field_name} exceeds maximum length of {max_length}")
 
-        # Check for SQL injection attempts. Reject rather than silently escape —
-        # silent-escape leaves dangerous tokens like ";--" and "DROP" intact.
-        dangerous_patterns = ["'", '"', ";", "--", "/*", "*/", "DROP", "DELETE", "INSERT", "UPDATE"]
-        upper_value = value.upper()
-        for pattern in dangerous_patterns:
-            if pattern in upper_value:
-                logger.error(f"Forbidden SQL keywords in {field_name}: {value!r}")
-                raise ValidationError(f"{field_name} contains forbidden SQL keywords")
+        # DB-R2-L1: Reject only literal SQL terminators / comment markers /
+        # quote characters that have no business appearing in legitimate
+        # free-form metadata. The previous keyword denylist (DROP/DELETE/...
+        # as substrings) over-rejected JSON metadata containing words like
+        # "select" or "drop" used in business context.
+        #
+        # Defense-in-depth note: the actual SQL-injection guarantee comes
+        # from parameterized queries everywhere in the data layer. This
+        # check is a belt-and-suspenders sanity filter, NOT the primary
+        # defense. Keep it narrow.
+        terminator_patterns = ["'", '"', ";", "--", "/*", "*/"]
+        for pattern in terminator_patterns:
+            if pattern in value:
+                logger.error(
+                    f"Forbidden SQL terminator/quote in {field_name}: {value!r}"
+                )
+                raise ValidationError(
+                    f"{field_name} contains forbidden quote or SQL terminator"
+                )
 
         return value
 
@@ -626,3 +637,18 @@ class DatabaseValidator:
                 sanitized[key] = value
 
         return sanitized
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Module-level convenience wrappers
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def validate_portfolio_id(portfolio_id: Any) -> str:
+    """Module-level alias for ``DatabaseValidator.validate_portfolio_id``.
+
+    Convenience wrapper so callers (like ``sync_db_reader``) can do
+    ``from robo_trader.database_validator import validate_portfolio_id``
+    without importing the class. Behavior is identical.
+    """
+    return DatabaseValidator.validate_portfolio_id(portfolio_id)

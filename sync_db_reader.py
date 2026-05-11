@@ -12,6 +12,8 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
+from robo_trader.database_validator import ValidationError, validate_portfolio_id
+
 
 DEFAULT_PORTFOLIO_ID = "default"
 
@@ -107,6 +109,8 @@ class SyncDatabaseReader:
 
     def get_positions(self, portfolio_id: str = DEFAULT_PORTFOLIO_ID) -> List[Dict]:
         """Get all current positions for a portfolio."""
+        # DB-R2-M2: validate portfolio_id (defense-in-depth alongside parameterized SQL).
+        portfolio_id = validate_portfolio_id(portfolio_id)
         try:
             rows = self._fetch_all(
                 """
@@ -148,6 +152,8 @@ class SyncDatabaseReader:
             days: If provided, include only trades with timestamp within the past N days
             portfolio_id: Portfolio to scope the query to
         """
+        # DB-R2-M2: validate portfolio_id at top of method.
+        portfolio_id = validate_portfolio_id(portfolio_id)
         try:
             # Build WHERE clauses dynamically
             where_clauses = ["portfolio_id = ?"]
@@ -177,6 +183,8 @@ class SyncDatabaseReader:
 
     def get_account_info(self, portfolio_id: str = DEFAULT_PORTFOLIO_ID) -> Dict:
         """Get current account information for a portfolio."""
+        # DB-R2-M2: validate portfolio_id at top of method.
+        portfolio_id = validate_portfolio_id(portfolio_id)
         try:
             row = self._fetch_one(
                 """
@@ -225,6 +233,8 @@ class SyncDatabaseReader:
 
     def get_signals(self, hours: int = 1, portfolio_id: str = DEFAULT_PORTFOLIO_ID) -> List[Dict]:
         """Get recent signals for a portfolio."""
+        # DB-R2-M2: validate portfolio_id at top of method.
+        portfolio_id = validate_portfolio_id(portfolio_id)
         try:
             rows = self._fetch_all(
                 """
@@ -246,6 +256,8 @@ class SyncDatabaseReader:
         Returns list of daily snapshots ordered by date ascending (oldest first).
         This is the industry standard for tracking portfolio performance.
         """
+        # DB-R2-M2: validate portfolio_id at top of method.
+        portfolio_id = validate_portfolio_id(portfolio_id)
         try:
             rows = self._fetch_all(
                 """

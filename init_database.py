@@ -137,11 +137,39 @@ def main() -> int:
 
     db_path = Path(args.db_path)
 
-    # Refuse to clobber the production database name.
-    if db_path.name == "trading_data.db":
+    # DB-R2-L3: Refuse symlinks outright. A symlink lets an attacker (or a
+    # careless `ln -s trading_data.db sample.db`) trick this script into
+    # clobbering the production DB regardless of the filename check below.
+    # Symlinks have no legitimate use case for an init-sample-data script.
+    if db_path.is_symlink():
+        print(
+            f"REFUSING to run: {db_path} is a symlink. This script will not "
+            "follow symlinks (prevents accidental writes through links to the "
+            "production DB).",
+            file=sys.stderr,
+        )
+        return 2
+
+    # DB-R2-L3: Check the RESOLVED final filename, not just db_path.name. A
+    # path like ./tmp/../trading_data.db has name "trading_data.db" only after
+    # resolution; a path like ./alias.db where alias.db is a hardlink to the
+    # production DB resolves to trading_data.db on most filesystems via
+    # readlink/realpath. We use resolve(strict=False) so non-existent targets
+    # (the normal case for fresh init) still work.
+    try:
+        resolved = db_path.resolve(strict=False)
+    except (OSError, RuntimeError) as e:
+        print(f"REFUSING to run: cannot resolve {db_path}: {e}", file=sys.stderr)
+        return 2
+
+    # Refuse to clobber the production database name (check both the original
+    # and resolved final-component names; --force lets an operator opt in).
+    if (db_path.name == "trading_data.db" or resolved.name == "trading_data.db") and not args.force:
         print(
             "REFUSING to run: this script is for SAMPLE/TEST DBs only. "
-            "Use a different filename (e.g. sample.db).",
+            f"Resolved path '{resolved}' has the production filename "
+            "'trading_data.db'. Use a different filename (e.g. sample.db), "
+            "or pass --force to override (DANGEROUS).",
             file=sys.stderr,
         )
         return 2

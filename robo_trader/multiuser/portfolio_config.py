@@ -135,10 +135,30 @@ def load_portfolio_configs() -> List[PortfolioConfig]:
                     raise ValueError(f"Each portfolio must be a JSON object, got: {type(item)}")
                 if "id" not in item:
                     raise ValueError(f"Each portfolio must have an 'id' field: {item}")
-                if item["id"] in seen_ids:
-                    raise ValueError(f"Duplicate portfolio id: {item['id']}")
-                seen_ids.add(item["id"])
-                configs.append(PortfolioConfig.from_dict(item))
+
+                # DB-R2-M1: Normalize id BEFORE dedupe check so case-collisions
+                # ("Default" vs "default") are caught. Apply the normalized id
+                # back to the dict so the constructed PortfolioConfig.id matches
+                # all downstream lookups (which use the same lowercase form via
+                # DatabaseValidator.validate_portfolio_id).
+                raw_id = item["id"]
+                if not isinstance(raw_id, str):
+                    raise ValueError(
+                        f"Portfolio 'id' must be a string, got {type(raw_id).__name__}: {raw_id!r}"
+                    )
+                norm_id = raw_id.strip().lower()
+                if not norm_id:
+                    raise ValueError("Portfolio 'id' cannot be empty after normalization")
+                if norm_id in seen_ids:
+                    raise ValueError(
+                        f"Duplicate portfolio id (case-insensitive): {raw_id!r} -> {norm_id!r}"
+                    )
+                seen_ids.add(norm_id)
+
+                # Replace the id in a shallow copy so from_dict sees the normalized form.
+                normalized_item = dict(item)
+                normalized_item["id"] = norm_id
+                configs.append(PortfolioConfig.from_dict(normalized_item))
 
             active = [c for c in configs if c.active]
             logger.info(
