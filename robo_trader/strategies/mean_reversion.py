@@ -15,6 +15,7 @@ import pandas as pd
 
 from ..features.engine import FeatureSet
 from ..logger import get_logger
+from ..ml._safe_load import verify_file
 from ..ml.model_registry import ModelRegistry
 from ..ml.model_selector import ModelSelector
 from .framework import Signal, SignalType, Strategy
@@ -440,6 +441,7 @@ class MeanReversionStrategy(Strategy):
         try:
             path = Path(model_path)
             if path.exists():
+                verify_file(path)
                 self.ml_model = joblib.load(path)
                 logger.info("mean_reversion.ml_model_loaded", path=model_path)
             else:

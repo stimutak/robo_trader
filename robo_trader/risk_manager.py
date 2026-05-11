@@ -260,6 +260,10 @@ class RiskManager:
         Returns:
             Number of shares to trade
         """
+        # R2-L1: refuse NaN/inf inputs — propagating them produces NaN share
+        # counts which silently round to 0 or to garbage downstream.
+        if not math.isfinite(entry_price) or not math.isfinite(cash_available):
+            return 0
         if entry_price <= 0 or cash_available <= 0:
             return 0
         notional = cash_available * self.max_position_risk_pct

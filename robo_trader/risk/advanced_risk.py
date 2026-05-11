@@ -7,6 +7,7 @@ automated kill switches, and comprehensive risk monitoring.
 
 import asyncio
 import json
+import os
 import warnings
 from collections import deque
 from dataclasses import dataclass, field
@@ -316,6 +317,14 @@ class KillSwitch:
         self.state_path: Path = (
             state_path if state_path is not None else Path("data/kill_switch_state.json")
         )
+        # R2-M2: derive the lock path from the state path so tests using a
+        # tmp_path don't collide with the production kill_switch.lock. For
+        # the default (production) path we keep the well-known location that
+        # execution.py:73-77 checks.
+        if state_path is None:
+            self.lock_path: Path = Path("data/kill_switch.lock")
+        else:
+            self.lock_path = self.state_path.parent / "kill_switch.lock"
         # Attempt to load any persisted triggered state on construction.
         self._load_persisted_state()
 
@@ -453,8 +462,20 @@ class KillSwitch:
         except Exception as exc:  # pragma: no cover - persistence must never raise
             print(f"⚠️  Failed to persist kill-switch state: {exc}")
 
+        # R2-M2: also touch the .lock file checked by execution.py so both
+        # indicators agree.
+        try:
+            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+            self.lock_path.touch(exist_ok=True)
+        except Exception as exc:  # pragma: no cover
+            print(f"⚠️  Failed to touch kill-switch lock file: {exc}")
+
     def _save_persisted_state(self) -> None:
-        """Write triggered state to disk as JSON."""
+        """Write triggered state to disk as JSON.
+
+        R2-M1: atomic write via tempfile + os.replace, with 0o600 perms on
+        first creation.
+        """
         if self.state_path is None:
             return
         try:
@@ -467,18 +488,82 @@ class KillSwitch:
             "trigger_reason": self.trigger_reason,
             "consecutive_losses": int(self.consecutive_losses),
         }
-        with open(self.state_path, "w") as f:
-            json.dump(payload, f, indent=2)
+        tmp_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+        # Open with O_EXCL where possible to guard against concurrent writers
+        # touching the same tmp; fall back to plain open if .tmp already exists
+        # from a prior interrupted write (we own this file's path).
+        try:
+            fd = os.open(
+                str(tmp_path),
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o600,
+            )
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(payload, f, indent=2)
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
+            except Exception:
+                # Ensure fd is closed if fdopen fails before with-block manages it.
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+            os.replace(str(tmp_path), str(self.state_path))
+            try:
+                os.chmod(self.state_path, 0o600)
+            except OSError:
+                pass
+        finally:
+            # Clean up tmp file if it still exists (replace failed).
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
 
     def _load_persisted_state(self) -> None:
-        """Restore triggered state from disk if present (JSON only)."""
+        """Restore triggered state from disk if present (JSON only).
+
+        R2-M1: fail CLOSED on any read/parse error — kill switch is a safety
+        gate, so an unreadable state file must NOT default to "untriggered".
+        R2-M2: also treat presence of data/kill_switch.lock as triggered.
+        """
+        # R2-M2: lock file presence is itself a trigger signal.
+        try:
+            if self.lock_path.exists():
+                if not self.triggered:
+                    self.triggered = True
+                    self.trigger_reason = (
+                        self.trigger_reason or "kill_switch.lock present at startup"
+                    )
+                    self.trigger_time = self.trigger_time or get_market_time()
+                    print(
+                        f"⚠️  Kill switch lock file present at {self.lock_path}; "
+                        f"failing closed."
+                    )
+        except Exception:
+            # Any error stat-ing the lock file should also fail closed.
+            self.triggered = True
+            self.trigger_reason = self.trigger_reason or "kill_switch.lock check failed"
+            self.trigger_time = self.trigger_time or get_market_time()
+
         if self.state_path is None or not Path(self.state_path).exists():
             return
         try:
             with open(self.state_path, "r") as f:
                 payload = json.load(f)
         except Exception as exc:
-            print(f"⚠️  Failed to load kill-switch state: {exc}")
+            # R2-M1: fail CLOSED — a corrupt/empty state file must trip the
+            # kill switch rather than allow trading to resume.
+            print(f"⚠️  Failed to load kill-switch state ({exc}); failing closed.")
+            self.triggered = True
+            self.trigger_reason = "state file corrupted - failing safe"
+            self.trigger_time = get_market_time()
             return
 
         if payload.get("triggered"):
@@ -512,6 +597,14 @@ class KillSwitch:
                 # Clear persisted state so we don't reload triggered=True later.
                 try:
                     self._save_persisted_state()
+                except Exception:
+                    pass
+
+                # R2-M2: clear the lock file too so the two indicators stay
+                # in sync.
+                try:
+                    if self.lock_path.exists():
+                        self.lock_path.unlink()
                 except Exception:
                     pass
 
@@ -601,7 +694,16 @@ class AdvancedRiskManager:
         # Initialize components
         self.kelly_sizer = KellySizer() if enable_kelly else None
         self.correlation_limiter = CorrelationLimiter() if enable_correlation_limits else None
-        self.kill_switch = KillSwitch() if enable_kill_switch else None
+        # R2-L2: surface the operator-configured daily-loss limit to the kill
+        # switch so the two layers (risk_manager soft check vs kill_switch hard
+        # backstop) agree. The kill-switch backstop kept its higher default
+        # (5%) deliberately when no config is provided — see the comment in
+        # KillSwitch.__init__ — but when config IS provided, honor it.
+        ks_kwargs: Dict[str, float] = {}
+        cfg_loss_pct = config.get("max_daily_loss_pct")
+        if isinstance(cfg_loss_pct, (int, float)) and cfg_loss_pct > 0:
+            ks_kwargs["max_daily_loss_pct"] = float(cfg_loss_pct)
+        self.kill_switch = KillSwitch(**ks_kwargs) if enable_kill_switch else None
 
         # Risk metrics tracking
         self.metrics_history: deque = deque(maxlen=1000)

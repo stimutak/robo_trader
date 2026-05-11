@@ -176,6 +176,7 @@ class AsyncRunner:
         self.advanced_risk = None  # Advanced risk manager with Kelly sizing
         self.risk_monitor_task = None  # Background risk monitoring task
         self.subprocess_monitor_task = None  # Background subprocess health monitoring task
+        self.cleanup_task = None  # DB-R2-L2: periodic cleanup_old_data task
         self.executor = None
         self.portfolio = None
         self.portfolio_manager: Optional[MultiStrategyPortfolioManager] = None
@@ -210,6 +211,14 @@ class AsyncRunner:
         # This is a more aggressive duplicate prevention mechanism
         self._cycle_executed_buys: set = set()
         self._cycle_executed_buys_lock = asyncio.Lock()
+
+        # TCN-H3 (followup audit): parallel set for SELL_SHORT legs of pairs
+        # trading. The pairs short paths previously skipped both the pending
+        # lock AND any cycle-level dedupe, allowing two concurrent pairs cycles
+        # to double-short the same symbol. Cleared at the start of each cycle
+        # alongside _cycle_executed_buys.
+        self._cycle_executed_shorts: set = set()
+        self._cycle_executed_shorts_lock = asyncio.Lock()
 
         # Correlation components
         self.correlation_tracker = None
@@ -610,6 +619,100 @@ class AsyncRunner:
                 )
                 return False
 
+    async def _on_stop_loss_executed(self, stop, result) -> None:
+        """Callback invoked by StopLossMonitor after a successful stop-loss fill.
+
+        Synchronizes runtime state (self.positions, portfolio, DB) with the
+        broker so the rest of the session does not see a phantom position.
+
+        TCN-H4 (followup audit): the monitor used to update only its own
+        bookkeeping. The runner still believed the position existed, which
+        blocked subsequent BUY signals (`already have position` guard) and
+        broke SELL signals (no position to close). Now we mirror the same
+        atomic-then-persist pattern used by the main BUY/SELL paths.
+
+        Failures here are logged but never raised — the broker fill already
+        happened, and surfacing an exception would crash the monitor loop and
+        leave OTHER stops unwatched.
+        """
+        symbol = stop.symbol
+        # Side that closes the position: stop_qty>0 (long) -> SELL,
+        # stop_qty<0 (short) -> BUY_TO_COVER.
+        is_long = stop.position_qty > 0
+        side = "SELL" if is_long else "BUY_TO_COVER"
+        qty = abs(stop.position_qty)
+        try:
+            fill_price = (
+                float(result.fill_price)
+                if result is not None and result.fill_price is not None
+                else float(stop.trigger_price or stop.stop_price)
+            )
+        except Exception:
+            fill_price = float(stop.stop_price)
+
+        # Use the same pending-orders lock the BUY/SELL paths use so any
+        # concurrent BUY/SELL on this symbol observes a consistent view.
+        try:
+            async with self._pending_orders_lock:
+                # 1. Drop in-memory position (if present).
+                if symbol in self.positions:
+                    try:
+                        del self.positions[symbol]
+                    except Exception as e:  # pragma: no cover - defensive
+                        logger.error(
+                            f"_on_stop_loss_executed: failed to drop {symbol} "
+                            f"from self.positions: {e}"
+                        )
+
+                # 2. Sync portfolio cash/P&L with the closing fill.
+                try:
+                    if self.portfolio is not None:
+                        await self.portfolio.update_fill(symbol, side, qty, fill_price)
+                except Exception as e:
+                    logger.error(
+                        f"_on_stop_loss_executed: portfolio.update_fill failed "
+                        f"for {symbol} {side} {qty}@{fill_price}: {e}"
+                    )
+
+                # 3. Persist position closure to DB.
+                try:
+                    if self.db is not None:
+                        await self.db.update_position(symbol, 0, 0.0, fill_price)
+                except Exception as e:
+                    logger.error(
+                        f"_on_stop_loss_executed: db.update_position failed "
+                        f"for {symbol}: {e}"
+                    )
+
+                # 4. Record the trade row so audit/PnL queries see the close.
+                try:
+                    if self.db is not None:
+                        await self.db.record_trade(symbol, side, qty, fill_price, 0)
+                except Exception as e:
+                    logger.error(
+                        f"_on_stop_loss_executed: db.record_trade failed "
+                        f"for {symbol}: {e}"
+                    )
+
+                # 5. Mark advanced-risk-manager position as closed (if used).
+                try:
+                    if self.use_advanced_risk and self.advanced_risk:
+                        self.advanced_risk.update_position(symbol, qty, fill_price, side)
+                except Exception as e:
+                    logger.error(
+                        f"_on_stop_loss_executed: advanced_risk update failed "
+                        f"for {symbol}: {e}"
+                    )
+
+            logger.info(
+                f"Stop-loss state sync complete for {symbol}: closed {side} "
+                f"{qty}@${fill_price:.2f}"
+            )
+        except Exception as outer:  # pragma: no cover - defensive
+            logger.error(
+                f"_on_stop_loss_executed top-level failure for {symbol}: {outer}"
+            )
+
     async def setup(self):
         """Initialize all components."""
         # Skip setup if already connected (for persistent connections)
@@ -828,6 +931,11 @@ class AsyncRunner:
                 "Advanced risk management initialized with Kelly criterion and kill switches"
             )
 
+        # DB-R2-L2: start periodic DB cleanup loop (idempotent — guard against
+        # multiple calls to setup()).
+        if self.cleanup_task is None or self.cleanup_task.done():
+            self.cleanup_task = asyncio.create_task(self._periodic_cleanup_loop())
+
         # Initialize executor with smart execution support
         smart_executor = None
 
@@ -862,6 +970,11 @@ class AsyncRunner:
                 risk_manager=self.risk,
                 emergency_shutdown_callback=emergency_shutdown_callback,
                 portfolio_id=self.portfolio_id,
+                # TCN-H4: wire up runner-state sync so successful stop-loss
+                # executions update self.positions, the Portfolio, and DB.
+                # Without this, the runner sees a phantom position post-stop
+                # and blocks/breaks subsequent BUY and SELL signals.
+                position_closed_callback=self._on_stop_loss_executed,
             )
             await self.stop_loss_monitor.start_monitoring()
             if self.use_trailing_stop:
@@ -1344,6 +1457,60 @@ class AsyncRunner:
                 # Continue monitoring even on errors
                 continue
 
+    async def _periodic_cleanup_loop(self):
+        """DB-R2-L2: periodically purge old market_data, ticks, and signals.
+
+        Runs at most once per hour. Retention windows configurable via env:
+          - SIGNAL_RETENTION_DAYS (default 30) — per-portfolio
+          - MARKET_DATA_RETENTION_DAYS (default 90) — global
+
+        Calls into the underlying AsyncTradingDatabase for the global tables
+        (market_data, ticks) and uses the portfolio-scoped DB for signals so
+        we never blanket-delete across tenants.
+        """
+        try:
+            signal_days = int(os.getenv("SIGNAL_RETENTION_DAYS", "30"))
+        except (TypeError, ValueError):
+            signal_days = 30
+        try:
+            market_days = int(os.getenv("MARKET_DATA_RETENTION_DAYS", "90"))
+        except (TypeError, ValueError):
+            market_days = 90
+
+        interval_seconds = 3600  # at most once per hour
+        logger.info(
+            f"Starting periodic DB cleanup loop: signals={signal_days}d, "
+            f"market_data={market_days}d, interval={interval_seconds}s"
+        )
+
+        while True:
+            try:
+                # Stagger the first run so cleanup never collides with startup
+                # work; sleep first, then run.
+                await asyncio.sleep(interval_seconds)
+
+                # Per-portfolio signal cleanup via the scoped DB proxy.
+                try:
+                    await self.db.cleanup_old_data(days_to_keep=signal_days)
+                except Exception as e:
+                    logger.warning(f"Periodic signal cleanup failed: {e}")
+
+                # Global market_data/ticks cleanup via the underlying DB,
+                # bypassing the portfolio-scoped proxy.
+                raw_db = getattr(self, "_raw_db", None)
+                if raw_db is not None:
+                    try:
+                        await raw_db.cleanup_old_data(days_to_keep=market_days)
+                    except Exception as e:
+                        logger.warning(f"Periodic market_data cleanup failed: {e}")
+
+            except asyncio.CancelledError:
+                logger.info("Periodic cleanup loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in periodic cleanup loop: {e}")
+                continue
+
     async def _restart_subprocess(self):
         """
         Restart the IBKR subprocess after a crash or health check failure.
@@ -1791,23 +1958,44 @@ class AsyncRunner:
                                         f"{analysis.confidence:.0%} < AI_MIN_CONFIDENCE "
                                         f"{ai_min_conf:.0%}"
                                     )
-                                elif (
-                                    analysis.suggested_action == "sell"
-                                    and analysis.confidence > 0.5
-                                ):
-                                    signal_value = -1
-                                    confidence = analysis.confidence
-                                    logger.info(
-                                        f"AI SELL signal for {symbol}: {analysis.reasoning[:80]}"
-                                    )
-                                    # Update prediction with AI signal
-                                    self._ml_predictions[symbol] = {
-                                        "signal": -1,
-                                        "confidence": confidence,
-                                        "action": "SELL",
-                                        "source": "AI_ANALYST",
-                                        "timestamp": datetime.now().isoformat(),
-                                    }
+                                elif analysis.suggested_action == "sell":
+                                    # AI-H3-SELL: mirror the BUY gate. SELL on
+                                    # AI alone (with no ML corroboration) is
+                                    # disabled by default; require an operator
+                                    # opt-out and the AI_MIN_CONFIDENCE floor.
+                                    # This branch runs only when ML signal==0,
+                                    # so by definition ML does NOT say SELL.
+                                    ai_sell_conf_ok = analysis.confidence > ai_min_conf
+                                    if ai_require_ml:
+                                        logger.warning(
+                                            f"AI SELL for {symbol} suppressed: ML did not "
+                                            f"corroborate (ML signal=0). AI conf="
+                                            f"{analysis.confidence:.0%}. "
+                                            f"Set AI_REQUIRE_ML_CONFIRMATION=false to override."
+                                        )
+                                        # default to HOLD; do NOT escalate to SELL
+                                    elif ai_sell_conf_ok:
+                                        signal_value = -1
+                                        confidence = analysis.confidence
+                                        logger.info(
+                                            f"AI SELL signal for {symbol} "
+                                            f"(operator override AI_REQUIRE_ML_CONFIRMATION=false, "
+                                            f"conf={confidence:.0%}): {analysis.reasoning[:80]}"
+                                        )
+                                        # Update prediction with AI signal
+                                        self._ml_predictions[symbol] = {
+                                            "signal": -1,
+                                            "confidence": confidence,
+                                            "action": "SELL",
+                                            "source": "AI_ANALYST",
+                                            "timestamp": datetime.now().isoformat(),
+                                        }
+                                    else:
+                                        logger.warning(
+                                            f"AI SELL for {symbol} suppressed: AI conf "
+                                            f"{analysis.confidence:.0%} < AI_MIN_CONFIDENCE "
+                                            f"{ai_min_conf:.0%}"
+                                        )
                                 else:
                                     logger.debug(
                                         f"AI HOLD for {symbol}: {analysis.suggested_action} conf={analysis.confidence:.2f}"
@@ -2318,20 +2506,18 @@ class AsyncRunner:
                                 quantity = qty
                                 message = f"Opened long: Bought {qty} shares at ${fill_price:.2f}"
 
-                                # Add stop-loss order for the new position
+                                # Add stop-loss order for the new/accumulated position.
+                                # R2-M5: pass the accumulated Position object
+                                # (self.positions[symbol]) — using the fresh
+                                # fill's price/qty would ratchet the stop DOWN
+                                # on every DCA add into a downtrend.
                                 if self.stop_loss_monitor and self.enable_stop_loss:
                                     try:
-                                        # Create position object for stop-loss
-                                        new_position = Position(
-                                            symbol=symbol,
-                                            quantity=qty,
-                                            avg_price=fill_price,
-                                            entry_time=datetime.now(),
-                                        )
+                                        accumulated_position = self.positions[symbol]
                                         if self.use_trailing_stop:
                                             await self.stop_loss_monitor.add_stop_loss(
                                                 symbol=symbol,
-                                                position=new_position,
+                                                position=accumulated_position,
                                                 stop_percent=self.trailing_stop_pct,
                                                 stop_type=StopType.TRAILING_PERCENT,
                                                 trailing_percent=self.trailing_stop_pct,
@@ -2342,7 +2528,7 @@ class AsyncRunner:
                                         else:
                                             await self.stop_loss_monitor.add_stop_loss(
                                                 symbol=symbol,
-                                                position=new_position,
+                                                position=accumulated_position,
                                                 stop_percent=self.stop_loss_percent,
                                                 stop_type=StopType.FIXED,
                                             )
@@ -2532,42 +2718,46 @@ class AsyncRunner:
                     if res.ok:
                         fill_price = res.fill_price if res.fill_price is not None else price_float
 
-                        if self.stop_loss_monitor and self.enable_stop_loss:
-                            try:
-                                short_position = Position(
-                                    symbol=symbol,
-                                    quantity=-qty,
-                                    avg_price=fill_price,
-                                    entry_time=datetime.now(),
-                                )
-                                if self.use_trailing_stop:
-                                    await self.stop_loss_monitor.add_stop_loss(
-                                        symbol=symbol,
-                                        position=short_position,
-                                        stop_percent=self.trailing_stop_pct,
-                                        stop_type=StopType.TRAILING_PERCENT,
-                                        trailing_percent=self.trailing_stop_pct,
-                                    )
-                                    logger.info(
-                                        f"Trailing stop added for SHORT {symbol} at {self.trailing_stop_pct:.1%}"
-                                    )
-                                else:
-                                    await self.stop_loss_monitor.add_stop_loss(
-                                        symbol=symbol,
-                                        position=short_position,
-                                        stop_percent=self.stop_loss_percent,
-                                        stop_type=StopType.FIXED,
-                                    )
-                                    logger.info(
-                                        f"Fixed stop-loss added for SHORT {symbol} at {self.stop_loss_percent:.1%}"
-                                    )
-                            except Exception as e:
-                                logger.error(f"Failed to add stop-loss for short {symbol}: {e}")
-
+                        # R2-M4: do the atomic position update FIRST. If it
+                        # fails we must not leave an orphaned stop-loss
+                        # registered against a position the runner doesn't
+                        # know it has.
                         success = await self._update_position_atomic(
                             symbol, qty, fill_price, "SELL_SHORT"
                         )
                         if success:
+                            if self.stop_loss_monitor and self.enable_stop_loss:
+                                try:
+                                    short_position = Position(
+                                        symbol=symbol,
+                                        quantity=-qty,
+                                        avg_price=fill_price,
+                                        entry_time=datetime.now(),
+                                    )
+                                    if self.use_trailing_stop:
+                                        await self.stop_loss_monitor.add_stop_loss(
+                                            symbol=symbol,
+                                            position=short_position,
+                                            stop_percent=self.trailing_stop_pct,
+                                            stop_type=StopType.TRAILING_PERCENT,
+                                            trailing_percent=self.trailing_stop_pct,
+                                        )
+                                        logger.info(
+                                            f"Trailing stop added for SHORT {symbol} at {self.trailing_stop_pct:.1%}"
+                                        )
+                                    else:
+                                        await self.stop_loss_monitor.add_stop_loss(
+                                            symbol=symbol,
+                                            position=short_position,
+                                            stop_percent=self.stop_loss_percent,
+                                            stop_type=StopType.FIXED,
+                                        )
+                                        logger.info(
+                                            f"Fixed stop-loss added for SHORT {symbol} at {self.stop_loss_percent:.1%}"
+                                        )
+                                except Exception as e:
+                                    logger.error(f"Failed to add stop-loss for short {symbol}: {e}")
+
                             self.daily_executed_notional += price_float * qty
 
                             await self.db.record_trade(
@@ -2620,6 +2810,12 @@ class AsyncRunner:
         try:
             async with self._cycle_executed_buys_lock:
                 self._cycle_executed_buys.clear()
+        except Exception:
+            pass
+        # TCN-H3: same per-cycle reset for the short-side dedupe set.
+        try:
+            async with self._cycle_executed_shorts_lock:
+                self._cycle_executed_shorts.clear()
         except Exception:
             pass
 
@@ -2939,15 +3135,16 @@ class AsyncRunner:
 
                                 if pair and len(pair) == 2:
                                     symbol_a, symbol_b = pair[0], pair[1]
-                                    # Skip if we already have significant positions in these symbols
-                                    # Check for existing positions (qty > 0, not > 100)
+                                    # R2-OP2: detect ALL non-zero positions (long
+                                    # AND short) so existing shorts can't be
+                                    # silently doubled by a pairs short signal.
                                     has_position_a = (
                                         symbol_a in self.positions
-                                        and self.positions[symbol_a].quantity > 0
+                                        and self.positions[symbol_a].quantity != 0
                                     )
                                     has_position_b = (
                                         symbol_b in self.positions
-                                        and self.positions[symbol_b].quantity > 0
+                                        and self.positions[symbol_b].quantity != 0
                                     )
 
                                     if has_position_a or has_position_b:
@@ -2958,11 +3155,12 @@ class AsyncRunner:
 
                                     # CRITICAL: Also check DB positions in case in-memory is out of sync
                                     # (uses db_positions_list fetched once before loop)
+                                    # R2-OP2: include shorts (quantity != 0).
                                     db_pos_a = next(
                                         (
                                             p
                                             for p in db_positions_list
-                                            if p["symbol"] == symbol_a and p.get("quantity", 0) > 0
+                                            if p["symbol"] == symbol_a and p.get("quantity", 0) != 0
                                         ),
                                         None,
                                     )
@@ -2970,7 +3168,7 @@ class AsyncRunner:
                                         (
                                             p
                                             for p in db_positions_list
-                                            if p["symbol"] == symbol_b and p.get("quantity", 0) > 0
+                                            if p["symbol"] == symbol_b and p.get("quantity", 0) != 0
                                         ),
                                         None,
                                     )
@@ -2982,9 +3180,11 @@ class AsyncRunner:
                                         continue
 
                                     # Check MAX_OPEN_POSITIONS limit before opening pairs trades
-                                    # Pairs trades open 2 positions, so check if we have room
+                                    # Pairs trades open 2 positions, so check if we have room.
+                                    # R2-OP2: count all non-zero positions (longs AND shorts)
+                                    # toward the cap.
                                     current_position_count = len(
-                                        [p for p in self.positions.values() if p.quantity > 0]
+                                        [p for p in self.positions.values() if p.quantity != 0]
                                     )
                                     max_positions = self.cfg.risk.max_open_positions
                                     if current_position_count + 2 > max_positions:
@@ -3206,6 +3406,33 @@ class AsyncRunner:
                                                         f"Pairs SHORT blocked: {blk_reason}"
                                                     )
                                                 else:
+                                                    # TCN-H3: pairs SHORT leg must acquire the same
+                                                    # pending-orders lock and consult a cycle-level
+                                                    # dedupe set, mirroring the BUY/long leg above.
+                                                    # Without this, two concurrent pairs cycles can
+                                                    # both decide to open the same short.
+                                                    proceed_short_b = True
+                                                    async with self._pending_orders_lock:
+                                                        if symbol_b in self._pending_orders:
+                                                            logger.warning(
+                                                                f"Pairs SHORT for {symbol_b}: pending lock held, skipping"
+                                                            )
+                                                            proceed_short_b = False
+                                                        else:
+                                                            async with self._cycle_executed_shorts_lock:
+                                                                if symbol_b in self._cycle_executed_shorts:
+                                                                    logger.warning(
+                                                                        f"DUPLICATE SHORT BLOCKED: {symbol_b} already shorted this cycle (pairs)"
+                                                                    )
+                                                                    proceed_short_b = False
+                                                                else:
+                                                                    self._cycle_executed_shorts.add(symbol_b)
+                                                            if proceed_short_b:
+                                                                self._pending_orders.add(symbol_b)
+                                                    if not proceed_short_b:
+                                                        # leave the long leg in place; downstream
+                                                        # reconciliation can manage half-fills.
+                                                        continue
                                                     # TC-H4: use SELL_SHORT to open a fresh short
                                                     order_b = Order(
                                                         symbol=symbol_b,
@@ -3213,11 +3440,15 @@ class AsyncRunner:
                                                         side="SELL_SHORT",
                                                         price=price_b,
                                                     )
-                                                    res_b = (
-                                                        await self._place_order_with_circuit_breaker(
-                                                            order_b
+                                                    try:
+                                                        res_b = (
+                                                            await self._place_order_with_circuit_breaker(
+                                                                order_b
+                                                            )
                                                         )
-                                                    )
+                                                    finally:
+                                                        async with self._pending_orders_lock:
+                                                            self._pending_orders.discard(symbol_b)
                                                     if res_b.ok:
                                                         fill_b = res_b.fill_price or price_b
                                                         await self.db.record_trade(
@@ -3227,9 +3458,13 @@ class AsyncRunner:
                                                             fill_b,
                                                             0,
                                                         )
-                                                        # TC-H4: track the short position
+                                                        # R2-OP1: single atomic update — internally
+                                                        # calls portfolio.update_fill. Persist to DB
+                                                        # only if atomic succeeds, mirroring the
+                                                        # main SELL_SHORT flow.
+                                                        atomic_ok = False
                                                         try:
-                                                            await self._update_position_atomic(
+                                                            atomic_ok = await self._update_position_atomic(
                                                                 symbol_b,
                                                                 qty_b,
                                                                 float(fill_b),
@@ -3239,39 +3474,43 @@ class AsyncRunner:
                                                             logger.error(
                                                                 f"Pairs SHORT _update_position_atomic failed for {symbol_b}: {e}"
                                                             )
-                                                        try:
-                                                            await self.portfolio.update_fill(
-                                                                symbol_b,
-                                                                "SELL_SHORT",
-                                                                qty_b,
-                                                                float(fill_b),
-                                                            )
-                                                        except Exception as e:
-                                                            logger.error(
-                                                                f"Pairs SHORT portfolio.update_fill failed for {symbol_b}: {e}"
-                                                            )
-                                                        # TC-H4: register a stop-loss for the short
-                                                        if (
-                                                            self.stop_loss_monitor
-                                                            and self.enable_stop_loss
-                                                        ):
+                                                        if atomic_ok:
                                                             try:
-                                                                short_pos = Position(
-                                                                    symbol=symbol_b,
-                                                                    quantity=-qty_b,
-                                                                    avg_price=fill_b,
-                                                                    entry_time=datetime.now(),
-                                                                )
-                                                                await self.stop_loss_monitor.add_stop_loss(
-                                                                    symbol=symbol_b,
-                                                                    position=short_pos,
-                                                                    stop_percent=self.stop_loss_percent,
-                                                                    stop_type=StopType.FIXED,
+                                                                pos_b = self.positions[symbol_b]
+                                                                await self.db.update_position(
+                                                                    symbol_b,
+                                                                    pos_b.quantity,
+                                                                    pos_b.avg_price,
+                                                                    float(fill_b),
                                                                 )
                                                             except Exception as e:
                                                                 logger.error(
-                                                                    f"Failed to add stop-loss for pairs SHORT {symbol_b}: {e}"
+                                                                    f"Pairs SHORT db.update_position failed for {symbol_b}: {e}"
                                                                 )
+                                                            # R2-M4 ordering: stop-loss only AFTER
+                                                            # atomic update succeeds, so we never
+                                                            # leave an orphaned stop-loss.
+                                                            if (
+                                                                self.stop_loss_monitor
+                                                                and self.enable_stop_loss
+                                                            ):
+                                                                try:
+                                                                    short_pos = Position(
+                                                                        symbol=symbol_b,
+                                                                        quantity=-qty_b,
+                                                                        avg_price=fill_b,
+                                                                        entry_time=datetime.now(),
+                                                                    )
+                                                                    await self.stop_loss_monitor.add_stop_loss(
+                                                                        symbol=symbol_b,
+                                                                        position=short_pos,
+                                                                        stop_percent=self.stop_loss_percent,
+                                                                        stop_type=StopType.FIXED,
+                                                                    )
+                                                                except Exception as e:
+                                                                    logger.error(
+                                                                        f"Failed to add stop-loss for pairs SHORT {symbol_b}: {e}"
+                                                                    )
                                                         # Daily executed notional
                                                         self.daily_executed_notional += float(
                                                             fill_b
@@ -3417,6 +3656,31 @@ class AsyncRunner:
                                                         f"Pairs SHORT blocked: {blk_reason}"
                                                     )
                                                 else:
+                                                    # TCN-H3: pending-order lock + cycle-level
+                                                    # dedupe set for the short leg, mirroring the
+                                                    # main BUY path. Pairs short legs were the only
+                                                    # remaining path that could open a position
+                                                    # without this protection.
+                                                    proceed_short_a = True
+                                                    async with self._pending_orders_lock:
+                                                        if symbol_a in self._pending_orders:
+                                                            logger.warning(
+                                                                f"Pairs SHORT for {symbol_a}: pending lock held, skipping"
+                                                            )
+                                                            proceed_short_a = False
+                                                        else:
+                                                            async with self._cycle_executed_shorts_lock:
+                                                                if symbol_a in self._cycle_executed_shorts:
+                                                                    logger.warning(
+                                                                        f"DUPLICATE SHORT BLOCKED: {symbol_a} already shorted this cycle (pairs)"
+                                                                    )
+                                                                    proceed_short_a = False
+                                                                else:
+                                                                    self._cycle_executed_shorts.add(symbol_a)
+                                                            if proceed_short_a:
+                                                                self._pending_orders.add(symbol_a)
+                                                    if not proceed_short_a:
+                                                        continue
                                                     # TC-H4: SELL_SHORT side + full short open path
                                                     order_a = Order(
                                                         symbol=symbol_a,
@@ -3424,11 +3688,15 @@ class AsyncRunner:
                                                         side="SELL_SHORT",
                                                         price=price_a,
                                                     )
-                                                    res_a = (
-                                                        await self._place_order_with_circuit_breaker(
-                                                            order_a
+                                                    try:
+                                                        res_a = (
+                                                            await self._place_order_with_circuit_breaker(
+                                                                order_a
+                                                            )
                                                         )
-                                                    )
+                                                    finally:
+                                                        async with self._pending_orders_lock:
+                                                            self._pending_orders.discard(symbol_a)
                                                     if res_a.ok:
                                                         fill_a = res_a.fill_price or price_a
                                                         await self.db.record_trade(
@@ -3438,8 +3706,13 @@ class AsyncRunner:
                                                             fill_a,
                                                             0,
                                                         )
+                                                        # R2-OP1: single atomic update — internally
+                                                        # calls portfolio.update_fill. Persist to DB
+                                                        # only if atomic succeeds, mirroring the
+                                                        # main SELL_SHORT flow.
+                                                        atomic_ok = False
                                                         try:
-                                                            await self._update_position_atomic(
+                                                            atomic_ok = await self._update_position_atomic(
                                                                 symbol_a,
                                                                 qty_a,
                                                                 float(fill_a),
@@ -3449,38 +3722,42 @@ class AsyncRunner:
                                                             logger.error(
                                                                 f"Pairs SHORT _update_position_atomic failed for {symbol_a}: {e}"
                                                             )
-                                                        try:
-                                                            await self.portfolio.update_fill(
-                                                                symbol_a,
-                                                                "SELL_SHORT",
-                                                                qty_a,
-                                                                float(fill_a),
-                                                            )
-                                                        except Exception as e:
-                                                            logger.error(
-                                                                f"Pairs SHORT portfolio.update_fill failed for {symbol_a}: {e}"
-                                                            )
-                                                        if (
-                                                            self.stop_loss_monitor
-                                                            and self.enable_stop_loss
-                                                        ):
+                                                        if atomic_ok:
                                                             try:
-                                                                short_pos = Position(
-                                                                    symbol=symbol_a,
-                                                                    quantity=-qty_a,
-                                                                    avg_price=fill_a,
-                                                                    entry_time=datetime.now(),
-                                                                )
-                                                                await self.stop_loss_monitor.add_stop_loss(
-                                                                    symbol=symbol_a,
-                                                                    position=short_pos,
-                                                                    stop_percent=self.stop_loss_percent,
-                                                                    stop_type=StopType.FIXED,
+                                                                pos_a = self.positions[symbol_a]
+                                                                await self.db.update_position(
+                                                                    symbol_a,
+                                                                    pos_a.quantity,
+                                                                    pos_a.avg_price,
+                                                                    float(fill_a),
                                                                 )
                                                             except Exception as e:
                                                                 logger.error(
-                                                                    f"Failed to add stop-loss for pairs SHORT {symbol_a}: {e}"
+                                                                    f"Pairs SHORT db.update_position failed for {symbol_a}: {e}"
                                                                 )
+                                                            # R2-M4 ordering: stop-loss only AFTER
+                                                            # atomic update succeeds.
+                                                            if (
+                                                                self.stop_loss_monitor
+                                                                and self.enable_stop_loss
+                                                            ):
+                                                                try:
+                                                                    short_pos = Position(
+                                                                        symbol=symbol_a,
+                                                                        quantity=-qty_a,
+                                                                        avg_price=fill_a,
+                                                                        entry_time=datetime.now(),
+                                                                    )
+                                                                    await self.stop_loss_monitor.add_stop_loss(
+                                                                        symbol=symbol_a,
+                                                                        position=short_pos,
+                                                                        stop_percent=self.stop_loss_percent,
+                                                                        stop_type=StopType.FIXED,
+                                                                    )
+                                                                except Exception as e:
+                                                                    logger.error(
+                                                                        f"Failed to add stop-loss for pairs SHORT {symbol_a}: {e}"
+                                                                    )
                                                         self.daily_executed_notional += float(
                                                             fill_a
                                                         ) * float(qty_a)
@@ -3586,6 +3863,14 @@ class AsyncRunner:
                 self.risk_monitor_task.cancel()
                 try:
                     await self.risk_monitor_task
+                except asyncio.CancelledError:
+                    pass
+
+            # DB-R2-L2: cancel periodic cleanup task if running
+            if self.cleanup_task and not self.cleanup_task.done():
+                self.cleanup_task.cancel()
+                try:
+                    await self.cleanup_task
                 except asyncio.CancelledError:
                     pass
 

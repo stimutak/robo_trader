@@ -102,26 +102,16 @@ class Portfolio:
                 new_avg = (existing_cost + new_cost) / Decimal(str(total_short))
                 self.positions[symbol] = PositionSnapshot(symbol, -total_short, new_avg)
             else:
-                # Have a long position; SELL_SHORT in this state is ambiguous —
-                # treat as a regular SELL up to the long quantity.
-                from .logger import get_logger
-
-                logger = get_logger(__name__)
-                logger.warning(
-                    f"SELL_SHORT received for {symbol} while holding long; treating as SELL"
-                )
-                actual_quantity = min(quantity, pos.quantity)
-                sell_notional = PrecisePricing.calculate_notional(actual_quantity, price_d)
-                realized = PrecisePricing.calculate_pnl(pos.avg_price, price_d, actual_quantity)
-                # Undo the speculative cash += we did above; replace with SELL semantics
+                # Have a positive (long) position; SELL_SHORT here is a state
+                # error. Refuse rather than silently coerce — coercion caused
+                # runner/portfolio desync (R2-M3). Caller must close the long
+                # first via SELL, then SELL_SHORT separately.
+                # Undo the speculative cash += from above before raising.
                 self.cash -= proceeds
-                self.cash += sell_notional
-                self.realized_pnl += realized
-                remaining = pos.quantity - actual_quantity
-                if remaining > 0:
-                    self.positions[symbol] = PositionSnapshot(symbol, remaining, pos.avg_price)
-                else:
-                    self.positions.pop(symbol, None)
+                raise ValueError(
+                    f"Refusing SELL_SHORT for {symbol}: existing long position "
+                    f"quantity={pos.quantity}; close long first"
+                )
         else:  # BUY_TO_COVER
             # Closing (or partially closing) a short position.
             if pos is None or pos.quantity >= 0:

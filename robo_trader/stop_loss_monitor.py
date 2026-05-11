@@ -18,10 +18,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import Enum
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from robo_trader.database_validator import DatabaseValidator, ValidationError
-from robo_trader.execution import Order
+from robo_trader.execution import ExecutionResult, Order
 from robo_trader.logger import get_logger
 from robo_trader.risk_manager import Position
 
@@ -118,6 +118,9 @@ class StopLossMonitor:
         risk_manager,
         emergency_shutdown_callback=None,
         portfolio_id: str = "default",
+        position_closed_callback: Optional[
+            Callable[["StopLossOrder", "ExecutionResult"], Awaitable[None]]
+        ] = None,
     ):
         """
         Initialize stop-loss monitor.
@@ -127,11 +130,18 @@ class StopLossMonitor:
             risk_manager: Risk manager for validation and limits
             emergency_shutdown_callback: Callback for emergency shutdown
             portfolio_id: Portfolio this monitor is scoped to
+            position_closed_callback: Optional async callback invoked AFTER a
+                stop-loss execution succeeds. Receives (stop_order, result).
+                Used by AsyncRunner to sync `runner.positions`,
+                `portfolio.update_fill`, and DB persistence so that a phantom
+                position does not block subsequent BUY/SELL signals.
+                (TCN-H4 followup audit fix.)
         """
         self.executor = executor
         self.risk_manager = risk_manager
         self.emergency_shutdown = emergency_shutdown_callback
         self.portfolio_id = portfolio_id
+        self.position_closed_callback = position_closed_callback
 
         # Active stop-loss orders by portfolio:symbol key (supports multi-portfolio)
         self.active_stops: Dict[str, StopLossOrder] = {}
@@ -392,15 +402,31 @@ class StopLossMonitor:
             f"{abs(stop.position_qty)} shares"
         )
 
-        # Create market order for immediate execution
+        # TCN-H5 (followup audit): pass stop.trigger_price as the order price
+        # rather than None. The paper executor's market-order path requires a
+        # cached reference price in _execution_cache; if the runner just restarted
+        # or the symbol has been "held" for >60s, the cache is empty/stale and
+        # the order fails with "No reference price for market order", causing the
+        # stop to never fire. trigger_price is the price that crossed the stop
+        # threshold this cycle, so it's the correct execution reference.
+        # IBKR live executor still treats this as the limit price guard around
+        # an immediate fill; paper executor uses it directly.
         order = Order(
             symbol=stop.symbol,
             quantity=abs(stop.position_qty),
             side="SELL" if stop.position_qty > 0 else "BUY",
-            price=None,  # Market order for immediate execution
+            price=stop.trigger_price if stop.trigger_price is not None else stop.stop_price,
         )
 
-        # Attempt execution with retries
+        # Attempt execution with retries.
+        #
+        # R2-L3 (intentional): stop-loss execution does NOT route through
+        # AsyncRunner._trading_blocked(). That's the gate for opening new
+        # positions; stop-losses are loss-mitigation exits on positions we
+        # already hold, and must execute even when normal trading is disabled
+        # (e.g. extended-hours window closed, AI suppressors active, daily
+        # notional cap hit). Refusing to close a losing position because new
+        # entries are blocked would be the worst possible behavior.
         for attempt in range(self.max_execution_retries):
             try:
                 result = await self.executor.place_order_async(order)
@@ -437,6 +463,22 @@ class StopLossMonitor:
                         f"filled at ${result.fill_price:.2f}, "
                         f"prevented loss: ${prevented_loss:.2f}"
                     )
+
+                    # TCN-H4 (followup audit): notify the runner so it can
+                    # update self.positions, portfolio.update_fill, and persist
+                    # to DB. Without this hook a phantom position would remain
+                    # in the runtime, blocking subsequent BUY/SELL signals.
+                    # Failures in the callback MUST NOT crash the monitor loop:
+                    # the stop-loss already filled with the broker.
+                    if self.position_closed_callback is not None:
+                        try:
+                            await self.position_closed_callback(stop, result)
+                        except Exception as cb_err:  # pragma: no cover - defensive
+                            logger.error(
+                                f"position_closed_callback failed for {stop.symbol}: "
+                                f"{cb_err} — runtime state may diverge from broker. "
+                                f"Reconcile via load_existing_positions() on restart."
+                            )
 
                     return True
 
@@ -565,9 +607,14 @@ class StopLossMonitor:
         Returns:
             Number of stops cancelled
         """
+        # TCN-H1 (followup audit): self.active_stops is keyed by _stop_key(symbol),
+        # which is "<portfolio_id>:<symbol>". The previous implementation iterated
+        # the keys and passed them as `symbol` to cancel_stop(), which then prefixed
+        # them AGAIN ("default:default:AAPL") and lookups failed silently. Use the
+        # actual `stop.symbol` attribute to recover the bare symbol.
         count = 0
-        for symbol in list(self.active_stops.keys()):
-            if self.cancel_stop(symbol):
+        for stop in list(self.active_stops.values()):
+            if self.cancel_stop(stop.symbol):
                 count += 1
 
         logger.info(f"Cancelled {count} stop-loss orders")
