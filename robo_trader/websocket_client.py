@@ -5,6 +5,7 @@ This ensures runner_async can send updates to the already-running server.
 
 import asyncio
 import json
+import os
 import threading
 from datetime import datetime
 from queue import Empty, Full, Queue
@@ -32,7 +33,31 @@ class WebSocketClient:
     async def connect(self):
         """Connect to the WebSocket server."""
         try:
-            self.websocket = await websockets.connect(self.uri)
+            # WN-L2 (followup audit): when WS_AUTH_TOKEN is set on the server,
+            # this client also needs to present it. Prefer the Authorization
+            # header path (W-R2-L3) over query-string. The `websockets` library
+            # exposes this via `additional_headers` in modern versions and via
+            # `extra_headers` in older ones; try both for compatibility.
+            #
+            # X-WS-Role: producer identifies this connection as the runner so
+            # the server rebroadcasts our market/position/trade payloads to
+            # consumer clients (browser). Without this header, the post-W-H3
+            # server silently ignores every inbound message and the dashboard
+            # never receives realtime updates. See websocket_server.py:
+            # handle_client / producer_clients for the corresponding gate.
+            token = (os.getenv("WS_AUTH_TOKEN") or "").strip()
+            headers = {"X-WS-Role": "producer", "Origin": "http://127.0.0.1:5555"}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            try:
+                self.websocket = await websockets.connect(
+                    self.uri, additional_headers=headers
+                )
+            except TypeError:
+                # Older websockets API used extra_headers.
+                self.websocket = await websockets.connect(
+                    self.uri, extra_headers=headers
+                )
             self.connected = True
             logger.info(f"Connected to WebSocket server at {self.uri}")
 

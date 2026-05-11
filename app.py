@@ -327,6 +327,98 @@ def requires_auth(f):
     return decorated
 
 
+# C-10: per-IP token-bucket rate limiter for expensive endpoints.
+# Stdlib-only — no Flask-Limiter dep, per the no-new-deps policy.
+class _RateLimiter:
+    """Sliding-window per-IP request counter.
+
+    Tracks timestamps of recent requests per IP. On each call, stale entries
+    (older than the window) are pruned and the remaining count is compared to
+    the configured limit.
+    """
+
+    def __init__(self, per_minute: int) -> None:
+        self.per_minute = max(1, int(per_minute))
+        self._hits: Dict[str, list] = {}
+        self._lock = threading.Lock()
+
+    def check(self, ip: str) -> tuple:
+        """Return (allowed, retry_after_seconds).
+
+        ``retry_after_seconds`` is 0 when allowed.
+        """
+        now = time.time()
+        window = 60.0
+        with self._lock:
+            timestamps = self._hits.get(ip, [])
+            # Prune timestamps older than the window.
+            cutoff = now - window
+            timestamps = [t for t in timestamps if t > cutoff]
+            if len(timestamps) >= self.per_minute:
+                oldest = timestamps[0]
+                retry_after = max(1, int(window - (now - oldest)) + 1)
+                # Persist pruned list so we don't keep stale entries forever.
+                self._hits[ip] = timestamps
+                return False, retry_after
+            timestamps.append(now)
+            self._hits[ip] = timestamps
+            return True, 0
+
+
+try:
+    _API_LOGS_RATE_LIMIT = max(1, int(os.getenv("API_LOGS_RATE_LIMIT_PER_MINUTE", "60")))
+except ValueError:
+    _API_LOGS_RATE_LIMIT = 60
+
+# Per-endpoint limiter registry; keyed by limit so two routes sharing the
+# same limit share a bucket only if explicitly given the same limiter.
+_api_logs_rate_limiter = _RateLimiter(per_minute=_API_LOGS_RATE_LIMIT)
+
+
+def rate_limit(limiter: "_RateLimiter"):
+    """Decorator that enforces a per-IP request rate limit.
+
+    Usage::
+
+        @rate_limit(_api_logs_rate_limiter)
+        def expensive_endpoint(): ...
+
+    On rejection: HTTP 429 with a ``Retry-After`` header (seconds).
+    """
+
+    def decorator(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            ip = _client_ip()
+            allowed, retry_after = limiter.check(ip)
+            if not allowed:
+                resp = jsonify({"error": "rate_limited"})
+                resp.status_code = 429
+                resp.headers["Retry-After"] = str(retry_after)
+                return resp
+            return f(*args, **kwargs)
+
+        return decorated
+
+    return decorator
+
+
+def _safe_error_response(endpoint: str, status: int = 500, extra: dict = None):
+    """C-9 / D-11: log the exception server-side, return a generic body.
+
+    Callers should be inside an ``except`` block so ``logger.exception``
+    captures the traceback. ``extra`` lets callers preserve auxiliary keys
+    (e.g. empty ``summary``/``statistics``) that the dashboard JS depends on,
+    without leaking exception detail.
+    """
+    logger.exception("%s failed", endpoint)
+    payload = {"error": "internal_error"}
+    if extra:
+        for key, value in extra.items():
+            payload.setdefault(key, value)
+    return jsonify(payload), status
+
+
 # W-H2: CSRF (double-submit cookie) and Origin check for state-changing requests.
 # W-R2-M2: do NOT trust request.host (attacker-controlled Host header). Build the
 # allowlist from configured DASH_HOST/DASH_PORT/CORS_ORIGINS only.
@@ -3645,8 +3737,18 @@ HTML_TEMPLATE = """
             if (ws && ws.readyState === WebSocket.OPEN) {
                 return; // Already connected
             }
-            
-            ws = new WebSocket('ws://localhost:8765');
+
+            // WN-L2 regression fix: pass WS_AUTH_TOKEN via query string.
+            // Browser WebSocket API cannot set custom headers on the upgrade
+            // request, so the server-side fallback (W-R2-L3) accepts ?token=.
+            // The token is injected by the index() view from the env var; it
+            // is visible only to authenticated dashboard users.
+            var wsAuthToken = {{ ws_auth_token | tojson }};
+            var wsUrl = 'ws://' + window.location.hostname + ':8765';
+            if (wsAuthToken) {
+                wsUrl += '?token=' + encodeURIComponent(wsAuthToken);
+            }
+            ws = new WebSocket(wsUrl);
             
             ws.onopen = function() {
                 console.log('WebSocket connected');
@@ -4130,8 +4232,18 @@ HTML_TEMPLATE = """
 @app.route("/")
 @requires_auth
 def index():
-    """Main dashboard page"""
-    return render_template_string(HTML_TEMPLATE)
+    """Main dashboard page.
+
+    WN-L2 (followup audit) regression fix: inject WS_AUTH_TOKEN into the
+    rendered HTML so the browser's WebSocket connection can authenticate.
+    Browser WebSocket API can't set custom headers on the upgrade request,
+    so we pass the token as a query-string. The dashboard is auth-gated
+    (@requires_auth above), so only authenticated users see the token.
+    """
+    return render_template_string(
+        HTML_TEMPLATE,
+        ws_auth_token=os.getenv("WS_AUTH_TOKEN", "").strip(),
+    )
 
 
 @app.route("/favicon.ico")
@@ -4229,10 +4341,16 @@ def database_health():
                 "timestamp": datetime.now().isoformat(),
             }
         )
-    except Exception as e:
+    except Exception:
+        # C-9: don't leak exception detail to clients; log full traceback.
+        logger.exception("database_health failed")
         return (
             jsonify(
-                {"status": "unhealthy", "error": str(e), "timestamp": datetime.now().isoformat()}
+                {
+                    "status": "unhealthy",
+                    "error": "internal_error",
+                    "timestamp": datetime.now().isoformat(),
+                }
             ),
             500,
         )
@@ -4252,11 +4370,13 @@ def health_liveness():
             ),
             200,
         )
-    except Exception as e:
-        logger.error(f"Liveness check failed: {e}")
+    except Exception:
+        # D-11: liveness endpoint is unauthenticated; never leak exception
+        # detail. Return HTTP 503 with a generic body. Log server-side.
+        logger.exception("health_liveness failed")
         return (
-            jsonify({"status": "dead", "error": str(e), "timestamp": datetime.now().isoformat()}),
-            500,
+            jsonify({"status": "fail"}),
+            503,
         )
 
 
@@ -5862,12 +5982,10 @@ def performance():
                 },
             }
         )
-    except Exception as e:
-        logger.error(f"Error calculating performance: {e}")
-        import traceback
-
-        traceback.print_exc()
-        return jsonify({"error": str(e), "summary": {}})
+    except Exception:
+        # C-9: don't leak exception detail to clients; log full traceback.
+        logger.exception("performance endpoint failed")
+        return jsonify({"error": "internal_error", "summary": {}}), 500
 
 
 @app.route("/api/equity-curve")
@@ -6317,13 +6435,13 @@ def strategies_status():
             setattr(app, strat_cache_time_key, time.time())
 
         return jsonify(strategies_data)
-    except Exception as e:
-        logger.error(f"Error getting strategy status: {e}")
-        # Return minimal real data on error
+    except Exception:
+        # C-9: don't leak exception detail to clients; log full traceback.
+        logger.exception("strategy_status failed")
         return jsonify(
             {
                 "active_strategies": {
-                    "ml_enhanced": {"enabled": True, "error": str(e)},
+                    "ml_enhanced": {"enabled": True, "error": "internal_error"},
                     "microstructure": {"enabled": False},
                     "portfolio_manager": {
                         "enabled": True,
@@ -6333,9 +6451,9 @@ def strategies_status():
                     "smart_execution": {"enabled": True},
                 },
                 "performance_by_strategy": {},
-                "error": str(e),
+                "error": "internal_error",
             }
-        )
+        ), 500
 
 
 @app.route("/api/microstructure/metrics")
@@ -6653,18 +6771,19 @@ def get_risk_status():
                 },
             }
         )
-    except Exception as e:
-        logger.error(f"Error getting risk status: {e}")
+    except Exception:
+        # C-9: don't leak exception detail to clients; log full traceback.
+        logger.exception("risk_status failed")
         return jsonify(
             {
                 "enabled": True,
-                "error": str(e),
+                "error": "internal_error",
                 "kelly_sizing": {"enabled": True, "current_positions": {}, "portfolio_kelly": 0},
                 "kill_switches": {"active": False, "limits": {}},
                 "correlation_limits": {},
                 "risk_metrics": {},
             }
-        )
+        ), 500
 
 
 @app.route("/api/risk/kelly/<symbol>")
@@ -6766,12 +6885,13 @@ def get_kelly_parameters(symbol):
                 ),  # Higher confidence with more trades
             }
         )
-    except Exception as e:
-        logger.error(f"Error calculating Kelly for {symbol}: {e}")
+    except Exception:
+        # C-9: don't leak exception detail to clients; log full traceback.
+        logger.exception("get_kelly_parameters failed for %s", symbol)
         return jsonify(
             {
                 "symbol": symbol,
-                "error": str(e),
+                "error": "internal_error",
                 "kelly_fraction": 0.01,
                 "half_kelly": 0.005,
                 "quarter_kelly": 0.0025,
@@ -6935,8 +7055,10 @@ def get_order_manager_status():
                     "active_orders": [],
                 }
             )
-    except Exception as e:
-        return jsonify({"error": str(e), "statistics": {}, "active_orders": []})
+    except Exception:
+        # C-9: don't leak exception detail to clients; log full traceback.
+        logger.exception("orders endpoint failed")
+        return jsonify({"error": "internal_error", "statistics": {}, "active_orders": []}), 500
 
 
 @app.route("/api/safety/data-validator")
@@ -6962,8 +7084,10 @@ def get_data_validator_status():
                     "pass_rate": 100.0,
                 }
             )
-    except Exception as e:
-        return jsonify({"error": str(e)})
+    except Exception:
+        # C-9: don't leak exception detail to clients; log full traceback.
+        logger.exception("data_validator_status failed")
+        return jsonify({"error": "internal_error"}), 500
 
 
 @app.route("/api/safety/thresholds")
@@ -7113,8 +7237,13 @@ def stop_trading():
 
 @app.route("/api/logs")
 @requires_auth
+@rate_limit(_api_logs_rate_limiter)
 def get_logs():
-    """Get recent logs from log file (newest first)"""
+    """Get recent logs from log file (newest first).
+
+    C-10: per-IP rate limited (API_LOGS_RATE_LIMIT_PER_MINUTE, default 60)
+    because this endpoint reads up to 5,000 lines from disk on every call.
+    """
     logs = []
     log_file = "robo_trader.log"
 
@@ -7181,8 +7310,10 @@ def get_logs():
 
     except FileNotFoundError:
         logs.append("Log file not found")
-    except Exception as e:
-        logs.append(f"Error reading logs: {str(e)}")
+    except Exception:
+        # C-9: don't leak exception detail to clients; log server-side.
+        logger.exception("get_logs failed")
+        logs.append("Error reading logs")
 
     # Return logs in reverse order (newest first), max 100
     return jsonify({"logs": list(reversed(logs[-100:]))})

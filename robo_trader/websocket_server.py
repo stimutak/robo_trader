@@ -20,6 +20,59 @@ from robo_trader.logger import get_logger
 logger = get_logger(__name__)
 
 
+# -----------------------------------------------------------------------------
+# WebSocket library API-version shim.
+#
+# The `websockets` library changed its public API between v14 and v15+:
+#   - v14 and earlier: `websocket.request_headers` and `path` argument on the
+#                      handler `async def handle(websocket, path)`.
+#   - v15 and newer:   `websocket.request.headers`, `websocket.request.path`,
+#                      and the handler signature is now `async def handle(websocket)`.
+#
+# Every previous attempt to upgrade the library silently broke our WS auth
+# because the AttributeError was swallowed by a broad `except Exception`, so
+# every token was treated as missing and the dashboard reconnected forever.
+# This shim reads headers and path from whichever attribute is present so the
+# server code stays version-agnostic.
+#
+# If `websockets` ever changes the attribute name AGAIN, add the new path
+# here — this is the only place that should know about the library's internal
+# API surface.
+# -----------------------------------------------------------------------------
+
+
+def _ws_request_headers(websocket) -> Dict[str, str]:
+    """Return the request headers dict for a server-side websocket, across
+    websockets-library versions. Returns {} if no headers can be read (which
+    is itself a bug worth surfacing — DO NOT silently treat as empty
+    elsewhere).
+    """
+    req = getattr(websocket, "request", None)
+    if req is not None:
+        headers = getattr(req, "headers", None)
+        if headers is not None:
+            return headers
+    legacy = getattr(websocket, "request_headers", None)
+    if legacy is not None:
+        return legacy
+    logger.error(
+        "websocket library API surface unknown: neither websocket.request.headers "
+        "nor websocket.request_headers is present. Update _ws_request_headers in "
+        "websocket_server.py for the new library version."
+    )
+    return {}
+
+
+def _ws_request_path(websocket, fallback: str = "/") -> str:
+    """Return the request path across websockets-library versions."""
+    req = getattr(websocket, "request", None)
+    if req is not None:
+        path = getattr(req, "path", None)
+        if path is not None:
+            return path
+    return getattr(websocket, "path", fallback)
+
+
 def _allowed_ws_origins(port: int) -> Set[Optional[str]]:
     """Whitelist of acceptable Origin header values for the WS handshake.
 
@@ -53,6 +106,12 @@ class WebSocketManager:
         self.host = host if host is not None else os.getenv("WS_HOST", "127.0.0.1")
         self.port = port
         self.clients: Set[WebSocketServerProtocol] = set()
+        # Producer connections (the runner) are tagged on handshake via the
+        # X-WS-Role: producer header. Inbound messages from producers are
+        # rebroadcast to consumer clients; inbound from non-producers is
+        # ignored. This restores the runner→browser data flow that the W-H3
+        # blanket-ignore fix had silently broken.
+        self.producer_clients: Set[WebSocketServerProtocol] = set()
         self.message_queue: Queue[Dict[str, Any]] = Queue()
         self.server = None
         self.loop = None
@@ -95,15 +154,20 @@ class WebSocketManager:
                     str(websocket.remote_address) if hasattr(websocket, "remote_address") else None
                 ),
             )
+        # Also clean up the producer set so a disconnected producer doesn't
+        # stay tagged through GC delays.
+        self.producer_clients.discard(websocket)
 
     def _authorize_handshake(self, websocket: WebSocketServerProtocol, path: str) -> bool:
-        """Validate Origin and (optionally) auth token at handshake (W-H3, W-M1)."""
+        """Validate Origin and (optionally) auth token at handshake (W-H3, W-M1).
+
+        NOTE: header access goes through `_ws_request_headers` which handles
+        both v14 (`websocket.request_headers`) and v15+ (`websocket.request.headers`)
+        of the `websockets` library. See module-level shim.
+        """
+        headers = _ws_request_headers(websocket)
         # Origin whitelist
-        origin = None
-        try:
-            origin = websocket.request_headers.get("Origin")
-        except Exception:
-            origin = None
+        origin = headers.get("Origin") if headers else None
         if origin not in _allowed_ws_origins(self.port):
             logger.warning(f"WS rejected: bad Origin {origin!r}")
             return False
@@ -116,11 +180,7 @@ class WebSocketManager:
         # query-string path in a future release.
         if self.auth_token:
             token = ""
-            auth_header = ""
-            try:
-                auth_header = websocket.request_headers.get("Authorization", "") or ""
-            except Exception:
-                auth_header = ""
+            auth_header = (headers.get("Authorization", "") or "") if headers else ""
             if auth_header.startswith("Bearer "):
                 token = auth_header[len("Bearer "):].strip()
             if not token:
@@ -167,13 +227,18 @@ class WebSocketManager:
                 return False
         return True
 
-    async def handle_client(self, websocket: WebSocketServerProtocol, path: str = "/"):
+    async def handle_client(self, websocket: WebSocketServerProtocol, path: Optional[str] = None):
         """Handle a client connection.
 
         Args:
             websocket: The WebSocket connection
-            path: The request path (required by websockets library)
+            path: (deprecated, kept for v14- compatibility) The request path.
+                  In v15+ the path is read from websocket.request.path via the
+                  _ws_request_path() shim, so this argument is optional. When
+                  it's None we fetch it from the websocket itself.
         """
+        if path is None:
+            path = _ws_request_path(websocket, fallback="/")
         # W-H3 / W-M1: enforce origin and (optional) token before accepting.
         if not self._authorize_handshake(websocket, path):
             try:
@@ -182,11 +247,25 @@ class WebSocketManager:
                 pass
             return
 
+        # Detect producer role. The runner-side WebSocketClient sets
+        # X-WS-Role: producer on the handshake; the browser does not.
+        # Only producer connections may push payloads that get rebroadcast
+        # to consumers. This restores the runner→browser data flow that
+        # W-H3 had silently disabled by blanket-ignoring inbound messages.
+        headers = _ws_request_headers(websocket)
+        role = (headers.get("X-WS-Role", "") or "").strip().lower() if headers else ""
+        is_producer = role == "producer"
+        if is_producer:
+            self.producer_clients.add(websocket)
+            logger.info("WS producer connection registered")
+
         await self.register_client(websocket)
         try:
             # Keep connection alive and handle any incoming messages.
-            # W-H3: do NOT rebroadcast client-supplied payloads. Trusted producers
-            # call broadcast() / send_*_update() directly via the queue.
+            # W-H3 (revised): consumer payloads are ignored. Producer payloads
+            # (from the runner, identified at handshake) are rebroadcast to
+            # other clients. This preserves the audit's intent (don't trust
+            # arbitrary clients) while restoring the legitimate data path.
             async for message in websocket:
                 try:
                     data = json.loads(message)
@@ -194,6 +273,15 @@ class WebSocketManager:
                     if msg_type == "subscribe":
                         symbols = data.get("symbols", [])
                         logger.info(f"Client subscribed to symbols: {symbols}")
+                    elif is_producer:
+                        # Producer-pushed update: broadcast to other clients
+                        # but NEVER echo back to the producer itself.
+                        try:
+                            await self.broadcast(data, exclude={websocket})
+                        except Exception as bcast_err:
+                            logger.error(
+                                f"Failed to rebroadcast producer message: {bcast_err}"
+                            )
                     else:
                         # Log only; never echo to other clients.
                         logger.debug(f"Ignoring inbound WS message of type {msg_type}")
@@ -204,15 +292,25 @@ class WebSocketManager:
         finally:
             self.unregister_client(websocket)
 
-    async def broadcast(self, message: Dict[str, Any]):
-        """Broadcast a message to all connected clients."""
+    async def broadcast(self, message: Dict[str, Any], exclude: Optional[Set[Any]] = None):
+        """Broadcast a message to all connected clients.
+
+        Args:
+            message: payload to JSON-serialize and send.
+            exclude: optional set of WebSocket connections to skip — used when
+                rebroadcasting a producer's message to avoid echoing it back
+                to the producer itself.
+        """
         if not self.clients:
             return
+        exclude = exclude or set()
 
         message_str = json.dumps(message)
         disconnected = set()
 
         for client in self.clients.copy():
+            if client in exclude:
+                continue
             try:
                 await client.send(message_str)
             except websockets.exceptions.ConnectionClosed:

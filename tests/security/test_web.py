@@ -563,3 +563,249 @@ def test_hsts_emitted_when_forwarded_proto_https_b_7(monkeypatch):
     resp = client.get("/api/health", headers={"X-Forwarded-Proto": "https"})
     hsts = resp.headers.get("Strict-Transport-Security", "")
     assert "max-age" in hsts, hsts
+
+
+# ---------------------------------------------------------------------------
+# C-9: error message leakage — endpoints must return {"error": "internal_error"}
+# rather than str(exception).
+# ---------------------------------------------------------------------------
+
+
+def test_c9_data_validator_endpoint_does_not_leak_exception_detail(monkeypatch):
+    """C-9: /api/safety/data-validator must return a generic error body and
+    HTTP 500 when the underlying call raises, never str(e) with internals.
+    """
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    client = app_mod.app.test_client()
+
+    secret = "SECRET_DETAIL_DO_NOT_LEAK_a9f7b3c1"
+
+    class _Boom:
+        def get_statistics(self):
+            raise RuntimeError(secret)
+
+    # Force the route into the except branch via the hasattr() path it checks.
+    app_mod.app.data_validator = _Boom()
+    try:
+        resp = client.get("/api/safety/data-validator")
+    finally:
+        del app_mod.app.data_validator
+
+    assert resp.status_code == 500, resp.status_code
+    body = resp.get_json() or {}
+    assert body.get("error") == "internal_error", body
+    # Belt-and-suspenders: raw exception detail must not appear anywhere.
+    assert secret not in resp.get_data(as_text=True)
+
+
+def test_c9_database_health_does_not_leak_exception_detail(monkeypatch):
+    """C-9: /api/database/health returns generic body + 500 when DB raises."""
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    client = app_mod.app.test_client()
+
+    secret = "DB_BOOM_PRIVATE_PATH_/var/lib/secret.db"
+
+    # SyncDatabaseReader is imported inside the function; patch the symbol on
+    # the module it imports from so the patch takes effect on the next call.
+    class _BoomReader:
+        def __init__(self):
+            raise RuntimeError(secret)
+
+        def _fetch_one(self, *a, **kw):  # pragma: no cover - never reached
+            raise RuntimeError(secret)
+
+    with patch("sync_db_reader.SyncDatabaseReader", _BoomReader):
+        resp = client.get("/api/database/health")
+
+    assert resp.status_code == 500, resp.status_code
+    body = resp.get_json() or {}
+    assert body.get("error") == "internal_error", body
+    assert body.get("status") == "unhealthy", body
+    assert secret not in resp.get_data(as_text=True)
+
+
+def test_c9_keeps_validation_error_messages_for_400(monkeypatch):
+    """C-9 nuance: deterministic ValidationError responses (HTTP 400) must
+    still surface the user-facing message — those are not exception leaks.
+    The portfolio_id validator runs on @validate_portfolio routes.
+    """
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    client = app_mod.app.test_client()
+    # /api/performance is @validate_portfolio; passing an invalid id should
+    # 400 with the validator's message intact (not "internal_error").
+    resp = client.get("/api/performance?portfolio_id=../etc/passwd")
+    # The validator rejects path-traversal-y characters with a clear message.
+    assert resp.status_code == 400, resp.status_code
+    body = resp.get_json() or {}
+    # The key is "error"; the value should be a validation-style message, NOT
+    # "internal_error".
+    assert body.get("error") != "internal_error", body
+
+
+# ---------------------------------------------------------------------------
+# D-11: liveness endpoint must return 503 (not 500) and no exception detail.
+# ---------------------------------------------------------------------------
+
+
+def test_d11_liveness_returns_503_with_generic_body_on_failure(monkeypatch):
+    """D-11: /health/live is unauthenticated. On internal failure it must
+    return HTTP 503 with ``{"status": "fail"}`` and zero exception detail.
+    """
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    client = app_mod.app.test_client()
+
+    secret = "LIVENESS_INTERNAL_BACKTRACE_x83qz"
+
+    # The liveness endpoint's body is a jsonify(...) of a dict literal that
+    # calls datetime.now().isoformat(); force that call to raise so the
+    # except branch executes.
+    with patch("app.datetime") as mock_dt:
+        mock_dt.now.side_effect = RuntimeError(secret)
+        resp = client.get("/health/live")
+
+    assert resp.status_code == 503, resp.status_code
+    body = resp.get_json() or {}
+    assert body == {"status": "fail"}, body
+    assert secret not in resp.get_data(as_text=True)
+
+
+# ---------------------------------------------------------------------------
+# C-10: per-IP rate limit on expensive endpoints (/api/logs).
+# ---------------------------------------------------------------------------
+
+
+def test_c10_api_logs_rate_limit_returns_429_after_threshold(monkeypatch, tmp_path):
+    """C-10: /api/logs is rate-limited per-IP via the
+    API_LOGS_RATE_LIMIT_PER_MINUTE env var. After N requests within a minute,
+    further requests get HTTP 429 + Retry-After header.
+    """
+    app_mod = _reload_app(
+        monkeypatch,
+        DASH_AUTH_ENABLED="false",
+        API_LOGS_RATE_LIMIT_PER_MINUTE="3",
+    )
+    client = app_mod.app.test_client()
+
+    # Pre-existing log file ensures the route runs to completion.
+    log_path = tmp_path / "robo_trader.log"
+    log_path.write_text("hello\n")
+    monkeypatch.chdir(tmp_path)
+
+    # First 3 should succeed.
+    for i in range(3):
+        resp = client.get("/api/logs")
+        assert resp.status_code == 200, (i, resp.status_code)
+
+    # 4th request must be rate-limited.
+    resp = client.get("/api/logs")
+    assert resp.status_code == 429, resp.status_code
+    assert "Retry-After" in resp.headers
+    # Retry-After should be a positive integer-as-string.
+    assert int(resp.headers["Retry-After"]) > 0
+
+
+def test_c10_rate_limit_is_per_ip(monkeypatch, tmp_path):
+    """C-10: rate-limit bucket is keyed on client IP. Different IPs should
+    have independent quotas. Flask's test client lets us spoof
+    REMOTE_ADDR via environ_overrides.
+    """
+    app_mod = _reload_app(
+        monkeypatch,
+        DASH_AUTH_ENABLED="false",
+        API_LOGS_RATE_LIMIT_PER_MINUTE="2",
+    )
+    client = app_mod.app.test_client()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "robo_trader.log").write_text("x\n")
+
+    ip_a = {"REMOTE_ADDR": "10.0.0.1"}
+    ip_b = {"REMOTE_ADDR": "10.0.0.2"}
+
+    # IP A: exhaust quota.
+    for _ in range(2):
+        assert client.get("/api/logs", environ_overrides=ip_a).status_code == 200
+    assert client.get("/api/logs", environ_overrides=ip_a).status_code == 429
+
+    # IP B: still has full quota.
+    assert client.get("/api/logs", environ_overrides=ip_b).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# WS-LIB-API — websockets library API version drift (recurring blocker)
+# ---------------------------------------------------------------------------
+
+
+def test_ws_request_headers_shim_handles_v15_api():
+    """The `websockets` library v15+ moved headers from
+    `websocket.request_headers` to `websocket.request.headers`. Our shim must
+    return the headers regardless of which attribute layout the library uses.
+
+    This bug has caused a months-long reconnect loop EVERY time the library
+    was upgraded; this test pins the shim so the next upgrade doesn't repeat.
+    """
+    from robo_trader.websocket_server import _ws_request_headers, _ws_request_path
+
+    # v15+ shape: websocket.request.headers / .path
+    class _V15Request:
+        headers = {"Authorization": "Bearer abc", "Origin": "http://127.0.0.1:5555"}
+        path = "/socket"
+
+    class _V15Ws:
+        request = _V15Request()
+
+    headers = _ws_request_headers(_V15Ws())
+    assert headers.get("Authorization") == "Bearer abc"
+    assert headers.get("Origin") == "http://127.0.0.1:5555"
+    assert _ws_request_path(_V15Ws()) == "/socket"
+
+    # v14- shape: websocket.request_headers / websocket.path
+    class _V14Ws:
+        request_headers = {"Authorization": "Bearer xyz"}
+        path = "/legacy"
+
+    headers = _ws_request_headers(_V14Ws())
+    assert headers.get("Authorization") == "Bearer xyz"
+    assert _ws_request_path(_V14Ws()) == "/legacy"
+
+    # Unknown shape: shim must return {} (not raise) so the server can reject
+    # cleanly rather than crash. The shim logs ERROR so the operator notices.
+    class _UnknownWs:
+        pass
+
+    headers = _ws_request_headers(_UnknownWs())
+    assert headers == {}
+
+
+def test_ws_auth_end_to_end_against_real_library():
+    """Smoke: stand up the real WebSocketManager and connect with a Bearer
+    token. This would have caught the v15 regression at PR time.
+    """
+    import asyncio
+    import websockets
+    from robo_trader.websocket_server import WebSocketManager
+
+    async def go():
+        mgr = WebSocketManager(host="127.0.0.1", port=18766)
+        mgr.auth_token = "test-token-32-chars-aaaaaaaaaaaaa"
+        server = await websockets.serve(mgr.handle_client, "127.0.0.1", 18766)
+        try:
+            headers = {
+                "Authorization": f"Bearer {mgr.auth_token}",
+                "Origin": "http://127.0.0.1:5555",
+            }
+            try:
+                ws = await websockets.connect(
+                    "ws://127.0.0.1:18766", additional_headers=headers
+                )
+            except TypeError:
+                ws = await websockets.connect(
+                    "ws://127.0.0.1:18766", extra_headers=headers
+                )
+            await ws.send('{"type":"subscribe","symbols":["AAPL"]}')
+            await asyncio.sleep(0.2)
+            await ws.close()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(go())

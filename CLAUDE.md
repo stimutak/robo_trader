@@ -170,6 +170,27 @@ python3 test_safety_features.py  # Test safety features
 
 ---
 
+## 🚨 NEVER REGRESS: WebSocket library API surface
+
+**Symptom:** "Real-time connection established / lost - reconnecting..." infinite loop in the dashboard, with `WS rejected: missing/invalid token` warnings in `robo_trader.log`. The dashboard never receives realtime updates. **This has blocked the project for months at a time** every time the `websockets` package is upgraded.
+
+**Root cause:** The `websockets` library changed its attribute layout between v14 and v15+:
+
+| version | headers attribute | path attribute | handler signature |
+|---------|---|---|---|
+| ≤ v14 | `websocket.request_headers` | `websocket.path` | `async def h(ws, path)` |
+| ≥ v15 | `websocket.request.headers` | `websocket.request.path` | `async def h(ws)` |
+
+Any code that hard-codes one of these forms will `AttributeError`, the broad `except Exception` swallows it, the auth check sees an empty header, every connection is rejected.
+
+**The fix that must never be undone:** `robo_trader/websocket_server.py` has two shim helpers (`_ws_request_headers`, `_ws_request_path`) that try BOTH attribute paths. All header / path access in that module MUST go through the shims.
+
+**Regression tests:** `tests/security/test_web.py::test_ws_request_headers_shim_handles_v15_api` and `::test_ws_auth_end_to_end_against_real_library`. **These tests MUST stay green.** If a websockets upgrade breaks them, fix the shim — do not delete the tests.
+
+**Don't trust `Connected to WebSocket server` in the runner log.** The `websockets` client logs that BEFORE the server's handshake completes. Look for `WS rejected` warnings on the server side, and for `client_count` increases on `WebSocket client connected` events.
+
+---
+
 ## Current Issues Status
 1. ✅ WebSocket stability - Fixed with client/server separation
 2. ✅ TWS API Connection Issues - RESOLVED with subprocess approach
