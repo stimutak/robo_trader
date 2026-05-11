@@ -823,3 +823,90 @@ def test_config_does_not_silently_flip_readonly_b_12(monkeypatch):
     assert cfg.ibkr.readonly is True, (
         "ENVIRONMENT=production without IBKR_LIVE_ALLOW_ORDERS must keep readonly=True"
     )
+
+
+# ---------------------------------------------------------------------------
+# Follow-up audit (2026-05-10): D-1 / D-2 / D-3 hygiene regressions
+# ---------------------------------------------------------------------------
+
+
+def test_worker_debug_log_path_is_unpredictable_d_3() -> None:
+    """D-3: subprocess_ibkr_client must NOT use the deterministic
+    /tmp/worker_debug.log path. That path is a symlink-attack vector on
+    shared hosts. The fix is to allocate a random tempfile path.
+    """
+    src = (
+        Path(__file__).resolve().parents[2]
+        / "robo_trader"
+        / "clients"
+        / "subprocess_ibkr_client.py"
+    ).read_text()
+
+    # Old, predictable path must be gone as a hardcoded literal.
+    assert '"/tmp/worker_debug.log"' not in src, (
+        "Deterministic /tmp/worker_debug.log path reintroduced — symlink-attack risk."
+    )
+    # Replacement must use tempfile-based randomization.
+    assert "tempfile.mkstemp" in src or "tempfile.NamedTemporaryFile" in src, (
+        "subprocess_ibkr_client must use tempfile.mkstemp/NamedTemporaryFile for the worker debug log."
+    )
+    # The randomized prefix is part of the contract.
+    assert 'prefix="worker_debug_"' in src, (
+        "tempfile must keep a worker_debug_ prefix so the file is identifiable for ops."
+    )
+
+
+def test_ibkr_connect_lock_uses_o_excl_handshake_d_3() -> None:
+    """D-3: the /tmp/ibkr_connect.lock path is deterministic by design (it
+    coordinates multiple processes), so symlink protection has to come from
+    the syscall flags: O_CREAT|O_EXCL|0o600 plus O_NOFOLLOW. Verify the open
+    call uses those flags instead of the old plain open() that would
+    happily follow a symlink.
+    """
+    src = (
+        Path(__file__).resolve().parents[2]
+        / "robo_trader"
+        / "connection_manager.py"
+    ).read_text()
+
+    # Old footgun-open must be gone.
+    assert 'open("/tmp/ibkr_connect.lock", "w")' not in src, (
+        "Plain open() on /tmp/ibkr_connect.lock reintroduced — symlink-attack risk."
+    )
+    # New hardened path: O_EXCL + 0o600 + O_NOFOLLOW.
+    assert "O_EXCL" in src, "Lockfile open must use O_EXCL to defeat symlink swap."
+    assert "0o600" in src, "Lockfile must be created with 0o600 perms."
+    assert "O_NOFOLLOW" in src, (
+        "Lockfile open must use O_NOFOLLOW so a planted symlink cannot redirect the open."
+    )
+    # FileExistsError handler must still be present so existing-lock case is graceful.
+    assert "FileExistsError" in src, (
+        "Hardened lockfile path must handle FileExistsError so cross-process locking still works."
+    )
+
+
+def test_md5_uses_used_for_security_false_d_1() -> None:
+    """D-1: md5() in runner_async is a deterministic, non-cryptographic
+    offset derived from a non-secret portfolio_id. It must be annotated
+    with usedforsecurity=False so bandit B324 and FIPS environments don't
+    treat it as a cryptographic primitive.
+    """
+    src = (
+        Path(__file__).resolve().parents[2]
+        / "robo_trader"
+        / "runner_async.py"
+    ).read_text()
+
+    # Find every md5(...) call site and ensure none of them are bare.
+    # We do a minimal scan: every line that calls hashlib.md5( must mention
+    # usedforsecurity= within a small window after it.
+    lines = src.splitlines()
+    md5_sites = [i for i, line in enumerate(lines) if "hashlib.md5(" in line]
+    assert md5_sites, "Expected at least one hashlib.md5() call in runner_async.py"
+    for idx in md5_sites:
+        window = "\n".join(lines[idx : idx + 6])
+        assert "usedforsecurity=False" in window, (
+            f"hashlib.md5() at line {idx + 1} of runner_async.py is missing "
+            "usedforsecurity=False (D-1)."
+        )
+

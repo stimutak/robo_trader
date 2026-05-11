@@ -1,4 +1,8 @@
 # Production requirements for RoboTrader
+# TODO(D-14): adopt pip-compile --generate-hashes for reproducible builds.
+# Today both requirements.txt and requirements-prod.txt are hand-maintained; CI
+# installs without --require-hashes, so a transitive registry compromise could
+# substitute a tampered wheel without detection.
 
 # Core dependencies (from requirements.txt)
 -r requirements.txt
@@ -8,7 +12,8 @@
 # Database
 psycopg2-binary==2.9.9
 asyncpg==0.29.0
-redis==5.0.1
+# C-4: synced across requirements files; bump both together.
+redis==5.0.4
 hiredis==2.2.3
 
 # Monitoring & Metrics
@@ -27,7 +32,13 @@ diskcache==5.6.3
 # CFGN-H3 (followup audit): cryptography 41.0.7 has post-release CVEs; floor at 44.0.1.
 cryptography>=44.0.1
 PyJWT==2.8.0
+# C-3 (followup audit): passlib 1.7.4 is unmaintained but still used by
+# robo_trader/security/auth.py (CryptContext + bcrypt). bcrypt 4.x removed
+# the `__about__` attribute that passlib 1.7.4 still touches, causing a
+# warning at import time. Pinning bcrypt<4 keeps the legacy passlib path
+# working until we migrate auth.py off passlib (see TODO in auth.py).
 passlib[bcrypt]==1.7.4
+bcrypt==3.2.2
 # CFGN-H2 (followup audit): python-jose 3.3.0 has CVE-2024-33664 (JWT alg confusion).
 # Removed: PyJWT (pinned above) covers JWT functionality. If a downstream module
 # imports `jose`, replace it with `jwt` from PyJWT before re-adding this dep.
@@ -63,7 +74,9 @@ sentry-sdk==1.39.1
 rollbar==0.16.3
 
 # Rate Limiting
-aioredis==2.0.1
+# C-2 (followup audit): aioredis 2.0.1 deprecated and unmaintained; not imported
+# anywhere in the codebase. Use redis.asyncio (from redis==5.0.4 pinned above)
+# if async Redis is ever needed.
 aioratelimiter==1.1.0
 
 # Production web server
@@ -74,7 +87,8 @@ gevent==23.9.1
 eventlet>=0.36.1
 
 # Configuration Management
-python-dotenv==1.0.0
+# C-4: synced across requirements files; bump both together.
+python-dotenv==1.0.1
 pydantic-settings==2.1.0
 
 # Testing in production (smoke tests)

@@ -22,6 +22,16 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    # C-7 (followup audit): cap resources to prevent a runaway service from
+    # starving the host. Mirrors the limits structure used by `robo-trader`.
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
 
   # Dashboard web application
   dashboard:
@@ -48,6 +58,15 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    # C-7 (followup audit): cap resources for the Flask dashboard.
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
 
   # Main trading runner
   robo-trader:
@@ -85,6 +104,10 @@ services:
 
   # Redis for caching and session management (optional)
   redis:
+    # TODO(C-8): pin to sha256 digest (e.g. redis:7-alpine@sha256:<digest>).
+    # Floating tags allow upstream to silently replace the image. Operator
+    # should run `docker pull redis:7-alpine && docker images --digests` and
+    # copy the digest here.
     image: redis:7-alpine
     container_name: robo_trader_redis
     ports:
@@ -99,6 +122,15 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    # C-7 (followup audit): cap redis resources too.
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
 
 networks:
   robo_trader_network:

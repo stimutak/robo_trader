@@ -15,7 +15,9 @@
 
 [tool.black]
 line-length = 100
-target-version = ['py39']
+# D-15 (followup audit): aligned with `requires-python = ">=3.10"` above and
+# the CI matrix (3.11 / 3.13). py39 was a stale drift target.
+target-version = ['py310', 'py311', 'py312']
 include = '\.pyi?$'
 extend-exclude = '''
 /(

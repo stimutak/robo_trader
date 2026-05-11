@@ -454,7 +454,7 @@ class ModelRegistry:
         # Select model based on traffic split
         import random
 
-        use_model_b = random.random() < test["traffic_split"]
+        use_model_b = random.random() < test["traffic_split"]  # nosec B311 - non-security A/B split
 
         if use_model_b:
             model_config = test["model_b"]

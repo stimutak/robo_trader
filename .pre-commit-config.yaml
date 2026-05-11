@@ -35,9 +35,21 @@ repos:
   #       args: ["--ignore-missing-imports", "--no-strict-optional"]
   #       exclude: ^(tests/|archived_|scripts/tests/)
 
+  # D-5 (followup audit): scan staged changes for committed secrets.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4  # TODO(C-5): consider pinning to commit SHA for full supply-chain integrity
+    hooks:
+      - id: gitleaks
+
   - repo: https://github.com/PyCQA/bandit
     rev: 1.7.7
     hooks:
       - id: bandit
-        args: ["-r", "-ll", "--skip", "B101,B104,B201"]
+        # D-4 (followup audit): B104 (hardcoded_bind_all_interfaces) removed
+        # from --skip. No source file binds to 0.0.0.0 by default; the
+        # dashboard and WS server default to 127.0.0.1, and 0.0.0.0 is only
+        # opted into via DASH_HOST / WS_HOST env vars at runtime. If a future
+        # code change adds an intentional bind, mark it `# nosec B104` with a
+        # justification next to the bind.
+        args: ["-r", "-ll", "--skip", "B101,B201"]
         exclude: ^(tests/|archived_tests/|scripts/tests/|sync_db_reader\.py)

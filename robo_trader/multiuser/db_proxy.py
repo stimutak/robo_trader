@@ -39,6 +39,15 @@ _PORTFOLIO_SCOPED_METHODS = frozenset(
         "save_equity_snapshot",
         "get_equity_history",
         "portfolio_exists",
+        # D-8: cleanup_old_data MUST be portfolio-scoped via the proxy so a
+        # scoped holder cannot accidentally blanket-clean across portfolios.
+        # The underlying method still cleans truly-global tables (market_data,
+        # ticks) unconditionally and only touches the signals table when an
+        # explicit portfolio_id is provided. Callers that intentionally want
+        # to skip the per-portfolio signal cleanup (e.g. periodic global
+        # market_data cleanup) MUST use the underlying ``_db`` reference
+        # directly: ``scoped_db._db.cleanup_old_data(...)``.
+        "cleanup_old_data",
     }
 )
 
@@ -57,9 +66,6 @@ _KNOWN_GLOBAL_METHODS = frozenset(
         "get_all_positions",
         "get_portfolios",
         "upsert_portfolio",
-        # cleanup_old_data is global by default; takes optional portfolio_id
-        # but is not auto-injected (intentional explicit-opt-in scoping).
-        "cleanup_old_data",
     }
 )
 

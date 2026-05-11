@@ -20,6 +20,58 @@ from ..logger import get_logger
 
 logger = get_logger(__name__)
 
+# D-9: hard caps for per-portfolio risk overrides. A misconfigured PORTFOLIOS
+# JSON should never be able to exceed these absolute ceilings, regardless of
+# what the user wrote. Defense-in-depth on top of the global risk config.
+_MAX_POSITION_PCT_CEILING = 0.25  # 25% of portfolio per position
+_MAX_OPEN_POSITIONS_CEILING = 50  # 50 concurrent positions
+_MAX_STOP_PCT_CEILING = 0.50  # 50% stop distance (trailing or fixed)
+_MAX_DAILY_LOSS_PCT_CEILING = 0.50  # 50% daily loss circuit
+
+
+def _clamp_optional_float(value, ceiling: float, name: str, portfolio_id: str):
+    """Clamp an optional positive float to ``ceiling``. None passes through."""
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Invalid {name} for portfolio '{portfolio_id}': {value!r} is not numeric"
+        )
+    if v < 0:
+        raise ValueError(
+            f"Invalid {name} for portfolio '{portfolio_id}': must be non-negative, got {v}"
+        )
+    if v > ceiling:
+        logger.warning(
+            f"Portfolio '{portfolio_id}' {name}={v} exceeds hard cap {ceiling}; clamping"
+        )
+        return ceiling
+    return v
+
+
+def _clamp_optional_int(value, ceiling: int, name: str, portfolio_id: str):
+    """Clamp an optional positive int to ``ceiling``. None passes through."""
+    if value is None:
+        return None
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Invalid {name} for portfolio '{portfolio_id}': {value!r} is not an integer"
+        )
+    if v < 0:
+        raise ValueError(
+            f"Invalid {name} for portfolio '{portfolio_id}': must be non-negative, got {v}"
+        )
+    if v > ceiling:
+        logger.warning(
+            f"Portfolio '{portfolio_id}' {name}={v} exceeds hard cap {ceiling}; clamping"
+        )
+        return ceiling
+    return v
+
 
 @dataclass
 class PortfolioConfig:
@@ -93,17 +145,51 @@ class PortfolioConfig:
                 f"Invalid starting_cash for portfolio '{data.get('id', 'unknown')}': {e}"
             ) from e
 
+        # D-9: clamp per-portfolio risk overrides at parse time so a
+        # misconfigured PORTFOLIOS JSON can never exceed absolute ceilings.
+        pid = data.get("id", "unknown")
+        max_position_pct = _clamp_optional_float(
+            data.get("max_position_pct"),
+            _MAX_POSITION_PCT_CEILING,
+            "max_position_pct",
+            pid,
+        )
+        max_daily_loss_pct = _clamp_optional_float(
+            data.get("max_daily_loss_pct"),
+            _MAX_DAILY_LOSS_PCT_CEILING,
+            "max_daily_loss_pct",
+            pid,
+        )
+        max_open_positions = _clamp_optional_int(
+            data.get("max_open_positions"),
+            _MAX_OPEN_POSITIONS_CEILING,
+            "max_open_positions",
+            pid,
+        )
+        stop_loss_pct = _clamp_optional_float(
+            data.get("stop_loss_pct"),
+            _MAX_STOP_PCT_CEILING,
+            "stop_loss_pct",
+            pid,
+        )
+        trailing_stop_pct = _clamp_optional_float(
+            data.get("trailing_stop_pct"),
+            _MAX_STOP_PCT_CEILING,
+            "trailing_stop_pct",
+            pid,
+        )
+
         return cls(
             id=data["id"],
             name=data.get("name", data["id"]),
             starting_cash=starting_cash,
             symbols=symbols,
             active=bool(data.get("active", True)),
-            max_position_pct=data.get("max_position_pct"),
-            max_daily_loss_pct=data.get("max_daily_loss_pct"),
-            max_open_positions=data.get("max_open_positions"),
-            stop_loss_pct=data.get("stop_loss_pct"),
-            trailing_stop_pct=data.get("trailing_stop_pct"),
+            max_position_pct=max_position_pct,
+            max_daily_loss_pct=max_daily_loss_pct,
+            max_open_positions=max_open_positions,
+            stop_loss_pct=stop_loss_pct,
+            trailing_stop_pct=trailing_stop_pct,
             use_trailing_stop=data.get("use_trailing_stop"),
             enabled_strategies=strategies,
             min_confidence=data.get("min_confidence"),

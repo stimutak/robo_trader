@@ -523,3 +523,262 @@ def test_init_database_refuses_resolved_production_filename(tmp_path):
         f"expected exit 2 for resolved production filename, got {proc.returncode}\n"
         f"stdout={proc.stdout}\nstderr={proc.stderr}"
     )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Followup audit (SECURITY_AUDIT_2026-05-10_FOLLOWUP.md section 2.D)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def test_portfolio_config_clamps_max_position_pct_d_9():
+    """D-9: per-portfolio max_position_pct must be clamped to <= 0.25."""
+    payload = json.dumps([
+        {
+            "id": "greedy",
+            "name": "Greedy",
+            "starting_cash": 50000,
+            "symbols": "NVDA",
+            "max_position_pct": 0.95,  # would let one position consume 95%
+            "max_open_positions": 9999,  # absurd
+            "trailing_stop_pct": 5.0,  # 500%
+            "stop_loss_pct": 0.99,  # 99%
+        }
+    ])
+    with patch.dict(os.environ, {"PORTFOLIOS": payload}, clear=False):
+        configs = load_portfolio_configs()
+    assert len(configs) == 1
+    cfg = configs[0]
+    assert cfg.max_position_pct == 0.25, "max_position_pct must clamp to 0.25"
+    assert cfg.max_open_positions == 50, "max_open_positions must clamp to 50"
+    assert cfg.trailing_stop_pct == 0.5, "trailing_stop_pct must clamp to 0.5"
+    assert cfg.stop_loss_pct == 0.5, "stop_loss_pct must clamp to 0.5"
+
+
+def test_portfolio_config_passes_through_safe_values_d_9():
+    """D-9: values below the hard ceilings must pass through unchanged."""
+    payload = json.dumps([
+        {
+            "id": "safe",
+            "name": "Safe",
+            "starting_cash": 50000,
+            "symbols": "AAPL",
+            "max_position_pct": 0.10,
+            "max_open_positions": 8,
+            "trailing_stop_pct": 0.05,
+            "stop_loss_pct": 0.02,
+        }
+    ])
+    with patch.dict(os.environ, {"PORTFOLIOS": payload}, clear=False):
+        configs = load_portfolio_configs()
+    cfg = configs[0]
+    assert cfg.max_position_pct == 0.10
+    assert cfg.max_open_positions == 8
+    assert cfg.trailing_stop_pct == 0.05
+    assert cfg.stop_loss_pct == 0.02
+
+
+def test_portfolio_config_rejects_negative_risk_overrides_d_9():
+    """Negative risk overrides must raise ValueError, not silently clamp."""
+    payload = json.dumps([
+        {
+            "id": "neg",
+            "name": "Neg",
+            "starting_cash": 50000,
+            "symbols": "AAPL",
+            "max_position_pct": -0.1,
+        }
+    ])
+    with patch.dict(os.environ, {"PORTFOLIOS": payload}, clear=False):
+        with pytest.raises(ValueError, match="non-negative"):
+            load_portfolio_configs()
+
+
+@pytest.mark.asyncio
+async def test_db_proxy_cleanup_old_data_requires_portfolio_id_d_8(db):
+    """D-8: cleanup_old_data is no longer in _KNOWN_GLOBAL_METHODS. A scoped
+    proxy must auto-inject the holder's portfolio_id, never call without it.
+
+    This ensures that a scoped DB holder cannot accidentally blanket-clean
+    signals across all portfolios.
+    """
+    from robo_trader.multiuser.db_proxy import (
+        _KNOWN_GLOBAL_METHODS,
+        _PORTFOLIO_SCOPED_METHODS,
+        PortfolioScopedDB,
+    )
+
+    # Structural assertion: the proxy must classify cleanup_old_data as
+    # scoped, not global.
+    assert "cleanup_old_data" not in _KNOWN_GLOBAL_METHODS, (
+        "D-8: cleanup_old_data must NOT be classified as a global method; "
+        "doing so would let a scoped holder blanket-clean across portfolios."
+    )
+    assert "cleanup_old_data" in _PORTFOLIO_SCOPED_METHODS, (
+        "D-8: cleanup_old_data must be in the portfolio-scoped set so the "
+        "proxy auto-injects portfolio_id."
+    )
+
+    # Behavioral assertion: calls through the scoped proxy must scope to the
+    # holder's portfolio. Set up two portfolios with recent signals and verify
+    # that proxy cleanup for portfolio "alpha" only touches alpha's signals.
+    await db.upsert_portfolio({"id": "alpha", "name": "Alpha"})
+    await db.upsert_portfolio({"id": "beta", "name": "Beta"})
+    await db.record_signal(
+        symbol="AAPL", strategy="x", signal_type="BUY",
+        strength=0.5, portfolio_id="alpha",
+    )
+    await db.record_signal(
+        symbol="AAPL", strategy="x", signal_type="BUY",
+        strength=0.5, portfolio_id="beta",
+    )
+
+    scoped = PortfolioScopedDB(db, portfolio_id="alpha")
+
+    # Spy on the underlying cleanup_old_data to verify portfolio_id is
+    # auto-injected by the proxy. Behavioral assertion via call inspection
+    # avoids relying on CURRENT_TIMESTAMP / local-tz cutoff math (signals
+    # use SQLite CURRENT_TIMESTAMP which is UTC, while cleanup uses
+    # datetime.now() locally; with days_to_keep=0 the cutoff comparison
+    # can be flaky across timezones).
+    seen_kwargs = {}
+    original = db.cleanup_old_data
+
+    async def spy_cleanup(*args, **kwargs):
+        seen_kwargs.update(kwargs)
+        return await original(*args, **kwargs)
+
+    db.cleanup_old_data = spy_cleanup  # type: ignore[assignment]
+    try:
+        await scoped.cleanup_old_data(days_to_keep=0)
+    finally:
+        db.cleanup_old_data = original  # type: ignore[assignment]
+
+    assert seen_kwargs.get("portfolio_id") == "alpha", (
+        "D-8: scoped proxy must auto-inject portfolio_id; "
+        f"actual kwargs: {seen_kwargs}"
+    )
+
+    # beta's signal must remain untouched regardless of cutoff timing.
+    async with db.get_connection() as conn:
+        cur = await conn.execute(
+            "SELECT COUNT(*) FROM signals WHERE portfolio_id = 'beta'"
+        )
+        beta_count = (await cur.fetchone())[0]
+    assert beta_count == 1, "beta's signal must NOT be touched"
+
+
+@pytest.mark.asyncio
+async def test_db_proxy_cleanup_global_via_raw_db_d_8(db):
+    """D-8: callers that want global cleanup must go through _db directly.
+    The underlying cleanup_old_data still cleans market_data unconditionally
+    when called without a portfolio_id."""
+    from robo_trader.multiuser.db_proxy import PortfolioScopedDB
+
+    scoped = PortfolioScopedDB(db, portfolio_id="alpha")
+    # Direct call on the underlying DB without portfolio_id must work.
+    await scoped._db.cleanup_old_data(days_to_keep=0)
+
+
+def test_migration_table_name_allowlisted_d_17():
+    """D-17: _migrate_table_add_portfolio_id must reject table_names that
+    are not in the hardcoded allowlist, before any f-string DDL executes."""
+    import asyncio as _asyncio
+
+    from robo_trader.multiuser.migration import (
+        ALLOWED_MIGRATION_TABLES,
+        MultiuserMigration,
+    )
+
+    # Structural assertion: the allowlist exists and is non-empty.
+    assert "positions" in ALLOWED_MIGRATION_TABLES
+    assert "trades" in ALLOWED_MIGRATION_TABLES
+    assert "drop_users" not in ALLOWED_MIGRATION_TABLES
+
+    # Behavioral assertion: an unexpected table_name raises before any DDL.
+    mig = MultiuserMigration(db_path=Path("/tmp/_d17_test_does_not_exist.db"))
+
+    async def _run():
+        # We never reach a real connection because the assertion fires first.
+        # Pass a sentinel conn=None; the validation is the first line of the
+        # function and never touches conn before failing.
+        with pytest.raises(ValueError, match="unexpected table_name"):
+            await mig._migrate_table_add_portfolio_id(
+                conn=None,  # type: ignore[arg-type]
+                table_name="users; DROP TABLE foo",
+                create_sql="",
+                insert_sql="",
+                index_sql=[],
+            )
+
+    _asyncio.get_event_loop().run_until_complete(_run()) if False else _asyncio.run(_run())
+
+
+def test_migration_table_name_allowlist_accepts_known_d_17():
+    """The allowlist must include every table currently migrated by v1."""
+    from robo_trader.multiuser.migration import ALLOWED_MIGRATION_TABLES
+
+    # These are the table_name values passed in _apply_migration_v1.
+    for name in ["positions", "trades", "account", "equity_history", "signals"]:
+        assert name in ALLOWED_MIGRATION_TABLES, (
+            f"D-17: migration v1 migrates {name!r} but the allowlist excludes it"
+        )
+
+
+@pytest.mark.asyncio
+async def test_batch_store_market_data_rejects_missing_keys_d_16(db):
+    """D-16: rows missing a bind-parameter key must raise ValueError before
+    executemany sees them."""
+    bad_row = {
+        "symbol": "AAPL",
+        "timestamp": "2026-01-01T00:00:00",
+        "open": 100.0,
+        "high": 110.0,
+        "low": 95.0,
+        "close": 105.0,
+        # missing "volume"
+    }
+    with pytest.raises(ValueError, match="missing keys"):
+        await db.batch_store_market_data([bad_row])
+
+
+@pytest.mark.asyncio
+async def test_batch_store_market_data_rejects_non_dict_row_d_16(db):
+    with pytest.raises(ValueError, match="must be a dict"):
+        await db.batch_store_market_data([("AAPL", "ts", 1, 2, 3, 4, 5)])
+
+
+@pytest.mark.asyncio
+async def test_batch_store_market_data_accepts_valid_d_16(db):
+    """D-16: a fully-populated row must pass validation and store."""
+    good_row = {
+        "symbol": "AAPL",
+        "timestamp": "2026-01-01 00:00:00",
+        "open": 100.0,
+        "high": 110.0,
+        "low": 95.0,
+        "close": 105.0,
+        "volume": 1000,
+    }
+    await db.batch_store_market_data([good_row])
+
+
+def test_validate_symbol_rejects_quote_chars_via_regex_d_12():
+    """D-12: even after removing the dead keyword denylist, quotes and SQL
+    metacharacters must still be rejected — by the regex.
+
+    Note: bare uppercase words like "DROP" are valid 4-letter symbols
+    (the regex admits any 1-5 uppercase letters); the actual SQL injection
+    guard is parameterized queries everywhere in the data layer. The regex
+    rejects anything with quotes, semicolons, comment markers, or
+    lowercase/punctuation that can't appear in a real ticker."""
+    for bad in ["AAPL'", 'AAPL"', "AA;PL", "A--PL", "A/*PL", "DROP TABLE"]:
+        with pytest.raises(ValidationError):
+            DatabaseValidator.validate_symbol(bad)
+
+
+def test_validate_symbol_accepts_legitimate_d_12():
+    """D-12: legitimate symbols (including dot-suffix) still pass after the
+    dead-code removal."""
+    assert DatabaseValidator.validate_symbol("AAPL") == "AAPL"
+    assert DatabaseValidator.validate_symbol("brk.b") == "BRK.B"
+    assert DatabaseValidator.validate_symbol("MSFT") == "MSFT"

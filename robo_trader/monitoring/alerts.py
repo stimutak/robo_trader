@@ -303,13 +303,21 @@ class MultiChannelAlerter:
 
 
 def create_example_config() -> Dict:
-    """Create example notification configuration."""
+    """Create example notification configuration.
+
+    D-13: All channels default to ``enabled=False`` because the bundled
+    placeholder credentials (``YOUR_TOKEN``, ``your-app-password``,
+    ``YOUR_TWILIO_TOKEN``, etc.) are not valid. A copy-paste of this template
+    must not arm an alert channel before the operator has filled in real
+    credentials. Flip ``enabled`` to ``True`` per-channel after replacing
+    the placeholders with real values.
+    """
     return {
         "channels": [
             {
                 "name": "webhook_primary",
                 "type": "webhook",
-                "enabled": True,
+                "enabled": False,
                 "rate_limit": 20,
                 "config": {
                     "url": "https://your-webhook-url.com/alerts",
@@ -319,7 +327,7 @@ def create_example_config() -> Dict:
             {
                 "name": "email_critical",
                 "type": "email",
-                "enabled": True,
+                "enabled": False,
                 "rate_limit": 5,
                 "config": {
                     "host": "smtp.gmail.com",
@@ -346,7 +354,7 @@ def create_example_config() -> Dict:
             {
                 "name": "slack_trading",
                 "type": "slack",
-                "enabled": True,
+                "enabled": False,
                 "rate_limit": 30,
                 "config": {"webhook_url": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"},
             },

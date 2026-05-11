@@ -865,8 +865,20 @@ class AsyncRunner:
         # delivering stale data from a prior session that used the same id.
         base_client_id = self.cfg.ibkr.client_id
         if self.portfolio_id != "default":
-            # Deterministic offset: use hashlib (not hash()) for cross-process stability
-            offset = int(hashlib.md5(self.portfolio_id.encode()).hexdigest(), 16) % 900 + 100
+            # Deterministic offset: use hashlib (not hash()) for cross-process stability.
+            # D-1: md5 here is a non-cryptographic, stable offset derived from a
+            # non-secret portfolio_id. usedforsecurity=False tells bandit/FIPS this
+            # is not a security-sensitive digest.
+            offset = (
+                int(
+                    hashlib.md5(
+                        self.portfolio_id.encode(), usedforsecurity=False
+                    ).hexdigest(),
+                    16,
+                )
+                % 900
+                + 100
+            )
             self._client_id = (base_client_id + offset) % 1000
         else:
             self._client_id = base_client_id

@@ -115,7 +115,7 @@ class ConnectionManager:
     def _generate_client_id(self) -> int:
         """Generate a semi-unique client ID to avoid collisions."""
         base_id = int(time.time()) % 10000
-        random_offset = random.randint(0, 99)
+        random_offset = random.randint(0, 99)  # nosec B311 - non-security A/B split
         return base_id + random_offset
 
     def _get_next_client_id(self) -> int:
@@ -224,9 +224,29 @@ class ConnectionManager:
         lock_fh = None
         try:
             async with _GLOBAL_IB_CONNECT_LOCK:  # type: ignore[arg-type]
-                # Cross-process file lock
+                # Cross-process file lock.
+                # D-3: harden against /tmp symlink attacks. The path is deterministic
+                # on purpose so multiple robo_trader processes coordinate via the
+                # same lock; symlink protection comes from the O_EXCL+0o600 create
+                # syscall plus O_NOFOLLOW, not from path randomization.
+                lock_path = "/tmp/ibkr_connect.lock"
                 try:
-                    lock_fh = open("/tmp/ibkr_connect.lock", "w")
+                    open_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                    if hasattr(os, "O_NOFOLLOW"):
+                        open_flags |= os.O_NOFOLLOW
+                    try:
+                        fd = os.open(lock_path, open_flags, 0o600)
+                        lock_fh = os.fdopen(fd, "w")
+                    except FileExistsError:
+                        # Another process already created the lockfile. Reopen
+                        # without O_CREAT but still O_NOFOLLOW so an attacker
+                        # cannot redirect this open via a symlink swap.
+                        reopen_flags = os.O_WRONLY
+                        if hasattr(os, "O_NOFOLLOW"):
+                            reopen_flags |= os.O_NOFOLLOW
+                        fd = os.open(lock_path, reopen_flags)
+                        lock_fh = os.fdopen(fd, "w")
+
                     import fcntl as _fcntl  # Local import to avoid Windows issues
 
                     _fcntl.flock(lock_fh, _fcntl.LOCK_EX)
@@ -309,7 +329,7 @@ class ConnectionManager:
                     # Backoff if we will retry
                     if attempt < self._max_retries - 1:
                         delay = min(self._retry_delay * (2**attempt), self._max_delay)
-                        jitter = delay * 0.25 * random.random()
+                        jitter = delay * 0.25 * random.random()  # nosec B311 - non-security jitter
                         delay += jitter
                         logger.info(
                             f"Retrying in {delay:.1f} seconds (exponential backoff with jitter)..."

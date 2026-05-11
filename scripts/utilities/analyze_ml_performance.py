@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Analyze ML model performance and suggest improvements."""
 
-import pickle
+import pickle  # noqa: S403 - loads are HMAC-verified via _safe_load.verify_file (D-7)
+import sys
 import warnings
 from pathlib import Path
 
@@ -11,6 +12,27 @@ import yfinance as yf
 from sklearn.metrics import classification_report, confusion_matrix
 
 warnings.filterwarnings("ignore")
+
+# D-7: HMAC-verify model artifacts before deserialization. Make repo root
+# importable when running this as an ad-hoc script outside the package.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+try:
+    from robo_trader.ml._safe_load import verify_file
+except ImportError as _e:  # pragma: no cover - dev convenience fallback
+    print(
+        f"⚠️  WARNING: could not import robo_trader.ml._safe_load.verify_file ({_e}). "
+        "Refusing to deserialize unverified model artifacts.",
+        file=sys.stderr,
+    )
+
+    def verify_file(path):  # type: ignore[no-redef]
+        raise RuntimeError(
+            "Cannot verify model signature: robo_trader.ml._safe_load is not importable. "
+            "Run from the repo root with the project venv activated."
+        )
 
 
 def analyze_current_models():
@@ -27,8 +49,11 @@ def analyze_current_models():
         print("❌ No trained models found. Run: python train_models_timeseries.py")
         return
 
+    # D-7: HMAC-verify before deserialization. verify_file raises if the
+    # artifact has no .sig file (when required) or if the signature mismatches.
+    verify_file(model_path)
     with open(model_path, "rb") as f:
-        model_data = pickle.load(f)  # Security: Trusted model file from our system
+        model_data = pickle.load(f)  # noqa: S301 - HMAC-verified above (D-7)
 
     print(f"\n1. Current Model Stats:")
     print(f"   Train accuracy: {model_data['metrics']['train_score']:.4f}")

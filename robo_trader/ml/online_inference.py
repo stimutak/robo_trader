@@ -391,7 +391,7 @@ class ModelUpdateManager:
         import random
 
         for symbol in self.ab_test_allocation:
-            if random.random() < allocation_pct:
+            if random.random() < allocation_pct:  # nosec B311 - non-security A/B split
                 self.ab_test_allocation[symbol] = model_name
 
         logger.info(f"Deployed model {model_name} with {allocation_pct*100}% allocation")

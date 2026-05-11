@@ -17,6 +17,7 @@ import os
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta
@@ -132,6 +133,7 @@ class SubprocessIBKRClient:
         self._connection_start_time: Optional[datetime] = None
         self._gateway_api_down_detail: Optional[str] = None
         self._debug_log_file = None  # For capturing worker stderr to file
+        self._debug_log_path: Optional[str] = None  # D-3: randomized tempfile path
         self._zombies_detected_before_connect = (
             False  # Track if zombies were present before connect
         )
@@ -245,12 +247,19 @@ class SubprocessIBKRClient:
                     "PATH/symlink hijacking (NEW-IB-M1.1)."
                 )
 
-        # DEBUGGING FIX: Create debug log file for worker stderr capture
-        # Use try/finally to ensure cleanup even if subprocess/thread startup fails
-        debug_log_path = "/tmp/worker_debug.log"
+        # DEBUGGING FIX: Create debug log file for worker stderr capture.
+        # D-3: Use tempfile to get an unpredictable path with 0o600 perms (mkstemp
+        # creates the file atomically with O_EXCL, so a pre-existing symlink at
+        # the path cannot be followed). The previous deterministic path
+        # `/tmp/worker_debug.log` was a symlink-attack vector on multi-user hosts.
+        # Use try/finally to ensure cleanup even if subprocess/thread startup fails.
+        debug_log_path: Optional[str] = None
         debug_log_file = None
         try:
-            debug_log_file = open(debug_log_path, "w")
+            fd, debug_log_path = tempfile.mkstemp(
+                prefix="worker_debug_", suffix=".log"
+            )
+            debug_log_file = os.fdopen(fd, "w")
             logger.info("Worker debug output will be captured", debug_log=debug_log_path)
         except Exception as e:
             logger.warning("Could not create debug log file", error=str(e))
@@ -276,6 +285,7 @@ class SubprocessIBKRClient:
 
             # Store debug log file only after successful subprocess start
             self._debug_log_file = debug_log_file
+            self._debug_log_path = debug_log_path
 
             # Start reader threads to avoid blocking
             self._stop_reader.clear()

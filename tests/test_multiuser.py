@@ -1168,15 +1168,22 @@ class TestPortfolioConfigEdgeCases:
         assert cfg.name == "my_portfolio"
 
     def test_from_dict_all_risk_overrides(self):
-        """All risk override fields are preserved in from_dict."""
+        """All risk override fields are preserved in from_dict.
+
+        D-9: stop_loss_pct / trailing_stop_pct are interpreted as fractions
+        (e.g. 0.05 = 5%) and clamped to 0.50 (50%) ceiling at parse time.
+        Use realistic fraction values here; the previous version of this
+        test passed raw 3.0 / 5.0 (300% / 500%) which is unrealistic and is
+        now correctly clamped to the ceiling.
+        """
         data = {
             "id": "test",
             "name": "Test",
             "max_position_pct": 0.05,
             "max_daily_loss_pct": 0.01,
             "max_open_positions": 5,
-            "stop_loss_pct": 3.0,
-            "trailing_stop_pct": 5.0,
+            "stop_loss_pct": 0.03,  # 3% — realistic, under the 0.50 cap
+            "trailing_stop_pct": 0.05,  # 5% — realistic
             "use_trailing_stop": True,
             "min_confidence": 0.6,
         }
@@ -1184,8 +1191,8 @@ class TestPortfolioConfigEdgeCases:
         assert cfg.max_position_pct == 0.05
         assert cfg.max_daily_loss_pct == 0.01
         assert cfg.max_open_positions == 5
-        assert cfg.stop_loss_pct == 3.0
-        assert cfg.trailing_stop_pct == 5.0
+        assert cfg.stop_loss_pct == 0.03
+        assert cfg.trailing_stop_pct == 0.05
         assert cfg.use_trailing_stop is True
         assert cfg.min_confidence == 0.6
 

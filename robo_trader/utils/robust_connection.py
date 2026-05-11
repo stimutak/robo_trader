@@ -619,7 +619,7 @@ class RobustConnectionManager:
             # Add random jitter (0-25% of delay)
             import random
 
-            jitter_amount = delay * 0.25 * random.random()
+            jitter_amount = delay * 0.25 * random.random()  # nosec B311 - non-security jitter
             delay += jitter_amount
 
         return delay
@@ -931,7 +931,7 @@ async def connect_ibkr_robust_subprocess(
         else:
             import random
 
-            use_client_id = client_id + random.randint(1, 99)
+            use_client_id = client_id + random.randint(1, 99)  # nosec B311 - non-security A/B split
 
         attempt_count += 1
 
@@ -1107,7 +1107,7 @@ async def connect_ibkr_robust(
         else:
             import random
 
-            use_client_id = client_id + random.randint(1, 99)
+            use_client_id = client_id + random.randint(1, 99)  # nosec B311 - non-security A/B split
 
         attempt_count += 1
 

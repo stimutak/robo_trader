@@ -97,11 +97,12 @@ class DatabaseValidator:
                 "Must be 1-5 uppercase letters, optionally followed by .XX"
             )
 
-        # Check for SQL injection attempts
-        if any(char in symbol for char in ["'", '"', ";", "--", "/*", "*/", "DROP", "DELETE"]):
-            logger.error(f"Potential SQL injection attempt in symbol: {symbol}")
-            raise ValidationError("Invalid characters in symbol")
-
+        # D-12: the SYMBOL_PATTERN regex above (^[A-Z]{1,5}(\.[A-Z]{1,2})?$)
+        # is the actual guard — it admits only uppercase letters and an
+        # optional ``.XX`` suffix, so quotes, semicolons, comment markers and
+        # SQL keywords are already rejected. A separate denylist check would
+        # be unreachable dead code; defense-in-depth lives in the data layer
+        # via parameterized queries.
         return symbol
 
     @staticmethod

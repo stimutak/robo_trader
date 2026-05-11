@@ -674,7 +674,36 @@ class AsyncTradingDatabase:
             await conn.commit()
 
     async def batch_store_market_data(self, data: List[Dict]) -> None:
-        """Store multiple market data bars in a batch for efficiency."""
+        """Store multiple market data bars in a batch for efficiency.
+
+        D-16: validate dict keys before executemany so a caller-supplied row
+        missing a bind parameter raises a clear ValueError instead of an
+        opaque sqlite ProgrammingError (or, worse, silently binding NULL).
+        """
+        if not data:
+            return
+
+        required_keys = {
+            "symbol",
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        }
+        for idx, row in enumerate(data):
+            if not isinstance(row, dict):
+                raise ValueError(
+                    f"batch_store_market_data row[{idx}] must be a dict, "
+                    f"got {type(row).__name__}"
+                )
+            missing = required_keys - row.keys()
+            if missing:
+                raise ValueError(
+                    f"batch_store_market_data row[{idx}] missing keys: {sorted(missing)}"
+                )
+
         async with self.get_connection() as conn:
             await conn.executemany(
                 """

@@ -1,4 +1,8 @@
 # All entries pinned for supply-chain security. Update via pip-compile.
+# TODO(D-14): adopt pip-compile --generate-hashes for reproducible builds.
+# Today both requirements.txt and requirements-prod.txt are hand-maintained; CI
+# installs without --require-hashes, so a transitive registry compromise could
+# substitute a tampered wheel without detection.
 ib-async==2.0.1
 pandas~=2.0
 numpy~=1.24
@@ -6,7 +10,7 @@ scipy~=1.10
 yfinance~=0.2.30
 python-dotenv==1.0.1
 pytest~=8.2
-pytest-asyncio~=0.21.0
+pytest-asyncio==0.21.1  # C-4: synced across requirements files; bump both together.
 pydantic==2.6.4
 structlog~=23.0
 aiofiles~=23.0
@@ -20,7 +24,7 @@ scikit-learn~=1.7
 xgboost~=3.0
 lightgbm~=4.6
 statsmodels~=0.14
-tensorflow~=2.15
+tensorflow==2.15.1  # D-6 (followup audit): exact-pin for ML reproducibility
 keras~=3.0
 optuna~=3.5
 

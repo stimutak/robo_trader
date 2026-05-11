@@ -109,8 +109,10 @@ jobs:
           pip install safety
           
       - name: Run security scan
+        # C-6 (followup audit): no `|| true` — failures must fail the job.
+        # If a specific CVE is intentionally tolerated, use `safety check --ignore <CVE-ID>`.
         run: |
-          safety check --json || true
+          safety check --json
           
       - name: Run Bandit security linter
         run: |

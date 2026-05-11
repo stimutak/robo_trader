@@ -1,4 +1,7 @@
 # Multi-stage build for RoboTrader
+# TODO(C-8): pin to sha256 digest (e.g. python:3.11-slim@sha256:<digest>).
+# Floating tags allow upstream to silently replace the image; operator should
+# run `docker pull python:3.11-slim && docker images --digests` and lock here.
 FROM python:3.11-slim as builder
 
 # Install build dependencies
@@ -16,6 +19,7 @@ COPY requirements.txt .
 RUN pip install --user --no-cache-dir -r requirements.txt
 
 # Production stage
+# TODO(C-8): pin to sha256 digest — see note above on the builder stage.
 FROM python:3.11-slim
 
 # Install runtime dependencies

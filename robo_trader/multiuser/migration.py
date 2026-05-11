@@ -26,6 +26,25 @@ logger = get_logger(__name__)
 MIGRATION_VERSION = 1  # Increment when adding new migrations
 
 
+# D-17: defense-in-depth allowlist. table_name in this module is always a
+# hardcoded literal from the call sites in _apply_migration_v1, but the DDL
+# below uses f-string interpolation — assert the value is one of the known
+# tables before any DDL executes so a future refactor that accidentally
+# threads a caller-supplied name through this path fails loudly.
+ALLOWED_MIGRATION_TABLES = frozenset(
+    {
+        "positions",
+        "trades",
+        "account",
+        "signals",
+        "equity_history",
+        "market_data",
+        "ticks",
+        "portfolios",
+    }
+)
+
+
 class MultiuserMigration:
     """Handles database schema migration for multi-portfolio support."""
 
@@ -382,6 +401,16 @@ class MultiuserMigration:
         Uses the rename-recreate pattern since SQLite doesn't support
         ALTER TABLE ADD CONSTRAINT.
         """
+        # D-17: refuse any table_name outside the hardcoded allowlist before
+        # any DDL (f-string interpolated) executes. The current call sites
+        # only pass literal table names, but this guards against future
+        # regressions where caller-supplied values could thread through.
+        if table_name not in ALLOWED_MIGRATION_TABLES:
+            raise ValueError(
+                f"unexpected table_name in migration: {table_name!r}; "
+                f"must be one of {sorted(ALLOWED_MIGRATION_TABLES)}"
+            )
+
         # Check if table exists
         cursor = await conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name=?",

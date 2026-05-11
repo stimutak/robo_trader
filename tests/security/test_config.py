@@ -552,3 +552,253 @@ def test_eventlet_floor_avoids_request_smuggling_b_5():
     assert _re.search(r"^eventlet\s*>=\s*0\.(3[6-9]|[4-9]\d)\.", text, _re.MULTILINE), (
         "eventlet must be pinned >=0.36.1 (B-5) or removed entirely"
     )
+
+
+# ---------------------------------------------------------------------------
+# Followup-audit Section C/D hygiene fixes (C-2/C-6/C-7/C-8/D-4/D-5/D-6/D-15)
+# ---------------------------------------------------------------------------
+
+
+def test_aioredis_removed_c2():
+    """C-2: aioredis 2.0.1 is deprecated/unmaintained. Use redis.asyncio instead.
+
+    Either the pin is gone, or it has been replaced with a redis.asyncio import.
+    """
+    text_prod = (REPO_ROOT / "requirements-prod.txt").read_text()
+    text_main = (REPO_ROOT / "requirements.txt").read_text()
+    assert not re.search(r"^aioredis", text_prod, re.MULTILINE), (
+        "aioredis must be removed from requirements-prod.txt (C-2). "
+        "Use redis.asyncio (from the `redis` package) for async Redis access."
+    )
+    assert not re.search(r"^aioredis", text_main, re.MULTILINE), (
+        "aioredis must be removed from requirements.txt (C-2)."
+    )
+
+    # Sanity: no source file imports aioredis any more.
+    py_with_aioredis = []
+    for p in REPO_ROOT.rglob("*.py"):
+        # Skip venvs / third-party / archived / generated.
+        s = str(p)
+        if any(seg in s for seg in (".venv", "site-packages", "archived_", "__pycache__")):
+            continue
+        try:
+            blob = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if re.search(r"^\s*(import aioredis|from aioredis)\b", blob, re.MULTILINE):
+            py_with_aioredis.append(str(p.relative_to(REPO_ROOT)))
+    assert not py_with_aioredis, (
+        f"aioredis is imported in: {py_with_aioredis}. "
+        "Migrate to `from redis.asyncio import Redis` before removing the dep."
+    )
+
+
+def test_safety_check_does_not_mask_failures_c6():
+    """C-6: `safety check ... || true` swallows CVE findings silently."""
+    text = (REPO_ROOT / ".github" / "workflows" / "deploy.yml").read_text()
+    # Find every line with `safety check` and ensure none end with `|| true`.
+    offenders = [
+        ln
+        for ln in text.splitlines()
+        if "safety check" in ln and re.search(r"\|\|\s*true\b", ln)
+    ]
+    assert not offenders, (
+        "safety check must not be followed by `|| true` (C-6). "
+        f"Offending lines: {offenders}"
+    )
+
+
+def test_tensorflow_pinned_exactly_d6():
+    """D-6: tensorflow must be exact-pinned (==) or removed entirely.
+
+    `~=` allows the bundled Keras to surprise-bump; that has burned ML pipelines.
+    """
+    text = (REPO_ROOT / "requirements.txt").read_text()
+    tf_lines = [
+        ln for ln in text.splitlines()
+        if re.match(r"^tensorflow\b", ln.strip())
+    ]
+    if not tf_lines:
+        # Removal is acceptable — only assert if it's present.
+        return
+    assert all("==" in ln.split("#", 1)[0] for ln in tf_lines), (
+        f"tensorflow must use exact-pin (==), got: {tf_lines}"
+    )
+
+
+def test_requirements_version_drift_synced_c4():
+    """C-4: redis, python-dotenv, pytest-asyncio must match across files."""
+    main_text = (REPO_ROOT / "requirements.txt").read_text()
+    prod_text = (REPO_ROOT / "requirements-prod.txt").read_text()
+
+    def _exact_pin(text: str, pkg: str) -> str | None:
+        m = re.search(
+            rf"^{re.escape(pkg)}\s*==\s*([0-9][^\s#]*)",
+            text,
+            re.MULTILINE,
+        )
+        return m.group(1) if m else None
+
+    for pkg in ("redis", "python-dotenv", "pytest-asyncio"):
+        main_v = _exact_pin(main_text, pkg)
+        prod_v = _exact_pin(prod_text, pkg)
+        if main_v is None or prod_v is None:
+            # Allow if the package is genuinely absent from one file.
+            continue
+        assert main_v == prod_v, (
+            f"{pkg} version drift: requirements.txt={main_v} vs "
+            f"requirements-prod.txt={prod_v} (C-4)"
+        )
+
+
+def test_dockerfile_pins_or_todo_c8():
+    """C-8: Dockerfile floating image tags must carry a digest-pin TODO."""
+    text = (REPO_ROOT / "Dockerfile").read_text()
+    # Every `FROM <image>:<tag>` line must either have @sha256: or a TODO(C-8) comment nearby.
+    lines = text.splitlines()
+    bad: list[str] = []
+    for i, ln in enumerate(lines):
+        m = re.match(r"^\s*FROM\s+([^\s]+)", ln)
+        if not m:
+            continue
+        image = m.group(1)
+        if "@sha256:" in image:
+            continue  # already digest-pinned
+        # Search backward up to 5 lines for the TODO marker.
+        ctx = "\n".join(lines[max(0, i - 5) : i + 1])
+        if "TODO(C-8)" in ctx:
+            continue
+        bad.append(f"line {i + 1}: {ln}")
+    assert not bad, (
+        "Dockerfile FROM directives must be digest-pinned or carry a "
+        f"`# TODO(C-8): pin to sha256 digest` comment within 5 lines: {bad}"
+    )
+
+
+def test_docker_compose_pins_or_todo_c8():
+    """C-8: docker-compose images either digest-pinned or carry TODO(C-8)."""
+    text = (REPO_ROOT / "docker-compose.yml").read_text()
+    # For each `image: <ref>` line that isn't digest-pinned, require TODO(C-8) within 5 lines above.
+    lines = text.splitlines()
+    bad: list[str] = []
+    for i, ln in enumerate(lines):
+        m = re.match(r"^\s*image:\s*(\S+)", ln)
+        if not m:
+            continue
+        image = m.group(1).strip("\"'")
+        if "@sha256:" in image:
+            continue
+        ctx = "\n".join(lines[max(0, i - 5) : i + 1])
+        if "TODO(C-8)" in ctx:
+            continue
+        bad.append(f"line {i + 1}: {ln}")
+    assert not bad, (
+        "docker-compose.yml `image:` directives must be digest-pinned or "
+        f"carry a `# TODO(C-8): pin to sha256 digest` comment: {bad}"
+    )
+
+
+def test_docker_compose_all_services_have_resource_limits_c7():
+    """C-7: every long-running service must declare deploy.resources.limits."""
+    yaml = pytest.importorskip("yaml")
+    data = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text())
+    services = data.get("services", {}) or {}
+    missing: list[str] = []
+    for name, svc in services.items():
+        if not isinstance(svc, dict):
+            continue
+        deploy = svc.get("deploy") or {}
+        resources = deploy.get("resources") or {}
+        limits = resources.get("limits") or {}
+        if not limits.get("cpus") or not limits.get("memory"):
+            missing.append(name)
+    assert not missing, (
+        f"docker-compose services missing deploy.resources.limits (C-7): {missing}"
+    )
+
+
+def test_pre_commit_does_not_skip_b104_d4():
+    """D-4: bandit pre-commit hook must NOT skip B104 globally.
+
+    Intentional 0.0.0.0 binds should be marked with `# nosec B104` at the call
+    site, not blanket-suppressed across the codebase.
+    """
+    yaml = pytest.importorskip("yaml")
+    data = yaml.safe_load((REPO_ROOT / ".pre-commit-config.yaml").read_text())
+    for repo in data.get("repos", []) or []:
+        repo_url = (repo or {}).get("repo", "")
+        if "bandit" not in repo_url.lower():
+            continue
+        for hook in repo.get("hooks", []) or []:
+            args = hook.get("args", []) or []
+            # Look for the --skip value (next arg after --skip) and ensure B104 isn't in it.
+            for i, arg in enumerate(args):
+                if arg == "--skip" and i + 1 < len(args):
+                    skipped = {s.strip() for s in args[i + 1].split(",")}
+                    assert "B104" not in skipped, (
+                        f"bandit hook still skips B104: {skipped} (D-4). "
+                        "Mark intentional 0.0.0.0 binds with `# nosec B104` instead."
+                    )
+
+
+def test_pre_commit_has_secret_scanner_d5():
+    """D-5: pre-commit must include a secret scanner (gitleaks or detect-secrets)."""
+    yaml = pytest.importorskip("yaml")
+    data = yaml.safe_load((REPO_ROOT / ".pre-commit-config.yaml").read_text())
+    repos = [
+        (repo or {}).get("repo", "").lower()
+        for repo in (data.get("repos", []) or [])
+    ]
+    has_scanner = any(
+        "gitleaks" in url or "detect-secrets" in url for url in repos
+    )
+    assert has_scanner, (
+        "pre-commit must include a secret scanner (gitleaks or detect-secrets) "
+        "to prevent accidental credential commits (D-5)."
+    )
+
+
+def test_black_target_version_matches_python_requirement_d15():
+    """D-15: pyproject black target-version must include the runtime Pythons."""
+    text = (REPO_ROOT / "pyproject.toml").read_text()
+    m = re.search(r"^\s*target-version\s*=\s*\[([^\]]*)\]", text, re.MULTILINE)
+    assert m, "pyproject [tool.black] target-version not found"
+    targets = {t.strip().strip("\"'") for t in m.group(1).split(",")}
+    # We require Python >=3.10; py39 alone was the drift.
+    assert "py39" not in targets or targets - {"py39"}, (
+        f"Black target-version stuck at py39 only: {targets} (D-15)"
+    )
+    # At least one of py310/py311/py312 must be listed.
+    assert targets & {"py310", "py311", "py312"}, (
+        f"Black target-version must include at least one of py310/py311/py312, got {targets}"
+    )
+
+
+def test_passlib_bcrypt_compat_c3():
+    """C-3: passlib 1.7.4 + bcrypt>=4 raises AttributeError on `__about__`.
+
+    If passlib is still pinned, bcrypt must be pinned <4 (we use ==3.2.2).
+    If passlib has been removed, this test is a no-op.
+    """
+    text = (REPO_ROOT / "requirements-prod.txt").read_text()
+    has_passlib = bool(re.search(r"^passlib\b", text, re.MULTILINE))
+    if not has_passlib:
+        return
+    # Either bcrypt is unpinned (NOT acceptable), pinned <4 (acceptable), or
+    # we have explicitly set ==3.2.2.
+    m = re.search(r"^bcrypt\s*([=<>!~][^\s#]*)", text, re.MULTILINE)
+    assert m, (
+        "passlib is pinned but bcrypt is not. passlib 1.7.4 + bcrypt>=4 "
+        "raises at import (C-3). Pin bcrypt==3.2.2 (or <4)."
+    )
+    spec = m.group(1)
+    # Accept ==3.x or <4 forms.
+    ok = (
+        re.match(r"^==\s*3\.", spec)
+        or re.match(r"^<\s*4", spec)
+        or re.match(r"^<=\s*3\.", spec)
+    )
+    assert ok, (
+        f"bcrypt pin {spec!r} may pull a 4.x release that breaks passlib 1.7.4 "
+        "(C-3). Use bcrypt==3.2.2 or bcrypt<4."
+    )
