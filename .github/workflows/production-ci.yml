@@ -10,6 +10,10 @@ on:
   schedule:
     - cron: '0 6 * * 1'  # Weekly security scan on Mondays
 
+# R2-CFG-H1.x: minimum permissions at workflow level; jobs widen.
+permissions:
+  contents: read
+
 jobs:
   # Security scanning
   security-scan:
@@ -23,7 +27,7 @@ jobs:
     - uses: actions/checkout@v4
 
     - name: Run Trivy security scan
-      # TODO: pin to commit SHA
+      # TODO(R2-CFG-H1.4): pin to specific commit SHA
       uses: aquasecurity/trivy-action@master
       with:
         scan-type: 'fs'
@@ -38,7 +42,7 @@ jobs:
         sarif_file: 'trivy-results.sarif'
 
     - name: Check for hardcoded secrets
-      # TODO: pin to commit SHA
+      # TODO(R2-CFG-H1.4): pin to specific commit SHA
       uses: trufflesecurity/trufflehog@main
       with:
         path: ./
@@ -47,7 +51,11 @@ jobs:
 
   # Comprehensive testing
   test-suite:
+    # R2-CFG-H1.x: fork guard — uploads coverage with CODECOV_TOKEN secret.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     env:
       EXECUTION_MODE: paper
     strategy:
@@ -110,7 +118,10 @@ jobs:
 
   # Code quality checks
   code-quality:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
     - uses: actions/checkout@v4
     
@@ -147,7 +158,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: [security-scan, test-suite, code-quality]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    
+    permissions:
+      contents: read
+      security-events: write  # for trivy SARIF upload
+
     steps:
     - uses: actions/checkout@v4
     
@@ -184,7 +198,7 @@ jobs:
         cache-to: type=gha,mode=max
     
     - name: Scan Docker image
-      # TODO: pin to commit SHA
+      # TODO(R2-CFG-H1.4): pin to specific commit SHA
       uses: aquasecurity/trivy-action@master
       with:
         image-ref: ${{ secrets.DOCKER_USERNAME }}/robo-trader:${{ steps.meta.outputs.version }}
@@ -201,10 +215,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: docker-build
     if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
     environment:
       name: staging
       url: https://staging.robo-trader.com
-    
+
     steps:
     - uses: actions/checkout@v4
     
@@ -226,10 +242,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: deploy-staging
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write   # actions/create-release writes a release
     environment:
       name: production
       url: https://robo-trader.com
-    
+
     steps:
     - uses: actions/checkout@v4
     

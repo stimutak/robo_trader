@@ -25,12 +25,20 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# R2-CFG-H1.2: minimum permissions at workflow level.
+permissions:
+  contents: read
+
 jobs:
   test:
+    # R2-CFG-H1.2: fork guard.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -54,15 +62,18 @@ jobs:
           path: test-results.xml
 
   lint:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-          
+
       - name: Install linting tools
         run: |
           python -m pip install --upgrade pip
@@ -80,15 +91,18 @@ jobs:
         run: mypy robo_trader --ignore-missing-imports || true
 
   security:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      
+
       - name: Install safety
         run: |
           python -m pip install --upgrade pip
@@ -104,11 +118,14 @@ jobs:
           bandit -r robo_trader -ll
 
   build:
+    # Fork guard — uses GITHUB_TOKEN with packages:write scope.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     needs: [test, lint]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      security-events: write  # for trivy SARIF upload
     steps:
       - uses: actions/checkout@v4
       
@@ -148,6 +165,7 @@ jobs:
           cache-to: type=gha,mode=max
           
       - name: Run Trivy vulnerability scanner
+        # TODO(R2-CFG-H1.4): pin to specific commit SHA
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
@@ -164,6 +182,8 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     needs: [build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     environment: staging
     steps:
       - uses: actions/checkout@v4
@@ -183,6 +203,7 @@ jobs:
           # curl https://staging.robo-trader.example.com/health
           
       - name: Notify deployment
+        # TODO(R2-CFG-H1.4): pin to specific commit SHA
         uses: 8398a7/action-slack@v3
         if: always()
         with:
@@ -194,7 +215,10 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [build, deploy-staging]
     runs-on: ubuntu-latest
-    environment: 
+    permissions:
+      contents: write       # createRelease writes a release
+      deployments: write    # createDeployment + createDeploymentStatus
+    environment:
       name: production
       url: https://robo-trader.example.com
     steps:
@@ -259,6 +283,8 @@ jobs:
     if: failure() && github.ref == 'refs/heads/main'
     needs: [deploy-staging, deploy-production]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Trigger rollback
         run: |
@@ -269,6 +295,7 @@ jobs:
           # - Clear caches
           
       - name: Notify rollback
+        # TODO(R2-CFG-H1.4): pin to specific commit SHA
         uses: 8398a7/action-slack@v3
         with:
           status: 'warning'

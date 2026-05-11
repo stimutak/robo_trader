@@ -26,10 +26,10 @@ optuna~=3.5
 
 # Production dependencies
 psutil~=5.9
-cryptography==41.0.7
+cryptography>=44.0.1  # R2-DEP-1: floor at 44.0.1 — older versions have post-release CVEs
 redis==5.0.4
 psycopg2-binary==2.9.9
-gunicorn==21.2.0
+gunicorn>=22.0.0  # CFGN-H1: 21.2.0 had CVE-2024-1135 (HTTP request smuggling). Floor at 22.0.0.
 prometheus-client~=0.19
 
 # Bug detection dependencies

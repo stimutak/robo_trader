@@ -6,12 +6,28 @@ Prevents multiple instances and manages process locks
 
 import atexit
 import os
+import re
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 import psutil
+
+# Allowlist for kill_all_instances pattern: alphanumerics, dot, dash, slash,
+# underscore. No shell metacharacters, no whitespace, no quotes. 1..128 chars.
+_PATTERN_ALLOWLIST = re.compile(r"^[A-Za-z0-9_.\-/]{1,128}$")
+
+
+def _validate_kill_pattern(pattern: str) -> str:
+    """Reject patterns that contain shell metacharacters or are too long."""
+    if not isinstance(pattern, str) or not _PATTERN_ALLOWLIST.match(pattern):
+        raise ValueError(
+            f"refusing to use unsafe pkill pattern: {pattern!r} "
+            f"(must match {_PATTERN_ALLOWLIST.pattern})"
+        )
+    return pattern
 
 
 class ProcessManager:
@@ -103,11 +119,23 @@ class ProcessManager:
 
         for pattern in process_patterns:
             try:
-                # Use pkill to kill processes matching pattern
-                result = os.system(f"pkill -9 -f '{pattern}' 2>/dev/null")
-                if result == 0:
+                # Validate pattern against an allowlist before invoking pkill.
+                # pkill is invoked with shell=False and an argv list, so even
+                # without the allowlist there is no shell injection vector;
+                # the allowlist defends against accidental garbage input.
+                safe_pattern = _validate_kill_pattern(pattern)
+                result = subprocess.run(
+                    ["pkill", "-9", "-f", safe_pattern],
+                    shell=False,
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if result.returncode == 0:
                     killed_count += 1
-                    print(f"Killed processes matching: {pattern}")
+                    print(f"Killed processes matching: {safe_pattern}")
+            except ValueError as e:
+                print(f"Refusing unsafe pattern: {e}")
             except Exception as e:
                 print(f"Error killing {pattern}: {e}")
 

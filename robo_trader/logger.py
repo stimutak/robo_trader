@@ -48,7 +48,21 @@ _SECRET_VALUE_PATTERNS = [
 
 
 def _scrub_value(v: Any) -> Any:
-    """Redact known secret patterns inside string values."""
+    """Redact known secret patterns inside values.
+
+    Recurses into dicts, lists, and tuples so that secrets nested in
+    structured log context (e.g. ``logger.info("event", config={...})``)
+    are still scrubbed. Sets are converted to lists so output stays
+    JSON-serializable. Non-string scalars pass through.
+    """
+    if isinstance(v, dict):
+        return {k: _scrub_value(vv) for k, vv in v.items()}
+    if isinstance(v, list):
+        return [_scrub_value(x) for x in v]
+    if isinstance(v, tuple):
+        return tuple(_scrub_value(x) for x in v)
+    if isinstance(v, set):
+        return [_scrub_value(x) for x in v]
     if not isinstance(v, str):
         return v
     for pat in _SECRET_VALUE_PATTERNS:
@@ -131,6 +145,16 @@ class WebSocketLogProcessor:
             if source == prefix or source.startswith(prefix + "."):
                 return event_dict
 
+        # Build a scrubbed context dict — recursive scrub catches secrets in
+        # nested structures the top-level censor_sensitive cannot reach.
+        raw_context = {
+            k: v
+            for k, v in event_dict.items()
+            if k not in ("event", "logger", "timestamp", "level")
+        }
+        scrubbed_context = _scrub_value(raw_context)
+        scrubbed_message = _scrub_value(event_dict.get("event", str(event_dict)))
+
         # Try server mode first (if ws_manager is running)
         if self._ws_manager is not None:
             thread = getattr(self._ws_manager, "thread", None)
@@ -139,12 +163,8 @@ class WebSocketLogProcessor:
                     self._ws_manager.send_log_message(
                         level=level,
                         source=event_dict.get("logger", "robo_trader"),
-                        message=event_dict.get("event", str(event_dict)),
-                        context={
-                            k: v
-                            for k, v in event_dict.items()
-                            if k not in ("event", "logger", "timestamp", "level")
-                        },
+                        message=scrubbed_message,
+                        context=scrubbed_context,
                     )
                     return event_dict
                 except Exception:
@@ -156,12 +176,8 @@ class WebSocketLogProcessor:
                 self._ws_client.send_log_message(
                     level=level,
                     source=event_dict.get("logger", "robo_trader"),
-                    message=event_dict.get("event", str(event_dict)),
-                    context={
-                        k: v
-                        for k, v in event_dict.items()
-                        if k not in ("event", "logger", "timestamp", "level")
-                    },
+                    message=scrubbed_message,
+                    context=scrubbed_context,
                 )
             except Exception:
                 pass  # Don't let log streaming failures break logging

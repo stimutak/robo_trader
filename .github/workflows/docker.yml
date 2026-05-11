@@ -18,8 +18,14 @@ env:
   DOCKER_BUILDKIT: 1
   COMPOSE_DOCKER_CLI_BUILD: 1
 
+# R2-CFG-H1.3: minimum permissions at workflow level.
+permissions:
+  contents: read
+
 jobs:
   docker-build:
+    # R2-CFG-H1.3: fork guard.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -52,7 +58,7 @@ jobs:
             .
 
       - name: Run Docker security scan
-        # TODO: pin to commit SHA
+        # TODO(R2-CFG-H1.4): pin to specific commit SHA
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: 'robotrader:test'
@@ -128,7 +134,11 @@ jobs:
           mv /tmp/.buildx-cache-new /tmp/.buildx-cache
 
   container-structure-test:
+    # R2-CFG-H1.3: fork guard.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout code
@@ -144,7 +154,11 @@ jobs:
           config: .github/container-structure-test.yml
 
   docker-compose-integration:
+    # R2-CFG-H1.3: fork guard.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout code

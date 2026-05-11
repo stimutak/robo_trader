@@ -6,9 +6,17 @@ on:
   pull_request:
     branches: [ main, develop ]
 
+# R2-CFG-H1.1: minimum permissions at workflow level; jobs only widen as needed.
+permissions:
+  contents: read
+
 jobs:
   lint:
+    # R2-CFG-H1.1: fork guard — never run with secrets on PRs from forks.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
     - uses: actions/checkout@v4
 
@@ -43,7 +51,11 @@ jobs:
       run: bandit -r robo_trader/ -ll --skip B101,B104,B201
 
   test:
+    # R2-CFG-H1.1: fork guard — codecov upload uses CODECOV_TOKEN secret.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     env:
       EXECUTION_MODE: paper
       ENVIRONMENT: dev

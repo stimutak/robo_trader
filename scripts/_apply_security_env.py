@@ -14,8 +14,26 @@ import secrets
 import sys
 from pathlib import Path
 
+# Bootstrap: allow `from _atomic_env import write_env_atomic` regardless of CWD.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _atomic_env import write_env_atomic  # noqa: E402
+
 ENV_PATH = Path(".env")
 IBC_INI_PATH = Path("config/ibc/config.ini")
+
+
+def _refuse_sudo() -> None:
+    """Refuse to run under sudo — would chown .env to root."""
+    try:
+        if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+            sys.stderr.write(
+                "ERROR: do not run this script with sudo. The .env file will be "
+                "owned by root.\nRun as your normal user.\n"
+            )
+            sys.exit(2)
+    except AttributeError:
+        # Non-POSIX — geteuid not available; skip.
+        pass
 
 # Keys we will set if missing (and report their fate). Values may be
 # generated; "GENERATE" means produce a random token.
@@ -71,6 +89,8 @@ def serialize_env(rows: list[tuple[str, str | None]]) -> str:
 
 
 def main() -> int:
+    _refuse_sudo()
+
     if not ENV_PATH.exists():
         print(f"ERROR: {ENV_PATH} not found. Run from project root.", file=sys.stderr)
         return 1
@@ -115,12 +135,8 @@ def main() -> int:
             else:
                 added.append(key)
 
-    # Write back atomically. Make .env mode 0600.
-    ENV_PATH.write_text(serialize_env(rows))
-    try:
-        os.chmod(ENV_PATH, 0o600)
-    except OSError:
-        pass
+    # Write back atomically (tmp + fsync + os.replace). Mode 0600.
+    write_env_atomic(ENV_PATH, serialize_env(rows))
 
     print(f".env updated at {ENV_PATH.resolve()}")
     print(f"  added:     {sorted(added) or '(none)'}")
@@ -147,11 +163,7 @@ def main() -> int:
             "\n" if ini_text.endswith("\n") else ""
         )
         if new_ini != ini_text:
-            IBC_INI_PATH.write_text(new_ini)
-            try:
-                os.chmod(IBC_INI_PATH, 0o600)
-            except OSError:
-                pass
+            write_env_atomic(IBC_INI_PATH, new_ini)
             print(f"\n{IBC_INI_PATH} flipped: {flipped}")
         else:
             print(f"\n{IBC_INI_PATH} already correctly configured.")

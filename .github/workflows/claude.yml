@@ -10,6 +10,10 @@ on:
   pull_request_review:
     types: [submitted]
 
+# R2-CFG-H1.x: minimum permissions at workflow level; job widens.
+permissions:
+  contents: read
+
 jobs:
   claude:
     # Restrict to repo owner/members only — prevents arbitrary external commenters
@@ -41,7 +45,7 @@ jobs:
 
       - name: Run Claude Code
         id: claude
-        # TODO: pin to commit SHA
+        # TODO(R2-CFG-H1.4): pin to specific commit SHA
         uses: anthropics/claude-code-action@beta
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

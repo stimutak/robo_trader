@@ -24,19 +24,24 @@ cachetools==5.3.2
 diskcache==5.6.3
 
 # Security
-cryptography==41.0.7
+# CFGN-H3 (followup audit): cryptography 41.0.7 has post-release CVEs; floor at 44.0.1.
+cryptography>=44.0.1
 PyJWT==2.8.0
 passlib[bcrypt]==1.7.4
-python-jose[cryptography]==3.3.0
+# CFGN-H2 (followup audit): python-jose 3.3.0 has CVE-2024-33664 (JWT alg confusion).
+# Removed: PyJWT (pinned above) covers JWT functionality. If a downstream module
+# imports `jose`, replace it with `jwt` from PyJWT before re-adding this dep.
 
 # HTTP & Networking
 httpx==0.25.2
-aiohttp[speedups]==3.9.1
+# CFGN-H3 (followup audit): aiohttp 3.9.1 has CVE-2024-23334 (directory traversal). Floor at 3.11.18.
+aiohttp[speedups]>=3.11.18
 uvloop==0.19.0
 
 # Process Management
 supervisor==4.2.5
-gunicorn==21.2.0
+# CFGN-H1 (followup audit): gunicorn 21.2.0 has CVE-2024-1135 (HTTP request smuggling, CVSS 7.5). Floor at 22.0.0.
+gunicorn>=22.0.0
 uvicorn[standard]==0.24.0
 
 # Logging & Tracing
