@@ -486,3 +486,80 @@ def test_debug_is_unconditionally_false_a_1():
     assert "debug=_debug" not in code_only, (
         "Remove the conditional debug pattern (A-1); use debug=False instead."
     )
+
+
+# ---------------------------------------------------------------------------
+# Branch-audit round-4: B-6 (CSRF Secure flag behind proxy), B-7 (HSTS + Permissions-Policy)
+# ---------------------------------------------------------------------------
+
+
+def test_csrf_cookie_secure_honors_forwarded_proto_b_6(monkeypatch):
+    """B-6: when X-Forwarded-Proto: https is set (TLS terminated upstream),
+    the CSRF cookie must carry the Secure flag even though Flask sees a
+    plain-HTTP inner connection.
+    """
+    monkeypatch.setenv("TRUST_PROXY", "true")
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    client = app_mod.app.test_client()
+    resp = client.get("/api/health", headers={"X-Forwarded-Proto": "https"})
+    set_cookie = resp.headers.get("Set-Cookie", "")
+    if "csrf_token" not in set_cookie:
+        # Force the cookie path: hit a GET that triggers _set_csrf_cookie.
+        resp = client.get("/api/positions", headers={"X-Forwarded-Proto": "https"})
+        set_cookie = resp.headers.get("Set-Cookie", "")
+    assert "csrf_token" in set_cookie, set_cookie
+    assert "Secure" in set_cookie, (
+        f"CSRF cookie must carry Secure when X-Forwarded-Proto=https. Got: {set_cookie}"
+    )
+
+
+def test_csrf_cookie_secure_via_explicit_override_b_6(monkeypatch):
+    """B-6: COOKIE_SECURE=true env var must force the Secure flag for ops
+    who don't run a proxy that sets X-Forwarded-Proto.
+    """
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false", COOKIE_SECURE="true")
+    client = app_mod.app.test_client()
+    resp = client.get("/api/health")
+    set_cookie = resp.headers.get("Set-Cookie", "")
+    if "csrf_token" not in set_cookie:
+        resp = client.get("/api/positions")
+        set_cookie = resp.headers.get("Set-Cookie", "")
+    assert "csrf_token" in set_cookie
+    assert "Secure" in set_cookie
+
+
+def test_permissions_policy_header_present_b_7(monkeypatch):
+    """B-7: every response must carry a Permissions-Policy header that
+    explicitly denies APIs the dashboard doesn't use.
+    """
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    client = app_mod.app.test_client()
+    resp = client.get("/api/health")
+    pp = resp.headers.get("Permissions-Policy", "")
+    assert pp, "Permissions-Policy header missing"
+    for api in ("geolocation", "microphone", "camera"):
+        assert api in pp, f"Permissions-Policy must explicitly deny {api!r}: got {pp!r}"
+
+
+def test_hsts_emitted_only_on_https_b_7(monkeypatch):
+    """B-7: Strict-Transport-Security must only be emitted when the
+    operator's connection is HTTPS (avoid shipping HSTS over HTTP).
+    """
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    client = app_mod.app.test_client()
+
+    # Plain HTTP test client request: no HSTS expected.
+    resp_http = client.get("/api/health")
+    assert "Strict-Transport-Security" not in resp_http.headers
+
+
+def test_hsts_emitted_when_forwarded_proto_https_b_7(monkeypatch):
+    """B-7: HSTS must appear when X-Forwarded-Proto: https indicates the
+    operator's connection is TLS-terminated upstream (with TRUST_PROXY=true).
+    """
+    monkeypatch.setenv("TRUST_PROXY", "true")
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    client = app_mod.app.test_client()
+    resp = client.get("/api/health", headers={"X-Forwarded-Proto": "https"})
+    hsts = resp.headers.get("Strict-Transport-Security", "")
+    assert "max-age" in hsts, hsts

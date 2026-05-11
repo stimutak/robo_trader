@@ -65,6 +65,19 @@ for _origin in allowed_origins:
         )
 
 CORS(app, origins=allowed_origins, supports_credentials=True)
+
+# B-6 (branch audit, HIGH): install ProxyFix so request.is_secure / scheme
+# reflect the operator's connection (X-Forwarded-Proto from nginx/Caddy)
+# instead of the inner plain-HTTP hop to Flask. Without this, the Secure
+# cookie flag and any HTTPS-conditional headers are silently disabled
+# behind a TLS-terminating reverse proxy. Gated on TRUST_PROXY=true so
+# direct (no-proxy) deployments don't accidentally trust attacker-supplied
+# X-Forwarded-* headers.
+if os.getenv("TRUST_PROXY", "").strip().lower() == "true":
+    from werkzeug.middleware.proxy_fix import ProxyFix  # noqa: E402
+
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1, x_for=1)
+
 server = app  # For Gunicorn compatibility
 
 # Thread-safe cache for positions endpoint
@@ -364,6 +377,26 @@ def csrf_required(f):
     return decorated
 
 
+def _request_is_https() -> bool:
+    """B-6 (branch audit, HIGH): `request.is_secure` reflects the inner Flask
+    connection only. With nginx/Caddy terminating TLS, the operator's
+    connection is HTTPS but Flask sees plain HTTP, so the Secure cookie
+    flag was never set and the CSRF token could be exfiltrated over
+    cleartext within the LAN. Honor X-Forwarded-Proto (set by configured
+    proxies) and an explicit COOKIE_SECURE=true override.
+    The ProxyFix middleware (wired below at app.wsgi_app) makes
+    request.is_secure correct when X-Forwarded-Proto is honored — this
+    helper layers an explicit env override on top for ops who don't run
+    a proxy that sets the header.
+    """
+    if os.getenv("COOKIE_SECURE", "").strip().lower() == "true":
+        return True
+    if request.is_secure:
+        return True
+    forwarded_proto = (request.headers.get("X-Forwarded-Proto", "") or "").split(",")[0].strip().lower()
+    return forwarded_proto == "https"
+
+
 @app.after_request
 def _set_csrf_cookie(response):
     """Issue a CSRF token cookie on responses if one isn't set yet (W-H2)."""
@@ -375,7 +408,10 @@ def _set_csrf_cookie(response):
                 token,
                 httponly=False,
                 samesite="Strict",
-                secure=request.is_secure,
+                # B-6: secure flag now honors X-Forwarded-Proto and the explicit
+                # COOKIE_SECURE override so the cookie isn't exposed over plain
+                # HTTP when a TLS-terminating proxy sits in front.
+                secure=_request_is_https(),
             )
     except Exception:
         pass
@@ -401,12 +437,26 @@ _DASHBOARD_CSP = (
 
 @app.after_request
 def _set_security_headers(response):
-    """Add baseline security headers to every response (W-R2-M1)."""
+    """Add baseline security headers to every response (W-R2-M1 + B-7)."""
     try:
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
         response.headers.setdefault("Content-Security-Policy", _DASHBOARD_CSP)
+        # B-7 (branch audit, HIGH): missing Permissions-Policy and HSTS.
+        # Permissions-Policy: explicitly deny APIs the dashboard does not use,
+        # so a future XSS-induced script can't ask for them. HSTS: only emit
+        # when the operator's connection is HTTPS, since shipping HSTS over
+        # HTTP for a 2-year window would be a foot-gun on a misconfigured host.
+        response.headers.setdefault(
+            "Permissions-Policy",
+            "geolocation=(), microphone=(), camera=(), payment=(), usb=()",
+        )
+        if _request_is_https():
+            response.headers.setdefault(
+                "Strict-Transport-Security",
+                "max-age=63072000; includeSubDomains",
+            )
     except Exception:
         pass
     return response
