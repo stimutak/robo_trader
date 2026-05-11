@@ -68,7 +68,10 @@ aioratelimiter==1.1.0
 
 # Production web server
 gevent==23.9.1
-eventlet==0.33.3
+# B-5 (branch audit, HIGH): eventlet 0.33.3 had request-smuggling CVEs.
+# Floor at 0.36.1. Remove this dep entirely if neither uvloop nor gevent
+# already cover the workers' needs.
+eventlet>=0.36.1
 
 # Configuration Management
 python-dotenv==1.0.0

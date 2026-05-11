@@ -1116,10 +1116,29 @@ async def connect_ibkr_robust(
         transport_mode = transport_modes[min(transport_index, len(transport_modes) - 1)]
 
         if transport_mode == "ssl":
-            # Configure TLS transport with relaxed certificate checks for local Gateway
+            # B-11 (branch audit, HIGH): TLS with CERT_NONE provides encryption
+            # without authentication. A local-LAN attacker can MITM the
+            # connection. Refuse this combination unless the Gateway is on
+            # a loopback address (where MITM requires already-root access).
+            # If you need to connect to a non-loopback Gateway over TLS, pin
+            # its self-signed certificate via IBKR_GATEWAY_CAFILE.
+            _loopback_hosts = {"127.0.0.1", "localhost", "::1"}
+            _cafile = os.getenv("IBKR_GATEWAY_CAFILE", "").strip()
             ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
+            if _cafile:
+                ssl_context.load_verify_locations(cafile=_cafile)
+                ssl_context.check_hostname = False  # self-signed gateway cert
+            else:
+                if host not in _loopback_hosts:
+                    raise RuntimeError(
+                        f"Refusing TLS to non-loopback IBKR host {host!r} without "
+                        "IBKR_GATEWAY_CAFILE set. CERT_NONE allows LAN MITM. "
+                        "Either pin the Gateway cert via IBKR_GATEWAY_CAFILE or "
+                        "connect via the loopback interface."
+                    )
+                # Loopback: CERT_NONE acceptable (MITM requires root anyway)
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
 
             conn = ib.client.conn
 

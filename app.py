@@ -54,6 +54,16 @@ if cors_origins:
 else:
     allowed_origins = ["http://127.0.0.1:5555", "http://localhost:5555"]
 
+# C-12 (branch audit, MED): reject any wildcard-containing origin because
+# CORS supports_credentials=True with `*` is a confused-deputy primitive.
+for _origin in allowed_origins:
+    if "*" in _origin:
+        raise SystemExit(
+            f"Refusing to start: wildcard CORS origin {_origin!r} is unsafe "
+            "with supports_credentials=True. Set CORS_ORIGINS to a comma-"
+            "separated list of exact origins."
+        )
+
 CORS(app, origins=allowed_origins, supports_credentials=True)
 server = app  # For Gunicorn compatibility
 
@@ -6724,20 +6734,86 @@ def get_kelly_parameters(symbol):
 @requires_auth
 @csrf_required
 def control_kill_switch():
-    """Control kill switch (reset after trigger)"""
+    """Control kill switch (reset / disable / status).
+
+    B-13 (branch audit, HIGH): previously the `reset` action returned
+    success without touching the actual KillSwitch state, so the UI lied
+    to operators. Now we either:
+      - Drive the on-disk kill_switch_state.json + kill_switch.lock that
+        `KillSwitch` reads (this matches the persistence contract added by
+        R2-M1/M2), or
+      - Return 501 Not Implemented so the operator knows to use the CLI.
+    We pick the file-driven path so the UI is honest.
+    """
     action = (request.json or {}).get("action", "status")
+    state_path = Path("data/kill_switch_state.json")
+    lock_path = Path("data/kill_switch.lock")
 
     if action == "reset":
-        # Would reset actual kill switch
-        return jsonify(
-            {"success": True, "message": "Kill switch reset successfully", "status": "active"}
-        )
+        # Drive the same on-disk state that KillSwitch._load_persisted_state
+        # reads. Removing both files mirrors KillSwitch.reset().
+        try:
+            cleared_state = False
+            cleared_lock = False
+            if state_path.exists():
+                state_path.unlink()
+                cleared_state = True
+            if lock_path.exists():
+                lock_path.unlink()
+                cleared_lock = True
+            logger.warning(
+                "kill-switch reset via dashboard",
+                cleared_state=cleared_state,
+                cleared_lock=cleared_lock,
+                remote_addr=request.remote_addr,
+            )
+            return jsonify(
+                {
+                    "success": True,
+                    "message": "Kill switch reset",
+                    "status": "active",
+                    "cleared_state_file": cleared_state,
+                    "cleared_lock_file": cleared_lock,
+                }
+            )
+        except OSError:
+            logger.exception("kill-switch reset failed")
+            return jsonify({"success": False, "error": "internal_error"}), 500
     elif action == "disable":
-        # Would disable kill switch temporarily
-        return jsonify({"success": True, "message": "Kill switch disabled", "status": "disabled"})
+        # "disable" is intentionally not supported via API — disabling the
+        # kill switch without an audit trail is operator-error territory.
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": "disable_not_allowed",
+                    "message": "Disabling the kill switch is restricted; edit data/kill_switch_state.json manually if you must.",
+                }
+            ),
+            403,
+        )
     else:
-        # Return current status
-        return jsonify({"active": False, "triggered": False, "can_trade": True})
+        # Status: read the same files KillSwitch persists to.
+        try:
+            triggered = state_path.exists() or lock_path.exists()
+            reason = None
+            if state_path.exists():
+                try:
+                    reason = json.loads(state_path.read_text()).get("reason")
+                except (OSError, ValueError):
+                    reason = "state file unreadable - failing safe"
+                    triggered = True  # R2-M1 fail-CLOSED on corrupt state
+            return jsonify(
+                {
+                    "active": triggered,
+                    "triggered": triggered,
+                    "can_trade": not triggered,
+                    "reason": reason,
+                }
+            )
+        except OSError:
+            logger.exception("kill-switch status check failed")
+            return jsonify({"active": True, "triggered": True, "can_trade": False}), 500
 
 
 @app.route("/api/safety/circuit-breakers")
@@ -6879,9 +6955,31 @@ def start_trading():
     if trading_status == "running":
         return jsonify({"status": "already_running"})
 
+    # B-9 (branch audit, HIGH): validate each symbol BEFORE flowing into the
+    # subprocess. subprocess.run(shell=False) blocks Python-side injection,
+    # but a control-character or 200-char payload could still confuse the
+    # runner's --symbols parser. Reuse DatabaseValidator.validate_symbol
+    # which already enforces the ^[A-Z]{1,5}(\.[A-Z]{1,2})?$ regex.
+    try:
+        from robo_trader.database_validator import DatabaseValidator, ValidationError
+
+        if isinstance(symbols, str):
+            symbols = [s.strip() for s in symbols.split(",") if s.strip()]
+        symbols = [DatabaseValidator.validate_symbol(s) for s in symbols]
+        if not symbols:
+            return (
+                jsonify({"status": "error", "error": "no_symbols"}),
+                400,
+            )
+    except ValidationError as exc:
+        return (
+            jsonify({"status": "error", "error": "invalid_symbol", "detail": str(exc)}),
+            400,
+        )
+
     # Use the start_runner.sh script for proper startup with Gateway checks
     script_path = os.path.join(os.path.dirname(__file__), "scripts", "start_runner.sh")
-    symbols_str = ",".join(symbols) if isinstance(symbols, list) else symbols
+    symbols_str = ",".join(symbols)
 
     try:
         # Run the startup script and capture output
@@ -7052,18 +7150,21 @@ if __name__ == "__main__":
 
     logger.info(f"Dashboard starting on port {os.getenv('DASH_PORT', 5555)}")
 
-    # W-R2-L1: refuse to start with the Werkzeug debugger reachable on a
-    # non-loopback interface. The debugger exposes a remote-code-execution
-    # console once an unhandled exception fires.
+    # A-1 (branch audit, CRITICAL): the Werkzeug debugger is unauth RCE-as-
+    # a-feature, gated only by a guessable PIN. The previous guard refused to
+    # start on a non-loopback host but still enabled debug=True on loopback.
+    # We now disable debug=True UNCONDITIONALLY. For dev convenience, set
+    # use_reloader=True (autoreload) when FLASK_ENV=development AND host is
+    # loopback. Anyone wanting the interactive debugger must explicitly opt
+    # in via `flask --debug run`, never via this process.
     _flask_env = (os.getenv("FLASK_ENV", "") or "").strip().lower()
     _dash_host = (os.getenv("DASH_HOST", "127.0.0.1") or "").strip()
-    _debug = _flask_env == "development"
     _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
-    if _debug and _dash_host not in _LOOPBACK:
+    _dev_reload = _flask_env == "development" and _dash_host in _LOOPBACK
+    if _flask_env == "development" and _dash_host not in _LOOPBACK:
         raise SystemExit(
-            "Refusing to start: FLASK_ENV=development with DASH_HOST=%r exposes "
-            "the Werkzeug debugger on a non-loopback interface. "
-            "Set DASH_HOST=127.0.0.1 or unset FLASK_ENV." % _dash_host
+            "Refusing to start: FLASK_ENV=development with DASH_HOST=%r is "
+            "ambiguous. Set DASH_HOST=127.0.0.1 or unset FLASK_ENV." % _dash_host
         )
 
     # Run Flask app
@@ -7072,6 +7173,6 @@ if __name__ == "__main__":
     app.run(
         host=_dash_host or "127.0.0.1",
         port=int(os.getenv("DASH_PORT", 5555)),
-        use_reloader=False,
-        debug=_debug,
+        use_reloader=_dev_reload,
+        debug=False,  # A-1: never enable Werkzeug debugger anywhere
     )

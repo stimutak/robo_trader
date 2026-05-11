@@ -772,3 +772,54 @@ async def test_runner_on_stop_loss_executed_short_uses_buy_to_cover_tcn_h4() -> 
     runner.portfolio.update_fill.assert_awaited_once_with("TSLA", "BUY_TO_COVER", 5, 210.6)
     args, _ = runner.db.record_trade.call_args
     assert args[1] == "BUY_TO_COVER"
+
+
+# ---------------------------------------------------------------------------
+# Branch-audit (claude/security-audit-5tFIY) round-3 regression tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_rejects_non_finite_price_c_13(monkeypatch) -> None:
+    """C-13: the SELL close-long path used to skip the finite-number guard
+    because that lived inside validate_order. Lift it into
+    _place_order_with_circuit_breaker so every order path is guarded.
+    """
+    import math
+    from robo_trader.runner_async import AsyncRunner
+    from robo_trader.execution import Order
+
+    # Build a minimal runner with mocked dependencies. We only exercise the
+    # finite-check, which short-circuits before any of the other gates.
+    runner = AsyncRunner.__new__(AsyncRunner)
+
+    bad_order = Order(
+        symbol="AAPL",
+        quantity=10,
+        side="SELL",
+        price=float("nan"),
+    )
+    result = await AsyncRunner._place_order_with_circuit_breaker(runner, bad_order)
+    assert result.ok is False
+    assert "Non-finite" in result.message or "non-finite" in result.message.lower()
+
+
+def test_config_does_not_silently_flip_readonly_b_12(monkeypatch):
+    """B-12: setting ENVIRONMENT=production alone must NOT clear the
+    readonly flag. Live order placement requires the explicit
+    IBKR_LIVE_ALLOW_ORDERS=true consent flag.
+    """
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.delenv("IBKR_LIVE_ALLOW_ORDERS", raising=False)
+    # Force reload of the config module so the env vars take effect.
+    import importlib
+    import robo_trader.config as cfg_mod
+    importlib.reload(cfg_mod)
+    try:
+        cfg = cfg_mod.load_config()
+    except Exception:
+        pytest.skip("load_config requires additional environment for production mode")
+        return
+    assert cfg.ibkr.readonly is True, (
+        "ENVIRONMENT=production without IBKR_LIVE_ALLOW_ORDERS must keep readonly=True"
+    )

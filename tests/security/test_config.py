@@ -535,3 +535,20 @@ def test_python_jose_removed_cfgn_h2():
     assert re.search(r"^PyJWT", text, re.MULTILINE), (
         "PyJWT must remain pinned as the JWT replacement for python-jose"
     )
+
+
+# ---------------------------------------------------------------------------
+# Branch-audit round-3: B-5 (eventlet pin)
+# ---------------------------------------------------------------------------
+
+
+def test_eventlet_floor_avoids_request_smuggling_b_5():
+    """B-5: eventlet 0.33.3 had request-smuggling CVEs. Floor at 0.36.1."""
+    text = (REPO_ROOT / "requirements-prod.txt").read_text()
+    import re as _re
+    if not _re.search(r"^eventlet\b", text, _re.MULTILINE):
+        # eventlet may legitimately be removed entirely
+        return
+    assert _re.search(r"^eventlet\s*>=\s*0\.(3[6-9]|[4-9]\d)\.", text, _re.MULTILINE), (
+        "eventlet must be pinned >=0.36.1 (B-5) or removed entirely"
+    )

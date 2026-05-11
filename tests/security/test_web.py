@@ -405,3 +405,84 @@ def test_debug_on_loopback_host_allowed(monkeypatch):
     # Loopback debug is OK.
     assert debug
     assert dash_host in LOOPBACK
+
+
+# ---------------------------------------------------------------------------
+# Branch-audit (claude/security-audit-5tFIY) round-3 regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_cors_rejects_wildcard_origin_c_12(monkeypatch):
+    """C-12: a wildcard CORS_ORIGINS entry must abort startup, since
+    supports_credentials=True + `*` is a confused-deputy primitive.
+    """
+    import importlib
+    import sys
+    monkeypatch.setenv("CORS_ORIGINS", "http://*.example.com")
+    sys.modules.pop("app", None)
+    with pytest.raises(SystemExit):
+        importlib.import_module("app")
+    # Cleanup so other tests can re-import cleanly without wildcard env.
+    sys.modules.pop("app", None)
+
+
+def test_kill_switch_status_reflects_state_file_b_13(tmp_path, monkeypatch):
+    """B-13: /api/risk/kill-switch status must read the on-disk state file
+    that KillSwitch persists to, not return a hard-coded {triggered: False}.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "kill_switch.lock").touch()
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    client = app_mod.app.test_client()
+    token = "kill-switch-token-32-chars-aaaaaa"
+    client.set_cookie("csrf_token", token, domain="localhost")
+    resp = client.post(
+        "/api/risk/kill-switch",
+        json={"action": "status"},
+        headers={"X-CSRF-Token": token},
+    )
+    body = resp.get_json()
+    assert body is not None and body.get("triggered") is True, body
+
+
+def test_start_endpoint_rejects_bad_symbol_b_9(monkeypatch):
+    """B-9: /api/start must reject invalid symbol strings BEFORE invoking
+    the subprocess, so a 200-char payload or control character cannot flow
+    into start_runner.sh.
+    """
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    # Reset trading_status because earlier tests may have left it "running".
+    app_mod.trading_status = "stopped"
+    client = app_mod.app.test_client()
+    token = "start-endpoint-token-32-chars-bbb"
+    client.set_cookie("csrf_token", token, domain="localhost")
+    bad_payload = {"symbols": ["AAPL;rm -rf /"]}
+    resp = client.post(
+        "/api/start",
+        json=bad_payload,
+        headers={"X-CSRF-Token": token},
+    )
+    assert resp.status_code == 400, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert body.get("error") == "invalid_symbol"
+
+
+def test_debug_is_unconditionally_false_a_1():
+    """A-1: the Werkzeug debugger must NEVER be enabled by this entrypoint.
+    The audit specifies disabling it unconditionally; FLASK_ENV=development
+    only flips use_reloader, not debug.
+    """
+    import inspect
+    import app as app_mod
+    source = inspect.getsource(app_mod)
+    # The literal call site for app.run must pass debug=False (or the
+    # named constant False), with an inline comment referencing A-1.
+    code_only = "\n".join(line.split("#", 1)[0] for line in source.splitlines())
+    assert "debug=False" in code_only, (
+        "app.run must pass debug=False unconditionally (A-1)."
+    )
+    # The old `debug=_debug` pattern must NOT come back.
+    assert "debug=_debug" not in code_only, (
+        "Remove the conditional debug pattern (A-1); use debug=False instead."
+    )

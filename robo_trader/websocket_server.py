@@ -139,6 +139,23 @@ class WebSocketManager:
             if not token or not hmac.compare_digest(token, self.auth_token):
                 logger.warning("WS rejected: missing/invalid token")
                 return False
+            # C-11 (branch audit, MED): even with a valid token, refuse non-
+            # loopback peers unless the server is explicitly bound to a non-
+            # loopback host. Without this, a leaked token grants LAN-wide
+            # WS access regardless of bind address (the token check used to
+            # bypass the peer check entirely).
+            ws_host = os.getenv("WS_HOST", "127.0.0.1").strip()
+            if ws_host in ("127.0.0.1", "localhost", "::1"):
+                try:
+                    peer_ip = websocket.remote_address[0] if websocket.remote_address else ""
+                except Exception:
+                    peer_ip = ""
+                if peer_ip not in ("127.0.0.1", "::1"):
+                    logger.warning(
+                        f"WS rejected: token-authenticated non-loopback peer {peer_ip} "
+                        f"while WS_HOST={ws_host!r} (loopback-only bind)"
+                    )
+                    return False
         else:
             # No token configured -> only allow connections from loopback.
             try:

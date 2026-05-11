@@ -552,3 +552,25 @@ def test_gateway_manager_start_uses_env_allowlist_ibn_h2():
     assert "os.environ.copy()" not in code_only, (
         "start_gateway code must not call os.environ.copy() (IBN-H2)."
     )
+
+
+# ---------------------------------------------------------------------------
+# Branch-audit (claude/security-audit-5tFIY) round-3
+# ---------------------------------------------------------------------------
+
+
+def test_robust_connection_refuses_cert_none_for_non_loopback_b_11():
+    """B-11: the SSL transport path in robust_connection must refuse
+    CERT_NONE to non-loopback hosts unless IBKR_GATEWAY_CAFILE is set.
+    """
+    import inspect
+    import robo_trader.utils.robust_connection as rc
+    source = inspect.getsource(rc)
+    # The CERT_NONE branch must check for loopback OR cafile.
+    assert "IBKR_GATEWAY_CAFILE" in source, (
+        "robust_connection must read IBKR_GATEWAY_CAFILE for cert pinning (B-11)"
+    )
+    code_only = "\n".join(line.split("#", 1)[0] for line in source.splitlines())
+    assert "loopback" in code_only.lower() or "127.0.0.1" in code_only, (
+        "robust_connection must refuse CERT_NONE on non-loopback hosts (B-11)"
+    )

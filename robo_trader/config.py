@@ -648,7 +648,12 @@ def get_config_for_environment(env: Environment) -> Config:
         base_config.risk.max_daily_loss_pct = 0.003
         base_config.monitoring.enable_alerts = True
         base_config.monitoring.log_level = "INFO"
-        base_config.ibkr.readonly = False
+        # B-12 (branch audit, HIGH): the previous unconditional assignment
+        # `base_config.ibkr.readonly = False` silently disabled the read-only
+        # safety net whenever ENVIRONMENT=production was set. Live trading
+        # now requires an explicit, separately-named consent flag.
+        if os.getenv("IBKR_LIVE_ALLOW_ORDERS", "").strip().lower() == "true":
+            base_config.ibkr.readonly = False
 
     elif env == Environment.STAGING:
         # Staging overrides

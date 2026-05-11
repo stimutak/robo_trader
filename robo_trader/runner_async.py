@@ -482,6 +482,24 @@ class AsyncRunner:
         Checks circuit breaker state before execution and records
         success/failure for fault tolerance monitoring.
         """
+        # C-13 (branch audit, MED): the SELL (close-long) path skips
+        # validate_order, so its NaN/Inf finite-number guard is missed.
+        # Lift the check here so every order path is guarded. Stop-loss
+        # execution also routes through this method, so the guard catches
+        # bad trigger_price values too.
+        import math as _math
+
+        _price = order.price if order.price is not None else 0.0
+        _qty = order.quantity if order.quantity is not None else 0
+        if not (_math.isfinite(_price) and _math.isfinite(float(_qty))):
+            logger.error(
+                f"Order rejected: non-finite price={_price!r} or qty={_qty!r} "
+                f"for {order.symbol}"
+            )
+            return SimpleNamespace(
+                ok=False, message="Non-finite price or quantity", fill_price=None
+            )
+
         # TC-M1 / TC-M6: centralized trading-blocked gate. This catches every
         # path that places an order, including SELL/closing flows, pairs trading,
         # and stop-loss execution. Without this, kill_switch / emergency_shutdown
@@ -733,6 +751,22 @@ class AsyncRunner:
                     self._setup_complete = False
 
         self.cfg = load_config()
+
+        # B-12 (branch audit, HIGH): belt-and-suspenders on top of
+        # config.py's gating — if anything is overriding config to set
+        # ibkr.readonly=False without the explicit consent flag, abort.
+        # This catches the case where readonly is mutated outside of
+        # _apply_env_overrides (tests, ad-hoc scripts, future bugs).
+        if (
+            not self.cfg.ibkr.readonly
+            and os.getenv("IBKR_LIVE_ALLOW_ORDERS", "").strip().lower() != "true"
+        ):
+            raise SystemExit(
+                "Refusing to start: cfg.ibkr.readonly=False without "
+                "IBKR_LIVE_ALLOW_ORDERS=true. Live order placement requires "
+                "an explicit consent flag; set IBKR_LIVE_ALLOW_ORDERS=true "
+                "alongside the readonly=False configuration."
+            )
 
         # Load stop-loss settings from validated config
         self.stop_loss_percent = self.cfg.risk.stop_loss_pct
