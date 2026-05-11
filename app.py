@@ -68,20 +68,58 @@ DEFAULT_CAPITAL = float(os.getenv("DEFAULT_CASH", getattr(config, "default_cash"
 AUTH_ENABLED = os.getenv("DASH_AUTH_ENABLED", "true").lower() == "true"
 AUTH_USER = os.getenv("DASH_USER", "admin")
 AUTH_PASS_HASH = os.getenv("DASH_PASS_HASH", "").strip()
-# Reject empty AND placeholder values. A SHA-256 hex digest is exactly 64
-# lowercase hex chars; anything else is misconfiguration.
+# W-R2-M3: support multiple hash formats so existing deployments keep working.
+#   - 64-char hex  -> legacy unsalted SHA-256 (still verified for back-compat)
+#   - $2a$/$2b$/$2y$ -> bcrypt (only if 'bcrypt' is importable)
+#   - $scrypt$N$r$p$<salt_b64>$<hash_b64> -> stdlib hashlib.scrypt (no new deps)
+# We deliberately use hashlib.scrypt as the recommended new format because the
+# project requirements.txt does not currently pin bcrypt and we do not want to
+# add a third-party dependency for a single-user dashboard.
 _PLACEHOLDER_PREFIXES = ("<", "TODO", "CHANGEME", "REPLACE")
-if AUTH_ENABLED and (
-    not AUTH_PASS_HASH
-    or AUTH_PASS_HASH.upper().startswith(_PLACEHOLDER_PREFIXES)
-    or len(AUTH_PASS_HASH) != 64
-    or not all(c in "0123456789abcdefABCDEF" for c in AUTH_PASS_HASH)
-):
+
+
+def _is_legacy_sha256_hex(value: str) -> bool:
+    if len(value) != 64:
+        return False
+    return all(c in "0123456789abcdefABCDEF" for c in value)
+
+
+def _is_valid_pass_hash(value: str) -> bool:
+    """Accept legacy hex-sha256, bcrypt ($2a/$2b/$2y), or our scrypt format."""
+    if not value:
+        return False
+    if value.upper().startswith(_PLACEHOLDER_PREFIXES):
+        return False
+    if _is_legacy_sha256_hex(value):
+        return True
+    if value.startswith(("$2a$", "$2b$", "$2y$")) and len(value) >= 59:
+        return True
+    if value.startswith("$scrypt$"):
+        # $scrypt$N$r$p$salt_b64$hash_b64
+        parts = value.split("$")
+        return len(parts) == 7 and parts[0] == "" and parts[1] == "scrypt"
+    return False
+
+
+if AUTH_ENABLED and not _is_valid_pass_hash(AUTH_PASS_HASH):
     raise SystemExit(
-        "DASH_PASS_HASH must be a 64-char SHA-256 hex digest when auth is enabled. "
+        "DASH_PASS_HASH must be a 64-char SHA-256 hex digest, a bcrypt hash, "
+        "or a $scrypt$... hash when auth is enabled. "
         "Run: .venv/bin/python scripts/_set_dashboard_password.py "
         "(or set DASH_AUTH_ENABLED=false for local dev)."
     )
+
+# W-R2-M3: per-IP lockout configuration.
+try:
+    AUTH_LOCKOUT_THRESHOLD = max(1, int(os.getenv("AUTH_LOCKOUT_THRESHOLD", "5")))
+except ValueError:
+    AUTH_LOCKOUT_THRESHOLD = 5
+try:
+    AUTH_LOCKOUT_MINUTES = max(1, int(os.getenv("AUTH_LOCKOUT_MINUTES", "30")))
+except ValueError:
+    AUTH_LOCKOUT_MINUTES = 30
+_AUTH_FAILURES: Dict[str, Dict[str, float]] = {}
+_AUTH_FAILURES_LOCK = threading.Lock()
 
 # Initialize components - will be loaded lazily
 db = None
@@ -140,6 +178,43 @@ else:
 
 
 # Authentication
+def _verify_password_against_hash(password: str, stored: str) -> bool:
+    """Verify ``password`` against ``stored`` (legacy sha256, bcrypt, or scrypt)."""
+    if not stored:
+        return False
+    # bcrypt format
+    if stored.startswith(("$2a$", "$2b$", "$2y$")):
+        try:
+            import bcrypt  # type: ignore
+        except ImportError:
+            logger.error("DASH_PASS_HASH is bcrypt but 'bcrypt' is not installed")
+            return False
+        try:
+            return bcrypt.checkpw(password.encode("utf-8"), stored.encode("utf-8"))
+        except Exception:
+            return False
+    # stdlib scrypt format: $scrypt$N$r$p$salt_b64$hash_b64
+    if stored.startswith("$scrypt$"):
+        try:
+            import base64
+
+            _, _, n_s, r_s, p_s, salt_b64, hash_b64 = stored.split("$")
+            n, r, p = int(n_s), int(r_s), int(p_s)
+            salt = base64.b64decode(salt_b64)
+            expected = base64.b64decode(hash_b64)
+            derived = hashlib.scrypt(
+                password.encode("utf-8"), salt=salt, n=n, r=r, p=p, dklen=len(expected)
+            )
+            return hmac.compare_digest(derived, expected)
+        except Exception:
+            return False
+    # Legacy unsalted SHA-256 hex digest (back-compat).
+    if _is_legacy_sha256_hex(stored):
+        digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        return hmac.compare_digest(digest.lower(), stored.lower())
+    return False
+
+
 def check_auth(username, password):
     """Check if username/password is valid using timing-safe comparison."""
     if not AUTH_ENABLED:
@@ -147,11 +222,48 @@ def check_auth(username, password):
     # W-H1: never short-circuit to True when auth is on but hash is missing.
     if not AUTH_PASS_HASH:
         return False
-    password_hash = hashlib.sha256(password.encode()).hexdigest()
-    # Use timing-safe comparison to prevent timing attacks
-    return hmac.compare_digest(username, AUTH_USER) and hmac.compare_digest(
-        password_hash, AUTH_PASS_HASH
-    )
+    if not isinstance(username, str) or not isinstance(password, str):
+        return False
+    user_ok = hmac.compare_digest(username, AUTH_USER)
+    pass_ok = _verify_password_against_hash(password, AUTH_PASS_HASH)
+    return user_ok and pass_ok
+
+
+def _client_ip() -> str:
+    """Best-effort client IP for lockout keying. We never trust XFF here."""
+    return (request.remote_addr or "unknown").strip()
+
+
+def _is_locked_out(ip: str) -> bool:
+    """Return True if ``ip`` has exceeded AUTH_LOCKOUT_THRESHOLD recently."""
+    now = time.time()
+    window = AUTH_LOCKOUT_MINUTES * 60
+    with _AUTH_FAILURES_LOCK:
+        entry = _AUTH_FAILURES.get(ip)
+        if not entry:
+            return False
+        # Drop stale entries.
+        if now - entry.get("first", now) > window:
+            _AUTH_FAILURES.pop(ip, None)
+            return False
+        return entry.get("count", 0) >= AUTH_LOCKOUT_THRESHOLD
+
+
+def _record_auth_failure(ip: str) -> None:
+    now = time.time()
+    window = AUTH_LOCKOUT_MINUTES * 60
+    with _AUTH_FAILURES_LOCK:
+        entry = _AUTH_FAILURES.get(ip)
+        if not entry or (now - entry.get("first", now)) > window:
+            _AUTH_FAILURES[ip] = {"first": now, "count": 1, "last": now}
+        else:
+            entry["count"] = entry.get("count", 0) + 1
+            entry["last"] = now
+
+
+def _record_auth_success(ip: str) -> None:
+    with _AUTH_FAILURES_LOCK:
+        _AUTH_FAILURES.pop(ip, None)
 
 
 def authenticate():
@@ -163,6 +275,14 @@ def authenticate():
     )
 
 
+def _locked_out_response():
+    return Response(
+        f"Too many failed attempts. Try again in {AUTH_LOCKOUT_MINUTES} minutes.\n",
+        429,
+        {"Retry-After": str(AUTH_LOCKOUT_MINUTES * 60)},
+    )
+
+
 def requires_auth(f):
     """Decorator to require authentication for routes."""
 
@@ -170,31 +290,40 @@ def requires_auth(f):
     def decorated(*args, **kwargs):
         if not AUTH_ENABLED:
             return f(*args, **kwargs)
+        ip = _client_ip()
+        # W-R2-M3: per-IP lockout after AUTH_LOCKOUT_THRESHOLD failures.
+        if _is_locked_out(ip):
+            return _locked_out_response()
         auth = request.authorization
         if not auth or not check_auth(auth.username, auth.password):
+            _record_auth_failure(ip)
             return authenticate()
+        _record_auth_success(ip)
         return f(*args, **kwargs)
 
     return decorated
 
 
 # W-H2: CSRF (double-submit cookie) and Origin check for state-changing requests.
+# W-R2-M2: do NOT trust request.host (attacker-controlled Host header). Build the
+# allowlist from configured DASH_HOST/DASH_PORT/CORS_ORIGINS only.
 def _allowed_request_origins():
-    """Whitelist of allowed Origin values for state-changing requests."""
-    host = request.host or ""
-    # request.host includes port already (e.g. "127.0.0.1:5555")
-    base = {
-        f"http://{host}",
-        f"https://{host}",
-    }
-    # Always allow loopback variants on the dashboard port.
+    """Whitelist of allowed Origin values for state-changing requests.
+
+    Origins are derived from DASH_HOST, DASH_PORT and explicit CORS_ORIGINS only.
+    The inbound Host header is ignored deliberately to prevent host-header
+    spoofing from satisfying the Origin check.
+    """
     port = os.getenv("DASH_PORT", "5555")
-    base.update(
-        {
-            f"http://127.0.0.1:{port}",
-            f"http://localhost:{port}",
-        }
-    )
+    dash_host = os.getenv("DASH_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    base = {
+        f"http://127.0.0.1:{port}",
+        f"http://localhost:{port}",
+    }
+    # If DASH_HOST is something specific (not 0.0.0.0), allow http+https of that host:port.
+    if dash_host not in ("0.0.0.0", "::", ""):
+        base.add(f"http://{dash_host}:{port}")
+        base.add(f"https://{dash_host}:{port}")
     extra = os.getenv("CORS_ORIGINS", "").strip()
     if extra:
         for origin in extra.split(","):
@@ -238,6 +367,36 @@ def _set_csrf_cookie(response):
                 samesite="Strict",
                 secure=request.is_secure,
             )
+    except Exception:
+        pass
+    return response
+
+
+# W-R2-M1: global security headers. Applied to every response.
+# CSP allows the dashboard's existing inline <style>/<script> blocks plus the
+# chart.js CDN. If the dashboard ever moves inline assets into static files,
+# tighten this by removing the 'unsafe-inline' tokens.
+_DASHBOARD_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "connect-src 'self' ws: wss:; "
+    "font-src 'self' data:; "
+    "frame-ancestors 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'"
+)
+
+
+@app.after_request
+def _set_security_headers(response):
+    """Add baseline security headers to every response (W-R2-M1)."""
+    try:
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("Content-Security-Policy", _DASHBOARD_CSP)
     except Exception:
         pass
     return response
@@ -1611,6 +1770,31 @@ HTML_TEMPLATE = """
     <script>
         // W-H3: escape untrusted strings before injecting via innerHTML.
         function escHTML(s){const d=document.createElement('div');d.textContent=String(s==null?'':s);return d.innerHTML;}
+
+        // R2-OP3: CSRF helpers. Server enforces double-submit-cookie on every
+        // state-changing route, so every POST/PUT/DELETE must echo the cookie
+        // in an X-CSRF-Token header.
+        function getCookie(name){
+            const cookies = document.cookie ? document.cookie.split('; ') : [];
+            for (let i = 0; i < cookies.length; i++) {
+                const idx = cookies[i].indexOf('=');
+                if (idx === -1) continue;
+                const k = cookies[i].substring(0, idx);
+                if (k === name) {
+                    return decodeURIComponent(cookies[i].substring(idx + 1));
+                }
+            }
+            return '';
+        }
+        async function csrfFetch(url, options){
+            options = options || {};
+            const headers = new Headers(options.headers || {});
+            const token = getCookie('csrf_token');
+            if (token) headers.set('X-CSRF-Token', token);
+            options.headers = headers;
+            options.credentials = options.credentials || 'same-origin';
+            return fetch(url, options);
+        }
         let currentTab = 'overview';
         let currentPortfolio = 'default';
         let portfolioList = [];
@@ -1749,7 +1933,7 @@ HTML_TEMPLATE = """
         async function startTrading() {
             document.getElementById('start-btn').disabled = true;
             try {
-                const response = await fetch('/api/start', {
+                const response = await csrfFetch('/api/start', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({})  // Will use symbols from user_settings.json
@@ -1769,7 +1953,7 @@ HTML_TEMPLATE = """
         async function stopTrading() {
             document.getElementById('stop-btn').disabled = true;
             try {
-                const response = await fetch('/api/stop', {method: 'POST'});
+                const response = await csrfFetch('/api/stop', {method: 'POST'});
                 const data = await response.json();
                 if (data.status === 'stopped') {
                     updateStatus('stopped');
@@ -6868,12 +7052,26 @@ if __name__ == "__main__":
 
     logger.info(f"Dashboard starting on port {os.getenv('DASH_PORT', 5555)}")
 
+    # W-R2-L1: refuse to start with the Werkzeug debugger reachable on a
+    # non-loopback interface. The debugger exposes a remote-code-execution
+    # console once an unhandled exception fires.
+    _flask_env = (os.getenv("FLASK_ENV", "") or "").strip().lower()
+    _dash_host = (os.getenv("DASH_HOST", "127.0.0.1") or "").strip()
+    _debug = _flask_env == "development"
+    _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+    if _debug and _dash_host not in _LOOPBACK:
+        raise SystemExit(
+            "Refusing to start: FLASK_ENV=development with DASH_HOST=%r exposes "
+            "the Werkzeug debugger on a non-loopback interface. "
+            "Set DASH_HOST=127.0.0.1 or unset FLASK_ENV." % _dash_host
+        )
+
     # Run Flask app
     # W-H1: bind to loopback by default. Set DASH_HOST=0.0.0.0 to expose on LAN
     # only after putting auth + reverse proxy in front.
     app.run(
-        host=os.getenv("DASH_HOST", "127.0.0.1"),
+        host=_dash_host or "127.0.0.1",
         port=int(os.getenv("DASH_PORT", 5555)),
         use_reloader=False,
-        debug=os.getenv("FLASK_ENV") == "development",
+        debug=_debug,
     )

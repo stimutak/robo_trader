@@ -21,12 +21,20 @@ logger = get_logger(__name__)
 
 
 def _allowed_ws_origins(port: int) -> Set[Optional[str]]:
-    """Whitelist of acceptable Origin header values for the WS handshake."""
+    """Whitelist of acceptable Origin header values for the WS handshake.
+
+    W-R2-L2: The browser sends the dashboard's Origin (DASH_PORT, default 5555),
+    NOT the WebSocket port (8765). Build the allowlist from the dashboard port
+    so the Origin check actually matches the values browsers send. The ``port``
+    parameter is kept for backwards compatibility but no longer drives the
+    default origin set.
+    """
+    dash_port = os.getenv("DASH_PORT", "5555").strip() or "5555"
     allowed: Set[Optional[str]] = {
         None,
         "null",
-        f"http://localhost:{port}",
-        f"http://127.0.0.1:{port}",
+        f"http://localhost:{dash_port}",
+        f"http://127.0.0.1:{dash_port}",
     }
     extra = os.getenv("WS_ALLOWED_ORIGINS", "").strip()
     if extra:
@@ -101,12 +109,33 @@ class WebSocketManager:
             return False
 
         # Auth: prefer token if configured; else require loopback peer.
+        # W-R2-L3: accept token via Authorization: Bearer <token> header (preferred,
+        # since URL query strings are logged by proxies and stick in browser
+        # history). Continue to accept ?token= for backward compatibility, but
+        # log a deprecation warning so callers can migrate. Remove the
+        # query-string path in a future release.
         if self.auth_token:
+            token = ""
+            auth_header = ""
             try:
-                query = urlsplit(path).query
-                token = (parse_qs(query).get("token") or [""])[0]
+                auth_header = websocket.request_headers.get("Authorization", "") or ""
             except Exception:
-                token = ""
+                auth_header = ""
+            if auth_header.startswith("Bearer "):
+                token = auth_header[len("Bearer "):].strip()
+            if not token:
+                # Backward-compat: query string token. Deprecated.
+                try:
+                    query = urlsplit(path).query
+                    qtoken = (parse_qs(query).get("token") or [""])[0]
+                except Exception:
+                    qtoken = ""
+                if qtoken:
+                    logger.warning(
+                        "WS auth token supplied via URL query string is deprecated; "
+                        "use 'Authorization: Bearer <token>' instead"
+                    )
+                    token = qtoken
             if not token or not hmac.compare_digest(token, self.auth_token):
                 logger.warning("WS rejected: missing/invalid token")
                 return False
