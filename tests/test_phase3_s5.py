@@ -109,6 +109,9 @@ def test_online_inference():
     # Initialize inference engine with smaller feature set
     feature_names = ["returns", "rsi", "volume_ratio", "volatility", "momentum"]
     inference = OnlineModelInference(feature_names=feature_names)
+    # AIN-H3: predict() no longer auto-installs a DummyModel on missing model.
+    # This is a smoke test that exercises the dummy code path explicitly.
+    inference._create_dummy_model("primary")
 
     # Create test features matching the feature list
     test_features = {
@@ -141,7 +144,9 @@ def test_online_inference():
 
     # Test ensemble prediction
     print("\nTesting ensemble prediction...")
-    inference.load_model("dummy", "model2")  # Add another model
+    # AIN-H3: load_model raises on missing/unsigned files. Use the explicit
+    # dummy installer for this smoke test instead of the load_model fallback.
+    inference._create_dummy_model("model2")
 
     ensemble_result = inference.predict_ensemble(test_features, "AAPL")
     if ensemble_result:
@@ -275,12 +280,24 @@ async def test_model_updates():
 
     # Initialize components
     inference = OnlineModelInference()
+    # AIN-H3: explicit dummy install for A/B-testing smoke test (was relying on
+    # the silent fallback that load_model used to perform on file-not-found).
+    inference._create_dummy_model("model_a")
+    inference._create_dummy_model("model_b")
     manager = ModelUpdateManager(inference)
 
     # Deploy models
     print("\nDeploying models for A/B testing...")
-    manager.deploy_model("dummy_path", "model_a", 0.5)
-    manager.deploy_model("dummy_path", "model_b", 0.5)
+    # NOTE: deploy_model previously called load_model('dummy_path', ...) which
+    # used to silently fall back to a DummyModel. After AIN-H3 the dummies must
+    # be installed directly (above) and this call is now best-effort. We swallow
+    # the FileNotFoundError because this is a smoke test for the routing logic,
+    # not for model loading.
+    try:
+        manager.deploy_model("dummy_path", "model_a", 0.5)
+        manager.deploy_model("dummy_path", "model_b", 0.5)
+    except (FileNotFoundError, ValueError):
+        pass
 
     # Test allocation
     symbols = ["AAPL", "NVDA", "TSLA", "GOOGL", "MSFT"]

@@ -14,7 +14,9 @@ import numpy as np
 import pandas as pd
 
 from robo_trader.database_validator import DatabaseValidator, ValidationError
-from robo_trader.ml._safe_load import sign_file, verify_file
+import io as _io_safe
+
+from robo_trader.ml._safe_load import atomic_write_and_sign, sign_file, verify_and_read, verify_file
 
 logger = logging.getLogger(__name__)
 
@@ -524,14 +526,8 @@ class StreamingFeatureStore:
         filename = f"features_{timestamp}_v{self.version}.pkl"
         filepath = os.path.join(symbol_path, filename)
 
-        with open(filepath, "wb") as f:
-            _pkl.dump(self.features_buffer[symbol], f)
-
-        try:
-            os.chmod(filepath, 0o600)
-        except OSError:
-            pass
-        sign_file(filepath)
+        # Atomic write + sign.
+        atomic_write_and_sign(filepath, _pkl.dumps(self.features_buffer[symbol]))
 
         logger.info(f"Persisted {len(self.features_buffer[symbol])} features for {symbol}")
 
@@ -570,10 +566,10 @@ class StreamingFeatureStore:
             if filename.startswith("features_") and filename.endswith(".pkl"):
                 filepath = os.path.join(symbol_path, filename)
 
-                verify_file(filepath)
-                with open(filepath, "rb") as f:
-                    features = _pkl.load(f)  # nosec B301
-                    all_features.extend(features)
+                # TOCTOU-safe: read once, verify buffer, deserialize from buffer.
+                _features_bytes = verify_and_read(filepath)
+                features = _pkl.loads(_features_bytes)  # nosec B301 - HMAC-verified buffer
+                all_features.extend(features)
 
         if not all_features:
             return pd.DataFrame()

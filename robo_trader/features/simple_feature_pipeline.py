@@ -3,6 +3,7 @@ Standalone feature pipeline for M1 that works without configuration.
 Provides simple interface for feature engineering.
 """
 
+import re as _re
 import warnings
 from typing import Dict, List, Optional, Union
 
@@ -10,7 +11,23 @@ import numpy as np
 import pandas as pd
 
 from robo_trader.database_validator import DatabaseValidator, ValidationError
-from robo_trader.ml._safe_load import sign_file, verify_file
+from robo_trader.ml._safe_load import atomic_write_and_sign, sign_file, verify_and_read, verify_file
+
+# Version strings flow into filesystem paths; restrict to a safe charset to
+# block path traversal (../etc/passwd) and absolute-path inputs.
+_VERSION_RE = _re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def _validate_version(version: str) -> str:
+    """Reject any ``version`` value that doesn't match a strict allowlist.
+
+    Raises:
+        ValidationError: if ``version`` is not a 1-64 char string of
+            ``[A-Za-z0-9._-]``.
+    """
+    if not isinstance(version, str) or not _VERSION_RE.fullmatch(version):
+        raise ValidationError(f"invalid version: {version!r}")
+    return version
 
 warnings.filterwarnings("ignore")
 
@@ -277,6 +294,7 @@ class FeatureStore:
     def save_features(self, symbol: str, features: pd.DataFrame, version: str = "latest") -> None:
         """Save features to store."""
         symbol = DatabaseValidator.validate_symbol(symbol)
+        version = _validate_version(version)
         key = f"{symbol}_{version}"
         self.cache[key] = features.copy()
 
@@ -285,17 +303,13 @@ class FeatureStore:
         import pickle as _pkl
 
         filepath = f"{self.cache_dir}/{key}.pkl"
-        with open(filepath, "wb") as f:
-            _pkl.dump(features, f)
-        try:
-            os.chmod(filepath, 0o600)
-        except OSError:
-            pass
-        sign_file(filepath)
+        # Atomic write + sign.
+        atomic_write_and_sign(filepath, _pkl.dumps(features))
 
     def load_features(self, symbol: str, version: str = "latest") -> Optional[pd.DataFrame]:
         """Load features from store."""
         symbol = DatabaseValidator.validate_symbol(symbol)
+        version = _validate_version(version)
         key = f"{symbol}_{version}"
 
         # Check memory cache first
@@ -309,9 +323,9 @@ class FeatureStore:
         import os
 
         if os.path.exists(filepath):
-            verify_file(filepath)
-            with open(filepath, "rb") as f:
-                features = _pkl.load(f)  # nosec B301
+            # TOCTOU-safe: read once, verify buffer, deserialize from buffer.
+            _features_bytes = verify_and_read(filepath)
+            features = _pkl.loads(_features_bytes)  # nosec B301 - HMAC-verified buffer
             self.cache[key] = features
             return features
 

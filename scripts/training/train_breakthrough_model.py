@@ -2,7 +2,9 @@
 """Breakthrough ML training - targeting 60%+ accuracy with advanced techniques."""
 
 import pickle
+import sys
 import warnings
+from pathlib import Path
 
 import lightgbm as lgb
 import numpy as np
@@ -13,6 +15,11 @@ from scipy import stats
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.metrics import accuracy_score, precision_score, recall_score
 from sklearn.preprocessing import StandardScaler
+
+# Allow running this script directly from the repo without `pip install -e .`.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from robo_trader.ml._safe_load import sign_file  # noqa: E402
 
 warnings.filterwarnings("ignore")
 
@@ -392,7 +399,8 @@ def main():
 
     if best_acc > 0.58:  # Save if we beat 58%
         print(f"\n✅ BREAKTHROUGH! Saving model...")
-        with open("trained_models/breakthrough_model.pkl", "wb") as f:
+        model_path = "trained_models/breakthrough_model.pkl"
+        with open(model_path, "wb") as f:
             pickle.dump(
                 {
                     "model": best_model,
@@ -403,6 +411,8 @@ def main():
                 },
                 f,
             )
+        # AIN-H2: sign the artifact so the runner's HMAC verifier accepts it.
+        sign_file(model_path)
     else:
         print(f"\n⚠️ Need more work to reach 60%")
 

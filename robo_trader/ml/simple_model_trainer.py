@@ -14,7 +14,9 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from ._safe_load import sign_file, verify_file
+import io as _io_safe
+
+from ._safe_load import atomic_write_and_sign, sign_file, verify_and_read, verify_file
 from sklearn.ensemble import (
     GradientBoostingClassifier,
     GradientBoostingRegressor,
@@ -411,14 +413,11 @@ class ModelRegistry:
         if model_id is None:
             model_id = f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-        # Save model
+        # Save model — atomic write to tmp + replace + sign.
         model_path = f"{self.model_dir}/{model_id}.joblib"
-        joblib.dump(model, model_path)
-        try:
-            os.chmod(model_path, 0o600)
-        except OSError:
-            pass
-        sign_file(model_path)
+        _buf = _io_safe.BytesIO()
+        joblib.dump(model, _buf)
+        atomic_write_and_sign(model_path, _buf.getvalue())
 
         # Save metadata
         metadata["model_id"] = model_id
@@ -446,8 +445,9 @@ class ModelRegistry:
         model_path = f"{self.model_dir}/{model_id}.joblib"
         metadata_path = f"{self.model_dir}/{model_id}_metadata.json"
 
-        verify_file(model_path)
-        model = joblib.load(model_path)
+        # TOCTOU-safe: read once, verify buffer, deserialize from buffer.
+        _model_bytes = verify_and_read(model_path)
+        model = joblib.load(_io_safe.BytesIO(_model_bytes))
 
         with open(metadata_path, "r") as f:
             metadata = json.load(f)

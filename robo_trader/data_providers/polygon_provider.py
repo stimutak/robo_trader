@@ -28,6 +28,15 @@ from robo_trader.database_validator import DatabaseValidator
 
 logger = structlog.get_logger(__name__)
 
+# AI-M2-RESIDUAL: any single-bar move greater than this is treated as bad data
+# unless a corporate-action flag is present on the bar. 50% one-bar move with no
+# flag is virtually always a tick error or split day that wasn't propagated.
+# TODO: Polygon's bar metadata does not currently expose a corp-action flag in
+# the REST aggs response; if/when one is added, key off it here. For now we
+# apply the threshold unconditionally and log so the operator can investigate
+# (e.g. mark known split days). See SECURITY_AUDIT_ROUND2_2026-05-10.md AI-M2.
+_MAX_ONE_BAR_PCT_DELTA = 0.5
+
 
 class PolygonDataProvider(DataProvider):
     """
@@ -199,6 +208,7 @@ class PolygonDataProvider(DataProvider):
 
             # Convert to DataFrame
             bars_data = []
+            prev_close: Optional[float] = None
             for bar in aggs:
                 bar_open = float(bar.open)
                 bar_high = float(bar.high)
@@ -223,6 +233,21 @@ class PolygonDataProvider(DataProvider):
                 if bar_volume < 0:
                     logger.warning("Polygon bar rejected: negative volume")
                     continue
+                # AI-M2-RESIDUAL: outlier %-delta check vs previous bar's close.
+                # No corp-action flag is exposed by polygon REST aggs today, so
+                # we apply the threshold unconditionally and log. Operators can
+                # mark known split/dividend days out-of-band.
+                if prev_close is not None and prev_close > 0:
+                    pct_delta = abs(bar_close - prev_close) / prev_close
+                    if pct_delta > _MAX_ONE_BAR_PCT_DELTA:
+                        logger.warning(
+                            f"Polygon bar rejected: %-delta outlier "
+                            f"{pct_delta:.1%} from {prev_close} -> {bar_close} "
+                            f"(symbol={symbol}); possible bad tick or unmarked "
+                            f"corporate action"
+                        )
+                        continue
+                prev_close = bar_close
                 bars_data.append(
                     {
                         "date": datetime.fromtimestamp(bar.timestamp / 1000),

@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import structlog
 
-from ._safe_load import sign_file, verify_file
+from ._safe_load import atomic_write_and_sign, sign_file, verify_and_read, verify_file
 from .model_trainer import ModelTrainer, ModelType, PredictionType
 
 logger = structlog.get_logger(__name__)
@@ -59,10 +59,10 @@ class ModelSelector:
         improved_model_path = Path("trained_models/improved_model.pkl")
         if improved_model_path.exists():
             try:
-                verify_file(improved_model_path)
-                with open(improved_model_path, "rb") as f:
-                    # Security: Only load trusted model files from our own system
-                    model_info = pickle.load(f)  # nosec B301 - Trusted file from our system
+                # TOCTOU-safe: read once, verify buffer, deserialize from buffer.
+                data = verify_and_read(improved_model_path)
+                # Security: Only load trusted model files from our own system
+                model_info = pickle.loads(data)  # nosec B301 - HMAC-verified buffer
 
                 # Add as priority model
                 models.append(model_info)
@@ -80,10 +80,10 @@ class ModelSelector:
         # Then load other models
         for model_file in self.model_dir.glob("*.pkl"):
             try:
-                verify_file(model_file)
-                with open(model_file, "rb") as f:
-                    # Security: Only load trusted model files from our own system
-                    model_info = pickle.load(f)  # nosec B301 - Trusted file from our system
+                # TOCTOU-safe: read once, verify buffer, deserialize from buffer.
+                data = verify_and_read(model_file)
+                # Security: Only load trusted model files from our own system
+                model_info = pickle.loads(data)  # nosec B301 - HMAC-verified buffer
 
                 # Load metadata
                 metadata_file = model_file.with_suffix(".json")

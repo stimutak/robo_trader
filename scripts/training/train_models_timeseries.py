@@ -3,6 +3,7 @@
 import asyncio
 import json
 import pickle
+import sys
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +16,11 @@ import yfinance as yf
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+
+# Allow running this script directly from the repo without `pip install -e .`.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from robo_trader.ml._safe_load import sign_file  # noqa: E402
 
 warnings.filterwarnings("ignore")
 
@@ -247,6 +253,8 @@ async def main():
     rf_path = models_dir / "random_forest_model.pkl"
     with open(rf_path, "wb") as f:
         pickle.dump(model_data, f)
+    # AIN-H2: sign the artifact so the runner's HMAC verifier accepts it.
+    sign_file(rf_path)
     print(f"    Saved to {rf_path}")
 
     # Train XGBoost with regularization
@@ -282,6 +290,8 @@ async def main():
     xgb_path = models_dir / "xgboost_model.pkl"
     with open(xgb_path, "wb") as f:
         pickle.dump(model_data, f)
+    # AIN-H2: sign the artifact so the runner's HMAC verifier accepts it.
+    sign_file(xgb_path)
     print(f"    Saved to {xgb_path}")
 
     # Train LightGBM with regularization
@@ -318,6 +328,8 @@ async def main():
     lgb_path = models_dir / "lightgbm_model.pkl"
     with open(lgb_path, "wb") as f:
         pickle.dump(model_data, f)
+    # AIN-H2: sign the artifact so the runner's HMAC verifier accepts it.
+    sign_file(lgb_path)
     print(f"    Saved to {lgb_path}")
 
     # Save metadata for each model

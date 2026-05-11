@@ -2,6 +2,7 @@
 """Improved ML training with better features and targets."""
 
 import pickle
+import sys
 import warnings
 from pathlib import Path
 
@@ -10,6 +11,11 @@ import pandas as pd
 import yfinance as yf
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report
+
+# Allow running this script directly from the repo without `pip install -e .`.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from robo_trader.ml._safe_load import sign_file  # noqa: E402
 
 warnings.filterwarnings("ignore")
 
@@ -169,8 +175,11 @@ def main():
         "metrics": {"train_score": train_score, "test_score": test_score},
     }
 
-    with open("trained_models/improved_model.pkl", "wb") as f:
+    model_path = "trained_models/improved_model.pkl"
+    with open(model_path, "wb") as f:
         pickle.dump(model_data, f)
+    # AIN-H2: sign the artifact so the runner's HMAC verifier accepts it.
+    sign_file(model_path)
 
     print("\n✅ Model saved to trained_models/improved_model.pkl")
 

@@ -2,6 +2,7 @@
 """Advanced ML training with better features and techniques for higher accuracy."""
 
 import pickle
+import sys
 import warnings
 from pathlib import Path
 
@@ -14,6 +15,11 @@ from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
 from sklearn.preprocessing import StandardScaler
+
+# Allow running this script directly from the repo without `pip install -e .`.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from robo_trader.ml._safe_load import sign_file  # noqa: E402
 
 warnings.filterwarnings("ignore")
 
@@ -270,8 +276,11 @@ def main():
             "accuracy": test_acc,
         }
 
-        with open("trained_models/advanced_ensemble_model.pkl", "wb") as f:
+        model_path = "trained_models/advanced_ensemble_model.pkl"
+        with open(model_path, "wb") as f:
             pickle.dump(model_data, f)
+        # AIN-H2: sign the artifact so the runner's HMAC verifier accepts it.
+        sign_file(model_path)
 
         print(f"\n✅ Advanced model saved with {test_acc:.1%} accuracy!")
     else:

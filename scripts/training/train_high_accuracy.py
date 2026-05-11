@@ -2,6 +2,7 @@
 """Simplified high-accuracy training focusing on what works."""
 
 import pickle
+import sys
 import warnings
 from pathlib import Path
 
@@ -12,6 +13,11 @@ import yfinance as yf
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import train_test_split
+
+# Allow running this script directly from the repo without `pip install -e .`.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from robo_trader.ml._safe_load import sign_file  # noqa: E402
 
 warnings.filterwarnings("ignore")
 
@@ -180,8 +186,11 @@ def main():
     if best_acc > 0.52:  # Better than random
         Path("trained_models").mkdir(exist_ok=True)
 
-        with open("trained_models/high_accuracy_model.pkl", "wb") as f:
+        model_path = "trained_models/high_accuracy_model.pkl"
+        with open(model_path, "wb") as f:
             pickle.dump({"model": best_model, "features": list(X.columns), "accuracy": best_acc}, f)
+        # AIN-H2: sign the artifact so the runner's HMAC verifier accepts it.
+        sign_file(model_path)
 
         print(f"\n✅ Model saved with {best_acc:.1%} accuracy!")
 

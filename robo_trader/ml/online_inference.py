@@ -14,7 +14,9 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from ._safe_load import verify_file
+import io
+
+from ._safe_load import verify_and_read, verify_file
 
 logger = logging.getLogger(__name__)
 
@@ -119,21 +121,23 @@ class OnlineModelInference:
             model_path: Path to model file
             model_name: Name for model identification
         """
-        try:
-            verify_file(model_path)
-            model = joblib.load(model_path)
-            self.models[model_name] = model
-            logger.info(f"Loaded model {model_name} from {model_path}")
+        # AIN-H3 (followup audit): a tampered model file produces a verify_and_read
+        # ValueError. The previous handler swallowed the exception and installed a
+        # DummyModel that returns random predictions, which would silently corrupt
+        # live trading signals. We now re-raise so the operator sees the failure
+        # and the runner refuses to start with a missing/tampered model.
+        # The DummyModel path remains available via _create_dummy_model() for
+        # explicit test fixtures only.
+        # TOCTOU-safe: read once, verify buffer, deserialize from buffer.
+        _model_bytes = verify_and_read(model_path)
+        model = joblib.load(io.BytesIO(_model_bytes))
+        self.models[model_name] = model
+        logger.info(f"Loaded model {model_name} from {model_path}")
 
-            # Update version based on file
-            import os
+        # Update version based on file
+        import os
 
-            self.model_version = f"v{os.path.getmtime(model_path):.0f}"
-
-        except Exception as e:
-            logger.error(f"Failed to load model: {e}")
-            # Create a dummy model for testing
-            self._create_dummy_model(model_name)
+        self.model_version = f"v{os.path.getmtime(model_path):.0f}"
 
     def _create_dummy_model(self, model_name: str):
         """Create a dummy model for testing."""
@@ -167,10 +171,15 @@ class OnlineModelInference:
         """
         start_time = time.time()
 
-        # Check if model exists
+        # AIN-H3: refuse to predict with a missing model. The previous code path
+        # silently installed a DummyModel returning random predictions, which is
+        # indistinguishable from a working model at the call site.
         if model_name not in self.models:
-            if not self.models:  # No models loaded
-                self._create_dummy_model("primary")
+            if not self.models:
+                raise RuntimeError(
+                    "No model loaded. Call load_model() with a signed model file "
+                    "before predict(). DummyModel auto-fallback removed (AIN-H3)."
+                )
             model_name = list(self.models.keys())[0]
 
         try:

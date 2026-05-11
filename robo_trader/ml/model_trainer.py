@@ -57,6 +57,7 @@ except ImportError:
 
 from ..config import Config
 from ..features.feature_pipeline import FeaturePipeline
+from ._safe_load import sign_file
 
 logger = structlog.get_logger(__name__)
 
@@ -464,6 +465,11 @@ class ModelTrainer:
         # Save model
         with open(filepath, "wb") as f:
             pickle.dump(model_info, f)
+
+        # AIN-H2 (followup audit): sign every binary model artifact so
+        # verify_file / verify_and_read accept it at runtime. Without this,
+        # every newly-trained model fails to load under MODEL_SIGNING_REQUIRED=true.
+        sign_file(filepath)
 
         # Save metadata
         metadata_file = filepath.with_suffix(".json")

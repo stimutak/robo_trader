@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import pickle  # noqa: S403
+import re as _re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -15,9 +16,24 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import structlog
 
-from ._safe_load import sign_file, verify_file
+from ._safe_load import atomic_write_and_sign, sign_file, verify_and_read, verify_file
 
 logger = structlog.get_logger(__name__)
+
+# model_name and version flow into filesystem paths; restrict to a safe charset.
+_NAME_OR_VERSION_RE = _re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def _validate_path_component(label: str, value: str) -> str:
+    """Reject any value that doesn't match a strict path-safe allowlist.
+
+    Used at entry to public methods of :class:`ModelRegistry` for both
+    ``model_name`` and ``version``. Blocks ``../etc/passwd``, absolute paths,
+    NUL bytes, etc.
+    """
+    if not isinstance(value, str) or not _NAME_OR_VERSION_RE.fullmatch(value):
+        raise ValueError(f"invalid {label}: {value!r}")
+    return value
 
 
 class ModelRegistry:
@@ -99,8 +115,10 @@ class ModelRegistry:
         Returns:
             Version identifier
         """
+        model_name = _validate_path_component("model_name", model_name)
         if version is None:
             version = datetime.now().strftime("v%Y%m%d_%H%M%S")
+        version = _validate_path_component("version", version)
 
         # Create model directory
         model_dir = self.registry_dir / model_name
@@ -111,13 +129,8 @@ class ModelRegistry:
         version_dir.mkdir(exist_ok=True)
 
         model_file = version_dir / "model.pkl"
-        with open(model_file, "wb") as f:
-            pickle.dump(model_info, f)
-        try:
-            os.chmod(model_file, 0o600)
-        except OSError:
-            pass
-        sign_file(model_file)
+        # Atomic write + sign: tmp file with O_EXCL+0o600, fsync, os.replace, then sign.
+        atomic_write_and_sign(model_file, pickle.dumps(model_info))
 
         # Create version metadata
         metadata = {
@@ -194,6 +207,14 @@ class ModelRegistry:
         Returns:
             Success status
         """
+        try:
+            model_name = _validate_path_component("model_name", model_name)
+            if version is not None:
+                version = _validate_path_component("version", version)
+        except ValueError as e:
+            logger.error(f"deploy_model rejected: {e}")
+            return False
+
         if model_name not in self.model_versions:
             logger.error(f"Model {model_name} not found in registry")
             return False
@@ -224,19 +245,17 @@ class ModelRegistry:
             return False
 
         try:
-            verify_file(model_file)
+            # TOCTOU-safe: read once, verify buffer, deserialize from buffer.
+            _model_bytes = verify_and_read(model_file)
         except (ValueError, RuntimeError) as e:
             logger.error(f"Refusing to load model {model_file}: {e}")
             return False
-        with open(model_file, "rb") as f:
-            # Security: Only load trusted model files from our own system
-            # In production, consider using joblib or safer serialization
-            # Security: Only loading trusted model files from our own system
-            try:
-                model_info = pickle.load(f)  # nosec B301 - Trusted file from our system
-            except (pickle.PickleError, EOFError, ImportError) as e:
-                logger.error(f"Failed to load model file {model_file}: {e}")
-                return False
+        try:
+            # Security: HMAC-verified buffer; safe to deserialize.
+            model_info = pickle.loads(_model_bytes)  # nosec B301 - HMAC-verified buffer
+        except (pickle.PickleError, EOFError, ImportError) as e:
+            logger.error(f"Failed to load model file {model_file}: {e}")
+            return False
 
         # Update deployment status
         deployment = {
@@ -276,6 +295,11 @@ class ModelRegistry:
         Returns:
             Deployed model info or None
         """
+        try:
+            model_name = _validate_path_component("model_name", model_name)
+        except ValueError as e:
+            logger.error(f"get_deployed_model rejected: {e}")
+            return None
         if environment not in self.deployed_models:
             return None
 
@@ -295,6 +319,11 @@ class ModelRegistry:
         Returns:
             Success status
         """
+        try:
+            model_name = _validate_path_component("model_name", model_name)
+        except ValueError as e:
+            logger.error(f"rollback_model rejected: {e}")
+            return False
         if model_name not in self.model_versions:
             logger.error(f"Model {model_name} not found")
             return False
@@ -443,17 +472,17 @@ class ModelRegistry:
         model_file = self.registry_dir / model_name / version / "model.pkl"
 
         try:
-            verify_file(model_file)
+            # TOCTOU-safe: read once, verify buffer, deserialize from buffer.
+            _model_bytes = verify_and_read(model_file)
         except (ValueError, RuntimeError) as e:
             logger.error(f"Refusing to load model {model_file}: {e}")
             return None
-        with open(model_file, "rb") as f:
-            # Security: Only load trusted model files from our own system
-            try:
-                model_info = pickle.load(f)  # nosec B301 - Trusted file from our system
-            except (pickle.PickleError, EOFError, ImportError) as e:
-                logger.error(f"Failed to load model file {model_file}: {e}")
-                return None
+        try:
+            # Security: HMAC-verified buffer; safe to deserialize.
+            model_info = pickle.loads(_model_bytes)  # nosec B301 - HMAC-verified buffer
+        except (pickle.PickleError, EOFError, ImportError) as e:
+            logger.error(f"Failed to load model file {model_file}: {e}")
+            return None
 
         model_info["ab_test"] = test_name
         model_info["ab_variant"] = "B" if use_model_b else "A"

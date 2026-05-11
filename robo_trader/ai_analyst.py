@@ -18,6 +18,31 @@ from robo_trader.logger import get_logger
 logger = get_logger(__name__)
 
 
+# AI-M6: bound LLM-output payload to keep parse cost / log noise / state size sane.
+_LLM_MAX_CONTENT_LEN = 4096
+_LLM_MAX_REASONING_LEN = 256
+_LLM_MAX_KEY_FACTORS = 8
+
+
+def _cap_str(value, limit: int) -> str:
+    """Coerce ``value`` to a string and truncate to ``limit`` chars."""
+    if not isinstance(value, str):
+        value = str(value) if value is not None else ""
+    if len(value) > limit:
+        return value[:limit]
+    return value
+
+
+def _cap_list(value, max_items: int, item_limit: int) -> list:
+    """Coerce ``value`` to a list of strings, capping count and item length."""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value[:max_items]:
+        out.append(_cap_str(item, item_limit))
+    return out
+
+
 class MarketSentiment(Enum):
     """Market sentiment levels from AI analysis."""
 
@@ -202,15 +227,31 @@ Focus on:
 
     def _parse_analysis(self, symbol: str, response: str) -> MarketAnalysis:
         """Parse LLM response into MarketAnalysis."""
+        # AI-M6: cap content length BEFORE parse. Reject (not truncate) so the
+        # parser never sees a half-truncated JSON object that might decode to
+        # attacker-controlled values.
+        if not isinstance(response, str):
+            logger.warning(f"LLM response not a string for {symbol}; using default")
+            return self._default_analysis(symbol)
+        if len(response) > _LLM_MAX_CONTENT_LEN:
+            logger.warning(
+                f"LLM response too large for {symbol} ({len(response)} chars > "
+                f"{_LLM_MAX_CONTENT_LEN}); rejecting and using default"
+            )
+            return self._default_analysis(symbol)
+
         try:
-            # Extract JSON from response
-            json_start = response.find("{")
-            json_end = response.rfind("}") + 1
-            if json_start >= 0 and json_end > json_start:
-                json_str = response[json_start:json_end]
-                data = json.loads(json_str)
-            else:
-                data = {}
+            # Extract JSON from response — use JSONDecoder.raw_decode to avoid
+            # greedy regex / nested-brace ambiguity (AI-L2).
+            data = {}
+            start = response.find("{")
+            if start >= 0:
+                try:
+                    data, _consumed = json.JSONDecoder().raw_decode(response[start:])
+                    if not isinstance(data, dict):
+                        data = {}
+                except json.JSONDecodeError:
+                    data = {}
 
             # Map sentiment string to enum
             sentiment_map = {
@@ -223,14 +264,22 @@ Focus on:
 
             sentiment = sentiment_map.get(data.get("sentiment", "neutral"), MarketSentiment.NEUTRAL)
 
+            # AI-M6: cap field lengths before constructing the dataclass.
             return MarketAnalysis(
                 symbol=symbol,
                 sentiment=sentiment,
                 confidence=float(data.get("confidence", 0.5)),
-                reasoning=data.get("reasoning", "No reasoning provided"),
-                key_factors=data.get("key_factors", []),
-                risk_level=data.get("risk_level", "medium"),
-                suggested_action=data.get("suggested_action", "hold"),
+                reasoning=_cap_str(
+                    data.get("reasoning", "No reasoning provided"),
+                    _LLM_MAX_REASONING_LEN,
+                ),
+                key_factors=_cap_list(
+                    data.get("key_factors", []),
+                    _LLM_MAX_KEY_FACTORS,
+                    _LLM_MAX_REASONING_LEN,
+                ),
+                risk_level=_cap_str(data.get("risk_level", "medium"), 32),
+                suggested_action=_cap_str(data.get("suggested_action", "hold"), 32),
                 timestamp=datetime.now(),
             )
 
@@ -339,12 +388,27 @@ Be specific - identify actual stock symbols from the news."""
                 )
                 content = response.choices[0].message.content
 
-            # Parse JSON response
-            import re
+            # AI-M6: cap content length BEFORE parse; reject if oversize.
+            if not isinstance(content, str):
+                logger.warning("LLM opportunities response not a string; rejecting")
+                return []
+            if len(content) > _LLM_MAX_CONTENT_LEN:
+                logger.warning(
+                    f"LLM opportunities response too large ({len(content)} chars > "
+                    f"{_LLM_MAX_CONTENT_LEN}); rejecting"
+                )
+                return []
 
-            json_match = re.search(r"\{.*\}", content, re.DOTALL)
-            if json_match:
-                result = json.loads(json_match.group())
+            # Parse JSON response — use JSONDecoder.raw_decode to avoid greedy
+            # regex / nested-brace ambiguity (AI-L2).
+            start = content.find("{")
+            if start < 0:
+                return []
+            try:
+                result, _consumed = json.JSONDecoder().raw_decode(content[start:])
+            except json.JSONDecodeError:
+                return []
+            if isinstance(result, dict):
                 opportunities = result.get("opportunities", [])
                 # Filter out excluded symbols and add action
                 valid_opps = []
@@ -387,7 +451,11 @@ Be specific - identify actual stock symbols from the news."""
                             "symbol": symbol,
                             "action": "buy",
                             "confidence": opp.get("confidence", 0.7),
-                            "reason": opp.get("reason", "AI identified opportunity"),
+                            # AI-M6: cap reason field
+                            "reason": _cap_str(
+                                opp.get("reason", "AI identified opportunity"),
+                                _LLM_MAX_REASONING_LEN,
+                            ),
                         }
                     )
                 logger.info(f"AI found {len(valid_opps)} buying opportunities")
