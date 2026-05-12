@@ -91,6 +91,10 @@ pip install -r requirements.txt
 # 4) Configure environment
 cp .env.example .env
 # Edit .env with your IBKR credentials and risk settings
+
+# 5) REQUIRED: install the launchd watchdog (auto-restart on stalls)
+./scripts/install_watchdog.sh
+# One-time per machine. See DEV_SETUP.md Section 2.6.1 and CLAUDE.md for details.
 ```
 
 ### Running the System

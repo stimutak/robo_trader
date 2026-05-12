@@ -126,6 +126,41 @@ The script:
 
 If auth is enabled, log in with the password you set in step 2.4. Username defaults to `admin` (override with `DASH_USER` env var).
 
+### 2.6.1 🚨 REQUIRED: load the launchd watchdog (one-time per machine)
+
+**This step is NOT optional. Skipping it caused the trader to stay dead overnight on 2026-05-11 after a transient `lsof` timeout killed the runner.**
+
+Run once per fresh machine:
+```bash
+./scripts/install_watchdog.sh
+```
+
+What it does:
+- Validates `scripts/com.robotrader.watchdog.plist` with `plutil -lint`.
+- Copies the plist to `~/Library/LaunchAgents/`.
+- Loads it with `launchctl` and asserts it registered.
+- Idempotent — safe to re-run after any update to the plist or `watchdog.sh`.
+
+What the watchdog actually does, once loaded:
+- Wakes every 60 seconds.
+- Checks `robo_trader.log` modification time AND the most-recent "Trading cycle complete" log line.
+- During regular market hours (9:30 AM – 4:00 PM ET, Mon–Fri) OR extended hours (4 AM – 8 PM ET when `ENABLE_EXTENDED_HOURS=true` in `.env`), if logs have been stale for 5+ minutes it kills any zombie runner / websocket processes and re-runs `./START_TRADER.sh`.
+- Survives reboot (loaded on next GUI login via `LimitLoadToSessionType=Aqua`).
+- All restart actions land in `watchdog.log` in the project root.
+
+Verify it's running:
+```bash
+launchctl list | grep robotrader     # Should show: com.robotrader.watchdog
+tail -f watchdog.log                  # Should show startup banner
+```
+
+Stop or uninstall:
+```bash
+launchctl unload ~/Library/LaunchAgents/com.robotrader.watchdog.plist
+```
+
+See `CLAUDE.md` (Watchdog Auto-Restarter section) for additional debugging commands.
+
 ### 2.7 Run the test suites
 ```bash
 # Security regression suite (65 tests; should be 65 passed, 2 documented skips)

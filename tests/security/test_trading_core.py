@@ -910,3 +910,195 @@ def test_md5_uses_used_for_security_false_d_1() -> None:
             "usedforsecurity=False (D-1)."
         )
 
+
+# ---------------------------------------------------------------------------
+# B1 / B2 / B3 — Runner pre-flight resilience + exit audit + alerts
+# (2026-05-12 hardening after a transient lsof timeout killed the runner)
+# ---------------------------------------------------------------------------
+
+
+def test_lsof_preflight_retries_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """B1: TimeoutExpired must be retried (transient probe failures should
+    not be misread as 'Gateway not running'). After two transient timeouts
+    followed by a healthy lsof response, pre-flight must succeed."""
+    import subprocess as _sp
+
+    from robo_trader import runner_async as ra
+
+    calls = {"n": 0}
+
+    def fake_run(cmd, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise _sp.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout", 5))
+
+        class _R:
+            returncode = 0
+            stdout = "lsof: COMMAND   PID USER   FD   TYPE ...\njava  123 u  LISTEN ...\n"
+            stderr = ""
+
+        return _R()
+
+    monkeypatch.setattr(ra.subprocess, "run", fake_run)
+    # Patch sleep so the test is fast (no 1s + 2s real wait).
+    monkeypatch.setattr(ra.time, "sleep", lambda *_a, **_kw: None)
+
+    ok, reason = ra._lsof_port_listening(port=4002)
+
+    assert ok is True, "Pre-flight must succeed after transient timeouts."
+    assert reason == "listening"
+    assert calls["n"] == 3, "Expected exactly 3 lsof attempts (2 timeouts + 1 success)."
+
+
+def test_lsof_preflight_fails_after_max_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """B1: If lsof always times out, pre-flight must fail closed with
+    reason='probe_timeout' after exactly 3 attempts (default max)."""
+    import subprocess as _sp
+
+    from robo_trader import runner_async as ra
+
+    calls = {"n": 0}
+
+    def fake_run(cmd, *args, **kwargs):
+        calls["n"] += 1
+        raise _sp.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout", 5))
+
+    monkeypatch.setattr(ra.subprocess, "run", fake_run)
+    monkeypatch.setattr(ra.time, "sleep", lambda *_a, **_kw: None)
+
+    ok, reason = ra._lsof_port_listening(port=4002)
+
+    assert ok is False
+    assert reason == "probe_timeout"
+    assert calls["n"] == 3, "Must attempt exactly 3 times before declaring failure."
+
+
+def test_lsof_preflight_no_retry_on_non_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """B1: A non-zero exit code (port really not listening) is a definitive
+    answer — pre-flight must FAIL FAST, no retries."""
+    from robo_trader import runner_async as ra
+
+    calls = {"n": 0}
+    sleeps = {"n": 0}
+
+    def fake_run(cmd, *args, **kwargs):
+        calls["n"] += 1
+
+        class _R:
+            returncode = 1  # lsof returns non-zero when no matching socket
+            stdout = ""
+            stderr = ""
+
+        return _R()
+
+    monkeypatch.setattr(ra.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        ra.time, "sleep", lambda *_a, **_kw: sleeps.__setitem__("n", sleeps["n"] + 1)
+    )
+
+    ok, reason = ra._lsof_port_listening(port=4002)
+
+    assert ok is False
+    assert reason == "not_listening"
+    assert calls["n"] == 1, "Must NOT retry on definitive 'not listening' answer."
+    assert sleeps["n"] == 0, "Must NOT sleep when failing fast."
+
+
+def test_runner_exit_audit_writes_atomically(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """B2: _write_exit_audit must produce a complete data/runner_exit.json
+    with all required fields and leave no .tmp file behind."""
+    import json as _json
+
+    from robo_trader import runner_async as ra
+
+    monkeypatch.chdir(tmp_path)
+
+    ra._write_exit_audit(
+        "pre_flight_gateway_unreachable",
+        exit_code=1,
+        extra={"port": 4002, "attempts": 3},
+    )
+
+    final = tmp_path / "data" / "runner_exit.json"
+    tmp = tmp_path / "data" / "runner_exit.json.tmp"
+
+    assert final.exists(), "runner_exit.json must be written"
+    assert not tmp.exists(), "Temp file must be cleaned up (atomic rename)"
+
+    payload = _json.loads(final.read_text())
+    for key in ("timestamp", "iso_timestamp", "reason", "exit_code", "pid"):
+        assert key in payload, f"runner_exit.json missing required key: {key}"
+    assert payload["reason"] == "pre_flight_gateway_unreachable"
+    assert payload["exit_code"] == 1
+    assert payload["port"] == 4002
+    assert payload["attempts"] == 3
+    assert isinstance(payload["pid"], int)
+    assert payload["iso_timestamp"].endswith("Z")
+
+
+def test_runner_exit_audit_unlinked_on_healthy_start(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B2: _clear_exit_audit must remove a stale runner_exit.json so its
+    presence reliably means 'runner exited' and absence means 'healthy'."""
+    from robo_trader import runner_async as ra
+
+    monkeypatch.chdir(tmp_path)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    stale = data_dir / "runner_exit.json"
+    stale.write_text('{"reason": "stale"}')
+    assert stale.exists()
+
+    ra._clear_exit_audit()
+
+    assert not stale.exists(), (
+        "_clear_exit_audit must remove the stale audit file on healthy startup."
+    )
+
+    # Idempotent: calling again on a missing file must not raise.
+    ra._clear_exit_audit()
+
+
+def test_fire_runner_exit_alert_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """B3: The alert helper is best-effort. Even if every alert channel
+    raises, fire_runner_exit_alert must not propagate the exception —
+    the runner's exit path must remain robust."""
+    from robo_trader.monitoring import alerts as _alerts
+
+    # Force the helper to "see" one webhook channel with non-placeholder
+    # credentials so it will attempt delivery — and make that delivery throw.
+    def fake_load_channels():
+        return [
+            _alerts.NotificationChannel(
+                name="explosive_webhook",
+                channel_type="webhook",
+                config={"url": "https://example.invalid/alerts"},
+                enabled=True,
+                rate_limit_per_hour=10,
+            )
+        ]
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated channel failure")
+
+    monkeypatch.setattr(
+        _alerts, "_load_alert_channels_from_default_config", fake_load_channels
+    )
+    monkeypatch.setattr(_alerts, "_send_runner_exit_sync", boom)
+
+    # Must NOT raise.
+    _alerts.fire_runner_exit_alert(
+        "pre_flight_gateway_unreachable",
+        {"port": 4002, "probe_reason": "probe_timeout"},
+    )
+
+    # Also: if even the loader explodes, still no propagation.
+    def loader_boom():
+        raise RuntimeError("loader exploded")
+
+    monkeypatch.setattr(
+        _alerts, "_load_alert_channels_from_default_config", loader_boom
+    )
+    _alerts.fire_runner_exit_alert("unhandled_exception", {"exception_type": "ValueError"})
+

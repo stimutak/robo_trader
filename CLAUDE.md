@@ -90,6 +90,18 @@ pkill -f "IB Gateway"  # Triggers auto-restart on next START_TRADER.sh
 
 ## Watchdog Auto-Restarter
 
+### 🚨 INSTALL ONCE PER MACHINE
+
+The launchd watchdog is **NOT** loaded automatically on a fresh checkout. Run once after cloning:
+
+```bash
+./scripts/install_watchdog.sh
+```
+
+This validates the plist, copies it to `~/Library/LaunchAgents/`, loads it, and verifies registration. Failing to run this is what caused the trader to stay dead overnight on 2026-05-11 after a transient `lsof` timeout. Run `launchctl list | grep robotrader` to confirm `com.robotrader.watchdog` is present.
+
+---
+
 - Monitors log file modification time every 60 seconds
 - If no log activity for 5+ minutes during market hours → auto-restart
 - Respects `ENABLE_EXTENDED_HOURS` setting (monitors 4 AM - 8 PM if enabled)
@@ -422,6 +434,7 @@ STOP_LOSS_PERCENT=2.0           # Fixed 2% stop
 | Main BUY flow allows re-buy right after SELL (churn) | Add `has_recent_sell_trade(symbol, 600)` check - 10 min cooldown after SELL | 2026-02-03 |
 | ML SELL signal executes even when position at loss | PRO RULE: Only execute SELL if profitable, let stop-loss handle losses | 2026-02-04 |
 | Stop-loss has no price data on restart → ML sells first | Stop-loss needs `update_price()` calls; ML sell blocked by profit check | 2026-02-04 |
+| Forgetting to load launchd watchdog on fresh install | Run ./scripts/install_watchdog.sh ONCE per machine | 2026-05-12 |
 
 ---
 

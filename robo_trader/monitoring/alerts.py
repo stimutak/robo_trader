@@ -381,3 +381,258 @@ async def send_trading_alert(
         channels=["slack_trading", "webhook_primary"],
         data={"symbol": symbol, "action": action, "timestamp": datetime.now().isoformat()},
     )
+
+
+# ---------------------------------------------------------------------------
+# Runner-exit alert (B3 of 2026-05-12 hardening)
+# ---------------------------------------------------------------------------
+
+
+def _load_alert_channels_from_default_config() -> List[NotificationChannel]:
+    """Best-effort load of NotificationChannels from the default config path.
+
+    Returns an empty list if no config file is found or it is unreadable.
+    Channels are returned regardless of their ``enabled`` flag; the caller
+    decides whether to send.
+    """
+    import logging
+
+    log = logging.getLogger(__name__)
+
+    # Candidate paths (first match wins). Keep this list short and explicit
+    # — we do NOT want to traverse the filesystem looking for configs.
+    candidates = [
+        Path("config/alerts.json"),
+        Path("config/monitoring/alerts.json"),
+        Path("data/alerts.json"),
+    ]
+    for path in candidates:
+        try:
+            if not path.exists():
+                continue
+            with open(path, "r") as f:
+                cfg = json.load(f)
+            channels: List[NotificationChannel] = []
+            for ch in cfg.get("channels", []):
+                try:
+                    channels.append(
+                        NotificationChannel(
+                            name=ch["name"],
+                            channel_type=ch["type"],
+                            config=ch.get("config", {}),
+                            enabled=ch.get("enabled", False),
+                            rate_limit_per_hour=ch.get("rate_limit", 10),
+                        )
+                    )
+                except Exception as e:
+                    log.warning(f"Skipping malformed alert channel: {e}")
+            return channels
+        except Exception as e:
+            log.warning(f"Failed to read alert config {path}: {e}")
+    return []
+
+
+def _channel_has_working_creds(channel: NotificationChannel) -> bool:
+    """Cheap heuristic: does the channel have non-placeholder credentials?
+
+    We refuse to send if any placeholder string (``YOUR_TOKEN``,
+    ``your-app-password``, ``YOUR/WEBHOOK/URL``, ``YOUR_TWILIO``) is found
+    anywhere in the channel config. This matches the D-13 defaults so a
+    copy-pasted example template never accidentally arms a channel.
+    """
+    try:
+        blob = json.dumps(channel.config)
+    except Exception:
+        return False
+    placeholders = (
+        "YOUR_TOKEN",
+        "your-email@",
+        "your-app-password",
+        "YOUR_TWILIO",
+        "YOUR/WEBHOOK/URL",
+        "your-webhook-url.com",
+    )
+    return not any(p in blob for p in placeholders)
+
+
+def fire_runner_exit_alert(reason: str, extra: Optional[Dict] = None) -> None:
+    """Best-effort runner-exit alert.
+
+    - ALWAYS logs at ERROR level (so operators see the event even with no
+      channel configured).
+    - If any channel is ``enabled=True`` AND passes the placeholder-creds
+      check, attempts to send a ``runner_exit: {reason}`` message to it.
+    - Wrapped in try/except — never lets an alert failure raise into the
+      runner's exit path.
+
+    This is intentionally synchronous and stdlib-only so it can be called
+    from signal handlers and ``sys.exit`` paths where an asyncio loop may
+    not be available or may have already shut down.
+    """
+    import logging
+
+    log = logging.getLogger(__name__)
+
+    title = f"runner_exit: {reason}"
+    safe_extra = {}
+    if extra:
+        try:
+            # Coerce to JSON-safe shallow dict; never include arbitrary objects.
+            for k, v in extra.items():
+                try:
+                    json.dumps(v)
+                    safe_extra[k] = v
+                except (TypeError, ValueError):
+                    safe_extra[k] = str(v)
+        except Exception:
+            safe_extra = {}
+
+    # 1) ALWAYS log at ERROR — this is the guaranteed path.
+    try:
+        log.error("RUNNER EXIT EVENT: %s extra=%s", reason, safe_extra)
+    except Exception:
+        # Logging itself failed; nothing we can safely do.
+        pass
+
+    # 2) Best-effort delivery via configured channels.
+    try:
+        channels = _load_alert_channels_from_default_config()
+    except Exception as e:  # pragma: no cover - defensive
+        log.warning("Could not load alert channels for runner_exit: %s", e)
+        return
+
+    if not channels:
+        return
+
+    message = f"RoboTrader runner exited: {reason}"
+    timestamp = datetime.now()
+
+    for channel in channels:
+        try:
+            if not channel.enabled:
+                continue
+            if not _channel_has_working_creds(channel):
+                log.warning(
+                    "Skipping channel '%s': placeholder credentials detected.",
+                    channel.name,
+                )
+                continue
+            _send_runner_exit_sync(channel, title, message, timestamp, safe_extra)
+        except Exception as e:
+            # Each channel is isolated; a failure in one must not block others.
+            try:
+                log.error(
+                    "Failed to deliver runner_exit via channel '%s': %s",
+                    channel.name,
+                    e,
+                )
+            except Exception:
+                pass
+
+
+def _send_runner_exit_sync(
+    channel: NotificationChannel,
+    title: str,
+    message: str,
+    timestamp: datetime,
+    extra: Dict,
+) -> None:
+    """Synchronous, stdlib-only delivery for a single channel.
+
+    We deliberately avoid aiohttp/asyncio here so this is callable from
+    signal handlers and atexit paths. Uses ``urllib.request`` for HTTP.
+    """
+    import logging
+    import urllib.request
+    from urllib.error import URLError
+
+    log = logging.getLogger(__name__)
+
+    if channel.channel_type == "webhook":
+        url = channel.config.get("url")
+        if not url:
+            return
+        headers = dict(channel.config.get("headers", {}))
+        headers.setdefault("Content-Type", "application/json")
+        payload = json.dumps(
+            {
+                "title": title,
+                "message": message,
+                "severity": "critical",
+                "timestamp": timestamp.isoformat(),
+                **extra,
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status not in (200, 201, 202, 204):
+                    raise URLError(f"webhook returned {resp.status}")
+        except Exception as e:
+            raise URLError(f"webhook send failed: {e}") from e
+
+    elif channel.channel_type == "slack":
+        webhook_url = channel.config.get("webhook_url")
+        if not webhook_url:
+            return
+        payload = json.dumps(
+            {
+                "text": message,
+                "attachments": [
+                    {
+                        "color": "#990000",
+                        "title": title,
+                        "text": message,
+                        "footer": "RoboTrader runner_exit",
+                        "ts": int(timestamp.timestamp()),
+                    }
+                ],
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            webhook_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status not in (200, 201, 202, 204):
+                    raise URLError(f"slack returned {resp.status}")
+        except Exception as e:
+            raise URLError(f"slack send failed: {e}") from e
+
+    elif channel.channel_type == "email":
+        cfg = channel.config
+        try:
+            msg = MIMEMultipart()
+            msg["From"] = cfg["from"]
+            msg["To"] = cfg["to"]
+            msg["Subject"] = f"[CRITICAL] {title}"
+            body = f"{message}\n\nExtra:\n{json.dumps(extra, indent=2)}\n"
+            msg.attach(MIMEText(body, "plain"))
+            with smtplib.SMTP(cfg["host"], cfg["port"], timeout=5) as server:
+                if cfg.get("use_tls"):
+                    server.starttls()
+                if cfg.get("username"):
+                    server.login(cfg["username"], cfg["password"])
+                server.send_message(msg)
+        except Exception as e:
+            raise RuntimeError(f"email send failed: {e}") from e
+
+    elif channel.channel_type == "sms":
+        if not TWILIO_AVAILABLE:
+            return
+        cfg = channel.config
+        try:
+            client = TwilioClient(cfg["account_sid"], cfg["auth_token"])
+            client.messages.create(
+                body=f"{title}\n{message}"[:160],
+                from_=cfg["from_number"],
+                to=cfg["to_number"],
+            )
+        except Exception as e:
+            raise RuntimeError(f"sms send failed: {e}") from e
+
+    else:
+        log.warning("Unknown channel type '%s' — skipping.", channel.channel_type)

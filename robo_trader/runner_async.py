@@ -15,6 +15,7 @@ import hashlib
 import os
 import subprocess
 import sys
+import time
 
 # Load .env EARLY before any os.getenv() calls at module level
 from dotenv import load_dotenv  # isort:skip
@@ -79,6 +80,159 @@ except ImportError as e:
     create_analyst = None
 from .utils.pricing import PrecisePricing  # noqa: E402
 from .utils.secure_config import SecureConfig  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Runner-exit audit + alert helpers (B2 / B3 of 2026-05-12 hardening)
+# ---------------------------------------------------------------------------
+
+
+def _write_exit_audit(reason: str, exit_code: int = 0, extra: Optional[dict] = None) -> None:
+    """Persist runner exit reason so dashboard/watchdog can show what happened.
+
+    Atomic write (tmp + os.replace) to avoid partial-file races with readers.
+    Best-effort: never raise — exit paths must remain robust.
+    """
+    import json as _json
+    import os as _os
+    import time as _time
+    from datetime import datetime as _dt
+    from pathlib import Path as _Path
+
+    try:
+        data_dir = _Path("data")
+        data_dir.mkdir(exist_ok=True)
+        payload = {
+            "timestamp": _time.time(),
+            "iso_timestamp": _dt.utcnow().isoformat() + "Z",
+            "reason": str(reason)[:512],
+            "exit_code": int(exit_code),
+            "pid": _os.getpid(),
+        }
+        if extra:
+            for k, v in extra.items():
+                # Coerce non-JSON-friendly values to strings
+                try:
+                    _json.dumps(v)
+                    payload[k] = v
+                except (TypeError, ValueError):
+                    payload[k] = str(v)
+        tmp = data_dir / "runner_exit.json.tmp"
+        final = data_dir / "runner_exit.json"
+        tmp.write_text(_json.dumps(payload, indent=2))
+        _os.replace(tmp, final)
+    except Exception as _audit_err:  # pragma: no cover - best-effort
+        try:
+            logger.error(f"Failed to write runner_exit.json: {_audit_err}")
+        except Exception:
+            pass
+
+
+def _clear_exit_audit() -> None:
+    """Remove the runner_exit.json marker on successful startup.
+
+    Presence of data/runner_exit.json means "runner is exited",
+    absence means "runner is healthy / currently running".
+    """
+    from pathlib import Path as _Path
+
+    try:
+        _Path("data/runner_exit.json").unlink(missing_ok=True)
+    except Exception as _err:  # pragma: no cover - best-effort
+        try:
+            logger.warning(f"Failed to clear runner_exit.json: {_err}")
+        except Exception:
+            pass
+
+
+def _lsof_port_listening(
+    port: int,
+    max_attempts: int = 3,
+    per_attempt_timeout: float = 5.0,
+) -> Tuple[bool, str]:
+    """Probe whether ``port`` has a LISTEN socket via ``lsof``.
+
+    Returns ``(is_open, reason)`` where reason is one of:
+      - ``"listening"``           — port is open
+      - ``"not_listening"``       — lsof returned non-zero / no LISTEN
+      - ``"probe_timeout"``       — all retries hit subprocess.TimeoutExpired
+      - ``"probe_error:<class>"`` — unexpected exception
+
+    Retries ONLY on ``subprocess.TimeoutExpired`` (transient OS hang),
+    with exponential backoff 1s, 2s, 4s between attempts. A non-zero
+    exit code is a real "not listening" answer and fails fast.
+
+    Worst case: 3 attempts * 5s timeout + 1s + 2s backoff = ~18s.
+    """
+    last_timeout_err: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = subprocess.run(
+                ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+                capture_output=True,
+                text=True,
+                timeout=per_attempt_timeout,
+            )
+            if result.returncode == 0 and "LISTEN" in result.stdout:
+                return True, "listening"
+            # Fail fast on a real "not listening" answer — do NOT retry.
+            return False, "not_listening"
+        except subprocess.TimeoutExpired as e:
+            last_timeout_err = e
+            if attempt < max_attempts:
+                backoff = 2 ** (attempt - 1)  # 1s, 2s, 4s
+                try:
+                    logger.warning(
+                        f"lsof pre-flight probe timed out "
+                        f"(attempt {attempt}/{max_attempts}); "
+                        f"retrying in {backoff}s..."
+                    )
+                except Exception:
+                    pass
+                try:
+                    time.sleep(backoff)
+                except Exception:
+                    pass
+            else:
+                try:
+                    logger.warning(
+                        f"lsof pre-flight probe timed out on final attempt "
+                        f"{attempt}/{max_attempts}: {e}"
+                    )
+                except Exception:
+                    pass
+        except FileNotFoundError as e:
+            try:
+                logger.error(f"lsof not available on this system: {e}")
+            except Exception:
+                pass
+            return False, "probe_error:FileNotFoundError"
+        except Exception as e:
+            try:
+                logger.error(f"Port test failed: {e}")
+            except Exception:
+                pass
+            return False, f"probe_error:{type(e).__name__}"
+    return False, "probe_timeout"
+
+
+def _fire_runner_exit_alert(reason: str, extra: Optional[dict] = None) -> None:
+    """Fire a best-effort alert for a runner exit event.
+
+    Always logs at ERROR. If any alert channel is enabled with working creds,
+    sends a `runner_exit: {reason}` message. Never raises — alert failures
+    must not interfere with the exit path.
+    """
+    try:
+        from .monitoring.alerts import fire_runner_exit_alert as _fire
+        _fire(reason, extra)
+    except Exception as _alert_err:  # pragma: no cover - best-effort
+        try:
+            logger.error(
+                f"runner_exit alert delivery failed (reason={reason}): {_alert_err}"
+            )
+        except Exception:
+            pass
+
 
 # Import mean reversion strategies if available
 
@@ -786,33 +940,49 @@ class AsyncRunner:
         # Test if configured TWS/IB Gateway port is open using lsof
         # IMPORTANT: Do NOT use socket.connect_ex() - it creates zombie connections
         # that block subsequent IBKR API handshakes!
-
-        def test_port_open_lsof(port=7497):
-            """Check if port is listening using lsof (no zombies)."""
-            try:
-                result = subprocess.run(
-                    ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                return result.returncode == 0 and "LISTEN" in result.stdout
-            except Exception as e:
-                logger.error(f"Port test failed: {e}")
-                return False
+        #
+        # B1 (2026-05-12): The previous version converted a transient lsof
+        # TimeoutExpired into "Gateway not running" and exited the runner.
+        # That caused a false-negative shutdown when Gateway was actually
+        # healthy. We now distinguish:
+        #   - subprocess.TimeoutExpired  => probe failure, RETRY (up to 3)
+        #   - non-zero exit code         => port truly not listening, fail fast
+        # Per-attempt timeout 5s; backoff 1s/2s/4s; worst case ~18s.
+        # See module-level ``_lsof_port_listening``.
 
         host = self.cfg.ibkr.host
         port = self.cfg.ibkr.port
 
-        if not test_port_open_lsof(port=port):
+        port_ok, probe_reason = _lsof_port_listening(port=port)
+        if not port_ok:
             logger.error(f"❌ IBKR PRE-FLIGHT CHECK FAILED")
-            logger.error(f"Port {port} is not listening - TWS/IB Gateway not running")
+            if probe_reason == "probe_timeout":
+                logger.error(
+                    f"lsof probe for port {port} timed out on all 3 attempts. "
+                    "Gateway may be healthy but the OS probe could not confirm. "
+                    "Refusing to start to avoid trading without a verified connection."
+                )
+            else:
+                logger.error(f"Port {port} is not listening - TWS/IB Gateway not running")
             logger.error("Please ensure TWS or IB Gateway is running and configured properly:")
             logger.error("1. Start TWS/IB Gateway")
             logger.error("2. Enable API connections in Global Configuration")
             logger.error("3. Set correct port (7497 for paper, 7496 for live)")
             logger.error("4. Allow connections from localhost")
             logger.error("REFUSING TO START WITHOUT IBKR CONNECTION")
+            _write_exit_audit(
+                "pre_flight_gateway_unreachable",
+                exit_code=1,
+                extra={
+                    "port": port,
+                    "attempts": 3,
+                    "probe_reason": probe_reason,
+                },
+            )
+            _fire_runner_exit_alert(
+                "pre_flight_gateway_unreachable",
+                {"port": port, "probe_reason": probe_reason},
+            )
             sys.exit(1)
 
         logger.info(f"✓ Port {port} is open - proceeding to IBKR connect")
@@ -1248,6 +1418,11 @@ class AsyncRunner:
         # Mark setup as complete for persistent connections
         self._setup_complete = True
         logger.info("AsyncRunner setup complete")
+
+        # B2 (2026-05-12): Setup succeeded — runner is healthy. Clear any
+        # stale exit-audit file so the dashboard/watchdog reads "no exit"
+        # while the runner is actually trading.
+        _clear_exit_audit()
 
     async def load_existing_positions(self):
         """Load existing positions and account state from database on startup."""
@@ -4030,6 +4205,17 @@ async def run_continuous(
         nonlocal shutdown_flag
         logger.info(f"Received signal {signum}, initiating shutdown...")
         shutdown_flag = True
+        # B2 (2026-05-12): Audit SIGTERM/SIGINT in case the outer
+        # finally block can't run (e.g., second signal). Best-effort.
+        try:
+            sig_name = (
+                "sigterm" if signum == signal.SIGTERM else
+                ("sigint" if signum == signal.SIGINT else f"signal_{signum}")
+            )
+            _write_exit_audit(sig_name, exit_code=0, extra={"signum": int(signum)})
+            _fire_runner_exit_alert(sig_name, {"signum": int(signum)})
+        except Exception:
+            pass
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -4173,6 +4359,13 @@ async def run_continuous(
             logger.info("Cleaning up persistent runner...")
             await runner.cleanup()
         logger.info("Trading system shutdown complete")
+        # B2 (2026-05-12): Record a clean exit so dashboard/watchdog know
+        # the runner ended normally (vs crashing). Best-effort — don't
+        # overwrite a more specific exit reason written from elsewhere
+        # if it was set in the same second. (We always write, and consumers
+        # can read the most recent reason.)
+        _write_exit_audit("clean_shutdown", exit_code=0)
+        _fire_runner_exit_alert("clean_shutdown", None)
 
 
 def check_gateway_zombies(port: int = 4002) -> bool:
@@ -4311,46 +4504,80 @@ def main() -> None:
         [s.strip().upper() for s in args.symbols.split(",") if s.strip()] if args.symbols else None
     )
 
-    if args.once:
-        # Run once and exit (for testing/debugging)
-        asyncio.run(
-            run_once(
-                symbols=override_symbols,
-                duration=args.duration,
-                bar_size=args.bar_size,
-                sma_fast=args.sma_fast,
-                sma_slow=args.sma_slow,
-                slippage_bps=args.slippage_bps,
-                max_order_notional=args.max_order_notional,
-                max_daily_notional=args.max_daily_notional,
-                default_cash=args.default_cash,
-                max_concurrent=args.max_concurrent,
-                use_ml_strategy=args.use_ml,
-                use_ml_enhanced=args.use_ml_enhanced,
-                use_smart_execution=args.use_smart_execution,
+    try:
+        if args.once:
+            # Run once and exit (for testing/debugging)
+            asyncio.run(
+                run_once(
+                    symbols=override_symbols,
+                    duration=args.duration,
+                    bar_size=args.bar_size,
+                    sma_fast=args.sma_fast,
+                    sma_slow=args.sma_slow,
+                    slippage_bps=args.slippage_bps,
+                    max_order_notional=args.max_order_notional,
+                    max_daily_notional=args.max_daily_notional,
+                    default_cash=args.default_cash,
+                    max_concurrent=args.max_concurrent,
+                    use_ml_strategy=args.use_ml,
+                    use_ml_enhanced=args.use_ml_enhanced,
+                    use_smart_execution=args.use_smart_execution,
+                )
             )
-        )
-    else:
-        # Run continuously (default behavior)
-        asyncio.run(
-            run_continuous(
-                symbols=override_symbols,
-                duration=args.duration,
-                bar_size=args.bar_size,
-                sma_fast=args.sma_fast,
-                sma_slow=args.sma_slow,
-                slippage_bps=args.slippage_bps,
-                max_order_notional=args.max_order_notional,
-                max_daily_notional=args.max_daily_notional,
-                default_cash=args.default_cash,
-                max_concurrent=args.max_concurrent,
-                interval_seconds=args.interval,
-                use_ml_strategy=args.use_ml,
-                use_ml_enhanced=args.use_ml_enhanced,
-                use_smart_execution=args.use_smart_execution,
-                force_connect=args.force_connect,
+        else:
+            # Run continuously (default behavior)
+            asyncio.run(
+                run_continuous(
+                    symbols=override_symbols,
+                    duration=args.duration,
+                    bar_size=args.bar_size,
+                    sma_fast=args.sma_fast,
+                    sma_slow=args.sma_slow,
+                    slippage_bps=args.slippage_bps,
+                    max_order_notional=args.max_order_notional,
+                    max_daily_notional=args.max_daily_notional,
+                    default_cash=args.default_cash,
+                    max_concurrent=args.max_concurrent,
+                    interval_seconds=args.interval,
+                    use_ml_strategy=args.use_ml,
+                    use_ml_enhanced=args.use_ml_enhanced,
+                    use_smart_execution=args.use_smart_execution,
+                    force_connect=args.force_connect,
+                )
             )
+    except SystemExit:
+        # B2: SystemExit propagates from pre-flight failures and similar
+        # explicit-exit paths. They've already written their own audit
+        # record — don't overwrite with a generic one. Re-raise so the
+        # interpreter returns the intended exit code.
+        raise
+    except KeyboardInterrupt:
+        # Ctrl+C at the top level — log it. Inner signal handler already
+        # wrote the sigint audit, but write a clean_shutdown as a fallback.
+        logger.info("Top-level KeyboardInterrupt — exiting.")
+        _write_exit_audit("keyboard_interrupt", exit_code=0)
+        _fire_runner_exit_alert("keyboard_interrupt", None)
+        raise
+    except Exception as e:
+        # B2: Audit unhandled exceptions. DO NOT log/persist the exception
+        # message verbatim — it may contain PII or secrets. Type name is
+        # sufficient context for triage.
+        exc_type = type(e).__name__
+        try:
+            logger.exception(
+                "Unhandled exception in runner main() (type=%s)", exc_type
+            )
+        except Exception:
+            pass
+        _write_exit_audit(
+            "unhandled_exception",
+            exit_code=2,
+            extra={"exception_type": exc_type},
         )
+        _fire_runner_exit_alert(
+            "unhandled_exception", {"exception_type": exc_type}
+        )
+        raise
 
 
 if __name__ == "__main__":

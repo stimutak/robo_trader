@@ -1109,10 +1109,37 @@ HTML_TEMPLATE = """
             opacity: 0.5;
             pointer-events: none;
         }
+
+        /* C4 — runner-stale banner. Fixed at very top so it overlays any
+           scrolled content; red so it's impossible to miss; full-width so
+           the operator can't mistake it for a transient toast. */
+        .runner-stale-banner {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 10000;
+            background: #b91c1c;
+            color: #ffffff;
+            padding: 10px 20px;
+            font-size: 14px;
+            font-weight: 600;
+            text-align: center;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+            min-height: 40px;
+            line-height: 20px;
+        }
+        .runner-stale-banner.visible {
+            display: block;
+        }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
+    <!-- C4: runner-stale banner. Hidden by default; JS shows it when
+         /api/runner/status reports healthy=false. -->
+    <div class="runner-stale-banner" id="runner-stale-banner" role="alert" aria-live="assertive"></div>
     <div class="error-banner" id="error-banner"></div>
     <div class="container">
         <header>
@@ -1946,6 +1973,61 @@ HTML_TEMPLATE = """
             options.headers = headers;
             options.credentials = options.credentials || 'same-origin';
             return fetch(url, options);
+        }
+
+        // C4: poll /api/runner/status and toggle the top-of-page stale banner.
+        // Banner content is assigned via textContent (NOT innerHTML), so any
+        // server-provided strings (exit_reason, iso_timestamp) are
+        // intrinsically XSS-safe — there is no HTML in this banner.
+        async function checkRunnerHealth() {
+            const banner = document.getElementById('runner-stale-banner');
+            if (!banner) return;
+            try {
+                const resp = await csrfFetch('/api/runner/status');
+                if (!resp.ok) {
+                    // 401/500/etc — leave the banner alone so a transient
+                    // auth blip doesn't false-alarm the operator. Next poll
+                    // will retry.
+                    return;
+                }
+                const data = await resp.json();
+                if (data && data.healthy) {
+                    banner.classList.remove('visible');
+                    banner.textContent = '';
+                    return;
+                }
+                // Unhealthy. Build the message as a plain string assigned via
+                // textContent — defense in depth even though escHTML would
+                // also neutralize the payload.
+                let msg = '⚠ Runner offline';
+                const secs = data && data.last_market_update_seconds_ago;
+                if (typeof secs === 'number' && isFinite(secs)) {
+                    const mins = Math.floor(secs / 60);
+                    if (mins >= 1) {
+                        msg += ' — last update ' + mins + ' minute' + (mins === 1 ? '' : 's') + ' ago';
+                    } else {
+                        msg += ' — last update ' + Math.round(secs) + 's ago';
+                    }
+                } else {
+                    msg += ' — no updates received this session';
+                }
+                const audit = data && data.exit_audit;
+                if (audit) {
+                    if (audit.reason) {
+                        msg += '. Reason: ' + escHTML(audit.reason);
+                    }
+                    if (audit.iso_timestamp) {
+                        const dt = new Date(audit.iso_timestamp);
+                        if (!isNaN(dt.getTime())) {
+                            msg += ' (' + escHTML(dt.toLocaleString()) + ')';
+                        }
+                    }
+                }
+                banner.textContent = msg;
+                banner.classList.add('visible');
+            } catch (e) {
+                console.warn('runner health poll failed:', e);
+            }
         }
         let currentTab = 'overview';
         let currentPortfolio = 'default';
@@ -4216,12 +4298,14 @@ HTML_TEMPLATE = """
             loadLogs(); // Load logs immediately on startup
             updateMarketStatus(); // Load market status on startup
             connectWebSocket(); // Connect to WebSocket
+            checkRunnerHealth(); // C4: prime the runner-stale banner
             setInterval(refreshData, 5000); // Keep polling as fallback
             setInterval(refreshStrategies, 5000); // Update strategies tab
             setInterval(updateSafetyMonitoring, 10000); // Update safety monitoring every 10 seconds
             setInterval(loadLogs, 2000); // Update logs every 2 seconds
             setInterval(updateMarketStatus, 60000); // Update market status every minute
             setInterval(loadPortfolios, 30000); // Refresh portfolio list every 30 seconds
+            setInterval(checkRunnerHealth, 15000); // C4: poll runner health every 15s
         };
     </script>
 </body>
@@ -4430,6 +4514,182 @@ def health_readiness():
 
     status_code = 200 if checks["ready"] else 503
     return jsonify(checks), status_code
+
+
+# ----------------------------------------------------------------------------
+# C2 / C3 — Runner liveness endpoints.
+#
+# The runner died overnight on 2026-05-09 and the dashboard kept happily
+# showing stale positions. These endpoints surface "is the runner alive?"
+# so external monitors AND the operator's browser banner can tell.
+#
+# /health/runner    -> unauthenticated, infra-style. 200 healthy / 503 stale.
+#                     Only emits fields explicitly enumerated below.
+# /api/runner/status -> auth-gated, richer payload for dashboard JS.
+#
+# Both read the persisted exit audit at data/runner_exit.json (written by
+# the runner on shutdown) for the "why did it exit" signal.
+# ----------------------------------------------------------------------------
+
+# Default: 90s of producer silence = stale. Configurable for tests / ops.
+try:
+    RUNNER_STALE_SECONDS = max(1, int(os.getenv("RUNNER_STALE_SECONDS", "90")))
+except ValueError:
+    RUNNER_STALE_SECONDS = 90
+
+# Whitelist of fields we'll surface from runner_exit.json. Anything else in
+# that file is silently dropped — defense against the audit JSON ever growing
+# secret-bearing fields in the future.
+_RUNNER_EXIT_ALLOWED_FIELDS = {"reason", "iso_timestamp", "timestamp", "exit_code", "pid"}
+# Hard cap on the reason string so a runaway log line can't be reflected in
+# unauth /health/runner output. Agent B already caps at 512; we re-cap defensively.
+_RUNNER_EXIT_REASON_CAP = 512
+
+
+def _read_runner_exit_audit() -> dict | None:
+    """Load and sanitize data/runner_exit.json. Returns None if missing or
+    unreadable. NEVER raises — failures are logged server-side and treated
+    as "no audit available".
+    """
+    path = Path("data") / "runner_exit.json"
+    try:
+        if not path.exists():
+            return None
+        # Cap read size so a runaway file can't blow up the dashboard process.
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read(16 * 1024)
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return None
+        cleaned: dict = {}
+        for key in _RUNNER_EXIT_ALLOWED_FIELDS:
+            if key in data:
+                value = data[key]
+                if key == "reason" and isinstance(value, str):
+                    cleaned[key] = value[:_RUNNER_EXIT_REASON_CAP]
+                else:
+                    cleaned[key] = value
+        return cleaned
+    except Exception:
+        # NEVER leak the exception to clients (C-9 / D-11 pattern).
+        logger.exception("Failed to read runner exit audit")
+        return None
+
+
+@app.route("/health/runner")
+def health_runner():
+    """Unauthenticated runner liveness probe.
+
+    Returns 200 + {"status":"healthy", "last_update_seconds_ago": float}
+    when the WS server has seen a producer (runner) update within
+    RUNNER_STALE_SECONDS (default 90s).
+
+    Returns 503 + {"status":"stale", "last_update_seconds_ago": float,
+    "exit_reason": str|null, "exit_iso_timestamp": str|null} otherwise.
+
+    UNAUTHENTICATED: this is health-check infrastructure (external monitors,
+    uptime checks, etc.). The endpoint NEVER leaks secrets — only the fields
+    enumerated in the route docstring are emitted. ``exit_reason`` is capped
+    at 512 chars and any exception detail is captured server-side, not in
+    the response body (C-9 / D-11 pattern).
+    """
+    try:
+        from robo_trader.websocket_server import get_last_market_update_ts
+
+        last_ts = get_last_market_update_ts()
+        now = time.time()
+        seconds_ago = (now - last_ts) if last_ts > 0 else float("inf")
+        is_healthy = last_ts > 0 and seconds_ago <= RUNNER_STALE_SECONDS
+
+        # Round to avoid emitting "inf" in JSON (json.dumps emits "Infinity"
+        # which isn't strict-JSON parseable by some clients).
+        seconds_ago_out: float | None
+        if seconds_ago == float("inf"):
+            seconds_ago_out = None
+        else:
+            seconds_ago_out = round(seconds_ago, 2)
+
+        if is_healthy:
+            return (
+                jsonify(
+                    {
+                        "status": "healthy",
+                        "last_update_seconds_ago": seconds_ago_out,
+                    }
+                ),
+                200,
+            )
+
+        # Stale path — include the exit-audit signal so external monitors
+        # see WHY the runner died, not just that it's silent.
+        audit = _read_runner_exit_audit() or {}
+        return (
+            jsonify(
+                {
+                    "status": "stale",
+                    "last_update_seconds_ago": seconds_ago_out,
+                    "exit_reason": audit.get("reason"),
+                    "exit_iso_timestamp": audit.get("iso_timestamp"),
+                }
+            ),
+            503,
+        )
+    except Exception:
+        # Match D-11: no exception detail in body, full traceback to logs.
+        logger.exception("health_runner failed")
+        return (
+            jsonify({"status": "fail"}),
+            503,
+        )
+
+
+@app.route("/api/runner/status")
+@requires_auth
+def api_runner_status():
+    """Auth-gated richer payload for the dashboard banner JS.
+
+    GET only — no CSRF needed (state-changing endpoints use @csrf_required;
+    pure-GET endpoints rely on @requires_auth + the SameSite cookie).
+
+    Response shape:
+        {
+          "healthy": bool,
+          "last_market_update_ts": float,        # epoch seconds (0 if never)
+          "last_market_update_seconds_ago": float|null,
+          "stale_threshold_seconds": int,
+          "exit_audit": {timestamp, iso_timestamp, reason, exit_code, pid} | null
+        }
+    """
+    try:
+        from robo_trader.websocket_server import get_last_market_update_ts
+
+        last_ts = get_last_market_update_ts()
+        now = time.time()
+        if last_ts > 0:
+            seconds_ago = round(now - last_ts, 2)
+            seconds_ago_out: float | None = seconds_ago
+            healthy = seconds_ago <= RUNNER_STALE_SECONDS
+        else:
+            seconds_ago_out = None
+            healthy = False
+
+        audit = _read_runner_exit_audit()
+
+        return (
+            jsonify(
+                {
+                    "healthy": healthy,
+                    "last_market_update_ts": last_ts,
+                    "last_market_update_seconds_ago": seconds_ago_out,
+                    "stale_threshold_seconds": RUNNER_STALE_SECONDS,
+                    "exit_audit": audit,
+                }
+            ),
+            200,
+        )
+    except Exception:
+        logger.exception("api_runner_status failed")
+        return jsonify({"error": "internal_error"}), 500
 
 
 @app.route("/metrics")

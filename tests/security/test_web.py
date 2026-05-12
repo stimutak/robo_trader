@@ -809,3 +809,129 @@ def test_ws_auth_end_to_end_against_real_library():
             await server.wait_closed()
 
     asyncio.run(go())
+
+
+# ---------------------------------------------------------------------------
+# C1 / C2 / C3 / C4 — runner-liveness endpoints + dashboard banner.
+#
+# Regression: on 2026-05-09 the runner died overnight and the dashboard kept
+# happily showing stale positions until the operator explicitly asked "is it
+# running". These tests pin the contract so it cannot recur silently.
+# ---------------------------------------------------------------------------
+
+
+def test_health_runner_returns_503_when_stale(monkeypatch):
+    """C2: /health/runner returns 503 + status:'stale' when no producer
+    update has been seen within RUNNER_STALE_SECONDS."""
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    # Force the counter to a very old timestamp.
+    import robo_trader.websocket_server as ws_mod
+
+    monkeypatch.setattr(ws_mod, "_last_market_update_ts", 1.0, raising=True)
+    client = app_mod.app.test_client()
+    resp = client.get("/health/runner")
+    assert resp.status_code == 503
+    body = resp.get_json()
+    assert body["status"] == "stale"
+    assert "last_update_seconds_ago" in body
+    # exit_reason field must exist (may be None when no audit file present).
+    assert "exit_reason" in body
+
+
+def test_health_runner_returns_200_when_fresh(monkeypatch):
+    """C2: /health/runner returns 200 + status:'healthy' when the counter is
+    fresh (within the stale threshold)."""
+    import time as _time
+
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    import robo_trader.websocket_server as ws_mod
+
+    monkeypatch.setattr(ws_mod, "_last_market_update_ts", _time.time(), raising=True)
+    client = app_mod.app.test_client()
+    resp = client.get("/health/runner")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["status"] == "healthy"
+    assert isinstance(body.get("last_update_seconds_ago"), (int, float))
+
+
+def test_health_runner_reads_exit_audit_when_present(monkeypatch, tmp_path):
+    """C2: When data/runner_exit.json exists, /health/runner's stale 503
+    response surfaces its `reason` field as `exit_reason`."""
+    import json as _json
+
+    monkeypatch.chdir(tmp_path)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    audit = {
+        "reason": "Gateway disconnected; max retries exceeded",
+        "iso_timestamp": "2026-05-09T03:14:00",
+        "timestamp": 1746769200.0,
+        "exit_code": 1,
+        "pid": 12345,
+    }
+    (data_dir / "runner_exit.json").write_text(_json.dumps(audit))
+
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    import robo_trader.websocket_server as ws_mod
+
+    monkeypatch.setattr(ws_mod, "_last_market_update_ts", 1.0, raising=True)
+    client = app_mod.app.test_client()
+    resp = client.get("/health/runner")
+    assert resp.status_code == 503
+    body = resp.get_json()
+    assert body["status"] == "stale"
+    assert body["exit_reason"] == "Gateway disconnected; max retries exceeded"
+    assert body["exit_iso_timestamp"] == "2026-05-09T03:14:00"
+
+
+def test_api_runner_status_requires_auth(monkeypatch):
+    """C3: /api/runner/status is auth-gated. Without credentials, 401."""
+    app_mod = _reload_app(
+        monkeypatch,
+        DASH_AUTH_ENABLED="true",
+        DASH_USER="admin",
+        DASH_PASS_HASH=_password_hash("hunter2"),
+    )
+    client = app_mod.app.test_client()
+    resp = client.get("/api/runner/status")
+    assert resp.status_code == 401
+
+
+def test_dashboard_html_has_stale_banner(monkeypatch):
+    """C4: the rendered dashboard must include the runner-stale banner element
+    and the polling JS that drives it."""
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    client = app_mod.app.test_client()
+    resp = client.get("/")
+    assert resp.status_code == 200
+    body = resp.get_data(as_text=True)
+    assert 'id="runner-stale-banner"' in body
+    assert "checkRunnerHealth" in body
+    # And it must be wired into the boot sequence.
+    assert "setInterval(checkRunnerHealth" in body
+
+
+def test_health_runner_does_not_leak_exception_detail(monkeypatch):
+    """C2 / C-9: /health/runner is unauthenticated. If the underlying file
+    read raises, the response body must NOT contain the exception detail.
+    """
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    import robo_trader.websocket_server as ws_mod
+
+    # Make the counter stale so the audit-file path is taken.
+    monkeypatch.setattr(ws_mod, "_last_market_update_ts", 1.0, raising=True)
+
+    secret = "RUNNER_AUDIT_SECRET_q9z4x"
+
+    # Patch the audit reader to raise with the secret in the message.
+    def boom(*_args, **_kwargs):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(app_mod, "_read_runner_exit_audit", boom, raising=True)
+    client = app_mod.app.test_client()
+    resp = client.get("/health/runner")
+    # The route's outer try/except returns 503 + generic body when something
+    # below it explodes. The contract: secret must not appear in body.
+    assert resp.status_code == 503
+    assert secret not in resp.get_data(as_text=True)

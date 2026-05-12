@@ -220,7 +220,7 @@ while true; do
                 # No cycle completion found - use file mtime instead
                 # This handles first startup or if cycle messages aren't in recent logs
                 age_seconds="$log_age_seconds"
-                age_minutes=$(( ("$age_seconds" + 59) / 60 ))
+                age_minutes=$(( (age_seconds + 59) / 60 ))
 
                 if [ "$age_minutes" -ge "$STALE_MINUTES" ]; then
                     log "STALL DETECTED: No log activity for ${age_seconds}s (~${age_minutes} min, threshold: ${STALE_MINUTES})"
@@ -229,7 +229,7 @@ while true; do
                 fi
             else
                 # We have cycle completion timestamps - use them for more accurate detection
-                cycle_age_minutes=$(( ("$cycle_age_seconds" + 59) / 60 ))
+                cycle_age_minutes=$(( (cycle_age_seconds + 59) / 60 ))
 
                 if [ "$cycle_age_minutes" -ge "$STALE_MINUTES" ]; then
                     # Detect connect/disconnect spam vs actual stall

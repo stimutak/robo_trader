@@ -381,6 +381,28 @@ if ps -p $TRADER_PID > /dev/null; then
     echo "  pkill -9 -f runner_async"
     echo "  pkill -9 -f app.py"
     echo ""
+
+    # Step 8: Verify the launchd watchdog is loaded.
+    # If it isn't, a transient crash (e.g. lsof timeout in the gateway pre-flight)
+    # will leave the trader dead until a human notices. This is exactly what
+    # happened on 2026-05-11.
+    if ! launchctl list 2>/dev/null | grep -q "robotrader"; then
+        echo "=========================================="
+        echo "WARNING: launchd watchdog is NOT LOADED"
+        echo "=========================================="
+        echo ""
+        echo "The watchdog auto-restarts the trader if it stalls during"
+        echo "market hours. Without it, a crash leaves the system dead"
+        echo "until someone notices. This caused an overnight outage on"
+        echo "2026-05-11."
+        echo ""
+        echo "Run ONCE per machine to fix:"
+        echo "  ./scripts/install_watchdog.sh"
+        echo ""
+        echo "See DEV_SETUP.md Section 2.6.1 and CLAUDE.md for details."
+        echo "=========================================="
+        echo ""
+    fi
 else
     echo "   ❌ Trading system stopped unexpectedly"
     echo ""

@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import threading
+import time
 from datetime import datetime
 from queue import Empty, Queue
 from typing import Any, Dict, Optional, Set
@@ -18,6 +19,44 @@ from websockets.server import WebSocketServerProtocol
 from robo_trader.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+# -----------------------------------------------------------------------------
+# C1 — Runner liveness counter.
+#
+# The dashboard previously kept happily showing stale positions overnight when
+# the runner died. To fix that, the WS server now records the wall-clock time
+# of every inbound producer rebroadcast (a producer = the runner). The Flask
+# /health/runner and /api/runner/status endpoints read this value to decide
+# whether the runner is healthy or stale.
+#
+# In-memory only — this is a hot-path counter, not durable state. The
+# `data/runner_exit.json` file (written by Agent B on shutdown) carries the
+# durable "why did it die" signal.
+# -----------------------------------------------------------------------------
+_last_market_update_ts: float = 0.0
+_last_market_update_lock = threading.Lock()
+
+
+def update_last_market_ts() -> None:
+    """Mark the runner as live: record now() as the last producer-update time.
+
+    Called from handle_client whenever a producer-tagged client pushes a
+    payload that is rebroadcast to consumers. Safe to call from any thread —
+    the lock keeps the read/write atomic for monitoring code.
+    """
+    global _last_market_update_ts
+    now = time.time()
+    with _last_market_update_lock:
+        _last_market_update_ts = now
+
+
+def get_last_market_update_ts() -> float:
+    """Return the timestamp (epoch seconds) of the last producer update, or
+    0.0 if no producer update has ever been seen this process-lifetime.
+    """
+    with _last_market_update_lock:
+        return _last_market_update_ts
 
 
 # -----------------------------------------------------------------------------
@@ -276,6 +315,10 @@ class WebSocketManager:
                     elif is_producer:
                         # Producer-pushed update: broadcast to other clients
                         # but NEVER echo back to the producer itself.
+                        # C1: stamp the liveness counter BEFORE the broadcast
+                        # so /health/runner reflects "we heard from the runner"
+                        # even if the rebroadcast fails for some clients.
+                        update_last_market_ts()
                         try:
                             await self.broadcast(data, exclude={websocket})
                         except Exception as bcast_err:
