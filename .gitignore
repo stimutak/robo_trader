@@ -89,6 +89,8 @@ handoff/archive/
 *.pid
 .dashboard.pid
 .trading.pid
+.watchdog.lock
+.watchdog_failures
 nohup.out
 
 # Test output and coverage

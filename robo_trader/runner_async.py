@@ -1610,22 +1610,18 @@ class AsyncRunner:
     async def teardown(self, full_cleanup: bool = False):
         """Clean up resources after a run cycle.
 
-        Args:
-            full_cleanup: If True, calls full cleanup() including IBKR disconnect.
-                          If False (default), only stops monitors but keeps connection alive.
+        Note: run_continuous() creates a fresh AsyncRunner each cycle and calls
+        cleanup() unconditionally, so the IBKR connection does NOT actually
+        persist across cycles regardless of full_cleanup. The parameter is
+        retained for any in-process caller that wants the lighter teardown.
         """
-        # Only stop monitors that need cycle-level cleanup
         if self.production_monitor:
             await self.production_monitor.stop()
         if self.correlation_manager:
             await self.correlation_manager.stop()
 
-        # Only do full cleanup (IBKR disconnect) when explicitly requested
-        # This allows persistent connections across trading cycles
         if full_cleanup:
             await self.cleanup()
-        else:
-            logger.info("Cycle complete - keeping IBKR connection alive for next cycle")
 
     async def _monitor_subprocess_health(self):
         """

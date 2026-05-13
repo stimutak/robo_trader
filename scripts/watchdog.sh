@@ -18,6 +18,15 @@ STALE_MINUTES="${1:-5}"  # Default 5 minutes
 CHECK_INTERVAL=60        # Check every 60 seconds
 LOCKFILE="$PROJECT_DIR/.watchdog.lock"
 
+# Layer 6: escalation when restart attempts repeatedly fail (e.g., Gateway 2FA wall).
+# Before this layer, the watchdog would silently retry forever — that's how the
+# 2026-05-12 outage went unnoticed for 22 hours.
+FAILURE_STATE_FILE="$PROJECT_DIR/.watchdog_failures"
+ESCALATION_THRESHOLD=3        # Failures before first notification
+REMINDER_INTERVAL=12          # Re-notify every N additional failures (with BACKOFF=300s → ~1h)
+BACKOFF_INTERVAL=300          # 5 min between attempts after escalation
+RESTART_VERIFY_WAIT=30        # Seconds to wait before checking if restart succeeded
+
 cd "$PROJECT_DIR"
 
 # Validate STALE_MINUTES (2-30 range)
@@ -187,7 +196,35 @@ is_runner_alive() {
     pgrep -f "python.*runner_async" > /dev/null 2>&1
 }
 
+get_failure_count() {
+    if [ -f "$FAILURE_STATE_FILE" ]; then
+        cat "$FAILURE_STATE_FILE" 2>/dev/null | head -1 | tr -d '[:space:]' || echo "0"
+    else
+        echo "0"
+    fi
+}
+
+set_failure_count() {
+    echo "$1" > "$FAILURE_STATE_FILE"
+}
+
+reset_failures() {
+    if [ -f "$FAILURE_STATE_FILE" ]; then
+        log "Recovery: clearing failure counter (was $(get_failure_count))"
+        rm -f "$FAILURE_STATE_FILE"
+    fi
+}
+
+notify_user() {
+    local title="$1"
+    local msg="$2"
+    # macOS native notification — works because launchd loads us under Aqua session
+    osascript -e "display notification \"$msg\" with title \"$title\" sound name \"Basso\"" >/dev/null 2>&1 || true
+    log "NOTIFICATION SENT [$title]: $msg"
+}
+
 restart_trader() {
+    # Returns 0 if the restart appears successful (runner alive after wait), 1 otherwise.
     log "RESTARTING trader due to stall..."
 
     # Kill existing processes - use more specific patterns
@@ -198,7 +235,36 @@ restart_trader() {
     # Restart
     "$PROJECT_DIR/START_TRADER.sh" >> "$WATCHDOG_LOG" 2>&1
 
-    log "Restart complete"
+    log "Restart script finished; verifying runner came up..."
+    sleep "$RESTART_VERIFY_WAIT"
+
+    if is_runner_alive; then
+        log "Restart verified: runner_async is alive"
+        reset_failures
+        return 0
+    fi
+
+    # Restart failed — likely a 2FA timeout on Gateway. Track and escalate.
+    local prev_failures
+    prev_failures=$(get_failure_count)
+    local failures=$((prev_failures + 1))
+    set_failure_count "$failures"
+    log "Restart FAILED: runner_async not alive after ${RESTART_VERIFY_WAIT}s (consecutive failures: $failures)"
+
+    # First-time escalation
+    if [ "$failures" -eq "$ESCALATION_THRESHOLD" ]; then
+        notify_user "RoboTrader watchdog: trader is DOWN" \
+            "Restart failed ${failures}x — likely IBKR 2FA wall. Check IBKR Mobile app or run ./START_TRADER.sh manually."
+    elif [ "$failures" -gt "$ESCALATION_THRESHOLD" ]; then
+        # Periodic reminder
+        local extra=$((failures - ESCALATION_THRESHOLD))
+        if [ "$((extra % REMINDER_INTERVAL))" -eq 0 ]; then
+            notify_user "RoboTrader still DOWN" \
+                "Restart still failing ($failures attempts). Trader has not traded for ~$((failures * BACKOFF_INTERVAL / 60)) min."
+        fi
+    fi
+
+    return 1
 }
 
 # Main loop
@@ -207,8 +273,25 @@ log "Watchdog started (PID: $$, stale threshold: ${STALE_MINUTES} minutes)"
 log "=========================================="
 
 while true; do
+    # Layer 6: if we're in an escalated-failure state, slow down to avoid
+    # hammering Gateway and burning 2FA attempts.
+    failure_count=$(get_failure_count)
+    if [ "$failure_count" -ge "$ESCALATION_THRESHOLD" ]; then
+        current_interval=$BACKOFF_INTERVAL
+    else
+        current_interval=$CHECK_INTERVAL
+    fi
+
     if is_trading_time; then
         if is_runner_alive; then
+            # Runner is alive — if we previously escalated, clear that state and
+            # notify the user that recovery happened (so they know the alert is resolved).
+            if [ "$failure_count" -ge "$ESCALATION_THRESHOLD" ]; then
+                notify_user "RoboTrader recovered" \
+                    "Trader is back up after ${failure_count} failed attempts."
+            fi
+            reset_failures
+
             # Check for actual trading cycles, not just log file modification
             cycle_age_seconds=$(get_last_cycle_age_seconds)
 
@@ -248,5 +331,5 @@ while true; do
         fi
     fi
 
-    sleep "$CHECK_INTERVAL"
+    sleep "$current_interval"
 done
