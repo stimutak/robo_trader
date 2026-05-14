@@ -20,7 +20,9 @@ scikit-learn~=1.7
 xgboost~=3.0
 lightgbm~=4.6
 statsmodels~=0.14
-tensorflow==2.15.1
+# NOTE: ~=2.15 resolves to current 2.x (TF respects keras 3 from 2.16+).
+# Stricter pin (e.g. ==2.15.1) conflicts with keras~=3.0 below.
+tensorflow~=2.15
 keras~=3.0
 optuna~=3.5
 
