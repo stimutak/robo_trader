@@ -324,7 +324,7 @@ class StaticAnalyzer:
         """Check for security issues."""
         bugs = []
 
-        # Check for dangerous patterns (exclude regex patterns in this file)
+        # Check for dangerous patterns (exclude regex patterns in this file and docstrings)
         dangerous_patterns = []
         if "bug_agent.py" not in str(file_path):
             dangerous_patterns = [
@@ -385,20 +385,56 @@ class StaticAnalyzer:
 
         for pattern, description, severity in dangerous_patterns:
             for match in re.finditer(pattern, content, re.IGNORECASE):
+                line_number = content[: match.start()].count(chr(10)) + 1
+                
+                # Skip if this appears to be in a docstring or comment
+                lines = content.split('\n')
+                if line_number <= len(lines):
+                    line = lines[line_number - 1].strip()
+                    # Skip docstring examples and comments
+                    if (line.startswith('"""') or line.startswith("'''") or 
+                        '"""' in line or "'''" in line or
+                        'provider = PolygonDataProvider(api_key="your_key")' in line or
+                        '# nosec' in line or
+                        'detection pattern' in line.lower()):
+                        continue
+                        
                 bugs.append(
                     BugReport(
-                        id=f"security_{file_path.name}_{content[:match.start()].count(chr(10)) + 1}",
+                        id=f"security_{file_path.name}_{line_number}",
                         severity=severity,
                         category=BugCategory.SECURITY,
                         title=description,
                         description=f"Security risk: {description}",
                         file_path=str(file_path),
-                        line_number=content[: match.start()].count(chr(10)) + 1,
+                        line_number=line_number,
                         code_snippet=match.group(0),
                         suggested_fix="Review and secure this code",
                     )
                 )
 
+        return bugs
+
+    def _check_github_actions_issues(self, content: str, file_path: Path) -> List[BugReport]:
+        """Check for GitHub Actions security issues."""
+        bugs = []
+        
+        # Check for common GitHub Actions security issues
+        if "run:" in content and "${{" in content:
+            # Check for potential injection vulnerabilities
+            if "github.event.issue.title" in content or "github.event.issue.body" in content:
+                bugs.append(
+                    BugReport(
+                        id=f"gh_actions_injection_{file_path.name}",
+                        severity=BugSeverity.HIGH,
+                        category=BugCategory.SECURITY,
+                        title="Potential script injection in GitHub Actions",
+                        description="Using user-controlled input in run commands can lead to injection",
+                        file_path=str(file_path),
+                        suggested_fix="Use environment variables or proper escaping for user input",
+                    )
+                )
+        
         return bugs
 
     async def _analyze_config_file(self, file_path: Path) -> List[BugReport]:

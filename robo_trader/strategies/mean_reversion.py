@@ -436,10 +436,21 @@ class MeanReversionStrategy(Strategy):
                 position["side"] = "short"
 
     def _load_ml_model(self, model_path: str) -> None:
-        """Load pre-trained ML model."""
+        """Load pre-trained ML model.
+
+        SEC-B10: verify the model HMAC signature before deserializing.
+        joblib.load -> pickle -> arbitrary code execution if an attacker can
+        write to the model directory. verify_file refuses to load tampered
+        artifacts when MODEL_SIGNING_KEY is set; under the dev-default
+        (no key) it logs a warning and falls through, matching every other
+        ML load site in the codebase.
+        """
         try:
+            from robo_trader.ml._safe_load import verify_file
+
             path = Path(model_path)
             if path.exists():
+                verify_file(path)
                 self.ml_model = joblib.load(path)
                 logger.info("mean_reversion.ml_model_loaded", path=model_path)
             else:

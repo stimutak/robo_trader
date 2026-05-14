@@ -54,7 +54,26 @@ if cors_origins:
 else:
     allowed_origins = ["http://127.0.0.1:5555", "http://localhost:5555"]
 
+# SEC-C12: refuse wildcard origins; supports_credentials=True + "*" is a CSRF
+# bypass on any origin. Fail loud at startup rather than silently re-enable.
+for _origin in allowed_origins:
+    if "*" in _origin:
+        raise SystemExit(
+            f"Wildcard CORS origin {_origin!r} is not allowed with "
+            "supports_credentials=True. Set explicit origins in CORS_ORIGINS."
+        )
+
 CORS(app, origins=allowed_origins, supports_credentials=True)
+
+# SEC-B6: honor X-Forwarded-Proto / X-Forwarded-Host from a TLS-terminating
+# reverse proxy so request.is_secure (used by the CSRF cookie below) reflects
+# the user-facing scheme. Enable only when DASH_TRUST_PROXY=true so direct-bind
+# deployments don't trust spoofed headers.
+if os.getenv("DASH_TRUST_PROXY", "false").lower() == "true":
+    from werkzeug.middleware.proxy_fix import ProxyFix
+
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1, x_for=1)
+
 server = app  # For Gunicorn compatibility
 
 # Thread-safe cache for positions endpoint
@@ -68,20 +87,47 @@ DEFAULT_CAPITAL = float(os.getenv("DEFAULT_CASH", getattr(config, "default_cash"
 AUTH_ENABLED = os.getenv("DASH_AUTH_ENABLED", "true").lower() == "true"
 AUTH_USER = os.getenv("DASH_USER", "admin")
 AUTH_PASS_HASH = os.getenv("DASH_PASS_HASH", "").strip()
-# Reject empty AND placeholder values. A SHA-256 hex digest is exactly 64
-# lowercase hex chars; anything else is misconfiguration.
+# SEC-B1: accept two hash formats:
+#   1. "bcrypt$<bcrypt-modular-crypt-string>"  (preferred — salted + cost factor)
+#   2. 64-char SHA-256 hex                     (legacy — kept for migration)
+# When auth is enabled the value must match one of those shapes; placeholders
+# and empty strings are hard-rejected.
 _PLACEHOLDER_PREFIXES = ("<", "TODO", "CHANGEME", "REPLACE")
-if AUTH_ENABLED and (
-    not AUTH_PASS_HASH
-    or AUTH_PASS_HASH.upper().startswith(_PLACEHOLDER_PREFIXES)
-    or len(AUTH_PASS_HASH) != 64
-    or not all(c in "0123456789abcdefABCDEF" for c in AUTH_PASS_HASH)
-):
-    raise SystemExit(
-        "DASH_PASS_HASH must be a 64-char SHA-256 hex digest when auth is enabled. "
-        "Run: .venv/bin/python scripts/_set_dashboard_password.py "
-        "(or set DASH_AUTH_ENABLED=false for local dev)."
-    )
+
+
+def _is_valid_legacy_sha256(h: str) -> bool:
+    return len(h) == 64 and all(c in "0123456789abcdefABCDEF" for c in h)
+
+
+def _is_valid_bcrypt(h: str) -> bool:
+    # passlib bcrypt hashes start with $2b$, $2a$, or $2y$ and are 60 chars.
+    body = h[len("bcrypt$") :]
+    return body.startswith(("$2a$", "$2b$", "$2y$")) and len(body) == 60
+
+
+if AUTH_ENABLED:
+    if not AUTH_PASS_HASH or AUTH_PASS_HASH.upper().startswith(_PLACEHOLDER_PREFIXES):
+        raise SystemExit(
+            "DASH_PASS_HASH must be set when auth is enabled. "
+            "Run: .venv/bin/python scripts/_set_dashboard_password.py "
+            "(or set DASH_AUTH_ENABLED=false for local dev)."
+        )
+    if AUTH_PASS_HASH.startswith("bcrypt$"):
+        if not _is_valid_bcrypt(AUTH_PASS_HASH):
+            raise SystemExit(
+                "DASH_PASS_HASH starts with 'bcrypt$' but the bcrypt hash is malformed. "
+                "Re-run scripts/_set_dashboard_password.py to regenerate."
+            )
+    elif not _is_valid_legacy_sha256(AUTH_PASS_HASH):
+        raise SystemExit(
+            "DASH_PASS_HASH must be either 'bcrypt$<hash>' or a 64-char SHA-256 hex digest. "
+            "Run scripts/_set_dashboard_password.py to regenerate (bcrypt by default)."
+        )
+    elif _is_valid_legacy_sha256(AUTH_PASS_HASH):
+        logger.warning(
+            "DASH_PASS_HASH is using legacy SHA-256 (no salt). Re-run "
+            "scripts/_set_dashboard_password.py to upgrade to bcrypt."
+        )
 
 # Initialize components - will be loaded lazily
 db = None
@@ -141,17 +187,31 @@ else:
 
 # Authentication
 def check_auth(username, password):
-    """Check if username/password is valid using timing-safe comparison."""
+    """Check if username/password is valid using timing-safe comparison.
+
+    SEC-B1: prefers bcrypt (DASH_PASS_HASH starts with "bcrypt$"). Falls back
+    to legacy unsalted SHA-256 for compatibility during migration; the legacy
+    path is logged at startup as a warning.
+    """
     if not AUTH_ENABLED:
         return True
-    # W-H1: never short-circuit to True when auth is on but hash is missing.
     if not AUTH_PASS_HASH:
         return False
+    if not hmac.compare_digest(username, AUTH_USER):
+        return False
+    if AUTH_PASS_HASH.startswith("bcrypt$"):
+        try:
+            from passlib.hash import bcrypt
+        except ImportError:
+            logger.error("passlib not installed but DASH_PASS_HASH uses bcrypt scheme")
+            return False
+        try:
+            return bcrypt.verify(password, AUTH_PASS_HASH[len("bcrypt$") :])
+        except Exception:
+            return False
+    # Legacy SHA-256 path.
     password_hash = hashlib.sha256(password.encode()).hexdigest()
-    # Use timing-safe comparison to prevent timing attacks
-    return hmac.compare_digest(username, AUTH_USER) and hmac.compare_digest(
-        password_hash, AUTH_PASS_HASH
-    )
+    return hmac.compare_digest(password_hash, AUTH_PASS_HASH)
 
 
 def authenticate():
@@ -231,15 +291,62 @@ def _set_csrf_cookie(response):
     try:
         if request.method == "GET" and not request.cookies.get("csrf_token"):
             token = secrets.token_urlsafe(32)
+            # SEC-B6: request.is_secure now reflects X-Forwarded-Proto when
+            # DASH_TRUST_PROXY=true. Allow an explicit override for setups where
+            # the proxy header is unreliable.
+            cookie_secure = os.getenv("COOKIE_SECURE", "").lower() == "true" or request.is_secure
             response.set_cookie(
                 "csrf_token",
                 token,
                 httponly=False,
                 samesite="Strict",
-                secure=request.is_secure,
+                secure=cookie_secure,
             )
     except Exception:
         pass
+    return response
+
+
+@app.after_request
+def _set_security_headers(response):
+    """SEC-B7/B8: defense-in-depth response headers.
+
+    Headers added:
+      - X-Content-Type-Options: nosniff      (block MIME sniffing)
+      - X-Frame-Options: DENY                (clickjacking)
+      - Referrer-Policy                      (don't leak query/path on outbound nav)
+      - Permissions-Policy                   (hard-deny powerful APIs we never use)
+      - Strict-Transport-Security            (only when HTTPS_ENABLED=true)
+      - Content-Security-Policy              (locked down to self + ws on dashboard port)
+    The inline-script template currently requires 'unsafe-inline'; tracked
+    in audit finding B-8 for migration to nonces.
+    """
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault(
+        "Permissions-Policy",
+        "geolocation=(), microphone=(), camera=(), payment=(), usb=()",
+    )
+    if os.getenv("HTTPS_ENABLED", "false").lower() == "true":
+        response.headers.setdefault(
+            "Strict-Transport-Security",
+            "max-age=63072000; includeSubDomains",
+        )
+    if "Content-Security-Policy" not in response.headers:
+        ws_port = os.getenv("WS_PORT", "8765")
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+            "style-src 'self' 'unsafe-inline'; "
+            f"connect-src 'self' ws://127.0.0.1:{ws_port} ws://localhost:{ws_port} "
+            f"wss://127.0.0.1:{ws_port} wss://localhost:{ws_port}; "
+            "img-src 'self' data:; "
+            "font-src 'self' data:; "
+            "frame-ancestors 'none'; "
+            "base-uri 'none'; "
+            "form-action 'self'"
+        )
     return response
 
 
@@ -4008,10 +4115,11 @@ def health_liveness():
             ),
             200,
         )
-    except Exception as e:
-        logger.error(f"Liveness check failed: {e}")
+    except Exception:
+        # SEC-C9: log full exception server-side; never leak str(e) to client.
+        logger.exception("Liveness check failed")
         return (
-            jsonify({"status": "dead", "error": str(e), "timestamp": datetime.now().isoformat()}),
+            jsonify({"status": "dead", "timestamp": datetime.now().isoformat()}),
             500,
         )
 
@@ -5618,12 +5726,10 @@ def performance():
                 },
             }
         )
-    except Exception as e:
-        logger.error(f"Error calculating performance: {e}")
-        import traceback
-
-        traceback.print_exc()
-        return jsonify({"error": str(e), "summary": {}})
+    except Exception:
+        # SEC-C9: log full exception server-side; never leak str(e) to client.
+        logger.exception("Error calculating performance")
+        return jsonify({"error": "internal_error", "summary": {}}), 500
 
 
 @app.route("/api/equity-curve")
@@ -6540,20 +6646,61 @@ def get_kelly_parameters(symbol):
 @requires_auth
 @csrf_required
 def control_kill_switch():
-    """Control kill switch (reset after trigger)"""
-    action = (request.json or {}).get("action", "status")
+    """Control kill switch.
 
-    if action == "reset":
-        # Would reset actual kill switch
-        return jsonify(
-            {"success": True, "message": "Kill switch reset successfully", "status": "active"}
+    SEC-B13: the previous implementation returned hardcoded "success"
+    strings without touching the real KillSwitch. That made the dashboard
+    lie to operators. Now:
+      - "status" reads the on-disk KillSwitch state file (single source
+        of truth shared with the runner).
+      - "reset" / "disable" return 501 because mutating the running
+        runner's in-memory KillSwitch from the dashboard requires
+        cross-process coordination that is not yet wired up. The kill-
+        switch state file is the safety-critical artifact and must only
+        be mutated from the runner process.
+    """
+    action = (request.json or {}).get("action", "status")
+    state_path = Path("data/kill_switch_state.json")
+
+    if action == "status":
+        try:
+            if state_path.exists():
+                state = json.loads(state_path.read_text())
+                triggered = bool(state.get("triggered", False))
+                return jsonify(
+                    {
+                        "active": True,
+                        "triggered": triggered,
+                        "can_trade": not triggered,
+                        "reason": state.get("reason"),
+                        "triggered_at": state.get("triggered_at"),
+                    }
+                )
+            return jsonify({"active": False, "triggered": False, "can_trade": True})
+        except Exception:
+            logger.exception("Reading kill-switch state failed")
+            return jsonify({"error": "internal_error"}), 500
+
+    if action in ("reset", "disable"):
+        # Operator must reset the kill switch from the runner side (it
+        # mutates in-process risk state). Returning 501 is honest;
+        # returning "success" is not.
+        return (
+            jsonify(
+                {
+                    "error": "not_implemented",
+                    "message": (
+                        "Resetting the kill switch from the dashboard is not yet "
+                        "supported. Restart the runner with the kill-switch state "
+                        "file cleared (data/kill_switch_state.json), or use the "
+                        "runner CLI."
+                    ),
+                }
+            ),
+            501,
         )
-    elif action == "disable":
-        # Would disable kill switch temporarily
-        return jsonify({"success": True, "message": "Kill switch disabled", "status": "disabled"})
-    else:
-        # Return current status
-        return jsonify({"active": False, "triggered": False, "can_trade": True})
+
+    return jsonify({"error": "unknown_action"}), 400
 
 
 @app.route("/api/safety/circuit-breakers")
@@ -6625,8 +6772,10 @@ def get_order_manager_status():
                     "active_orders": [],
                 }
             )
-    except Exception as e:
-        return jsonify({"error": str(e), "statistics": {}, "active_orders": []})
+    except Exception:
+        # SEC-C9: log full exception server-side; never leak str(e) to client.
+        logger.exception("Order manager status error")
+        return jsonify({"error": "internal_error", "statistics": {}, "active_orders": []}), 500
 
 
 @app.route("/api/safety/data-validator")
@@ -6652,8 +6801,10 @@ def get_data_validator_status():
                     "pass_rate": 100.0,
                 }
             )
-    except Exception as e:
-        return jsonify({"error": str(e)})
+    except Exception:
+        # SEC-C9: log full exception server-side; never leak str(e) to client.
+        logger.exception("Data validator status error")
+        return jsonify({"error": "internal_error"}), 500
 
 
 @app.route("/api/safety/thresholds")
@@ -6695,9 +6846,25 @@ def start_trading():
     if trading_status == "running":
         return jsonify({"status": "already_running"})
 
+    # SEC-B9: validate every symbol before passing it into the start_runner
+    # subprocess. Without this, arbitrary strings (including 200-char payloads
+    # or control characters) reach the runner's CLI parser. DatabaseValidator
+    # already enforces the trading-symbol shape.
+    if isinstance(symbols, str):
+        symbols = [s.strip() for s in symbols.split(",") if s.strip()]
+    if not isinstance(symbols, list) or not symbols:
+        return jsonify({"status": "error", "error": "symbols must be a non-empty list"}), 400
+    try:
+        symbols = [_portfolio_validator.validate_symbol(s) for s in symbols]
+    except ValidationError as e:
+        return jsonify({"status": "error", "error": str(e)}), 400
+    if len(symbols) > 100:
+        # Cap the number of symbols to keep the CLI argument bounded.
+        return jsonify({"status": "error", "error": "too many symbols (max 100)"}), 400
+
     # Use the start_runner.sh script for proper startup with Gateway checks
     script_path = os.path.join(os.path.dirname(__file__), "scripts", "start_runner.sh")
-    symbols_str = ",".join(symbols) if isinstance(symbols, list) else symbols
+    symbols_str = ",".join(symbols)
 
     try:
         # Run the startup script and capture output
@@ -6727,8 +6894,12 @@ def start_trading():
             trading_log.append(
                 f"{datetime.now().strftime('%H:%M:%S')} - Failed to start (rc={result.returncode})"
             )
-            app.logger.warning("start_runner failed rc=%s stdout=%s stderr=%s",
-                               result.returncode, result.stdout, result.stderr)
+            app.logger.warning(
+                "start_runner failed rc=%s stdout=%s stderr=%s",
+                result.returncode,
+                result.stdout,
+                result.stderr,
+            )
             return (
                 jsonify({"status": "error", "error": "start_failed"}),
                 500,
@@ -6758,8 +6929,12 @@ def stop_trading():
         )
 
         # W-M5: log subprocess output server-side, do not return it to client.
-        app.logger.info("pkill runner_async rc=%s stdout=%s stderr=%s",
-                        result.returncode, result.stdout, result.stderr)
+        app.logger.info(
+            "pkill runner_async rc=%s stdout=%s stderr=%s",
+            result.returncode,
+            result.stdout,
+            result.stderr,
+        )
 
         # Also terminate tracked process if any
         if trading_process:
@@ -6871,9 +7046,13 @@ if __name__ == "__main__":
     # Run Flask app
     # W-H1: bind to loopback by default. Set DASH_HOST=0.0.0.0 to expose on LAN
     # only after putting auth + reverse proxy in front.
+    # SEC-A1: never enable Werkzeug interactive debugger. It exposes an unauth
+    # Python REPL gated only by a guessable PIN. Use a real WSGI server
+    # (gunicorn) for any non-localhost deployment.
+    _dev = os.getenv("FLASK_ENV") == "development"
     app.run(
         host=os.getenv("DASH_HOST", "127.0.0.1"),
         port=int(os.getenv("DASH_PORT", 5555)),
-        use_reloader=False,
-        debug=os.getenv("FLASK_ENV") == "development",
+        use_reloader=_dev,
+        debug=False,
     )

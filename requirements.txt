@@ -6,7 +6,7 @@ scipy~=1.10
 yfinance~=0.2.30
 python-dotenv==1.0.1
 pytest~=8.2
-pytest-asyncio~=0.21.0
+pytest-asyncio==0.21.1
 pydantic==2.6.4
 structlog~=23.0
 aiofiles~=23.0
@@ -20,17 +20,26 @@ scikit-learn~=1.7
 xgboost~=3.0
 lightgbm~=4.6
 statsmodels~=0.14
+# NOTE: ~=2.15 resolves to current 2.x (TF respects keras 3 from 2.16+).
+# Stricter pin (e.g. ==2.15.1) conflicts with keras~=3.0 below.
 tensorflow~=2.15
 keras~=3.0
 optuna~=3.5
 
 # Production dependencies
 psutil~=5.9
-cryptography==41.0.7
+# SEC-B2: cryptography 41.x has CVE-2023-50782, CVE-2024-0727, CVE-2024-26130.
+cryptography>=42.0.5,<44.0
 redis==5.0.4
 psycopg2-binary==2.9.9
-gunicorn==21.2.0
+# SEC-B3: gunicorn 21.x has CVE-2024-1135 (HTTP request smuggling).
+gunicorn>=22.0.0
 prometheus-client~=0.19
+# Password hashing (SEC-B1)
+# passlib 1.7.4 is incompatible with bcrypt>=4.0 (raises during bug detection).
+# Pin bcrypt to the 3.x series until passlib publishes a 4.x-compat release.
+passlib[bcrypt]==1.7.4
+bcrypt==3.2.2
 
 # Bug detection dependencies
 watchdog~=6.0

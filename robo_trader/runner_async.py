@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import math
 import os
 import subprocess
 import sys
@@ -473,6 +474,27 @@ class AsyncRunner:
         Checks circuit breaker state before execution and records
         success/failure for fault tolerance monitoring.
         """
+        # SEC-C13: NaN/Inf guard for every order path, including SELL-close
+        # which bypasses validate_order. Without this, a corrupted price
+        # (NaN, Inf, or non-numeric) would silently pass downstream where
+        # NaN comparisons all evaluate to False and slip past every
+        # numeric gate.
+        try:
+            qty_val = float(getattr(order, "quantity", 0))
+            price_val = float(
+                getattr(order, "limit_price", None) or getattr(order, "price", 0) or 0
+            )
+        except (TypeError, ValueError):
+            logger.error(f"Non-numeric quantity/price for {order.symbol}: blocked")
+            return SimpleNamespace(
+                ok=False, message="Non-numeric price or quantity", fill_price=None
+            )
+        if not math.isfinite(qty_val) or (price_val and not math.isfinite(price_val)):
+            logger.error(f"Non-finite quantity/price for {order.symbol}: blocked")
+            return SimpleNamespace(
+                ok=False, message="Non-finite price or quantity", fill_price=None
+            )
+
         # TC-M1 / TC-M6: centralized trading-blocked gate. This catches every
         # path that places an order, including SELL/closing flows, pairs trading,
         # and stop-loss execution. Without this, kill_switch / emergency_shutdown
@@ -480,9 +502,7 @@ class AsyncRunner:
         # and the pairs path bypassed the check entirely.
         blocked, reason = self._trading_blocked()
         if blocked:
-            logger.error(
-                f"Order blocked by trading_blocked gate for {order.symbol}: {reason}"
-            )
+            logger.error(f"Order blocked by trading_blocked gate for {order.symbol}: {reason}")
             return SimpleNamespace(ok=False, message=f"Trading blocked: {reason}", fill_price=None)
 
         # Check if circuit breaker allows the request
@@ -3087,9 +3107,7 @@ class AsyncRunner:
                                                 continue
                                             blocked, blk_reason = self._trading_blocked()
                                             if blocked:
-                                                logger.error(
-                                                    f"Pairs BUY blocked: {blk_reason}"
-                                                )
+                                                logger.error(f"Pairs BUY blocked: {blk_reason}")
                                                 continue
 
                                             # TC-M2: acquire pending-order lock and add to
@@ -3142,7 +3160,9 @@ class AsyncRunner:
                                                     symbol_a, "BUY", qty_a, fill_a
                                                 )
                                                 # TC-H3: increment daily executed notional
-                                                self.daily_executed_notional += float(fill_a) * float(qty_a)
+                                                self.daily_executed_notional += float(
+                                                    fill_a
+                                                ) * float(qty_a)
                                                 logger.info(
                                                     f"Pairs trade: Bought {qty_a} {symbol_a} at ${fill_a:.2f}"
                                                 )
@@ -3213,10 +3233,8 @@ class AsyncRunner:
                                                         side="SELL_SHORT",
                                                         price=price_b,
                                                     )
-                                                    res_b = (
-                                                        await self._place_order_with_circuit_breaker(
-                                                            order_b
-                                                        )
+                                                    res_b = await self._place_order_with_circuit_breaker(
+                                                        order_b
                                                     )
                                                     if res_b.ok:
                                                         fill_b = res_b.fill_price or price_b
@@ -3302,9 +3320,7 @@ class AsyncRunner:
                                                 continue
                                             blocked, blk_reason = self._trading_blocked()
                                             if blocked:
-                                                logger.error(
-                                                    f"Pairs BUY blocked: {blk_reason}"
-                                                )
+                                                logger.error(f"Pairs BUY blocked: {blk_reason}")
                                                 continue
 
                                             # TC-M2: pending lock + cycle dedupe
@@ -3355,7 +3371,9 @@ class AsyncRunner:
                                                     symbol_b, "BUY", qty_b, fill_b
                                                 )
                                                 # TC-H3: increment daily executed notional
-                                                self.daily_executed_notional += float(fill_b) * float(qty_b)
+                                                self.daily_executed_notional += float(
+                                                    fill_b
+                                                ) * float(qty_b)
                                                 logger.info(
                                                     f"Pairs trade: Bought {qty_b} {symbol_b} at ${fill_b:.2f}"
                                                 )
@@ -3424,10 +3442,8 @@ class AsyncRunner:
                                                         side="SELL_SHORT",
                                                         price=price_a,
                                                     )
-                                                    res_a = (
-                                                        await self._place_order_with_circuit_breaker(
-                                                            order_a
-                                                        )
+                                                    res_a = await self._place_order_with_circuit_breaker(
+                                                        order_a
                                                     )
                                                     if res_a.ok:
                                                         fill_a = res_a.fill_price or price_a

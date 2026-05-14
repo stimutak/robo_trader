@@ -21,6 +21,20 @@ from ..logger import get_logger
 logger = get_logger(__name__)
 
 
+# SEC-D9: hard upper bounds on per-portfolio risk overrides. A misconfigured
+# or malicious PORTFOLIOS entry could otherwise set max_position_pct=1.0
+# (100% in one position) or max_open_positions=9999, bypassing the global
+# safety defaults. These caps are deliberately generous but finite.
+_PORTFOLIO_RISK_CAPS = {
+    "max_position_pct": 0.25,  # at most 25% of equity in a single name
+    "max_daily_loss_pct": 0.05,  # at most 5% daily loss tolerance
+    "max_open_positions": 50,  # at most 50 concurrent positions
+    "stop_loss_pct": 0.20,  # at most 20% stop distance
+    "trailing_stop_pct": 0.20,
+    "min_confidence": 1.0,
+}
+
+
 @dataclass
 class PortfolioConfig:
     """Configuration for a single portfolio."""
@@ -42,6 +56,28 @@ class PortfolioConfig:
     # Strategy overrides (None = use global default from Config.strategy)
     enabled_strategies: Optional[List[str]] = None
     min_confidence: Optional[float] = None
+
+    def __post_init__(self):
+        # SEC-D9: clamp overrides to safe ceilings; reject negatives.
+        for param, cap in _PORTFOLIO_RISK_CAPS.items():
+            value = getattr(self, param, None)
+            if value is None:
+                continue
+            try:
+                value = type(cap)(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"Portfolio {self.id!r}: {param}={value!r} is not numeric")
+            if value < 0:
+                raise ValueError(
+                    f"Portfolio {self.id!r}: {param} must be non-negative (got {value})"
+                )
+            if value > cap:
+                logger.warning(
+                    f"Portfolio {self.id!r}: {param}={value} exceeds cap {cap}; clamping."
+                )
+                setattr(self, param, cap)
+            else:
+                setattr(self, param, value)
 
     def get_risk_param(self, param_name: str, global_default):
         """Get a risk parameter, falling back to global default if not overridden."""

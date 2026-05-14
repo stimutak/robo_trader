@@ -1116,10 +1116,26 @@ async def connect_ibkr_robust(
         transport_mode = transport_modes[min(transport_index, len(transport_modes) - 1)]
 
         if transport_mode == "ssl":
-            # Configure TLS transport with relaxed certificate checks for local Gateway
+            # SEC-B11: IB Gateway uses a self-signed cert with no SAN, so
+            # standard hostname verification doesn't apply. Skipping cert
+            # validation entirely (CERT_NONE) is only acceptable on a
+            # loopback connection where there is no network attacker between
+            # us and the Gateway. For non-loopback hosts, pin the Gateway
+            # cert via IBKR_TLS_CA env var; refuse to start otherwise.
             ssl_context = ssl.create_default_context()
             ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
+            tls_ca = os.environ.get("IBKR_TLS_CA", "").strip()
+            if host in ("127.0.0.1", "localhost", "::1"):
+                ssl_context.verify_mode = ssl.CERT_NONE
+            elif tls_ca:
+                ssl_context.load_verify_locations(cafile=tls_ca)
+                # verify_mode defaults to CERT_REQUIRED for create_default_context().
+            else:
+                raise RuntimeError(
+                    f"IBKR_SSL_MODE=require with non-loopback host {host!r} but "
+                    "IBKR_TLS_CA is not set. Pin the Gateway certificate or "
+                    "connect over loopback. Refusing to start with unauthenticated TLS."
+                )
 
             conn = ib.client.conn
 
