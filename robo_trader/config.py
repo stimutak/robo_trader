@@ -599,18 +599,21 @@ def load_config_from_env() -> Config:
     # Load multi-portfolio configurations
     try:
         from .multiuser.portfolio_config import load_portfolio_configs
+
         portfolio_configs = load_portfolio_configs()
         config.portfolio_configs = [pc.to_dict() for pc in portfolio_configs]
     except Exception as e:
         logger.warning(f"Could not load portfolio configs: {e}")
         # Fall back to single default portfolio
-        config.portfolio_configs = [{
-            "id": "default",
-            "name": "Default Portfolio",
-            "starting_cash": config.default_cash,
-            "symbols": ",".join(config.symbols),
-            "active": True,
-        }]
+        config.portfolio_configs = [
+            {
+                "id": "default",
+                "name": "Default Portfolio",
+                "starting_cash": config.default_cash,
+                "symbols": ",".join(config.symbols),
+                "active": True,
+            }
+        ]
 
     return config
 
@@ -648,7 +651,19 @@ def get_config_for_environment(env: Environment) -> Config:
         base_config.risk.max_daily_loss_pct = 0.003
         base_config.monitoring.enable_alerts = True
         base_config.monitoring.log_level = "INFO"
-        base_config.ibkr.readonly = False
+        # SEC-B12: do NOT silently flip readonly here. Disabling the IBKR
+        # read-only guard must be an explicit, separately-named env opt-in
+        # (IBKR_LIVE_ALLOW_ORDERS=true) — not a side-effect of selecting
+        # the production environment. Gateway-side ReadOnlyApi=yes remains
+        # the primary defense; this code is the secondary.
+        if os.getenv("IBKR_LIVE_ALLOW_ORDERS", "").lower() == "true":
+            logger.warning(
+                "IBKR_LIVE_ALLOW_ORDERS=true: enabling order placement. "
+                "Gateway ReadOnlyApi=no must also be set or orders will still be rejected."
+            )
+            base_config.ibkr.readonly = False
+        else:
+            base_config.ibkr.readonly = True
 
     elif env == Environment.STAGING:
         # Staging overrides

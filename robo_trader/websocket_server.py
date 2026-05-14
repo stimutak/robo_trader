@@ -197,6 +197,16 @@ class WebSocketManager:
 
     async def start_server(self):
         """Start the WebSocket server."""
+        # SEC-C11: refuse to bind a non-loopback host without a token.
+        # Anyone on the LAN would otherwise get full WS access. The
+        # handshake check also enforces this, but a startup-time refusal
+        # is louder and catches misconfiguration before connections land.
+        if self.host not in ("127.0.0.1", "localhost", "::1") and not self.auth_token:
+            raise RuntimeError(
+                f"WS_HOST={self.host!r} is non-loopback but WS_AUTH_TOKEN is unset. "
+                "Refusing to start unauthenticated WebSocket server on LAN. "
+                "Set WS_AUTH_TOKEN to a 32+ char random string."
+            )
         logger.info(f"Starting WebSocket server on ws://{self.host}:{self.port}")
 
         # Disable websockets library's own logging to prevent serialization issues
@@ -271,7 +281,12 @@ class WebSocketManager:
         )
 
     def send_trade_update(
-        self, symbol: str, side: str, quantity: int, price: float, status: str = "executed",
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+        price: float,
+        status: str = "executed",
         portfolio_id: str = "default",
     ):
         """Queue a trade update for broadcast."""
@@ -299,7 +314,9 @@ class WebSocketManager:
 
         self.message_queue.put(message)
 
-    def send_signal_update(self, symbol: str, signal: str, strength: float, portfolio_id: str = "default"):
+    def send_signal_update(
+        self, symbol: str, signal: str, strength: float, portfolio_id: str = "default"
+    ):
         """Queue a trading signal update for broadcast."""
         message = {
             "type": "signal",

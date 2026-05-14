@@ -142,11 +142,17 @@ class SubprocessIBKRClient:
             logger.debug("Using sys.executable Python", python_exe=python_exe)
 
         # DEBUGGING FIX: Create debug log file for worker stderr capture
-        # Use try/finally to ensure cleanup even if subprocess/thread startup fails
-        debug_log_path = "/tmp/worker_debug.log"
+        # SEC-D3: tempfile.NamedTemporaryFile avoids the predictable
+        # /tmp/worker_debug.log symlink attack vector on shared hosts.
+        import tempfile
+
         debug_log_file = None
+        debug_log_path = None
         try:
-            debug_log_file = open(debug_log_path, "w")
+            debug_log_file = tempfile.NamedTemporaryFile(
+                mode="w", prefix="robotrader_worker_debug_", suffix=".log", delete=False
+            )
+            debug_log_path = debug_log_file.name
             logger.info("Worker debug output will be captured", debug_log=debug_log_path)
         except Exception as e:
             logger.warning("Could not create debug log file", error=str(e))

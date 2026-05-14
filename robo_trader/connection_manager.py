@@ -225,8 +225,20 @@ class ConnectionManager:
         try:
             async with _GLOBAL_IB_CONNECT_LOCK:  # type: ignore[arg-type]
                 # Cross-process file lock
+                # SEC-D3: open with O_CREAT (mode 0o600) so a hostile
+                # pre-existing symlink at /tmp/ibkr_connect.lock cannot
+                # redirect the write. Path is configurable via
+                # IBKR_LOCK_FILE_PATH for non-/tmp deployments.
+                lock_path = os.environ.get(
+                    "IBKR_LOCK_FILE_PATH", "/tmp/ibkr_connect.lock"
+                )  # nosec B108
                 try:
-                    lock_fh = open("/tmp/ibkr_connect.lock", "w")
+                    fd = os.open(
+                        lock_path,
+                        os.O_WRONLY | os.O_CREAT,
+                        0o600,
+                    )
+                    lock_fh = os.fdopen(fd, "w")
                     import fcntl as _fcntl  # Local import to avoid Windows issues
 
                     _fcntl.flock(lock_fh, _fcntl.LOCK_EX)

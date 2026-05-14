@@ -319,7 +319,9 @@ def create_example_config() -> Dict:
             {
                 "name": "email_critical",
                 "type": "email",
-                "enabled": True,
+                # SEC-D13: default off — placeholder credentials must be
+                # replaced before the channel is enabled.
+                "enabled": False,
                 "rate_limit": 5,
                 "config": {
                     "host": "smtp.gmail.com",
