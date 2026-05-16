@@ -3,6 +3,7 @@
 Per 2026-05-16 design spec: exponential backoff [15, 30, 60, 120, 300],
 Gateway restart on attempt >=3, returns bool, mutex via _recovery_lock.
 """
+
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -103,9 +104,7 @@ async def test_backoff_schedule_is_15_30_60_120_300():
         new_callable=AsyncMock,
     ) as gm_restart:
         gm_restart.return_value = True
-        with patch(
-            "robo_trader.runner_async.asyncio.sleep", side_effect=record_sleep
-        ):
+        with patch("robo_trader.runner_async.asyncio.sleep", side_effect=record_sleep):
             await runner.recover_connection("test")
     assert sleeps == [15, 30, 60, 120, 300]
 
@@ -159,7 +158,7 @@ async def test_recovery_in_progress_observable_before_lock_acquired():
     original_init = runner.initialize_connection
 
     async def gated_init():
-        init_started.set()        # signal: we're inside the lock
+        init_started.set()  # signal: we're inside the lock
         await test_may_proceed.wait()  # wait for test to observe state
         return await original_init()
 

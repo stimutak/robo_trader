@@ -4,6 +4,7 @@ Per the 2026-05-16 design spec, ConnectionHealth is the single decision
 point for 'is the connection usable?', replacing health logic scattered
 across subprocess_ibkr_client, connection_manager, and runner_async.
 """
+
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 

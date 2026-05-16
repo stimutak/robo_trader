@@ -6,6 +6,7 @@ connection_manager.py, and runner_async._monitor_subprocess_health.
 
 Per 2026-05-16 design spec (docs/superpowers/specs/).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -17,9 +18,9 @@ logger = logging.getLogger(__name__)
 
 
 class HealthStatus(Enum):
-    HEALTHY = "healthy"          # consecutive_failures < max_consecutive_failures
-    UNHEALTHY = "unhealthy"      # consecutive_failures >= max_consecutive_failures
-    RECOVERING = "recovering"    # recover_connection() is mid-flight
+    HEALTHY = "healthy"  # consecutive_failures < max_consecutive_failures
+    UNHEALTHY = "unhealthy"  # consecutive_failures >= max_consecutive_failures
+    RECOVERING = "recovering"  # recover_connection() is mid-flight
 
 
 class ConnectionHealth:
@@ -155,15 +156,11 @@ class ConnectionHealth:
                             f"{self._consecutive_failures} consecutive failures"
                         )
                     except Exception:
-                        logger.exception(
-                            "on_unhealthy callback raised; continuing monitor loop"
-                        )
+                        logger.exception("on_unhealthy callback raised; continuing monitor loop")
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception(
-                    "Health monitor iteration crashed - failing safe to UNHEALTHY"
-                )
+                logger.exception("Health monitor iteration crashed - failing safe to UNHEALTHY")
                 self._status = HealthStatus.UNHEALTHY
             try:
                 await asyncio.sleep(self._ping_interval)

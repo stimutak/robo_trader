@@ -2,6 +2,7 @@
 
 Verifies that initialize_connection wires up health monitoring and that
 the on_unhealthy callback triggers recover_connection."""
+
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -41,10 +42,13 @@ async def test_initialize_connection_creates_health_module():
     fake_client.ping = AsyncMock(return_value=True)
     fake_client.stop = AsyncMock()
 
-    with patch(
-        "robo_trader.runner_async.SubprocessIBKRClient",
-        return_value=fake_client,
-    ), patch("asyncio.sleep", new_callable=AsyncMock):
+    with (
+        patch(
+            "robo_trader.runner_async.SubprocessIBKRClient",
+            return_value=fake_client,
+        ),
+        patch("asyncio.sleep", new_callable=AsyncMock),
+    ):
         await runner.initialize_connection()
 
     try:
@@ -71,10 +75,13 @@ async def test_initialize_connection_replaces_existing_health_module():
     fake_client.ping = AsyncMock(return_value=True)
     fake_client.stop = AsyncMock()
 
-    with patch(
-        "robo_trader.runner_async.SubprocessIBKRClient",
-        return_value=fake_client,
-    ), patch("asyncio.sleep", new_callable=AsyncMock):
+    with (
+        patch(
+            "robo_trader.runner_async.SubprocessIBKRClient",
+            return_value=fake_client,
+        ),
+        patch("asyncio.sleep", new_callable=AsyncMock),
+    ):
         await runner.initialize_connection()
         first_health = runner.health
 

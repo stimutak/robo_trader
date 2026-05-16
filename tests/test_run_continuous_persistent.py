@@ -9,6 +9,7 @@ API surface notes (verified):
 - SubprocessIBKRClient.is_connected() is snake_case (not isConnected)
 - get_accounts() is a separate async method
 """
+
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -19,6 +20,7 @@ from robo_trader.runner_async import AsyncRunner
 
 class FakeSubprocessClient:
     """Matches the verified subset of SubprocessIBKRClient API."""
+
     instances_created = 0
     start_call_count = 0
     stop_call_count = 0
@@ -72,19 +74,24 @@ async def test_persistent_runner_starts_subprocess_only_once_across_cycles():
     runner.production_monitor = None
     runner.correlation_manager = None
 
-    with patch(
-        "robo_trader.runner_async.SubprocessIBKRClient",
-        FakeSubprocessClient,
-    ), patch("asyncio.sleep", new_callable=AsyncMock):
+    with (
+        patch(
+            "robo_trader.runner_async.SubprocessIBKRClient",
+            FakeSubprocessClient,
+        ),
+        patch("asyncio.sleep", new_callable=AsyncMock),
+    ):
         await runner.initialize_connection()
         for _ in range(3):
             await runner.teardown(full_cleanup=False)
 
         # The persistent contract:
-        assert FakeSubprocessClient.start_call_count == 1, \
-            f"start was called {FakeSubprocessClient.start_call_count}x, expected 1"
-        assert FakeSubprocessClient.stop_call_count == 0, \
-            f"stop was called {FakeSubprocessClient.stop_call_count}x, expected 0 (teardown should not disconnect)"
+        assert (
+            FakeSubprocessClient.start_call_count == 1
+        ), f"start was called {FakeSubprocessClient.start_call_count}x, expected 1"
+        assert (
+            FakeSubprocessClient.stop_call_count == 0
+        ), f"stop was called {FakeSubprocessClient.stop_call_count}x, expected 0 (teardown should not disconnect)"
 
         # Cleanup the background health monitor task
         if runner.health is not None:

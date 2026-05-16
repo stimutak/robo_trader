@@ -8,6 +8,7 @@ Note: SubprocessIBKRClient.connect() returns bool, and the connection
 state check is is_connected() (snake_case) — these tests match the
 real client API surface.
 """
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -39,10 +40,13 @@ async def test_initialize_connection_starts_subprocess_and_connects():
     fake_client.get_accounts = AsyncMock(return_value=["DUN264991"])
     fake_client.stop = AsyncMock()
 
-    with patch(
-        "robo_trader.runner_async.SubprocessIBKRClient",
-        return_value=fake_client,
-    ), patch("asyncio.sleep", new_callable=AsyncMock):
+    with (
+        patch(
+            "robo_trader.runner_async.SubprocessIBKRClient",
+            return_value=fake_client,
+        ),
+        patch("asyncio.sleep", new_callable=AsyncMock),
+    ):
         await runner.initialize_connection()
 
     fake_client.start.assert_awaited_once()
@@ -60,10 +64,13 @@ async def test_initialize_connection_raises_on_connect_returning_false():
     fake_client.connect = AsyncMock(return_value=False)  # bool, not dict
     fake_client.stop = AsyncMock()
 
-    with patch(
-        "robo_trader.runner_async.SubprocessIBKRClient",
-        return_value=fake_client,
-    ), patch("asyncio.sleep", new_callable=AsyncMock):
+    with (
+        patch(
+            "robo_trader.runner_async.SubprocessIBKRClient",
+            return_value=fake_client,
+        ),
+        patch("asyncio.sleep", new_callable=AsyncMock),
+    ):
         with pytest.raises(ConnectionError):
             await runner.initialize_connection()
 
@@ -83,10 +90,13 @@ async def test_initialize_connection_raises_on_stabilization_timeout():
     fake_client.is_connected = MagicMock(return_value=False)  # never connects
     fake_client.stop = AsyncMock()
 
-    with patch(
-        "robo_trader.runner_async.SubprocessIBKRClient",
-        return_value=fake_client,
-    ), patch("asyncio.sleep", new_callable=AsyncMock):
+    with (
+        patch(
+            "robo_trader.runner_async.SubprocessIBKRClient",
+            return_value=fake_client,
+        ),
+        patch("asyncio.sleep", new_callable=AsyncMock),
+    ):
         with pytest.raises(ConnectionError):
             await runner.initialize_connection()
 
@@ -104,9 +114,12 @@ async def test_initialize_connection_cleanup_swallows_stop_error():
     fake_client.connect = AsyncMock(return_value=False)  # forces cleanup path
     fake_client.stop = AsyncMock(side_effect=RuntimeError("stop failed"))
 
-    with patch(
-        "robo_trader.runner_async.SubprocessIBKRClient",
-        return_value=fake_client,
-    ), patch("asyncio.sleep", new_callable=AsyncMock):
+    with (
+        patch(
+            "robo_trader.runner_async.SubprocessIBKRClient",
+            return_value=fake_client,
+        ),
+        patch("asyncio.sleep", new_callable=AsyncMock),
+    ):
         with pytest.raises(ConnectionError):  # NOT RuntimeError
             await runner.initialize_connection()

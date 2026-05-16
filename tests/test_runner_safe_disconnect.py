@@ -5,6 +5,7 @@ crashes the Gateway API layer. _safe_disconnect must delegate to the
 project-wide safe_disconnect() helper, which checks isConnected() and
 respects the IBKR_FORCE_DISCONNECT escape hatch.
 """
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -28,9 +29,7 @@ async def test_safe_disconnect_delegates_to_safe_disconnect_helper():
     """_safe_disconnect must call the project-wide safe_disconnect helper
     rather than rolling its own disconnect logic."""
     runner = make_runner_with_fake_ib(is_connected=True)
-    with patch(
-        "robo_trader.utils.ibkr_safe.safe_disconnect", return_value=True
-    ) as mock_safe:
+    with patch("robo_trader.utils.ibkr_safe.safe_disconnect", return_value=True) as mock_safe:
         await runner._safe_disconnect()
     mock_safe.assert_called_once()
     # Verify it was called with the correct context
