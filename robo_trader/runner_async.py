@@ -44,7 +44,11 @@ from .market_hours import (
 )
 from .monitoring.performance import PerformanceMonitor, Timer
 from .monitoring.production_monitor import ProductionMonitor
-from .utils.robust_connection import CircuitBreakerConfig, connect_ibkr_robust
+from .utils.robust_connection import (
+    CircuitBreakerConfig,
+    connect_ibkr_robust,
+    restart_gateway_for_zombies_async,
+)
 
 # Import WebSocket client for real-time updates
 try:
@@ -332,6 +336,8 @@ class AsyncRunner:
         self.risk_monitor_task = None  # Background risk monitoring task
         self.subprocess_monitor_task = None  # Background subprocess health monitoring task
         self.cleanup_task = None  # DB-R2-L2: periodic cleanup_old_data task
+        self.recovery_in_progress = False
+        self._recovery_lock = asyncio.Lock()
         self.executor = None
         self.portfolio = None
         self.portfolio_manager: Optional[MultiStrategyPortfolioManager] = None
@@ -4233,6 +4239,76 @@ class AsyncRunner:
             client_id,
             accounts,
         )
+
+    async def recover_connection(self, reason: str) -> bool:
+        """Re-establish IBKR connection after ConnectionHealth reports unhealthy.
+
+        Returns True if recovered, False if all 5 backoff attempts failed.
+        On False, the caller should exit run_continuous and let the watchdog
+        do process-level restart.
+
+        Per 2026-05-16 design spec:
+        - Backoff: [15, 30, 60, 120, 300] seconds
+        - Gateway restart on attempt >= 3
+        - Mutex via _recovery_lock (no concurrent recovery)
+        - Sets recovery_in_progress flag for cycle-skip logic
+        """
+        backoff_schedule = [15, 30, 60, 120, 300]
+        gateway_restart_attempt_threshold = 3
+
+        async with self._recovery_lock:
+            self.recovery_in_progress = True
+            try:
+                for attempt_idx, delay in enumerate(backoff_schedule):
+                    attempt = attempt_idx + 1
+                    logger.warning(
+                        "event=recovery_started attempt=%d backoff_seconds=%d reason=%r",
+                        attempt,
+                        delay,
+                        reason,
+                    )
+
+                    await self._safe_disconnect()
+                    await asyncio.sleep(delay)
+
+                    if attempt >= gateway_restart_attempt_threshold:
+                        try:
+                            ok = await restart_gateway_for_zombies_async(
+                                self.cfg.ibkr.port, 180
+                            )
+                            logger.info(
+                                "event=recovery_gateway_restart_done attempt=%d success=%s",
+                                attempt,
+                                ok,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "event=recovery_gateway_restart_failed attempt=%d error=%r",
+                                attempt,
+                                e,
+                            )
+
+                    try:
+                        await self.initialize_connection()
+                        logger.info(
+                            "event=recovery_succeeded attempt=%d", attempt
+                        )
+                        return True
+                    except Exception as e:
+                        logger.warning(
+                            "event=recovery_attempt_failed attempt=%d error=%r",
+                            attempt,
+                            e,
+                        )
+
+                logger.error(
+                    "event=recovery_exhausted attempts=%d reason=%r",
+                    len(backoff_schedule),
+                    reason,
+                )
+                return False
+            finally:
+                self.recovery_in_progress = False
 
 
 async def run_once(
