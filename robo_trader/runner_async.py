@@ -4418,8 +4418,11 @@ async def run_continuous(
     logger.info("Starting continuous trading system...")
     logger.info("Press Ctrl+C to stop gracefully")
 
-    # Persistent runner - created once, reused across cycles
-    runner = None
+    # Persistent connection design (2026-05-16): runners dict holds
+    # long-lived AsyncRunner per portfolio_id. Created lazily on first
+    # cycle and reused across all subsequent cycles. The IBKR connection
+    # lives inside the runner and persists.
+    runners: dict[str, AsyncRunner] = {}
 
     try:
         while not shutdown_flag:
@@ -4488,38 +4491,71 @@ async def run_continuous(
                 )
 
                 for portfolio_cfg in active_portfolios:
-                    # Determine symbols for this portfolio
+                    portfolio_id = portfolio_cfg.id
                     portfolio_symbols = portfolio_cfg.symbols if portfolio_cfg.symbols else symbols
 
                     logger.info(
-                        f"── Portfolio '{portfolio_cfg.id}' ({portfolio_cfg.name}): "
+                        f"── Portfolio '{portfolio_id}' ({portfolio_cfg.name}): "
                         f"{len(portfolio_symbols or [])} symbols ──"
                     )
 
-                    # Create fresh runner each cycle for stability (disconnect between cycles)
-                    # This avoids connection timeouts and subprocess health check issues
-                    runner = AsyncRunner(
-                        duration=duration,
-                        bar_size=bar_size,
-                        sma_fast=sma_fast,
-                        sma_slow=sma_slow,
-                        slippage_bps=slippage_bps,
-                        max_order_notional=max_order_notional,
-                        max_daily_notional=max_daily_notional,
-                        default_cash=portfolio_cfg.starting_cash,
-                        max_concurrent_symbols=max_concurrent,
-                        use_correlation_sizing=True,  # FIXED: Enabled M5 correlation integration
-                        use_ml_strategy=use_ml_strategy,
-                        use_smart_execution=use_smart_execution,
-                        portfolio_id=portfolio_cfg.id,
-                    )
+                    # Lazy long-lived runner creation
+                    if portfolio_id not in runners:
+                        new_runner = AsyncRunner(
+                            duration=duration,
+                            bar_size=bar_size,
+                            sma_fast=sma_fast,
+                            sma_slow=sma_slow,
+                            slippage_bps=slippage_bps,
+                            max_order_notional=max_order_notional,
+                            max_daily_notional=max_daily_notional,
+                            default_cash=portfolio_cfg.starting_cash,
+                            max_concurrent_symbols=max_concurrent,
+                            use_correlation_sizing=True,
+                            use_ml_strategy=use_ml_strategy,
+                            use_smart_execution=use_smart_execution,
+                            portfolio_id=portfolio_id,
+                        )
+                        await new_runner.setup()
+                        await new_runner.initialize_connection()
+                        runners[portfolio_id] = new_runner
+                    portfolio_runner = runners[portfolio_id]
 
-                    await runner.run(portfolio_symbols)
+                    # Skip cycle if recovery is mid-flight
+                    if portfolio_runner.recovery_in_progress:
+                        logger.info(
+                            "event=cycle_skipped_recovery_in_progress portfolio=%s",
+                            portfolio_id,
+                        )
+                        continue
 
-                    # Clean up connection after each portfolio (more stable for long-running)
-                    logger.info(f"Cleaning up runner for portfolio '{portfolio_cfg.id}'...")
-                    await runner.cleanup()
-                    runner = None
+                    # Cycle health gate — only run if HEALTHY
+                    from robo_trader.connection_health import HealthStatus
+                    if (
+                        portfolio_runner.health is not None
+                        and portfolio_runner.health.status is not HealthStatus.HEALTHY
+                    ):
+                        logger.warning(
+                            "event=cycle_skipped_unhealthy portfolio=%s status=%s",
+                            portfolio_id,
+                            portfolio_runner.health.status.value,
+                        )
+                        continue
+
+                    try:
+                        await portfolio_runner.run(portfolio_symbols)
+                    except Exception as cycle_err:
+                        logger.exception(
+                            "event=cycle_error portfolio=%s error=%r",
+                            portfolio_id,
+                            cycle_err,
+                        )
+                        if portfolio_runner.health is not None:
+                            portfolio_runner.health.record_failure(
+                                cycle_err, f"cycle:{portfolio_id}"
+                            )
+
+                    await portfolio_runner.teardown(full_cleanup=False)
 
                 # Wait before next iteration
                 if not shutdown_flag and is_trading_allowed():
@@ -4538,21 +4574,23 @@ async def run_continuous(
                 break
             except Exception as e:
                 logger.error(f"Error in trading cycle: {e}")
-                # If connection error, reset runner to force reconnect
-                if "connect" in str(e).lower() or "timeout" in str(e).lower():
-                    logger.warning("Connection error detected, will reconnect on next cycle")
-                    if runner:
-                        await runner.cleanup()
-                    runner = None
+                # If connection error at the outer level, let ConnectionHealth +
+                # recover_connection handle reconnection on the affected runner.
+                # We no longer tear down the runner here — the long-lived runner
+                # owns its connection lifecycle.
                 if not shutdown_flag:
                     logger.info("Waiting 1 minute before retry...")
                     await asyncio.sleep(60)
 
     finally:
-        # Cleanup on shutdown
-        if runner:
-            logger.info("Cleaning up persistent runner...")
-            await runner.cleanup()
+        # Final cleanup: all portfolios get full disconnect on process exit
+        for pid, r in runners.items():
+            try:
+                await r.cleanup()
+            except Exception:
+                logger.exception(
+                    "event=final_cleanup_failed portfolio=%s", pid
+                )
         logger.info("Trading system shutdown complete")
         # B2 (2026-05-12): Record a clean exit so dashboard/watchdog know
         # the runner ended normally (vs crashing). Best-effort — don't
