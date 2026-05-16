@@ -158,6 +158,8 @@ class ConnectionHealth:
                         logger.exception(
                             "on_unhealthy callback raised; continuing monitor loop"
                         )
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.exception(
                     "Health monitor iteration crashed - failing safe to UNHEALTHY"

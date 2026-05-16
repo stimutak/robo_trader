@@ -4,6 +4,7 @@ Per the 2026-05-16 design spec, ConnectionHealth is the single decision
 point for 'is the connection usable?', replacing health logic scattered
 across subprocess_ibkr_client, connection_manager, and runner_async.
 """
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -101,9 +102,6 @@ async def test_perform_check_respects_ib_not_connected():
     result = await health.perform_check()
     assert result is HealthStatus.HEALTHY  # 1/3, still healthy by status
     assert health._consecutive_failures == 1
-
-
-import asyncio
 
 
 @pytest.mark.asyncio
