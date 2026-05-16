@@ -1634,57 +1634,6 @@ class AsyncRunner:
         if full_cleanup:
             await self.cleanup()
 
-    async def _monitor_subprocess_health(self):
-        """
-        Background task to monitor subprocess health.
-
-        Pings the subprocess every 60 seconds and automatically restarts
-        if the subprocess becomes unresponsive after multiple failures.
-        """
-        logger.info("Starting subprocess health monitoring (60s interval, 3 failures to restart)")
-        consecutive_failures = 0
-        max_failures = 3  # Require 3 consecutive failures before restart
-
-        while True:
-            try:
-                await asyncio.sleep(60)  # Check every minute
-
-                # Only monitor if using subprocess client
-                if not hasattr(self.ib, "ping"):
-                    logger.debug("Not using subprocess client, skipping health check")
-                    continue
-
-                # Ping subprocess
-                logger.debug("Pinging subprocess for health check...")
-                is_healthy = await self.ib.ping()
-
-                if not is_healthy:
-                    consecutive_failures += 1
-                    logger.warning(
-                        f"Subprocess health check failed ({consecutive_failures}/{max_failures})"
-                    )
-
-                    if consecutive_failures >= max_failures:
-                        logger.error(
-                            f"Subprocess unresponsive after {max_failures} consecutive failures - restarting"
-                        )
-                        await self._restart_subprocess()
-                        consecutive_failures = 0  # Reset after restart attempt
-                else:
-                    if consecutive_failures > 0:
-                        logger.info("Subprocess health check recovered")
-                    consecutive_failures = 0
-                    logger.debug("Subprocess health check passed")
-
-            except asyncio.CancelledError:
-                logger.info("Subprocess health monitoring cancelled")
-                break
-            except Exception as e:
-                logger.error(f"Error in subprocess health monitoring: {e}")
-                consecutive_failures += 1
-                # Continue monitoring even on errors
-                continue
-
     async def _periodic_cleanup_loop(self):
         """DB-R2-L2: periodically purge old market_data, ticks, and signals.
 
@@ -1738,81 +1687,6 @@ class AsyncRunner:
             except Exception as e:
                 logger.error(f"Error in periodic cleanup loop: {e}")
                 continue
-
-    async def _restart_subprocess(self):
-        """
-        Restart the IBKR subprocess after a crash or health check failure.
-
-        This attempts to gracefully stop the subprocess and create a new
-        connection using the same configuration.
-        """
-        logger.warning("⚠️ Restarting IBKR subprocess due to health check failure")
-
-        try:
-            # Clean up stale lock files first
-            import os
-
-            lock_path = os.environ.get(
-                "IBKR_LOCK_FILE_PATH", "/tmp/ibkr_connect.lock"
-            )  # nosec B108
-            try:
-                if os.path.exists(lock_path):
-                    os.remove(lock_path)
-                    logger.info(f"Removed stale lock file: {lock_path}")
-            except Exception as e:
-                logger.warning(f"Could not remove lock file: {e}")
-
-            # Stop the old subprocess
-            if hasattr(self.ib, "stop"):
-                try:
-                    await asyncio.wait_for(self.ib.stop(), timeout=10.0)
-                except asyncio.TimeoutError:
-                    logger.warning("Subprocess stop timed out, continuing with restart")
-                except Exception as e:
-                    logger.warning(f"Error stopping subprocess: {e}")
-
-            # Kill any orphaned worker processes
-            import subprocess
-
-            subprocess.run(
-                ["pkill", "-9", "-f", "ibkr_subprocess_worker"], capture_output=True, timeout=5
-            )
-            await asyncio.sleep(1)  # Give time for cleanup
-
-            # Reconnect using robust connection
-            from .utils.robust_connection import CircuitBreakerConfig, connect_ibkr_robust
-
-            # Get connection parameters from config
-            host = self.cfg.ibkr.host
-            port = self.cfg.ibkr.port
-
-            circuit_config = CircuitBreakerConfig(
-                failure_threshold=int(os.getenv("CIRCUIT_BREAKER_THRESHOLD", "5")),
-                recovery_timeout=float(os.getenv("CIRCUIT_BREAKER_TIMEOUT", "300")),
-                success_threshold=2,
-            )
-
-            # Reconnect with the same portfolio-specific client_id
-            client_id = getattr(self, "_client_id", self.cfg.ibkr.client_id)
-            logger.info(f"Reconnecting to IBKR at {host}:{port}")
-            self.ib = await connect_ibkr_robust(
-                host=host,
-                port=port,
-                client_id=client_id,
-                readonly=self.cfg.ibkr.readonly,
-                timeout=self.cfg.ibkr.timeout,
-                max_retries=3,  # More retries
-                circuit_breaker_config=circuit_config,
-                ssl_mode=self.cfg.ibkr.ssl_mode,
-            )
-
-            logger.info("✅ Subprocess restarted successfully")
-
-        except Exception as e:
-            logger.error(f"❌ Failed to restart subprocess: {e}")
-            logger.warning("Will retry on next health check cycle")
-            # Don't raise - let it retry on the next health check
-            # raise RuntimeError(f"Failed to restart subprocess: {e}")
 
     async def fetch_and_store_data(self, symbol: str) -> Optional[pd.DataFrame]:
         """Fetch market data for a symbol and store in database."""
