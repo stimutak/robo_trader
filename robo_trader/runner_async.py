@@ -4172,15 +4172,26 @@ class AsyncRunner:
         same path during runtime recovery. Raises ConnectionError if the
         subprocess fails to connect.
 
-        Per 2025-11-24 handoff: includes 2.0s stabilization wait + isConnected()
+        Per 2025-11-24 handoff: includes 2.0s stabilization wait + is_connected()
         poll AFTER handshake to ensure Gateway has fully published nextValidId.
         """
+
+        async def _cleanup(client):
+            try:
+                await client.stop()
+            except Exception:
+                logger.warning(
+                    "SubprocessIBKRClient.stop() raised during initialize_connection cleanup; ignoring",
+                    exc_info=True,
+                )
+
+        # _client_id is set by setup() for portfolio-specific id; fallback to base config
         client_id = getattr(self, "_client_id", self.cfg.ibkr.client_id)
 
         client = SubprocessIBKRClient()
-        await client.start()
         try:
-            result = await client.connect(
+            await client.start()
+            connected = await client.connect(
                 host=self.cfg.ibkr.host,
                 port=self.cfg.ibkr.port,
                 client_id=client_id,
@@ -4188,35 +4199,39 @@ class AsyncRunner:
                 timeout=10.0,
             )
         except Exception:
-            await client.stop()
+            await _cleanup(client)
             raise
 
-        if not result.get("connected"):
-            await client.stop()
-            raise ConnectionError(
-                f"Subprocess connect failed: {result.get('error', 'unknown')}"
-            )
+        if not connected:
+            await _cleanup(client)
+            raise ConnectionError("SubprocessIBKRClient.connect() returned False")
 
         # 2.0s stabilization wait per 2025-11-24 handoff
         await asyncio.sleep(2.0)
 
-        # Poll isConnected() to verify the Gateway-side state is stable
+        # Poll is_connected() to verify the Gateway-side state is stable
         for _ in range(10):
-            if client.isConnected():
+            if client.is_connected():
                 break
             await asyncio.sleep(0.2)
         else:
-            await client.stop()
+            await _cleanup(client)
             raise ConnectionError(
-                "ib.isConnected() never returned True after 2s+ stabilization"
+                "is_connected() never returned True after 2s+ stabilization"
             )
+
+        # Get accounts for logging - connect() returns bool, accounts come from get_accounts()
+        try:
+            accounts = await client.get_accounts()
+        except Exception:
+            accounts = []
 
         self.subprocess_client = client
         self.ib = client
         logger.info(
             "event=connection_initialized client_id=%s accounts=%s",
             client_id,
-            result.get("accounts", []),
+            accounts,
         )
 
 
