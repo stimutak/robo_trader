@@ -58,3 +58,46 @@ def test_record_success_clears_recovering_state():
     health.record_success()
     assert health.status is HealthStatus.HEALTHY
     assert health._consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_perform_check_calls_subprocess_ping():
+    fake = make_fake_ib_client()
+    health = ConnectionHealth(ib_client=fake)
+    result = await health.perform_check()
+    fake.ping.assert_awaited_once()
+    assert result is HealthStatus.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_perform_check_failure_increments_counter():
+    fake = make_fake_ib_client()
+    fake.ping = AsyncMock(return_value=False)
+    health = ConnectionHealth(ib_client=fake, max_consecutive_failures=3)
+    await health.perform_check()
+    await health.perform_check()
+    assert health.status is HealthStatus.HEALTHY  # 2/3 failures
+    await health.perform_check()
+    assert health.status is HealthStatus.UNHEALTHY  # 3/3 -> threshold
+
+
+@pytest.mark.asyncio
+async def test_perform_check_success_resets_counter():
+    fake = make_fake_ib_client()
+    fake.ping = AsyncMock(side_effect=[False, False, True])
+    health = ConnectionHealth(ib_client=fake, max_consecutive_failures=3)
+    await health.perform_check()
+    await health.perform_check()
+    await health.perform_check()
+    assert health.status is HealthStatus.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_perform_check_respects_ib_not_connected():
+    fake = make_fake_ib_client()
+    fake.isConnected = MagicMock(return_value=False)
+    health = ConnectionHealth(ib_client=fake, max_consecutive_failures=3)
+    # Even if ping would succeed, isConnected()==False is a hard failure.
+    result = await health.perform_check()
+    assert result is HealthStatus.HEALTHY  # 1/3, still healthy by status
+    assert health._consecutive_failures == 1
