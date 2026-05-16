@@ -8,9 +8,10 @@ Per 2026-05-16 design spec (docs/superpowers/specs/).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from enum import Enum
-from typing import Any
+from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,7 @@ class ConnectionHealth:
     def __init__(
         self,
         ib_client: Any,
-        ping_interval_seconds: int = 30,
+        ping_interval_seconds: float = 30,
         max_consecutive_failures: int = 3,
     ) -> None:
         self._ib_client = ib_client
@@ -33,6 +34,9 @@ class ConnectionHealth:
         self._max_failures = max_consecutive_failures
         self._consecutive_failures = 0
         self._status: HealthStatus = HealthStatus.HEALTHY
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._stopped = False
+        self._on_unhealthy: Optional[Callable[[str], Awaitable[None]]] = None
 
     @property
     def status(self) -> HealthStatus:
@@ -106,3 +110,60 @@ class ConnectionHealth:
                 "perform_check:ping_falsy",
             )
         return self._status
+
+    async def start_monitoring(
+        self,
+        on_unhealthy: Callable[[str], Awaitable[None]],
+    ) -> None:
+        """Spawn background task that calls perform_check() every
+        ping_interval_seconds. On transition to UNHEALTHY, awaits
+        on_unhealthy(reason)."""
+        if self._monitor_task is not None and not self._monitor_task.done():
+            return
+        self._on_unhealthy = on_unhealthy
+        self._stopped = False
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
+
+    async def stop_monitoring(self) -> None:
+        """Cancel the background monitor task. Idempotent."""
+        self._stopped = True
+        if self._monitor_task is None:
+            return
+        if not self._monitor_task.done():
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+        self._monitor_task = None
+
+    async def _monitor_loop(self) -> None:
+        """Survives perform_check exceptions — fails safe to UNHEALTHY,
+        keeps trying. Never silently dies."""
+        while not self._stopped:
+            try:
+                prev_status = self._status
+                await self.perform_check()
+                if (
+                    prev_status is not HealthStatus.UNHEALTHY
+                    and self._status is HealthStatus.UNHEALTHY
+                    and self._on_unhealthy is not None
+                ):
+                    try:
+                        await self._on_unhealthy(
+                            f"perform_check transitioned to UNHEALTHY after "
+                            f"{self._consecutive_failures} consecutive failures"
+                        )
+                    except Exception:
+                        logger.exception(
+                            "on_unhealthy callback raised; continuing monitor loop"
+                        )
+            except Exception:
+                logger.exception(
+                    "Health monitor iteration crashed - failing safe to UNHEALTHY"
+                )
+                self._status = HealthStatus.UNHEALTHY
+            try:
+                await asyncio.sleep(self._ping_interval)
+            except asyncio.CancelledError:
+                break

@@ -101,3 +101,58 @@ async def test_perform_check_respects_ib_not_connected():
     result = await health.perform_check()
     assert result is HealthStatus.HEALTHY  # 1/3, still healthy by status
     assert health._consecutive_failures == 1
+
+
+import asyncio
+
+
+@pytest.mark.asyncio
+async def test_start_monitoring_calls_on_unhealthy_at_threshold():
+    fake = make_fake_ib_client()
+    fake.ping = AsyncMock(return_value=False)
+    on_unhealthy = AsyncMock()
+    health = ConnectionHealth(
+        ib_client=fake,
+        ping_interval_seconds=0.01,  # fast for test
+        max_consecutive_failures=2,
+    )
+    await health.start_monitoring(on_unhealthy=on_unhealthy)
+    # Give the monitor loop time to fire 2 checks
+    await asyncio.sleep(0.05)
+    await health.stop_monitoring()
+    on_unhealthy.assert_awaited()
+    # Reason argument should describe the failure
+    call_args = on_unhealthy.await_args
+    assert "perform_check" in str(call_args) or "ping" in str(call_args)
+
+
+@pytest.mark.asyncio
+async def test_monitor_loop_survives_perform_check_exception():
+    fake = make_fake_ib_client()
+    fake.ping = AsyncMock(side_effect=[RuntimeError("boom"), True, True])
+    on_unhealthy = AsyncMock()
+    health = ConnectionHealth(
+        ib_client=fake,
+        ping_interval_seconds=0.01,
+        max_consecutive_failures=5,  # high so exception doesn't trip it
+    )
+    await health.start_monitoring(on_unhealthy=on_unhealthy)
+    await asyncio.sleep(0.05)
+    await health.stop_monitoring()
+    # Despite the first ping raising, subsequent checks ran (no silent death)
+    assert fake.ping.await_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_stop_monitoring_cancels_task_cleanly():
+    fake = make_fake_ib_client()
+    on_unhealthy = AsyncMock()
+    health = ConnectionHealth(
+        ib_client=fake,
+        ping_interval_seconds=10,  # very long so we can stop before it fires
+    )
+    await health.start_monitoring(on_unhealthy=on_unhealthy)
+    await health.stop_monitoring()
+    # stop_monitoring should be idempotent
+    await health.stop_monitoring()
+    # No assertion needed — just that no exception/hang
