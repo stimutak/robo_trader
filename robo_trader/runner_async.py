@@ -4136,6 +4136,38 @@ class AsyncRunner:
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
 
+    async def _safe_disconnect(self) -> None:
+        """Disconnect IBKR cleanly when possible; never crash Gateway.
+
+        Per 2025-11-20 handoff: calling ib.disconnect() on a FAILED
+        connection crashes the Gateway API layer. Skip disconnect when
+        isConnected() is False. ALWAYS stop the subprocess.
+        """
+        import asyncio
+
+        if self.ib is not None:
+            try:
+                if self.ib.isConnected():
+                    try:
+                        await asyncio.wait_for(
+                            self.ib.disconnectAsync(), timeout=5.0
+                        )
+                    except (asyncio.TimeoutError, Exception):
+                        # Connection already broken — don't make Gateway crash matter
+                        pass
+            except Exception:
+                # isConnected() itself can throw on a dead client
+                pass
+
+        if getattr(self, "subprocess_client", None) is not None:
+            try:
+                await self.subprocess_client.stop()
+            except Exception:
+                logger.warning(
+                    "subprocess_client.stop() raised during _safe_disconnect; ignoring",
+                    exc_info=True,
+                )
+
 
 async def run_once(
     symbols: Optional[List[str]] = None,
