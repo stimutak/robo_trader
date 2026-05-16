@@ -5,8 +5,8 @@ This enables recover_connection() to call the same setup path during
 runtime recovery without going through full setup()/run() startup.
 
 Note: SubprocessIBKRClient.connect() returns bool, and the connection
-state check is is_connected() (snake_case) — these tests match the
-real client API surface.
+state check is is_connected (snake_case, @property — not a method) —
+these tests match the real client API surface.
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -26,6 +26,10 @@ def make_runner_skeleton():
     runner.portfolio_id = "default"
     runner.ib = None
     runner.subprocess_client = None
+    runner.health = None
+    # initialize_connection delegates health wiring to _attach_health_monitor;
+    # stub it out — health-monitor integration is covered separately.
+    runner._attach_health_monitor = AsyncMock()
     return runner
 
 
@@ -36,7 +40,7 @@ async def test_initialize_connection_starts_subprocess_and_connects():
     fake_client = MagicMock()
     fake_client.start = AsyncMock()
     fake_client.connect = AsyncMock(return_value=True)  # bool, not dict
-    fake_client.is_connected = MagicMock(return_value=True)  # snake_case
+    fake_client.is_connected = True  # @property on real client — plain attr in mock
     fake_client.get_accounts = AsyncMock(return_value=["DUN264991"])
     fake_client.stop = AsyncMock()
 
@@ -80,14 +84,14 @@ async def test_initialize_connection_raises_on_connect_returning_false():
 
 @pytest.mark.asyncio
 async def test_initialize_connection_raises_on_stabilization_timeout():
-    """is_connected() never returns True even after the 2.0s stabilization +
+    """is_connected never returns True even after the 2.0s stabilization +
     10 poll iterations. initialize_connection must raise ConnectionError."""
     runner = make_runner_skeleton()
 
     fake_client = MagicMock()
     fake_client.start = AsyncMock()
     fake_client.connect = AsyncMock(return_value=True)
-    fake_client.is_connected = MagicMock(return_value=False)  # never connects
+    fake_client.is_connected = False  # never reaches connected state
     fake_client.stop = AsyncMock()
 
     with (

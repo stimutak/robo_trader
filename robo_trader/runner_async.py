@@ -3952,6 +3952,17 @@ class AsyncRunner:
     async def cleanup(self):
         """Clean up resources when runner is done."""
         try:
+            # Stop the persistent health monitor first so it can't fire
+            # during the rest of cleanup.
+            if getattr(self, "health", None) is not None:
+                try:
+                    await self.health.stop_monitoring()
+                except Exception:
+                    logger.warning(
+                        "Stopping health monitor in cleanup raised", exc_info=True
+                    )
+                self.health = None
+
             # Cancel subprocess monitor task if running
             if self.subprocess_monitor_task and not self.subprocess_monitor_task.done():
                 self.subprocess_monitor_task.cancel()
@@ -4056,7 +4067,7 @@ class AsyncRunner:
         same path during runtime recovery. Raises ConnectionError if the
         subprocess fails to connect.
 
-        Per 2025-11-24 handoff: includes 2.0s stabilization wait + is_connected()
+        Per 2025-11-24 handoff: includes 2.0s stabilization wait + is_connected
         poll AFTER handshake to ensure Gateway has fully published nextValidId.
         """
 
@@ -4093,15 +4104,15 @@ class AsyncRunner:
         # 2.0s stabilization wait per 2025-11-24 handoff
         await asyncio.sleep(2.0)
 
-        # Poll is_connected() to verify the Gateway-side state is stable
+        # Poll is_connected to verify the Gateway-side state is stable
         for _ in range(10):
-            if client.is_connected():
+            if client.is_connected:
                 break
             await asyncio.sleep(0.2)
         else:
             await _cleanup(client)
             raise ConnectionError(
-                "is_connected() never returned True after 2s+ stabilization"
+                "is_connected never returned True after 2s+ stabilization"
             )
 
         # Get accounts for logging - connect() returns bool, accounts come from get_accounts()
@@ -4118,15 +4129,30 @@ class AsyncRunner:
             accounts,
         )
 
+        await self._attach_health_monitor()
+
+    async def _attach_health_monitor(self) -> None:
+        """Wire ConnectionHealth onto an existing self.ib.
+
+        setup() (and recover_connection -> initialize_connection) populate
+        self.ib via connect_ibkr_robust or SubprocessIBKRClient.connect.
+        This helper attaches the persistent ConnectionHealth monitor
+        WITHOUT creating a new subprocess. Idempotent: stops any prior
+        monitor before starting a new one.
+        """
         from robo_trader.connection_health import ConnectionHealth
 
-        # Replace any existing health module from a prior connection
-        # (e.g., during recover_connection re-initialization)
         if getattr(self, "health", None) is not None:
-            await self.health.stop_monitoring()
+            try:
+                await self.health.stop_monitoring()
+            except Exception:
+                logger.warning(
+                    "Stopping prior health monitor raised; continuing",
+                    exc_info=True,
+                )
 
         self.health = ConnectionHealth(
-            ib_client=client,
+            ib_client=self.ib,
             ping_interval_seconds=30,
             max_consecutive_failures=3,
         )
@@ -4394,7 +4420,7 @@ async def run_continuous(
                             portfolio_id=portfolio_id,
                         )
                         await new_runner.setup()
-                        await new_runner.initialize_connection()
+                        await new_runner._attach_health_monitor()
                         runners[portfolio_id] = new_runner
                     portfolio_runner = runners[portfolio_id]
 

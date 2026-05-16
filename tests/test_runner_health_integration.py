@@ -14,7 +14,7 @@ from robo_trader.connection_health import ConnectionHealth, HealthStatus
 
 def make_runner_skeleton_for_init():
     """Skeleton AsyncRunner matching what initialize_connection needs.
-    Uses the verified API surface (is_connected snake_case, connect returning bool)."""
+    Uses the verified API surface (is_connected as @property, connect returning bool)."""
     runner = AsyncRunner.__new__(AsyncRunner)
     runner.cfg = MagicMock()
     runner.cfg.ibkr.host = "127.0.0.1"
@@ -37,7 +37,7 @@ async def test_initialize_connection_creates_health_module():
     fake_client = MagicMock()
     fake_client.start = AsyncMock()
     fake_client.connect = AsyncMock(return_value=True)  # bool, not dict (post Task 6 fix)
-    fake_client.is_connected = MagicMock(return_value=True)  # snake_case
+    fake_client.is_connected = True  # @property on real client — plain attr in mock
     fake_client.get_accounts = AsyncMock(return_value=[])
     fake_client.ping = AsyncMock(return_value=True)
     fake_client.stop = AsyncMock()
@@ -70,7 +70,7 @@ async def test_initialize_connection_replaces_existing_health_module():
     fake_client = MagicMock()
     fake_client.start = AsyncMock()
     fake_client.connect = AsyncMock(return_value=True)
-    fake_client.is_connected = MagicMock(return_value=True)
+    fake_client.is_connected = True
     fake_client.get_accounts = AsyncMock(return_value=[])
     fake_client.ping = AsyncMock(return_value=True)
     fake_client.stop = AsyncMock()

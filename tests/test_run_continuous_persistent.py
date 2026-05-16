@@ -6,7 +6,7 @@ subprocess is started ONCE, not on every cycle.
 
 API surface notes (verified):
 - SubprocessIBKRClient.connect() returns bool (not dict)
-- SubprocessIBKRClient.is_connected() is snake_case (not isConnected)
+- SubprocessIBKRClient.is_connected is a @property (snake_case, no parens)
 - get_accounts() is a separate async method
 """
 
@@ -36,7 +36,8 @@ class FakeSubprocessClient:
     async def connect(self, **kwargs):
         return True  # bool, not dict (post Task 6 API verification)
 
-    def is_connected(self):  # snake_case (not camelCase)
+    @property
+    def is_connected(self):  # @property on real client (not a method)
         return self._connected
 
     async def ping(self):

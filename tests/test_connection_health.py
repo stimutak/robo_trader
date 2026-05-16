@@ -15,10 +15,11 @@ from robo_trader.connection_health import ConnectionHealth, HealthStatus
 
 def make_fake_ib_client():
     """Return a fake IB client matching the SubprocessIBKRClient surface
-    that ConnectionHealth needs: ping() -> bool, isConnected() -> bool."""
+    that ConnectionHealth needs: ping() -> bool, is_connected (property/attr)."""
     client = MagicMock()
     client.ping = AsyncMock(return_value=True)
-    client.isConnected = MagicMock(return_value=True)
+    # is_connected is a @property on the real client; mock as a plain attribute
+    client.is_connected = True
     return client
 
 
@@ -97,9 +98,9 @@ async def test_perform_check_success_resets_counter():
 @pytest.mark.asyncio
 async def test_perform_check_respects_ib_not_connected():
     fake = make_fake_ib_client()
-    fake.isConnected = MagicMock(return_value=False)
+    fake.is_connected = False
     health = ConnectionHealth(ib_client=fake, max_consecutive_failures=3)
-    # Even if ping would succeed, isConnected()==False is a hard failure.
+    # Even if ping would succeed, is_connected==False is a hard failure.
     result = await health.perform_check()
     assert result is HealthStatus.HEALTHY  # 1/3, still healthy by status
     assert health._consecutive_failures == 1

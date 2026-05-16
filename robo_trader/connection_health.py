@@ -79,20 +79,20 @@ class ConnectionHealth:
             )
 
     async def perform_check(self) -> HealthStatus:
-        """Active probe: subprocess ping + ib.isConnected().
+        """Active probe: subprocess ping + ib.is_connected.
 
         Returns the current status after the probe. Mutates internal state
         via record_success() or record_failure().
         """
         try:
-            is_connected = self._ib_client.isConnected()
+            is_connected = self._ib_client.is_connected
         except Exception as e:
-            self.record_failure(e, "perform_check:isConnected")
+            self.record_failure(e, "perform_check:is_connected")
             return self._status
 
         if not is_connected:
             self.record_failure(
-                RuntimeError("ib.isConnected() returned False"),
+                RuntimeError("ib.is_connected returned False"),
                 "perform_check:not_connected",
             )
             return self._status
