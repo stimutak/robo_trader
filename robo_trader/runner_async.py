@@ -64,6 +64,7 @@ from .stop_loss_monitor import StopLossMonitor, StopType
 from .strategies import MLStrategy, sma_crossover_signals
 from .strategies.ml_enhanced_strategy import MLEnhancedStrategy
 from .utils.connection_recovery import OrderRateLimiter
+from .clients.subprocess_ibkr_client import SubprocessIBKRClient
 
 # Initialize logger early for use in import error handling
 logger = get_logger(__name__)
@@ -4163,6 +4164,60 @@ class AsyncRunner:
                     "subprocess_client.stop() raised during _safe_disconnect; ignoring",
                     exc_info=True,
                 )
+
+    async def initialize_connection(self) -> None:
+        """Establish IBKR connection: start subprocess + connect + stabilize.
+
+        Extracted from run()/setup() so recover_connection() can call the
+        same path during runtime recovery. Raises ConnectionError if the
+        subprocess fails to connect.
+
+        Per 2025-11-24 handoff: includes 2.0s stabilization wait + isConnected()
+        poll AFTER handshake to ensure Gateway has fully published nextValidId.
+        """
+        client_id = getattr(self, "_client_id", self.cfg.ibkr.client_id)
+
+        client = SubprocessIBKRClient()
+        await client.start()
+        try:
+            result = await client.connect(
+                host=self.cfg.ibkr.host,
+                port=self.cfg.ibkr.port,
+                client_id=client_id,
+                readonly=True,
+                timeout=10.0,
+            )
+        except Exception:
+            await client.stop()
+            raise
+
+        if not result.get("connected"):
+            await client.stop()
+            raise ConnectionError(
+                f"Subprocess connect failed: {result.get('error', 'unknown')}"
+            )
+
+        # 2.0s stabilization wait per 2025-11-24 handoff
+        await asyncio.sleep(2.0)
+
+        # Poll isConnected() to verify the Gateway-side state is stable
+        for _ in range(10):
+            if client.isConnected():
+                break
+            await asyncio.sleep(0.2)
+        else:
+            await client.stop()
+            raise ConnectionError(
+                "ib.isConnected() never returned True after 2s+ stabilization"
+            )
+
+        self.subprocess_client = client
+        self.ib = client
+        logger.info(
+            "event=connection_initialized client_id=%s accounts=%s",
+            client_id,
+            result.get("accounts", []),
+        )
 
 
 async def run_once(
