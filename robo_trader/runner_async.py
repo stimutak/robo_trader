@@ -338,6 +338,7 @@ class AsyncRunner:
         self.cleanup_task = None  # DB-R2-L2: periodic cleanup_old_data task
         self.recovery_in_progress = False
         self._recovery_lock = asyncio.Lock()
+        self.health = None  # ConnectionHealth instance, set by initialize_connection
         self.executor = None
         self.portfolio = None
         self.portfolio_manager: Optional[MultiStrategyPortfolioManager] = None
@@ -4239,6 +4240,30 @@ class AsyncRunner:
             client_id,
             accounts,
         )
+
+        from robo_trader.connection_health import ConnectionHealth
+
+        # Replace any existing health module from a prior connection
+        # (e.g., during recover_connection re-initialization)
+        if getattr(self, "health", None) is not None:
+            await self.health.stop_monitoring()
+
+        self.health = ConnectionHealth(
+            ib_client=client,
+            ping_interval_seconds=30,
+            max_consecutive_failures=3,
+        )
+        await self.health.start_monitoring(on_unhealthy=self._on_connection_unhealthy)
+
+    async def _on_connection_unhealthy(self, reason: str) -> None:
+        """Callback fired by ConnectionHealth when threshold hit.
+
+        Invokes recover_connection. If recovery exhausted, the runner exits
+        run_continuous — watchdog handles process-level restart."""
+        logger.warning(
+            "event=health_triggered_recovery reason=%r", reason
+        )
+        await self.recover_connection(f"health monitor: {reason}")
 
     async def recover_connection(self, reason: str) -> bool:
         """Re-establish IBKR connection after ConnectionHealth reports unhealthy.
