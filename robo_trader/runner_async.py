@@ -4139,25 +4139,21 @@ class AsyncRunner:
     async def _safe_disconnect(self) -> None:
         """Disconnect IBKR cleanly when possible; never crash Gateway.
 
-        Per 2025-11-20 handoff: calling ib.disconnect() on a FAILED
-        connection crashes the Gateway API layer. Skip disconnect when
-        isConnected() is False. ALWAYS stop the subprocess.
+        Delegates to robo_trader.utils.ibkr_safe.safe_disconnect, which is the
+        project-wide authority on the 2025-11-20 regression (calling
+        ib.disconnect() on a failed connection crashes the Gateway API layer).
+        Always stops the subprocess regardless.
         """
-        import asyncio
+        from robo_trader.utils.ibkr_safe import safe_disconnect
 
         if self.ib is not None:
             try:
-                if self.ib.isConnected():
-                    try:
-                        await asyncio.wait_for(
-                            self.ib.disconnectAsync(), timeout=5.0
-                        )
-                    except (asyncio.TimeoutError, Exception):
-                        # Connection already broken — don't make Gateway crash matter
-                        pass
+                safe_disconnect(self.ib, context="AsyncRunner._safe_disconnect")
             except Exception:
-                # isConnected() itself can throw on a dead client
-                pass
+                logger.warning(
+                    "safe_disconnect raised in AsyncRunner._safe_disconnect; ignoring",
+                    exc_info=True,
+                )
 
         if getattr(self, "subprocess_client", None) is not None:
             try:
