@@ -23,3 +23,28 @@ def make_fake_ib_client():
 def test_initial_status_is_healthy():
     health = ConnectionHealth(ib_client=make_fake_ib_client())
     assert health.status is HealthStatus.HEALTHY
+
+
+def test_record_failure_below_threshold_stays_healthy():
+    health = ConnectionHealth(ib_client=make_fake_ib_client(), max_consecutive_failures=3)
+    health.record_failure(RuntimeError("transient"), context="cycle:AAPL")
+    health.record_failure(RuntimeError("transient"), context="cycle:NVDA")
+    assert health.status is HealthStatus.HEALTHY
+
+
+def test_record_failure_at_threshold_transitions_unhealthy():
+    health = ConnectionHealth(ib_client=make_fake_ib_client(), max_consecutive_failures=3)
+    health.record_failure(RuntimeError("transient"), context="cycle:AAPL")
+    health.record_failure(RuntimeError("transient"), context="cycle:NVDA")
+    health.record_failure(RuntimeError("transient"), context="cycle:TSLA")
+    assert health.status is HealthStatus.UNHEALTHY
+
+
+def test_record_success_resets_counter():
+    health = ConnectionHealth(ib_client=make_fake_ib_client(), max_consecutive_failures=3)
+    health.record_failure(RuntimeError("transient"), context="ping")
+    health.record_failure(RuntimeError("transient"), context="ping")
+    health.record_success()
+    health.record_failure(RuntimeError("transient"), context="ping")
+    # After reset, this is failure 1, not failure 3
+    assert health.status is HealthStatus.HEALTHY
