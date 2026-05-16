@@ -48,3 +48,13 @@ def test_record_success_resets_counter():
     health.record_failure(RuntimeError("transient"), context="ping")
     # After reset, this is failure 1, not failure 3
     assert health.status is HealthStatus.HEALTHY
+
+
+def test_record_success_clears_recovering_state():
+    health = ConnectionHealth(ib_client=make_fake_ib_client())
+    # Simulate recovery midway: manually set internal state as recover_connection would
+    health._status = HealthStatus.RECOVERING
+    health._consecutive_failures = 5
+    health.record_success()
+    assert health.status is HealthStatus.HEALTHY
+    assert health._consecutive_failures == 0

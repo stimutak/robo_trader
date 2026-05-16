@@ -64,7 +64,7 @@ class ConnectionHealth:
             return
         prev_status = self._status
         self._consecutive_failures = 0
-        if self._status is HealthStatus.UNHEALTHY:
+        if self._status in (HealthStatus.UNHEALTHY, HealthStatus.RECOVERING):
             self._status = HealthStatus.HEALTHY
         if prev_status is not self._status:
             logger.info(
