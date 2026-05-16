@@ -111,27 +111,72 @@ async def test_backoff_schedule_is_15_30_60_120_300():
 
 
 @pytest.mark.asyncio
-async def test_concurrent_invocations_serialize_via_lock():
+async def test_lock_is_held_during_initialize_connection():
+    """Verify _recovery_lock is held while initialize_connection runs.
+    This proves concurrent recover_connection calls cannot interleave their
+    initialize_connection invocations — a second caller would block on the
+    lock acquire until the first completes (or fails)."""
     runner = make_runner_for_recovery(initialize_succeeds_on=1)
-    call_order = []
+    locked_during_init = []
+    flag_during_init = []
 
     original_init = runner.initialize_connection
 
-    async def slow_init():
-        call_order.append("start")
-        await asyncio.sleep(0)  # yield to event loop
-        call_order.append("end")
+    async def check_lock_state():
+        locked_during_init.append(runner._recovery_lock.locked())
+        flag_during_init.append(runner.recovery_in_progress)
         return await original_init()
 
-    runner.initialize_connection = slow_init
+    runner.initialize_connection = check_lock_state
 
     with patch("robo_trader.runner_async.asyncio.sleep", AsyncMock()):
-        await asyncio.gather(
-            runner.recover_connection("first"),
-            runner.recover_connection("second"),
-        )
-    # The two runs must serialize: start, end, start, end (not interleaved)
-    assert call_order == ["start", "end", "start", "end"]
+        await runner.recover_connection("test")
+
+    # Lock must be held during the critical section
+    assert locked_during_init == [True]
+    # recovery_in_progress flag must also be set during the critical section
+    assert flag_during_init == [True]
+
+
+@pytest.mark.asyncio
+async def test_recovery_in_progress_observable_before_lock_acquired():
+    """recovery_in_progress is set BEFORE the lock acquire, so external
+    readers (the run_continuous cycle loop in Task 9) can observe it even
+    if they call into recovery code that's mid-flight. Without this
+    invariant, the cycle-skip logic in Task 9 would race.
+
+    Strategy: pre-acquire the lock, then start recover_connection as a
+    task. Use an asyncio.Event inside a custom initialize_connection to
+    pause the task after the lock is acquired (proving the flag was True
+    before the lock too). Avoids patching asyncio.sleep at module level
+    so that our own await asyncio.sleep(0) calls actually yield."""
+    runner = make_runner_for_recovery(initialize_succeeds_on=1)
+
+    # Gate that lets the test pause recover_connection mid-flight
+    init_started = asyncio.Event()
+    test_may_proceed = asyncio.Event()
+
+    original_init = runner.initialize_connection
+
+    async def gated_init():
+        init_started.set()        # signal: we're inside the lock
+        await test_may_proceed.wait()  # wait for test to observe state
+        return await original_init()
+
+    runner.initialize_connection = gated_init
+
+    # Replace backoff sleep with a no-op so the task reaches init quickly
+    with patch("robo_trader.runner_async.asyncio.sleep", AsyncMock()):
+        task = asyncio.create_task(runner.recover_connection("test"))
+        # Wait for the task to enter initialize_connection (inside the lock)
+        await init_started.wait()
+        # At this point the task holds the lock AND recovery_in_progress is True
+        assert runner._recovery_lock.locked() is True
+        assert runner.recovery_in_progress is True
+        # Unblock the task
+        test_may_proceed.set()
+        await task
+    assert runner.recovery_in_progress is False
 
 
 @pytest.mark.asyncio

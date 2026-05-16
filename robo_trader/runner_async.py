@@ -4256,9 +4256,9 @@ class AsyncRunner:
         backoff_schedule = [15, 30, 60, 120, 300]
         gateway_restart_attempt_threshold = 3
 
-        async with self._recovery_lock:
-            self.recovery_in_progress = True
-            try:
+        self.recovery_in_progress = True
+        try:
+            async with self._recovery_lock:
                 for attempt_idx, delay in enumerate(backoff_schedule):
                     attempt = attempt_idx + 1
                     logger.warning(
@@ -4307,8 +4307,8 @@ class AsyncRunner:
                     reason,
                 )
                 return False
-            finally:
-                self.recovery_in_progress = False
+        finally:
+            self.recovery_in_progress = False
 
 
 async def run_once(
