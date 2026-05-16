@@ -217,6 +217,7 @@ Any code that hard-codes one of these forms will `AttributeError`, the broad `ex
 11. ✅ Duplicate BUY Race Condition - FIXED (3-layer protection)
 12. ✅ ML/MTF Disagreement Threshold - FIXED (adaptive threshold)
 13. ✅ Stop-losses on restart - FIXED (recreated from DB positions)
+14. ✅ Persistent IBKR Connection - IMPLEMENTED (2026-05-16, prevents IBKR-throttle cascade from per-cycle reconnects)
 
 ---
 
@@ -435,6 +436,7 @@ STOP_LOSS_PERCENT=2.0           # Fixed 2% stop
 | ML SELL signal executes even when position at loss | PRO RULE: Only execute SELL if profitable, let stop-loss handle losses | 2026-02-04 |
 | Stop-loss has no price data on restart → ML sells first | Stop-loss needs `update_price()` calls; ML sell blocked by profit check | 2026-02-04 |
 | Forgetting to load launchd watchdog on fresh install | Run ./scripts/install_watchdog.sh ONCE per machine | 2026-05-12 |
+| Adding per-cycle IBKR disconnect/reconnect in run_continuous | Connection is long-lived under run_continuous; cycles must reuse via teardown(full_cleanup=False). Re-introducing per-cycle disconnect causes 2026-05-13-style IBKR-throttle cascade | 2026-05-16 |
 
 ---
 
