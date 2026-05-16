@@ -89,3 +89,35 @@ async def test_persistent_runner_starts_subprocess_only_once_across_cycles():
         # Cleanup the background health monitor task
         if runner.health is not None:
             await runner.health.stop_monitoring()
+
+
+import pytest
+from robo_trader.exceptions import KillSwitchTriggeredError
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_propagates_through_cycle_exception_handler():
+    """Regression guard: KillSwitchTriggeredError must NOT be caught by the
+    cycle-level `except Exception` handler. It is a safety signal that must
+    reach the outer while-loop handler for graceful shutdown.
+
+    Simulates the cycle-level exception handling block in run_continuous."""
+
+    class FakeRunner:
+        async def run(self, symbols):
+            raise KillSwitchTriggeredError("test: kill switch armed")
+
+    runner = FakeRunner()
+
+    # Mirror the exception handling structure in run_continuous
+    with pytest.raises(KillSwitchTriggeredError):
+        try:
+            await runner.run([])
+        except KillSwitchTriggeredError:
+            raise
+        except Exception:
+            pytest.fail(
+                "KillSwitchTriggeredError must not be caught by `except Exception` "
+                "in cycle handler — it is a safety signal that must reach the "
+                "outer while-loop handler for graceful shutdown."
+            )

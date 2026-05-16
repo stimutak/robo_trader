@@ -1618,10 +1618,13 @@ class AsyncRunner:
     async def teardown(self, full_cleanup: bool = False):
         """Clean up resources after a run cycle.
 
-        Note: run_continuous() creates a fresh AsyncRunner each cycle and calls
-        cleanup() unconditionally, so the IBKR connection does NOT actually
-        persist across cycles regardless of full_cleanup. The parameter is
-        retained for any in-process caller that wants the lighter teardown.
+        Between cycles (the default, full_cleanup=False), only stops cycle-level
+        monitors (production_monitor, correlation_manager). The IBKR connection
+        and subprocess stay alive — this is the persistent-connection design
+        landed in commit daa8b61.
+
+        On process exit (full_cleanup=True, called from run_continuous's outer
+        finally), fully tears down the connection via cleanup().
         """
         if self.production_monitor:
             await self.production_monitor.stop()
@@ -4544,6 +4547,8 @@ async def run_continuous(
 
                     try:
                         await portfolio_runner.run(portfolio_symbols)
+                    except KillSwitchTriggeredError:
+                        raise  # propagate to outer while-loop handler for graceful shutdown
                     except Exception as cycle_err:
                         logger.exception(
                             "event=cycle_error portfolio=%s error=%r",
