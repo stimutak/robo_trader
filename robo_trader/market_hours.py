@@ -383,3 +383,58 @@ def seconds_until_market_open() -> int:
 
     delta = next_open - now
     return int(delta.total_seconds())
+
+
+def count_trading_days(start: datetime, end: datetime) -> int:
+    """
+    Count trading days strictly between two datetimes.
+
+    A trading day is any Mon–Fri that is not on the NYSE holiday calendar
+    (see :func:`_is_market_holiday`). Used by the preflight equity-history
+    freshness check to distinguish "data is one day stale" from "data is
+    several trading days stale", so a Monday startup after a Friday close
+    correctly counts as 0 trading days elapsed, not 3.
+
+    The interval is the open–open range ``(start.date(), end.date()]`` —
+    the start day itself is excluded (it's "as of" the snapshot's day) and
+    the end day is included if it is a trading day. Same-day or reversed
+    intervals return 0. Sub-day time-of-day is ignored for the comparison;
+    we work at date granularity because equity_history snapshots are
+    end-of-day.
+
+    Examples
+    --------
+    * Friday → Monday (next): 1 (Monday is the only counted trading day)
+    * Friday → Friday (same day): 0
+    * Monday → Wednesday (next): 2 (Tuesday + Wednesday)
+    * Friday → Friday (one week later): 5 (Mon, Tue, Wed, Thu, Fri)
+    * Wed before Thanksgiving → Friday after: 1 (Thursday is a holiday,
+      so only Friday counts)
+    * end < start: 0 (callers should never see negative)
+
+    Args:
+        start: Earlier datetime (timezone-aware or naive — only the date
+            portion is used).
+        end: Later datetime.
+
+    Returns:
+        Non-negative count of trading days in ``(start.date(), end.date()]``.
+    """
+    start_date = start.date() if isinstance(start, datetime) else start
+    end_date = end.date() if isinstance(end, datetime) else end
+
+    if end_date <= start_date:
+        return 0
+
+    count = 0
+    cursor = start_date + timedelta(days=1)
+    while cursor <= end_date:
+        # Weekend check (Monday=0, Sunday=6)
+        if cursor.weekday() < 5:
+            # Reuse holiday logic; pass through a datetime so the helper's
+            # isinstance(check, datetime) branch is taken consistently.
+            if not _is_market_holiday(datetime(cursor.year, cursor.month, cursor.day)):
+                count += 1
+        cursor += timedelta(days=1)
+
+    return count
