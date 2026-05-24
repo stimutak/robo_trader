@@ -1705,14 +1705,16 @@ class AsyncRunner:
             )
             return None
 
-        # Check connection health and reconnect if needed
+        # Check connection health; surface failure to ConnectionHealth and let the
+        # background monitor (or next cycle) handle recovery — do NOT reconnect here.
         if hasattr(self.ib, "is_connected") and not self.ib.is_connected:
-            logger.warning(f"Connection lost before fetching {symbol}, attempting reconnect...")
-            try:
-                await self.restart_subprocess()
-            except Exception as e:
-                logger.error(f"Failed to reconnect: {e}")
-                return None
+            logger.warning(f"Connection lost before fetching {symbol}; deferring to health monitor")
+            if getattr(self, "health", None) is not None:
+                self.health.record_failure(
+                    RuntimeError("is_connected=False before fetch"),
+                    "fetch_and_store_data",
+                )
+            return None
 
         try:
             start_time = asyncio.get_event_loop().time()
