@@ -239,6 +239,65 @@ def _fire_runner_exit_alert(reason: str, extra: Optional[dict] = None) -> None:
             pass
 
 
+def _enforce_preflight_or_exit(
+    project_root: Optional[Path] = None, max_age_seconds: int = 300
+) -> None:
+    """Refuse to start if preflight hasn't passed within max_age_seconds.
+
+    Q11.6 server-side enforcement: scripts/preflight_check.py writes
+    data/.preflight_last_ok on every clean exit (PASS or --force). This
+    function reads the file's mtime/contents and exits the process if:
+    - the file is missing (preflight was never run, or START_TRADER.sh
+      was bypassed)
+    - the file is older than max_age_seconds (preflight ran but stale)
+
+    The bypass is itself bypassable via PREFLIGHT_ENFORCEMENT=off env var —
+    intentional escape hatch for test/dev shells, NOT for production. The
+    bypass is logged at WARNING level so anyone reviewing logs sees it.
+    """
+    import os
+    import sys
+    import time
+    from pathlib import Path
+
+    if os.environ.get("PREFLIGHT_ENFORCEMENT", "").lower() == "off":
+        # Logger may not exist yet at this point in startup — use stderr.
+        print(
+            "WARNING: PREFLIGHT_ENFORCEMENT=off — runner-side gate bypassed",
+            file=sys.stderr,
+        )
+        return
+
+    if project_root is None:
+        # Default: this file lives at robo_trader/runner_async.py
+        project_root = Path(__file__).resolve().parent.parent
+
+    flag_path = project_root / "data" / ".preflight_last_ok"
+    if not flag_path.exists():
+        print(
+            "❌ PREFLIGHT NOT RUN — runner refuses to start.\n"
+            f"   Expected: {flag_path}\n"
+            "   Fix: run ./START_TRADER.sh (which invokes preflight automatically)\n"
+            "        or run scripts/preflight_check.py directly first.\n"
+            "   Emergency bypass (NOT for production): PREFLIGHT_ENFORCEMENT=off",
+            file=sys.stderr,
+        )
+        sys.exit(4)  # new exit code, distinct from preflight's 1/2/3
+
+    age_seconds = time.time() - flag_path.stat().st_mtime
+    if age_seconds > max_age_seconds:
+        mins = int(age_seconds / 60)
+        print(
+            f"❌ PREFLIGHT STALE — last passed {mins} minutes ago "
+            f"(threshold {int(max_age_seconds/60)} min).\n"
+            f"   Flag file:  {flag_path}\n"
+            "   Fix: run ./START_TRADER.sh to re-run preflight.\n"
+            "   Emergency bypass (NOT for production): PREFLIGHT_ENFORCEMENT=off",
+            file=sys.stderr,
+        )
+        sys.exit(5)  # distinct exit code for stale-vs-missing
+
+
 # Import mean reversion strategies if available
 
 try:
@@ -4754,6 +4813,11 @@ def check_gateway_zombies(port: int = 4002) -> bool:
 
 def main() -> None:
     """Main entry point with CLI argument parsing."""
+    # Q11.6: Refuse to start if preflight hasn't passed recently. This is the
+    # FIRST action of main() — before argparse, before config load, before any
+    # IBKR connection. Catches operators who invoke
+    # `python3 -m robo_trader.runner_async` directly, bypassing START_TRADER.sh.
+    _enforce_preflight_or_exit()
     parser = argparse.ArgumentParser(
         description="Async Robo Trader with parallel symbol processing"
     )
