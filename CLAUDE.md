@@ -34,6 +34,64 @@ Adding new code? See `DEV_SETUP.md` Section 3 for the things that now fail diffe
 
 ---
 
+## 🔄 Persistent IBKR Connection — Rollback Procedure
+
+**Added 2026-05-16:** the IBKR connection now persists across trading cycles instead of reconnecting per-cycle (commits `f8388f3..6f195a3`). If this causes a new class of production failure, here is the documented rollback path.
+
+### Rollback target
+
+Annotated tag `pre-persistent-connection` marks the last commit before persistent-connection work began:
+
+```bash
+git log -1 pre-persistent-connection
+# 1a68a0a ops: watchdog Layer 6 — escalate after repeated Gateway 2FA failures
+```
+
+### How to revert
+
+```bash
+# Inspect what would change:
+git log --oneline pre-persistent-connection..HEAD -- robo_trader/runner_async.py robo_trader/connection_health.py
+
+# Revert the persistent-connection commits:
+git revert --no-edit f8388f3^..6f195a3
+# Resolve any conflicts (most likely in robo_trader/runner_async.py and CLAUDE.md).
+
+# Confirm cycles disconnect again:
+grep -n "teardown.*full_cleanup" robo_trader/runner_async.py
+# Post-rollback should show full_cleanup=True per cycle.
+
+# Validate:
+.venv/bin/pytest --tb=short
+```
+
+### What you LOSE by rolling back
+
+- The 2026-05-13-style per-cycle throttle cascade returns as a known risk
+- `ConnectionHealth` state machine + `recover_connection()` become unused
+- Multi-portfolio Gateway recovery serialization (no-op for single portfolio anyway)
+
+### What you KEEP (independent of persistent connection)
+
+These commits are NOT part of the `f8388f3..6f195a3` range — they survive a revert:
+
+- KillSwitch loss-trigger and config plumbing (env-configurable `RISK_MAX_POSITION_LOSS_PCT`)
+- Per-path kill-switch check centralization + log throttle
+- Recovery-exhaustion exit propagation (no zombie loop)
+- Stop-loss price re-warm after recovery (no-op if recover_connection isn't called)
+- Auto-reset kill switch on connection-related triggers
+- The preflight safety gate (separate PR, builds on this branch)
+
+### When NOT to roll back
+
+- **Preflight blocking startup** → that is the gate working as designed. Use `python3 scripts/preflight_check.py --force "<reason>"`.
+- **Real loss-trigger** → close the position or raise `RISK_MAX_POSITION_LOSS_PCT`, don't revert.
+- **Intermittent IBKR disconnects** → persistent connection is helping, not hurting. Check Gateway/IBC config first.
+
+Rollback is reserved for: persistent socket state causing a NEW class of failure not seen pre-persistence.
+
+---
+
 ## Project Phase Plan
 **IMPORTANT:** The authoritative phase plan is in `IMPLEMENTATION_PLAN.md`. This is the ML-focused 4-phase plan:
 - Phase 1: Foundation & Quick Wins (Tasks F1-F5) - COMPLETE ✅
