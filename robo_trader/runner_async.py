@@ -229,12 +229,11 @@ def _fire_runner_exit_alert(reason: str, extra: Optional[dict] = None) -> None:
     """
     try:
         from .monitoring.alerts import fire_runner_exit_alert as _fire
+
         _fire(reason, extra)
     except Exception as _alert_err:  # pragma: no cover - best-effort
         try:
-            logger.error(
-                f"runner_exit alert delivery failed (reason={reason}): {_alert_err}"
-            )
+            logger.error(f"runner_exit alert delivery failed (reason={reason}): {_alert_err}")
         except Exception:
             pass
 
@@ -249,6 +248,16 @@ try:
 except ImportError as e:
     logger.warning(f"Mean reversion strategies not available: {e}")
     MEAN_REVERSION_AVAILABLE = False
+
+
+class RecoveryExhaustedError(Exception):
+    """Raised when recover_connection has exhausted all retry attempts.
+
+    Propagated out of the cycle loop in run_continuous so the process exits
+    cleanly. The macOS launchd watchdog (Layer 6 — see
+    ~/.claude/projects/-Users-oliver-Projects-robo-trader/memory/project_watchdog_layer6.md)
+    handles process-level restart and 2FA notification.
+    """
 
 
 @dataclass
@@ -338,6 +347,11 @@ class AsyncRunner:
         self.cleanup_task = None  # DB-R2-L2: periodic cleanup_old_data task
         self.recovery_in_progress = False
         self._recovery_lock = asyncio.Lock()
+        # C2: latched by _on_connection_unhealthy when recover_connection returns
+        # False. run_continuous polls this flag on every cycle and raises
+        # RecoveryExhaustedError to break out cleanly. We can't raise from the
+        # callback itself because the monitor loop's broad except swallows it.
+        self._recovery_exhausted = False
         self.health = None  # ConnectionHealth instance, set by initialize_connection
         self.executor = None
         self.portfolio = None
@@ -669,9 +683,7 @@ class AsyncRunner:
         # and the pairs path bypassed the check entirely.
         blocked, reason = self._trading_blocked()
         if blocked:
-            logger.error(
-                f"Order blocked by trading_blocked gate for {order.symbol}: {reason}"
-            )
+            logger.error(f"Order blocked by trading_blocked gate for {order.symbol}: {reason}")
             return SimpleNamespace(ok=False, message=f"Trading blocked: {reason}", fill_price=None)
 
         # Check if circuit breaker allows the request
@@ -860,8 +872,7 @@ class AsyncRunner:
                         await self.db.update_position(symbol, 0, 0.0, fill_price)
                 except Exception as e:
                     logger.error(
-                        f"_on_stop_loss_executed: db.update_position failed "
-                        f"for {symbol}: {e}"
+                        f"_on_stop_loss_executed: db.update_position failed " f"for {symbol}: {e}"
                     )
 
                 # 4. Record the trade row so audit/PnL queries see the close.
@@ -870,8 +881,7 @@ class AsyncRunner:
                         await self.db.record_trade(symbol, side, qty, fill_price, 0)
                 except Exception as e:
                     logger.error(
-                        f"_on_stop_loss_executed: db.record_trade failed "
-                        f"for {symbol}: {e}"
+                        f"_on_stop_loss_executed: db.record_trade failed " f"for {symbol}: {e}"
                     )
 
                 # 5. Mark advanced-risk-manager position as closed (if used).
@@ -880,8 +890,7 @@ class AsyncRunner:
                         self.advanced_risk.update_position(symbol, qty, fill_price, side)
                 except Exception as e:
                     logger.error(
-                        f"_on_stop_loss_executed: advanced_risk update failed "
-                        f"for {symbol}: {e}"
+                        f"_on_stop_loss_executed: advanced_risk update failed " f"for {symbol}: {e}"
                     )
 
             logger.info(
@@ -889,9 +898,7 @@ class AsyncRunner:
                 f"{qty}@${fill_price:.2f}"
             )
         except Exception as outer:  # pragma: no cover - defensive
-            logger.error(
-                f"_on_stop_loss_executed top-level failure for {symbol}: {outer}"
-            )
+            logger.error(f"_on_stop_loss_executed top-level failure for {symbol}: {outer}")
 
     async def setup(self):
         """Initialize all components."""
@@ -1049,9 +1056,7 @@ class AsyncRunner:
             # is not a security-sensitive digest.
             offset = (
                 int(
-                    hashlib.md5(
-                        self.portfolio_id.encode(), usedforsecurity=False
-                    ).hexdigest(),
+                    hashlib.md5(self.portfolio_id.encode(), usedforsecurity=False).hexdigest(),
                     16,
                 )
                 % 900
@@ -3389,9 +3394,7 @@ class AsyncRunner:
                                                 continue
                                             blocked, blk_reason = self._trading_blocked()
                                             if blocked:
-                                                logger.error(
-                                                    f"Pairs BUY blocked: {blk_reason}"
-                                                )
+                                                logger.error(f"Pairs BUY blocked: {blk_reason}")
                                                 continue
 
                                             # TC-M2: acquire pending-order lock and add to
@@ -3444,7 +3447,9 @@ class AsyncRunner:
                                                     symbol_a, "BUY", qty_a, fill_a
                                                 )
                                                 # TC-H3: increment daily executed notional
-                                                self.daily_executed_notional += float(fill_a) * float(qty_a)
+                                                self.daily_executed_notional += float(
+                                                    fill_a
+                                                ) * float(qty_a)
                                                 logger.info(
                                                     f"Pairs trade: Bought {qty_a} {symbol_a} at ${fill_a:.2f}"
                                                 )
@@ -3521,14 +3526,21 @@ class AsyncRunner:
                                                             )
                                                             proceed_short_b = False
                                                         else:
-                                                            async with self._cycle_executed_shorts_lock:
-                                                                if symbol_b in self._cycle_executed_shorts:
+                                                            async with (
+                                                                self._cycle_executed_shorts_lock
+                                                            ):
+                                                                if (
+                                                                    symbol_b
+                                                                    in self._cycle_executed_shorts
+                                                                ):
                                                                     logger.warning(
                                                                         f"DUPLICATE SHORT BLOCKED: {symbol_b} already shorted this cycle (pairs)"
                                                                     )
                                                                     proceed_short_b = False
                                                                 else:
-                                                                    self._cycle_executed_shorts.add(symbol_b)
+                                                                    self._cycle_executed_shorts.add(
+                                                                        symbol_b
+                                                                    )
                                                             if proceed_short_b:
                                                                 self._pending_orders.add(symbol_b)
                                                     if not proceed_short_b:
@@ -3543,10 +3555,8 @@ class AsyncRunner:
                                                         price=price_b,
                                                     )
                                                     try:
-                                                        res_b = (
-                                                            await self._place_order_with_circuit_breaker(
-                                                                order_b
-                                                            )
+                                                        res_b = await self._place_order_with_circuit_breaker(
+                                                            order_b
                                                         )
                                                     finally:
                                                         async with self._pending_orders_lock:
@@ -3566,11 +3576,13 @@ class AsyncRunner:
                                                         # main SELL_SHORT flow.
                                                         atomic_ok = False
                                                         try:
-                                                            atomic_ok = await self._update_position_atomic(
-                                                                symbol_b,
-                                                                qty_b,
-                                                                float(fill_b),
-                                                                "SELL_SHORT",
+                                                            atomic_ok = (
+                                                                await self._update_position_atomic(
+                                                                    symbol_b,
+                                                                    qty_b,
+                                                                    float(fill_b),
+                                                                    "SELL_SHORT",
+                                                                )
                                                             )
                                                         except Exception as e:
                                                             logger.error(
@@ -3643,9 +3655,7 @@ class AsyncRunner:
                                                 continue
                                             blocked, blk_reason = self._trading_blocked()
                                             if blocked:
-                                                logger.error(
-                                                    f"Pairs BUY blocked: {blk_reason}"
-                                                )
+                                                logger.error(f"Pairs BUY blocked: {blk_reason}")
                                                 continue
 
                                             # TC-M2: pending lock + cycle dedupe
@@ -3696,7 +3706,9 @@ class AsyncRunner:
                                                     symbol_b, "BUY", qty_b, fill_b
                                                 )
                                                 # TC-H3: increment daily executed notional
-                                                self.daily_executed_notional += float(fill_b) * float(qty_b)
+                                                self.daily_executed_notional += float(
+                                                    fill_b
+                                                ) * float(qty_b)
                                                 logger.info(
                                                     f"Pairs trade: Bought {qty_b} {symbol_b} at ${fill_b:.2f}"
                                                 )
@@ -3771,14 +3783,21 @@ class AsyncRunner:
                                                             )
                                                             proceed_short_a = False
                                                         else:
-                                                            async with self._cycle_executed_shorts_lock:
-                                                                if symbol_a in self._cycle_executed_shorts:
+                                                            async with (
+                                                                self._cycle_executed_shorts_lock
+                                                            ):
+                                                                if (
+                                                                    symbol_a
+                                                                    in self._cycle_executed_shorts
+                                                                ):
                                                                     logger.warning(
                                                                         f"DUPLICATE SHORT BLOCKED: {symbol_a} already shorted this cycle (pairs)"
                                                                     )
                                                                     proceed_short_a = False
                                                                 else:
-                                                                    self._cycle_executed_shorts.add(symbol_a)
+                                                                    self._cycle_executed_shorts.add(
+                                                                        symbol_a
+                                                                    )
                                                             if proceed_short_a:
                                                                 self._pending_orders.add(symbol_a)
                                                     if not proceed_short_a:
@@ -3791,10 +3810,8 @@ class AsyncRunner:
                                                         price=price_a,
                                                     )
                                                     try:
-                                                        res_a = (
-                                                            await self._place_order_with_circuit_breaker(
-                                                                order_a
-                                                            )
+                                                        res_a = await self._place_order_with_circuit_breaker(
+                                                            order_a
                                                         )
                                                     finally:
                                                         async with self._pending_orders_lock:
@@ -3814,11 +3831,13 @@ class AsyncRunner:
                                                         # main SELL_SHORT flow.
                                                         atomic_ok = False
                                                         try:
-                                                            atomic_ok = await self._update_position_atomic(
-                                                                symbol_a,
-                                                                qty_a,
-                                                                float(fill_a),
-                                                                "SELL_SHORT",
+                                                            atomic_ok = (
+                                                                await self._update_position_atomic(
+                                                                    symbol_a,
+                                                                    qty_a,
+                                                                    float(fill_a),
+                                                                    "SELL_SHORT",
+                                                                )
                                                             )
                                                         except Exception as e:
                                                             logger.error(
@@ -3958,9 +3977,7 @@ class AsyncRunner:
                 try:
                     await self.health.stop_monitoring()
                 except Exception:
-                    logger.warning(
-                        "Stopping health monitor in cleanup raised", exc_info=True
-                    )
+                    logger.warning("Stopping health monitor in cleanup raised", exc_info=True)
                 self.health = None
 
             # Cancel subprocess monitor task if running
@@ -4111,9 +4128,7 @@ class AsyncRunner:
             await asyncio.sleep(0.2)
         else:
             await _cleanup(client)
-            raise ConnectionError(
-                "is_connected never returned True after 2s+ stabilization"
-            )
+            raise ConnectionError("is_connected never returned True after 2s+ stabilization")
 
         # Get accounts for logging - connect() returns bool, accounts come from get_accounts()
         try:
@@ -4161,12 +4176,21 @@ class AsyncRunner:
     async def _on_connection_unhealthy(self, reason: str) -> None:
         """Callback fired by ConnectionHealth when threshold hit.
 
-        Invokes recover_connection. If recovery exhausted, the runner exits
-        run_continuous — watchdog handles process-level restart."""
-        logger.warning(
-            "event=health_triggered_recovery reason=%r", reason
-        )
-        await self.recover_connection(f"health monitor: {reason}")
+        Invokes recover_connection. If recovery exhausted, latches
+        self._recovery_exhausted so the run_continuous cycle loop can raise
+        RecoveryExhaustedError on the next iteration and exit cleanly. We can't
+        raise here because ConnectionHealth._monitor_loop wraps the callback
+        in a broad except (connection_health.py:158-159) that would swallow it.
+        """
+        logger.warning("event=health_triggered_recovery reason=%r", reason)
+        recovered = await self.recover_connection(f"health monitor: {reason}")
+        if not recovered:
+            logger.critical(
+                "event=recovery_exhausted_latched reason=%r "
+                "note=run_continuous_will_exit_for_watchdog_restart",
+                reason,
+            )
+            self._recovery_exhausted = True
 
     async def recover_connection(self, reason: str) -> bool:
         """Re-establish IBKR connection after ConnectionHealth reports unhealthy.
@@ -4201,9 +4225,7 @@ class AsyncRunner:
 
                     if attempt >= gateway_restart_attempt_threshold:
                         try:
-                            ok = await restart_gateway_for_zombies_async(
-                                self.cfg.ibkr.port, 180
-                            )
+                            ok = await restart_gateway_for_zombies_async(self.cfg.ibkr.port, 180)
                             logger.info(
                                 "event=recovery_gateway_restart_done attempt=%d success=%s",
                                 attempt,
@@ -4218,9 +4240,7 @@ class AsyncRunner:
 
                     try:
                         await self.initialize_connection()
-                        logger.info(
-                            "event=recovery_succeeded attempt=%d", attempt
-                        )
+                        logger.info("event=recovery_succeeded attempt=%d", attempt)
                         return True
                     except Exception as e:
                         logger.warning(
@@ -4307,8 +4327,9 @@ async def run_continuous(
         # finally block can't run (e.g., second signal). Best-effort.
         try:
             sig_name = (
-                "sigterm" if signum == signal.SIGTERM else
-                ("sigint" if signum == signal.SIGINT else f"signal_{signum}")
+                "sigterm"
+                if signum == signal.SIGTERM
+                else ("sigint" if signum == signal.SIGINT else f"signal_{signum}")
             )
             _write_exit_audit(sig_name, exit_code=0, extra={"signum": int(signum)})
             _fire_runner_exit_alert(sig_name, {"signum": int(signum)})
@@ -4424,6 +4445,20 @@ async def run_continuous(
                         runners[portfolio_id] = new_runner
                     portfolio_runner = runners[portfolio_id]
 
+                    # C2: if recover_connection exhausted all attempts, exit
+                    # the cycle loop so the watchdog can do process-level
+                    # restart + 2FA notification. Done BEFORE the recovery-in-
+                    # progress and health-gate checks so a permanently-failed
+                    # runner can't get stuck in a perpetual "cycle skipped"
+                    # state that keeps the log mtime fresh (which would defeat
+                    # the watchdog's "no log activity for 5 min" trigger).
+                    if portfolio_runner._recovery_exhausted:
+                        raise RecoveryExhaustedError(
+                            f"portfolio={portfolio_id} recovery exhausted after "
+                            f"all backoff attempts; exiting run_continuous so "
+                            f"watchdog can restart the process"
+                        )
+
                     # Skip cycle if recovery is mid-flight
                     if portfolio_runner.recovery_in_progress:
                         logger.info(
@@ -4434,6 +4469,7 @@ async def run_continuous(
 
                     # Cycle health gate — only run if HEALTHY
                     from robo_trader.connection_health import HealthStatus
+
                     if (
                         portfolio_runner.health is not None
                         and portfolio_runner.health.status is not HealthStatus.HEALTHY
@@ -4477,6 +4513,17 @@ async def run_continuous(
                 logger.critical(f"KILL SWITCH: Shutting down trading system - {e}")
                 shutdown_flag = True
                 break
+            except RecoveryExhaustedError as e:
+                # C2: recover_connection exhausted all attempts. Exit cleanly
+                # so the watchdog can do process-level restart (Layer 6
+                # notification per memory/project_watchdog_layer6.md). The
+                # finally block below runs full cleanup for all portfolios.
+                logger.critical(
+                    "event=run_continuous_exit_recovery_exhausted reason=%r",
+                    str(e),
+                )
+                shutdown_flag = True
+                break
             except Exception as e:
                 logger.error(f"Error in trading cycle: {e}")
                 # If connection error at the outer level, let ConnectionHealth +
@@ -4493,9 +4540,7 @@ async def run_continuous(
             try:
                 await r.cleanup()
             except Exception:
-                logger.exception(
-                    "event=final_cleanup_failed portfolio=%s", pid
-                )
+                logger.exception("event=final_cleanup_failed portfolio=%s", pid)
         logger.info("Trading system shutdown complete")
         # B2 (2026-05-12): Record a clean exit so dashboard/watchdog know
         # the runner ended normally (vs crashing). Best-effort — don't
@@ -4702,9 +4747,7 @@ def main() -> None:
         # sufficient context for triage.
         exc_type = type(e).__name__
         try:
-            logger.exception(
-                "Unhandled exception in runner main() (type=%s)", exc_type
-            )
+            logger.exception("Unhandled exception in runner main() (type=%s)", exc_type)
         except Exception:
             pass
         _write_exit_audit(
@@ -4712,9 +4755,7 @@ def main() -> None:
             exit_code=2,
             extra={"exception_type": exc_type},
         )
-        _fire_runner_exit_alert(
-            "unhandled_exception", {"exception_type": exc_type}
-        )
+        _fire_runner_exit_alert("unhandled_exception", {"exception_type": exc_type})
         raise
 
 
