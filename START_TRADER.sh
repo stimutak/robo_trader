@@ -330,6 +330,45 @@ if ! $PYTHON -c "import pandas" 2>/dev/null; then
 fi
 echo ""
 
+# Step 4.5: Preflight safety gate
+# Runs scripts/preflight_check.py which validates system state before launch.
+# Exit codes:
+#   0 -> all checks passed, proceed
+#   2 -> operator used --force to bypass a BLOCK (audited); proceed with warning banner
+#   1, 3, * -> BLOCKED or preflight itself failed; abort startup
+echo "4.5. Running preflight safety gate..."
+$PYTHON scripts/preflight_check.py
+PREFLIGHT_RC=$?
+case "$PREFLIGHT_RC" in
+    0)
+        echo "   ✓ Preflight gate passed"
+        ;;
+    2)
+        echo ""
+        echo "=========================================="
+        echo "⚠️  PREFLIGHT BYPASSED VIA --force"
+        echo "=========================================="
+        echo "Operator override was used. See data/preflight_bypass.log for audit trail."
+        echo "Proceeding with launch."
+        echo ""
+        ;;
+    *)
+        # 1 (BLOCKED), 3 (preflight failed), or anything else.
+        echo ""
+        echo "=========================================="
+        echo "❌ PREFLIGHT SAFETY GATE BLOCKED STARTUP"
+        echo "=========================================="
+        echo ""
+        echo "Preflight reported blocking issues above (exit code $PREFLIGHT_RC)."
+        echo "Resolve each one and re-run ./START_TRADER.sh, or"
+        echo "bypass with: $PYTHON scripts/preflight_check.py --force \"<reason>\""
+        echo "(then re-run ./START_TRADER.sh — bypass is per-invocation, not persistent)"
+        echo ""
+        exit 1
+        ;;
+esac
+echo ""
+
 # Step 5: Start dashboard (includes WebSocket server)
 echo "5. Starting dashboard with WebSocket server..."
 export DASH_PORT=5555
