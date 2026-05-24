@@ -43,6 +43,16 @@ class ConnectionHealth:
     def status(self) -> HealthStatus:
         return self._status
 
+    @property
+    def consecutive_failures(self) -> int:
+        """Read-only view of the consecutive-failure counter.
+
+        Public, stable surface for tests and callers that need to observe
+        recovery state without poking the private ``_consecutive_failures``
+        attribute.
+        """
+        return self._consecutive_failures
+
     def record_failure(self, error: BaseException, context: str) -> None:
         """Report a transient failure (e.g., Errno 54 in a cycle).
 

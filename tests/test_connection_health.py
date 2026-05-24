@@ -60,7 +60,7 @@ def test_record_success_clears_recovering_state():
     health._consecutive_failures = 5
     health.record_success()
     assert health.status is HealthStatus.HEALTHY
-    assert health._consecutive_failures == 0
+    assert health.consecutive_failures == 0
 
 
 @pytest.mark.asyncio
@@ -103,7 +103,7 @@ async def test_perform_check_respects_ib_not_connected():
     # Even if ping would succeed, is_connected==False is a hard failure.
     result = await health.perform_check()
     assert result is HealthStatus.HEALTHY  # 1/3, still healthy by status
-    assert health._consecutive_failures == 1
+    assert health.consecutive_failures == 1
 
 
 @pytest.mark.asyncio

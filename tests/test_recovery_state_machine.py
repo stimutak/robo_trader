@@ -226,7 +226,7 @@ async def test_monitor_loop_failsafe_uses_record_failure_not_direct_write():
     assert crashed["n"] >= 1
     # The counter must reflect those crashes — proving record_failure
     # was called, not the old direct write.
-    assert health._consecutive_failures >= 1
+    assert health.consecutive_failures >= 1
 
 
 @pytest.mark.asyncio
@@ -252,7 +252,7 @@ async def test_single_failsafe_crash_does_not_immediately_trip_unhealthy():
     await health.stop_monitoring()
 
     # After one crash: counter == 1, status still HEALTHY (1 of 3).
-    assert health._consecutive_failures == 1
+    assert health.consecutive_failures == 1
     assert health.status is HealthStatus.HEALTHY
 
 
@@ -270,4 +270,4 @@ def test_record_success_still_clears_recovering():
     health.record_success()
 
     assert health.status is HealthStatus.HEALTHY
-    assert health._consecutive_failures == 0
+    assert health.consecutive_failures == 0
