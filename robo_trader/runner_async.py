@@ -59,6 +59,7 @@ except ImportError:
     ws_client = None
     WEBSOCKET_ENABLED = False
 from .circuit_breaker import CircuitBreaker
+from .connection_health import HealthStatus
 from .exceptions import KillSwitchTriggeredError
 from .portfolio import Portfolio, PositionSnapshot  # Import Portfolio class from portfolio.py file
 from .portfolio_pkg.portfolio_manager import AllocationMethod, MultiStrategyPortfolioManager
@@ -4211,6 +4212,16 @@ class AsyncRunner:
         self.recovery_in_progress = True
         try:
             async with self._recovery_lock:
+                # C3: declare RECOVERING so ConnectionHealth._monitor_loop
+                # does not queue a *second* on_unhealthy callback while this
+                # recovery is mid-flight. The monitor's guard already skips
+                # when the previous status was UNHEALTHY, but the fail-safe
+                # path (and any direct UNHEALTHY → UNHEALTHY repeat) could
+                # otherwise re-trigger. record_success() clears RECOVERING
+                # → HEALTHY when initialize_connection() succeeds.
+                if getattr(self, "health", None) is not None:
+                    self.health._status = HealthStatus.RECOVERING
+
                 for attempt_idx, delay in enumerate(backoff_schedule):
                     attempt = attempt_idx + 1
                     logger.warning(
@@ -4468,8 +4479,6 @@ async def run_continuous(
                         continue
 
                     # Cycle health gate — only run if HEALTHY
-                    from robo_trader.connection_health import HealthStatus
-
                     if (
                         portfolio_runner.health is not None
                         and portfolio_runner.health.status is not HealthStatus.HEALTHY

@@ -145,8 +145,16 @@ class ConnectionHealth:
             try:
                 prev_status = self._status
                 await self.perform_check()
+                # C3: also skip firing on_unhealthy when we're already in
+                # RECOVERING. Without this, a transient ping failure during
+                # an in-progress recovery would queue a *second* recovery
+                # task after the first releases _recovery_lock. The
+                # RECOVERING state is set by recover_connection() at the top
+                # of its critical section and cleared by record_success()
+                # on successful re-init.
                 if (
                     prev_status is not HealthStatus.UNHEALTHY
+                    and prev_status is not HealthStatus.RECOVERING
                     and self._status is HealthStatus.UNHEALTHY
                     and self._on_unhealthy is not None
                 ):
@@ -159,9 +167,15 @@ class ConnectionHealth:
                         logger.exception("on_unhealthy callback raised; continuing monitor loop")
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception("Health monitor iteration crashed - failing safe to UNHEALTHY")
-                self._status = HealthStatus.UNHEALTHY
+            except Exception as e:
+                # C3: route the fail-safe through record_failure() so the
+                # counter increments symmetrically (3 strikes to UNHEALTHY)
+                # instead of jumping straight to UNHEALTHY on any crash.
+                # The asymmetric direct-write previously could queue an
+                # extra on_unhealthy callback during recovery (the prev/
+                # current status guard above closes the other window).
+                logger.exception("Health monitor iteration crashed - recording as failure")
+                self.record_failure(e, "monitor_loop_crash")
             try:
                 await asyncio.sleep(self._ping_interval)
             except asyncio.CancelledError:
