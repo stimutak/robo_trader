@@ -59,7 +59,7 @@ except ImportError:
     ws_client = None
     WEBSOCKET_ENABLED = False
 from .circuit_breaker import CircuitBreaker
-from .connection_health import HealthStatus
+from .connection_health import HealthStatus, get_gateway_recovery_lock
 from .exceptions import KillSwitchTriggeredError
 from .portfolio import Portfolio, PositionSnapshot  # Import Portfolio class from portfolio.py file
 from .portfolio_pkg.portfolio_manager import AllocationMethod, MultiStrategyPortfolioManager
@@ -367,6 +367,12 @@ class AsyncRunner:
         self._starting_unrealized_today: float = 0.0
         self._daily_pnl_date: Optional[date] = None
         self.session_start_equity: Optional[float] = None  # Captured after loading positions
+        # Per-(symbol, action) throttle for the centralized kill-switch/blocked-trading
+        # log emitted from _place_order_with_circuit_breaker. Prevents log spam when
+        # the kill switch is triggered and SELL signals resolve every cycle (~15s)
+        # against held positions. Value is the last time.monotonic() the log fired.
+        self._kill_switch_log_last: Dict[Tuple[str, str], float] = {}
+        self._kill_switch_log_throttle_seconds: float = 60.0
         self.monitor = PerformanceMonitor()
 
         # Production monitoring (Phase 4 P2)
@@ -684,7 +690,16 @@ class AsyncRunner:
         # and the pairs path bypassed the check entirely.
         blocked, reason = self._trading_blocked()
         if blocked:
-            logger.error(f"Order blocked by trading_blocked gate for {order.symbol}: {reason}")
+            # Throttle log per (symbol, action) to avoid 1000s of identical lines
+            # when the kill switch is triggered and SELL signals resolve every cycle.
+            # First occurrence always logs so operators see the block; subsequent
+            # identical messages within _kill_switch_log_throttle_seconds are suppressed.
+            _key = (order.symbol, getattr(order, "side", "") or "")
+            _now = time.monotonic()
+            _last = self._kill_switch_log_last.get(_key)
+            if _last is None or (_now - _last) >= self._kill_switch_log_throttle_seconds:
+                logger.error(f"Order blocked by trading_blocked gate for {order.symbol}: {reason}")
+                self._kill_switch_log_last[_key] = _now
             return SimpleNamespace(ok=False, message=f"Trading blocked: {reason}", fill_price=None)
 
         # Check if circuit breaker allows the request
@@ -1148,6 +1163,8 @@ class AsyncRunner:
                     ),
                     "max_position_pct": 0.1,
                     "max_risk_per_trade": 0.02,
+                    "max_position_loss_pct": self.cfg.risk.max_position_loss_pct,
+                    "max_daily_loss_pct": self.cfg.risk.max_daily_loss_pct,
                 },
                 enable_kelly=True,
                 enable_correlation_limits=True,
@@ -2325,16 +2342,8 @@ class AsyncRunner:
                 pos = self.positions[symbol]
                 qty_to_cover = abs(pos.quantity)
 
-                # Check kill switch before order execution
-                if self.advanced_risk and hasattr(self.advanced_risk, "kill_switch"):
-                    if self.advanced_risk.kill_switch.triggered:
-                        logger.error(
-                            f"KILL SWITCH ACTIVE - Order blocked for {symbol} BUY_TO_COVER"
-                        )
-                        return self._blocked_result(
-                            symbol, 0, price_float, "Kill switch active - trading halted", df
-                        )
-
+                # Kill-switch / emergency-shutdown is enforced centrally inside
+                # _place_order_with_circuit_breaker via _trading_blocked().
                 res = await self._place_order_with_circuit_breaker(
                     Order(symbol=symbol, quantity=qty_to_cover, side="BUY_TO_COVER", price=price)
                 )
@@ -2558,17 +2567,8 @@ class AsyncRunner:
                     )
 
                     if ok and qty > 0:
-                        # Check kill switch before order execution
-                        if self.advanced_risk and hasattr(self.advanced_risk, "kill_switch"):
-                            if self.advanced_risk.kill_switch.triggered:
-                                logger.error(f"KILL SWITCH ACTIVE - Order blocked for {symbol} BUY")
-                                return self._blocked_result(
-                                    symbol,
-                                    0,
-                                    price_float,
-                                    "Kill switch active - trading halted",
-                                    df,
-                                )
+                        # Kill-switch / emergency-shutdown is enforced centrally inside
+                        # _place_order_with_circuit_breaker via _trading_blocked().
 
                         res = await self._place_order_with_circuit_breaker(
                             Order(symbol=symbol, quantity=qty, side="BUY", price=price)
@@ -2712,14 +2712,8 @@ class AsyncRunner:
                         f"(profit: {pnl_percent:.1f}%)"
                     )
 
-                    # Check kill switch before order execution
-                    if self.advanced_risk and hasattr(self.advanced_risk, "kill_switch"):
-                        if self.advanced_risk.kill_switch.triggered:
-                            logger.error(f"KILL SWITCH ACTIVE - Order blocked for {symbol} SELL")
-                            return self._blocked_result(
-                                symbol, 0, price_float, "Kill switch active - trading halted", df
-                            )
-
+                    # Kill-switch / emergency-shutdown is enforced centrally inside
+                    # _place_order_with_circuit_breaker via _trading_blocked().
                     res = await self._place_order_with_circuit_breaker(
                         Order(symbol=symbol, quantity=pos.quantity, side="SELL", price=price)
                     )
@@ -2812,16 +2806,8 @@ class AsyncRunner:
                 )
 
                 if ok and qty > 0:
-                    # Check kill switch before order execution
-                    if self.advanced_risk and hasattr(self.advanced_risk, "kill_switch"):
-                        if self.advanced_risk.kill_switch.triggered:
-                            logger.error(
-                                f"KILL SWITCH ACTIVE - Order blocked for {symbol} SELL_SHORT"
-                            )
-                            return self._blocked_result(
-                                symbol, 0, price_float, "Kill switch active - trading halted", df
-                            )
-
+                    # Kill-switch / emergency-shutdown is enforced centrally inside
+                    # _place_order_with_circuit_breaker via _trading_blocked().
                     res = await self._place_order_with_circuit_breaker(
                         Order(symbol=symbol, quantity=qty, side="SELL_SHORT", price=price)
                     )

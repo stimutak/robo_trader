@@ -102,6 +102,23 @@ class RiskConfig(BaseModel):
     max_daily_loss_pct: float = Field(
         default=0.005, gt=0, le=0.05, description="Max daily loss as % of portfolio"
     )
+    max_position_loss_pct: float = Field(
+        default=0.05,
+        gt=0,
+        le=0.10,
+        description="Per-position unrealized loss that trips the kill switch",
+    )
+
+    @field_validator("max_position_loss_pct")
+    @classmethod
+    def validate_position_loss_pct(cls, v: float) -> float:
+        if not 0 < v <= 0.10:
+            raise ValueError(f"max_position_loss_pct must be between 0 and 0.10, got {v}")
+        if v < 0.02:
+            logger.warning(
+                f"Very tight per-position loss limit: {v * 100:.1f}% — will trigger on normal volatility"
+            )
+        return v
 
     @field_validator("max_position_pct")
     @classmethod
@@ -464,6 +481,9 @@ def load_config_from_env() -> Config:
             # Use validated values for critical risk parameters
             "max_position_pct": validator.validate_percentage("RISK_MAX_POSITION_PCT", 0.02),
             "max_daily_loss_pct": validator.validate_percentage("RISK_MAX_DAILY_LOSS_PCT", 0.005),
+            "max_position_loss_pct": validator.validate_percentage(
+                "RISK_MAX_POSITION_LOSS_PCT", 0.05
+            ),
             "max_portfolio_beta": validator.validate_range(
                 "RISK_MAX_PORTFOLIO_BETA", 0.5, 2.0, 1.2
             ),

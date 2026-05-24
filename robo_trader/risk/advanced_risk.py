@@ -720,6 +720,9 @@ class AdvancedRiskManager:
         cfg_loss_pct = config.get("max_daily_loss_pct")
         if isinstance(cfg_loss_pct, (int, float)) and cfg_loss_pct > 0:
             ks_kwargs["max_daily_loss_pct"] = float(cfg_loss_pct)
+        cfg_pos_loss_pct = config.get("max_position_loss_pct")
+        if isinstance(cfg_pos_loss_pct, (int, float)) and cfg_pos_loss_pct > 0:
+            ks_kwargs["max_position_loss_pct"] = float(cfg_pos_loss_pct)
         self.kill_switch = KillSwitch(**ks_kwargs) if enable_kill_switch else None
 
         # Risk metrics tracking
