@@ -580,12 +580,27 @@ class KillSwitch:
                 f"⚠️  Kill switch state loaded from {self.state_path}: triggered=True ({self.trigger_reason})"
             )
 
-    def reset(self) -> None:
-        """Reset kill switch after cooldown period."""
+    def reset(self, force: bool = False) -> None:
+        """Reset kill switch after cooldown period.
+
+        Args:
+            force: When True, bypass the cooldown gate and reset immediately.
+                Reserved for narrow cases where the runner knows the trigger
+                was caused by an external transient (e.g., IBKR connection
+                failure that has since recovered) and the cooldown is not
+                semantically meaningful. Use sparingly — loss-based triggers
+                must NEVER be force-reset.
+        """
         if not self.triggered:
             return
 
-        if self.trigger_time:
+        if force:
+            self.triggered = False
+            self.trigger_time = None
+            self.trigger_reason = None
+            self.consecutive_losses = 0
+            print("✅ Kill switch force-reset (cooldown bypassed)")
+        elif self.trigger_time:
             elapsed = get_market_time() - self.trigger_time
             if elapsed > timedelta(minutes=self.cooldown_minutes):
                 self.triggered = False
@@ -593,20 +608,22 @@ class KillSwitch:
                 self.trigger_reason = None
                 self.consecutive_losses = 0
                 print(f"✅ Kill switch reset after {self.cooldown_minutes} minute cooldown")
+            else:
+                return  # cooldown not elapsed, leave triggered
 
-                # Clear persisted state so we don't reload triggered=True later.
-                try:
-                    self._save_persisted_state()
-                except Exception:
-                    pass
+        # Clear persisted state so we don't reload triggered=True later.
+        try:
+            self._save_persisted_state()
+        except Exception:
+            pass
 
-                # R2-M2: clear the lock file too so the two indicators stay
-                # in sync.
-                try:
-                    if self.lock_path.exists():
-                        self.lock_path.unlink()
-                except Exception:
-                    pass
+        # R2-M2: clear the lock file too so the two indicators stay
+        # in sync.
+        try:
+            if self.lock_path.exists():
+                self.lock_path.unlink()
+        except Exception:
+            pass
 
     def is_active(self) -> bool:
         """Check if kill switch is currently active."""

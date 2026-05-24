@@ -4242,6 +4242,55 @@ class AsyncRunner:
             skipped,
         )
 
+    def _maybe_auto_reset_kill_switch_after_recovery(self) -> None:
+        """Auto-reset the AdvancedRiskManager kill switch iff it was
+        triggered by a connection-related reason that the recovery just
+        resolved.
+
+        This handles the production case where the kill switch was
+        tripped by an IBKR transient (handshake timeout, subprocess
+        crash, gateway zombie) and persists to disk as triggered=True.
+        Without this auto-reset, the runner reconnects successfully but
+        cannot trade because the kill switch is still locked from the
+        prior episode.
+
+        Loss-based triggers (e.g., "Position loss limit exceeded for
+        NVDA: 2.93% loss") are PRESERVED — those are real safety stops
+        and a connection recovery doesn't make them go away.
+        """
+        if (
+            getattr(self, "advanced_risk", None) is None
+            or getattr(self.advanced_risk, "kill_switch", None) is None
+            or not self.advanced_risk.kill_switch.triggered
+        ):
+            return
+
+        reason = (self.advanced_risk.kill_switch.trigger_reason or "").lower()
+        connection_keywords = (
+            "connection",
+            "handshake",
+            "gateway",
+            "timeout",
+            "subprocess",
+            "ibkr",
+        )
+        if any(kw in reason for kw in connection_keywords):
+            logger.warning(
+                "event=kill_switch_auto_reset reason=%r " "note=connection_related_after_recovery",
+                self.advanced_risk.kill_switch.trigger_reason,
+            )
+            # force=True because cooldown is not semantically meaningful for
+            # a connection-flap trigger — the proximate cause is already
+            # resolved by recover_connection. Loss-based reasons would
+            # need the cooldown and are filtered out above.
+            self.advanced_risk.kill_switch.reset(force=True)
+        else:
+            logger.warning(
+                "event=kill_switch_not_reset reason=%r "
+                "note=non_connection_reason_preserves_trigger",
+                self.advanced_risk.kill_switch.trigger_reason,
+            )
+
     async def recover_connection(self, reason: str) -> bool:
         """Re-establish IBKR connection after ConnectionHealth reports unhealthy.
 
@@ -4308,6 +4357,11 @@ class AsyncRunner:
                         # first 1–N cycles after recovery because they require
                         # a recent price tick to evaluate.
                         await self._rewarm_stop_loss_prices_after_recovery()
+                        # H1: auto-clear kill switch if it was tripped by a
+                        # connection-related transient (now resolved).
+                        # Loss-based triggers are preserved — those are real
+                        # safety stops and a recovery doesn't change them.
+                        self._maybe_auto_reset_kill_switch_after_recovery()
                         return True
                     except Exception as e:
                         logger.warning(

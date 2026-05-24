@@ -335,3 +335,146 @@ async def test_recovery_rewarm_not_called_when_recovery_fails():
 
     assert result is False
     runner.stop_loss_monitor.update_price.assert_not_awaited()
+
+
+# --- H1: kill switch auto-reset after recovery iff trigger was connection-related ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "trigger_reason,should_reset",
+    [
+        # Connection-related → auto-reset
+        ("Connection lost to IBKR Gateway", True),
+        ("Handshake timeout after 30s", True),
+        ("Gateway returned no response", True),
+        ("Subprocess crashed unexpectedly", True),
+        ("IBKR API error 1100", True),
+        ("Connection refused on port 4002", True),
+        # Mixed-case variants (matching is case-insensitive)
+        ("CONNECTION POOL EXHAUSTED", True),
+        ("IBKR Timeout During Reconnect", True),
+        # Loss-based / safety-meaningful → preserve
+        ("Position loss limit exceeded for NVDA: 2.93% loss", False),
+        ("Daily loss limit breached: -$2,450", False),
+        ("Margin call from broker", False),
+        ("Manual trigger by operator", False),
+        ("Risk: portfolio drawdown 8.5%", False),
+    ],
+)
+async def test_kill_switch_auto_reset_only_for_connection_reasons(trigger_reason, should_reset):
+    """H1: After recovery, the kill switch is auto-reset iff its
+    trigger_reason contains a connection-related keyword. Loss-based
+    triggers must persist because the recovery doesn't make the loss
+    go away."""
+    runner = make_runner_for_recovery(initialize_succeeds_on=1)
+    # Set up advanced_risk with a triggered kill switch
+    runner.advanced_risk = MagicMock()
+    runner.advanced_risk.kill_switch = MagicMock()
+    runner.advanced_risk.kill_switch.triggered = True
+    runner.advanced_risk.kill_switch.trigger_reason = trigger_reason
+    runner.advanced_risk.kill_switch.reset = MagicMock()
+
+    with patch("robo_trader.runner_async.asyncio.sleep", AsyncMock()):
+        result = await runner.recover_connection("test")
+
+    assert result is True
+    if should_reset:
+        # Must be called with force=True to bypass the cooldown gate
+        runner.advanced_risk.kill_switch.reset.assert_called_once()
+        call = runner.advanced_risk.kill_switch.reset.call_args
+        # Accept either keyword or positional force=True
+        force_arg = call.kwargs.get("force", call.args[0] if call.args else None)
+        assert force_arg is True, (
+            f"Connection-related reset must use force=True to bypass cooldown; "
+            f"got force={force_arg!r}"
+        )
+    else:
+        runner.advanced_risk.kill_switch.reset.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_not_reset_when_not_triggered():
+    """If the kill switch was never tripped, recovery must NOT touch it."""
+    runner = make_runner_for_recovery(initialize_succeeds_on=1)
+    runner.advanced_risk = MagicMock()
+    runner.advanced_risk.kill_switch = MagicMock()
+    runner.advanced_risk.kill_switch.triggered = False
+    runner.advanced_risk.kill_switch.trigger_reason = None
+    runner.advanced_risk.kill_switch.reset = MagicMock()
+
+    with patch("robo_trader.runner_async.asyncio.sleep", AsyncMock()):
+        await runner.recover_connection("test")
+
+    runner.advanced_risk.kill_switch.reset.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_auto_reset_handles_missing_advanced_risk():
+    """advanced_risk == None must not crash recovery."""
+    runner = make_runner_for_recovery(initialize_succeeds_on=1)
+    runner.advanced_risk = None
+
+    with patch("robo_trader.runner_async.asyncio.sleep", AsyncMock()):
+        result = await runner.recover_connection("test")
+
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_auto_reset_handles_missing_kill_switch_attr():
+    """advanced_risk.kill_switch == None must not crash recovery."""
+    runner = make_runner_for_recovery(initialize_succeeds_on=1)
+    runner.advanced_risk = MagicMock()
+    runner.advanced_risk.kill_switch = None
+
+    with patch("robo_trader.runner_async.asyncio.sleep", AsyncMock()):
+        result = await runner.recover_connection("test")
+
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_auto_reset_handles_none_trigger_reason():
+    """Triggered but trigger_reason=None must be safely treated as
+    non-connection (preserve the trigger)."""
+    runner = make_runner_for_recovery(initialize_succeeds_on=1)
+    runner.advanced_risk = MagicMock()
+    runner.advanced_risk.kill_switch = MagicMock()
+    runner.advanced_risk.kill_switch.triggered = True
+    runner.advanced_risk.kill_switch.trigger_reason = None
+    runner.advanced_risk.kill_switch.reset = MagicMock()
+
+    with patch("robo_trader.runner_async.asyncio.sleep", AsyncMock()):
+        await runner.recover_connection("test")
+
+    runner.advanced_risk.kill_switch.reset.assert_not_called()
+
+
+def test_kill_switch_force_reset_bypasses_cooldown(tmp_path):
+    """H1 dependency: AdvancedRiskManager.kill_switch.reset(force=True)
+    must perform the reset immediately, ignoring the cooldown timer."""
+    from datetime import timedelta
+
+    from robo_trader.risk.advanced_risk import KillSwitch, get_market_time
+
+    # Use tmp_path so this test doesn't touch the production kill_switch
+    # state file. KillSwitch's constructor derives the lock path from
+    # state_path's parent — point both into the tmp dir.
+    state_file = tmp_path / "kill_switch_state.json"
+    ks = KillSwitch(cooldown_minutes=60, state_path=state_file)
+
+    # Pretend it was just triggered (well within cooldown — use market-time
+    # to avoid offset-naive/aware mismatch with reset()).
+    ks.triggered = True
+    ks.trigger_time = get_market_time() - timedelta(seconds=5)
+    ks.trigger_reason = "Connection lost during ping"
+
+    # Without force: cooldown not elapsed → must remain triggered
+    ks.reset()
+    assert ks.triggered is True
+
+    # With force=True: must reset regardless
+    ks.reset(force=True)
+    assert ks.triggered is False
+    assert ks.trigger_reason is None
