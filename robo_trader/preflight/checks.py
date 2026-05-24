@@ -6,15 +6,29 @@ check is one line: import the class, instantiate it, append to
 are otherwise independent — the runner runs them all even if early ones
 fail, so the operator sees every problem at once.
 
-Empty registry is a deliberate Task-#2 state — each check is added by its
-own commit in tasks #3-#8. The empty list still imports cleanly so the
-runner can be scaffolded in parallel.
+Display order rationale: kill-switch checks first (most likely cause of
+the 2026-05-22-style livelock), then state-freshness, then config, then
+network-state checks (the latter are most likely to be transient and
+self-resolve on the next launcher attempt).
 """
 
 from __future__ import annotations
 
 from typing import List
 
+from .equity_history_freshness_check import EquityHistoryFreshnessCheck
+from .gateway_port_listening_check import GatewayPortListeningCheck
+from .kill_switch_lock_check import KillSwitchLockCheck
+from .kill_switch_state_check import KillSwitchStateCheck
 from .protocol import Check
+from .risk_threshold_check import RiskThresholdCheck
+from .zombie_connections_check import ZombieConnectionsCheck
 
-ALL_CHECKS: List[Check] = []
+ALL_CHECKS: List[Check] = [
+    KillSwitchStateCheck(),
+    KillSwitchLockCheck(),
+    EquityHistoryFreshnessCheck(),
+    RiskThresholdCheck(),
+    GatewayPortListeningCheck(),
+    ZombieConnectionsCheck(),
+]
