@@ -117,6 +117,51 @@ launchctl load ~/Library/LaunchAgents/com.robotrader.watchdog.plist    # Start
 
 ---
 
+## Preflight Safety Gate
+
+**Always invoked automatically by `./START_TRADER.sh` — runs BEFORE the runner spins up.**
+
+The gate inspects six conditions and refuses to start if any BLOCKs. Built after the 2026-05-22 incident where a triggered kill switch caused 18 silent failed restarts over 4 hours.
+
+### What it checks
+1. `data/kill_switch_state.json` — BLOCK if `triggered=True`
+2. `data/kill_switch.lock` — BLOCK if file exists (deny-by-default signal)
+3. `equity_history` freshness — BLOCK if last row is >1 trading day old
+4. `RISK_MAX_POSITION_LOSS_PCT` — WARN <2%, BLOCK <1%
+5. Gateway port LISTEN — BLOCK if port 4002 (paper) / 4001 (live) not listening
+6. Zombie CLOSE_WAIT connections — BLOCK if any present
+
+### When it BLOCKs
+The script prints a boxed remediation per BLOCK with the exact command to fix the condition. Three response patterns:
+- **Real problem** (e.g., real loss-based kill switch trigger): fix the underlying issue, re-run `./START_TRADER.sh`
+- **Stale state from a transient issue** (e.g., the 2026-05-22 NVDA event): clear the state file after confirming, re-run
+- **Known-but-acceptable** (e.g., diagnosing why preflight thinks there's a problem): bypass with `python3 scripts/preflight_check.py --force "real-sentence reason"` and re-run `./START_TRADER.sh`
+
+### Bypass mechanics
+- `--force` requires a reason string ≥10 chars, not a placeholder (`force`, `bypass`, `idk`, etc. rejected)
+- Every bypass appends a JSONL entry to `data/preflight_bypass.log` with operator, timestamp, reason
+- Bypass exits the script with code 2 (distinct from clean 0) so downstream tooling can tell "started with bypass" vs "all clean"
+- Bypass is per-invocation only — does NOT persist; the next `./START_TRADER.sh` runs preflight again
+
+### Output formats
+```bash
+python3 scripts/preflight_check.py           # plaintext, default
+python3 scripts/preflight_check.py --json    # machine-readable
+python3 scripts/preflight_check.py --verbose # add per-check details block
+```
+
+### When NOT to bypass
+Loss-based kill switches (e.g., "Position loss limit exceeded for NVDA") are real risk signals. Bypassing them resumes trading with the underlying loss still active. Either close the position, raise `RISK_MAX_POSITION_LOSS_PCT` in `.env`, or both — then clear and re-run.
+
+### Files
+- `scripts/preflight_check.py` — CLI entry point
+- `robo_trader/preflight/` — check classes and runner
+- `data/preflight_bypass.log` — audit log (append-only)
+- `data/.preflight_last_ok` — last-pass timestamp (read by runner-side enforcement)
+- `docs/superpowers/specs/2026-05-23-startup-safety-gate-design.md` — design spec
+
+---
+
 ## Mobile App & Parallel Development
 
 | Location | Branch | Purpose |
@@ -218,6 +263,7 @@ Any code that hard-codes one of these forms will `AttributeError`, the broad `ex
 12. ✅ ML/MTF Disagreement Threshold - FIXED (adaptive threshold)
 13. ✅ Stop-losses on restart - FIXED (recreated from DB positions)
 14. ✅ Persistent IBKR Connection - IMPLEMENTED (2026-05-16, prevents IBKR-throttle cascade from per-cycle reconnects)
+15. ✅ Startup safety gate - IMPLEMENTED (2026-05-23, prevents 2026-05-22-style silent livelock)
 
 ---
 
@@ -380,6 +426,7 @@ STOP_LOSS_PERCENT=2.0           # Fixed 2% stop
 | Using `socket.connect_ex()` for port check | Use `lsof -nP -iTCP:PORT -sTCP:LISTEN` | 2025-12-06 |
 | Not checking for zombies before connect | Check CLOSE_WAIT connections first | 2025-11-24 |
 | Reading subprocess stdout too early | Wait for `isConnected()` polling loop | 2025-11-24 |
+| Skipping the preflight safety gate when restarting after an incident | Always run `./START_TRADER.sh` (preflight runs automatically). If it blocks, fix the condition or use `--force "<reason>"`. The gate exists because of the 2026-05-22 4-hour silent livelock. | 2026-05-23 |
 
 ### Async/Await Errors
 | Mistake | Correct Approach | Date |
