@@ -14,6 +14,7 @@ a clear, actionable message on the first restart.
 Design spec: ``docs/superpowers/specs/2026-05-23-startup-safety-gate-design.md``
 """
 
+from .protocol import Check, PreflightContext
 from .result import CheckResult, CheckStatus
 
-__all__ = ["CheckResult", "CheckStatus"]
+__all__ = ["Check", "CheckResult", "CheckStatus", "PreflightContext"]
