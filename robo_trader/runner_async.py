@@ -4289,83 +4289,137 @@ class AsyncRunner:
         Per 2026-05-16 design spec:
         - Backoff: [15, 30, 60, 120, 300] seconds
         - Gateway restart on attempt >= 3
-        - Mutex via _recovery_lock (no concurrent recovery)
+        - Mutex via _recovery_lock (no concurrent recovery on same runner)
+        - Mutex via process-wide gateway lock (H2: no concurrent recovery
+          across multi-portfolio runners sharing one Gateway)
         - Sets recovery_in_progress flag for cycle-skip logic
         """
         backoff_schedule = [15, 30, 60, 120, 300]
         gateway_restart_attempt_threshold = 3
+        # H2: 600s ceiling on how long another portfolio's recovery may
+        # block us before we give up and let our own recovery attempt
+        # proceed (or surface as exhausted). Worst-case full backoff is
+        # 15+30+60+120+300 = 525s plus per-attempt initialize_connection
+        # overhead; 600s gives a small slack without letting a wedged
+        # holder permanently freeze every other portfolio.
+        gateway_lock_timeout_seconds = 600
 
         self.recovery_in_progress = True
         try:
             async with self._recovery_lock:
-                # C3: declare RECOVERING so ConnectionHealth._monitor_loop
-                # does not queue a *second* on_unhealthy callback while this
-                # recovery is mid-flight. The monitor's guard already skips
-                # when the previous status was UNHEALTHY, but the fail-safe
-                # path (and any direct UNHEALTHY → UNHEALTHY repeat) could
-                # otherwise re-trigger. record_success() clears RECOVERING
-                # → HEALTHY when initialize_connection() succeeds.
-                if getattr(self, "health", None) is not None:
-                    self.health._status = HealthStatus.RECOVERING
-
-                for attempt_idx, delay in enumerate(backoff_schedule):
-                    attempt = attempt_idx + 1
-                    logger.warning(
-                        "event=recovery_started attempt=%d backoff_seconds=%d reason=%r",
-                        attempt,
-                        delay,
+                # H2: serialize Gateway recovery across all AsyncRunner
+                # instances in this process. The per-instance _recovery_lock
+                # above prevents one runner from re-entering its own
+                # recovery; this process-wide lock prevents Portfolio A
+                # from yanking the shared connection out from under
+                # Portfolio B mid-recovery. Acquisition order is fixed
+                # (instance lock first, gateway lock second) — see
+                # connection_health._GATEWAY_RECOVERY_LOCK docstring for
+                # the rationale.
+                gateway_lock = get_gateway_recovery_lock()
+                try:
+                    await asyncio.wait_for(
+                        gateway_lock.acquire(),
+                        timeout=gateway_lock_timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "event=gateway_recovery_lock_timeout "
+                        "timeout_seconds=%d reason=%r "
+                        "another portfolio's recovery appears wedged; "
+                        "skipping this recovery attempt",
+                        gateway_lock_timeout_seconds,
                         reason,
                     )
+                    return False
+                try:
+                    # C3: declare RECOVERING so ConnectionHealth._monitor_loop
+                    # does not queue a *second* on_unhealthy callback while this
+                    # recovery is mid-flight. The monitor's guard already skips
+                    # when the previous status was UNHEALTHY, but the fail-safe
+                    # path (and any direct UNHEALTHY → UNHEALTHY repeat) could
+                    # otherwise re-trigger. record_success() clears RECOVERING
+                    # → HEALTHY when initialize_connection() succeeds.
+                    if getattr(self, "health", None) is not None:
+                        self.health._status = HealthStatus.RECOVERING
 
-                    await self._safe_disconnect()
-                    await asyncio.sleep(delay)
-
-                    if attempt >= gateway_restart_attempt_threshold:
-                        try:
-                            ok = await restart_gateway_for_zombies_async(self.cfg.ibkr.port, 180)
-                            logger.info(
-                                "event=recovery_gateway_restart_done attempt=%d success=%s",
-                                attempt,
-                                ok,
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                "event=recovery_gateway_restart_failed attempt=%d error=%r",
-                                attempt,
-                                e,
-                            )
-
-                    try:
-                        await self.initialize_connection()
-                        logger.info("event=recovery_succeeded attempt=%d", attempt)
-                        # C4: rewarm stop_loss_monitor with cached prices from
-                        # latest_prices so the freshness check
-                        # (max_price_age_seconds=10) passes for the next
-                        # check. Without this, stop-losses go blind for the
-                        # first 1–N cycles after recovery because they require
-                        # a recent price tick to evaluate.
-                        await self._rewarm_stop_loss_prices_after_recovery()
-                        # H1: auto-clear kill switch if it was tripped by a
-                        # connection-related transient (now resolved).
-                        # Loss-based triggers are preserved — those are real
-                        # safety stops and a recovery doesn't change them.
-                        self._maybe_auto_reset_kill_switch_after_recovery()
-                        return True
-                    except Exception as e:
-                        logger.warning(
-                            "event=recovery_attempt_failed attempt=%d error=%r",
-                            attempt,
-                            e,
-                        )
-
-                logger.error(
-                    "event=recovery_exhausted attempts=%d reason=%r",
-                    len(backoff_schedule),
-                    reason,
-                )
-                return False
+                    return await self._recover_connection_locked(
+                        reason,
+                        backoff_schedule,
+                        gateway_restart_attempt_threshold,
+                    )
+                finally:
+                    gateway_lock.release()
         finally:
             self.recovery_in_progress = False
+
+    async def _recover_connection_locked(
+        self,
+        reason: str,
+        backoff_schedule: list,
+        gateway_restart_attempt_threshold: int,
+    ) -> bool:
+        """Inner body of recover_connection executed while holding BOTH
+        the per-instance _recovery_lock AND the process-wide gateway
+        recovery lock. Split out so the lock-acquisition ceremony in the
+        caller stays readable. Do not call directly — always go through
+        recover_connection() so lock ordering is preserved."""
+        for attempt_idx, delay in enumerate(backoff_schedule):
+            attempt = attempt_idx + 1
+            logger.warning(
+                "event=recovery_started attempt=%d backoff_seconds=%d reason=%r",
+                attempt,
+                delay,
+                reason,
+            )
+
+            await self._safe_disconnect()
+            await asyncio.sleep(delay)
+
+            if attempt >= gateway_restart_attempt_threshold:
+                try:
+                    ok = await restart_gateway_for_zombies_async(self.cfg.ibkr.port, 180)
+                    logger.info(
+                        "event=recovery_gateway_restart_done attempt=%d success=%s",
+                        attempt,
+                        ok,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "event=recovery_gateway_restart_failed attempt=%d error=%r",
+                        attempt,
+                        e,
+                    )
+
+            try:
+                await self.initialize_connection()
+                logger.info("event=recovery_succeeded attempt=%d", attempt)
+                # C4: rewarm stop_loss_monitor with cached prices from
+                # latest_prices so the freshness check
+                # (max_price_age_seconds=10) passes for the next
+                # check. Without this, stop-losses go blind for the
+                # first 1–N cycles after recovery because they require
+                # a recent price tick to evaluate.
+                await self._rewarm_stop_loss_prices_after_recovery()
+                # H1: auto-clear kill switch if it was tripped by a
+                # connection-related transient (now resolved).
+                # Loss-based triggers are preserved — those are real
+                # safety stops and a recovery doesn't change them.
+                self._maybe_auto_reset_kill_switch_after_recovery()
+                return True
+            except Exception as e:
+                logger.warning(
+                    "event=recovery_attempt_failed attempt=%d error=%r",
+                    attempt,
+                    e,
+                )
+
+        logger.error(
+            "event=recovery_exhausted attempts=%d reason=%r",
+            len(backoff_schedule),
+            reason,
+        )
+        return False
 
 
 async def run_once(

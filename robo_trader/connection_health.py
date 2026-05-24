@@ -38,6 +38,35 @@ class IBKRClientProtocol(Protocol):
         """Active probe — return True iff the API responds healthy."""
 
 
+# H2: process-wide mutex that serializes Gateway recovery across all
+# AsyncRunner instances (multi-portfolio mode runs N runners sharing one
+# IBKR Gateway on port 4002). Without this lock, Portfolio A's
+# recover_connection() can call _safe_disconnect() on the shared connection
+# while Portfolio B is mid-recovery — producing the IBKR throttle cascade
+# documented for 2026-05-13.
+#
+# Acquisition order (must not be violated to avoid deadlock):
+#   1. AsyncRunner._recovery_lock  (per-instance, prevents one runner from
+#      re-entering its own recovery while one is in flight)
+#   2. _GATEWAY_RECOVERY_LOCK      (process-wide, prevents concurrent
+#      recovery across runners)
+#
+# This is a no-op in single-portfolio mode (only one runner ever acquires
+# it), so it's safe to leave on unconditionally.
+_GATEWAY_RECOVERY_LOCK: asyncio.Lock = asyncio.Lock()
+
+
+def get_gateway_recovery_lock() -> asyncio.Lock:
+    """Return the process-wide Gateway recovery mutex.
+
+    Exposed as a function (not a direct import) so tests can patch it
+    via ``patch("robo_trader.connection_health._GATEWAY_RECOVERY_LOCK", ...)``
+    and so callers always pick up the current module-level binding rather
+    than a stale snapshot taken at import time.
+    """
+    return _GATEWAY_RECOVERY_LOCK
+
+
 class HealthStatus(Enum):
     HEALTHY = "healthy"  # consecutive_failures < max_consecutive_failures
     UNHEALTHY = "unhealthy"  # consecutive_failures >= max_consecutive_failures
