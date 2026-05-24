@@ -12,9 +12,30 @@ from __future__ import annotations
 import asyncio
 import logging
 from enum import Enum
-from typing import Any, Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class IBKRClientProtocol(Protocol):
+    """Minimal interface ConnectionHealth requires from its IB client.
+
+    The canonical conforming implementation is
+    ``robo_trader.clients.subprocess_ibkr_client.SubprocessIBKRClient``.
+    Documenting the surface explicitly (rather than ``Any``) prevents
+    drift between the client and its only consumer here.
+
+    ``runtime_checkable`` is set so callers and tests can validate
+    conformance via ``isinstance(client, IBKRClientProtocol)``.
+    """
+
+    @property
+    def is_connected(self) -> bool:
+        """True iff the underlying API session is currently usable."""
+
+    async def ping(self) -> bool:
+        """Active probe — return True iff the API responds healthy."""
 
 
 class HealthStatus(Enum):
@@ -26,7 +47,7 @@ class HealthStatus(Enum):
 class ConnectionHealth:
     def __init__(
         self,
-        ib_client: Any,
+        ib_client: IBKRClientProtocol,
         ping_interval_seconds: float = 30,
         max_consecutive_failures: int = 3,
     ) -> None:

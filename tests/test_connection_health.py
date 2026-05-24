@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from robo_trader.connection_health import ConnectionHealth, HealthStatus
+from robo_trader.connection_health import ConnectionHealth, HealthStatus, IBKRClientProtocol
 
 
 def make_fake_ib_client():
@@ -156,3 +156,34 @@ async def test_stop_monitoring_cancels_task_cleanly():
     # stop_monitoring should be idempotent
     await health.stop_monitoring()
     # No assertion needed — just that no exception/hang
+
+
+# ---------------------------------------------------------------------------
+# IBKRClientProtocol conformance
+# ---------------------------------------------------------------------------
+
+
+def test_subprocess_ibkr_client_conforms_to_protocol():
+    """SubprocessIBKRClient is the canonical conforming implementation —
+    if this breaks, ConnectionHealth's documented duck-typed contract has
+    silently drifted from the only real client that satisfies it."""
+    from robo_trader.clients.subprocess_ibkr_client import SubprocessIBKRClient
+
+    # Duck-typing check via hasattr (the protocol's @property and async
+    # method are present on the class). We avoid instantiating because the
+    # real client spawns a subprocess.
+    assert hasattr(SubprocessIBKRClient, "is_connected"), (
+        "SubprocessIBKRClient missing 'is_connected' — "
+        "IBKRClientProtocol contract broken"
+    )
+    assert hasattr(SubprocessIBKRClient, "ping"), (
+        "SubprocessIBKRClient missing 'ping' — IBKRClientProtocol contract broken"
+    )
+
+
+def test_make_fake_ib_client_conforms_to_protocol():
+    """The test double we use across this module must also satisfy the
+    protocol — otherwise tests are exercising something other than what
+    ConnectionHealth requires."""
+    fake = make_fake_ib_client()
+    assert isinstance(fake, IBKRClientProtocol)
