@@ -7,6 +7,7 @@ Tests Kelly sizing, correlation limits, and kill switches
 import asyncio
 import json
 import sys
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -121,18 +122,22 @@ def test_correlation_limiter():
     return True
 
 
-def test_kill_switches():
+def test_kill_switches(tmp_path):
     """Test automated kill switches"""
     print("\n" + "=" * 50)
     print("Testing Automated Kill Switches")
     print("=" * 50)
 
+    # Isolate state file (and the lock path KillSwitch derives from it) under
+    # tmp_path so triggered state never pollutes the real data/ directory and
+    # blocks the preflight safety gate on the next ./START_TRADER.sh.
     kill_switch = KillSwitch(
         max_daily_loss_pct=0.05,
         max_position_loss_pct=0.02,
         max_consecutive_losses=5,
         max_drawdown_pct=0.10,
         cooldown_minutes=60,
+        state_path=tmp_path / "kill_switch_state.json",
     )
 
     # Test daily loss check
@@ -305,11 +310,12 @@ def main():
 
     # Test kill switches
     try:
-        if test_kill_switches():
-            print("✅ Kill switch tests PASSED")
-        else:
-            print("❌ Kill switch tests FAILED")
-            all_passed = False
+        with tempfile.TemporaryDirectory() as td:
+            if test_kill_switches(Path(td)):
+                print("✅ Kill switch tests PASSED")
+            else:
+                print("❌ Kill switch tests FAILED")
+                all_passed = False
     except Exception as e:
         print(f"❌ Kill switch tests FAILED: {e}")
         all_passed = False
