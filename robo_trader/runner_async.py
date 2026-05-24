@@ -4193,6 +4193,55 @@ class AsyncRunner:
             )
             self._recovery_exhausted = True
 
+    async def _rewarm_stop_loss_prices_after_recovery(self) -> None:
+        """Push cached prices from self.latest_prices into the stop-loss
+        monitor's active stops after a successful reconnect.
+
+        The stop-loss monitor's freshness gate is 10 seconds — if no price
+        tick arrives that fast after recovery, stops go blind until the
+        next cycle finishes processing each symbol. Rewarming from the
+        in-memory price cache (which survives recovery — _safe_disconnect
+        and initialize_connection do not touch it) closes that gap.
+
+        Defensive: skips when attributes don't exist (e.g., minimal test
+        runners). Each update_price call is independently wrapped so a
+        single symbol's failure cannot poison the others.
+        """
+        stop_monitor = getattr(self, "stop_loss_monitor", None)
+        prices = getattr(self, "latest_prices", None)
+        if stop_monitor is None or prices is None:
+            logger.debug("event=stop_loss_prices_rewarm_skipped reason=missing_attributes")
+            return
+
+        active_stops = getattr(stop_monitor, "active_stops", None)
+        if not active_stops:
+            return
+
+        rewarmed = 0
+        skipped = 0
+        # active_stops is keyed by portfolio_id:symbol but the StopLossOrder
+        # objects carry the bare symbol on .symbol.
+        for stop in list(active_stops.values()):
+            symbol = getattr(stop, "symbol", None)
+            if symbol is None or symbol not in prices:
+                skipped += 1
+                continue
+            try:
+                await stop_monitor.update_price(symbol, prices[symbol])
+                rewarmed += 1
+            except Exception as e:
+                logger.warning(
+                    "event=stop_loss_price_rewarm_failed symbol=%s error=%r",
+                    symbol,
+                    e,
+                )
+                skipped += 1
+        logger.info(
+            "event=stop_loss_prices_rewarmed count=%d skipped=%d",
+            rewarmed,
+            skipped,
+        )
+
     async def recover_connection(self, reason: str) -> bool:
         """Re-establish IBKR connection after ConnectionHealth reports unhealthy.
 
@@ -4252,6 +4301,13 @@ class AsyncRunner:
                     try:
                         await self.initialize_connection()
                         logger.info("event=recovery_succeeded attempt=%d", attempt)
+                        # C4: rewarm stop_loss_monitor with cached prices from
+                        # latest_prices so the freshness check
+                        # (max_price_age_seconds=10) passes for the next
+                        # check. Without this, stop-losses go blind for the
+                        # first 1–N cycles after recovery because they require
+                        # a recent price tick to evaluate.
+                        await self._rewarm_stop_loss_prices_after_recovery()
                         return True
                     except Exception as e:
                         logger.warning(
