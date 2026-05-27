@@ -39,6 +39,9 @@ Icon
 *.db-wal
 launchd_*.log
 
+# Test artifacts (per-pytest-session log + temp DB)
+.test_artifacts/
+
 # Runtime data files
 logs/monitoring/metrics_*.jsonl
 logs/monitoring/dashboard.json

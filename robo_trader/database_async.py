@@ -22,7 +22,7 @@ from robo_trader.logger import get_logger
 
 logger = get_logger(__name__)
 
-DB_PATH = Path("trading_data.db")
+DB_PATH = Path(os.getenv("RT_DB_PATH", "trading_data.db"))
 
 # Default portfolio ID for backward compatibility
 DEFAULT_PORTFOLIO_ID = "default"

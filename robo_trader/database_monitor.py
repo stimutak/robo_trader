@@ -20,11 +20,13 @@ from .logger import get_logger
 
 logger = get_logger(__name__)
 
+_DEFAULT_DB_PATH = os.getenv("RT_DB_PATH", "trading_data.db")
+
 
 class DatabaseMonitor:
     """Monitor database health and manage connections."""
 
-    def __init__(self, db_path: str = "trading_data.db", check_interval: int = 60):
+    def __init__(self, db_path: str = _DEFAULT_DB_PATH, check_interval: int = 60):
         self.db_path = Path(db_path)
         self.check_interval = check_interval
         self.running = False
@@ -300,7 +302,7 @@ class DatabaseMonitor:
 _monitor_instance: Optional[DatabaseMonitor] = None
 
 
-async def start_database_monitor(db_path: str = "trading_data.db", check_interval: int = 60):
+async def start_database_monitor(db_path: str = _DEFAULT_DB_PATH, check_interval: int = 60):
     """Start the global database monitor."""
     global _monitor_instance
 

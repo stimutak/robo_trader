@@ -4,15 +4,18 @@ This module provides a synchronous wrapper around the async database.
 """
 
 import asyncio
+import os
 from typing import Any, Dict, List, Optional
 
 from robo_trader.database_async import AsyncTradingDatabase
+
+_DEFAULT_DB_PATH = os.getenv("RT_DB_PATH", "trading_data.db")
 
 
 class TradingDatabase:
     """Synchronous wrapper for AsyncTradingDatabase for backward compatibility."""
 
-    def __init__(self, db_path: str = "trading_data.db"):
+    def __init__(self, db_path: str = _DEFAULT_DB_PATH):
         self.async_db = AsyncTradingDatabase(db_path)
         self._loop = None
         self._initialized = False
