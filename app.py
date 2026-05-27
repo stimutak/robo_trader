@@ -318,7 +318,7 @@ HTML_TEMPLATE = """
         }
         
         .container {
-            max-width: 1400px;
+            max-width: 1800px;
             margin: 0 auto;
             padding: 20px;
         }
@@ -798,6 +798,42 @@ HTML_TEMPLATE = """
             opacity: 0.5;
             pointer-events: none;
         }
+
+        /* P&L attribution bars */
+        .pnl-bar-container {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 0;
+        }
+        .pnl-bar-label {
+            width: 40px;
+            font-size: 10px;
+            color: #58a6ff;
+            font-weight: 600;
+            text-align: right;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .pnl-bar-track {
+            flex: 1;
+            height: 14px;
+            background: #161b22;
+            border-radius: 3px;
+            position: relative;
+            overflow: hidden;
+        }
+        .pnl-bar-fill {
+            height: 100%;
+            border-radius: 3px;
+            transition: width 0.4s ease;
+            min-width: 2px;
+        }
+        .pnl-bar-value {
+            width: 55px;
+            font-size: 10px;
+            font-family: 'JetBrains Mono', monospace;
+            text-align: right;
+        }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
@@ -1005,8 +1041,30 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
+            <!-- P&L + STOPS ROW: 3-column layout -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 10px;">
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 8px 0; font-size: 11px; text-transform: uppercase;">P&L by Symbol</h4>
+                    <div id="pnl-by-symbol" style="font-size: 11px;">
+                        <div style="color: #666; text-align: center; padding: 10px;">Loading...</div>
+                    </div>
+                </div>
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 8px 0; font-size: 11px; text-transform: uppercase;">Active Stop-Losses</h4>
+                    <div id="active-stops-list" style="font-size: 11px; max-height: 130px; overflow-y: auto;">
+                        <div style="color: #666; text-align: center; padding: 10px;">Loading...</div>
+                    </div>
+                </div>
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 8px 0; font-size: 11px; text-transform: uppercase;">Signal Activity</h4>
+                    <div id="signal-activity-list" style="font-size: 11px; max-height: 130px; overflow-y: auto;">
+                        <div style="color: #666; text-align: center; padding: 10px;">Loading...</div>
+                    </div>
+                </div>
+            </div>
+
             <!-- STATUS ROW: System Health -->
-            <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px;">
+            <div style="display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px;">
                 <div style="background: #161b22; padding: 10px; border-radius: 6px; display: flex; align-items: center; gap: 8px; border: 1px solid #21262d;">
                     <div style="width: 8px; height: 8px; border-radius: 50%; background: #4ade80;" id="ov-conn-dot"></div>
                     <div>
@@ -3094,8 +3152,131 @@ HTML_TEMPLATE = """
                     posTextEl.textContent = `${formatCurrency(totalValue)} deployed`;
                 }
             }
+
+            // Overview panels: P&L by Symbol, Active Stops, Signal Activity
+            renderPnlBySymbol(posData);
+            renderActiveStops(posData).catch(err => console.error('renderActiveStops failed:', err));
+            renderSignalActivity().catch(err => console.error('renderSignalActivity failed:', err));
         }
-        
+
+        function renderPnlBySymbol(posData) {
+            const container = document.getElementById('pnl-by-symbol');
+            if (!container) return;
+
+            if (!posData || posData.length === 0) {
+                container.innerHTML = '<div style="color: #666; text-align: center; padding: 10px;">No positions</div>';
+                return;
+            }
+
+            // Sort by absolute P&L, show top contributors
+            const sorted = [...posData].sort((a, b) => Math.abs(b.pnl) - Math.abs(a.pnl)).slice(0, 6);
+            const maxAbsPnl = Math.max(...sorted.map(p => Math.abs(p.pnl)), 1);
+
+            container.innerHTML = sorted.map(pos => {
+                const isPositive = pos.pnl >= 0;
+                const barColor = isPositive ? '#4ade80' : '#f87171';
+                const barWidth = Math.max(2, (Math.abs(pos.pnl) / maxAbsPnl) * 100);
+                const pnlSign = isPositive ? '+' : '';
+                // W-H3: escape symbol (DB-derived but defense in depth)
+                return `<div class="pnl-bar-container">
+                    <span class="pnl-bar-label">${escHTML(pos.symbol)}</span>
+                    <div class="pnl-bar-track">
+                        <div class="pnl-bar-fill" style="width: ${barWidth}%; background: ${barColor};"></div>
+                    </div>
+                    <span class="pnl-bar-value" style="color: ${barColor};">${pnlSign}$${Math.abs(pos.pnl).toFixed(0)}</span>
+                </div>`;
+            }).join('');
+        }
+
+        // Cache for stop-loss config from safety thresholds API (60s TTL)
+        let _stopConfig = null;
+
+        async function loadStopConfig() {
+            if (_stopConfig && (Date.now() - _stopConfig._ts < 60000)) return _stopConfig;
+            try {
+                const resp = await fetch('/api/safety/thresholds');
+                const data = await resp.json();
+                const useTrailing = data.use_trailing_stop === 'true';
+                _stopConfig = {
+                    trailingPct: parseFloat(useTrailing
+                        ? (data.trailing_stop_percent || '5.0')
+                        : (data.stop_loss_percent || '2.0')),
+                    useTrailing: useTrailing,
+                    _ts: Date.now()
+                };
+            } catch (e) {
+                _stopConfig = { trailingPct: 5.0, useTrailing: true, _ts: Date.now() };
+            }
+            return _stopConfig;
+        }
+
+        async function renderActiveStops(posData) {
+            const container = document.getElementById('active-stops-list');
+            if (!container) return;
+
+            if (!posData || posData.length === 0) {
+                container.innerHTML = '<div style="color: #666; text-align: center; padding: 10px;">No positions</div>';
+                return;
+            }
+
+            const config = await loadStopConfig();
+            const trailingPct = config.trailingPct;
+            const useTrailing = config.useTrailing;
+
+            container.innerHTML = posData.map(pos => {
+                // Estimate stop level - high water mark would be max(entry, current)
+                const highWater = Math.max(pos.entry_price, pos.current_price);
+                const stopLevel = useTrailing
+                    ? highWater * (1 - trailingPct / 100)
+                    : pos.entry_price * (1 - trailingPct / 100);
+                const stopDistance = pos.current_price > 0
+                    ? ((pos.current_price - stopLevel) / pos.current_price * 100)
+                    : 0;
+                const stopColor = stopDistance < 2 ? '#f87171' : stopDistance < 3 ? '#fbbf24' : '#4ade80';
+
+                // W-H3: escape symbol
+                return `<div style="display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #21262d; font-size: 10px;">
+                    <span style="color: #58a6ff; font-weight: 600; width: 40px;">${escHTML(pos.symbol)}</span>
+                    <span style="color: #8b949e; font-family: 'JetBrains Mono', monospace;">$${stopLevel.toFixed(2)}</span>
+                    <span style="color: ${stopColor}; font-family: 'JetBrains Mono', monospace;">${stopDistance.toFixed(1)}% away</span>
+                    <span style="color: #6b7280; font-size: 9px;">${useTrailing ? 'TRAIL' : 'FIXED'}</span>
+                </div>`;
+            }).join('');
+        }
+
+        async function renderSignalActivity() {
+            const container = document.getElementById('signal-activity-list');
+            if (!container) return;
+            try {
+                const resp = await fetch('/api/ml/predictions');
+                const data = await resp.json();
+                const preds = data.predictions || [];
+                // Show BUY/SELL first, then top-confidence HOLDs
+                const actionOrder = { BUY: 0, SELL: 1, HOLD: 2 };
+                const sorted = [...preds]
+                    .sort((a, b) => (actionOrder[a.action] ?? 3) - (actionOrder[b.action] ?? 3) || b.confidence - a.confidence)
+                    .slice(0, 8);
+                if (sorted.length === 0) {
+                    container.innerHTML = '<div style="color: #666; text-align: center; padding: 10px;">No signals</div>';
+                    return;
+                }
+                // W-H3: escape ML-derived fields
+                container.innerHTML = sorted.map(p => {
+                    const color = p.action === 'BUY' ? '#4ade80' : p.action === 'SELL' ? '#f87171' : '#6b7280';
+                    const conf = (p.confidence * 100).toFixed(0);
+                    const sourceLabel = (p.source || '').replace('ML_', '');
+                    return `<div style="display: flex; justify-content: space-between; align-items: center; padding: 3px 0; border-bottom: 1px solid #21262d; font-size: 10px;">
+                        <span style="color: #58a6ff; font-weight: 600; width: 40px;">${escHTML(p.symbol)}</span>
+                        <span style="background: ${color}22; color: ${color}; padding: 1px 6px; border-radius: 3px; font-size: 9px; font-weight: 600;">${escHTML(p.action)}</span>
+                        <span style="color: #8b949e; font-family: 'JetBrains Mono', monospace;">${conf}%</span>
+                        <span style="color: #4a5568; font-size: 9px;">${escHTML(sourceLabel)}</span>
+                    </div>`;
+                }).join('');
+            } catch (e) {
+                container.innerHTML = '<div style="color: #666; text-align: center; padding: 10px;">Error loading</div>';
+            }
+        }
+
         async function updateSafetyMonitoring() {
             try {
                 // Fetch circuit breakers
@@ -3861,6 +4042,25 @@ HTML_TEMPLATE = """
             });
         }
         
+        // Keyboard shortcuts for tab switching
+        document.addEventListener('keydown', (e) => {
+            // Don't fire when typing in inputs
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
+
+            const tabs = ['overview', 'watchlist', 'positions', 'strategies', 'trades', 'ml', 'performance', 'logs'];
+            const key = parseInt(e.key);
+            if (key >= 1 && key <= tabs.length) {
+                const tabName = tabs[key - 1];
+                const tabEl = document.querySelectorAll('.tab')[key - 1];
+                if (tabEl) switchTab(tabName, tabEl);
+            }
+            // R = refresh (only standalone — preserves Cmd+R / Ctrl+R browser reload)
+            if ((e.key === 'r' || e.key === 'R') && !e.ctrlKey && !e.metaKey) {
+                e.preventDefault();
+                refreshData();
+            }
+        });
+
         // Initialize on load
         window.onload = async () => {
             await loadPortfolios(); // Load portfolio list first
@@ -5211,6 +5411,11 @@ def ml_status():
 
     latest_models = {}
     for model_file in model_files:
+        try:
+            mtime = model_file.stat().st_mtime
+        except OSError:
+            continue  # Skip broken symlinks or deleted files
+
         # Handle both "high_accuracy" and single word model types
         stem_parts = model_file.stem.split("_")
         if stem_parts[0].lower() == "high" and len(stem_parts) > 1:
@@ -5220,13 +5425,10 @@ def ml_status():
 
         if model_type in model_info:
             model_info[model_type]["count"] += 1
-            if (
-                model_type not in latest_models
-                or model_file.stat().st_mtime > latest_models[model_type]["mtime"]
-            ):
+            if model_type not in latest_models or mtime > latest_models[model_type]["mtime"]:
                 latest_models[model_type] = {
                     "file": model_file,
-                    "mtime": model_file.stat().st_mtime,
+                    "mtime": mtime,
                 }
 
     # Build models list showing latest of each type
@@ -6281,6 +6483,9 @@ def get_risk_status():
         if risk_state_file.exists():
             with open(risk_state_file) as f:
                 risk_state = json.load(f)
+        # Guard against zero/missing capital (division-by-zero protection downstream)
+        if not risk_state.get("current_capital"):
+            risk_state["current_capital"] = 100000
 
         # Get real data from database
         from sync_db_reader import SyncDatabaseReader
@@ -6664,6 +6869,8 @@ def get_safety_thresholds():
         "max_open_positions": os.getenv("MAX_OPEN_POSITIONS", "5"),
         "max_orders_per_minute": os.getenv("MAX_ORDERS_PER_MINUTE", "10"),
         "stop_loss_percent": os.getenv("STOP_LOSS_PERCENT", "2.0"),
+        "trailing_stop_percent": os.getenv("TRAILING_STOP_PERCENT", "5.0"),
+        "use_trailing_stop": os.getenv("USE_TRAILING_STOP", "true"),
         "take_profit_percent": os.getenv("TAKE_PROFIT_PERCENT", "3.0"),
         "data_staleness_seconds": os.getenv("DATA_STALENESS_SECONDS", "60"),
         "circuit_breaker_threshold": os.getenv("CIRCUIT_BREAKER_THRESHOLD", "5"),
