@@ -504,6 +504,15 @@ STOP_LOSS_PERCENT=2.0           # Fixed 2% stop
 |---------|-----------------|------|
 | `self.cfg.portfolio.initial_capital` | Use `self.cfg.default_cash` - no portfolio.initial_capital | 2026-01-26 |
 
+### Test Isolation Errors
+| Mistake | Correct Approach | Date |
+|---------|-----------------|------|
+| Tests inherit `LOG_FILE=robo_trader.log` from prod env → pytest output pollutes prod log | `conftest.py` sets `LOG_FILE` to `.test_artifacts/` before any `robo_trader` import | 2026-05-26 |
+| Tests hit hardcoded `trading_data.db` → DB teardown closes live trader's pool | All 3 DB modules read `RT_DB_PATH` env var (prod fallback `trading_data.db`); conftest sets it to a per-PID temp file | 2026-05-26 |
+| Running pytest while the trader is live (caused the 2026-05-24 → 05-26 outage) | Test isolation makes this safe; otherwise pytest's `Closed all database connections` teardown kills the runner | 2026-05-26 |
+| `START_TRADER.sh` killed Gateway after 30s port-not-listening | Wait 180s for port bind, early-exit only if Gateway process actually dies (IBC + 2FA routinely needs 60-180s) | 2026-05-26 |
+| `start_gateway()` cold-start timeout 120s | 240s — IBC + Gateway + 2FA approval often exceeds 120s | 2026-05-26 |
+
 ### Trading Logic Errors
 | Mistake | Correct Approach | Date |
 |---------|-----------------|------|
