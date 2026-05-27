@@ -136,8 +136,10 @@ start_gateway() {
 
     # Wait for Gateway to start and API port to open
     # CRITICAL: Use lsof, NOT nc -z (nc creates zombie connections that block API handshakes!)
+    # 240s window: IBC + Gateway cold-start + 2FA approval routinely needs >120s.
+    # The previous 120s window was tight enough to lose 89 races over 13 days.
     echo "   Waiting for Gateway to start..."
-    for i in $(seq 1 120); do
+    for i in $(seq 1 240); do
         if lsof -nP -iTCP:$PORT -sTCP:LISTEN 2>/dev/null | grep -q LISTEN; then
             echo "   ✓ Gateway API port $PORT is now open!"
             # Wait for Gateway to fully initialize after port opens
@@ -164,7 +166,7 @@ start_gateway() {
         fi
     done
 
-    echo "   TIMEOUT: Gateway did not start within 120 seconds"
+    echo "   TIMEOUT: Gateway did not start within 240 seconds"
     return 1
 }
 
@@ -217,19 +219,31 @@ while [ "$API_CONNECTED" = false ] && [ $GATEWAY_RETRY -lt $MAX_GATEWAY_RETRIES 
     # Check if port is listening (using lsof to avoid zombie connections)
     if ! is_port_listening; then
         echo "   ⚠️  API port $PORT is NOT listening"
-        echo "   Gateway may be starting or needs restart..."
+        echo "   Gateway process is alive but API port not bound yet."
+        echo "   Normal during startup/2FA — waiting up to 180s before assuming Gateway is stuck."
+        echo "   (Killing Gateway prematurely triggers a fresh 2FA prompt and causes restart storms.)"
 
-        # Wait a bit for Gateway to fully start
-        for i in $(seq 1 30); do
+        # Wait for Gateway to bind the API port. Gateway+IBC+2FA routinely needs 60-180s,
+        # especially after a SIGTERM cycle. The previous 30s window was the root cause of
+        # the 2026-05-13 → 05-26 restart storm (89 consecutive failed restarts).
+        for i in $(seq 1 180); do
             if is_port_listening; then
-                echo "   ✓ API port $PORT is now listening"
+                echo "   ✓ API port $PORT is now listening (after ${i}s)"
+                break
+            fi
+            # Early-exit if Gateway actually died during the wait — no point waiting longer.
+            if ! pgrep -f "IB Gateway" > /dev/null 2>&1 && ! pgrep -f "ibcalpha.ibc" > /dev/null 2>&1; then
+                echo "   Gateway process died during wait — restart needed"
                 break
             fi
             sleep 1
+            if [ $((i % 30)) -eq 0 ]; then
+                echo "   Still waiting for port bind... (${i}s) — check IBKR Mobile for 2FA prompt"
+            fi
         done
 
         if ! is_port_listening; then
-            echo "   Port still not listening - restarting Gateway..."
+            echo "   Port still not listening after 180s - restarting Gateway..."
             start_gateway
             continue
         fi
