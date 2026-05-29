@@ -485,6 +485,9 @@ STOP_LOSS_PERCENT=2.0           # Fixed 2% stop
 | Not checking for zombies before connect | Check CLOSE_WAIT connections first | 2025-11-24 |
 | Reading subprocess stdout too early | Wait for `isConnected()` polling loop | 2025-11-24 |
 | Skipping the preflight safety gate when restarting after an incident | Always run `./START_TRADER.sh` (preflight runs automatically). If it blocks, fix the condition or use `--force "<reason>"`. The gate exists because of the 2026-05-22 4-hour silent livelock. | 2026-05-23 |
+| Bare `lsof` in code the launchd watchdog runs (`START_TRADER.sh`, preflight checks) | The watchdog plist PATH lacks `/usr/sbin` where `lsof` lives, so a bare `lsof` is "command not found"; the `2>/dev/null` on every port check silently turns that into "port not listening" → START_TRADER kills a healthy Gateway in a 472-restart storm (2026-05-29). Resolve `lsof` to an absolute path and FAIL LOUD if missing; keep `/usr/sbin:/sbin` in the watchdog plist PATH. Works when run by hand (interactive PATH has `/usr/sbin`), fails only under the watchdog — classic env-only bug. | 2026-05-29 |
+| Restart storm where START_TRADER says "port not listening" but a manual `lsof` shows LISTEN | This is an environment/detection bug (lsof not found under launchd PATH), NOT 2FA/timing. Commit `0719769` mis-blamed 2FA and widened the wait windows; the storm continued (89→472 restarts). When a documented "fix" doesn't stop the symptom, re-investigate root cause — don't re-apply it. | 2026-05-29 |
+| `cmd` on its own line then `RC=$?` under `set -e` (e.g. the preflight call in START_TRADER) | `set -e` aborts the script on `cmd`'s non-zero exit BEFORE `RC=$?` runs, so the exit-code `case` was dead code — preflight's `2=--force bypass` / `1=BLOCK` handling never ran and `--force` could never start the trader. Capture with `cmd \|\| RC=$?`, which is exempt from `set -e`. | 2026-05-29 |
 
 ### Async/Await Errors
 | Mistake | Correct Approach | Date |
