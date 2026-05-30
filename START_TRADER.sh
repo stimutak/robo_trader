@@ -24,6 +24,21 @@ PORT=4002
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MAX_GATEWAY_RETRIES=3
 
+# Resolve lsof to an absolute path and refuse to run without it.
+# The watchdog launches us under launchd, whose PATH omits /usr/sbin (where lsof
+# lives). A bare `lsof` there is "command not found"; the `2>/dev/null` on every
+# port check silently turns that into "port not listening", so START_TRADER kills
+# a perfectly healthy Gateway and the watchdog restart-storms. This was the real
+# root cause of the 2026-05-13 → 2026-05-29 storms (472 failed restarts) — NOT
+# 2FA timing. Fail loud instead of starting blind.
+LSOF="$(command -v lsof 2>/dev/null || true)"
+[ -z "$LSOF" ] && [ -x /usr/sbin/lsof ] && LSOF=/usr/sbin/lsof
+if [ -z "$LSOF" ]; then
+    echo "FATAL: lsof not found on PATH ($PATH) and not at /usr/sbin/lsof." >&2
+    echo "       Port checks cannot run; refusing to start to avoid a Gateway-kill restart storm." >&2
+    exit 3
+fi
+
 # Load defaults from .env if present
 if [ -f "$SCRIPT_DIR/.env" ]; then
     # Source only SYMBOLS to avoid polluting environment
@@ -34,8 +49,16 @@ fi
 SYMBOLS="${SYMBOLS:-AAPL,NVDA,TSLA}"
 
 # Parse arguments (override .env if provided)
+# --force="<reason>" is forwarded to the preflight gate so the documented
+# bypass (CLAUDE.md "Bypass mechanics") actually works through this entrypoint;
+# previously the gate was always called with no args, so re-running START_TRADER
+# could never clear a BLOCK.
+PREFLIGHT_FORCE_REASON=""
 for arg in "$@"; do
     case $arg in
+        --force=*)
+            PREFLIGHT_FORCE_REASON="${arg#--force=}"
+            ;;
         *)
             SYMBOLS="$arg"
             ;;
@@ -140,7 +163,7 @@ start_gateway() {
     # The previous 120s window was tight enough to lose 89 races over 13 days.
     echo "   Waiting for Gateway to start..."
     for i in $(seq 1 240); do
-        if lsof -nP -iTCP:$PORT -sTCP:LISTEN 2>/dev/null | grep -q LISTEN; then
+        if "$LSOF" -nP -iTCP:$PORT -sTCP:LISTEN 2>/dev/null | grep -q LISTEN; then
             echo "   ✓ Gateway API port $PORT is now open!"
             # Wait for Gateway to fully initialize after port opens
             # Gateway needs time to complete login/2FA before API is responsive
@@ -177,14 +200,14 @@ start_gateway() {
 # Function to check if port is listening (uses lsof to avoid creating zombie connections)
 # CRITICAL: Do NOT use nc -z for port checking - it creates zombie connections that block API handshakes!
 is_port_listening() {
-    lsof -nP -iTCP:$PORT -sTCP:LISTEN 2>/dev/null | grep -q LISTEN
+    "$LSOF" -nP -iTCP:$PORT -sTCP:LISTEN 2>/dev/null | grep -q LISTEN
 }
 
 # Function to check for zombie connections
 check_zombies() {
     # Count actual zombie lines - use wc -l and trim whitespace
     local count
-    count=$(lsof -nP -iTCP:$PORT -sTCP:CLOSE_WAIT 2>/dev/null | grep "CLOSE_WAIT" | wc -l | tr -d ' ')
+    count=$("$LSOF" -nP -iTCP:$PORT -sTCP:CLOSE_WAIT 2>/dev/null | grep "CLOSE_WAIT" | wc -l | tr -d ' ')
     # Return 0 if empty
     echo "${count:-0}"
 }
@@ -258,7 +281,7 @@ while [ "$API_CONNECTED" = false ] && [ $GATEWAY_RETRY -lt $MAX_GATEWAY_RETRIES 
         echo "   Zombies block API handshakes - restarting Gateway..."
 
         # Kill Python zombies first
-        lsof -nP -iTCP:$PORT -sTCP:CLOSE_WAIT 2>/dev/null | grep -i python | awk '{print $2}' | sort -u | while read pid; do
+        "$LSOF" -nP -iTCP:$PORT -sTCP:CLOSE_WAIT 2>/dev/null | grep -i python | awk '{print $2}' | sort -u | while read pid; do
             kill -9 $pid 2>/dev/null && echo "   Killed Python zombie PID $pid" || true
         done
         sleep 1
@@ -302,7 +325,7 @@ echo "3. Final zombie cleanup..."
 ZOMBIES=$(check_zombies)
 if [ "$ZOMBIES" -gt 0 ]; then
     echo "   Killing $ZOMBIES zombie connection(s)..."
-    lsof -nP -iTCP:$PORT -sTCP:CLOSE_WAIT 2>/dev/null | grep -i python | awk '{print $2}' | sort -u | while read pid; do
+    "$LSOF" -nP -iTCP:$PORT -sTCP:CLOSE_WAIT 2>/dev/null | grep -i python | awk '{print $2}' | sort -u | while read pid; do
         kill -9 $pid 2>/dev/null || true
     done
     sleep 1
@@ -351,8 +374,18 @@ echo ""
 #   2 -> operator used --force to bypass a BLOCK (audited); proceed with warning banner
 #   1, 3, * -> BLOCKED or preflight itself failed; abort startup
 echo "4.5. Running preflight safety gate..."
-$PYTHON scripts/preflight_check.py
-PREFLIGHT_RC=$?
+# preflight intentionally exits non-zero (1=BLOCK, 2=--force bypass-and-proceed).
+# Under `set -e` a bare invocation aborts the script before the case below can
+# interpret the code — capture it via `|| PREFLIGHT_RC=$?`, which is exempt from
+# set -e. (Without this, the 2=proceed branch was dead code and --force could
+# never actually start the trader.)
+PREFLIGHT_RC=0
+if [ -n "$PREFLIGHT_FORCE_REASON" ]; then
+    echo "   (operator --force supplied — bypass will be audited to data/preflight_bypass.log)"
+    $PYTHON scripts/preflight_check.py --force "$PREFLIGHT_FORCE_REASON" || PREFLIGHT_RC=$?
+else
+    $PYTHON scripts/preflight_check.py || PREFLIGHT_RC=$?
+fi
 case "$PREFLIGHT_RC" in
     0)
         echo "   ✓ Preflight gate passed"
