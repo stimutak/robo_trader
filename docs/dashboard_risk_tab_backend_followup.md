@@ -120,3 +120,48 @@ total-exposure gauges reflect real values; the leverage gauge color band
 Do #3 first (smallest, reuses the stop-loss price path, lights up the most
 visible gauge), then #1 and #2 together since they share the same
 "persist runner state to a shared store" pattern.
+
+---
+
+## #4 — Pre-existing `get_risk_status` issues surfaced by the multi-agent review (2026-05-30)
+
+The Risk-tab PR (#76) review flagged these in `get_risk_status`. They are
+**pre-existing on `main`** — the PR's only change to that function was adding a
+zero-capital guard — so they were intentionally left out of the UI PR and are
+tracked here instead.
+
+- **Timezone-naive daily-P&L window.** `daily_pnl` selects today's trades via
+  `datetime.fromisoformat(t["timestamp"]).date() == datetime.now().date()`. If
+  timestamps are stored UTC-aware, `.date()` is not adjusted to local (ET), so
+  extended-hours trades between 8 PM and midnight ET land in the wrong day and
+  skew the daily-loss gauge / kill-switch threshold. Fix: compare in a single
+  consistent timezone (ET, or UTC on both sides).
+
+- **`max_drawdown` is a rolling 100-trade window, not all-time.** It's computed
+  over `db.get_recent_trades(limit=100)` starting from `cumulative_pnl = 0`, so
+  it measures drawdown from the start of that window, not the historical equity
+  peak — understating true drawdown. The UI labels it "Max Drawdown (Realized)".
+  Fix: compute from the `equity_history` all-time peak, or relabel as
+  "Rolling 100-trade drawdown".
+
+- **No `portfolio_id` scoping.** `/api/risk/status` (and the three
+  `/api/safety/*` endpoints) read only the default portfolio; they carry
+  `@requires_auth` but not `@validate_portfolio`. The Risk tab fetches via
+  `withPortfolio(...)`, but the backend ignores the `portfolio_id` query param,
+  so in multi-portfolio mode the tab always shows the default portfolio. This is
+  consistent across all four endpoints (not a regression). Fix: add
+  `@validate_portfolio` and thread `portfolio_id` into the `SyncDatabaseReader`
+  calls — do all four together for consistency.
+
+- **Negative-capital guard is falsy-only.** The new guard
+  `if not risk_state.get("current_capital"): … = 100000` catches `0`/missing but
+  not a negative value (negatives are truthy), which would yield negative
+  leverage. Low-likelihood data path; tighten to `<= 0` / type-check, mirroring
+  the more defensive guard in `get_kelly_parameters`.
+
+### Also noted (not backend — housekeeping)
+
+- `app.py` does not pass `black --check` on `main` (e.g. lines ~483, ~7252),
+  independent of this PR. A repo-wide `black` pass should be its own dedicated
+  commit, never folded into a feature PR (it would bury real changes in a
+  whole-file reformat).

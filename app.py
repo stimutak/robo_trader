@@ -2397,6 +2397,8 @@ HTML_TEMPLATE = """
                 loadWatchlist();
             } else if (tab === 'trades') {
                 loadTrades();
+            } else if (tab === 'risk') {
+                loadRiskData();
             }
         }
         
@@ -3792,7 +3794,7 @@ HTML_TEMPLATE = """
             try {
                 const resp = await fetch('/api/safety/thresholds');
                 const data = await resp.json();
-                const useTrailing = data.use_trailing_stop === 'true';
+                const useTrailing = String(data.use_trailing_stop ?? '').toLowerCase() === 'true';
                 _stopConfig = {
                     trailingPct: parseFloat(useTrailing
                         ? (data.trailing_stop_percent || '5.0')
@@ -4721,6 +4723,7 @@ HTML_TEMPLATE = """
                         dailyPnlEl.textContent = formatCurrency(dailyPnl);
                         dailyPnlEl.style.color = dailyPnl >= 0 ? '#4ade80' : '#f87171';
                         document.getElementById('risk-current-capital').textContent = formatCurrency(risk.risk_metrics.current_capital || 0);
+                        document.getElementById('risk-win-rate').textContent = ((risk.risk_metrics.win_rate || 0) * 100).toFixed(1) + '%';
                         document.getElementById('risk-max-dd').textContent = ((risk.risk_metrics.max_drawdown || 0) * 100).toFixed(2) + '%';
                         const totalPnlEl = document.getElementById('risk-total-pnl');
                         const totalPnl = risk.risk_metrics.total_pnl || 0;
@@ -4774,8 +4777,8 @@ HTML_TEMPLATE = """
                             return `<div style="display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; background: #161b22; border-radius: 4px; font-size: 10px;">
                                 <span style="color: #c9d1d9; font-weight: 500;">${escHTML(name)}</span>
                                 <div style="display: flex; gap: 10px; align-items: center;">
-                                    <span style="color: #8b949e;">Calls: <span style="font-family: 'JetBrains Mono', monospace;">${stats.total_calls || 0}</span></span>
-                                    <span style="color: #8b949e;">Success: <span style="font-family: 'JetBrains Mono', monospace;">${successRate}%</span></span>
+                                    <span style="color: #8b949e;">Calls: <span style="font-family: 'JetBrains Mono', monospace;">${escHTML(stats.total_calls || 0)}</span></span>
+                                    <span style="color: #8b949e;">Success: <span style="font-family: 'JetBrains Mono', monospace;">${escHTML(successRate)}%</span></span>
                                     <span style="color: ${stateColor}; font-weight: 600; font-size: 9px; padding: 1px 5px; border-radius: 3px; border: 1px solid ${stateColor};">${stateIcon}</span>
                                 </div>
                             </div>`;
@@ -7584,6 +7587,7 @@ def get_risk_status():
                     "current_capital": risk_state.get("current_capital", 100000),
                     "total_pnl": risk_state.get("total_pnl", 0),
                     "daily_pnl": round(daily_pnl, 2),
+                    "win_rate": round(win_rate, 3),
                 },
             }
         )
