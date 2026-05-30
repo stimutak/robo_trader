@@ -201,7 +201,7 @@ class DataValidator:
             ):
                 self.validation_stats["failed_stale"] += 1
                 return ValidationResult(
-                    False, f"Data is stale (>{ self.max_staleness_seconds}s old)"
+                    False, f"Data is stale (>{self.max_staleness_seconds}s old)"
                 )
 
         self.validation_stats["passed"] += 1

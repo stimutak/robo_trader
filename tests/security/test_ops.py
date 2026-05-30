@@ -15,11 +15,11 @@ import os
 import plistlib
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
@@ -29,6 +29,14 @@ INSTALL_SH = SCRIPTS_DIR / "install_watchdog.sh"
 START_TRADER_SH = PROJECT_ROOT / "START_TRADER.sh"
 DEV_SETUP_MD = PROJECT_ROOT / "DEV_SETUP.md"
 CLAUDE_MD = PROJECT_ROOT / "CLAUDE.md"
+
+# The watchdog is a macOS launchd agent. Tests that invoke macOS-only tooling
+# (plutil), check absolute macOS paths inside the plist, or run the launchctl
+# installer can't pass on Linux CI — skip them off-Darwin.
+macos_only = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="macOS launchd / plutil / LaunchAgents only; not available on Linux CI",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +50,7 @@ def _load_plist() -> dict:
         return plistlib.load(fh)
 
 
+@macos_only
 def test_watchdog_plist_paths_exist():
     """ProgramArguments[0], StandardOut, StandardError must resolve to real,
     writable locations. Otherwise launchd silently fails."""
@@ -67,11 +76,12 @@ def test_watchdog_plist_paths_exist():
     # Audit hardening from Round-2: agent must be pinned to the GUI session
     # of a real user, not run as root or in a background session.
     assert plist.get("UserName"), "UserName must be set on the agent"
-    assert plist.get("LimitLoadToSessionType") == "Aqua", (
-        "LimitLoadToSessionType must be 'Aqua' so the agent runs in the GUI session"
-    )
+    assert (
+        plist.get("LimitLoadToSessionType") == "Aqua"
+    ), "LimitLoadToSessionType must be 'Aqua' so the agent runs in the GUI session"
 
 
+@macos_only
 def test_watchdog_plist_lints_ok():
     """`plutil -lint` must pass; otherwise launchctl refuses to load it."""
     result = subprocess.run(
@@ -104,6 +114,7 @@ def test_install_watchdog_script_bash_syntax():
     assert result.returncode == 0, f"bash -n failed: {result.stderr}"
 
 
+@macos_only
 def test_install_watchdog_script_is_idempotent(tmp_path):
     """Run the installer twice into a fake LaunchAgents dir; both runs must
     exit 0. SKIP_LAUNCHCTL=1 skips the actual launchctl load (which would
@@ -139,23 +150,21 @@ def test_dev_setup_mentions_watchdog_install():
     regresses, fresh machines will repeat the 2026-05-11 outage."""
     assert DEV_SETUP_MD.exists(), "DEV_SETUP.md missing"
     content = DEV_SETUP_MD.read_text()
-    assert "install_watchdog.sh" in content, (
-        "DEV_SETUP.md must reference scripts/install_watchdog.sh"
-    )
+    assert (
+        "install_watchdog.sh" in content
+    ), "DEV_SETUP.md must reference scripts/install_watchdog.sh"
     # Also assert it's marked as required, not optional.
     lowered = content.lower()
-    assert "required" in lowered or "not optional" in lowered, (
-        "DEV_SETUP.md must mark the watchdog install as required"
-    )
+    assert (
+        "required" in lowered or "not optional" in lowered
+    ), "DEV_SETUP.md must mark the watchdog install as required"
 
 
 def test_claude_md_mentions_watchdog_install():
     """CLAUDE.md must tell future Claude sessions about the install step."""
     assert CLAUDE_MD.exists(), "CLAUDE.md missing"
     content = CLAUDE_MD.read_text()
-    assert "install_watchdog.sh" in content, (
-        "CLAUDE.md must reference scripts/install_watchdog.sh"
-    )
+    assert "install_watchdog.sh" in content, "CLAUDE.md must reference scripts/install_watchdog.sh"
 
 
 # ---------------------------------------------------------------------------
@@ -166,18 +175,16 @@ def test_claude_md_mentions_watchdog_install():
 def test_start_trader_warns_if_watchdog_not_loaded():
     assert START_TRADER_SH.exists(), "START_TRADER.sh missing"
     src = START_TRADER_SH.read_text()
-    assert "launchctl list" in src, (
-        "START_TRADER.sh must call `launchctl list` to detect a missing watchdog"
-    )
-    assert "robotrader" in src, (
-        "START_TRADER.sh launchctl check must grep for 'robotrader'"
-    )
-    assert "WARNING" in src, (
-        "START_TRADER.sh must print a WARNING block when the watchdog is missing"
-    )
-    assert "install_watchdog.sh" in src, (
-        "START_TRADER.sh WARNING must reference scripts/install_watchdog.sh"
-    )
+    assert (
+        "launchctl list" in src
+    ), "START_TRADER.sh must call `launchctl list` to detect a missing watchdog"
+    assert "robotrader" in src, "START_TRADER.sh launchctl check must grep for 'robotrader'"
+    assert (
+        "WARNING" in src
+    ), "START_TRADER.sh must print a WARNING block when the watchdog is missing"
+    assert (
+        "install_watchdog.sh" in src
+    ), "START_TRADER.sh WARNING must reference scripts/install_watchdog.sh"
 
 
 # ---------------------------------------------------------------------------

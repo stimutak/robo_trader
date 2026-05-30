@@ -93,18 +93,24 @@ jobs:
     
     - name: Run unit tests
       if: matrix.test-type == 'unit'
+      # The repo keeps tests flat under tests/ (no tests/unit dir); run the
+      # whole suite except the integration subdir, which the integration leg
+      # covers separately.
       run: |
-        pytest tests/unit/ -v --cov=robo_trader --cov-report=xml --cov-report=html
-    
+        pytest tests/ --ignore=tests/integration -v --cov=robo_trader --cov-report=xml --cov-report=html
+
     - name: Run integration tests
       if: matrix.test-type == 'integration'
       run: |
         pytest tests/integration/ -v --cov=robo_trader --cov-append
-    
+
     - name: Run performance tests
       if: matrix.test-type == 'performance'
+      # No performance/benchmark suite exists yet (no tests/performance dir and
+      # pytest-benchmark isn't a dependency). Keep the matrix leg green until one
+      # is added rather than failing on a missing directory.
       run: |
-        pytest tests/performance/ -v --benchmark-only
+        echo "No performance benchmark suite configured; skipping."
     
     - name: Upload coverage reports
       if: matrix.test-type == 'unit' && matrix.python-version == '3.11'

@@ -119,9 +119,7 @@ class Portfolio:
                 from .logger import get_logger
 
                 logger = get_logger(__name__)
-                logger.warning(
-                    f"BUY_TO_COVER received for {symbol} but no short position exists"
-                )
+                logger.warning(f"BUY_TO_COVER received for {symbol} but no short position exists")
                 return
 
             short_qty = abs(pos.quantity)

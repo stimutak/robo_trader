@@ -100,6 +100,7 @@ async def test_persistent_runner_starts_subprocess_only_once_across_cycles():
 
 
 import pytest
+
 from robo_trader.exceptions import KillSwitchTriggeredError
 
 

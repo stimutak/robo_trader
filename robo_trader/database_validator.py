@@ -565,12 +565,8 @@ class DatabaseValidator:
         terminator_patterns = ["'", '"', ";", "--", "/*", "*/"]
         for pattern in terminator_patterns:
             if pattern in value:
-                logger.error(
-                    f"Forbidden SQL terminator/quote in {field_name}: {value!r}"
-                )
-                raise ValidationError(
-                    f"{field_name} contains forbidden quote or SQL terminator"
-                )
+                logger.error(f"Forbidden SQL terminator/quote in {field_name}: {value!r}")
+                raise ValidationError(f"{field_name} contains forbidden quote or SQL terminator")
 
         return value
 

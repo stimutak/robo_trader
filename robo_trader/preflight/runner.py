@@ -33,7 +33,8 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as _FutureTimeout
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 

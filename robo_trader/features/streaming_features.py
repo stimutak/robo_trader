@@ -4,6 +4,7 @@ Provides incremental feature updates without full recalculation.
 """
 
 import asyncio
+import io as _io_safe
 import logging
 from collections import deque
 from dataclasses import dataclass, field
@@ -14,8 +15,6 @@ import numpy as np
 import pandas as pd
 
 from robo_trader.database_validator import DatabaseValidator, ValidationError
-import io as _io_safe
-
 from robo_trader.ml._safe_load import atomic_write_and_sign, sign_file, verify_and_read, verify_file
 
 logger = logging.getLogger(__name__)

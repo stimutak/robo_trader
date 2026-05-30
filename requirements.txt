@@ -10,7 +10,7 @@ scipy~=1.10
 yfinance~=0.2.30
 python-dotenv==1.0.1
 pytest~=8.2
-pytest-asyncio==0.21.1  # C-4: synced across requirements files; bump both together.
+pytest-asyncio==0.24.0  # C-4: synced across requirements files; bump together. >=0.24 required for pytest 8 (0.21 hits 'FixtureDef has no attribute unittest').
 pydantic==2.6.4
 structlog~=23.0
 aiofiles~=23.0
@@ -24,8 +24,7 @@ scikit-learn~=1.7
 xgboost~=3.0
 lightgbm~=4.6
 statsmodels~=0.14
-tensorflow==2.15.1  # D-6 (followup audit): exact-pin for ML reproducibility
-keras~=3.0
+tensorflow==2.15.1; python_version < "3.12"  # D-6: exact-pin for ML reproducibility. Optional tf.keras backend; no wheel for 3.12+, code degrades via NEURAL_NETWORK_AVAILABLE. Standalone keras is unused (model_trainer uses tf.keras), so no separate keras pin.
 optuna~=3.5
 
 # Production dependencies

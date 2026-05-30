@@ -16,7 +16,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -256,9 +255,11 @@ def test_csrf_origin_allowlist_uses_dash_host_port(monkeypatch):
         DASH_HOST="127.0.0.1",
         DASH_PORT="5555",
     )
-    origins = app_mod._allowed_request_origins.__wrapped__ if hasattr(
-        app_mod._allowed_request_origins, "__wrapped__"
-    ) else None
+    origins = (
+        app_mod._allowed_request_origins.__wrapped__
+        if hasattr(app_mod._allowed_request_origins, "__wrapped__")
+        else None
+    )
     # Call inside a request context so request.* doesn't blow up.
     with app_mod.app.test_request_context("/"):
         allowed = app_mod._allowed_request_origins()
@@ -418,6 +419,7 @@ def test_cors_rejects_wildcard_origin_c_12(monkeypatch):
     """
     import importlib
     import sys
+
     monkeypatch.setenv("CORS_ORIGINS", "http://*.example.com")
     sys.modules.pop("app", None)
     with pytest.raises(SystemExit):
@@ -474,18 +476,18 @@ def test_debug_is_unconditionally_false_a_1():
     only flips use_reloader, not debug.
     """
     import inspect
+
     import app as app_mod
+
     source = inspect.getsource(app_mod)
     # The literal call site for app.run must pass debug=False (or the
     # named constant False), with an inline comment referencing A-1.
     code_only = "\n".join(line.split("#", 1)[0] for line in source.splitlines())
-    assert "debug=False" in code_only, (
-        "app.run must pass debug=False unconditionally (A-1)."
-    )
+    assert "debug=False" in code_only, "app.run must pass debug=False unconditionally (A-1)."
     # The old `debug=_debug` pattern must NOT come back.
-    assert "debug=_debug" not in code_only, (
-        "Remove the conditional debug pattern (A-1); use debug=False instead."
-    )
+    assert (
+        "debug=_debug" not in code_only
+    ), "Remove the conditional debug pattern (A-1); use debug=False instead."
 
 
 # ---------------------------------------------------------------------------
@@ -508,9 +510,9 @@ def test_csrf_cookie_secure_honors_forwarded_proto_b_6(monkeypatch):
         resp = client.get("/api/positions", headers={"X-Forwarded-Proto": "https"})
         set_cookie = resp.headers.get("Set-Cookie", "")
     assert "csrf_token" in set_cookie, set_cookie
-    assert "Secure" in set_cookie, (
-        f"CSRF cookie must carry Secure when X-Forwarded-Proto=https. Got: {set_cookie}"
-    )
+    assert (
+        "Secure" in set_cookie
+    ), f"CSRF cookie must carry Secure when X-Forwarded-Proto=https. Got: {set_cookie}"
 
 
 def test_csrf_cookie_secure_via_explicit_override_b_6(monkeypatch):
@@ -781,7 +783,9 @@ def test_ws_auth_end_to_end_against_real_library():
     token. This would have caught the v15 regression at PR time.
     """
     import asyncio
+
     import websockets
+
     from robo_trader.websocket_server import WebSocketManager
 
     async def go():
@@ -794,13 +798,9 @@ def test_ws_auth_end_to_end_against_real_library():
                 "Origin": "http://127.0.0.1:5555",
             }
             try:
-                ws = await websockets.connect(
-                    "ws://127.0.0.1:18766", additional_headers=headers
-                )
+                ws = await websockets.connect("ws://127.0.0.1:18766", additional_headers=headers)
             except TypeError:
-                ws = await websockets.connect(
-                    "ws://127.0.0.1:18766", extra_headers=headers
-                )
+                ws = await websockets.connect("ws://127.0.0.1:18766", extra_headers=headers)
             await ws.send('{"type":"subscribe","symbols":["AAPL"]}')
             await asyncio.sleep(0.2)
             await ws.close()

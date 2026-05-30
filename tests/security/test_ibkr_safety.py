@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -49,12 +50,11 @@ def test_ibc_template_is_readonly():
     )
 
     # The audit explicitly calls out AllowBlindTrading=yes as unsafe.
-    assert "AllowBlindTrading=yes" not in lines, (
-        "config/ibc/config.ini.template must not enable blind trading."
-    )
+    assert (
+        "AllowBlindTrading=yes" not in lines
+    ), "config/ibc/config.ini.template must not enable blind trading."
     assert "AllowBlindTrading=no" in lines, (
-        "config/ibc/config.ini.template must explicitly set "
-        "'AllowBlindTrading=no'."
+        "config/ibc/config.ini.template must explicitly set " "'AllowBlindTrading=no'."
     )
 
 
@@ -73,15 +73,14 @@ def test_start_trader_checks_readonly():
     assert script_path.exists(), f"START_TRADER.sh not found at {script_path}"
 
     text = script_path.read_text()
-    assert "ReadOnlyApi=yes" in text, (
-        "START_TRADER.sh must reference 'ReadOnlyApi=yes' for the safety check."
-    )
+    assert (
+        "ReadOnlyApi=yes" in text
+    ), "START_TRADER.sh must reference 'ReadOnlyApi=yes' for the safety check."
     # NEW-IB-H1.1: The check must be the anchored, case-insensitive grep -E
     # variant. The bare '^ReadOnlyApi=yes' grep is fragile (matches yesno,
     # rejects 'Yes'). We require the new form.
     assert "grep -Eqi" in text and "readonlyapi" in text.lower(), (
-        "START_TRADER.sh must use the anchored, case-insensitive ReadOnlyApi grep "
-        "(NEW-IB-H1.1)."
+        "START_TRADER.sh must use the anchored, case-insensitive ReadOnlyApi grep " "(NEW-IB-H1.1)."
     )
     assert "exit 4" in text, (
         "START_TRADER.sh must exit non-zero (audit prescribes 4) when the "
@@ -101,9 +100,7 @@ def test_start_gateway_script_checks_readonly():
         "scripts/start_gateway.sh must verify ReadOnlyApi=yes via anchored, "
         "case-insensitive grep (NEW-IB-H1.1)."
     )
-    assert "exit 3" in text, (
-        "scripts/start_gateway.sh must exit non-zero on failed safety check."
-    )
+    assert "exit 3" in text, "scripts/start_gateway.sh must exit non-zero on failed safety check."
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +162,18 @@ async def test_subprocess_client_ignores_external_venv(monkeypatch, tmp_path):
 
     monkeypatch.setattr(mod.subprocess, "Popen", _BoomPopen)
 
+    # On CI the test interpreter may resolve outside the production allowlist
+    # (e.g. /opt/hostedtoolcache on GitHub Actions). That allowlist is NOT what
+    # this test exercises — it verifies the external VIRTUAL_ENV is ignored — so
+    # trust the real interpreter's prefix to reach the Popen capture point. The
+    # attacker venv lives under tmp_path and remains outside the allowlist, so
+    # the assertions below still prove it was rejected.
+    monkeypatch.setattr(
+        mod,
+        "_INTERPRETER_PREFIX_ALLOWLIST",
+        mod._INTERPRETER_PREFIX_ALLOWLIST + (Path(sys.executable).resolve().parent,),
+    )
+
     client = mod.SubprocessIBKRClient()
     with pytest.raises(RuntimeError, match="stop here for test"):
         await client.start()
@@ -178,17 +187,14 @@ async def test_subprocess_client_ignores_external_venv(monkeypatch, tmp_path):
         f"({python_exe}); IB-M1 requires that be ignored."
     )
     assert str(evil_venv) not in python_exe, (
-        f"Resolved python_exe '{python_exe}' is inside the attacker venv "
-        f"'{evil_venv}'."
+        f"Resolved python_exe '{python_exe}' is inside the attacker venv " f"'{evil_venv}'."
     )
 
 
 def test_subprocess_client_source_has_relative_to_check():
     """Belt-and-suspenders: the source must contain the relative_to() guard
     that anchors VIRTUAL_ENV to the project root (audit IB-M1)."""
-    src_path = (
-        PROJECT_ROOT / "robo_trader" / "clients" / "subprocess_ibkr_client.py"
-    )
+    src_path = PROJECT_ROOT / "robo_trader" / "clients" / "subprocess_ibkr_client.py"
     text = src_path.read_text()
     assert ".relative_to(project_root)" in text, (
         "subprocess_ibkr_client.py must constrain VIRTUAL_ENV to the project "
@@ -214,24 +220,24 @@ def test_force_gateway_reconnect_uses_mktemp():
     text = script_path.read_text()
 
     # Must call mktemp.
-    assert "mktemp" in text, (
-        "force_gateway_reconnect.sh must use mktemp instead of a hardcoded path."
-    )
+    assert (
+        "mktemp" in text
+    ), "force_gateway_reconnect.sh must use mktemp instead of a hardcoded path."
 
     # The old hardcoded path must not be present as a write target. The
     # comment-only mention in cleanup is fine, but we should not see
     # `cat > /tmp/test_gateway_accept.py` or `python3 /tmp/test_gateway_accept.py`.
-    assert "cat > /tmp/test_gateway_accept.py" not in text, (
-        "force_gateway_reconnect.sh must not write to a predictable path."
-    )
-    assert "python3 /tmp/test_gateway_accept.py" not in text, (
-        "force_gateway_reconnect.sh must not exec from a predictable path."
-    )
+    assert (
+        "cat > /tmp/test_gateway_accept.py" not in text
+    ), "force_gateway_reconnect.sh must not write to a predictable path."
+    assert (
+        "python3 /tmp/test_gateway_accept.py" not in text
+    ), "force_gateway_reconnect.sh must not exec from a predictable path."
 
     # And it should clean up via trap.
-    assert "trap" in text and 'rm -f "$TMPFILE"' in text, (
-        "force_gateway_reconnect.sh must clean up its tempfile via trap."
-    )
+    assert (
+        "trap" in text and 'rm -f "$TMPFILE"' in text
+    ), "force_gateway_reconnect.sh must clean up its tempfile via trap."
 
 
 # ---------------------------------------------------------------------------
@@ -240,9 +246,7 @@ def test_force_gateway_reconnect_uses_mktemp():
 
 # The exact bash grep used in START_TRADER.sh and scripts/start_gateway.sh.
 # Keep this in sync with both scripts and with gateway_manager._READONLY_API_RE.
-_BASH_RO_REGEX = (
-    r"^[[:space:]]*readonlyapi[[:space:]]*=[[:space:]]*yes[[:space:]]*$"
-)
+_BASH_RO_REGEX = r"^[[:space:]]*readonlyapi[[:space:]]*=[[:space:]]*yes[[:space:]]*$"
 
 
 def _bash_grep_accepts(line: str) -> bool:
@@ -323,9 +327,7 @@ def test_python_regex_accepts_valid_readonly(line: str):
     gm = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(gm)  # type: ignore[union-attr]
 
-    assert gm._READONLY_API_RE.search(line + "\n"), (
-        f"Python regex should accept: {line!r}"
-    )
+    assert gm._READONLY_API_RE.search(line + "\n"), f"Python regex should accept: {line!r}"
 
 
 @pytest.mark.parametrize(
@@ -351,9 +353,7 @@ def test_python_regex_rejects_invalid(line: str):
     gm = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(gm)  # type: ignore[union-attr]
 
-    assert not gm._READONLY_API_RE.search(line + "\n"), (
-        f"Python regex should reject: {line!r}"
-    )
+    assert not gm._READONLY_API_RE.search(line + "\n"), f"Python regex should reject: {line!r}"
 
 
 def test_python_regex_finds_anywhere_in_multiline_config():
@@ -387,20 +387,18 @@ def test_python_regex_finds_anywhere_in_multiline_config():
 def test_subprocess_client_has_interpreter_allowlist():
     """The source must contain the realpath + allowlist enforcement for the
     worker interpreter (NEW-IB-M1.1)."""
-    src_path = (
-        PROJECT_ROOT / "robo_trader" / "clients" / "subprocess_ibkr_client.py"
-    )
+    src_path = PROJECT_ROOT / "robo_trader" / "clients" / "subprocess_ibkr_client.py"
     text = src_path.read_text()
-    assert "_is_interpreter_path_safe" in text, (
-        "subprocess_ibkr_client.py must define the interpreter allowlist helper."
-    )
-    assert "/Library/Frameworks/Python.framework" in text, (
-        "Allowlist must include the macOS framework Python prefix."
-    )
+    assert (
+        "_is_interpreter_path_safe" in text
+    ), "subprocess_ibkr_client.py must define the interpreter allowlist helper."
+    assert (
+        "/Library/Frameworks/Python.framework" in text
+    ), "Allowlist must include the macOS framework Python prefix."
     assert "/opt/homebrew" in text, "Allowlist must include Homebrew."
-    assert "_find_project_root" in text, (
-        "subprocess_ibkr_client.py must use marker-file probing for project root."
-    )
+    assert (
+        "_find_project_root" in text
+    ), "subprocess_ibkr_client.py must use marker-file probing for project root."
 
 
 def test_is_interpreter_path_safe_accepts_allowlist(tmp_path):
@@ -425,9 +423,7 @@ def test_is_interpreter_path_safe_accepts_allowlist(tmp_path):
         Path("/opt/homebrew/bin/python3"),
         Path("/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"),
     ]:
-        assert _is_interpreter_path_safe(ok, project_root), (
-            f"{ok} should be in the allowlist"
-        )
+        assert _is_interpreter_path_safe(ok, project_root), f"{ok} should be in the allowlist"
 
 
 def test_is_interpreter_path_safe_rejects_outside_allowlist(tmp_path):
@@ -454,9 +450,7 @@ def test_is_interpreter_path_safe_rejects_outside_allowlist(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_subprocess_client_rejects_symlinked_external_venv(
-    monkeypatch, tmp_path
-):
+async def test_subprocess_client_rejects_symlinked_external_venv(monkeypatch, tmp_path):
     """An attacker who creates a venv inside the project root that symlinks
     its `bin/python3` to an external interpreter must be rejected by the
     realpath check (NEW-IB-M1.1).
@@ -493,8 +487,7 @@ async def test_subprocess_client_rejects_symlinked_external_venv(
     resolved = inner_py.resolve()
     assert resolved == outside_py.resolve()
     assert not mod._is_interpreter_path_safe(resolved, fake_project_root), (
-        "Realpath of the symlink lands outside the allowlist; client must "
-        "refuse to exec it."
+        "Realpath of the symlink lands outside the allowlist; client must " "refuse to exec it."
     )
 
 
@@ -509,10 +502,11 @@ def test_start_runner_sh_enforces_readonly_ibn_m3():
     START_TRADER.sh and start_gateway.sh now use.
     """
     import pathlib
+
     text = pathlib.Path("scripts/start_runner.sh").read_text()
-    assert "grep -Eqi" in text and "readonlyapi" in text.lower(), (
-        "start_runner.sh must include the same ReadOnlyApi grep guard as the other start paths"
-    )
+    assert (
+        "grep -Eqi" in text and "readonlyapi" in text.lower()
+    ), "start_runner.sh must include the same ReadOnlyApi grep guard as the other start paths"
 
 
 def test_gateway_manager_start_refuses_without_readonly_ibn_h1():
@@ -522,11 +516,13 @@ def test_gateway_manager_start_refuses_without_readonly_ibn_h1():
     it returns False on the missing-readonly path.
     """
     import inspect
+
     import scripts.gateway_manager as gm
+
     source = inspect.getsource(gm.start_gateway)
-    assert "_READONLY_API_RE" in source, (
-        "start_gateway must reference _READONLY_API_RE before launching the Gateway"
-    )
+    assert (
+        "_READONLY_API_RE" in source
+    ), "start_gateway must reference _READONLY_API_RE before launching the Gateway"
     # It's the same regex used by show_status, so cross-check it works.
     assert gm._READONLY_API_RE.search("ReadOnlyApi=yes") is not None
     assert gm._READONLY_API_RE.search("ReadOnlyApi=no") is None
@@ -539,7 +535,9 @@ def test_gateway_manager_start_uses_env_allowlist_ibn_h2():
     need them).
     """
     import inspect
+
     import scripts.gateway_manager as gm
+
     source = inspect.getsource(gm.start_gateway)
     assert "_IBC_ENV_ALLOWLIST" in source, (
         "start_gateway must build env from an allowlist (IBN-H2). "
@@ -549,9 +547,9 @@ def test_gateway_manager_start_uses_env_allowlist_ibn_h2():
     # os.environ.copy() must not be used to construct env, even though the
     # symbol may appear in an explanatory comment.
     code_only = "\n".join(line.split("#", 1)[0] for line in source.splitlines())
-    assert "os.environ.copy()" not in code_only, (
-        "start_gateway code must not call os.environ.copy() (IBN-H2)."
-    )
+    assert (
+        "os.environ.copy()" not in code_only
+    ), "start_gateway code must not call os.environ.copy() (IBN-H2)."
 
 
 # ---------------------------------------------------------------------------
@@ -564,13 +562,15 @@ def test_robust_connection_refuses_cert_none_for_non_loopback_b_11():
     CERT_NONE to non-loopback hosts unless IBKR_GATEWAY_CAFILE is set.
     """
     import inspect
+
     import robo_trader.utils.robust_connection as rc
+
     source = inspect.getsource(rc)
     # The CERT_NONE branch must check for loopback OR cafile.
-    assert "IBKR_GATEWAY_CAFILE" in source, (
-        "robust_connection must read IBKR_GATEWAY_CAFILE for cert pinning (B-11)"
-    )
+    assert (
+        "IBKR_GATEWAY_CAFILE" in source
+    ), "robust_connection must read IBKR_GATEWAY_CAFILE for cert pinning (B-11)"
     code_only = "\n".join(line.split("#", 1)[0] for line in source.splitlines())
-    assert "loopback" in code_only.lower() or "127.0.0.1" in code_only, (
-        "robust_connection must refuse CERT_NONE on non-loopback hosts (B-11)"
-    )
+    assert (
+        "loopback" in code_only.lower() or "127.0.0.1" in code_only
+    ), "robust_connection must refuse CERT_NONE on non-loopback hosts (B-11)"

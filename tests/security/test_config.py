@@ -16,6 +16,7 @@ Round-2 additions (SECURITY_AUDIT_ROUND2_2026-05-10 Section 2.F):
   - process_manager rejects pkill patterns with shell metachars
   - GitHub workflow YAML has top-level or per-job ``permissions: read``
 """
+
 from __future__ import annotations
 
 import os
@@ -25,7 +26,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -510,31 +510,31 @@ def test_gunicorn_floor_avoids_cve_2024_1135():
     """
     text_main = (REPO_ROOT / "requirements.txt").read_text()
     text_prod = (REPO_ROOT / "requirements-prod.txt").read_text()
-    assert re.search(r"^gunicorn\s*>=\s*22\.", text_main, re.MULTILINE), (
-        "requirements.txt must pin gunicorn>=22.0.0 (CFGN-H1, CVE-2024-1135)"
-    )
-    assert re.search(r"^gunicorn\s*>=\s*22\.", text_prod, re.MULTILINE), (
-        "requirements-prod.txt must pin gunicorn>=22.0.0 (CFGN-H1)"
-    )
+    assert re.search(
+        r"^gunicorn\s*>=\s*22\.", text_main, re.MULTILINE
+    ), "requirements.txt must pin gunicorn>=22.0.0 (CFGN-H1, CVE-2024-1135)"
+    assert re.search(
+        r"^gunicorn\s*>=\s*22\.", text_prod, re.MULTILINE
+    ), "requirements-prod.txt must pin gunicorn>=22.0.0 (CFGN-H1)"
 
 
 def test_aiohttp_floor_avoids_cve_2024_23334():
     """CFGN-H3: aiohttp 3.9.1 has CVE-2024-23334. Production must require >=3.11.18."""
     text = (REPO_ROOT / "requirements-prod.txt").read_text()
-    assert re.search(r"^aiohttp\b.*>=\s*3\.11\.", text, re.MULTILINE), (
-        "requirements-prod.txt must pin aiohttp>=3.11.18 (CFGN-H3, CVE-2024-23334)"
-    )
+    assert re.search(
+        r"^aiohttp\b.*>=\s*3\.11\.", text, re.MULTILINE
+    ), "requirements-prod.txt must pin aiohttp>=3.11.18 (CFGN-H3, CVE-2024-23334)"
 
 
 def test_python_jose_removed_cfgn_h2():
     """CFGN-H2: python-jose 3.3.0 has CVE-2024-33664. We rely on PyJWT instead."""
     text = (REPO_ROOT / "requirements-prod.txt").read_text()
-    assert not re.search(r"^python-jose", text, re.MULTILINE), (
-        "python-jose must be removed (CFGN-H2, CVE-2024-33664). Use PyJWT instead."
-    )
-    assert re.search(r"^PyJWT", text, re.MULTILINE), (
-        "PyJWT must remain pinned as the JWT replacement for python-jose"
-    )
+    assert not re.search(
+        r"^python-jose", text, re.MULTILINE
+    ), "python-jose must be removed (CFGN-H2, CVE-2024-33664). Use PyJWT instead."
+    assert re.search(
+        r"^PyJWT", text, re.MULTILINE
+    ), "PyJWT must remain pinned as the JWT replacement for python-jose"
 
 
 # ---------------------------------------------------------------------------
@@ -546,12 +546,13 @@ def test_eventlet_floor_avoids_request_smuggling_b_5():
     """B-5: eventlet 0.33.3 had request-smuggling CVEs. Floor at 0.36.1."""
     text = (REPO_ROOT / "requirements-prod.txt").read_text()
     import re as _re
+
     if not _re.search(r"^eventlet\b", text, _re.MULTILINE):
         # eventlet may legitimately be removed entirely
         return
-    assert _re.search(r"^eventlet\s*>=\s*0\.(3[6-9]|[4-9]\d)\.", text, _re.MULTILINE), (
-        "eventlet must be pinned >=0.36.1 (B-5) or removed entirely"
-    )
+    assert _re.search(
+        r"^eventlet\s*>=\s*0\.(3[6-9]|[4-9]\d)\.", text, _re.MULTILINE
+    ), "eventlet must be pinned >=0.36.1 (B-5) or removed entirely"
 
 
 # ---------------------------------------------------------------------------
@@ -570,9 +571,9 @@ def test_aioredis_removed_c2():
         "aioredis must be removed from requirements-prod.txt (C-2). "
         "Use redis.asyncio (from the `redis` package) for async Redis access."
     )
-    assert not re.search(r"^aioredis", text_main, re.MULTILINE), (
-        "aioredis must be removed from requirements.txt (C-2)."
-    )
+    assert not re.search(
+        r"^aioredis", text_main, re.MULTILINE
+    ), "aioredis must be removed from requirements.txt (C-2)."
 
     # Sanity: no source file imports aioredis any more.
     py_with_aioredis = []
@@ -598,13 +599,10 @@ def test_safety_check_does_not_mask_failures_c6():
     text = (REPO_ROOT / ".github" / "workflows" / "deploy.yml").read_text()
     # Find every line with `safety check` and ensure none end with `|| true`.
     offenders = [
-        ln
-        for ln in text.splitlines()
-        if "safety check" in ln and re.search(r"\|\|\s*true\b", ln)
+        ln for ln in text.splitlines() if "safety check" in ln and re.search(r"\|\|\s*true\b", ln)
     ]
     assert not offenders, (
-        "safety check must not be followed by `|| true` (C-6). "
-        f"Offending lines: {offenders}"
+        "safety check must not be followed by `|| true` (C-6). " f"Offending lines: {offenders}"
     )
 
 
@@ -614,16 +612,13 @@ def test_tensorflow_pinned_exactly_d6():
     `~=` allows the bundled Keras to surprise-bump; that has burned ML pipelines.
     """
     text = (REPO_ROOT / "requirements.txt").read_text()
-    tf_lines = [
-        ln for ln in text.splitlines()
-        if re.match(r"^tensorflow\b", ln.strip())
-    ]
+    tf_lines = [ln for ln in text.splitlines() if re.match(r"^tensorflow\b", ln.strip())]
     if not tf_lines:
         # Removal is acceptable — only assert if it's present.
         return
-    assert all("==" in ln.split("#", 1)[0] for ln in tf_lines), (
-        f"tensorflow must use exact-pin (==), got: {tf_lines}"
-    )
+    assert all(
+        "==" in ln.split("#", 1)[0] for ln in tf_lines
+    ), f"tensorflow must use exact-pin (==), got: {tf_lines}"
 
 
 def test_requirements_version_drift_synced_c4():
@@ -712,9 +707,7 @@ def test_docker_compose_all_services_have_resource_limits_c7():
         limits = resources.get("limits") or {}
         if not limits.get("cpus") or not limits.get("memory"):
             missing.append(name)
-    assert not missing, (
-        f"docker-compose services missing deploy.resources.limits (C-7): {missing}"
-    )
+    assert not missing, f"docker-compose services missing deploy.resources.limits (C-7): {missing}"
 
 
 def test_pre_commit_does_not_skip_b104_d4():
@@ -745,13 +738,8 @@ def test_pre_commit_has_secret_scanner_d5():
     """D-5: pre-commit must include a secret scanner (gitleaks or detect-secrets)."""
     yaml = pytest.importorskip("yaml")
     data = yaml.safe_load((REPO_ROOT / ".pre-commit-config.yaml").read_text())
-    repos = [
-        (repo or {}).get("repo", "").lower()
-        for repo in (data.get("repos", []) or [])
-    ]
-    has_scanner = any(
-        "gitleaks" in url or "detect-secrets" in url for url in repos
-    )
+    repos = [(repo or {}).get("repo", "").lower() for repo in (data.get("repos", []) or [])]
+    has_scanner = any("gitleaks" in url or "detect-secrets" in url for url in repos)
     assert has_scanner, (
         "pre-commit must include a secret scanner (gitleaks or detect-secrets) "
         "to prevent accidental credential commits (D-5)."
@@ -765,13 +753,15 @@ def test_black_target_version_matches_python_requirement_d15():
     assert m, "pyproject [tool.black] target-version not found"
     targets = {t.strip().strip("\"'") for t in m.group(1).split(",")}
     # We require Python >=3.10; py39 alone was the drift.
-    assert "py39" not in targets or targets - {"py39"}, (
-        f"Black target-version stuck at py39 only: {targets} (D-15)"
-    )
+    assert "py39" not in targets or targets - {
+        "py39"
+    }, f"Black target-version stuck at py39 only: {targets} (D-15)"
     # At least one of py310/py311/py312 must be listed.
-    assert targets & {"py310", "py311", "py312"}, (
-        f"Black target-version must include at least one of py310/py311/py312, got {targets}"
-    )
+    assert targets & {
+        "py310",
+        "py311",
+        "py312",
+    }, f"Black target-version must include at least one of py310/py311/py312, got {targets}"
 
 
 def test_passlib_bcrypt_compat_c3():
@@ -793,11 +783,7 @@ def test_passlib_bcrypt_compat_c3():
     )
     spec = m.group(1)
     # Accept ==3.x or <4 forms.
-    ok = (
-        re.match(r"^==\s*3\.", spec)
-        or re.match(r"^<\s*4", spec)
-        or re.match(r"^<=\s*3\.", spec)
-    )
+    ok = re.match(r"^==\s*3\.", spec) or re.match(r"^<\s*4", spec) or re.match(r"^<=\s*3\.", spec)
     assert ok, (
         f"bcrypt pin {spec!r} may pull a 4.x release that breaks passlib 1.7.4 "
         "(C-3). Use bcrypt==3.2.2 or bcrypt<4."

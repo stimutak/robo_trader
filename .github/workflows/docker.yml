@@ -74,8 +74,13 @@ jobs:
 
       - name: Test Docker image
         run: |
-          # Run container
+          # Run container. The entrypoint's validate_environment() requires
+          # TRADING_MODE, IBKR_HOST and IBKR_PORT (it exits 1 otherwise), so
+          # provide them or the container dies before the import test runs.
           docker run -d --name test-container \
+            -e TRADING_MODE=paper \
+            -e IBKR_HOST=127.0.0.1 \
+            -e IBKR_PORT=4002 \
             -e EXECUTION_MODE=paper \
             -e ENVIRONMENT=test \
             -e LOG_LEVEL=DEBUG \

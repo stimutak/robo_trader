@@ -8,9 +8,9 @@ This package provides:
 - Portfolio registry: Load/save portfolio definitions
 """
 
-from .portfolio_config import PortfolioConfig, load_portfolio_configs
-from .migration import MultiuserMigration
 from .db_proxy import PortfolioScopedDB
+from .migration import MultiuserMigration
+from .portfolio_config import PortfolioConfig, load_portfolio_configs
 
 __all__ = [
     "PortfolioConfig",

@@ -376,9 +376,7 @@ Focus on:
         # D-10: headlines come from untrusted RSS feeds. Sanitize and wrap
         # them in a delimited block so prompt-injection attempts in a
         # headline cannot rewrite the model's instructions.
-        sanitized_headlines = [
-            _sanitize_untrusted_text(h) for h in news_headlines[:15]
-        ]
+        sanitized_headlines = [_sanitize_untrusted_text(h) for h in news_headlines[:15]]
         news_text = "\n".join([f"- {h}" for h in sanitized_headlines])
 
         prompt = f"""You are a master stock trader scanning today's news for buying opportunities.
@@ -457,14 +455,10 @@ Be specific - identify actual stock symbols from the news."""
                 universe = os.environ.get("TRADABLE_UNIVERSE")
                 universe_set = None
                 if universe:
-                    universe_set = {
-                        s.strip().upper() for s in universe.split(",") if s.strip()
-                    }
+                    universe_set = {s.strip().upper() for s in universe.split(",") if s.strip()}
                 # Cap discoveries per cycle
                 try:
-                    max_discoveries = int(
-                        os.environ.get("AI_MAX_DISCOVERIES_PER_CYCLE", "3")
-                    )
+                    max_discoveries = int(os.environ.get("AI_MAX_DISCOVERIES_PER_CYCLE", "3"))
                 except ValueError:
                     max_discoveries = 3
                 for opp in opportunities:
@@ -474,14 +468,10 @@ Be specific - identify actual stock symbols from the news."""
                     try:
                         symbol = DatabaseValidator.validate_symbol(raw_symbol)
                     except ValidationError:
-                        logger.warning(
-                            f"AI returned invalid symbol {raw_symbol!r}; skipping"
-                        )
+                        logger.warning(f"AI returned invalid symbol {raw_symbol!r}; skipping")
                         continue
                     if universe_set is not None and symbol not in universe_set:
-                        logger.warning(
-                            f"AI symbol {symbol} not in TRADABLE_UNIVERSE; skipping"
-                        )
+                        logger.warning(f"AI symbol {symbol} not in TRADABLE_UNIVERSE; skipping")
                         continue
                     if symbol in exclude_symbols:
                         continue

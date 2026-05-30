@@ -36,9 +36,7 @@ def _clamp_optional_float(value, ceiling: float, name: str, portfolio_id: str):
     try:
         v = float(value)
     except (TypeError, ValueError):
-        raise ValueError(
-            f"Invalid {name} for portfolio '{portfolio_id}': {value!r} is not numeric"
-        )
+        raise ValueError(f"Invalid {name} for portfolio '{portfolio_id}': {value!r} is not numeric")
     if v < 0:
         raise ValueError(
             f"Invalid {name} for portfolio '{portfolio_id}': must be non-negative, got {v}"

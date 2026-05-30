@@ -283,9 +283,7 @@ class MultiuserMigration:
                     cursor = await conn.execute("SELECT COUNT(*) FROM account")
                     account_row_count = (await cursor.fetchone())[0]
                     if account_row_count > 1:
-                        cursor = await conn.execute(
-                            "SELECT MAX(id), MIN(id) FROM account"
-                        )
+                        cursor = await conn.execute("SELECT MAX(id), MIN(id) FROM account")
                         max_id, min_id = await cursor.fetchone()
                         logger.warning(
                             f"account table has {account_row_count} rows; "

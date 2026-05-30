@@ -30,8 +30,7 @@ class TradingDatabase:
             cursor = conn.cursor()
 
             # Positions table
-            cursor.execute(
-                """
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS positions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
@@ -41,12 +40,10 @@ class TradingDatabase:
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(symbol)
                 )
-            """
-            )
+            """)
 
             # Tick data table (Phase 2)
-            cursor.execute(
-                """
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS ticks (
                     timestamp DATETIME NOT NULL,
                     symbol TEXT NOT NULL,
@@ -59,20 +56,16 @@ class TradingDatabase:
                     volume INTEGER,
                     PRIMARY KEY (timestamp, symbol)
                 )
-            """
-            )
+            """)
 
             # Create index for efficient queries
-            cursor.execute(
-                """
+            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_ticks_symbol 
                 ON ticks (symbol, timestamp DESC)
-            """
-            )
+            """)
 
             # Features table (Phase 2)
-            cursor.execute(
-                """
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS features (
                     timestamp DATETIME NOT NULL,
                     symbol TEXT NOT NULL,
@@ -96,20 +89,16 @@ class TradingDatabase:
                     breakout_signal REAL,
                     PRIMARY KEY (timestamp, symbol)
                 )
-            """
-            )
+            """)
 
             # Create index for efficient queries
-            cursor.execute(
-                """
+            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_features_symbol 
                 ON features (symbol, timestamp DESC)
-            """
-            )
+            """)
 
             # Trades table
-            cursor.execute(
-                """
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
@@ -120,12 +109,10 @@ class TradingDatabase:
                     commission REAL DEFAULT 0,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
-            """
-            )
+            """)
 
             # Account table
-            cursor.execute(
-                """
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS account (
                     id INTEGER PRIMARY KEY,
                     cash REAL NOT NULL,
@@ -135,12 +122,10 @@ class TradingDatabase:
                     unrealized_pnl REAL DEFAULT 0,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
-            """
-            )
+            """)
 
             # Market data table (for historical prices)
-            cursor.execute(
-                """
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS market_data (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
@@ -152,12 +137,10 @@ class TradingDatabase:
                     timestamp DATETIME NOT NULL,
                     UNIQUE(symbol, timestamp)
                 )
-            """
-            )
+            """)
 
             # Strategy signals table
-            cursor.execute(
-                """
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS signals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
@@ -167,16 +150,13 @@ class TradingDatabase:
                     metadata TEXT,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
-            """
-            )
+            """)
 
             # Insert default account if not exists
-            cursor.execute(
-                """
+            cursor.execute("""
                 INSERT OR IGNORE INTO account (id, cash, equity) 
                 VALUES (1, 100000, 100000)
-            """
-            )
+            """)
 
             conn.commit()
             logger.info(f"Database initialized at {self.db_path}")
@@ -438,13 +418,11 @@ class TradingDatabase:
         """Get all current positions."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                """
+            cursor.execute("""
                 SELECT symbol, quantity, avg_cost, market_price, timestamp
                 FROM positions
                 WHERE quantity != 0
-            """
-            )
+            """)
 
             positions = []
             for row in cursor.fetchall():
@@ -464,14 +442,12 @@ class TradingDatabase:
         """Get all trades from today."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                """
+            cursor.execute("""
                 SELECT symbol, side, quantity, price, slippage, commission, timestamp
                 FROM trades
                 WHERE DATE(timestamp) = DATE('now')
                 ORDER BY timestamp DESC
-            """
-            )
+            """)
 
             trades = []
             for row in cursor.fetchall():
@@ -493,13 +469,11 @@ class TradingDatabase:
         """Get current account information."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                """
+            cursor.execute("""
                 SELECT cash, equity, daily_pnl, realized_pnl, unrealized_pnl, timestamp
                 FROM account
                 WHERE id = 1
-            """
-            )
+            """)
 
             row = cursor.fetchone()
             if row:
@@ -527,8 +501,7 @@ class TradingDatabase:
             cursor = conn.cursor()
 
             # Calculate realized P&L from today's trades
-            cursor.execute(
-                """
+            cursor.execute("""
                 SELECT SUM(
                     CASE 
                         WHEN side = 'SELL' THEN quantity * price
@@ -538,19 +511,16 @@ class TradingDatabase:
                 ) as realized_pnl
                 FROM trades
                 WHERE DATE(timestamp) = DATE('now')
-            """
-            )
+            """)
 
             realized_pnl = cursor.fetchone()[0] or 0.0
 
             # Calculate unrealized P&L from open positions
-            cursor.execute(
-                """
+            cursor.execute("""
                 SELECT SUM((market_price - avg_cost) * quantity) as unrealized_pnl
                 FROM positions
                 WHERE quantity != 0 AND market_price IS NOT NULL
-            """
-            )
+            """)
 
             unrealized_pnl = cursor.fetchone()[0] or 0.0
 
@@ -640,14 +610,12 @@ class TradingDatabase:
             cursor = conn.cursor()
 
             # Get account history for today
-            cursor.execute(
-                """
+            cursor.execute("""
                 SELECT equity, daily_pnl, realized_pnl, unrealized_pnl, timestamp
                 FROM account
                 WHERE DATE(timestamp) = DATE('now')
                 ORDER BY timestamp
-            """
-            )
+            """)
 
             history = []
             for i, row in enumerate(cursor.fetchall()):
@@ -671,15 +639,13 @@ class TradingDatabase:
             cursor = conn.cursor()
 
             # Get latest account info for today
-            cursor.execute(
-                """
+            cursor.execute("""
                 SELECT equity, daily_pnl, realized_pnl, unrealized_pnl
                 FROM account
                 WHERE DATE(timestamp) = DATE('now')
                 ORDER BY timestamp DESC
                 LIMIT 1
-            """
-            )
+            """)
 
             row = cursor.fetchone()
             if row:

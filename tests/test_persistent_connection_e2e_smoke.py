@@ -26,13 +26,12 @@ network:
 """
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
 from robo_trader.connection_health import ConnectionHealth, HealthStatus
 from robo_trader.runner_async import AsyncRunner
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -185,38 +184,36 @@ async def test_full_recovery_chain_fires_end_to_end():
     )
 
     # recover_connection was reached and succeeded
-    assert recovery_result.get("value") is True, (
-        f"recover_connection did not return True; result={recovery_result}"
-    )
+    assert (
+        recovery_result.get("value") is True
+    ), f"recover_connection did not return True; result={recovery_result}"
 
     # _safe_disconnect was called (at least once per attempt)
-    assert runner._safe_disconnect.await_count >= 1, (
-        "_safe_disconnect was never called during recovery"
-    )
+    assert (
+        runner._safe_disconnect.await_count >= 1
+    ), "_safe_disconnect was never called during recovery"
 
     # initialize_connection was called 3 times (2 failures + 1 success)
-    assert init_call_count["n"] == 3, (
-        f"initialize_connection called {init_call_count['n']} times, expected 3"
-    )
+    assert (
+        init_call_count["n"] == 3
+    ), f"initialize_connection called {init_call_count['n']} times, expected 3"
 
     # restart_gateway_for_zombies_async was called on attempt 3
     # (gateway_restart_attempt_threshold = 3 in recover_connection)
-    assert len(gateway_restart_calls) >= 1, (
-        "restart_gateway_for_zombies_async was never called"
-    )
-    assert gateway_restart_calls[0][0] == 4002, (
-        f"Gateway restart used wrong port: {gateway_restart_calls[0][0]}"
-    )
+    assert len(gateway_restart_calls) >= 1, "restart_gateway_for_zombies_async was never called"
+    assert (
+        gateway_restart_calls[0][0] == 4002
+    ), f"Gateway restart used wrong port: {gateway_restart_calls[0][0]}"
 
     # After initialize_connection succeeded, _attach_health_monitor was reached
-    assert attach_called["yes"] is True, (
-        "_attach_health_monitor path was not reached after successful initialize_connection"
-    )
+    assert (
+        attach_called["yes"] is True
+    ), "_attach_health_monitor path was not reached after successful initialize_connection"
 
     # recovery_in_progress flag was cleaned up
-    assert runner.recovery_in_progress is False, (
-        "recovery_in_progress was not reset to False after recovery completed"
-    )
+    assert (
+        runner.recovery_in_progress is False
+    ), "recovery_in_progress was not reset to False after recovery completed"
 
 
 # ---------------------------------------------------------------------------
@@ -235,9 +232,7 @@ async def test_on_unhealthy_delegates_to_recover_connection():
 
     runner.recover_connection.assert_awaited_once()
     forwarded = runner.recover_connection.await_args.args[0]
-    assert reason in forwarded, (
-        f"reason not forwarded: expected {reason!r} in {forwarded!r}"
-    )
+    assert reason in forwarded, f"reason not forwarded: expected {reason!r} in {forwarded!r}"
 
 
 @pytest.mark.asyncio
@@ -325,6 +320,6 @@ async def test_recover_connection_no_gateway_restart_on_attempt_1():
             result = await runner.recover_connection("test")
 
     assert result is True
-    assert gateway_called["n"] == 0, (
-        f"restart_gateway_for_zombies_async called on attempt 1 (should not be)"
-    )
+    assert (
+        gateway_called["n"] == 0
+    ), f"restart_gateway_for_zombies_async called on attempt 1 (should not be)"

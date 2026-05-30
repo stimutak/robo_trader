@@ -256,9 +256,7 @@ class SubprocessIBKRClient:
         debug_log_path: Optional[str] = None
         debug_log_file = None
         try:
-            fd, debug_log_path = tempfile.mkstemp(
-                prefix="worker_debug_", suffix=".log"
-            )
+            fd, debug_log_path = tempfile.mkstemp(prefix="worker_debug_", suffix=".log")
             debug_log_file = os.fdopen(fd, "w")
             logger.info("Worker debug output will be captured", debug_log=debug_log_path)
         except Exception as e:

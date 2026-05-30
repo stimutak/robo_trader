@@ -243,9 +243,11 @@ class PaperExecutor(BaseExecutor):
             # Stale-price fallback guard (TC-L3): if the last cached price is
             # older than max-age, refuse the order rather than fill at stale data.
             ts = self._execution_cache_ts.get(order.symbol)
-            if ts is None or (
-                dt.datetime.utcnow() - ts
-            ).total_seconds() > self._execution_cache_max_age_seconds:
+            if (
+                ts is None
+                or (dt.datetime.utcnow() - ts).total_seconds()
+                > self._execution_cache_max_age_seconds
+            ):
                 logger.error(
                     "Stale cached reference price for market order in paper execution",
                     symbol=order.symbol,

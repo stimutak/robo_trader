@@ -260,18 +260,14 @@ class FeatureEngine:
         await self.db.execute(query)
 
         # Create indices for performance
-        await self.db.execute(
-            """
+        await self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_features_symbol_timestamp 
             ON features(symbol, timestamp DESC)
-        """
-        )
-        await self.db.execute(
-            """
+        """)
+        await self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_features_feature_name 
             ON features(feature_name, timestamp DESC)
-        """
-        )
+        """)
 
     async def get_latest_features(
         self, symbol: str, feature_names: Optional[List[str]] = None

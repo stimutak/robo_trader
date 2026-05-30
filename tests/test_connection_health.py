@@ -173,12 +173,11 @@ def test_subprocess_ibkr_client_conforms_to_protocol():
     # method are present on the class). We avoid instantiating because the
     # real client spawns a subprocess.
     assert hasattr(SubprocessIBKRClient, "is_connected"), (
-        "SubprocessIBKRClient missing 'is_connected' — "
-        "IBKRClientProtocol contract broken"
+        "SubprocessIBKRClient missing 'is_connected' — " "IBKRClientProtocol contract broken"
     )
-    assert hasattr(SubprocessIBKRClient, "ping"), (
-        "SubprocessIBKRClient missing 'ping' — IBKRClientProtocol contract broken"
-    )
+    assert hasattr(
+        SubprocessIBKRClient, "ping"
+    ), "SubprocessIBKRClient missing 'ping' — IBKRClientProtocol contract broken"
 
 
 def test_make_fake_ib_client_conforms_to_protocol():

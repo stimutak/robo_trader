@@ -50,14 +50,10 @@ class WebSocketClient:
             if token:
                 headers["Authorization"] = f"Bearer {token}"
             try:
-                self.websocket = await websockets.connect(
-                    self.uri, additional_headers=headers
-                )
+                self.websocket = await websockets.connect(self.uri, additional_headers=headers)
             except TypeError:
                 # Older websockets API used extra_headers.
-                self.websocket = await websockets.connect(
-                    self.uri, extra_headers=headers
-                )
+                self.websocket = await websockets.connect(self.uri, extra_headers=headers)
             self.connected = True
             logger.info(f"Connected to WebSocket server at {self.uri}")
 

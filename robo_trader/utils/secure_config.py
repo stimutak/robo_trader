@@ -275,9 +275,7 @@ class SecureConfig:
                     "MONITORING_ALERT_WEBHOOK: HTTP webhooks are not allowed; use HTTPS"
                 )
             if not u.startswith("https://"):
-                raise ConfigValidationError(
-                    "MONITORING_ALERT_WEBHOOK: must start with https://"
-                )
+                raise ConfigValidationError("MONITORING_ALERT_WEBHOOK: must start with https://")
             return True
 
         webhook_url = cls.get_secure_config(

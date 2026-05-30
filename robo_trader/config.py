@@ -619,18 +619,21 @@ def load_config_from_env() -> Config:
     # Load multi-portfolio configurations
     try:
         from .multiuser.portfolio_config import load_portfolio_configs
+
         portfolio_configs = load_portfolio_configs()
         config.portfolio_configs = [pc.to_dict() for pc in portfolio_configs]
     except Exception as e:
         logger.warning(f"Could not load portfolio configs: {e}")
         # Fall back to single default portfolio
-        config.portfolio_configs = [{
-            "id": "default",
-            "name": "Default Portfolio",
-            "starting_cash": config.default_cash,
-            "symbols": ",".join(config.symbols),
-            "active": True,
-        }]
+        config.portfolio_configs = [
+            {
+                "id": "default",
+                "name": "Default Portfolio",
+                "starting_cash": config.default_cash,
+                "symbols": ",".join(config.symbols),
+                "active": True,
+            }
+        ]
 
     return config
 
