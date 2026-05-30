@@ -39,9 +39,7 @@ WS_LOGGER_DENYLIST = (
 _SECRET_VALUE_PATTERNS = [
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),  # GitHub tokens
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),  # AWS access keys
-    re.compile(
-        r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b"
-    ),  # JWTs
+    re.compile(r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b"),  # JWTs
     re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]{16,}"),
     re.compile(r"(?i)password[=:\s]+\S{4,}"),
 ]

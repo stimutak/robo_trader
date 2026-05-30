@@ -215,14 +215,8 @@ class PolygonDataProvider(DataProvider):
                 bar_low = float(bar.low)
                 bar_close = float(bar.close)
                 bar_volume = int(bar.volume)
-                if not (
-                    DatabaseValidator.MIN_PRICE
-                    <= bar_close
-                    <= DatabaseValidator.MAX_PRICE
-                ):
-                    logger.warning(
-                        f"Polygon bar rejected: close out of range: {bar_close}"
-                    )
+                if not (DatabaseValidator.MIN_PRICE <= bar_close <= DatabaseValidator.MAX_PRICE):
+                    logger.warning(f"Polygon bar rejected: close out of range: {bar_close}")
                     continue
                 if bar_high < bar_low or bar_close <= 0 or bar_open <= 0:
                     logger.warning(
@@ -333,14 +327,8 @@ class PolygonDataProvider(DataProvider):
                 bar_high = float(bar.high)
                 bar_low = float(bar.low)
                 bar_volume = int(bar.volume)
-                if not (
-                    DatabaseValidator.MIN_PRICE
-                    <= bar_close
-                    <= DatabaseValidator.MAX_PRICE
-                ):
-                    logger.warning(
-                        f"Polygon bar rejected: close out of range: {bar_close}"
-                    )
+                if not (DatabaseValidator.MIN_PRICE <= bar_close <= DatabaseValidator.MAX_PRICE):
+                    logger.warning(f"Polygon bar rejected: close out of range: {bar_close}")
                     continue
                 if bar_high < bar_low or bar_close <= 0 or bar_open <= 0:
                     logger.warning(

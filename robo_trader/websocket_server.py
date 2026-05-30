@@ -221,7 +221,7 @@ class WebSocketManager:
             token = ""
             auth_header = (headers.get("Authorization", "") or "") if headers else ""
             if auth_header.startswith("Bearer "):
-                token = auth_header[len("Bearer "):].strip()
+                token = auth_header[len("Bearer ") :].strip()
             if not token:
                 # Backward-compat: query string token. Deprecated.
                 try:
@@ -322,9 +322,7 @@ class WebSocketManager:
                         try:
                             await self.broadcast(data, exclude={websocket})
                         except Exception as bcast_err:
-                            logger.error(
-                                f"Failed to rebroadcast producer message: {bcast_err}"
-                            )
+                            logger.error(f"Failed to rebroadcast producer message: {bcast_err}")
                     else:
                         # Log only; never echo to other clients.
                         logger.debug(f"Ignoring inbound WS message of type {msg_type}")
@@ -458,7 +456,12 @@ class WebSocketManager:
         )
 
     def send_trade_update(
-        self, symbol: str, side: str, quantity: int, price: float, status: str = "executed",
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+        price: float,
+        status: str = "executed",
         portfolio_id: str = "default",
     ):
         """Queue a trade update for broadcast."""
@@ -486,7 +489,9 @@ class WebSocketManager:
 
         self.message_queue.put(message)
 
-    def send_signal_update(self, symbol: str, signal: str, strength: float, portfolio_id: str = "default"):
+    def send_signal_update(
+        self, symbol: str, signal: str, strength: float, portfolio_id: str = "default"
+    ):
         """Queue a trading signal update for broadcast."""
         message = {
             "type": "signal",

@@ -391,8 +391,6 @@ class ModelRegistry:
     def __init__(self, model_dir: str = "./models"):
         """Initialize model registry."""
         self.model_dir = model_dir
-        import os
-
         os.makedirs(model_dir, exist_ok=True)
         self.registry: Dict[str, Dict] = {}
 
@@ -457,7 +455,6 @@ class ModelRegistry:
     def list_models(self) -> List[Dict]:
         """List all registered models."""
         import glob
-        import os
 
         models = []
 
@@ -470,8 +467,6 @@ class ModelRegistry:
 
     def delete_model(self, model_id: str) -> None:
         """Delete a model."""
-        import os
-
         model_path = f"{self.model_dir}/{model_id}.joblib"
         metadata_path = f"{self.model_dir}/{model_id}_metadata.json"
 

@@ -26,7 +26,6 @@ from robo_trader.risk_manager import (
 )
 from robo_trader.stop_loss_monitor import StopLossMonitor, StopType
 
-
 # ---------------------------------------------------------------------------
 # Test doubles
 # ---------------------------------------------------------------------------
@@ -252,9 +251,9 @@ def test_ai_alone_does_not_buy() -> None:
 
     # Default for the gate is "true" — operators must explicitly opt out.
     default_value = os.getenv("AI_REQUIRE_ML_CONFIRMATION", "true").lower()
-    assert default_value == "true", (
-        "Default AI_REQUIRE_ML_CONFIRMATION must be 'true' so AI alone cannot trade"
-    )
+    assert (
+        default_value == "true"
+    ), "Default AI_REQUIRE_ML_CONFIRMATION must be 'true' so AI alone cannot trade"
 
     # Default min confidence is high.
     default_conf = float(os.getenv("AI_MIN_CONFIDENCE", "0.85"))
@@ -814,15 +813,16 @@ def test_config_does_not_silently_flip_readonly_b_12(monkeypatch):
     # Force reload of the config module so the env vars take effect.
     import importlib
     import robo_trader.config as cfg_mod
+
     importlib.reload(cfg_mod)
     try:
         cfg = cfg_mod.load_config()
     except Exception:
         pytest.skip("load_config requires additional environment for production mode")
         return
-    assert cfg.ibkr.readonly is True, (
-        "ENVIRONMENT=production without IBKR_LIVE_ALLOW_ORDERS must keep readonly=True"
-    )
+    assert (
+        cfg.ibkr.readonly is True
+    ), "ENVIRONMENT=production without IBKR_LIVE_ALLOW_ORDERS must keep readonly=True"
 
 
 # ---------------------------------------------------------------------------
@@ -843,17 +843,17 @@ def test_worker_debug_log_path_is_unpredictable_d_3() -> None:
     ).read_text()
 
     # Old, predictable path must be gone as a hardcoded literal.
-    assert '"/tmp/worker_debug.log"' not in src, (
-        "Deterministic /tmp/worker_debug.log path reintroduced — symlink-attack risk."
-    )
+    assert (
+        '"/tmp/worker_debug.log"' not in src
+    ), "Deterministic /tmp/worker_debug.log path reintroduced — symlink-attack risk."
     # Replacement must use tempfile-based randomization.
-    assert "tempfile.mkstemp" in src or "tempfile.NamedTemporaryFile" in src, (
-        "subprocess_ibkr_client must use tempfile.mkstemp/NamedTemporaryFile for the worker debug log."
-    )
+    assert (
+        "tempfile.mkstemp" in src or "tempfile.NamedTemporaryFile" in src
+    ), "subprocess_ibkr_client must use tempfile.mkstemp/NamedTemporaryFile for the worker debug log."
     # The randomized prefix is part of the contract.
-    assert 'prefix="worker_debug_"' in src, (
-        "tempfile must keep a worker_debug_ prefix so the file is identifiable for ops."
-    )
+    assert (
+        'prefix="worker_debug_"' in src
+    ), "tempfile must keep a worker_debug_ prefix so the file is identifiable for ops."
 
 
 def test_ibkr_connect_lock_uses_o_excl_handshake_d_3() -> None:
@@ -864,25 +864,23 @@ def test_ibkr_connect_lock_uses_o_excl_handshake_d_3() -> None:
     happily follow a symlink.
     """
     src = (
-        Path(__file__).resolve().parents[2]
-        / "robo_trader"
-        / "connection_manager.py"
+        Path(__file__).resolve().parents[2] / "robo_trader" / "connection_manager.py"
     ).read_text()
 
     # Old footgun-open must be gone.
-    assert 'open("/tmp/ibkr_connect.lock", "w")' not in src, (
-        "Plain open() on /tmp/ibkr_connect.lock reintroduced — symlink-attack risk."
-    )
+    assert (
+        'open("/tmp/ibkr_connect.lock", "w")' not in src
+    ), "Plain open() on /tmp/ibkr_connect.lock reintroduced — symlink-attack risk."
     # New hardened path: O_EXCL + 0o600 + O_NOFOLLOW.
     assert "O_EXCL" in src, "Lockfile open must use O_EXCL to defeat symlink swap."
     assert "0o600" in src, "Lockfile must be created with 0o600 perms."
-    assert "O_NOFOLLOW" in src, (
-        "Lockfile open must use O_NOFOLLOW so a planted symlink cannot redirect the open."
-    )
+    assert (
+        "O_NOFOLLOW" in src
+    ), "Lockfile open must use O_NOFOLLOW so a planted symlink cannot redirect the open."
     # FileExistsError handler must still be present so existing-lock case is graceful.
-    assert "FileExistsError" in src, (
-        "Hardened lockfile path must handle FileExistsError so cross-process locking still works."
-    )
+    assert (
+        "FileExistsError" in src
+    ), "Hardened lockfile path must handle FileExistsError so cross-process locking still works."
 
 
 def test_md5_uses_used_for_security_false_d_1() -> None:
@@ -891,11 +889,7 @@ def test_md5_uses_used_for_security_false_d_1() -> None:
     with usedforsecurity=False so bandit B324 and FIPS environments don't
     treat it as a cryptographic primitive.
     """
-    src = (
-        Path(__file__).resolve().parents[2]
-        / "robo_trader"
-        / "runner_async.py"
-    ).read_text()
+    src = (Path(__file__).resolve().parents[2] / "robo_trader" / "runner_async.py").read_text()
 
     # Find every md5(...) call site and ensure none of them are bare.
     # We do a minimal scan: every line that calls hashlib.md5( must mention
@@ -1052,9 +1046,9 @@ def test_runner_exit_audit_unlinked_on_healthy_start(
 
     ra._clear_exit_audit()
 
-    assert not stale.exists(), (
-        "_clear_exit_audit must remove the stale audit file on healthy startup."
-    )
+    assert (
+        not stale.exists()
+    ), "_clear_exit_audit must remove the stale audit file on healthy startup."
 
     # Idempotent: calling again on a missing file must not raise.
     ra._clear_exit_audit()
@@ -1082,9 +1076,7 @@ def test_fire_runner_exit_alert_never_raises(monkeypatch: pytest.MonkeyPatch) ->
     def boom(*args, **kwargs):
         raise RuntimeError("simulated channel failure")
 
-    monkeypatch.setattr(
-        _alerts, "_load_alert_channels_from_default_config", fake_load_channels
-    )
+    monkeypatch.setattr(_alerts, "_load_alert_channels_from_default_config", fake_load_channels)
     monkeypatch.setattr(_alerts, "_send_runner_exit_sync", boom)
 
     # Must NOT raise.
@@ -1097,8 +1089,5 @@ def test_fire_runner_exit_alert_never_raises(monkeypatch: pytest.MonkeyPatch) ->
     def loader_boom():
         raise RuntimeError("loader exploded")
 
-    monkeypatch.setattr(
-        _alerts, "_load_alert_channels_from_default_config", loader_boom
-    )
+    monkeypatch.setattr(_alerts, "_load_alert_channels_from_default_config", loader_boom)
     _alerts.fire_runner_exit_alert("unhandled_exception", {"exception_type": "ValueError"})
-

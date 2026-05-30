@@ -108,8 +108,7 @@ class FeatureStore:
             await db.execute("PRAGMA journal_mode=WAL")
 
             # Create features table
-            await db.execute(
-                """
+            await db.execute("""
                 CREATE TABLE IF NOT EXISTS features (
                     feature_id TEXT PRIMARY KEY,
                     symbol TEXT NOT NULL,
@@ -119,8 +118,7 @@ class FeatureStore:
                     metadata TEXT NOT NULL,  -- JSON encoded metadata
                     created_at TEXT NOT NULL
                 )
-            """
-            )
+            """)
 
             # Create indices
             await db.execute(
@@ -129,8 +127,7 @@ class FeatureStore:
             await db.execute("CREATE INDEX IF NOT EXISTS idx_version ON features (version)")
 
             # Create feature metadata table
-            await db.execute(
-                """
+            await db.execute("""
                 CREATE TABLE IF NOT EXISTS feature_metadata (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     feature_id TEXT NOT NULL,
@@ -144,12 +141,10 @@ class FeatureStore:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY (feature_id) REFERENCES features(feature_id)
                 )
-            """
-            )
+            """)
 
             # Create feature importance table
-            await db.execute(
-                """
+            await db.execute("""
                 CREATE TABLE IF NOT EXISTS feature_importance (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     feature_name TEXT NOT NULL,
@@ -158,8 +153,7 @@ class FeatureStore:
                     timestamp TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 )
-            """
-            )
+            """)
 
             await db.commit()
 

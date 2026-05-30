@@ -70,6 +70,8 @@ config/*.key
 # IBC and local environment files (must never be baked into images)
 config/ibc/
 config/*.ini
+# ...but the non-secret template IS needed by the Dockerfile COPY (build context)
+!config/ibc/config.ini.template
 .env
 .env.*
 !.env.example

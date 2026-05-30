@@ -425,9 +425,7 @@ Skewness:              {skewness:>10.2f}
 Kurtosis:              {kurtosis:>10.2f}
 
 ================================================================================
-        """.format(
-            **{k: metrics.get(k, 0) for k in metrics}
-        )
+        """.format(**{k: metrics.get(k, 0) for k in metrics})
 
         return report
 

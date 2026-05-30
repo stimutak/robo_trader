@@ -26,7 +26,6 @@ from robo_trader.database_validator import (
 from robo_trader.multiuser.db_proxy import PortfolioScopedDB
 from robo_trader.multiuser.portfolio_config import load_portfolio_configs
 
-
 # ────────────────────────────────────────────────────────────────────────────
 # Async DB fixture (per-test temp file)
 # ────────────────────────────────────────────────────────────────────────────
@@ -287,10 +286,12 @@ async def test_cleanup_old_data_does_not_touch_other_portfolios_signals(db):
 
 def test_load_portfolio_configs_rejects_case_collision_dupes():
     """'Default' and 'default' must be detected as duplicates after normalization."""
-    payload = json.dumps([
-        {"id": "Default", "name": "First", "starting_cash": 50000, "symbols": "AAPL"},
-        {"id": "default", "name": "Second", "starting_cash": 60000, "symbols": "MSFT"},
-    ])
+    payload = json.dumps(
+        [
+            {"id": "Default", "name": "First", "starting_cash": 50000, "symbols": "AAPL"},
+            {"id": "default", "name": "Second", "starting_cash": 60000, "symbols": "MSFT"},
+        ]
+    )
     with patch.dict(os.environ, {"PORTFOLIOS": payload}, clear=False):
         with pytest.raises(ValueError, match=r"[Dd]uplicate"):
             load_portfolio_configs()
@@ -298,10 +299,12 @@ def test_load_portfolio_configs_rejects_case_collision_dupes():
 
 def test_load_portfolio_configs_rejects_whitespace_collision_dupes():
     """'  default  ' and 'default' must collide after strip+lower."""
-    payload = json.dumps([
-        {"id": "default", "name": "First", "starting_cash": 50000, "symbols": "AAPL"},
-        {"id": "  DEFAULT  ", "name": "Second", "starting_cash": 60000, "symbols": "MSFT"},
-    ])
+    payload = json.dumps(
+        [
+            {"id": "default", "name": "First", "starting_cash": 50000, "symbols": "AAPL"},
+            {"id": "  DEFAULT  ", "name": "Second", "starting_cash": 60000, "symbols": "MSFT"},
+        ]
+    )
     with patch.dict(os.environ, {"PORTFOLIOS": payload}, clear=False):
         with pytest.raises(ValueError, match=r"[Dd]uplicate"):
             load_portfolio_configs()
@@ -310,10 +313,12 @@ def test_load_portfolio_configs_rejects_whitespace_collision_dupes():
 def test_load_portfolio_configs_normalizes_id_on_resulting_config():
     """The PortfolioConfig.id field must be the lowercased/stripped form so
     downstream lookups (DB queries via validate_portfolio_id) match."""
-    payload = json.dumps([
-        {"id": "  Aggressive  ", "name": "A", "starting_cash": 50000, "symbols": "NVDA"},
-        {"id": "CONSERVATIVE", "name": "B", "starting_cash": 50000, "symbols": "JNJ"},
-    ])
+    payload = json.dumps(
+        [
+            {"id": "  Aggressive  ", "name": "A", "starting_cash": 50000, "symbols": "NVDA"},
+            {"id": "CONSERVATIVE", "name": "B", "starting_cash": 50000, "symbols": "JNJ"},
+        ]
+    )
     with patch.dict(os.environ, {"PORTFOLIOS": payload}, clear=False):
         configs = load_portfolio_configs()
     ids = sorted(c.id for c in configs)
@@ -532,18 +537,20 @@ def test_init_database_refuses_resolved_production_filename(tmp_path):
 
 def test_portfolio_config_clamps_max_position_pct_d_9():
     """D-9: per-portfolio max_position_pct must be clamped to <= 0.25."""
-    payload = json.dumps([
-        {
-            "id": "greedy",
-            "name": "Greedy",
-            "starting_cash": 50000,
-            "symbols": "NVDA",
-            "max_position_pct": 0.95,  # would let one position consume 95%
-            "max_open_positions": 9999,  # absurd
-            "trailing_stop_pct": 5.0,  # 500%
-            "stop_loss_pct": 0.99,  # 99%
-        }
-    ])
+    payload = json.dumps(
+        [
+            {
+                "id": "greedy",
+                "name": "Greedy",
+                "starting_cash": 50000,
+                "symbols": "NVDA",
+                "max_position_pct": 0.95,  # would let one position consume 95%
+                "max_open_positions": 9999,  # absurd
+                "trailing_stop_pct": 5.0,  # 500%
+                "stop_loss_pct": 0.99,  # 99%
+            }
+        ]
+    )
     with patch.dict(os.environ, {"PORTFOLIOS": payload}, clear=False):
         configs = load_portfolio_configs()
     assert len(configs) == 1
@@ -556,18 +563,20 @@ def test_portfolio_config_clamps_max_position_pct_d_9():
 
 def test_portfolio_config_passes_through_safe_values_d_9():
     """D-9: values below the hard ceilings must pass through unchanged."""
-    payload = json.dumps([
-        {
-            "id": "safe",
-            "name": "Safe",
-            "starting_cash": 50000,
-            "symbols": "AAPL",
-            "max_position_pct": 0.10,
-            "max_open_positions": 8,
-            "trailing_stop_pct": 0.05,
-            "stop_loss_pct": 0.02,
-        }
-    ])
+    payload = json.dumps(
+        [
+            {
+                "id": "safe",
+                "name": "Safe",
+                "starting_cash": 50000,
+                "symbols": "AAPL",
+                "max_position_pct": 0.10,
+                "max_open_positions": 8,
+                "trailing_stop_pct": 0.05,
+                "stop_loss_pct": 0.02,
+            }
+        ]
+    )
     with patch.dict(os.environ, {"PORTFOLIOS": payload}, clear=False):
         configs = load_portfolio_configs()
     cfg = configs[0]
@@ -579,15 +588,17 @@ def test_portfolio_config_passes_through_safe_values_d_9():
 
 def test_portfolio_config_rejects_negative_risk_overrides_d_9():
     """Negative risk overrides must raise ValueError, not silently clamp."""
-    payload = json.dumps([
-        {
-            "id": "neg",
-            "name": "Neg",
-            "starting_cash": 50000,
-            "symbols": "AAPL",
-            "max_position_pct": -0.1,
-        }
-    ])
+    payload = json.dumps(
+        [
+            {
+                "id": "neg",
+                "name": "Neg",
+                "starting_cash": 50000,
+                "symbols": "AAPL",
+                "max_position_pct": -0.1,
+            }
+        ]
+    )
     with patch.dict(os.environ, {"PORTFOLIOS": payload}, clear=False):
         with pytest.raises(ValueError, match="non-negative"):
             load_portfolio_configs()
@@ -624,12 +635,18 @@ async def test_db_proxy_cleanup_old_data_requires_portfolio_id_d_8(db):
     await db.upsert_portfolio({"id": "alpha", "name": "Alpha"})
     await db.upsert_portfolio({"id": "beta", "name": "Beta"})
     await db.record_signal(
-        symbol="AAPL", strategy="x", signal_type="BUY",
-        strength=0.5, portfolio_id="alpha",
+        symbol="AAPL",
+        strategy="x",
+        signal_type="BUY",
+        strength=0.5,
+        portfolio_id="alpha",
     )
     await db.record_signal(
-        symbol="AAPL", strategy="x", signal_type="BUY",
-        strength=0.5, portfolio_id="beta",
+        symbol="AAPL",
+        strategy="x",
+        signal_type="BUY",
+        strength=0.5,
+        portfolio_id="beta",
     )
 
     scoped = PortfolioScopedDB(db, portfolio_id="alpha")
@@ -654,15 +671,12 @@ async def test_db_proxy_cleanup_old_data_requires_portfolio_id_d_8(db):
         db.cleanup_old_data = original  # type: ignore[assignment]
 
     assert seen_kwargs.get("portfolio_id") == "alpha", (
-        "D-8: scoped proxy must auto-inject portfolio_id; "
-        f"actual kwargs: {seen_kwargs}"
+        "D-8: scoped proxy must auto-inject portfolio_id; " f"actual kwargs: {seen_kwargs}"
     )
 
     # beta's signal must remain untouched regardless of cutoff timing.
     async with db.get_connection() as conn:
-        cur = await conn.execute(
-            "SELECT COUNT(*) FROM signals WHERE portfolio_id = 'beta'"
-        )
+        cur = await conn.execute("SELECT COUNT(*) FROM signals WHERE portfolio_id = 'beta'")
         beta_count = (await cur.fetchone())[0]
     assert beta_count == 1, "beta's signal must NOT be touched"
 
@@ -719,9 +733,9 @@ def test_migration_table_name_allowlist_accepts_known_d_17():
 
     # These are the table_name values passed in _apply_migration_v1.
     for name in ["positions", "trades", "account", "equity_history", "signals"]:
-        assert name in ALLOWED_MIGRATION_TABLES, (
-            f"D-17: migration v1 migrates {name!r} but the allowlist excludes it"
-        )
+        assert (
+            name in ALLOWED_MIGRATION_TABLES
+        ), f"D-17: migration v1 migrates {name!r} but the allowlist excludes it"
 
 
 @pytest.mark.asyncio

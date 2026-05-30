@@ -33,7 +33,6 @@ from unittest.mock import patch
 
 import pytest
 
-
 pytestmark = pytest.mark.integration
 
 
@@ -46,6 +45,7 @@ def _agent_b_exit_audit_landed() -> bool:
     """Agent B: data/runner_exit.json audit trail helper."""
     try:
         from robo_trader.runner_async import _write_exit_audit  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -61,27 +61,19 @@ def _agent_b_lsof_retry_landed() -> bool:
     """
     try:
         src = pathlib.Path(
-            pathlib.Path(__file__).resolve().parents[2]
-            / "robo_trader"
-            / "runner_async.py"
+            pathlib.Path(__file__).resolve().parents[2] / "robo_trader" / "runner_async.py"
         ).read_text()
     except OSError:
         return False
     # The fix introduces max_attempts + TimeoutExpired retry, surfaced via
     # the _lsof_port_listening helper.
-    return (
-        "TimeoutExpired" in src
-        and "max_attempts" in src
-        and "_lsof_port_listening" in src
-    )
+    return "TimeoutExpired" in src and "max_attempts" in src and "_lsof_port_listening" in src
 
 
 def _agent_c_health_endpoint_landed() -> bool:
     """Agent C: /health/runner + /api/runner/status routes."""
     try:
-        src = pathlib.Path(
-            pathlib.Path(__file__).resolve().parents[2] / "app.py"
-        ).read_text()
+        src = pathlib.Path(pathlib.Path(__file__).resolve().parents[2] / "app.py").read_text()
     except OSError:
         return False
     return "/health/runner" in src
@@ -89,9 +81,7 @@ def _agent_c_health_endpoint_landed() -> bool:
 
 def _agent_a_watchdog_plist_landed() -> bool:
     plist = (
-        pathlib.Path(__file__).resolve().parents[2]
-        / "scripts"
-        / "com.robotrader.watchdog.plist"
+        pathlib.Path(__file__).resolve().parents[2] / "scripts" / "com.robotrader.watchdog.plist"
     )
     return plist.is_file()
 
@@ -139,9 +129,9 @@ def test_runner_death_triggers_full_defense_stack(tmp_path, monkeypatch):
 
     # --- Step 2: pre-condition — no audit marker yet. ---
     audit_path = data_dir / "runner_exit.json"
-    assert not audit_path.exists(), (
-        "pre-condition violated: runner_exit.json already exists in tmp dir"
-    )
+    assert (
+        not audit_path.exists()
+    ), "pre-condition violated: runner_exit.json already exists in tmp dir"
 
     # --- Step 3: simulate the runner's exit code path. ---
     _write_exit_audit(
@@ -151,9 +141,7 @@ def test_runner_death_triggers_full_defense_stack(tmp_path, monkeypatch):
     )
 
     # --- Step 4: defense #5 — audit file written correctly. ---
-    assert audit_path.exists(), (
-        "Defense #5 (audit trail) FAILED: runner_exit.json was not written"
-    )
+    assert audit_path.exists(), "Defense #5 (audit trail) FAILED: runner_exit.json was not written"
     payload = json.loads(audit_path.read_text())
     assert payload["reason"] == "pre_flight_gateway_unreachable"
     assert payload["exit_code"] == 1
@@ -164,9 +152,7 @@ def test_runner_death_triggers_full_defense_stack(tmp_path, monkeypatch):
 
     # --- Step 5+6: defenses #3 + #4 — dashboard liveness routes. ---
     if not _agent_c_health_endpoint_landed():
-        pytest.skip(
-            "Agent C (dashboard /health/runner + stale banner) not yet merged"
-        )
+        pytest.skip("Agent C (dashboard /health/runner + stale banner) not yet merged")
 
     # Reload app.py with auth disabled and pointed at our tmp data dir.
     app_mod = _reload_app_with_env(
@@ -182,29 +168,28 @@ def test_runner_death_triggers_full_defense_stack(tmp_path, monkeypatch):
         f"got {resp.status_code}"
     )
     body = resp.get_json() or {}
-    assert body.get("status") == "stale", (
-        f"Defense #4: expected status='stale', got {body!r}"
-    )
+    assert body.get("status") == "stale", f"Defense #4: expected status='stale', got {body!r}"
     # The exit_reason field must mirror the audit's reason so the dashboard
     # banner (defense #3) can show it without re-parsing the file.
     exit_reason = body.get("exit_reason") or body.get("reason") or ""
-    assert "pre_flight_gateway_unreachable" in exit_reason, (
-        f"Defense #4: exit_reason missing audit reason, got {body!r}"
-    )
+    assert (
+        "pre_flight_gateway_unreachable" in exit_reason
+    ), f"Defense #4: exit_reason missing audit reason, got {body!r}"
 
     # Defense #4 (auth-gated detailed status): full audit payload exposed.
     resp = client.get("/api/runner/status")
-    assert resp.status_code in (200, 503), (
-        f"/api/runner/status returned unexpected {resp.status_code}"
-    )
+    assert resp.status_code in (
+        200,
+        503,
+    ), f"/api/runner/status returned unexpected {resp.status_code}"
     detail = resp.get_json() or {}
-    assert detail.get("healthy") is False, (
-        f"/api/runner/status: expected healthy=False, got {detail!r}"
-    )
+    assert (
+        detail.get("healthy") is False
+    ), f"/api/runner/status: expected healthy=False, got {detail!r}"
     audit_view = detail.get("exit_audit") or detail.get("audit") or {}
-    assert audit_view.get("reason") == "pre_flight_gateway_unreachable", (
-        f"/api/runner/status: exit_audit.reason missing, got {detail!r}"
-    )
+    assert (
+        audit_view.get("reason") == "pre_flight_gateway_unreachable"
+    ), f"/api/runner/status: exit_audit.reason missing, got {detail!r}"
 
     # --- Step 7: defense #2 — lsof pre-flight tolerates transient timeouts. ---
     if not _agent_b_lsof_retry_landed():
@@ -258,8 +243,7 @@ def test_runner_death_triggers_full_defense_stack(tmp_path, monkeypatch):
     )
     assert reason == "listening"
     assert call_count["n"] == 3, (
-        f"Defense #2: expected 3 lsof attempts (2 timeouts + 1 success), "
-        f"got {call_count['n']}"
+        f"Defense #2: expected 3 lsof attempts (2 timeouts + 1 success), " f"got {call_count['n']}"
     )
 
     # --- Step 8: defense #1 — watchdog plist is structurally valid. ---
@@ -267,27 +251,22 @@ def test_runner_death_triggers_full_defense_stack(tmp_path, monkeypatch):
         pytest.skip("Agent A (watchdog plist) not yet merged")
 
     plist_path = (
-        pathlib.Path(__file__).resolve().parents[2]
-        / "scripts"
-        / "com.robotrader.watchdog.plist"
+        pathlib.Path(__file__).resolve().parents[2] / "scripts" / "com.robotrader.watchdog.plist"
     )
     with plist_path.open("rb") as fh:
         parsed = plistlib.load(fh)
 
-    assert "ProgramArguments" in parsed, (
-        "Defense #1 (watchdog plist) FAILED: missing ProgramArguments"
-    )
+    assert (
+        "ProgramArguments" in parsed
+    ), "Defense #1 (watchdog plist) FAILED: missing ProgramArguments"
     args = parsed["ProgramArguments"]
-    assert isinstance(args, list) and args, (
-        "Defense #1: ProgramArguments must be a non-empty list"
-    )
+    assert isinstance(args, list) and args, "Defense #1: ProgramArguments must be a non-empty list"
     script_path = pathlib.Path(args[0])
     # Path must look like a real script (absolute, .sh / .py, etc.). We
     # don't require it to exist on this machine — CI runs elsewhere — but
     # the reference must be plausible.
     assert script_path.is_absolute(), (
-        f"Defense #1: ProgramArguments[0] should be an absolute path, "
-        f"got {script_path}"
+        f"Defense #1: ProgramArguments[0] should be an absolute path, " f"got {script_path}"
     )
     assert script_path.name.endswith((".sh", ".py")), (
         f"Defense #1: ProgramArguments[0] should be a script "
@@ -303,9 +282,7 @@ def test_runner_death_triggers_full_defense_stack(tmp_path, monkeypatch):
 
     # plist must request KeepAlive so launchd restarts the watchdog if it
     # dies — otherwise defense #1 itself can silently disappear.
-    assert parsed.get("KeepAlive") is True, (
-        "Defense #1: watchdog plist must set KeepAlive=true"
-    )
+    assert parsed.get("KeepAlive") is True, "Defense #1: watchdog plist must set KeepAlive=true"
 
 
 # ---------------------------------------------------------------------------
@@ -322,9 +299,7 @@ def test_full_defense_stack_has_no_redundant_paths():
     if not sec_dir.is_dir():
         pytest.skip("tests/security/ not present")
 
-    all_test_src = "\n".join(
-        p.read_text(errors="replace") for p in sec_dir.glob("*.py")
-    )
+    all_test_src = "\n".join(p.read_text(errors="replace") for p in sec_dir.glob("*.py"))
     # Also include this integration file so the meta-test itself counts —
     # any defense covered ONLY by this file still has a regression test.
     all_test_src += "\n" + pathlib.Path(__file__).read_text()

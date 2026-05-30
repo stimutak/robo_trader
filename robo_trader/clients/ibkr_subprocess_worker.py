@@ -8,6 +8,7 @@ complex async environment. Communicates via JSON over stdin/stdout.
 This solves the ib_async library incompatibility with complex async environments
 where API handshakes timeout despite successful TCP connections.
 """
+
 import asyncio
 import atexit
 import json

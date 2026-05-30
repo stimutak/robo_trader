@@ -20,7 +20,6 @@ from pathlib import Path
 
 import pytest
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 PLIST_PATH = SCRIPTS_DIR / "com.robotrader.watchdog.plist"
@@ -67,9 +66,9 @@ def test_watchdog_plist_paths_exist():
     # Audit hardening from Round-2: agent must be pinned to the GUI session
     # of a real user, not run as root or in a background session.
     assert plist.get("UserName"), "UserName must be set on the agent"
-    assert plist.get("LimitLoadToSessionType") == "Aqua", (
-        "LimitLoadToSessionType must be 'Aqua' so the agent runs in the GUI session"
-    )
+    assert (
+        plist.get("LimitLoadToSessionType") == "Aqua"
+    ), "LimitLoadToSessionType must be 'Aqua' so the agent runs in the GUI session"
 
 
 def test_watchdog_plist_lints_ok():
@@ -139,23 +138,21 @@ def test_dev_setup_mentions_watchdog_install():
     regresses, fresh machines will repeat the 2026-05-11 outage."""
     assert DEV_SETUP_MD.exists(), "DEV_SETUP.md missing"
     content = DEV_SETUP_MD.read_text()
-    assert "install_watchdog.sh" in content, (
-        "DEV_SETUP.md must reference scripts/install_watchdog.sh"
-    )
+    assert (
+        "install_watchdog.sh" in content
+    ), "DEV_SETUP.md must reference scripts/install_watchdog.sh"
     # Also assert it's marked as required, not optional.
     lowered = content.lower()
-    assert "required" in lowered or "not optional" in lowered, (
-        "DEV_SETUP.md must mark the watchdog install as required"
-    )
+    assert (
+        "required" in lowered or "not optional" in lowered
+    ), "DEV_SETUP.md must mark the watchdog install as required"
 
 
 def test_claude_md_mentions_watchdog_install():
     """CLAUDE.md must tell future Claude sessions about the install step."""
     assert CLAUDE_MD.exists(), "CLAUDE.md missing"
     content = CLAUDE_MD.read_text()
-    assert "install_watchdog.sh" in content, (
-        "CLAUDE.md must reference scripts/install_watchdog.sh"
-    )
+    assert "install_watchdog.sh" in content, "CLAUDE.md must reference scripts/install_watchdog.sh"
 
 
 # ---------------------------------------------------------------------------
@@ -166,18 +163,16 @@ def test_claude_md_mentions_watchdog_install():
 def test_start_trader_warns_if_watchdog_not_loaded():
     assert START_TRADER_SH.exists(), "START_TRADER.sh missing"
     src = START_TRADER_SH.read_text()
-    assert "launchctl list" in src, (
-        "START_TRADER.sh must call `launchctl list` to detect a missing watchdog"
-    )
-    assert "robotrader" in src, (
-        "START_TRADER.sh launchctl check must grep for 'robotrader'"
-    )
-    assert "WARNING" in src, (
-        "START_TRADER.sh must print a WARNING block when the watchdog is missing"
-    )
-    assert "install_watchdog.sh" in src, (
-        "START_TRADER.sh WARNING must reference scripts/install_watchdog.sh"
-    )
+    assert (
+        "launchctl list" in src
+    ), "START_TRADER.sh must call `launchctl list` to detect a missing watchdog"
+    assert "robotrader" in src, "START_TRADER.sh launchctl check must grep for 'robotrader'"
+    assert (
+        "WARNING" in src
+    ), "START_TRADER.sh must print a WARNING block when the watchdog is missing"
+    assert (
+        "install_watchdog.sh" in src
+    ), "START_TRADER.sh WARNING must reference scripts/install_watchdog.sh"
 
 
 # ---------------------------------------------------------------------------

@@ -29,6 +29,7 @@ def _validate_version(version: str) -> str:
         raise ValidationError(f"invalid version: {version!r}")
     return version
 
+
 warnings.filterwarnings("ignore")
 
 

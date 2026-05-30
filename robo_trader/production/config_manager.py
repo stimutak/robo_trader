@@ -233,9 +233,7 @@ class ConfigManager:
             return Environment(env_var)
         except ValueError:
             if os.environ.get("ALLOW_ENV_FALLBACK") == "1" or os.environ.get("CI"):
-                logger.warning(
-                    f"Unknown TRADING_ENV={env_var!r}, falling back to DEVELOPMENT"
-                )
+                logger.warning(f"Unknown TRADING_ENV={env_var!r}, falling back to DEVELOPMENT")
                 return Environment.DEVELOPMENT
             raise ConfigurationError(
                 f"Invalid TRADING_ENV={env_var!r}. Set explicitly to one of: "
@@ -411,20 +409,14 @@ class ConfigManager:
             config.database.db_type = "postgresql"
             # urlparse leaves percent-encoded chars in username/password; decode
             # so callers receive the real credentials.
-            config.database.pg_username = (
-                unquote(parsed.username) if parsed.username else None
-            )
-            config.database.pg_password = (
-                unquote(parsed.password) if parsed.password else None
-            )
+            config.database.pg_username = unquote(parsed.username) if parsed.username else None
+            config.database.pg_password = unquote(parsed.password) if parsed.password else None
             config.database.pg_host = parsed.hostname or "localhost"
             config.database.pg_port = parsed.port or 5432
             config.database.pg_database = (parsed.path or "/").lstrip("/") or None
         except Exception as e:
             # Never include the URL itself — it contains credentials.
-            raise ConfigurationError(
-                f"Invalid DATABASE_URL: {type(e).__name__}"
-            ) from None
+            raise ConfigurationError(f"Invalid DATABASE_URL: {type(e).__name__}") from None
 
         return config
 

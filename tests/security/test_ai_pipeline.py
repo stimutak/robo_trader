@@ -22,7 +22,6 @@ from robo_trader.ml._safe_load import (
     verify_file,
 )
 
-
 # ---------------------------------------------------------------------------
 # AI-H1: _safe_load
 # ---------------------------------------------------------------------------
@@ -227,7 +226,6 @@ def test_news_title_sanitization_strips_control_chars(monkeypatch):
     assert "<" not in title
     assert ">" not in title
     assert "\n" not in title
-
 
 
 # ---------------------------------------------------------------------------
@@ -488,10 +486,10 @@ def test_ai_analyst_json_decoder_handles_nested_braces():
     analyst.model = "test-model"
 
     payload = (
-        'Here is the analysis: '
+        "Here is the analysis: "
         '{"sentiment": "bullish", "confidence": 0.8, "reasoning": "ok",'
         ' "key_factors": ["a"], "risk_level": "low", "suggested_action": "buy"}'
-        ' and some trailing text {with nested {braces}} that must be ignored'
+        " and some trailing text {with nested {braces}} that must be ignored"
     )
     result = analyst._parse_analysis("AAPL", payload)
     assert result.sentiment.name == "BULLISH"
@@ -518,9 +516,9 @@ def test_load_model_re_raises_instead_of_dummy_ain_h3(tmp_path, monkeypatch) -> 
     bogus_path = tmp_path / "nonexistent.pkl"
     with pytest.raises(Exception):
         inference.load_model(str(bogus_path), "primary")
-    assert "primary" not in inference.models, (
-        "load_model must NOT silently install a DummyModel after verify failure"
-    )
+    assert (
+        "primary" not in inference.models
+    ), "load_model must NOT silently install a DummyModel after verify failure"
 
 
 def test_predict_refuses_when_no_model_loaded_ain_h3() -> None:

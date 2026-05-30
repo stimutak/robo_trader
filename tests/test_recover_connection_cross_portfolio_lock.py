@@ -132,9 +132,10 @@ async def test_only_one_runner_in_safe_disconnect_at_a_time(_fresh_gateway_lock)
             runner_b.recover_connection("test-B"),
         )
 
-    assert results == [True, True], (
-        f"both runners should have recovered successfully, got {results}"
-    )
+    assert results == [
+        True,
+        True,
+    ], f"both runners should have recovered successfully, got {results}"
     assert in_critical["max"] == 1, (
         f"expected at most 1 runner inside the critical section at a time, "
         f"observed max={in_critical['max']}"

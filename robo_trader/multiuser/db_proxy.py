@@ -69,6 +69,7 @@ _KNOWN_GLOBAL_METHODS = frozenset(
     }
 )
 
+
 class PortfolioScopedDB:
     """Proxy that auto-injects portfolio_id into portfolio-scoped DB methods.
 
