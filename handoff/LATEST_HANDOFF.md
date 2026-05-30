@@ -1,1 +1,1 @@
-HANDOFF_2026-02-03_trailing_stops.md
+HANDOFF_2026-05-30_risk-tab-and-ci-repair.md
