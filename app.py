@@ -629,7 +629,7 @@ HTML_TEMPLATE = """
         }
         
         .container {
-            max-width: 1400px;
+            max-width: 1800px;
             margin: 0 auto;
             padding: 20px;
         }
@@ -1133,6 +1133,58 @@ HTML_TEMPLATE = """
         .runner-stale-banner.visible {
             display: block;
         }
+        /* Risk gauge bars (Risk tab) */
+        .risk-gauge {
+            height: 6px;
+            background: #21262d;
+            border-radius: 3px;
+            overflow: hidden;
+            margin-top: 4px;
+        }
+        .risk-gauge-fill {
+            height: 100%;
+            border-radius: 3px;
+            transition: width 0.5s ease;
+        }
+        .risk-gauge-fill.safe { background: #4ade80; }
+        .risk-gauge-fill.warning { background: #fbbf24; }
+        .risk-gauge-fill.danger { background: #f87171; }
+
+        /* P&L attribution bars */
+        .pnl-bar-container {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 0;
+        }
+        .pnl-bar-label {
+            width: 40px;
+            font-size: 10px;
+            color: #58a6ff;
+            font-weight: 600;
+            text-align: right;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .pnl-bar-track {
+            flex: 1;
+            height: 14px;
+            background: #161b22;
+            border-radius: 3px;
+            position: relative;
+            overflow: hidden;
+        }
+        .pnl-bar-fill {
+            height: 100%;
+            border-radius: 3px;
+            transition: width 0.4s ease;
+            min-width: 2px;
+        }
+        .pnl-bar-value {
+            width: 55px;
+            font-size: 10px;
+            font-family: 'JetBrains Mono', monospace;
+            text-align: right;
+        }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
@@ -1178,6 +1230,7 @@ HTML_TEMPLATE = """
             <div class="tab" onclick="switchTab('trades', this)">Trades</div>
             <div class="tab" onclick="switchTab('ml', this)">ML</div>
             <div class="tab" onclick="switchTab('performance', this)">Performance</div>
+            <div class="tab" onclick="switchTab('risk', this)">Risk</div>
             <div class="tab" onclick="switchTab('logs', this)">Logs</div>
         </div>
         
@@ -1343,8 +1396,30 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
+            <!-- P&L + STOPS ROW: 3-column layout -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 10px;">
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 8px 0; font-size: 11px; text-transform: uppercase;">P&L by Symbol</h4>
+                    <div id="pnl-by-symbol" style="font-size: 11px;">
+                        <div style="color: #666; text-align: center; padding: 10px;">Loading...</div>
+                    </div>
+                </div>
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 8px 0; font-size: 11px; text-transform: uppercase;">Active Stop-Losses</h4>
+                    <div id="active-stops-list" style="font-size: 11px; max-height: 130px; overflow-y: auto;">
+                        <div style="color: #666; text-align: center; padding: 10px;">Loading...</div>
+                    </div>
+                </div>
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 8px 0; font-size: 11px; text-transform: uppercase;">Signal Activity</h4>
+                    <div id="signal-activity-list" style="font-size: 11px; max-height: 130px; overflow-y: auto;">
+                        <div style="color: #666; text-align: center; padding: 10px;">Loading...</div>
+                    </div>
+                </div>
+            </div>
+
             <!-- STATUS ROW: System Health -->
-            <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px;">
+            <div style="display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px;">
                 <div style="background: #161b22; padding: 10px; border-radius: 6px; display: flex; align-items: center; gap: 8px; border: 1px solid #21262d;">
                     <div style="width: 8px; height: 8px; border-radius: 50%; background: #4ade80;" id="ov-conn-dot"></div>
                     <div>
@@ -1944,8 +2019,169 @@ HTML_TEMPLATE = """
                 </div>
             </div>
         </div>
+
+        <div id="risk-tab" class="tab-content" style="display: none;">
+            <!-- Kill Switch & Risk Limits -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                <!-- Kill Switch Status -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <h4 style="color: #58a6ff; margin: 0; font-size: 11px; text-transform: uppercase;">Kill Switches</h4>
+                        <span id="kill-switch-status" style="font-size: 10px; padding: 2px 8px; border-radius: 3px; background: #238636; color: #fff;">SAFE</span>
+                    </div>
+                    <div style="display: flex; flex-direction: column; gap: 10px;">
+                        <div>
+                            <div style="display: flex; justify-content: space-between; font-size: 10px; margin-bottom: 2px;">
+                                <span style="color: #8b949e;">Daily Loss</span>
+                                <span style="font-family: 'JetBrains Mono', monospace;"><span id="risk-daily-loss-current" style="color: #e0e0e0;">0%</span> / <span style="color: #6b7280;" id="risk-daily-loss-limit">5%</span></span>
+                            </div>
+                            <div class="risk-gauge"><div class="risk-gauge-fill safe" id="risk-daily-loss-bar" style="width: 0%;"></div></div>
+                        </div>
+                        <div>
+                            <div style="display: flex; justify-content: space-between; font-size: 10px; margin-bottom: 2px;">
+                                <span style="color: #8b949e;">Consecutive Losses</span>
+                                <span style="font-family: 'JetBrains Mono', monospace;"><span id="risk-consec-current" style="color: #e0e0e0;">0</span> / <span style="color: #6b7280;" id="risk-consec-limit">5</span></span>
+                            </div>
+                            <div class="risk-gauge"><div class="risk-gauge-fill safe" id="risk-consec-bar" style="width: 0%;"></div></div>
+                        </div>
+                        <div>
+                            <div style="display: flex; justify-content: space-between; font-size: 10px; margin-bottom: 2px;">
+                                <span style="color: #8b949e;">Max Drawdown</span>
+                                <span style="font-family: 'JetBrains Mono', monospace;"><span id="risk-dd-current" style="color: #e0e0e0;">0%</span> / <span style="color: #6b7280;" id="risk-dd-limit">10%</span></span>
+                            </div>
+                            <div class="risk-gauge"><div class="risk-gauge-fill safe" id="risk-dd-bar" style="width: 0%;"></div></div>
+                        </div>
+                        <div>
+                            <div style="display: flex; justify-content: space-between; font-size: 10px; margin-bottom: 2px;">
+                                <span style="color: #8b949e;">Portfolio Leverage</span>
+                                <span style="font-family: 'JetBrains Mono', monospace;" id="risk-leverage">0.00x</span>
+                            </div>
+                            <div class="risk-gauge"><div class="risk-gauge-fill safe" id="risk-leverage-bar" style="width: 0%;"></div></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Kelly Sizing -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <h4 style="color: #58a6ff; margin: 0; font-size: 11px; text-transform: uppercase;">Kelly Position Sizing</h4>
+                        <span style="font-size: 10px; color: #8b949e;">Portfolio Kelly: <span id="portfolio-kelly" style="color: #fbbf24; font-family: 'JetBrains Mono', monospace;">0%</span></span>
+                    </div>
+                    <div style="max-height: 150px; overflow-y: auto;">
+                        <table style="width: 100%; border-collapse: collapse; font-size: 11px;">
+                            <thead>
+                                <tr style="border-bottom: 1px solid #21262d;">
+                                    <th style="padding: 4px 6px; text-align: left; color: #8b949e; font-weight: 500;">Symbol</th>
+                                    <th style="padding: 4px 6px; text-align: right; color: #8b949e; font-weight: 500;">Kelly %</th>
+                                    <th style="padding: 4px 6px; text-align: right; color: #8b949e; font-weight: 500;">Win Rate</th>
+                                    <th style="padding: 4px 6px; text-align: right; color: #8b949e; font-weight: 500;">Edge</th>
+                                </tr>
+                            </thead>
+                            <tbody id="kelly-table">
+                                <tr><td colspan="4" style="text-align: center; color: #666; padding: 12px;">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Circuit Breakers & Safety Thresholds -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                <!-- Circuit Breakers -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <h4 style="color: #58a6ff; margin: 0; font-size: 11px; text-transform: uppercase;">Circuit Breakers</h4>
+                        <span id="breakers-open-count" style="font-size: 10px; padding: 2px 8px; border-radius: 3px; background: #238636; color: #fff;">0 OPEN</span>
+                    </div>
+                    <div id="circuit-breakers-grid" style="display: flex; flex-direction: column; gap: 6px;">
+                        <div style="color: #666; text-align: center; padding: 12px; font-size: 11px;">Loading...</div>
+                    </div>
+                </div>
+
+                <!-- Safety Thresholds -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 11px; text-transform: uppercase;">Safety Thresholds</h4>
+                    <div id="safety-thresholds-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px;">
+                        <div style="color: #666; text-align: center; padding: 12px; font-size: 11px; grid-column: span 2;">Loading...</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Data Validation & Risk Metrics -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                <!-- Data Validator -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 11px; text-transform: uppercase;">Data Validation</h4>
+                    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;">
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Validations</div>
+                            <div style="font-size: 14px; font-weight: bold; font-family: 'JetBrains Mono', monospace;" id="risk-total-validations">0</div>
+                        </div>
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Pass Rate</div>
+                            <div style="font-size: 14px; font-weight: bold; color: #4ade80; font-family: 'JetBrains Mono', monospace;" id="risk-pass-rate">100%</div>
+                        </div>
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Failed</div>
+                            <div style="font-size: 14px; font-weight: bold; color: #f87171; font-family: 'JetBrains Mono', monospace;" id="risk-failed-total">0</div>
+                        </div>
+                    </div>
+                    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin-top: 8px;">
+                        <div style="text-align: center; font-size: 9px;">
+                            <div style="color: #8b949e;">Stale</div>
+                            <div style="color: #fbbf24; font-family: 'JetBrains Mono', monospace;" id="risk-failed-stale">0</div>
+                        </div>
+                        <div style="text-align: center; font-size: 9px;">
+                            <div style="color: #8b949e;">Spread</div>
+                            <div style="color: #fbbf24; font-family: 'JetBrains Mono', monospace;" id="risk-failed-spread">0</div>
+                        </div>
+                        <div style="text-align: center; font-size: 9px;">
+                            <div style="color: #8b949e;">Price</div>
+                            <div style="color: #fbbf24; font-family: 'JetBrains Mono', monospace;" id="risk-failed-price">0</div>
+                        </div>
+                        <div style="text-align: center; font-size: 9px;">
+                            <div style="color: #8b949e;">Volume</div>
+                            <div style="color: #fbbf24; font-family: 'JetBrains Mono', monospace;" id="risk-failed-volume">0</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Risk Summary Metrics -->
+                <div style="background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px;">
+                    <h4 style="color: #58a6ff; margin: 0 0 10px 0; font-size: 11px; text-transform: uppercase;">Risk Metrics</h4>
+                    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;">
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Total Exposure</div>
+                            <div style="font-size: 13px; font-weight: bold; font-family: 'JetBrains Mono', monospace;" id="risk-total-exposure">$0</div>
+                        </div>
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Daily P&L</div>
+                            <div style="font-size: 13px; font-weight: bold; font-family: 'JetBrains Mono', monospace;" id="risk-daily-pnl">$0</div>
+                        </div>
+                        <div style="background: #161b22; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 9px; color: #8b949e;">Capital</div>
+                            <div style="font-size: 13px; font-weight: bold; font-family: 'JetBrains Mono', monospace;" id="risk-current-capital">$0</div>
+                        </div>
+                    </div>
+                    <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #21262d;">
+                        <div style="display: flex; justify-content: space-between; font-size: 10px; padding: 3px 0;">
+                            <span style="color: #8b949e;">Win Rate (Overall)</span>
+                            <span style="font-family: 'JetBrains Mono', monospace;" id="risk-win-rate">—</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; font-size: 10px; padding: 3px 0;">
+                            <span style="color: #8b949e;">Total P&L</span>
+                            <span style="font-family: 'JetBrains Mono', monospace;" id="risk-total-pnl">—</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; font-size: 10px; padding: 3px 0;">
+                            <span style="color: #8b949e;">Max Drawdown (Realized)</span>
+                            <span style="font-family: 'JetBrains Mono', monospace; color: #f87171;" id="risk-max-dd">—</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
-    
+
     <script>
         // W-H3: escape untrusted strings before injecting via innerHTML.
         function escHTML(s){const d=document.createElement('div');d.textContent=String(s==null?'':s);return d.innerHTML;}
@@ -2161,6 +2397,8 @@ HTML_TEMPLATE = """
                 loadWatchlist();
             } else if (tab === 'trades') {
                 loadTrades();
+            } else if (tab === 'risk') {
+                loadRiskData();
             }
         }
         
@@ -3512,8 +3750,131 @@ HTML_TEMPLATE = """
                     posTextEl.textContent = `${formatCurrency(totalValue)} deployed`;
                 }
             }
+
+            // Overview panels: P&L by Symbol, Active Stops, Signal Activity
+            renderPnlBySymbol(posData);
+            renderActiveStops(posData).catch(err => console.error('renderActiveStops failed:', err));
+            renderSignalActivity().catch(err => console.error('renderSignalActivity failed:', err));
         }
-        
+
+        function renderPnlBySymbol(posData) {
+            const container = document.getElementById('pnl-by-symbol');
+            if (!container) return;
+
+            if (!posData || posData.length === 0) {
+                container.innerHTML = '<div style="color: #666; text-align: center; padding: 10px;">No positions</div>';
+                return;
+            }
+
+            // Sort by absolute P&L, show top contributors
+            const sorted = [...posData].sort((a, b) => Math.abs(b.pnl) - Math.abs(a.pnl)).slice(0, 6);
+            const maxAbsPnl = Math.max(...sorted.map(p => Math.abs(p.pnl)), 1);
+
+            container.innerHTML = sorted.map(pos => {
+                const isPositive = pos.pnl >= 0;
+                const barColor = isPositive ? '#4ade80' : '#f87171';
+                const barWidth = Math.max(2, (Math.abs(pos.pnl) / maxAbsPnl) * 100);
+                const pnlSign = isPositive ? '+' : '';
+                // W-H3: escape symbol (DB-derived but defense in depth)
+                return `<div class="pnl-bar-container">
+                    <span class="pnl-bar-label">${escHTML(pos.symbol)}</span>
+                    <div class="pnl-bar-track">
+                        <div class="pnl-bar-fill" style="width: ${barWidth}%; background: ${barColor};"></div>
+                    </div>
+                    <span class="pnl-bar-value" style="color: ${barColor};">${pnlSign}$${Math.abs(pos.pnl).toFixed(0)}</span>
+                </div>`;
+            }).join('');
+        }
+
+        // Cache for stop-loss config from safety thresholds API (60s TTL)
+        let _stopConfig = null;
+
+        async function loadStopConfig() {
+            if (_stopConfig && (Date.now() - _stopConfig._ts < 60000)) return _stopConfig;
+            try {
+                const resp = await fetch('/api/safety/thresholds');
+                const data = await resp.json();
+                const useTrailing = String(data.use_trailing_stop ?? '').toLowerCase() === 'true';
+                _stopConfig = {
+                    trailingPct: parseFloat(useTrailing
+                        ? (data.trailing_stop_percent || '5.0')
+                        : (data.stop_loss_percent || '2.0')),
+                    useTrailing: useTrailing,
+                    _ts: Date.now()
+                };
+            } catch (e) {
+                _stopConfig = { trailingPct: 5.0, useTrailing: true, _ts: Date.now() };
+            }
+            return _stopConfig;
+        }
+
+        async function renderActiveStops(posData) {
+            const container = document.getElementById('active-stops-list');
+            if (!container) return;
+
+            if (!posData || posData.length === 0) {
+                container.innerHTML = '<div style="color: #666; text-align: center; padding: 10px;">No positions</div>';
+                return;
+            }
+
+            const config = await loadStopConfig();
+            const trailingPct = config.trailingPct;
+            const useTrailing = config.useTrailing;
+
+            container.innerHTML = posData.map(pos => {
+                // Estimate stop level - high water mark would be max(entry, current)
+                const highWater = Math.max(pos.entry_price, pos.current_price);
+                const stopLevel = useTrailing
+                    ? highWater * (1 - trailingPct / 100)
+                    : pos.entry_price * (1 - trailingPct / 100);
+                const stopDistance = pos.current_price > 0
+                    ? ((pos.current_price - stopLevel) / pos.current_price * 100)
+                    : 0;
+                const stopColor = stopDistance < 2 ? '#f87171' : stopDistance < 3 ? '#fbbf24' : '#4ade80';
+
+                // W-H3: escape symbol
+                return `<div style="display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #21262d; font-size: 10px;">
+                    <span style="color: #58a6ff; font-weight: 600; width: 40px;">${escHTML(pos.symbol)}</span>
+                    <span style="color: #8b949e; font-family: 'JetBrains Mono', monospace;">$${stopLevel.toFixed(2)}</span>
+                    <span style="color: ${stopColor}; font-family: 'JetBrains Mono', monospace;">${stopDistance.toFixed(1)}% away</span>
+                    <span style="color: #6b7280; font-size: 9px;">${useTrailing ? 'TRAIL' : 'FIXED'}</span>
+                </div>`;
+            }).join('');
+        }
+
+        async function renderSignalActivity() {
+            const container = document.getElementById('signal-activity-list');
+            if (!container) return;
+            try {
+                const resp = await fetch('/api/ml/predictions');
+                const data = await resp.json();
+                const preds = data.predictions || [];
+                // Show BUY/SELL first, then top-confidence HOLDs
+                const actionOrder = { BUY: 0, SELL: 1, HOLD: 2 };
+                const sorted = [...preds]
+                    .sort((a, b) => (actionOrder[a.action] ?? 3) - (actionOrder[b.action] ?? 3) || b.confidence - a.confidence)
+                    .slice(0, 8);
+                if (sorted.length === 0) {
+                    container.innerHTML = '<div style="color: #666; text-align: center; padding: 10px;">No signals</div>';
+                    return;
+                }
+                // W-H3: escape ML-derived fields
+                container.innerHTML = sorted.map(p => {
+                    const color = p.action === 'BUY' ? '#4ade80' : p.action === 'SELL' ? '#f87171' : '#6b7280';
+                    const conf = (p.confidence * 100).toFixed(0);
+                    const sourceLabel = (p.source || '').replace('ML_', '');
+                    return `<div style="display: flex; justify-content: space-between; align-items: center; padding: 3px 0; border-bottom: 1px solid #21262d; font-size: 10px;">
+                        <span style="color: #58a6ff; font-weight: 600; width: 40px;">${escHTML(p.symbol)}</span>
+                        <span style="background: ${color}22; color: ${color}; padding: 1px 6px; border-radius: 3px; font-size: 9px; font-weight: 600;">${escHTML(p.action)}</span>
+                        <span style="color: #8b949e; font-family: 'JetBrains Mono', monospace;">${conf}%</span>
+                        <span style="color: #4a5568; font-size: 9px;">${escHTML(sourceLabel)}</span>
+                    </div>`;
+                }).join('');
+            } catch (e) {
+                container.innerHTML = '<div style="color: #666; text-align: center; padding: 10px;">Error loading</div>';
+            }
+        }
+
         async function updateSafetyMonitoring() {
             try {
                 // Fetch circuit breakers
@@ -4289,12 +4650,204 @@ HTML_TEMPLATE = """
             });
         }
         
+        async function loadRiskData() {
+            try {
+                const [riskResp, breakersResp, thresholdsResp, validatorResp] = await Promise.all([
+                    fetch(withPortfolio('/api/risk/status')),
+                    fetch('/api/safety/circuit-breakers'),
+                    fetch('/api/safety/thresholds'),
+                    fetch('/api/safety/data-validator')
+                ]);
+
+                // Risk status (kill switches, kelly, metrics)
+                if (riskResp.ok) {
+                    const risk = await riskResp.json();
+
+                    // Kill switch status
+                    const ksEl = document.getElementById('kill-switch-status');
+                    if (risk.kill_switches?.active) {
+                        ksEl.textContent = 'TRIGGERED';
+                        ksEl.style.background = '#da3633';
+                    } else {
+                        ksEl.textContent = 'SAFE';
+                        ksEl.style.background = '#238636';
+                    }
+
+                    // Risk limit gauges
+                    if (risk.kill_switches?.limits) {
+                        const limits = risk.kill_switches.limits;
+
+                        // Daily loss
+                        const dlCurrent = (limits.daily_loss?.current || 0) * 100;
+                        const dlLimit = (limits.daily_loss?.limit || 0.05) * 100;
+                        document.getElementById('risk-daily-loss-current').textContent = dlCurrent.toFixed(2) + '%';
+                        document.getElementById('risk-daily-loss-limit').textContent = dlLimit.toFixed(0) + '%';
+                        const dlBar = document.getElementById('risk-daily-loss-bar');
+                        const dlPct = dlLimit > 0 ? Math.min(100, (dlCurrent / dlLimit) * 100) : 0;
+                        dlBar.style.width = dlPct + '%';
+                        dlBar.className = 'risk-gauge-fill ' + (dlPct > 80 ? 'danger' : dlPct > 50 ? 'warning' : 'safe');
+
+                        // Consecutive losses
+                        const clCurrent = limits.consecutive_losses?.current || 0;
+                        const clLimit = limits.consecutive_losses?.limit || 5;
+                        document.getElementById('risk-consec-current').textContent = clCurrent;
+                        document.getElementById('risk-consec-limit').textContent = clLimit;
+                        const clBar = document.getElementById('risk-consec-bar');
+                        const clPct = clLimit > 0 ? Math.min(100, (clCurrent / clLimit) * 100) : 0;
+                        clBar.style.width = clPct + '%';
+                        clBar.className = 'risk-gauge-fill ' + (clPct > 80 ? 'danger' : clPct > 50 ? 'warning' : 'safe');
+
+                        // Max drawdown
+                        const ddCurrent = (limits.max_drawdown?.current || 0) * 100;
+                        const ddLimit = (limits.max_drawdown?.limit || 0.10) * 100;
+                        document.getElementById('risk-dd-current').textContent = ddCurrent.toFixed(2) + '%';
+                        document.getElementById('risk-dd-limit').textContent = ddLimit.toFixed(0) + '%';
+                        const ddBar = document.getElementById('risk-dd-bar');
+                        const ddPct = ddLimit > 0 ? Math.min(100, (ddCurrent / ddLimit) * 100) : 0;
+                        ddBar.style.width = ddPct + '%';
+                        ddBar.className = 'risk-gauge-fill ' + (ddPct > 80 ? 'danger' : ddPct > 50 ? 'warning' : 'safe');
+                    }
+
+                    // Leverage + risk metrics
+                    if (risk.risk_metrics) {
+                        const leverage = risk.risk_metrics.leverage || 0;
+                        document.getElementById('risk-leverage').textContent = leverage.toFixed(2) + 'x';
+                        const levBar = document.getElementById('risk-leverage-bar');
+                        const levPct = Math.min(100, leverage * 100);
+                        levBar.style.width = levPct + '%';
+                        levBar.className = 'risk-gauge-fill ' + (leverage > 0.8 ? 'danger' : leverage > 0.5 ? 'warning' : 'safe');
+
+                        document.getElementById('risk-total-exposure').textContent = formatCurrency(risk.risk_metrics.total_exposure || 0);
+                        const dailyPnlEl = document.getElementById('risk-daily-pnl');
+                        const dailyPnl = risk.risk_metrics.daily_pnl || 0;
+                        dailyPnlEl.textContent = formatCurrency(dailyPnl);
+                        dailyPnlEl.style.color = dailyPnl >= 0 ? '#4ade80' : '#f87171';
+                        document.getElementById('risk-current-capital').textContent = formatCurrency(risk.risk_metrics.current_capital || 0);
+                        document.getElementById('risk-win-rate').textContent = ((risk.risk_metrics.win_rate || 0) * 100).toFixed(1) + '%';
+                        document.getElementById('risk-max-dd').textContent = ((risk.risk_metrics.max_drawdown || 0) * 100).toFixed(2) + '%';
+                        const totalPnlEl = document.getElementById('risk-total-pnl');
+                        const totalPnl = risk.risk_metrics.total_pnl || 0;
+                        totalPnlEl.textContent = formatCurrency(totalPnl);
+                        totalPnlEl.style.color = totalPnl >= 0 ? '#4ade80' : '#f87171';
+                    }
+
+                    // Kelly sizing
+                    if (risk.kelly_sizing) {
+                        document.getElementById('portfolio-kelly').textContent =
+                            (risk.kelly_sizing.portfolio_kelly * 100).toFixed(1) + '%';
+
+                        const kellyTbody = document.getElementById('kelly-table');
+                        const positions = risk.kelly_sizing.current_positions || {};
+                        if (Object.keys(positions).length > 0) {
+                            // W-H3: escape symbol (DB-derived) before innerHTML
+                            kellyTbody.innerHTML = Object.entries(positions).map(([symbol, data]) => {
+                                const kellyColor = data.kelly_fraction > 0.1 ? '#4ade80' : data.kelly_fraction > 0.02 ? '#fbbf24' : '#f87171';
+                                const edgeColor = data.edge > 0 ? '#4ade80' : '#f87171';
+                                return `<tr style="border-bottom: 1px solid #21262d;">
+                                    <td style="padding: 4px 6px; color: #58a6ff; font-weight: 600;">${escHTML(symbol)}</td>
+                                    <td style="padding: 4px 6px; text-align: right; color: ${kellyColor}; font-family: 'JetBrains Mono', monospace;">${(data.kelly_fraction * 100).toFixed(1)}%</td>
+                                    <td style="padding: 4px 6px; text-align: right; font-family: 'JetBrains Mono', monospace;">${(data.win_rate * 100).toFixed(0)}%</td>
+                                    <td style="padding: 4px 6px; text-align: right; color: ${edgeColor}; font-family: 'JetBrains Mono', monospace;">${(data.edge * 100).toFixed(2)}%</td>
+                                </tr>`;
+                            }).join('');
+                        } else {
+                            kellyTbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: #666; padding: 12px;">No positions for Kelly calc</td></tr>';
+                        }
+                    }
+                }
+
+                // Circuit breakers
+                if (breakersResp.ok) {
+                    const breakersData = await breakersResp.json();
+                    const countEl = document.getElementById('breakers-open-count');
+                    const openCount = breakersData.open_count || 0;
+                    countEl.textContent = openCount + ' OPEN';
+                    countEl.style.background = openCount > 0 ? '#da3633' : '#238636';
+
+                    const grid = document.getElementById('circuit-breakers-grid');
+                    const breakers = breakersData.breakers || {};
+                    if (Object.keys(breakers).length > 0) {
+                        // W-H3: escape breaker name + state
+                        grid.innerHTML = Object.entries(breakers).map(([name, stats]) => {
+                            const stateColor = stats.state === 'closed' ? '#4ade80' : stats.state === 'open' ? '#f87171' : '#fbbf24';
+                            const stateIcon = stats.state === 'closed' ? 'CLOSED' : stats.state === 'open' ? 'OPEN' : 'HALF';
+                            const successRate = stats.total_calls > 0
+                                ? ((stats.successful_calls / stats.total_calls) * 100).toFixed(0)
+                                : '100';
+                            return `<div style="display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; background: #161b22; border-radius: 4px; font-size: 10px;">
+                                <span style="color: #c9d1d9; font-weight: 500;">${escHTML(name)}</span>
+                                <div style="display: flex; gap: 10px; align-items: center;">
+                                    <span style="color: #8b949e;">Calls: <span style="font-family: 'JetBrains Mono', monospace;">${escHTML(stats.total_calls || 0)}</span></span>
+                                    <span style="color: #8b949e;">Success: <span style="font-family: 'JetBrains Mono', monospace;">${escHTML(successRate)}%</span></span>
+                                    <span style="color: ${stateColor}; font-weight: 600; font-size: 9px; padding: 1px 5px; border-radius: 3px; border: 1px solid ${stateColor};">${stateIcon}</span>
+                                </div>
+                            </div>`;
+                        }).join('');
+                    } else {
+                        grid.innerHTML = '<div style="color: #666; text-align: center; padding: 12px; font-size: 11px;">No circuit breakers registered</div>';
+                    }
+                }
+
+                // Safety thresholds
+                if (thresholdsResp.ok) {
+                    const thresholds = await thresholdsResp.json();
+                    const grid = document.getElementById('safety-thresholds-grid');
+                    // W-H3: escape env-derived key+value
+                    grid.innerHTML = Object.entries(thresholds).map(([key, value]) => {
+                        const label = key.replace(/_/g, ' ').split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+                        return `<div style="background: #161b22; padding: 6px 8px; border-radius: 4px;">
+                            <div style="font-size: 9px; color: #8b949e;">${escHTML(label)}</div>
+                            <div style="font-size: 12px; font-weight: 600; font-family: 'JetBrains Mono', monospace; color: #c9d1d9;">${escHTML(value)}</div>
+                        </div>`;
+                    }).join('');
+                }
+
+                // Data validator
+                if (validatorResp.ok) {
+                    const validator = await validatorResp.json();
+                    document.getElementById('risk-total-validations').textContent = validator.total_validations || 0;
+                    const passRate = validator.pass_rate || 100;
+                    const passRateEl = document.getElementById('risk-pass-rate');
+                    passRateEl.textContent = passRate.toFixed(1) + '%';
+                    passRateEl.style.color = passRate >= 95 ? '#4ade80' : passRate >= 80 ? '#fbbf24' : '#f87171';
+                    const failedTotal = (validator.failed_stale || 0) + (validator.failed_spread || 0) + (validator.failed_price || 0) + (validator.failed_volume || 0);
+                    document.getElementById('risk-failed-total').textContent = failedTotal;
+                    document.getElementById('risk-failed-stale').textContent = validator.failed_stale || 0;
+                    document.getElementById('risk-failed-spread').textContent = validator.failed_spread || 0;
+                    document.getElementById('risk-failed-price').textContent = validator.failed_price || 0;
+                    document.getElementById('risk-failed-volume').textContent = validator.failed_volume || 0;
+                }
+            } catch (error) {
+                console.error('Error loading risk data:', error);
+            }
+        }
+
+        // Keyboard shortcuts for tab switching
+        document.addEventListener('keydown', (e) => {
+            // Don't fire when typing in inputs
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
+
+            const tabs = ['overview', 'watchlist', 'positions', 'strategies', 'trades', 'ml', 'performance', 'risk', 'logs'];
+            const key = parseInt(e.key);
+            if (key >= 1 && key <= tabs.length) {
+                const tabName = tabs[key - 1];
+                const tabEl = document.querySelectorAll('.tab')[key - 1];
+                if (tabEl) switchTab(tabName, tabEl);
+            }
+            // R = refresh (only standalone — preserves Cmd+R / Ctrl+R browser reload)
+            if ((e.key === 'r' || e.key === 'R') && !e.ctrlKey && !e.metaKey) {
+                e.preventDefault();
+                refreshData();
+            }
+        });
+
         // Initialize on load
         window.onload = async () => {
             await loadPortfolios(); // Load portfolio list first
             refreshData();
             refreshStrategies();
             updateSafetyMonitoring(); // Load safety monitoring on startup
+            loadRiskData(); // Load Risk tab data on startup
             loadLogs(); // Load logs immediately on startup
             updateMarketStatus(); // Load market status on startup
             connectWebSocket(); // Connect to WebSocket
@@ -4302,6 +4855,7 @@ HTML_TEMPLATE = """
             setInterval(refreshData, 5000); // Keep polling as fallback
             setInterval(refreshStrategies, 5000); // Update strategies tab
             setInterval(updateSafetyMonitoring, 10000); // Update safety monitoring every 10 seconds
+            setInterval(loadRiskData, 10000); // Update Risk tab every 10 seconds
             setInterval(loadLogs, 2000); // Update logs every 2 seconds
             setInterval(updateMarketStatus, 60000); // Update market status every minute
             setInterval(loadPortfolios, 30000); // Refresh portfolio list every 30 seconds
@@ -5835,6 +6389,11 @@ def ml_status():
 
     latest_models = {}
     for model_file in model_files:
+        try:
+            mtime = model_file.stat().st_mtime
+        except OSError:
+            continue  # Skip broken symlinks or deleted files
+
         # Handle both "high_accuracy" and single word model types
         stem_parts = model_file.stem.split("_")
         if stem_parts[0].lower() == "high" and len(stem_parts) > 1:
@@ -5844,13 +6403,10 @@ def ml_status():
 
         if model_type in model_info:
             model_info[model_type]["count"] += 1
-            if (
-                model_type not in latest_models
-                or model_file.stat().st_mtime > latest_models[model_type]["mtime"]
-            ):
+            if model_type not in latest_models or mtime > latest_models[model_type]["mtime"]:
                 latest_models[model_type] = {
                     "file": model_file,
-                    "mtime": model_file.stat().st_mtime,
+                    "mtime": mtime,
                 }
 
     # Build models list showing latest of each type
@@ -6903,6 +7459,9 @@ def get_risk_status():
         if risk_state_file.exists():
             with open(risk_state_file) as f:
                 risk_state = json.load(f)
+        # Guard against zero/missing capital (division-by-zero protection downstream)
+        if not risk_state.get("current_capital"):
+            risk_state["current_capital"] = 100000
 
         # Get real data from database
         from sync_db_reader import SyncDatabaseReader
@@ -7028,6 +7587,7 @@ def get_risk_status():
                     "current_capital": risk_state.get("current_capital", 100000),
                     "total_pnl": risk_state.get("total_pnl", 0),
                     "daily_pnl": round(daily_pnl, 2),
+                    "win_rate": round(win_rate, 3),
                 },
             }
         )
@@ -7358,6 +7918,8 @@ def get_safety_thresholds():
         "max_open_positions": os.getenv("MAX_OPEN_POSITIONS", "5"),
         "max_orders_per_minute": os.getenv("MAX_ORDERS_PER_MINUTE", "10"),
         "stop_loss_percent": os.getenv("STOP_LOSS_PERCENT", "2.0"),
+        "trailing_stop_percent": os.getenv("TRAILING_STOP_PERCENT", "5.0"),
+        "use_trailing_stop": os.getenv("USE_TRAILING_STOP", "true"),
         "take_profit_percent": os.getenv("TAKE_PROFIT_PERCENT", "3.0"),
         "data_staleness_seconds": os.getenv("DATA_STALENESS_SECONDS", "60"),
         "circuit_breaker_threshold": os.getenv("CIRCUIT_BREAKER_THRESHOLD", "5"),
