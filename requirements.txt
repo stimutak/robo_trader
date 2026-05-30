@@ -10,7 +10,7 @@ scipy~=1.10
 yfinance~=0.2.30
 python-dotenv==1.0.1
 pytest~=8.2
-pytest-asyncio==0.21.1  # C-4: synced across requirements files; bump both together.
+pytest-asyncio==0.24.0  # C-4: synced across requirements files; bump together. >=0.24 required for pytest 8 (0.21 hits 'FixtureDef has no attribute unittest').
 pydantic==2.6.4
 structlog~=23.0
 aiofiles~=23.0
