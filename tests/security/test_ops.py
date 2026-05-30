@@ -15,6 +15,7 @@ import os
 import plistlib
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -29,6 +30,14 @@ START_TRADER_SH = PROJECT_ROOT / "START_TRADER.sh"
 DEV_SETUP_MD = PROJECT_ROOT / "DEV_SETUP.md"
 CLAUDE_MD = PROJECT_ROOT / "CLAUDE.md"
 
+# The watchdog is a macOS launchd agent. Tests that invoke macOS-only tooling
+# (plutil), check absolute macOS paths inside the plist, or run the launchctl
+# installer can't pass on Linux CI — skip them off-Darwin.
+macos_only = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="macOS launchd / plutil / LaunchAgents only; not available on Linux CI",
+)
+
 
 # ---------------------------------------------------------------------------
 # Plist contract
@@ -41,6 +50,7 @@ def _load_plist() -> dict:
         return plistlib.load(fh)
 
 
+@macos_only
 def test_watchdog_plist_paths_exist():
     """ProgramArguments[0], StandardOut, StandardError must resolve to real,
     writable locations. Otherwise launchd silently fails."""
@@ -71,6 +81,7 @@ def test_watchdog_plist_paths_exist():
     ), "LimitLoadToSessionType must be 'Aqua' so the agent runs in the GUI session"
 
 
+@macos_only
 def test_watchdog_plist_lints_ok():
     """`plutil -lint` must pass; otherwise launchctl refuses to load it."""
     result = subprocess.run(
@@ -103,6 +114,7 @@ def test_install_watchdog_script_bash_syntax():
     assert result.returncode == 0, f"bash -n failed: {result.stderr}"
 
 
+@macos_only
 def test_install_watchdog_script_is_idempotent(tmp_path):
     """Run the installer twice into a fake LaunchAgents dir; both runs must
     exit 0. SKIP_LAUNCHCTL=1 skips the actual launchctl load (which would

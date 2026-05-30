@@ -64,8 +64,14 @@ elif PLATFORM == "Windows":
     GATEWAY_BASE = Path("C:/Jts")
     GATEWAY_SETTINGS = Path.home() / "Jts"
 else:
-    print(f"Unsupported platform: {PLATFORM}")
-    sys.exit(1)
+    # Unsupported platform (e.g. Linux CI). Keep the module importable so the
+    # platform-independent regexes (e.g. _READONLY_API_RE) can be unit-tested;
+    # main() refuses to actually run on unsupported platforms (see below).
+    IBC_DIR = PROJECT_ROOT / "IBC"
+    IBC_CONFIG = PROJECT_ROOT / "config" / "ibc" / "config.ini"
+    IBC_LOGS = PROJECT_ROOT / "config" / "ibc" / "logs"
+    GATEWAY_BASE = Path.home() / "Applications"
+    GATEWAY_SETTINGS = Path.home() / "Jts"
 
 # API ports
 PAPER_PORT = 4002
@@ -481,6 +487,11 @@ def show_status():
 
 
 def main():
+    # Hard refusal moved here from module import time so the module stays
+    # importable on unsupported platforms (e.g. Linux CI) for unit testing.
+    if PLATFORM not in ("Darwin", "Windows"):
+        print(f"Unsupported platform: {PLATFORM}")
+        sys.exit(1)
     parser = argparse.ArgumentParser(
         description="IB Gateway Manager for RoboTrader",
         formatter_class=argparse.RawDescriptionHelpFormatter,

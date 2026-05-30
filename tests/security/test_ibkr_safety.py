@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -160,6 +161,18 @@ async def test_subprocess_client_ignores_external_venv(monkeypatch, tmp_path):
             raise RuntimeError("stop here for test")
 
     monkeypatch.setattr(mod.subprocess, "Popen", _BoomPopen)
+
+    # On CI the test interpreter may resolve outside the production allowlist
+    # (e.g. /opt/hostedtoolcache on GitHub Actions). That allowlist is NOT what
+    # this test exercises — it verifies the external VIRTUAL_ENV is ignored — so
+    # trust the real interpreter's prefix to reach the Popen capture point. The
+    # attacker venv lives under tmp_path and remains outside the allowlist, so
+    # the assertions below still prove it was rejected.
+    monkeypatch.setattr(
+        mod,
+        "_INTERPRETER_PREFIX_ALLOWLIST",
+        mod._INTERPRETER_PREFIX_ALLOWLIST + (Path(sys.executable).resolve().parent,),
+    )
 
     client = mod.SubprocessIBKRClient()
     with pytest.raises(RuntimeError, match="stop here for test"):
