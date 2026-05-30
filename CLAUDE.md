@@ -322,6 +322,8 @@ Any code that hard-codes one of these forms will `AttributeError`, the broad `ex
 13. ✅ Stop-losses on restart - FIXED (recreated from DB positions)
 14. ✅ Persistent IBKR Connection - IMPLEMENTED (2026-05-16, prevents IBKR-throttle cascade from per-cycle reconnects)
 15. ✅ Startup safety gate - IMPLEMENTED (2026-05-23, prevents 2026-05-22-style silent livelock)
+16. ✅ Dashboard Risk tab - IMPLEMENTED (2026-05-30, gauges/Kelly/breakers/validation; backend data-plumbing follow-ups in `docs/dashboard_risk_tab_backend_followup.md`)
+17. ✅ CI pipeline repair - DONE (2026-05-30, fixed 9 broken dependency pins + lint + Linux-portable tests; core pipeline green. Remaining: mypy/E501 debt + docker-compose infra)
 
 ---
 
@@ -515,6 +517,16 @@ STOP_LOSS_PERCENT=2.0           # Fixed 2% stop
 | Running pytest while the trader is live (caused the 2026-05-24 → 05-26 outage) | Test isolation makes this safe; otherwise pytest's `Closed all database connections` teardown kills the runner | 2026-05-26 |
 | `START_TRADER.sh` killed Gateway after 30s port-not-listening | Wait 180s for port bind, early-exit only if Gateway process actually dies (IBC + 2FA routinely needs 60-180s) | 2026-05-26 |
 | `start_gateway()` cold-start timeout 120s | 240s — IBC + Gateway + 2FA approval often exceeds 120s | 2026-05-26 |
+
+### CI & Dependency Errors
+| Mistake | Correct Approach | Date |
+|---------|-----------------|------|
+| Assuming CI is green once `pip install` is fixed | The install failure (`tensorflow==2.15.1` + `keras~=3.0` = ResolutionImpossible) had masked EVERY test/lint/docker job — they never ran. Fixing install makes the suite run for the first time and exposes latent failures (164 fixture errors, 19 macOS-only tests). Re-run and inspect each job; never claim green from an install fix alone | 2026-05-30 |
+| Only validating `requirements.txt` when changing deps | The `test-suite` job also installs `requirements-prod.txt`, which was never validated and had ~6 broken pins (nonexistent `aioratelimiter`, `py-healthcheck==2.0.0`/`aiohttp-healthcheck==2.0.0` never published, cross-file `mypy`/`bandit`/`safety` conflicts). Run `pip install --dry-run -r requirements.txt -r requirements-dev.txt -r requirements-prod.txt` together before pushing | 2026-05-30 |
+| Trusting "passes locally" for a dependency or test fix | The dev `.venv` drifts newer than the pins (had pytest-asyncio 1.3.0 vs pinned 0.21.1, which breaks pytest 8 with `FixtureDef has no attribute unittest`). Verify dep fixes in a throwaway venv at the exact CI-pinned versions | 2026-05-30 |
+| Tests that assume the macOS dev box, run on Linux CI | Tests touching launchd plists / `plutil` / the `/opt/homebrew` interpreter allowlist fail on Linux. Use `@pytest.mark.skipif(sys.platform != "darwin")` or a test-only mock (e.g. add the real interpreter prefix to the allowlist inside the test). NEVER weaken the production NEW-IB-M1.1 allowlist to make a test pass | 2026-05-30 |
+| Re-applying a lint fix when the lint job still fails | The repo has TWO flake8 configs: `.flake8` (ignores E501) vs `deploy.yml`'s explicit `--ignore=` (enforces E501). Identify WHICH workflow's job is red and its exact command/black-version before editing — a fix for one config can break the other | 2026-05-30 |
+| Adding Python 3.13 to the test matrix | `pydantic==2.6.4` / pydantic-core won't build on 3.13 (`ForwardRef._evaluate` signature change) and the pinned tensorflow has no 3.13 wheel. Production runs 3.12; 3.13 needs `pydantic>=2.9` first | 2026-05-30 |
 
 ### Trading Logic Errors
 | Mistake | Correct Approach | Date |
