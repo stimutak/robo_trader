@@ -61,9 +61,10 @@ opentelemetry-api==1.22.0
 opentelemetry-sdk==1.22.0
 opentelemetry-instrumentation==0.43b0
 
-# Health Checks
-py-healthcheck==2.0.0
-aiohttp-healthcheck==2.0.0
+# Health Checks (currently unused — engine.py has its own HealthCheck class;
+# pinned to the latest published versions since 2.0.0 was never released)
+py-healthcheck==1.10.1
+aiohttp-healthcheck==1.3.1
 
 # System Monitoring
 psutil==5.9.6
