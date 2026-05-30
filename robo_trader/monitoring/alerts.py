@@ -565,9 +565,7 @@ def _send_runner_exit_sync(
         ).encode("utf-8")
         req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(
-                req, timeout=5
-            ) as resp:  # nosec B310 - operator-configured webhook URL (PagerDuty/Slack), not user input
+            with urllib.request.urlopen(req, timeout=5) as resp:  # nosec B310 - operator webhook
                 if resp.status not in (200, 201, 202, 204):
                     raise URLError(f"webhook returned {resp.status}")
         except Exception as e:
@@ -598,9 +596,7 @@ def _send_runner_exit_sync(
             method="POST",
         )
         try:
-            with urllib.request.urlopen(
-                req, timeout=5
-            ) as resp:  # nosec B310 - operator-configured webhook URL (PagerDuty/Slack), not user input
+            with urllib.request.urlopen(req, timeout=5) as resp:  # nosec B310 - operator webhook
                 if resp.status not in (200, 201, 202, 204):
                     raise URLError(f"slack returned {resp.status}")
         except Exception as e:

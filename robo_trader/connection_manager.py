@@ -229,7 +229,7 @@ class ConnectionManager:
                 # on purpose so multiple robo_trader processes coordinate via the
                 # same lock; symlink protection comes from the O_EXCL+0o600 create
                 # syscall plus O_NOFOLLOW, not from path randomization.
-                lock_path = "/tmp/ibkr_connect.lock"  # nosec B108 - deterministic by design; hardened via O_EXCL|O_NOFOLLOW|0o600 (see D-3 above)
+                lock_path = "/tmp/ibkr_connect.lock"  # nosec B108 - hardened, see D-3
                 try:
                     open_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
                     if hasattr(os, "O_NOFOLLOW"):
