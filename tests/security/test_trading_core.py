@@ -785,8 +785,9 @@ async def test_circuit_breaker_rejects_non_finite_price_c_13(monkeypatch) -> Non
     _place_order_with_circuit_breaker so every order path is guarded.
     """
     import math
-    from robo_trader.runner_async import AsyncRunner
+
     from robo_trader.execution import Order
+    from robo_trader.runner_async import AsyncRunner
 
     # Build a minimal runner with mocked dependencies. We only exercise the
     # finite-check, which short-circuits before any of the other gates.
@@ -812,6 +813,7 @@ def test_config_does_not_silently_flip_readonly_b_12(monkeypatch):
     monkeypatch.delenv("IBKR_LIVE_ALLOW_ORDERS", raising=False)
     # Force reload of the config module so the env vars take effect.
     import importlib
+
     import robo_trader.config as cfg_mod
 
     importlib.reload(cfg_mod)

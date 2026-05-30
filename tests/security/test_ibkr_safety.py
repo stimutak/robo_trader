@@ -503,6 +503,7 @@ def test_gateway_manager_start_refuses_without_readonly_ibn_h1():
     it returns False on the missing-readonly path.
     """
     import inspect
+
     import scripts.gateway_manager as gm
 
     source = inspect.getsource(gm.start_gateway)
@@ -521,6 +522,7 @@ def test_gateway_manager_start_uses_env_allowlist_ibn_h2():
     need them).
     """
     import inspect
+
     import scripts.gateway_manager as gm
 
     source = inspect.getsource(gm.start_gateway)
@@ -547,6 +549,7 @@ def test_robust_connection_refuses_cert_none_for_non_loopback_b_11():
     CERT_NONE to non-loopback hosts unless IBKR_GATEWAY_CAFILE is set.
     """
     import inspect
+
     import robo_trader.utils.robust_connection as rc
 
     source = inspect.getsource(rc)

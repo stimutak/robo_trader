@@ -4,6 +4,7 @@ Part of Phase 3 S5 implementation.
 """
 
 import asyncio
+import io
 import logging
 import time
 from dataclasses import dataclass
@@ -13,8 +14,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import joblib
 import numpy as np
 import pandas as pd
-
-import io
 
 from ._safe_load import verify_and_read, verify_file
 

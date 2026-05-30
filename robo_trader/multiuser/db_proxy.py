@@ -18,8 +18,9 @@ Usage:
     await scoped_db.store_market_data(...)    # → db.store_market_data(...)
 """
 
-from ..logger import get_logger
 from robo_trader.database_async import DEFAULT_PORTFOLIO_ID
+
+from ..logger import get_logger
 
 logger = get_logger(__name__)
 

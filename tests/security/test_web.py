@@ -476,6 +476,7 @@ def test_debug_is_unconditionally_false_a_1():
     only flips use_reloader, not debug.
     """
     import inspect
+
     import app as app_mod
 
     source = inspect.getsource(app_mod)
@@ -782,7 +783,9 @@ def test_ws_auth_end_to_end_against_real_library():
     token. This would have caught the v15 regression at PR time.
     """
     import asyncio
+
     import websockets
+
     from robo_trader.websocket_server import WebSocketManager
 
     async def go():

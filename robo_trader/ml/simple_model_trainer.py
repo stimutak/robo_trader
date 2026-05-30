@@ -3,6 +3,7 @@ Simple standalone ML model trainer for M3.
 Works with numpy arrays without complex configuration.
 """
 
+import io as _io_safe
 import json
 import os
 import warnings
@@ -13,10 +14,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import joblib
 import numpy as np
 import pandas as pd
-
-import io as _io_safe
-
-from ._safe_load import atomic_write_and_sign, sign_file, verify_and_read, verify_file
 from sklearn.ensemble import (
     GradientBoostingClassifier,
     GradientBoostingRegressor,
@@ -34,6 +31,8 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import cross_val_score, train_test_split
 from sklearn.preprocessing import StandardScaler
+
+from ._safe_load import atomic_write_and_sign, sign_file, verify_and_read, verify_file
 
 warnings.filterwarnings("ignore")
 

@@ -59,6 +59,7 @@ except ImportError:
     ws_client = None
     WEBSOCKET_ENABLED = False
 from .circuit_breaker import CircuitBreaker
+from .clients.subprocess_ibkr_client import SubprocessIBKRClient
 from .connection_health import HealthStatus, get_gateway_recovery_lock
 from .exceptions import KillSwitchTriggeredError
 from .portfolio import Portfolio, PositionSnapshot  # Import Portfolio class from portfolio.py file
@@ -69,7 +70,6 @@ from .stop_loss_monitor import StopLossMonitor, StopType
 from .strategies import MLStrategy, sma_crossover_signals
 from .strategies.ml_enhanced_strategy import MLEnhancedStrategy
 from .utils.connection_recovery import OrderRateLimiter
-from .clients.subprocess_ibkr_client import SubprocessIBKRClient
 
 # Initialize logger early for use in import error handling
 logger = get_logger(__name__)
