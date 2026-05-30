@@ -54,8 +54,10 @@ def _agent_b_exit_audit_landed() -> bool:
 def _agent_b_lsof_retry_landed() -> bool:
     """Agent B: lsof pre-flight tolerates TimeoutExpired transients.
 
-    The retry helper is defined inline inside `AsyncRunner.run()`, so we
-    detect it structurally via the source.
+    The retry contract now lives in the module-level ``_lsof_port_listening``
+    helper (refactored out of the inline ``test_port_open_lsof`` that existed
+    when this probe was first written), so we detect it structurally via the
+    source.
     """
     try:
         src = pathlib.Path(
@@ -65,11 +67,12 @@ def _agent_b_lsof_retry_landed() -> bool:
         ).read_text()
     except OSError:
         return False
-    # The fix introduces max_attempts + TimeoutExpired retry.
+    # The fix introduces max_attempts + TimeoutExpired retry, surfaced via
+    # the _lsof_port_listening helper.
     return (
         "TimeoutExpired" in src
         and "max_attempts" in src
-        and "test_port_open_lsof" in src
+        and "_lsof_port_listening" in src
     )
 
 
