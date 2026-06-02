@@ -28,6 +28,18 @@ from flask_cors import CORS
 
 load_dotenv()
 
+# Multi-process logging fix: the dashboard and the trading runner both emit logs,
+# but logging.handlers.RotatingFileHandler is NOT multi-process safe. Two writers
+# on one file race on rotation — the loser strands its fd on the renamed inode
+# (.log.1) and grows it past the 10MB cap forever, defeating rotation. Give the
+# dashboard its own log file so each file has a single writer and rotation works.
+# The runner keeps robo_trader.log, which is the file the /api/logs panel reads.
+# Must run before the first robo_trader import, which lazily configures logging.
+os.environ["LOG_FILE"] = os.getenv(
+    "DASHBOARD_LOG_FILE",
+    str(Path(__file__).resolve().parent / "dashboard.log"),
+)
+
 from robo_trader.analytics.performance import PerformanceAnalyzer  # noqa: E402
 
 # Import our modules - using lazy imports to avoid startup issues
@@ -3110,7 +3122,7 @@ HTML_TEMPLATE = """
                     `;
                     container.appendChild(logDiv);
                 });
-                
+
                 // Update loaded count
                 loadedLogCount = deduplicatedLogs.length;
                 
@@ -4085,6 +4097,16 @@ HTML_TEMPLATE = """
             }
         }
         
+        // Cap the live log DOM so a long-lived tab can't grow #log-container
+        // without bound (was the Safari "reloaded due to memory" cause: the
+        // addLog() and realtime 'log' WS handlers appendChild forever).
+        const MAX_LOG_ENTRIES = 500;
+        function trimLogContainer(container) {
+            while (container.childElementCount > MAX_LOG_ENTRIES) {
+                container.removeChild(container.firstElementChild);
+            }
+        }
+
         function addLog(message) {
             const container = document.getElementById('log-container');
             const entry = document.createElement('div');
@@ -4093,6 +4115,7 @@ HTML_TEMPLATE = """
             // W-H3: escape time and message (message comes from WS or other code paths)
             entry.innerHTML = `<span class="log-time">${escHTML(time)}</span><span>${escHTML(message)}</span>`;
             container.appendChild(entry);
+            trimLogContainer(container);
             // Auto-scroll if enabled
             const autoScrollEnabled = document.getElementById('auto-scroll-toggle')?.checked;
             if (autoScrollEnabled) {
@@ -4287,6 +4310,7 @@ HTML_TEMPLATE = """
             }
 
             container.appendChild(entry);
+            trimLogContainer(container);
 
             // Auto-scroll if enabled
             const autoScrollEnabled = document.getElementById('auto-scroll-toggle')?.checked;
@@ -4294,7 +4318,7 @@ HTML_TEMPLATE = """
                 container.scrollTop = container.scrollHeight;
             }
         }
-        
+
         function updateMarketPrice(symbol, price, bid, ask, volume) {
             console.log('updateMarketPrice called:', symbol, price);
             // Update watchlist prices in real-time
