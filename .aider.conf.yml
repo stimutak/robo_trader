@@ -1,0 +1,30 @@
+# RoboTrader — Aider project config
+# Automated trading system (Python + Flask + IB Gateway)
+
+# Default coding model
+model: ollama/qwen2.5-coder:32b
+
+# Edit format
+edit-format: diff
+
+# Git
+auto-commits: true
+attribute-author: false
+attribute-committer: false
+
+# Repo map — trading code needs careful context
+map-tokens: 4096
+map-refresh: auto
+
+# Stream output
+stream: true
+show-diffs: true
+suggest-shell-commands: true
+
+# Auto-lint Python
+lint-cmd: python3 -m py_compile
+auto-lint: true
+
+# Test command (uses venv)
+# test-cmd: .venv/bin/python -m pytest tests/ -x -q
+# auto-test: true

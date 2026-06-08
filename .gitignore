@@ -45,10 +45,11 @@ launchd_*.log
 # Runtime data files
 logs/monitoring/metrics_*.jsonl
 logs/monitoring/dashboard.json
-data/risk_state.json
-data/test_risk_state.json
-data/kill_switch_state.json
+# all runtime trading state (risk/kill-switch/preflight); no source lives here
+data/
 reports/production_validation.json
+# generated artifacts; regenerate from the .md via reports/_render_pdf.py
+reports/*.pdf
 ml_predictions.json
 
 # ML model artifacts (regenerated)
