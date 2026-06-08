@@ -9,13 +9,11 @@ Tests the Phase 3 S5 implementation including:
 
 import asyncio
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List
-from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from robo_trader.features.engine import FeatureSet
 from robo_trader.strategies.framework import Signal, SignalType
@@ -29,7 +27,7 @@ from robo_trader.strategies.pairs_trading import (
 )
 
 
-class TestMeanReversionStrategy(unittest.TestCase):
+class TestMeanReversionStrategy(unittest.IsolatedAsyncioTestCase):
     """Test mean reversion strategy implementation."""
 
     def setUp(self):
@@ -39,6 +37,17 @@ class TestMeanReversionStrategy(unittest.TestCase):
             symbols=self.symbols,
             use_ml_enhancement=False,  # Test without ML first
         )
+
+    def tearDown(self):
+        """Clean up test fixtures."""
+        import shutil
+        import os
+
+        if os.path.exists("model_registry"):
+            try:
+                shutil.rmtree("model_registry")
+            except Exception:
+                pass
 
     def _create_test_data(self, symbol: str, periods: int = 100) -> pd.DataFrame:
         """Create synthetic test data."""
@@ -79,12 +88,12 @@ class TestMeanReversionStrategy(unittest.TestCase):
         self.assertEqual(self.strategy.bb_period, 20)
         self.assertEqual(self.strategy.zscore_threshold, 2.0)
 
-    async def test_reversion_score_calculation(self):
+    def test_reversion_score_calculation(self):
         """Test mean reversion score calculation."""
         data = self._create_test_data("AAPL")
 
         # Create feature set
-        features = FeatureSet()
+        features = FeatureSet(timestamp=datetime.now(), symbol="AAPL")
         features.bb_upper = 105
         features.bb_middle = 100
         features.bb_lower = 95
@@ -101,19 +110,22 @@ class TestMeanReversionStrategy(unittest.TestCase):
         """Test signal generation for mean reversion."""
         # Initialize market data
         market_data = {symbol: self._create_test_data(symbol) for symbol in self.symbols}
+        # Force AAPL price to be extremely low (oversold)
+        market_data["AAPL"].loc[market_data["AAPL"].index[-1], "close"] = 85.0
 
         # Create features
         features = {}
         for symbol in self.symbols:
-            feature_set = FeatureSet()
+            feature_set = FeatureSet(timestamp=datetime.now(), symbol=symbol)
             feature_set.bb_upper = 105
             feature_set.bb_middle = 100
             feature_set.bb_lower = 95
-            feature_set.rsi = 20 if symbol == "AAPL" else 50  # AAPL oversold
+            feature_set.rsi = 5 if symbol == "AAPL" else 50  # AAPL oversold
             feature_set.atr = 2.0
             features[symbol] = feature_set
 
         # Initialize strategy
+        self.strategy.zscore_threshold = 1.0
         await self.strategy._initialize(market_data)
 
         # Generate signals
@@ -124,11 +136,11 @@ class TestMeanReversionStrategy(unittest.TestCase):
 
         # Check signal properties
         aapl_signals = [s for s in signals if s.symbol == "AAPL"]
-        if aapl_signals:
-            signal = aapl_signals[0]
-            self.assertEqual(signal.signal_type, SignalType.BUY)
-            self.assertIsNotNone(signal.stop_loss)
-            self.assertIsNotNone(signal.take_profit)
+        self.assertEqual(len(aapl_signals), 1, "Expected exactly one AAPL buy signal")
+        signal = aapl_signals[0]
+        self.assertEqual(signal.signal_type, SignalType.BUY)
+        self.assertIsNotNone(signal.stop_loss)
+        self.assertIsNotNone(signal.take_profit)
 
     def test_ml_feature_extraction(self):
         """Test ML feature extraction."""
@@ -144,8 +156,7 @@ class TestMeanReversionStrategy(unittest.TestCase):
         self.assertGreater(len(features), 0)
 
         # Check feature vector dimensions
-        if features:
-            self.assertEqual(len(features[0]), 9)  # 9 features
+        self.assertEqual(len(features[0]), 9)  # 9 features
 
     def test_ml_label_generation(self):
         """Test ML label generation for training."""
@@ -165,7 +176,7 @@ class TestMeanReversionStrategy(unittest.TestCase):
             self.assertIn(label, [0, 1])
 
 
-class TestPairsTrading(unittest.TestCase):
+class TestPairsTrading(unittest.IsolatedAsyncioTestCase):
     """Test pairs trading strategies."""
 
     def setUp(self):
@@ -246,14 +257,13 @@ class TestPairsTrading(unittest.TestCase):
 
     def test_half_life_calculation(self):
         """Test mean reversion half-life calculation."""
-        # Create mean-reverting spread
-        spread = pd.Series([0, 1, 0.5, 0.25, 0.125, 0.0625])
+        # Create mean-reverting spread of length >= 11
+        spread = pd.Series([1.0 / (2**i) for i in range(15)])
 
         half_life = self.strategy._calculate_half_life(spread)
 
-        # Should be approximately 1 (perfect half-life series)
-        self.assertGreater(half_life, 0)
-        self.assertLess(half_life, 100)
+        # Should be approximately 1.0 (perfect half-life series)
+        self.assertAlmostEqual(half_life, 1.0, places=1)
 
     def test_ml_enhanced_pairs(self):
         """Test ML-enhanced pairs trading."""
@@ -291,7 +301,7 @@ class TestPairsTrading(unittest.TestCase):
         self.assertLessEqual(hurst, 1)
 
 
-class TestStatisticalArbitrage(unittest.TestCase):
+class TestStatisticalArbitrage(unittest.IsolatedAsyncioTestCase):
     """Test statistical arbitrage strategy."""
 
     def setUp(self):
@@ -389,7 +399,7 @@ class TestStatisticalArbitrage(unittest.TestCase):
             "MSFT": 0.7,
             "AMZN": 0.6,
             "TSLA": 0.5,
-            "FB": 0.4,
+            "META": 0.4,
         }
 
         weights = self.strategy.generate_portfolio_weights(scores)
@@ -401,8 +411,9 @@ class TestStatisticalArbitrage(unittest.TestCase):
         self.assertAlmostEqual(sum(weights.values()), 1.0, places=5)
 
         # Higher scores should have higher weights
-        if "AAPL" in weights and "TSLA" in weights:
-            self.assertGreater(weights["AAPL"], weights["TSLA"])
+        self.assertIn("AAPL", weights)
+        self.assertIn("TSLA", weights)
+        self.assertGreater(weights["AAPL"], weights["TSLA"])
 
     def test_sector_neutrality(self):
         """Test sector neutrality application."""
@@ -426,7 +437,7 @@ class TestStatisticalArbitrage(unittest.TestCase):
             self.assertLessEqual(score, 1)
 
 
-class TestIntegration(unittest.TestCase):
+class TestIntegration(unittest.IsolatedAsyncioTestCase):
     """Integration tests for mean reversion suite."""
 
     def test_strategy_suite_creation(self):
@@ -447,6 +458,8 @@ class TestIntegration(unittest.TestCase):
         strategy = CointegrationPairsStrategy(
             lookback_days=30,
             use_ml_enhancement=False,
+            min_correlation=0.3,
+            max_cointegration_pvalue=0.2,
         )
 
         # Create cointegrated data
@@ -483,35 +496,3 @@ class TestIntegration(unittest.TestCase):
         summary = strategy.get_portfolio_summary()
         self.assertIn("active_pairs", summary)
         self.assertIn("total_pairs_discovered", summary)
-
-
-def run_tests():
-    """Run all tests."""
-    # Create test suite
-    loader = unittest.TestLoader()
-    suite = unittest.TestSuite()
-
-    # Add test cases
-    suite.addTests(loader.loadTestsFromTestCase(TestMeanReversionStrategy))
-    suite.addTests(loader.loadTestsFromTestCase(TestPairsTrading))
-    suite.addTests(loader.loadTestsFromTestCase(TestStatisticalArbitrage))
-    suite.addTests(loader.loadTestsFromTestCase(TestIntegration))
-
-    # Run tests
-    runner = unittest.TextTestRunner(verbosity=2)
-    result = runner.run(suite)
-
-    return result.wasSuccessful()
-
-
-if __name__ == "__main__":
-    # Run async tests with asyncio
-    success = run_tests()
-
-    print("\n" + "=" * 60)
-    if success:
-        print("✅ All mean reversion strategy tests passed!")
-    else:
-        print("❌ Some tests failed. Please review the output above.")
-
-    exit(0 if success else 1)

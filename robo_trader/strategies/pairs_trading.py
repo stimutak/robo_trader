@@ -701,8 +701,9 @@ class StatisticalArbitrageStrategy:
             # Check for mean crossing frequency
             prices = df["close"].tail(50)
             mean = prices.rolling(20).mean()
-            crosses = np.sum(np.diff(np.sign(prices - mean)) != 0)
-            crossing_freq = crosses / len(prices)
+            diff_series = (prices - mean).dropna()
+            crosses = np.sum(np.diff(np.sign(diff_series)) != 0) if len(diff_series) > 1 else 0
+            crossing_freq = crosses / len(diff_series) if len(diff_series) > 0 else 0
 
             # Combined score
             reversion_score = 0.0
@@ -909,14 +910,40 @@ class StatisticalArbitrageStrategy:
 
         if total_score > 0:
             for symbol, score in selected:
-                # Weight proportional to score with max cap
-                weight = score / total_score
-                weights[symbol] = min(weight, 1.0 / self.max_positions * 2)  # Max 2x equal weight
+                weights[symbol] = score / total_score
 
-        # Normalize weights to sum to 1
-        total_weight = sum(weights.values())
-        if total_weight > 0:
-            weights = {s: w / total_weight for s, w in weights.items()}
+        # Iteratively apply cap and distribute remaining weights
+        max_pos = max(1, self.max_positions)
+        max_cap = 1.0 / max_pos * 2
+
+        for _ in range(10):
+            total_weight = sum(weights.values())
+            if total_weight <= 0:
+                break
+
+            normalized = {s: w / total_weight for s, w in weights.items()}
+            exceeded = {s: w for s, w in normalized.items() if w > max_cap}
+            if not exceeded:
+                weights = normalized
+                break
+
+            for s in exceeded:
+                weights[s] = max_cap
+
+            uncapped = [s for s in normalized if s not in exceeded]
+            if not uncapped:
+                weights = {s: 1.0 / len(normalized) for s in normalized}
+                break
+
+            remaining_weight = 1.0 - sum(weights[s] for s in exceeded)
+            uncapped_sum = sum(normalized[s] for s in uncapped)
+
+            if uncapped_sum > 0:
+                for s in uncapped:
+                    weights[s] = normalized[s] / uncapped_sum * remaining_weight
+            else:
+                for s in uncapped:
+                    weights[s] = remaining_weight / len(uncapped)
 
         return weights
 
@@ -1035,7 +1062,9 @@ class MLEnhancedPairsTrading(CointegrationPairsStrategy):
 
         # Spread dynamics
         spread = prices_a - pair_stats.hedge_ratio * prices_b
-        spread_returns = spread.pct_change().dropna()
+        # Use change in spread normalized by standard deviation to avoid division-by-zero on zero crossings
+        spread_std = pair_stats.spread_std if pair_stats.spread_std > 0 else 1.0
+        spread_returns = (spread.diff() / spread_std).dropna()
 
         features.extend(
             [
@@ -1054,6 +1083,7 @@ class MLEnhancedPairsTrading(CointegrationPairsStrategy):
             # Simplified Hurst calculation using R/S analysis
             lags = range(2, min(20, len(series) // 2))
             tau = []
+            valid_lags = []
 
             for lag in lags:
                 # Calculate R/S statistic
@@ -1074,10 +1104,11 @@ class MLEnhancedPairsTrading(CointegrationPairsStrategy):
 
                 if rs_values:
                     tau.append(np.mean(rs_values))
+                    valid_lags.append(lag)
 
             if len(tau) > 2:
                 # Fit log-log relationship
-                log_lags = np.log(list(lags[: len(tau)]))
+                log_lags = np.log(valid_lags)
                 log_tau = np.log(tau)
 
                 # Linear regression for Hurst exponent
