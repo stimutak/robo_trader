@@ -1,1 +1,1 @@
-HANDOFF_2026-05-30_risk-tab-and-ci-repair.md
+HANDOFF_2026-06-13_pnl-and-data-quality-investigation.md
