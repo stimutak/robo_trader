@@ -14,7 +14,7 @@ import signal
 import subprocess
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from functools import wraps
 from pathlib import Path
@@ -7483,8 +7483,10 @@ def get_risk_status():
         if risk_state_file.exists():
             with open(risk_state_file) as f:
                 risk_state = json.load(f)
-        # Guard against zero/missing capital (division-by-zero protection downstream)
-        if not risk_state.get("current_capital"):
+        # Guard against zero/missing/negative capital (division-by-zero and
+        # negative-leverage protection downstream); mirror get_kelly_parameters.
+        capital = risk_state.get("current_capital")
+        if not isinstance(capital, (int, float)) or capital <= 0:
             risk_state["current_capital"] = 100000
 
         # Get real data from database
@@ -7515,13 +7517,22 @@ def get_risk_status():
             else:
                 break
 
-        # Calculate daily loss
-        today_trades = [
-            t
-            for t in trades
-            if t.get("timestamp")
-            and datetime.fromisoformat(t["timestamp"]).date() == datetime.now().date()
-        ]
+        # Calculate daily loss. Trade timestamps are stored as naive-UTC strings
+        # (SQLite CURRENT_TIMESTAMP), so attach UTC and convert to ET before
+        # comparing dates -- otherwise extended-hours trades after 8 PM ET land
+        # on the wrong calendar day (mirrors the ET handling near line 6058).
+        from zoneinfo import ZoneInfo
+
+        et_tz = ZoneInfo("America/New_York")
+        today_et = datetime.now(et_tz).date()
+        today_trades = []
+        for t in trades:
+            if not t.get("timestamp"):
+                continue
+            ts = datetime.fromisoformat(t["timestamp"].replace(" ", "T"))
+            ts_utc = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+            if ts_utc.astimezone(et_tz).date() == today_et:
+                today_trades.append(t)
         daily_pnl = sum((t.get("pnl") or 0) for t in today_trades)
         daily_loss_pct = (
             abs(daily_pnl / risk_state.get("current_capital", 100000)) if daily_pnl < 0 else 0
