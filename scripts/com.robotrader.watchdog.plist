@@ -29,11 +29,16 @@
     <key>KeepAlive</key>
     <true/>
 
+    <!-- 2026-07-10: must NOT point at watchdog.log. launchd holds a
+         persistent write fd on these paths, so any child output streamed
+         here bypasses watchdog.sh's rotate_log() entirely (69 GB disk-fill
+         incident). watchdog.sh writes its own rotated watchdog.log; this
+         file only catches stray stdout/stderr (e.g. bash errors). -->
     <key>StandardOutPath</key>
-    <string>/Users/oliver/Projects/robo_trader/watchdog.log</string>
+    <string>/Users/oliver/Projects/robo_trader/watchdog_launchd.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/oliver/Projects/robo_trader/watchdog.log</string>
+    <string>/Users/oliver/Projects/robo_trader/watchdog_launchd.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>

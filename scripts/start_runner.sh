@@ -80,8 +80,10 @@ echo "4. Starting runner..."
 echo "   Symbols: $SYMBOLS"
 
 export LOG_FILE="$SCRIPT_DIR/robo_trader.log"
-# Redirect output to log file so subprocess.run can complete
-$PYTHON -m robo_trader.runner_async --symbols "$SYMBOLS" --force-connect >> "$LOG_FILE" 2>&1 &
+# Redirect output to log file so subprocess.run can complete.
+# --force-connect removed 2026-07-10 (testing-only flag; see CLAUDE.md
+# Common Mistakes and the disk-fill incident) — same fix as START_TRADER.sh.
+$PYTHON -m robo_trader.runner_async --symbols "$SYMBOLS" >> "$LOG_FILE" 2>&1 &
 RUNNER_PID=$!
 
 sleep 3

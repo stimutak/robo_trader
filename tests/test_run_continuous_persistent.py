@@ -102,6 +102,31 @@ async def test_persistent_runner_starts_subprocess_only_once_across_cycles():
 import pytest
 
 from robo_trader.exceptions import KillSwitchTriggeredError
+from robo_trader.runner_async import intercycle_wait_seconds
+
+
+class TestIntercycleWait:
+    """Regression guard for the 2026-07-10 disk-fill incident.
+
+    With --force-connect and the market closed, run_continuous skipped BOTH
+    wait branches (top-of-loop market wait AND bottom-of-loop interval sleep)
+    and spun at thousands of iterations/second, filling watchdog.log at
+    ~20 GB/hour. The inter-cycle wait must be positive on EVERY path.
+    """
+
+    def test_wait_when_market_closed_is_long_not_zero(self):
+        # force-connect + market closed: must back off, not spin
+        assert intercycle_wait_seconds(15, trading_allowed=False) >= 120
+
+    def test_wait_when_trading_uses_interval(self):
+        assert intercycle_wait_seconds(15, trading_allowed=True) == 15
+
+    def test_wait_has_positive_floor_even_with_zero_interval(self):
+        assert intercycle_wait_seconds(0, trading_allowed=True) >= 1
+        assert intercycle_wait_seconds(0, trading_allowed=False) >= 1
+
+    def test_wait_respects_interval_larger_than_closed_floor(self):
+        assert intercycle_wait_seconds(600, trading_allowed=False) == 600
 
 
 @pytest.mark.asyncio

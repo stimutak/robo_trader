@@ -419,7 +419,11 @@ echo ""
 # Step 5: Start dashboard (includes WebSocket server)
 echo "5. Starting dashboard with WebSocket server..."
 export DASH_PORT=5555
-$PYTHON app.py &
+# Redirect stdout/stderr: backgrounded children otherwise inherit the
+# caller's fds — under the watchdog/launchd that was watchdog.log, which
+# bypassed all rotation and filled the disk on 2026-07-10. Truncate on
+# each start so these can't grow unbounded across restarts.
+$PYTHON app.py > "$SCRIPT_DIR/dashboard_stdout.log" 2>&1 &
 DASH_PID=$!
 sleep 2
 
@@ -439,7 +443,12 @@ echo ""
 
 export LOG_FILE="$SCRIPT_DIR/robo_trader.log"
 
-$PYTHON -m robo_trader.runner_async --symbols "$SYMBOLS" --force-connect &
+# --force-connect removed 2026-07-10: it is a testing flag ("Force IBKR
+# connection even when market is closed") that, combined with a health-gate
+# skip, drove the zero-backoff spin loop in the disk-fill incident. Outside
+# market hours the runner now sleeps until open (extended hours still
+# covered by ENABLE_EXTENDED_HOURS via is_trading_allowed).
+$PYTHON -m robo_trader.runner_async --symbols "$SYMBOLS" > "$SCRIPT_DIR/runner_stdout.log" 2>&1 &
 TRADER_PID=$!
 
 echo "   ✓ Trading system started (PID: $TRADER_PID)"

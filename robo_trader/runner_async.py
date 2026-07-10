@@ -4515,6 +4515,26 @@ async def run_once(
     await runner.run(symbols)
 
 
+# 2026-07-10 disk-fill incident: with --force-connect and the market closed,
+# run_continuous skipped both wait branches and spun at loop speed, flooding
+# watchdog.log at ~20 GB/hour. Inter-cycle wait must be positive on every path.
+FORCE_CONNECT_CLOSED_WAIT_SECONDS = 120
+
+
+def intercycle_wait_seconds(interval_seconds: int, trading_allowed: bool) -> float:
+    """Seconds to sleep between run_continuous iterations. Never returns < 1.
+
+    When trading is not allowed, back off to at least
+    FORCE_CONNECT_CLOSED_WAIT_SECONDS. Reachable with --force-connect (the
+    top-of-loop closed-market branch is skipped entirely) or, without the
+    flag, on the single iteration where the market closes mid-cycle before
+    this bottom-of-loop re-check.
+    """
+    if trading_allowed:
+        return max(1.0, float(interval_seconds))
+    return max(1.0, float(interval_seconds), float(FORCE_CONNECT_CLOSED_WAIT_SECONDS))
+
+
 async def run_continuous(
     symbols: Optional[List[str]] = None,
     duration: str = "1 D",
@@ -4718,12 +4738,19 @@ async def run_continuous(
 
                     await portfolio_runner.teardown(full_cleanup=False)
 
-                # Wait before next iteration
-                if not shutdown_flag and is_trading_allowed():
-                    logger.info(
-                        f"Waiting {interval_seconds/60:.1f} minutes before next iteration..."
+                # Wait before next iteration. This sleep must run on EVERY
+                # path: with --force-connect and the market closed, neither
+                # top-of-loop wait branch runs, so gating this sleep on
+                # is_trading_allowed() spins the loop with zero delay
+                # (2026-07-10 disk-fill incident, ~20 GB/hour of logs).
+                if not shutdown_flag:
+                    intercycle_wait = intercycle_wait_seconds(
+                        interval_seconds, is_trading_allowed()
                     )
-                    await asyncio.sleep(interval_seconds)
+                    logger.info(
+                        f"Waiting {intercycle_wait/60:.1f} minutes before next iteration..."
+                    )
+                    await asyncio.sleep(intercycle_wait)
 
             except asyncio.CancelledError:
                 logger.info("Trading loop cancelled")
