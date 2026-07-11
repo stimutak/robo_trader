@@ -25,7 +25,7 @@ from dataclasses import dataclass  # isort:skip  # noqa: E402
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 from ib_async import Stock
@@ -4535,6 +4535,32 @@ def intercycle_wait_seconds(interval_seconds: int, trading_allowed: bool) -> flo
     return max(1.0, float(interval_seconds), float(FORCE_CONNECT_CLOSED_WAIT_SECONDS))
 
 
+async def sleep_unless_shutdown(
+    total_seconds: float,
+    should_stop: Callable[[], bool],
+    poll_seconds: float = 1.0,
+) -> None:
+    """Sleep up to total_seconds, returning early once should_stop() is True.
+
+    run_continuous's SIGINT/SIGTERM handler only flips a local shutdown_flag;
+    it does not cancel the running coroutine. A single long asyncio.sleep()
+    (up to 1800s for the overnight closed-market branch, or intercycle_wait for
+    the inter-cycle wait) therefore delays a graceful shutdown by up to its full
+    duration. Sleeping in poll_seconds chunks and re-checking should_stop() caps
+    that delay at ~poll_seconds. Pass `lambda: shutdown_flag` for should_stop.
+    """
+    if should_stop():
+        return
+    remaining = float(total_seconds)
+    poll = float(poll_seconds)
+    while remaining > 0:
+        chunk = min(poll, remaining) if poll > 0 else remaining
+        await asyncio.sleep(chunk)
+        remaining -= chunk
+        if should_stop():
+            return
+
+
 async def run_continuous(
     symbols: Optional[List[str]] = None,
     duration: str = "1 D",
@@ -4605,7 +4631,7 @@ async def run_continuous(
                 if session in ["after-hours", "pre-market"]:
                     wait_time = 120  # 2 minutes during extended hours
                     logger.info(f"Extended hours ({session}). Polling every 2 minutes...")
-                    await asyncio.sleep(wait_time)
+                    await sleep_unless_shutdown(wait_time, lambda: shutdown_flag)
                     continue
                 # Within 1 hour of open: moderate polling (5 min)
                 elif seconds_to_open < 3600:
@@ -4613,7 +4639,7 @@ async def run_continuous(
                     logger.info(
                         f"Market opens in {seconds_to_open/60:.0f} min. Polling every 5 minutes..."
                     )
-                    await asyncio.sleep(wait_time)
+                    await sleep_unless_shutdown(wait_time, lambda: shutdown_flag)
                     continue
                 else:
                     # Market fully closed (overnight/weekend): long wait (30 min max)
@@ -4622,7 +4648,7 @@ async def run_continuous(
                         f"Market {session}. Next open in {seconds_to_open/3600:.1f} hours. "
                         f"Sleeping {wait_time/60:.1f} minutes..."
                     )
-                    await asyncio.sleep(wait_time)
+                    await sleep_unless_shutdown(wait_time, lambda: shutdown_flag)
                     continue
             elif force_connect and not is_trading_allowed():
                 logger.warning(
@@ -4750,7 +4776,7 @@ async def run_continuous(
                     logger.info(
                         f"Waiting {intercycle_wait/60:.1f} minutes before next iteration..."
                     )
-                    await asyncio.sleep(intercycle_wait)
+                    await sleep_unless_shutdown(intercycle_wait, lambda: shutdown_flag)
 
             except asyncio.CancelledError:
                 logger.info("Trading loop cancelled")
@@ -4779,7 +4805,7 @@ async def run_continuous(
                 # owns its connection lifecycle.
                 if not shutdown_flag:
                     logger.info("Waiting 1 minute before retry...")
-                    await asyncio.sleep(60)
+                    await sleep_unless_shutdown(60, lambda: shutdown_flag)
 
     finally:
         # Final cleanup: all portfolios get full disconnect on process exit

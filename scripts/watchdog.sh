@@ -13,6 +13,10 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 LOG_FILE="$PROJECT_DIR/robo_trader.log"
 LOG_FILE_1="$PROJECT_DIR/robo_trader.log.1"
 WATCHDOG_LOG="$PROJECT_DIR/watchdog.log"
+# launchd's StandardOutPath/StandardErrorPath target (see com.robotrader.watchdog.plist).
+# launchd holds a persistent O_APPEND fd on this file, so it must be capped IN PLACE
+# (copy-then-truncate) — an mv would leave writers appending to the moved inode.
+WATCHDOG_LAUNCHD_LOG="$PROJECT_DIR/watchdog_launchd.log"
 WATCHDOG_LOG_MAX_SIZE=10485760  # 10MB max log size
 STALE_MINUTES="${1:-5}"  # Default 5 minutes
 CHECK_INTERVAL=60        # Check every 60 seconds
@@ -55,6 +59,22 @@ rotate_log() {
         if [ "$size" -gt "$WATCHDOG_LOG_MAX_SIZE" ]; then
             mv "$WATCHDOG_LOG" "$WATCHDOG_LOG.old"
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] Log rotated (was ${size} bytes)" > "$WATCHDOG_LOG"
+        fi
+    fi
+}
+
+cap_launchd_log() {
+    # Cap the launchd stdout/stderr log IN PLACE. launchd holds a persistent
+    # O_APPEND fd on this file, so `mv` does NOT work (writers follow the moved
+    # inode — that was the 2026-07-10 incident's bypass). Copy the current
+    # contents aside, then truncate in place with `: >`, which O_APPEND writers
+    # continue past safely at the new EOF.
+    if [ -f "$WATCHDOG_LAUNCHD_LOG" ]; then
+        local size=$(stat -f %z "$WATCHDOG_LAUNCHD_LOG" 2>/dev/null || stat -c %s "$WATCHDOG_LAUNCHD_LOG" 2>/dev/null || echo 0)
+        if [ "$size" -gt "$WATCHDOG_LOG_MAX_SIZE" ]; then
+            cp "$WATCHDOG_LAUNCHD_LOG" "$WATCHDOG_LAUNCHD_LOG.old" 2>/dev/null
+            : > "$WATCHDOG_LAUNCHD_LOG"
+            log "launchd log capped in place (was ${size} bytes, saved to $(basename "$WATCHDOG_LAUNCHD_LOG").old)"
         fi
     fi
 }
@@ -273,6 +293,9 @@ log "Watchdog started (PID: $$, stale threshold: ${STALE_MINUTES} minutes)"
 log "=========================================="
 
 while true; do
+    # Keep the launchd stdout/stderr log from filling the disk (2026-07-10 incident).
+    cap_launchd_log
+
     # Layer 6: if we're in an escalated-failure state, slow down to avoid
     # hammering Gateway and burning 2FA attempts.
     failure_count=$(get_failure_count)

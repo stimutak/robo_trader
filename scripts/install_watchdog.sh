@@ -87,9 +87,20 @@ echo "==> Loading $PLIST_DEST"
 launchctl load "$PLIST_DEST" || die "launchctl load failed for $PLIST_DEST"
 
 # 8. Give launchd a beat, then assert the agent registered ----------------
-sleep 2
+# launchd registration can lag the `launchctl load` return, so poll instead of
+# checking once (a single check raced registration on 2026-07-10 and printed a
+# false ERROR while the job was in fact present). `grep` returning non-zero must
+# not trip `set -e`, hence the `if` guard around it.
 echo "==> Verifying registration with launchctl list"
-if ! launchctl list | grep -q "$LABEL"; then
+registered=0
+for _ in $(seq 1 10); do
+    if launchctl list | grep -q "$LABEL"; then
+        registered=1
+        break
+    fi
+    sleep 1
+done
+if [[ "$registered" -ne 1 ]]; then
     die "launchctl list does not show $LABEL after load"
 fi
 
