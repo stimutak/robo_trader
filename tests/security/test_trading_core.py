@@ -16,7 +16,7 @@ from typing import Any, Dict
 
 import pytest
 
-from robo_trader.execution import ExecutionResult, Order, PaperExecutor
+from robo_trader.execution import ExecutionResult, LiveExecutor, Order, PaperExecutor
 from robo_trader.portfolio import Portfolio
 from robo_trader.risk.advanced_risk import KillSwitch
 from robo_trader.risk_manager import (
@@ -1093,3 +1093,104 @@ def test_fire_runner_exit_alert_never_raises(monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setattr(_alerts, "_load_alert_channels_from_default_config", loader_boom)
     _alerts.fire_runner_exit_alert("unhandled_exception", {"exception_type": "ValueError"})
+
+
+class _ConnectedLiveClient:
+    is_connected = True
+
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    async def place_order(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.result
+
+
+@pytest.mark.asyncio
+async def test_live_executor_sync_wrapper_refuses_fire_and_forget_in_event_loop():
+    """Live orders must not be submitted via fire-and-forget task creation."""
+
+    client = _ConnectedLiveClient({"status": "Filled", "avg_fill_price": 101.25})
+    executor = LiveExecutor(ibkr_client=client)
+
+    result = executor.place_order(Order("AAPL", 1, "BUY", 101.0))
+
+    assert not result.ok
+    assert "place_order_async" in result.message
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_live_executor_submitted_order_is_not_reported_as_fill():
+    """Submitted is an order lifecycle state, not a confirmed fill."""
+
+    client = _ConnectedLiveClient({"status": "Submitted", "order_id": 12345})
+    executor = LiveExecutor(ibkr_client=client)
+
+    result = await executor.place_order_async(Order("AAPL", 10, "BUY", 100.0))
+
+    assert not result.ok
+    assert result.fill_price is None
+    assert "not filled" in result.message
+    assert client.calls == [
+        {
+            "symbol": "AAPL",
+            "action": "BUY",
+            "quantity": 10,
+            "order_type": "LMT",
+            "limit_price": 100.0,
+        }
+    ]
+
+
+class _AsyncOnlyExecutor:
+    def __init__(self):
+        self.async_calls = 0
+        self.sync_calls = 0
+
+    async def place_order_async(self, order):
+        self.async_calls += 1
+        return ExecutionResult(True, "async fill", fill_price=123.45)
+
+    def place_order(self, order):
+        self.sync_calls += 1
+        raise AssertionError("sync place_order must not be used by AsyncRunner")
+
+
+class _AllowingCircuitBreaker:
+    async def can_proceed(self):
+        return True
+
+    async def record_success(self):
+        self.success = True
+
+    async def record_failure(self):
+        self.failure = True
+
+
+class _NoopRateLimiter:
+    async def acquire(self):
+        self.acquired = True
+
+
+@pytest.mark.asyncio
+async def test_async_runner_awaits_async_executor_instead_of_sync_wrapper(monkeypatch):
+    """AsyncRunner must await async executors to avoid live broker/local desync."""
+    from robo_trader.runner_async import AsyncRunner
+
+    runner = AsyncRunner.__new__(AsyncRunner)
+    runner.executor = _AsyncOnlyExecutor()
+    runner.circuit_breaker = _AllowingCircuitBreaker()
+    runner.rate_limiter = _NoopRateLimiter()
+    runner.monitor = None
+    runner._kill_switch_log_last = {}
+    runner._kill_switch_log_throttle_seconds = 60.0
+    monkeypatch.setattr(runner, "_trading_blocked", lambda: (False, ""))
+
+    result = await runner._place_order_with_circuit_breaker(Order("AAPL", 1, "BUY", 100.0))
+
+    assert result.ok
+    assert result.fill_price == 123.45
+    assert runner.executor.async_calls == 1
+    assert runner.executor.sync_calls == 0

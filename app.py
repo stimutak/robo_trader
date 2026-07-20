@@ -497,7 +497,9 @@ def _request_is_https() -> bool:
         return True
     if request.is_secure:
         return True
-    forwarded_proto = (request.headers.get("X-Forwarded-Proto", "") or "").split(",")[0].strip().lower()
+    forwarded_proto = (
+        (request.headers.get("X-Forwarded-Proto", "") or "").split(",")[0].strip().lower()
+    )
     return forwarded_proto == "https"
 
 
@@ -7278,22 +7280,25 @@ def strategies_status():
     except Exception:
         # C-9: don't leak exception detail to clients; log full traceback.
         logger.exception("strategy_status failed")
-        return jsonify(
-            {
-                "active_strategies": {
-                    "ml_enhanced": {"enabled": True, "error": "internal_error"},
-                    "microstructure": {"enabled": False},
-                    "portfolio_manager": {
-                        "enabled": True,
-                        "allocation_method": "Equal Weight",
-                        "strategies_count": 4,
+        return (
+            jsonify(
+                {
+                    "active_strategies": {
+                        "ml_enhanced": {"enabled": True, "error": "internal_error"},
+                        "microstructure": {"enabled": False},
+                        "portfolio_manager": {
+                            "enabled": True,
+                            "allocation_method": "Equal Weight",
+                            "strategies_count": 4,
+                        },
+                        "smart_execution": {"enabled": True},
                     },
-                    "smart_execution": {"enabled": True},
-                },
-                "performance_by_strategy": {},
-                "error": "internal_error",
-            }
-        ), 500
+                    "performance_by_strategy": {},
+                    "error": "internal_error",
+                }
+            ),
+            500,
+        )
 
 
 @app.route("/api/microstructure/metrics")
@@ -7618,16 +7623,23 @@ def get_risk_status():
     except Exception:
         # C-9: don't leak exception detail to clients; log full traceback.
         logger.exception("risk_status failed")
-        return jsonify(
-            {
-                "enabled": True,
-                "error": "internal_error",
-                "kelly_sizing": {"enabled": True, "current_positions": {}, "portfolio_kelly": 0},
-                "kill_switches": {"active": False, "limits": {}},
-                "correlation_limits": {},
-                "risk_metrics": {},
-            }
-        ), 500
+        return (
+            jsonify(
+                {
+                    "enabled": True,
+                    "error": "internal_error",
+                    "kelly_sizing": {
+                        "enabled": True,
+                        "current_positions": {},
+                        "portfolio_kelly": 0,
+                    },
+                    "kill_switches": {"active": False, "limits": {}},
+                    "correlation_limits": {},
+                    "risk_metrics": {},
+                }
+            ),
+            500,
+        )
 
 
 @app.route("/api/risk/kelly/<symbol>")
@@ -7885,19 +7897,20 @@ def get_order_manager_status():
                 }
             )
         else:
-            # Return mock data for demonstration
-            return jsonify(
-                {
-                    "statistics": {
-                        "total_orders": 0,
-                        "active_orders": 0,
-                        "successful_fills": 0,
-                        "failed_orders": 0,
-                        "fill_rate": 0.0,
-                        "error_rate": 0.0,
-                    },
-                    "active_orders": [],
-                }
+            # Do not return healthy-looking mock data for safety systems.  If
+            # the dashboard is not wired to the runner's OrderManager, say so
+            # explicitly so operators do not mistake placeholder zeros for a
+            # real safety signal.
+            return (
+                jsonify(
+                    {
+                        "connected": False,
+                        "error": "order_manager_unavailable",
+                        "statistics": {},
+                        "active_orders": [],
+                    }
+                ),
+                503,
             )
     except Exception:
         # C-9: don't leak exception detail to clients; log full traceback.
@@ -7915,18 +7928,16 @@ def get_data_validator_status():
             stats = app.data_validator.get_statistics()
             return jsonify(stats)
         else:
-            # Return mock data for demonstration
-            return jsonify(
-                {
-                    "total_validations": 0,
-                    "passed": 0,
-                    "failed_stale": 0,
-                    "failed_spread": 0,
-                    "failed_price": 0,
-                    "failed_volume": 0,
-                    "failed_anomaly": 0,
-                    "pass_rate": 100.0,
-                }
+            # Do not return healthy-looking mock validation stats.  Stale or
+            # disconnected data validation is a safety-relevant condition.
+            return (
+                jsonify(
+                    {
+                        "connected": False,
+                        "error": "data_validator_unavailable",
+                    }
+                ),
+                503,
             )
     except Exception:
         # C-9: don't leak exception detail to clients; log full traceback.
@@ -8029,8 +8040,12 @@ def start_trading():
             trading_log.append(
                 f"{datetime.now().strftime('%H:%M:%S')} - Failed to start (rc={result.returncode})"
             )
-            app.logger.warning("start_runner failed rc=%s stdout=%s stderr=%s",
-                               result.returncode, result.stdout, result.stderr)
+            app.logger.warning(
+                "start_runner failed rc=%s stdout=%s stderr=%s",
+                result.returncode,
+                result.stdout,
+                result.stderr,
+            )
             return (
                 jsonify({"status": "error", "error": "start_failed"}),
                 500,
@@ -8060,8 +8075,12 @@ def stop_trading():
         )
 
         # W-M5: log subprocess output server-side, do not return it to client.
-        app.logger.info("pkill runner_async rc=%s stdout=%s stderr=%s",
-                        result.returncode, result.stdout, result.stderr)
+        app.logger.info(
+            "pkill runner_async rc=%s stdout=%s stderr=%s",
+            result.returncode,
+            result.stdout,
+            result.stderr,
+        )
 
         # Also terminate tracked process if any
         if trading_process:

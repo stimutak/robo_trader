@@ -8,9 +8,10 @@ All runtime configuration is loaded via environment variables in `robo_trader/co
 - `IBKR_CLIENT_ID` (integer client ID)
 
 ### Trading Mode
-- `TRADING_MODE`:
+- `EXECUTION_MODE` is the canonical runtime mode:
   - `paper` (default)
   - `live` (opt-in only; see live safeguards)
+- `TRADING_MODE` is accepted only as a legacy/deployment alias when `EXECUTION_MODE` is unset. If both are set, they must match.
 
 ### Symbols
 - `SYMBOLS` comma-separated list, default: `AAPL,MSFT,SPY`

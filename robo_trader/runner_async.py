@@ -771,9 +771,14 @@ class AsyncRunner:
         logger.debug(f"Rate limit acquired for {order.symbol} order")
 
         try:
-            # Execute the order
+            # Execute the order. Async-capable executors (especially live
+            # broker executors) must be awaited so broker state cannot diverge
+            # from DB/portfolio state via fire-and-forget background tasks.
             with Timer("order_execution", self.monitor):
-                result = self.executor.place_order(order)
+                if hasattr(self.executor, "place_order_async"):
+                    result = await self.executor.place_order_async(order)
+                else:
+                    result = self.executor.place_order(order)
 
             # Record success/failure with circuit breaker
             if result.ok:

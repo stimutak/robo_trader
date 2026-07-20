@@ -444,6 +444,31 @@ class Config(BaseModel):
         return self
 
 
+def _resolve_execution_mode_from_env() -> str:
+    """Resolve the authoritative execution mode with legacy compatibility.
+
+    EXECUTION_MODE is the canonical setting used by the Config model.
+    TRADING_MODE is accepted only as a legacy/deployment alias.  If both are
+    present they must agree; otherwise operators can believe the system is in
+    paper mode while deployment metadata says live, or vice versa.
+    """
+    execution_mode = os.getenv("EXECUTION_MODE")
+    trading_mode = os.getenv("TRADING_MODE")
+
+    if (
+        execution_mode
+        and trading_mode
+        and execution_mode.strip().lower() != trading_mode.strip().lower()
+    ):
+        raise ConfigValidationError(
+            "EXECUTION_MODE and TRADING_MODE conflict; set only EXECUTION_MODE "
+            "or make both values identical"
+        )
+
+    mode = execution_mode if execution_mode is not None else trading_mode
+    return (mode or "paper").strip().lower()
+
+
 def load_config_from_env() -> Config:
     """
     Load configuration from environment variables with enhanced validation.
@@ -470,7 +495,7 @@ def load_config_from_env() -> Config:
     config_dict = {
         "environment": os.getenv("ENVIRONMENT", "dev"),
         "execution": {
-            "mode": os.getenv("EXECUTION_MODE", "paper"),
+            "mode": _resolve_execution_mode_from_env(),
             "account_type": os.getenv("EXECUTION_ACCOUNT_TYPE", "equity"),
             "max_daily_trades": int(os.getenv("EXECUTION_MAX_DAILY_TRADES", "100")),
             "position_timeout_hours": int(os.getenv("EXECUTION_POSITION_TIMEOUT", "24")),

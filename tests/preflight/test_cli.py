@@ -266,7 +266,23 @@ class TestPortResolution:
 
     def test_unset_defaults_to_paper(self, monkeypatch: pytest.MonkeyPatch, cli_module) -> None:
         monkeypatch.delenv("EXECUTION_MODE", raising=False)
+        monkeypatch.delenv("TRADING_MODE", raising=False)
         assert cli_module._resolve_target_port() == 4002
+
+    def test_legacy_trading_mode_live_used_when_execution_mode_unset(
+        self, monkeypatch: pytest.MonkeyPatch, cli_module
+    ) -> None:
+        monkeypatch.delenv("EXECUTION_MODE", raising=False)
+        monkeypatch.setenv("TRADING_MODE", "live")
+        assert cli_module._resolve_target_port() == 4001
+
+    def test_execution_and_trading_mode_conflict_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch, cli_module
+    ) -> None:
+        monkeypatch.setenv("EXECUTION_MODE", "paper")
+        monkeypatch.setenv("TRADING_MODE", "live")
+        with pytest.raises(ValueError, match="EXECUTION_MODE.*TRADING_MODE"):
+            cli_module._resolve_target_port()
 
     def test_unknown_mode_defaults_to_paper(
         self, monkeypatch: pytest.MonkeyPatch, cli_module

@@ -23,6 +23,14 @@ import pytest
 
 def _reload_app(monkeypatch, **env):
     """Reload app.py with a fresh environment so module-level guards re-run."""
+    defaults = {
+        "IBKR_HOST": "127.0.0.1",
+        "IBKR_PORT": "4002",
+        "IBKR_CLIENT_ID": "123",
+        "EXECUTION_MODE": "paper",
+    }
+    for key, value in defaults.items():
+        monkeypatch.setenv(key, value)
     for key, value in env.items():
         if value is None:
             monkeypatch.delenv(key, raising=False)
@@ -598,6 +606,39 @@ def test_c9_data_validator_endpoint_does_not_leak_exception_detail(monkeypatch):
     assert body.get("error") == "internal_error", body
     # Belt-and-suspenders: raw exception detail must not appear anywhere.
     assert secret not in resp.get_data(as_text=True)
+
+
+def test_safety_order_manager_unavailable_is_explicit_503(monkeypatch):
+    """Safety telemetry must not return healthy-looking mock zeros."""
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    client = app_mod.app.test_client()
+
+    if hasattr(app_mod.app, "order_manager"):
+        del app_mod.app.order_manager
+
+    resp = client.get("/api/safety/order-manager")
+    body = resp.get_json() or {}
+
+    assert resp.status_code == 503
+    assert body.get("connected") is False
+    assert body.get("error") == "order_manager_unavailable"
+    assert body.get("statistics") == {}
+
+
+def test_safety_data_validator_unavailable_is_explicit_503(monkeypatch):
+    """Data-validator telemetry must not imply validation is connected."""
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    client = app_mod.app.test_client()
+
+    if hasattr(app_mod.app, "data_validator"):
+        del app_mod.app.data_validator
+
+    resp = client.get("/api/safety/data-validator")
+    body = resp.get_json() or {}
+
+    assert resp.status_code == 503
+    assert body.get("connected") is False
+    assert body.get("error") == "data_validator_unavailable"
 
 
 def test_c9_database_health_does_not_leak_exception_detail(monkeypatch):

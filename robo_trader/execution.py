@@ -356,22 +356,17 @@ class LiveExecutor(BaseExecutor):
         self.ibkr_client = ibkr_client
 
     def place_order(self, order: Order) -> ExecutionResult:
-        """Place live order through IBKR (sync wrapper).
+        """Place live order through IBKR from synchronous code only.
 
-        Note: This method creates an event loop if needed.
-        Use place_order_async() for proper async support.
+        Live orders must never be fire-and-forget.  If this sync wrapper is
+        called while an event loop is already running, returning before the
+        broker response would desynchronize broker state from the DB/portfolio.
+        Async callers must use and await :meth:`place_order_async` instead.
         """
         try:
-            loop = asyncio.get_running_loop()
-            # We're in an async context but called synchronously
-            logger.warning(
-                "Live order placement called synchronously from async context", symbol=order.symbol
-            )
-            # Create a task but can't wait for it synchronously
-            asyncio.create_task(self.place_order_async(order))
-            return ExecutionResult(False, "Order submitted asynchronously")
+            asyncio.get_running_loop()
         except RuntimeError:
-            # No event loop running, create one
+            # No event loop running, create one and wait for the broker result.
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
@@ -380,6 +375,15 @@ class LiveExecutor(BaseExecutor):
             finally:
                 loop.close()
 
+        logger.error(
+            "Refusing live order from synchronous wrapper inside running event loop",
+            symbol=order.symbol,
+        )
+        return ExecutionResult(
+            False,
+            "Live orders must be awaited with place_order_async() from async code",
+        )
+
     async def place_order_async(self, order: Order) -> ExecutionResult:
         """Place live order through IBKR asynchronously."""
         # Validate order
@@ -387,8 +391,15 @@ class LiveExecutor(BaseExecutor):
         if validation_result:
             return validation_result
 
-        # Check IBKR connection
-        if not self.ibkr_client or not self.ibkr_client.is_connected():
+        # Check IBKR connection.  Some clients expose is_connected as a method,
+        # others as a property; support both without treating the property bool
+        # as callable.
+        if not self.ibkr_client:
+            logger.error("IBKR client not connected")
+            return ExecutionResult(False, "IBKR not connected")
+        connected_attr = getattr(self.ibkr_client, "is_connected", False)
+        connected = connected_attr() if callable(connected_attr) else bool(connected_attr)
+        if not connected:
             logger.error("IBKR client not connected")
             return ExecutionResult(False, "IBKR not connected")
 
@@ -429,7 +440,13 @@ class LiveExecutor(BaseExecutor):
                 fill_price = result.get("avg_fill_price", order.price or 0)
                 return ExecutionResult(True, "Order filled", fill_price)
             elif result and result.get("status") == "Submitted":
-                return ExecutionResult(True, "Order submitted", order.price)
+                broker_order_id = result.get("order_id") or result.get("broker_order_id")
+                logger.warning(
+                    "Live order submitted but not filled; refusing to report a fill",
+                    symbol=order.symbol,
+                    broker_order_id=broker_order_id,
+                )
+                return ExecutionResult(False, "Order submitted but not filled")
             else:
                 error_msg = result.get("error", "Unknown error") if result else "No response"
                 return ExecutionResult(False, f"Order failed: {error_msg}")

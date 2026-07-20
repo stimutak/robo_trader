@@ -788,3 +788,23 @@ def test_passlib_bcrypt_compat_c3():
         f"bcrypt pin {spec!r} may pull a 4.x release that breaks passlib 1.7.4 "
         "(C-3). Use bcrypt==3.2.2 or bcrypt<4."
     )
+
+
+def test_execution_mode_accepts_legacy_trading_mode_alias(monkeypatch):
+    from robo_trader.config import _resolve_execution_mode_from_env
+
+    monkeypatch.delenv("EXECUTION_MODE", raising=False)
+    monkeypatch.setenv("TRADING_MODE", "live")
+
+    assert _resolve_execution_mode_from_env() == "live"
+
+
+def test_execution_mode_conflict_fails_closed(monkeypatch):
+    from robo_trader.config import _resolve_execution_mode_from_env
+    from robo_trader.utils.secure_config import ConfigValidationError
+
+    monkeypatch.setenv("EXECUTION_MODE", "paper")
+    monkeypatch.setenv("TRADING_MODE", "live")
+
+    with pytest.raises(ConfigValidationError, match="conflict"):
+        _resolve_execution_mode_from_env()

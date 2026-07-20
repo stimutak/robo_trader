@@ -157,11 +157,6 @@ class BacktestEngine:
                 # Get current market data
                 current_data = self._get_current_data(data, timestamp, symbols)
 
-                # Update portfolio value
-                portfolio_value = self._calculate_portfolio_value(current_data)
-                self.equity_curve.append(portfolio_value)
-                self.timestamps.append(timestamp)
-
                 # Check for rebalancing
                 if self._should_rebalance(timestamp):
                     self._rebalance_portfolio(current_data)
@@ -182,10 +177,17 @@ class BacktestEngine:
                 if self.risk_manager:
                     self._apply_risk_management(current_data)
 
-                # Calculate daily returns
-                if len(self.equity_curve) > 1:
-                    daily_return = (portfolio_value - self.equity_curve[-1]) / self.equity_curve[-1]
+                # Record end-of-bar equity after trades/stops/risk actions and
+                # compute returns versus the previous recorded equity point.
+                previous_portfolio_value = self.equity_curve[-1] if self.equity_curve else None
+                portfolio_value = self._calculate_portfolio_value(current_data)
+                if previous_portfolio_value and previous_portfolio_value != 0:
+                    daily_return = (
+                        portfolio_value - previous_portfolio_value
+                    ) / previous_portfolio_value
                     self.daily_returns.append(daily_return)
+                self.equity_curve.append(portfolio_value)
+                self.timestamps.append(timestamp)
 
             except Exception as e:
                 logger.error(f"Error processing timestamp {timestamp}: {e}")
@@ -455,17 +457,29 @@ class BacktestEngine:
             if not position.is_open or symbol not in current_data.index:
                 continue
 
-            current_price = current_data.loc[symbol, "close"]
+            row = current_data.loc[symbol]
+            current_price = row["close"]
 
-            # Check stop loss if strategy has it
+            if position.quantity >= 0:
+                stop_check_price = row.get("low", current_price)
+                take_profit_check_price = row.get("high", current_price)
+            else:
+                stop_check_price = row.get("high", current_price)
+                take_profit_check_price = row.get("low", current_price)
+
+            # Check stop loss if strategy has it. For OHLC bars, use the
+            # adverse intrabar touch price so a recovered close cannot hide a
+            # breached stop.
             if hasattr(self.strategy, "check_stop_loss"):
-                if self.strategy.check_stop_loss(position, current_price):
-                    self._close_position(symbol, current_data.loc[symbol], timestamp)
+                if self.strategy.check_stop_loss(position, stop_check_price):
+                    self._close_position(symbol, row, timestamp)
+                    continue
 
-            # Check take profit if strategy has it
+            # Check take profit if strategy has it. Use the favorable intrabar
+            # touch price for the same reason.
             if hasattr(self.strategy, "check_take_profit"):
-                if self.strategy.check_take_profit(position, current_price):
-                    self._close_position(symbol, current_data.loc[symbol], timestamp)
+                if self.strategy.check_take_profit(position, take_profit_check_price):
+                    self._close_position(symbol, row, timestamp)
 
     def _apply_risk_management(self, current_data: pd.DataFrame) -> None:
         """Apply risk management rules."""

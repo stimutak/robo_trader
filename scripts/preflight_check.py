@@ -113,10 +113,23 @@ def _build_argparser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_execution_mode() -> str:
+    """Resolve EXECUTION_MODE with TRADING_MODE legacy compatibility."""
+    execution_mode = os.environ.get("EXECUTION_MODE")
+    trading_mode = os.environ.get("TRADING_MODE")
+    if (
+        execution_mode
+        and trading_mode
+        and execution_mode.strip().lower() != trading_mode.strip().lower()
+    ):
+        raise ValueError("EXECUTION_MODE and TRADING_MODE conflict; refusing to infer Gateway port")
+    mode = execution_mode if execution_mode is not None else trading_mode
+    return (mode or "paper").strip().lower()
+
+
 def _resolve_target_port() -> int:
     """4001 for live, 4002 for paper (default)."""
-    mode = os.environ.get("EXECUTION_MODE", "paper").strip().lower()
-    return 4001 if mode == "live" else 4002
+    return 4001 if _resolve_execution_mode() == "live" else 4002
 
 
 def _build_context(project_root: Path) -> PreflightContext:

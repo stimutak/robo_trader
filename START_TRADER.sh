@@ -122,7 +122,8 @@ start_gateway() {
     fi
 
     export IBC_INI="${SCRIPT_DIR}/config/ibc/config.ini"
-    export TRADING_MODE="paper"
+    export EXECUTION_MODE="${EXECUTION_MODE:-paper}"
+    export TRADING_MODE="$EXECUTION_MODE"
     export TWOFA_TIMEOUT_ACTION="restart"
     export IBC_PATH="${SCRIPT_DIR}/IBCMacos-3"
     export TWS_PATH=~/Applications
