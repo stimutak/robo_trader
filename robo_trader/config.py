@@ -23,7 +23,7 @@ from .utils.secure_config import ConfigValidationError, SecureConfig
 logger = get_logger(__name__)
 
 
-PAPER_PORTS = frozenset({7497, 4002})
+PAPER_PORTS = frozenset({4002})
 LIVE_PORTS = frozenset({7496, 4001})
 PAPER_ONLY_EXECUTION_SOURCE = "paper_simulator"
 
@@ -394,7 +394,7 @@ class IBKRConfig(BaseModel):
     """Interactive Brokers configuration."""
 
     host: str = Field(default="127.0.0.1", description="IBKR Gateway/TWS host")
-    port: int = Field(default=7497, ge=1, le=65535, description="IBKR Gateway/TWS port")
+    port: int = Field(default=4002, ge=1, le=65535, description="IBKR Gateway port")
     client_id: int = Field(default=123, ge=0, le=999, description="IBKR client ID")
     account: Optional[str] = Field(default=None, description="IBKR account number")
     readonly: bool = Field(default=True, description="Connect in read-only mode")
@@ -409,8 +409,7 @@ class IBKRConfig(BaseModel):
     @model_validator(mode="after")
     def validate_port_for_mode(self) -> "IBKRConfig":
         """Validate port matches trading mode."""
-        # TWS Paper: 7497, TWS Live: 7496
-        # Gateway Paper: 4002, Gateway Live: 4001
+        # The supervised containment path manages IB Gateway paper on 4002.
         allowed_ssl_modes = {"auto", "require", "disabled"}
         if self.ssl_mode not in allowed_ssl_modes:
             raise ValueError(f"ssl_mode must be one of {sorted(allowed_ssl_modes)}")
@@ -738,7 +737,7 @@ def load_config_from_env() -> Config:
     if mode == "paper" and port in live_ports:
         raise ConfigValidationError(
             f"Paper mode configured but using live trading port {port}. "
-            f"Use port 7497 (TWS) or 4002 (Gateway) for paper trading."
+            f"Use supervised IB Gateway paper port 4002."
         )
     elif mode == "live" and port in paper_ports:
         raise ConfigValidationError(

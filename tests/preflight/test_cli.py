@@ -261,12 +261,13 @@ class TestPortResolution:
         monkeypatch.setenv("IBKR_PORT", "4002")
         assert cli_module._resolve_target_port() == 4002
 
-    def test_paper_mode_honors_configured_7497(
+    def test_tws_paper_port_is_rejected_without_supervision(
         self, monkeypatch: pytest.MonkeyPatch, cli_module
     ) -> None:
         monkeypatch.setenv("EXECUTION_MODE", "paper")
         monkeypatch.setenv("IBKR_PORT", "7497")
-        assert cli_module._resolve_target_port() == 7497
+        with pytest.raises(ValueError, match="paper port.*4002"):
+            cli_module._resolve_target_port()
 
     def test_live_mode_is_rejected(self, monkeypatch: pytest.MonkeyPatch, cli_module) -> None:
         monkeypatch.setenv("EXECUTION_MODE", "live")

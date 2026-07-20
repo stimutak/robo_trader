@@ -132,7 +132,8 @@ def test_authoritative_launcher_fails_if_ibc_config_is_missing_before_process_ki
     assert 'export EXECUTION_MODE="paper"' in source
     assert 'export IBKR_READONLY="true"' in source
     assert 'ENV_IBKR_PORT=$(grep "^IBKR_PORT="' in source
-    assert "4002|7497)" in source
+    assert "supervised paper remediation requires IB Gateway port 4002" in source
+    assert "4002|7497" not in source
 
 
 def test_watchdog_delegates_restart_without_pre_killing_runner():

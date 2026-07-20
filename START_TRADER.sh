@@ -50,10 +50,10 @@ fi
 SYMBOLS="${SYMBOLS:-AAPL,NVDA,TSLA}"
 PORT="${PORT:-${ENV_IBKR_PORT:-4002}}"
 case "$PORT" in
-    4002|7497)
+    4002)
         ;;
     *)
-        echo "FATAL: paper-only remediation requires IBKR_PORT 4002 or 7497; got '$PORT'." >&2
+        echo "FATAL: supervised paper remediation requires IB Gateway port 4002; got '$PORT'." >&2
         exit 4
         ;;
 esac

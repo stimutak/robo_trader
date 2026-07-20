@@ -7,7 +7,7 @@ Current enforced boundary:
 
 1. `EXECUTION_MODE=paper` is canonical.
 2. The temporary `TRADING_MODE` alias must also be `paper`.
-3. Only IBKR paper ports 4002 (Gateway) and 7497 (TWS) are accepted.
+3. Only supervised IB Gateway paper port 4002 is accepted; TWS port 7497 has no managed lifecycle.
 4. `IBKR_READONLY=true` is required.
 5. IBC must contain `ReadOnlyApi=yes`.
 6. `LiveExecutor` cannot be instantiated.
