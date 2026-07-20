@@ -43,7 +43,7 @@ os.environ["LOG_FILE"] = os.getenv(
 from robo_trader.analytics.performance import PerformanceAnalyzer  # noqa: E402
 
 # Import our modules - using lazy imports to avoid startup issues
-from robo_trader.config import load_config  # noqa: E402
+from robo_trader.config import load_config, load_runtime_contract_from_env  # noqa: E402
 
 # Lazy imports to avoid blocking startup
 from robo_trader.database_async import AsyncTradingDatabase  # noqa: E402
@@ -98,6 +98,7 @@ _strategies_cache_lock = threading.Lock()
 
 # Configuration
 config = load_config()
+runtime_contract = load_runtime_contract_from_env()
 DEFAULT_CAPITAL = float(os.getenv("DEFAULT_CASH", getattr(config, "default_cash", 100000)))
 # W-H1: auth on by default. Empty hash with auth enabled is a hard error.
 AUTH_ENABLED = os.getenv("DASH_AUTH_ENABLED", "true").lower() == "true"
@@ -5521,7 +5522,7 @@ def status():
     # Build clear status message based on actual connection state
     if not runner_running:
         status_message = "⚠️ Runner not started - No trading activity"
-        status_detail = "Start the runner with: python3 -m robo_trader.runner_async"
+        status_detail = "Start locally with the authoritative ./START_TRADER.sh launcher"
     elif not market_open:
         status_message = "💤 Market Closed - Runner sleeping"
         # Calculate time until market open
@@ -5538,10 +5539,10 @@ def status():
         status_detail = "Runner has active IBKR API connection and is processing data"
     elif gateway_available or tws_available:
         # Runner is running, market is open, but NO active API connection
-        # This is the per-cycle mode - connects only during trading cycles
-        status_message = "🔄 Market Open - Waiting for cycle"
+        status_message = "🔄 Market Open - API session not confirmed"
         status_detail = (
-            "Gateway available. Runner connects per-cycle for stability (no active API session now)"
+            "Gateway is available, but the dashboard cannot confirm "
+            "an active runner API session"
         )
     else:
         # Runner is running, market is open, but no Gateway/TWS
@@ -5613,7 +5614,13 @@ def status():
                 "api_connected": api_connected,  # Explicit: active ESTABLISHED connection
                 "gateway_available": gateway_available,  # Gateway is listening (can connect)
                 "market_open": market_open,
-                "mode": "paper",
+                "mode": runtime_contract.execution_mode,
+                "execution_source": runtime_contract.execution_source,
+                "ibkr_readonly": runtime_contract.ibkr_readonly,
+                "ibkr_port": runtime_contract.ibkr_port,
+                "account_alias": runtime_contract.account_alias,
+                "config_fingerprint": runtime_contract.fingerprint,
+                "live_capability": "disabled",
                 "session_start": datetime.now().isoformat(),
                 "message": status_message,
                 "detail": status_detail,
@@ -7957,7 +7964,7 @@ def get_safety_thresholds():
 @requires_auth
 @csrf_required
 def start_trading():
-    """Start trading with proper Gateway checks and zombie cleanup."""
+    """Reject dashboard startup while the single-launcher contract is enforced."""
     global trading_status
 
     # Load symbols from user settings
@@ -7997,88 +8004,35 @@ def start_trading():
             400,
         )
 
-    # Use the start_runner.sh script for proper startup with Gateway checks
-    script_path = os.path.join(os.path.dirname(__file__), "scripts", "start_runner.sh")
-    symbols_str = ",".join(symbols)
-
-    try:
-        # Run the startup script and capture output
-        result = subprocess.run(
-            [script_path, symbols_str],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-
-        if result.returncode == 0:
-            trading_status = "running"
-            trading_log.append(
-                f"{datetime.now().strftime('%H:%M:%S')} - Trading started for {symbols_str}"
-            )
-            # W-M5: log subprocess output server-side only, do not return to client.
-            app.logger.info("start_runner stdout: %s", result.stdout)
-            if result.stderr:
-                app.logger.info("start_runner stderr: %s", result.stderr)
-            return jsonify(
-                {
-                    "status": "started",
-                    "symbols": symbols_str.split(","),
-                }
-            )
-        else:
-            trading_log.append(
-                f"{datetime.now().strftime('%H:%M:%S')} - Failed to start (rc={result.returncode})"
-            )
-            app.logger.warning("start_runner failed rc=%s stdout=%s stderr=%s",
-                               result.returncode, result.stdout, result.stderr)
-            return (
-                jsonify({"status": "error", "error": "start_failed"}),
-                500,
-            )
-
-    except subprocess.TimeoutExpired:
-        return jsonify({"status": "error", "error": "Startup timed out"}), 500
-    except Exception as e:
-        logger.error(f"Error starting trading: {e}")
-        # Don't expose internal error details to client
-        return jsonify({"status": "error", "error": "Failed to start trading system"}), 500
+    logger.warning("Dashboard start rejected: authoritative launcher required")
+    return (
+        jsonify(
+            {
+                "status": "disabled",
+                "error": "authoritative_launcher_required",
+                "action": "Run ./START_TRADER.sh from the RoboTrader host.",
+            }
+        ),
+        409,
+    )
 
 
 @app.route("/api/stop", methods=["POST"])
 @requires_auth
 @csrf_required
 def stop_trading():
-    """Stop trading - kills all runner processes."""
-    global trading_status, trading_process
-
-    try:
-        # Kill all runner processes (more reliable than just terminating one)
-        result = subprocess.run(
-            ["pkill", "-9", "-f", "runner_async"],
-            capture_output=True,
-            text=True,
-        )
-
-        # W-M5: log subprocess output server-side, do not return it to client.
-        app.logger.info("pkill runner_async rc=%s stdout=%s stderr=%s",
-                        result.returncode, result.stdout, result.stderr)
-
-        # Also terminate tracked process if any
-        if trading_process:
-            try:
-                trading_process.terminate()
-            except Exception:
-                pass
-            trading_process = None
-
-        trading_status = "stopped"
-        trading_log.append(f"{datetime.now().strftime('%H:%M:%S')} - Trading stopped")
-
-        return jsonify({"status": "stopped"})
-
-    except Exception as e:
-        logger.error(f"Error stopping trading: {e}")
-        return jsonify({"status": "error", "error": "stop_failed"}), 500
+    """Reject dashboard stop while graceful supervised shutdown is unfinished."""
+    logger.warning("Dashboard stop rejected: supervised shutdown required")
+    return (
+        jsonify(
+            {
+                "status": "disabled",
+                "error": "supervised_shutdown_required",
+                "action": "Use the documented local operator shutdown procedure.",
+            }
+        ),
+        409,
+    )
 
 
 @app.route("/api/logs")

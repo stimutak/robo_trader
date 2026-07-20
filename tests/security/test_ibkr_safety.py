@@ -213,16 +213,16 @@ def test_subprocess_client_source_has_relative_to_check():
 
 def test_force_gateway_reconnect_uses_mktemp():
     """force_gateway_reconnect.sh must create its temp script via mktemp,
-    not at a predictable /tmp/test_gateway_accept.py path (audit IB-L1)."""
+    or remain fully quarantined (audit IB-L1 / PR-01)."""
     script_path = PROJECT_ROOT / "force_gateway_reconnect.sh"
     assert script_path.exists()
 
     text = script_path.read_text()
 
-    # Must call mktemp.
-    assert (
-        "mktemp" in text
-    ), "force_gateway_reconnect.sh must use mktemp instead of a hardcoded path."
+    is_quarantined = "DISABLED:" in text and "exit 2" in text
+    assert is_quarantined or "mktemp" in text, (
+        "force_gateway_reconnect.sh must be inert or use mktemp instead of " "a hardcoded path."
+    )
 
     # The old hardcoded path must not be present as a write target. The
     # comment-only mention in cleanup is fine, but we should not see
@@ -234,10 +234,11 @@ def test_force_gateway_reconnect_uses_mktemp():
         "python3 /tmp/test_gateway_accept.py" not in text
     ), "force_gateway_reconnect.sh must not exec from a predictable path."
 
-    # And it should clean up via trap.
-    assert (
+    # An active implementation must clean up via trap. The quarantined stub
+    # creates no temporary file.
+    assert is_quarantined or (
         "trap" in text and 'rm -f "$TMPFILE"' in text
-    ), "force_gateway_reconnect.sh must clean up its tempfile via trap."
+    ), "force_gateway_reconnect.sh must be inert or clean up its tempfile via trap."
 
 
 # ---------------------------------------------------------------------------
@@ -497,16 +498,20 @@ async def test_subprocess_client_rejects_symlinked_external_venv(monkeypatch, tm
 
 
 def test_start_runner_sh_enforces_readonly_ibn_m3():
-    """IBN-M3: scripts/start_runner.sh (the dashboard "Start" button path) must
-    apply the same anchored case-insensitive ReadOnlyApi=yes grep that
-    START_TRADER.sh and start_gateway.sh now use.
+    """IBN-M3: the legacy dashboard launcher must not bypass read-only safety.
+
+    PR-01 quarantines this alternate path entirely.  If it is ever restored,
+    the original anchored ReadOnlyApi validation remains mandatory.
     """
     import pathlib
 
     text = pathlib.Path("scripts/start_runner.sh").read_text()
-    assert (
-        "grep -Eqi" in text and "readonlyapi" in text.lower()
-    ), "start_runner.sh must include the same ReadOnlyApi grep guard as the other start paths"
+    is_quarantined = "DISABLED:" in text and "exit 2" in text and "pkill" not in text
+    has_readonly_guard = "grep -Eqi" in text and "readonlyapi" in text.lower()
+    assert is_quarantined or has_readonly_guard, (
+        "start_runner.sh must be inert or include the same ReadOnlyApi guard "
+        "as the authoritative launcher"
+    )
 
 
 def test_gateway_manager_start_refuses_without_readonly_ibn_h1():

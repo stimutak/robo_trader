@@ -114,9 +114,14 @@ def _build_argparser() -> argparse.ArgumentParser:
 
 
 def _resolve_target_port() -> int:
-    """4001 for live, 4002 for paper (default)."""
+    """Resolve the paper Gateway port or reject unsafe/unknown modes."""
     mode = os.environ.get("EXECUTION_MODE", "paper").strip().lower()
-    return 4001 if mode == "live" else 4002
+    if mode != "paper":
+        raise ValueError(
+            "Live trading capability is disabled during remediation; "
+            "EXECUTION_MODE must be paper."
+        )
+    return 4002
 
 
 def _build_context(project_root: Path) -> PreflightContext:

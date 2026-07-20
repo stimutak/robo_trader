@@ -255,12 +255,9 @@ restart_trader() {
     # Returns 0 if the restart appears successful (runner alive after wait), 1 otherwise.
     log "RESTARTING trader due to stall..."
 
-    # Kill existing processes - use more specific patterns
-    pkill -9 -f "python.*runner_async" 2>/dev/null
-    pkill -9 -f "python.*websocket_server" 2>/dev/null
-    sleep 2
-
-    # Restart
+    # Delegate the complete restart to the authoritative launcher. It validates
+    # the paper/read-only contract and IBC configuration before terminating any
+    # process, so the watchdog must not pre-kill a healthy runner itself.
     "$PROJECT_DIR/START_TRADER.sh" >> "$WATCHDOG_LOG" 2>&1
 
     log "Restart script finished; verifying runner came up..."

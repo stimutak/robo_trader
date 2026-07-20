@@ -14,6 +14,12 @@ from robo_trader.logger import get_logger
 
 logger = get_logger(__name__)
 
+# PR-01 containment: no code path may instantiate the unfinished live adapter.
+# This is a code capability, not an environment toggle, so setting a variable
+# cannot weaken it accidentally. PR 11 will replace this executor with a
+# reviewed broker lifecycle adapter rather than flipping this constant.
+LIVE_TRADING_CAPABILITY_ENABLED = False
+
 
 @dataclass
 class Order:
@@ -352,6 +358,8 @@ class LiveExecutor(BaseExecutor):
         use_smart_execution: bool = False,
         skip_execution_delays: bool = False,
     ) -> None:
+        if not LIVE_TRADING_CAPABILITY_ENABLED:
+            raise RuntimeError("LiveExecutor is disabled during remediation; use PaperExecutor")
         super().__init__(use_smart_execution, skip_execution_delays)
         self.ibkr_client = ibkr_client
 

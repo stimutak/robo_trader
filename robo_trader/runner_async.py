@@ -4929,7 +4929,7 @@ def main() -> None:
     parser.add_argument(
         "--confirm-live",
         action="store_true",
-        help="Required confirmation flag for live mode",
+        help="Disabled compatibility flag; live trading is unavailable during remediation",
     )
     parser.add_argument("--sma-fast", type=int, default=10, help="Fast SMA window")
     parser.add_argument("--sma-slow", type=int, default=20, help="Slow SMA window")
@@ -4994,8 +4994,13 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config()
-    if cfg.execution.mode == "live" and not args.confirm_live:
-        raise SystemExit("Refusing to run in live mode without --confirm-live")
+    if args.confirm_live:
+        raise SystemExit(
+            "Live trading capability is disabled during remediation; "
+            "--confirm-live cannot enable it."
+        )
+    if cfg.execution.mode.value != "paper" or not cfg.ibkr.readonly:
+        raise SystemExit("Refusing to run outside the validated paper/read-only contract")
 
     # Check for zombie connections before starting
     # Gateway-owned zombies will be handled in setup() by triggering Gateway restart

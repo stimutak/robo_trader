@@ -79,13 +79,27 @@ IBC_INI="${SCRIPT_DIR}/config/ibc/config.ini"
 # - Old grep ('^ReadOnlyApi=yes') matched 'ReadOnlyApi=yesno' (no end anchor)
 #   and rejected 'ReadOnlyApi=Yes' (case-sensitive) even though IBC honors it.
 # - The -E + -i flags + start/end anchors + tolerated whitespace fix all three.
-if [ -f "$IBC_INI" ] && ! grep -Eqi '^[[:space:]]*readonlyapi[[:space:]]*=[[:space:]]*yes[[:space:]]*$' "$IBC_INI"; then
+if [ ! -f "$IBC_INI" ]; then
+    echo "FATAL: IBC config not found." >&2
+    echo "       File: $IBC_INI" >&2
+    echo "       Copy config/ibc/config.ini.template and configure the paper account first." >&2
+    exit 4
+fi
+if ! grep -Eqi '^[[:space:]]*readonlyapi[[:space:]]*=[[:space:]]*yes[[:space:]]*$' "$IBC_INI"; then
     echo "FATAL: IBC config has ReadOnlyApi != yes." >&2
     echo "       RoboTrader requires Gateway-side read-only enforcement." >&2
     echo "       File: $IBC_INI" >&2
     echo "       To fix: set 'ReadOnlyApi=yes' and re-run." >&2
     exit 4
 fi
+
+# PR-01 containment contract. Export both the canonical variables and the
+# temporary legacy alias so every child observes the same paper/read-only
+# identity. load_dotenv() does not override these exported values.
+export EXECUTION_MODE="paper"
+export TRADING_MODE="paper"
+export IBKR_PORT="$PORT"
+export IBKR_READONLY="true"
 
 
 # Step 1: Kill existing Python processes first

@@ -20,8 +20,14 @@ umask 077
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
-# Trading mode (default: paper)
+# Trading mode (default: paper). Live Gateway startup is intentionally
+# unavailable during the remediation program.
 TRADING_MODE="${1:-paper}"
+if [ "$TRADING_MODE" != "paper" ]; then
+    echo "FATAL: live Gateway startup is disabled during remediation." >&2
+    echo "       Use: ./scripts/start_gateway.sh paper" >&2
+    exit 2
+fi
 
 # Gateway version - auto-detect or set manually
 # Prefer 10.37 (stable) over 10.41 if available
@@ -106,11 +112,7 @@ if ! grep -Eqi '^[[:space:]]*readonlyapi[[:space:]]*=[[:space:]]*yes[[:space:]]*
 fi
 
 # Update trading mode in config
-if [ "$TRADING_MODE" = "paper" ]; then
-    sed -i '' 's/^TradingMode=.*/TradingMode=paper/' "$IBC_INI" 2>/dev/null || true
-elif [ "$TRADING_MODE" = "live" ]; then
-    sed -i '' 's/^TradingMode=.*/TradingMode=live/' "$IBC_INI" 2>/dev/null || true
-fi
+sed -i '' 's/^TradingMode=.*/TradingMode=paper/' "$IBC_INI" 2>/dev/null || true
 
 # Check if Gateway is already running
 if pgrep -f "ibgateway" > /dev/null 2>&1; then
@@ -118,11 +120,7 @@ if pgrep -f "ibgateway" > /dev/null 2>&1; then
     echo ""
 
     # Check API port
-    if [ "$TRADING_MODE" = "paper" ]; then
-        PORT=4002
-    else
-        PORT=4001
-    fi
+    PORT=4002
 
     if nc -z 127.0.0.1 $PORT 2>/dev/null; then
         echo "API port $PORT is accepting connections."

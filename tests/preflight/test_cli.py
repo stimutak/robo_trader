@@ -260,20 +260,19 @@ class TestPortResolution:
         monkeypatch.setenv("EXECUTION_MODE", "paper")
         assert cli_module._resolve_target_port() == 4002
 
-    def test_live_mode_uses_4001(self, monkeypatch: pytest.MonkeyPatch, cli_module) -> None:
+    def test_live_mode_is_rejected(self, monkeypatch: pytest.MonkeyPatch, cli_module) -> None:
         monkeypatch.setenv("EXECUTION_MODE", "live")
-        assert cli_module._resolve_target_port() == 4001
+        with pytest.raises(ValueError, match="disabled during remediation"):
+            cli_module._resolve_target_port()
 
     def test_unset_defaults_to_paper(self, monkeypatch: pytest.MonkeyPatch, cli_module) -> None:
         monkeypatch.delenv("EXECUTION_MODE", raising=False)
         assert cli_module._resolve_target_port() == 4002
 
-    def test_unknown_mode_defaults_to_paper(
-        self, monkeypatch: pytest.MonkeyPatch, cli_module
-    ) -> None:
+    def test_unknown_mode_is_rejected(self, monkeypatch: pytest.MonkeyPatch, cli_module) -> None:
         monkeypatch.setenv("EXECUTION_MODE", "backtest")
-        # Anything that isn't "live" → paper (4002)
-        assert cli_module._resolve_target_port() == 4002
+        with pytest.raises(ValueError, match="must be paper"):
+            cli_module._resolve_target_port()
 
 
 # ---------------------------------------------------------------------------

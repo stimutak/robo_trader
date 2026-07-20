@@ -7,7 +7,7 @@ data:
   environment: "production"
   log_level: "INFO"
   ibkr_host: "ibkr-gateway.trading.svc.cluster.local"
-  ibkr_port: "7496"
+  ibkr_port: "4002"
   
   production.json: |
     {
@@ -40,8 +40,8 @@ data:
         "latency_alert_ms": 1000
       },
       "feature_flags": {
-        "enable_paper_trading": false,
-        "enable_live_trading": true,
+        "enable_paper_trading": true,
+        "enable_live_trading": false,
         "enable_ml_predictions": false,
         "enable_news_sentiment": false,
         "enable_options_trading": false,
@@ -49,7 +49,7 @@ data:
         "enable_international_markets": false,
         "use_advanced_risk_models": true,
         "log_all_orders": true,
-        "dry_run_mode": false,
+        "dry_run_mode": true,
         "maintenance_mode": false
       },
       "ibkr": {

@@ -1,5 +1,23 @@
 # RoboTrader Project Guidelines
 
+> **Canonical agent instructions:** `AGENTS.md` is a tracked symlink to this
+> file. All coding agents and GitHub review agents must read this file before
+> changing or reviewing the project.
+
+## Current Operating Contract
+
+- The remediation program is tracked in
+  `docs/ROBOTRADER_REMEDIATION_PLAN_2026-07-20.md`; execute its PRs in order and
+  record evidence in that document as each gate is completed.
+- Runtime execution is **paper-only and IBKR read-only** until the remediation
+  plan's live-trading release gate is explicitly completed. Do not add or use a
+  live-order bypass while that gate is closed.
+- Start or restart the system only with `./START_TRADER.sh`. Never launch the
+  runner, dashboard, WebSocket server, or Gateway as an ad-hoc substitute.
+- Never delete or rewrite trading history, positions, equity history, account
+  data, or other user data without explicit user approval and a verified backup.
+- Keep unrelated working-tree changes out of commits and pull requests.
+
 ## 🚨 CRITICAL: NEVER DELETE USER DATA 🚨
 
 **ABSOLUTELY NEVER delete, wipe, or "clean up" database data without EXPLICIT user permission.**

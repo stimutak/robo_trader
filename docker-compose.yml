@@ -73,11 +73,13 @@ services:
   robo-trader:
     build: .
     container_name: robo_trader_main
-    command: python3 -m robo_trader.runner_async --symbols ${TRADING_SYMBOLS:-AAPL,NVDA,TSLA}
+    command: ["sh", "-c", "echo 'DISABLED: container trader startup is not yet supported' >&2; exit 2"]
     environment:
-      - TRADING_MODE=${TRADING_MODE:-paper}
+      - EXECUTION_MODE=paper
+      - TRADING_MODE=paper
+      - IBKR_READONLY=true
       - IBKR_HOST=${IBKR_HOST:-127.0.0.1}
-      - IBKR_PORT=${IBKR_PORT:-7497}
+      - IBKR_PORT=${IBKR_PORT:-4002}
       - IBKR_CLIENT_ID=${IBKR_CLIENT_ID:-1}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - WEBSOCKET_URL=ws://websocket:8765

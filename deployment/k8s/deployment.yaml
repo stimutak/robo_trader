@@ -45,6 +45,17 @@ spec:
             configMapKeyRef:
               name: robo-trader-config
               key: environment
+        - name: ENVIRONMENT
+          valueFrom:
+            configMapKeyRef:
+              name: robo-trader-config
+              key: environment
+        - name: EXECUTION_MODE
+          value: "paper"
+        - name: TRADING_MODE
+          value: "paper"
+        - name: IBKR_READONLY
+          value: "true"
         - name: LOG_LEVEL
           valueFrom:
             configMapKeyRef:

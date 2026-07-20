@@ -1,94 +1,24 @@
 #!/usr/bin/env python3
+"""Quarantined legacy IBKR position replacement utility.
+
+The former implementation deleted every local position before inserting the
+latest broker response.  It was neither portfolio-scoped nor safe when the
+broker response was empty or partial.  Position reconciliation must remain a
+read-only diff until the durable ledger/reconciliation PRs are complete.
 """
-Sync actual Interactive Brokers positions to local database.
-This will clear old test data and replace with real positions.
-"""
 
-import asyncio
-import logging
-from datetime import datetime
+import sys
 
-from robo_trader.connection_manager import ConnectionManager
-from robo_trader.database_async import AsyncTradingDatabase
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+MESSAGE = (
+    "DISABLED: sync_ib_positions.py cannot overwrite local positions. "
+    "Use read-only broker/database reconciliation and resolve differences explicitly."
+)
 
 
-async def sync_positions():
-    """Sync IB positions to database."""
-    mgr = None
-    db = None
-
-    try:
-        # Initialize IB client
-        logger.info("Connecting to Interactive Brokers...")
-        mgr = ConnectionManager()
-        ib = await mgr.connect()
-
-        # Initialize database
-        logger.info("Connecting to database...")
-        db = AsyncTradingDatabase()
-        await db.initialize()
-
-        # Get real positions from IB
-        logger.info("Fetching positions from IB...")
-        # Get positions via ib_insync
-        ib_positions = [
-            {
-                "symbol": p.contract.symbol,
-                "quantity": p.position,
-                "avg_cost": p.avgCost,
-                "market_value": getattr(p, "marketValue", 0),
-            }
-            for p in ib.positions()
-        ]
-
-        if not ib_positions:
-            logger.warning("No positions found in IB account")
-        else:
-            logger.info(f"Found {len(ib_positions)} positions in IB:")
-            for pos in ib_positions:
-                logger.info(f"  {pos['symbol']}: {pos['quantity']} shares @ ${pos['avg_cost']:.2f}")
-
-        # Clear old test positions
-        logger.info("\nClearing old test positions from database...")
-        async with db.get_connection() as conn:
-            await conn.execute("DELETE FROM positions")
-            await conn.commit()
-            logger.info("Old positions cleared")
-
-        # Insert real IB positions
-        if ib_positions:
-            logger.info("\nSyncing IB positions to database...")
-            for pos in ib_positions:
-                await db.update_position(
-                    symbol=pos["symbol"],
-                    quantity=pos["quantity"],
-                    avg_cost=pos["avg_cost"],
-                    market_price=(
-                        pos.get("market_value", 0) / pos["quantity"] if pos["quantity"] else 0
-                    ),
-                )
-            logger.info(f"Synced {len(ib_positions)} positions to database")
-
-        # Verify the sync
-        logger.info("\nVerifying database positions:")
-        db_positions = await db.get_positions()
-        for pos in db_positions:
-            logger.info(f"  {pos['symbol']}: {pos['quantity']} shares @ ${pos['avg_cost']:.2f}")
-
-        logger.info("\n✅ Position sync complete!")
-
-    except Exception as e:
-        logger.error(f"Error syncing positions: {e}")
-        raise
-    finally:
-        if mgr:
-            await mgr.disconnect()
-        if db:
-            await db.close()
+def main() -> int:
+    print(MESSAGE, file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":
-    asyncio.run(sync_positions())
+    raise SystemExit(main())

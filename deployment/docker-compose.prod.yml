@@ -70,11 +70,14 @@ services:
   trader:
     image: robo_trader:latest
     container_name: robo_trader_main_prod
-    command: python3 -m robo_trader.runner_async --symbols ${TRADING_SYMBOLS}
+    command: ["sh", "-c", "echo 'DISABLED: container trader startup is not yet supported' >&2; exit 2"]
     environment:
-      - TRADING_MODE=live
+      # PR-01: production-like deployment remains paper/read-only only.
+      - EXECUTION_MODE=paper
+      - TRADING_MODE=paper
       - IBKR_HOST=${IBKR_HOST}
-      - IBKR_PORT=${IBKR_PORT:-4001}  # Live trading port
+      - IBKR_PORT=${IBKR_PORT:-4002}
+      - IBKR_READONLY=true
       - IBKR_CLIENT_ID=${IBKR_CLIENT_ID:-1}
       - LOG_LEVEL=WARNING
       - WEBSOCKET_URL=ws://websocket:8765

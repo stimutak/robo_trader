@@ -138,22 +138,24 @@ def test_websocket_xss_helper_escapes_html(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_start_trading_does_not_leak_subprocess_output(monkeypatch):
+def test_start_trading_is_disabled_and_does_not_spawn_subprocess(monkeypatch):
     app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
     client = app_mod.app.test_client()
     token = "csrf-token-value"
     client.set_cookie("csrf_token", token, domain="localhost")
 
     fake = MagicMock(returncode=0, stdout="SECRET STDOUT TOKEN", stderr="SECRET STDERR TOKEN")
-    with patch("subprocess.run", return_value=fake):
+    with patch("subprocess.run", return_value=fake) as mock_run:
         resp = client.post(
             "/api/start",
             json={"symbols": ["AAPL"]},
             headers={"X-CSRF-Token": token},
         )
 
-    assert resp.status_code == 200
+    assert resp.status_code == 409
     payload = resp.get_json() or {}
+    assert payload.get("error") == "authoritative_launcher_required"
+    mock_run.assert_not_called()
     # No raw subprocess fields leaked.
     assert "output" not in payload
     assert "stdout" not in payload

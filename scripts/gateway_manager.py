@@ -206,6 +206,9 @@ def clear_python_zombies(port: int = PAPER_PORT) -> int:
 
 def start_gateway(trading_mode: str = "paper", version: Optional[str] = None) -> bool:
     """Start Gateway using IBC."""
+    if trading_mode != "paper":
+        print("ERROR: live Gateway startup is disabled during remediation.")
+        return False
     print(f"\n{'='*60}")
     print(f"Starting IB Gateway ({trading_mode} mode)")
     print(f"{'='*60}\n")
@@ -400,6 +403,9 @@ def stop_gateway() -> bool:
 
 def restart_gateway(trading_mode: str = "paper") -> bool:
     """Restart Gateway (clears all zombie connections)."""
+    if trading_mode != "paper":
+        print("ERROR: live Gateway restart is disabled during remediation.")
+        return False
     print("\n" + "=" * 60)
     print("Restarting IB Gateway")
     print("=" * 60 + "\n")
@@ -511,7 +517,9 @@ Examples:
     start_parser.add_argument(
         "--paper", action="store_true", default=True, help="Use paper trading mode (default)"
     )
-    start_parser.add_argument("--live", action="store_true", help="Use live trading mode")
+    start_parser.add_argument(
+        "--live", action="store_true", help="Disabled during the remediation program"
+    )
     start_parser.add_argument("--version", help="Gateway version to use")
 
     # Stop command
@@ -522,7 +530,9 @@ Examples:
     restart_parser.add_argument(
         "--paper", action="store_true", default=True, help="Use paper trading mode (default)"
     )
-    restart_parser.add_argument("--live", action="store_true", help="Use live trading mode")
+    restart_parser.add_argument(
+        "--live", action="store_true", help="Disabled during the remediation program"
+    )
 
     # Status command
     subparsers.add_parser("status", help="Show Gateway status")

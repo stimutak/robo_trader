@@ -265,14 +265,21 @@ The production deployment includes:
 6. **Prometheus** - Metrics collection and alerting
 7. **Grafana** - Visualization dashboards
 
-### Environment Variables for Production
+### Production-like Paper Environment
+
+Live trading is intentionally disabled during the remediation program. The
+deployment files are scaffolding only and are not a supported order-writing
+topology. Production-like monitoring may be exercised only against a paper
+account with Gateway-side read-only enforcement.
 
 Key production environment variables (in `.env.production`):
 
 ```bash
 # Trading
-TRADING_MODE=live  # IMPORTANT: Set to 'live' for production
-IBKR_PORT=4001     # Live trading port
+EXECUTION_MODE=paper
+TRADING_MODE=paper # Temporary legacy alias; must match EXECUTION_MODE
+IBKR_PORT=4002     # IB Gateway paper port
+IBKR_READONLY=true
 ENVIRONMENT=production
 
 # Monitoring
