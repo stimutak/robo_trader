@@ -258,20 +258,32 @@ class TestOutputFormat:
 class TestPortResolution:
     def test_paper_mode_uses_4002(self, monkeypatch: pytest.MonkeyPatch, cli_module) -> None:
         monkeypatch.setenv("EXECUTION_MODE", "paper")
+        monkeypatch.setenv("IBKR_PORT", "4002")
         assert cli_module._resolve_target_port() == 4002
+
+    def test_paper_mode_honors_configured_7497(
+        self, monkeypatch: pytest.MonkeyPatch, cli_module
+    ) -> None:
+        monkeypatch.setenv("EXECUTION_MODE", "paper")
+        monkeypatch.setenv("IBKR_PORT", "7497")
+        assert cli_module._resolve_target_port() == 7497
 
     def test_live_mode_is_rejected(self, monkeypatch: pytest.MonkeyPatch, cli_module) -> None:
         monkeypatch.setenv("EXECUTION_MODE", "live")
+        monkeypatch.setenv("TRADING_MODE", "live")
         with pytest.raises(ValueError, match="disabled during remediation"):
             cli_module._resolve_target_port()
 
     def test_unset_defaults_to_paper(self, monkeypatch: pytest.MonkeyPatch, cli_module) -> None:
         monkeypatch.delenv("EXECUTION_MODE", raising=False)
+        monkeypatch.delenv("TRADING_MODE", raising=False)
+        monkeypatch.delenv("IBKR_PORT", raising=False)
         assert cli_module._resolve_target_port() == 4002
 
     def test_unknown_mode_is_rejected(self, monkeypatch: pytest.MonkeyPatch, cli_module) -> None:
         monkeypatch.setenv("EXECUTION_MODE", "backtest")
-        with pytest.raises(ValueError, match="must be paper"):
+        monkeypatch.delenv("TRADING_MODE", raising=False)
+        with pytest.raises(ValueError, match="disabled during remediation"):
             cli_module._resolve_target_port()
 
 

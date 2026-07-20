@@ -586,7 +586,7 @@ def validate_portfolio(f):
             import sqlite3
 
             try:
-                with sqlite3.connect(str(Path("trading_data.db"))) as conn:
+                with sqlite3.connect(runtime_contract.database_path) as conn:
                     conn.execute("PRAGMA busy_timeout=5000")
                     # Check account table first, then portfolios definition table
                     cursor = conn.execute(

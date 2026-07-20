@@ -4,6 +4,7 @@ Tests the validate_portfolio decorator and endpoint behavior with
 various portfolio_id values (valid, invalid, non-existent).
 """
 
+from dataclasses import replace
 import os
 import sqlite3
 from unittest.mock import MagicMock, patch
@@ -111,11 +112,7 @@ class TestNonExistentPortfolio404:
 
     @pytest.fixture
     def trading_db(self, tmp_path, monkeypatch):
-        """Create trading_data.db in a temp dir and chdir there.
-
-        The validate_portfolio decorator opens Path("trading_data.db") directly,
-        so we place a real DB file in the working directory.
-        """
+        """Create the configured dashboard database in a temp directory."""
         db_path = tmp_path / "trading_data.db"
         conn = sqlite3.connect(str(db_path))
         conn.execute("""
@@ -141,7 +138,13 @@ class TestNonExistentPortfolio404:
         )
         conn.commit()
         conn.close()
-        monkeypatch.chdir(tmp_path)
+        import app as dashboard_app
+
+        monkeypatch.setattr(
+            dashboard_app,
+            "runtime_contract",
+            replace(dashboard_app.runtime_contract, database_path=str(db_path)),
+        )
         return db_path
 
     def test_nonexistent_portfolio_returns_404(self, client, trading_db):
@@ -263,7 +266,7 @@ class TestPortfolioScoping:
 
     @pytest.fixture
     def trading_db_with_portfolio(self, tmp_path, monkeypatch):
-        """Create trading_data.db with a non-default portfolio in a temp dir."""
+        """Create the configured DB with a non-default portfolio."""
         db_path = tmp_path / "trading_data.db"
         conn = sqlite3.connect(str(db_path))
         conn.execute("""
@@ -292,7 +295,13 @@ class TestPortfolioScoping:
         )
         conn.commit()
         conn.close()
-        monkeypatch.chdir(tmp_path)
+        import app as dashboard_app
+
+        monkeypatch.setattr(
+            dashboard_app,
+            "runtime_contract",
+            replace(dashboard_app.runtime_contract, database_path=str(db_path)),
+        )
         return db_path
 
     def test_positions_with_explicit_default(self, client, mock_db_reader):

@@ -58,6 +58,8 @@ from robo_trader.preflight.runner import (  # noqa: E402
     format_plaintext,
     run_all_checks,
 )
+from robo_trader.config import load_runtime_contract_from_env  # noqa: E402
+from robo_trader.utils.secure_config import ConfigValidationError  # noqa: E402
 
 # Reason denylist (spec §6.3 step 4): reject obviously-low-effort
 # justifications. Forces a real-sentence rationale at the moment of
@@ -114,14 +116,13 @@ def _build_argparser() -> argparse.ArgumentParser:
 
 
 def _resolve_target_port() -> int:
-    """Resolve the paper Gateway port or reject unsafe/unknown modes."""
-    mode = os.environ.get("EXECUTION_MODE", "paper").strip().lower()
-    if mode != "paper":
-        raise ValueError(
-            "Live trading capability is disabled during remediation; "
-            "EXECUTION_MODE must be paper."
-        )
-    return 4002
+    """Resolve the validated paper Gateway port from the runtime contract."""
+    try:
+        return load_runtime_contract_from_env().ibkr_port
+    except ConfigValidationError as exc:
+        # Keep this helper's longstanding ValueError API while ensuring
+        # preflight and the runner validate exactly the same environment.
+        raise ValueError(str(exc)) from exc
 
 
 def _build_context(project_root: Path) -> PreflightContext:
