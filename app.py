@@ -2427,6 +2427,9 @@ HTML_TEMPLATE = """
                 if (data.status === 'started') {
                     updateStatus('running');
                     addLog('Trading started');
+                } else {
+                    const message = data.message || data.error || 'Use ./START_TRADER.sh';
+                    addLog(`Start disabled: ${message}`);
                 }
             } catch (error) {
                 console.error('Error starting trading:', error);
@@ -2443,6 +2446,9 @@ HTML_TEMPLATE = """
                 if (data.status === 'stopped') {
                     updateStatus('stopped');
                     addLog('Trading stopped');
+                } else {
+                    const message = data.message || data.error || 'Use supervised shutdown';
+                    addLog(`Stop disabled: ${message}`);
                 }
             } catch (error) {
                 console.error('Error stopping trading:', error);

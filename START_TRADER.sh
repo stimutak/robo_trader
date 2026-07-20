@@ -20,7 +20,7 @@
 
 set -e
 
-PORT=4002
+PORT="${IBKR_PORT:-}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MAX_GATEWAY_RETRIES=3
 
@@ -41,12 +41,22 @@ fi
 
 # Load defaults from .env if present
 if [ -f "$SCRIPT_DIR/.env" ]; then
-    # Source only SYMBOLS to avoid polluting environment
+    # Read only the startup values we need instead of sourcing arbitrary shell.
     SYMBOLS=$(grep "^SYMBOLS=" "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+    ENV_IBKR_PORT=$(grep "^IBKR_PORT=" "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
 fi
 
 # Fallback default if .env doesn't have SYMBOLS
 SYMBOLS="${SYMBOLS:-AAPL,NVDA,TSLA}"
+PORT="${PORT:-${ENV_IBKR_PORT:-4002}}"
+case "$PORT" in
+    4002|7497)
+        ;;
+    *)
+        echo "FATAL: paper-only remediation requires IBKR_PORT 4002 or 7497; got '$PORT'." >&2
+        exit 4
+        ;;
+esac
 
 # Parse arguments (override .env if provided)
 # --force="<reason>" is forwarded to the preflight gate so the documented

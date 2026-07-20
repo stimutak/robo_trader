@@ -83,6 +83,15 @@ def test_runtime_contract_fingerprint_excludes_full_account_number():
     assert public["fingerprint"] == contract.fingerprint
 
 
+def test_dashboard_reader_defaults_to_runtime_database(monkeypatch, tmp_path):
+    from sync_db_reader import SyncDatabaseReader
+
+    configured_db = tmp_path / "paper-runtime.db"
+    monkeypatch.setenv("RT_DB_PATH", str(configured_db))
+
+    assert SyncDatabaseReader().db_path == str(configured_db)
+
+
 def test_direct_config_construction_rejects_live_or_writable_client():
     with pytest.raises(ValidationError, match="Live trading capability is disabled"):
         Config(execution={"mode": TradingMode.LIVE}, ibkr=IBKRConfig(port=4001))
@@ -122,6 +131,8 @@ def test_authoritative_launcher_fails_if_ibc_config_is_missing_before_process_ki
     assert missing_guard < first_process_kill
     assert 'export EXECUTION_MODE="paper"' in source
     assert 'export IBKR_READONLY="true"' in source
+    assert 'ENV_IBKR_PORT=$(grep "^IBKR_PORT="' in source
+    assert "4002|7497)" in source
 
 
 def test_watchdog_delegates_restart_without_pre_killing_runner():
@@ -139,6 +150,13 @@ def test_legacy_dashboard_launcher_is_inert():
     assert result.returncode == 2
     assert "DISABLED" in result.stderr
     assert "pkill" not in script.read_text()
+
+
+def test_dashboard_controls_explain_disabled_process_actions():
+    source = (ROOT / "app.py").read_text()
+
+    assert "Start disabled: ${message}" in source
+    assert "Stop disabled: ${message}" in source
 
 
 @pytest.mark.parametrize(

@@ -7,6 +7,7 @@ Hardened for concurrent access with the async trader:
 - Uses short retry/backoff on SQLITE_BUSY/locked errors
 """
 
+import os
 import sqlite3
 import time
 from datetime import datetime
@@ -25,8 +26,8 @@ class SyncDatabaseReader:
     Default portfolio_id='default' for backward compatibility.
     """
 
-    def __init__(self, db_path="trading_data.db"):
-        self.db_path = db_path
+    def __init__(self, db_path: Optional[str] = None):
+        self.db_path = db_path or os.getenv("RT_DB_PATH", "trading_data.db")
 
     def _make_uri(self, read_only: bool = True) -> str:
         """Build a SQLite URI for the database path."""
