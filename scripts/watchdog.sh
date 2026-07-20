@@ -14,8 +14,9 @@ LOG_FILE="$PROJECT_DIR/robo_trader.log"
 LOG_FILE_1="$PROJECT_DIR/robo_trader.log.1"
 WATCHDOG_LOG="$PROJECT_DIR/watchdog.log"
 # launchd's StandardOutPath/StandardErrorPath target (see com.robotrader.watchdog.plist).
-# launchd holds a persistent O_APPEND fd on this file, so it must be capped IN PLACE
-# (copy-then-truncate) — an mv would leave writers appending to the moved inode.
+# launchd holds a persistent O_APPEND fd on this file, so it must be capped IN PLACE.
+# Preserve at most one bounded tail before truncating; copying the whole file can
+# consume the last free disk space during the failure mode this guard handles.
 WATCHDOG_LAUNCHD_LOG="$PROJECT_DIR/watchdog_launchd.log"
 WATCHDOG_LOG_MAX_SIZE=10485760  # 10MB max log size
 STALE_MINUTES="${1:-5}"  # Default 5 minutes
@@ -66,15 +67,22 @@ rotate_log() {
 cap_launchd_log() {
     # Cap the launchd stdout/stderr log IN PLACE. launchd holds a persistent
     # O_APPEND fd on this file, so `mv` does NOT work (writers follow the moved
-    # inode — that was the 2026-07-10 incident's bypass). Copy the current
-    # contents aside, then truncate in place with `: >`, which O_APPEND writers
-    # continue past safely at the new EOF.
+    # inode — that was the 2026-07-10 incident's bypass). Save only a bounded
+    # tail, then truncate in place with `: >`, which O_APPEND writers continue
+    # past safely at the new EOF.
     if [ -f "$WATCHDOG_LAUNCHD_LOG" ]; then
         local size=$(stat -f %z "$WATCHDOG_LAUNCHD_LOG" 2>/dev/null || stat -c %s "$WATCHDOG_LAUNCHD_LOG" 2>/dev/null || echo 0)
         if [ "$size" -gt "$WATCHDOG_LOG_MAX_SIZE" ]; then
-            cp "$WATCHDOG_LAUNCHD_LOG" "$WATCHDOG_LAUNCHD_LOG.old" 2>/dev/null
+            local backup_tmp="$WATCHDOG_LAUNCHD_LOG.old.tmp"
+            local backup_note="without backup (bounded tail copy failed)"
+            if tail -c "$WATCHDOG_LOG_MAX_SIZE" "$WATCHDOG_LAUNCHD_LOG" > "$backup_tmp" 2>/dev/null; then
+                mv -f "$backup_tmp" "$WATCHDOG_LAUNCHD_LOG.old"
+                backup_note="saved final ${WATCHDOG_LOG_MAX_SIZE} bytes"
+            else
+                rm -f "$backup_tmp"
+            fi
             : > "$WATCHDOG_LAUNCHD_LOG"
-            log "launchd log capped in place (was ${size} bytes, saved to $(basename "$WATCHDOG_LAUNCHD_LOG").old)"
+            log "launchd log capped in place (was ${size} bytes; ${backup_note})"
         fi
     fi
 }
