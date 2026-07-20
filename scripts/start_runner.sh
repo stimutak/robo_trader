@@ -80,10 +80,16 @@ echo "4. Starting runner..."
 echo "   Symbols: $SYMBOLS"
 
 export LOG_FILE="$SCRIPT_DIR/robo_trader.log"
-# Redirect output to log file so subprocess.run can complete.
+RUNNER_STDOUT_LOG="$SCRIPT_DIR/runner_stdout.log"
+RUNNER_STDOUT_PREVIOUS="$SCRIPT_DIR/runner_stdout.log.1"
+if [ -f "$RUNNER_STDOUT_LOG" ]; then
+    mv -f "$RUNNER_STDOUT_LOG" "$RUNNER_STDOUT_PREVIOUS"
+fi
+# Keep inherited stdout/stderr separate from RotatingFileHandler's LOG_FILE.
+# Sharing the same inode lets post-rotation writes bypass the configured cap.
 # --force-connect removed 2026-07-10 (testing-only flag; see CLAUDE.md
 # Common Mistakes and the disk-fill incident) — same fix as START_TRADER.sh.
-$PYTHON -m robo_trader.runner_async --symbols "$SYMBOLS" >> "$LOG_FILE" 2>&1 &
+$PYTHON -m robo_trader.runner_async --symbols "$SYMBOLS" >> "$RUNNER_STDOUT_LOG" 2>&1 &
 RUNNER_PID=$!
 
 sleep 3
