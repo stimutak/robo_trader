@@ -7756,6 +7756,40 @@ def get_kelly_parameters(symbol):
         )
 
 
+def _is_placeholder_reason(reason: str) -> bool:
+    """Return True for non-auditable placeholder operator reasons."""
+    normalized = " ".join(reason.strip().lower().split())
+    return normalized in {"", "force", "bypass", "reset", "idk", "n/a", "na", "none"}
+
+
+def _validate_operator_reason(reason: object) -> tuple[bool, str]:
+    """Validate an operator-supplied reason for risky dashboard actions."""
+    if not isinstance(reason, str):
+        return False, "reason_required"
+    cleaned = reason.strip()
+    if len(cleaned) < 10 or _is_placeholder_reason(cleaned):
+        return False, "reason_too_short"
+    return True, cleaned[:512]
+
+
+def _dashboard_kill_switch_reset_allowed_in_live() -> bool:
+    """Return whether dashboard kill-switch reset is allowed in live mode."""
+    mode = str(getattr(getattr(config, "execution", None), "mode", "paper")).lower()
+    is_live = mode.endswith("live") or mode == "live"
+    if not is_live:
+        return True
+    return os.getenv("DASH_ALLOW_LIVE_KILL_SWITCH_RESET", "false").lower() == "true"
+
+
+def _append_kill_switch_audit(event: dict) -> None:
+    """Append a dashboard kill-switch operator event to JSONL audit log."""
+    data_dir = Path("data")
+    data_dir.mkdir(exist_ok=True)
+    audit_path = data_dir / "kill_switch_audit.log"
+    with audit_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(event, sort_keys=True) + "\n")
+
+
 @app.route("/api/risk/kill-switch", methods=["POST"])
 @requires_auth
 @csrf_required
@@ -7771,11 +7805,38 @@ def control_kill_switch():
       - Return 501 Not Implemented so the operator knows to use the CLI.
     We pick the file-driven path so the UI is honest.
     """
-    action = (request.json or {}).get("action", "status")
+    payload = request.json or {}
+    action = payload.get("action", "status")
     state_path = Path("data/kill_switch_state.json")
     lock_path = Path("data/kill_switch.lock")
 
     if action == "reset":
+        if not _dashboard_kill_switch_reset_allowed_in_live():
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "live_reset_not_allowed",
+                        "message": "Dashboard kill-switch reset is disabled in live mode",
+                    }
+                ),
+                403,
+            )
+
+        reason_ok, reason_or_error = _validate_operator_reason(payload.get("reason"))
+        if not reason_ok:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": reason_or_error,
+                        "message": "Kill-switch reset requires a specific operator reason",
+                    }
+                ),
+                400,
+            )
+        reason = reason_or_error
+
         # Drive the same on-disk state that KillSwitch._load_persisted_state
         # reads. Removing both files mirrors KillSwitch.reset().
         try:
@@ -7787,11 +7848,26 @@ def control_kill_switch():
             if lock_path.exists():
                 lock_path.unlink()
                 cleared_lock = True
+
+            audit_event = {
+                "action": "reset",
+                "actor": (
+                    request.authorization.username if request.authorization else "auth-disabled"
+                ),
+                "cleared_lock_file": cleared_lock,
+                "cleared_state_file": cleared_state,
+                "iso_timestamp": datetime.utcnow().isoformat() + "Z",
+                "reason": reason,
+                "remote_addr": request.remote_addr,
+                "user_agent": request.headers.get("User-Agent", "")[:256],
+            }
+            _append_kill_switch_audit(audit_event)
             logger.warning(
                 "kill-switch reset via dashboard",
                 cleared_state=cleared_state,
                 cleared_lock=cleared_lock,
                 remote_addr=request.remote_addr,
+                reason=reason,
             )
             return jsonify(
                 {
@@ -7800,6 +7876,7 @@ def control_kill_switch():
                     "status": "active",
                     "cleared_state_file": cleared_state,
                     "cleared_lock_file": cleared_lock,
+                    "audit_logged": True,
                 }
             )
         except OSError:

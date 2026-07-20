@@ -10,6 +10,7 @@ and W-R2-L1 (refuse debug=True on non-loopback host).
 import base64
 import hashlib
 import importlib
+import json as _json
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -454,6 +455,95 @@ def test_kill_switch_status_reflects_state_file_b_13(tmp_path, monkeypatch):
     )
     body = resp.get_json()
     assert body is not None and body.get("triggered") is True, body
+
+
+def test_kill_switch_reset_requires_specific_reason(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "kill_switch.lock").touch()
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    client = app_mod.app.test_client()
+    token = "kill-switch-reset-reason-token"
+    client.set_cookie("csrf_token", token, domain="localhost")
+
+    resp = client.post(
+        "/api/risk/kill-switch",
+        json={"action": "reset", "reason": "reset"},
+        headers={"X-CSRF-Token": token},
+    )
+
+    body = resp.get_json() or {}
+    assert resp.status_code == 400
+    assert body.get("error") == "reason_too_short"
+    assert (data_dir / "kill_switch.lock").exists()
+    assert not (data_dir / "kill_switch_audit.log").exists()
+
+
+def test_kill_switch_reset_clears_state_and_writes_audit(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "kill_switch.lock").touch()
+    (data_dir / "kill_switch_state.json").write_text(
+        '{"triggered": true, "reason": "test trigger"}'
+    )
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    client = app_mod.app.test_client()
+    token = "kill-switch-reset-audit-token"
+    client.set_cookie("csrf_token", token, domain="localhost")
+
+    reason = "operator verified stale paper-trading trigger"
+    resp = client.post(
+        "/api/risk/kill-switch",
+        json={"action": "reset", "reason": reason},
+        headers={"X-CSRF-Token": token},
+    )
+
+    body = resp.get_json() or {}
+    assert resp.status_code == 200
+    assert body.get("success") is True
+    assert body.get("audit_logged") is True
+    assert not (data_dir / "kill_switch.lock").exists()
+    assert not (data_dir / "kill_switch_state.json").exists()
+
+    audit_lines = (data_dir / "kill_switch_audit.log").read_text().splitlines()
+    assert len(audit_lines) == 1
+    audit = _json.loads(audit_lines[0])
+    assert audit["action"] == "reset"
+    assert audit["reason"] == reason
+    assert audit["cleared_lock_file"] is True
+    assert audit["cleared_state_file"] is True
+
+
+def test_kill_switch_reset_denied_in_live_mode_by_default(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "kill_switch.lock").touch()
+    app_mod = _reload_app(
+        monkeypatch,
+        DASH_AUTH_ENABLED="false",
+        EXECUTION_MODE="live",
+        TRADING_MODE=None,
+        IBKR_PORT="4001",
+        DASH_ALLOW_LIVE_KILL_SWITCH_RESET=None,
+    )
+    client = app_mod.app.test_client()
+    token = "kill-switch-live-deny-token"
+    client.set_cookie("csrf_token", token, domain="localhost")
+
+    resp = client.post(
+        "/api/risk/kill-switch",
+        json={"action": "reset", "reason": "operator supplied a real reason"},
+        headers={"X-CSRF-Token": token},
+    )
+
+    body = resp.get_json() or {}
+    assert resp.status_code == 403
+    assert body.get("error") == "live_reset_not_allowed"
+    assert (data_dir / "kill_switch.lock").exists()
+    assert not (data_dir / "kill_switch_audit.log").exists()
 
 
 def test_start_endpoint_rejects_bad_symbol_b_9(monkeypatch):
