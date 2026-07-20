@@ -4,9 +4,9 @@ Tests the validate_portfolio decorator and endpoint behavior with
 various portfolio_id values (valid, invalid, non-existent).
 """
 
-from dataclasses import replace
 import os
 import sqlite3
+from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
 import pytest
