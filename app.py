@@ -2428,7 +2428,8 @@ HTML_TEMPLATE = """
                     updateStatus('running');
                     addLog('Trading started');
                 } else {
-                    const message = data.message || data.error || 'Use ./START_TRADER.sh';
+                    const message = data.action || data.message ||
+                        data.error || 'Use ./START_TRADER.sh';
                     addLog(`Start disabled: ${message}`);
                 }
             } catch (error) {
@@ -2447,7 +2448,8 @@ HTML_TEMPLATE = """
                     updateStatus('stopped');
                     addLog('Trading stopped');
                 } else {
-                    const message = data.message || data.error || 'Use supervised shutdown';
+                    const message = data.action || data.message ||
+                        data.error || 'Use supervised shutdown';
                     addLog(`Stop disabled: ${message}`);
                 }
             } catch (error) {
@@ -5365,10 +5367,12 @@ def market_status():
 
 def check_ibkr_connection():
     """
-    Check TWS/Gateway connection using lsof (no zombies).
+    Check the supervised paper Gateway connection using lsof (no zombies).
 
-    Checks both TWS (port 7497) and Gateway (port 4002) to see which is running.
-    Also checks for ESTABLISHED connections to distinguish between:
+    Checks only the port in the validated runtime contract. During containment
+    that is IB Gateway paper on 4002; an unrelated TWS listener must never make
+    the dashboard claim the supervised topology is healthy. Also checks for
+    ESTABLISHED connections to distinguish between:
     - Gateway available (listening) but no active API connection
     - Gateway available AND runner has active API connection
 
@@ -5380,25 +5384,18 @@ def check_ibkr_connection():
     """
     import subprocess
 
-    tws_healthy = False
     gateway_healthy = False
-    api_connected = False  # True if there's an ESTABLISHED connection to Gateway/TWS
+    api_connected = False
     status_msg = "Unknown"
+    gateway_port = str(runtime_contract.ibkr_port)
 
-    # Check TWS (port 7497) using lsof
+    # Check the contract Gateway port using lsof.
     try:
         result = subprocess.run(
-            ["lsof", "-nP", "-iTCP:7497", "-sTCP:LISTEN"], capture_output=True, text=True, timeout=2
-        )
-        if result.returncode == 0 and "LISTEN" in result.stdout:
-            tws_healthy = True
-    except Exception as e:
-        logger.debug(f"TWS health check error: {e}")
-
-    # Check Gateway (port 4002) using lsof
-    try:
-        result = subprocess.run(
-            ["lsof", "-nP", "-iTCP:4002", "-sTCP:LISTEN"], capture_output=True, text=True, timeout=2
+            ["lsof", "-nP", f"-iTCP:{gateway_port}", "-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            timeout=2,
         )
         if result.returncode == 0 and "LISTEN" in result.stdout:
             gateway_healthy = True
@@ -5406,56 +5403,34 @@ def check_ibkr_connection():
         logger.debug(f"Gateway health check error: {e}")
 
     # Check for ESTABLISHED connections (actual API connections)
-    # This tells us if the runner currently has an active connection to Gateway/TWS
+    # This tells us if the runner currently has an active Gateway connection.
     try:
-        # Check for established connections on port 4002 (Gateway) or 7497 (TWS)
         result = subprocess.run(
-            ["lsof", "-nP", "-iTCP:4002", "-sTCP:ESTABLISHED"],
+            ["lsof", "-nP", f"-iTCP:{gateway_port}", "-sTCP:ESTABLISHED"],
             capture_output=True,
             text=True,
             timeout=2,
         )
         if result.returncode == 0 and "ESTABLISHED" in result.stdout:
             api_connected = True
-        else:
-            # Also check TWS port
-            result = subprocess.run(
-                ["lsof", "-nP", "-iTCP:7497", "-sTCP:ESTABLISHED"],
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            if result.returncode == 0 and "ESTABLISHED" in result.stdout:
-                api_connected = True
     except Exception as e:
         logger.debug(f"API connection check error: {e}")
 
     # Determine status message - be clear about the distinction
     if api_connected:
-        if gateway_healthy:
-            status_msg = "Gateway API connected (port 4002)"
-        elif tws_healthy:
-            status_msg = "TWS API connected (port 7497)"
-        else:
-            status_msg = "API connected"
-    elif gateway_healthy or tws_healthy:
-        # Gateway/TWS is running but no active API connection
-        if gateway_healthy and tws_healthy:
-            status_msg = "Gateway & TWS available (no active API session)"
-        elif gateway_healthy:
-            status_msg = "Gateway available (no active API session)"
-        else:
-            status_msg = "TWS available (no active API session)"
+        status_msg = f"Gateway API connected (port {gateway_port})"
+    elif gateway_healthy:
+        status_msg = "Gateway available (no active API session)"
     else:
-        status_msg = "No TWS/Gateway detected"
+        status_msg = "No supervised Gateway detected"
 
     return {
         "connected": api_connected,  # Now means actually connected, not just available
         "gateway_available": gateway_healthy,  # Gateway is listening
-        "tws_available": tws_healthy,  # TWS is listening
+        "tws_available": False,  # Backwards-compatible field; TWS is unsupported.
         "api_connected": api_connected,  # Active ESTABLISHED connection exists
         "status": status_msg,
-        "tws_running": tws_healthy,  # Keep for backwards compat
+        "tws_running": False,  # Backwards-compatible field; TWS is unsupported.
         "gateway_running": gateway_healthy,  # Keep for backwards compat
     }
 
@@ -5515,7 +5490,7 @@ def status():
     # Build clear status message
     runner_running = runner_actually_running
 
-    # Check TWS/Gateway health with sync approach (no zombies)
+    # Check the supervised Gateway health with sync approach (no zombies)
     # Do this FIRST so we can use it in status messages
     ibkr_check = check_ibkr_connection()
     api_connected = ibkr_check.get("api_connected", False)  # Active ESTABLISHED connection
@@ -5543,7 +5518,7 @@ def status():
         # Runner is running, market is open, AND we have an active API connection
         status_message = "✅ Market Open - API Connected"
         status_detail = "Runner has active IBKR API connection and is processing data"
-    elif gateway_available or tws_available:
+    elif gateway_available:
         # Runner is running, market is open, but NO active API connection
         status_message = "🔄 Market Open - API session not confirmed"
         status_detail = (

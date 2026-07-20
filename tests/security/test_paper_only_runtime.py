@@ -158,6 +158,17 @@ def test_dashboard_controls_explain_disabled_process_actions():
 
     assert "Start disabled: ${message}" in source
     assert "Stop disabled: ${message}" in source
+    assert "data.action || data.message ||" in source
+
+
+def test_dashboard_health_uses_only_the_contract_gateway_port():
+    source = (ROOT / "app.py").read_text()
+    health_check = source.split("def check_ibkr_connection():", 1)[1].split(
+        '@app.route("/api/status")', 1
+    )[0]
+
+    assert "runtime_contract.ibkr_port" in health_check
+    assert "7497" not in health_check
 
 
 @pytest.mark.parametrize(
