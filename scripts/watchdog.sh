@@ -289,6 +289,11 @@ restart_trader() {
             if [ -z "$policy_reason" ]; then
                 policy_reason="restart_policy_invalid"
             fi
+            # Log every supervisor restart request that terminates at the
+            # policy boundary. This is intentionally distinct from the
+            # "RESTARTING" message below because START_TRADER.sh was not
+            # invoked. Notifications remain deduplicated to avoid alert spam.
+            log "AUTOMATIC RESTART REQUEST DENIED: launcher not invoked (restart_rc=2, policy_rc=${policy_rc}, reason=${policy_reason})"
             if [ "$policy_reason" != "$LAST_TERMINAL_SAFETY_REASON" ]; then
                 log "TERMINAL SAFETY BLOCK: watchdog restart suppressed (reason=$policy_reason)"
                 notify_user "RoboTrader safety block" \

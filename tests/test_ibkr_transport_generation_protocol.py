@@ -536,6 +536,26 @@ async def test_historical_response_symbol_and_contract_identity_fail_closed(data
 
 
 @pytest.mark.asyncio
+async def test_historical_response_preserves_first_integrity_violation():
+    data = _valid_historical_data(symbol="MSFT")
+    data["broker_timestamp"] = "2026-07-23T14:31:00"
+    data["bars"] = {"unexpected": "mapping"}
+
+    def handler(process, request):
+        _feed(process, _response(request, data=data))
+
+    client, _, generation = _attach_client(handler)
+
+    with pytest.raises(
+        IBKRTransportPoisonedError,
+        match="historical response requested symbol mismatch",
+    ):
+        await client.get_historical_bars("AAPL")
+
+    assert generation.poisoned_reason == "historical response requested symbol mismatch"
+
+
+@pytest.mark.asyncio
 async def test_historical_validation_poisons_exact_generation_before_stop(monkeypatch):
     held = {}
 

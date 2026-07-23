@@ -1313,18 +1313,23 @@ class SubprocessIBKRClient:
         ):
             integrity_error = "historical response has incomplete contract identity"
 
-        for timestamp_field in ("broker_timestamp", "retrieval_timestamp"):
-            timestamp = data.get(timestamp_field)
-            try:
-                parsed = datetime.fromisoformat(timestamp) if isinstance(timestamp, str) else None
-            except ValueError:
-                parsed = None
-            if parsed is None or parsed.tzinfo is None or parsed.utcoffset() is None:
-                integrity_error = f"historical response {timestamp_field} is not timezone-aware"
-                break
-
         bars = data.get("bars")
-        if not isinstance(bars, list) or any(not isinstance(bar, dict) for bar in bars):
+        if integrity_error is None:
+            for timestamp_field in ("broker_timestamp", "retrieval_timestamp"):
+                timestamp = data.get(timestamp_field)
+                try:
+                    parsed = (
+                        datetime.fromisoformat(timestamp) if isinstance(timestamp, str) else None
+                    )
+                except ValueError:
+                    parsed = None
+                if parsed is None or parsed.tzinfo is None or parsed.utcoffset() is None:
+                    integrity_error = f"historical response {timestamp_field} is not timezone-aware"
+                    break
+
+        if integrity_error is None and (
+            not isinstance(bars, list) or any(not isinstance(bar, dict) for bar in bars)
+        ):
             integrity_error = "historical response bars are malformed"
 
         if integrity_error:

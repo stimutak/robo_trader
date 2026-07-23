@@ -2192,7 +2192,9 @@ class AsyncRunner:
         closes = frame["close"].astype(float)
 
         intrabar_spread = ohlc.max(axis=1) / ohlc.min(axis=1)
-        if ((intrabar_spread >= limit) | (intrabar_spread <= reciprocal)).any():
+        # max(OHLC) / min(OHLC) is always >= 1 for the positive prices
+        # validated above, so only the upper anomaly bound is meaningful.
+        if (intrabar_spread >= limit).any():
             raise MarketDataContractError(
                 f"intrabar OHLC anomaly quarantined for {symbol}: "
                 "possible bad tick or corporate action"
@@ -2471,7 +2473,16 @@ class AsyncRunner:
             )
 
         latest_price = float(df["close"].iloc[-1])
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise MarketDataContractError(
+                "validated broker bars lost their timezone-aware DatetimeIndex"
+            )
         latest_timestamp = df.index[-1].to_pydatetime()
+        if latest_timestamp.tzinfo is None or latest_timestamp.utcoffset() is None:
+            raise MarketDataContractError(
+                "validated broker bars contain a timezone-naive latest timestamp"
+            )
+        latest_timestamp = latest_timestamp.astimezone(timezone.utc)
 
         # Historical bars are validated observations, but they are not a
         # live-grade protective feed. A one-minute bar carries its bar event

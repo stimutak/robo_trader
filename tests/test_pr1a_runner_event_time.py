@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections import OrderedDict
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -356,6 +357,75 @@ def test_common_split_ratio_vs_prior_trusted_price_is_quarantined(
     )
     with pytest.raises(MarketDataContractError, match="latest bar OHLC anomaly"):
         runner._validate_cross_bar_anomaly("AAPL", frame)
+
+
+def test_intrabar_spread_has_only_the_mathematically_reachable_upper_bound() -> None:
+    source = inspect.getsource(AsyncRunner._validate_cross_bar_anomaly)
+
+    assert "intrabar_spread >= limit" in source
+    assert "intrabar_spread <= reciprocal" not in source
+
+
+@pytest.mark.asyncio
+async def test_process_symbol_rejects_naive_latest_timestamp_before_state_mutation() -> None:
+    runner = AsyncRunner.__new__(AsyncRunner)
+    runner.fetch_and_store_data = AsyncMock(
+        return_value=pd.DataFrame(
+            {
+                "open": [100.0],
+                "high": [101.0],
+                "low": [99.0],
+                "close": [100.0],
+                "volume": [100],
+            },
+            index=pd.DatetimeIndex(["2026-07-23 15:00:00"]),
+        )
+    )
+    runner.market_data_cache = OrderedDict()
+    runner.latest_prices = {}
+    runner.latest_price_times = {}
+    runner.stop_loss_monitor = MagicMock()
+    runner.stop_loss_monitor.update_price = AsyncMock()
+
+    with pytest.raises(MarketDataContractError, match="timezone-naive latest timestamp"):
+        await runner.process_symbol("AAPL")
+
+    assert runner.market_data_cache == {}
+    assert runner.latest_prices == {}
+    assert runner.latest_price_times == {}
+    runner.stop_loss_monitor.update_price.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_symbol_normalizes_aware_latest_timestamp_to_utc() -> None:
+    runner = AsyncRunner.__new__(AsyncRunner)
+    frame = pd.DataFrame(
+        {
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "close": [100.0],
+            "volume": [100],
+        },
+        index=pd.DatetimeIndex(["2026-07-23T11:00:00-04:00"]),
+    )
+    runner.fetch_and_store_data = AsyncMock(return_value=frame)
+    runner.market_data_cache = OrderedDict()
+    runner.max_cache_size = 10
+    runner.latest_prices = {}
+    runner.latest_price_times = {}
+    runner.stop_loss_monitor = MagicMock()
+    runner.stop_loss_monitor.update_price = AsyncMock()
+    runner.use_advanced_risk = False
+
+    result = await runner.process_symbol("AAPL")
+
+    assert result.executed is False
+    assert runner.latest_price_times["AAPL"] == datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc)
+    assert runner._protective_feed_status["AAPL"]["source_timestamp"] == (
+        "2026-07-23T15:00:00+00:00"
+    )
+    runner.stop_loss_monitor.update_price.assert_not_awaited()
 
 
 @pytest.mark.asyncio

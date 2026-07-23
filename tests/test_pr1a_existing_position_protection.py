@@ -389,3 +389,58 @@ def test_watchdog_calls_policy_before_authoritative_launcher() -> None:
         '"$PROJECT_DIR/START_TRADER.sh"'
     )
     assert "return 2" in restart_body
+
+
+def test_watchdog_logs_terminal_restart_request_without_claiming_launcher_ran(
+    tmp_path: Path,
+) -> None:
+    source = (ROOT / "scripts" / "watchdog.sh").read_text()
+    restart_function = (
+        "restart_trader() {" + source.split("restart_trader() {", 1)[1].split("# Main loop", 1)[0]
+    )
+    audit = tmp_path / "runner_exit.json"
+    audit.write_text('{"reason":"unprotected_existing_positions","exit_code":6}')
+    policy = tmp_path / "policy"
+    policy.write_text("#!/bin/bash\necho unprotected_existing_positions\nexit 20\n")
+    policy.chmod(0o700)
+    capture = tmp_path / "watchdog.log"
+    launcher = tmp_path / "START_TRADER.sh"
+    launcher.write_text(f"#!/bin/bash\necho LAUNCHER_RAN >> {capture!s}\n")
+    launcher.chmod(0o700)
+
+    harness = f"""
+RUNNER_EXIT_AUDIT={audit!s}
+PYTHON3_BIN={policy!s}
+RESTART_POLICY={policy!s}
+PROJECT_DIR={tmp_path!s}
+WATCHDOG_LOG={capture!s}
+CAPTURE={capture!s}
+LAST_TERMINAL_SAFETY_REASON=""
+RESTART_VERIFY_WAIT=0
+is_runner_alive() {{ return 1; }}
+watchdog_restart_allowed_for_policy_rc() {{ return 1; }}
+log() {{ printf '%s\\n' "$1" >> "$CAPTURE"; }}
+notify_user() {{ :; }}
+reset_failures() {{ :; }}
+get_failure_count() {{ echo 0; }}
+set_failure_count() {{ :; }}
+{restart_function}
+restart_trader
+rc=$?
+printf 'RETURN_CODE=%s\\n' "$rc" >> "$CAPTURE"
+"""
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    log_output = capture.read_text()
+    assert (
+        "AUTOMATIC RESTART REQUEST DENIED: launcher not invoked "
+        "(restart_rc=2, policy_rc=20, reason=unprotected_existing_positions)" in log_output
+    )
+    assert "RETURN_CODE=2" in log_output
+    assert "LAUNCHER_RAN" not in log_output
