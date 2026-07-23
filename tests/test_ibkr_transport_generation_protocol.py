@@ -12,7 +12,9 @@ from robo_trader.clients import subprocess_ibkr_client as client_module
 from robo_trader.clients.subprocess_ibkr_client import (
     IBKRConnectionConflictError,
     IBKRTimeoutError,
+    IBKRTimeoutRequiresGatewayRestartError,
     IBKRTransportPoisonedError,
+    GatewayRequiresRestartError,
     SubprocessCrashError,
     SubprocessIBKRClient,
     _WorkerGeneration,
@@ -138,6 +140,76 @@ async def test_timeout_poison_rejects_next_command_and_late_response():
         await client._execute_command({"command": "B"})
     assert len(process.stdin.writes) == 1
     assert generation.poisoned_reason.startswith("command timeout")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    [
+        "get_accounts",
+        "get_positions",
+        "get_account_summary",
+        "get_historical_bars",
+        "ping",
+        "health",
+    ],
+)
+async def test_worker_reported_timeout_poisons_exact_generation_for_every_command(command):
+    def handler(process, request):
+        _feed(
+            process,
+            _response(
+                request,
+                status="error",
+                error="broker timeout sentinel",
+                error_type="TimeoutError",
+            ),
+        )
+
+    client, process, generation = _attach_client(handler)
+
+    with pytest.raises(IBKRTimeoutError, match="broker timeout sentinel"):
+        await client._execute_command({"command": command})
+
+    writes_after_timeout = len(process.stdin.writes)
+    with pytest.raises(IBKRTransportPoisonedError, match="worker-reported broker timeout"):
+        await client._execute_command({"command": "next-command"})
+
+    assert len(process.stdin.writes) == writes_after_timeout
+    assert generation.poisoned_reason is not None
+    assert "worker-reported broker timeout" in generation.poisoned_reason
+    assert command in generation.poisoned_reason
+    assert "broker timeout sentinel" in generation.poisoned_reason
+
+
+@pytest.mark.asyncio
+async def test_worker_reported_gateway_timeout_preserves_both_recovery_signals():
+    def handler(process, request):
+        _feed(
+            process,
+            _response(
+                request,
+                status="error",
+                error="handshake timeout sentinel",
+                error_type="TimeoutError",
+                requires_restart=True,
+                detail="restart Gateway diagnostic sentinel",
+            ),
+        )
+
+    client, _, generation = _attach_client(handler)
+
+    with pytest.raises(
+        IBKRTimeoutRequiresGatewayRestartError,
+        match="restart Gateway diagnostic sentinel",
+    ) as caught:
+        await client._execute_command({"command": "connect"})
+
+    assert isinstance(caught.value, IBKRTimeoutError)
+    assert isinstance(caught.value, GatewayRequiresRestartError)
+    assert generation.poisoned_reason is not None
+    assert "handshake timeout sentinel" in generation.poisoned_reason
+    assert "restart Gateway diagnostic sentinel" in generation.poisoned_reason
 
 
 @pytest.mark.asyncio
@@ -720,6 +792,61 @@ async def test_worker_identity_protocol_error_poisons_parent_generation(monkeypa
         await client.get_historical_bars("AAPL")
 
     assert generation.poisoned_reason == "unknown response status"
+
+
+@pytest.mark.asyncio
+async def test_worker_historical_timeout_poisons_parent_generation_end_to_end(
+    monkeypatch,
+):
+    contract = SimpleNamespace(
+        symbol="AAPL",
+        localSymbol="AAPL",
+        conId=265598,
+        secType="STK",
+        exchange="SMART",
+        primaryExchange="NASDAQ",
+        currency="USD",
+        tradingClass="NMS",
+    )
+
+    class TimeoutIB:
+        def isConnected(self):
+            return True
+
+        async def qualifyContractsAsync(self, requested):
+            return [contract]
+
+        async def reqCurrentTimeAsync(self):
+            return datetime(2026, 7, 23, 14, 31, tzinfo=timezone.utc)
+
+        async def reqHistoricalDataAsync(self, requested, **kwargs):
+            raise TimeoutError("historical broker timeout sentinel")
+
+    monkeypatch.setattr(worker, "ib", TimeoutIB())
+    worker_response = await worker.handle_get_historical_bars({"symbol": "AAPL"})
+
+    assert worker_response["status"] == "error"
+    assert worker_response["error_type"] == "TimeoutError"
+
+    def handler(process, request):
+        envelope = _response(request)
+        envelope.pop("data")
+        envelope.update(worker_response)
+        _feed(process, envelope)
+
+    client, process, generation = _attach_client(handler)
+
+    with pytest.raises(IBKRTimeoutError, match="historical broker timeout sentinel"):
+        await client.get_historical_bars("AAPL")
+
+    writes_after_timeout = len(process.stdin.writes)
+    with pytest.raises(IBKRTransportPoisonedError, match="worker-reported broker timeout"):
+        await client.get_positions()
+
+    assert len(process.stdin.writes) == writes_after_timeout
+    assert generation.poisoned_reason is not None
+    assert "get_historical_bars" in generation.poisoned_reason
+    assert "historical broker timeout sentinel" in generation.poisoned_reason
 
 
 @pytest.mark.asyncio

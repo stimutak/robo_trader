@@ -857,6 +857,50 @@ class AsyncRunner:
         receipt_age = float(now_monotonic) - float(receipt_time)
         return 0 <= event_age <= float(max_age) and 0 <= receipt_age <= float(max_age)
 
+    def _monitor_owns_exact_fresh_protective_event(
+        self,
+        symbol: str,
+        price: object,
+        event_time: object,
+    ) -> bool:
+        """Return whether the monitor already owns this exact live event.
+
+        ``StopLossMonitor.update_price`` deliberately rejects a repeated
+        broker timestamp. Recovery may therefore receive ``False`` when the
+        exact cached event was accepted immediately before the disconnect.
+        That rejection is safe to treat as satisfied only when the monitor's
+        independently-clocked state is still fresh and matches both the
+        cached event timestamp and price exactly.
+        """
+        if not self._has_live_protective_feed(symbol):
+            return False
+        if (
+            not isinstance(price, (int, float))
+            or isinstance(price, bool)
+            or not math.isfinite(float(price))
+            or float(price) <= 0
+            or not isinstance(event_time, datetime)
+            or event_time.tzinfo is None
+            or event_time.utcoffset() is None
+        ):
+            return False
+
+        monitor = self.stop_loss_monitor
+        monitor_price = monitor.last_prices.get(symbol)
+        monitor_event_time = monitor.price_event_times.get(symbol)
+        if (
+            not isinstance(monitor_price, (int, float))
+            or isinstance(monitor_price, bool)
+            or not math.isfinite(float(monitor_price))
+            or not isinstance(monitor_event_time, datetime)
+            or monitor_event_time.tzinfo is None
+            or monitor_event_time.utcoffset() is None
+        ):
+            return False
+        return float(monitor_price) == float(price) and monitor_event_time.astimezone(
+            timezone.utc
+        ) == event_time.astimezone(timezone.utc)
+
     def _pairs_execution_admitted(self, pair: object) -> bool:
         """Fail closed until pairs have an atomic two-leg execution lifecycle."""
         if (
@@ -5187,6 +5231,16 @@ class AsyncRunner:
                     source_timestamp=price_times[symbol],
                 )
                 if accepted:
+                    rewarmed += 1
+                elif self._monitor_owns_exact_fresh_protective_event(
+                    symbol,
+                    prices[symbol],
+                    price_times[symbol],
+                ):
+                    logger.info(
+                        "event=stop_loss_price_rewarm_already_current symbol=%s",
+                        symbol,
+                    )
                     rewarmed += 1
                 else:
                     skipped += 1

@@ -123,6 +123,12 @@ class GatewayRequiresRestartError(IBKRError):
     pass
 
 
+class IBKRTimeoutRequiresGatewayRestartError(IBKRTimeoutError, GatewayRequiresRestartError):
+    """Worker timeout that requires both worker replacement and Gateway recovery."""
+
+    pass
+
+
 _TRANSPORT_PROTOCOL_VERSION = 1
 _INTRADAY_BAR_SIZES = {
     "1 secs",
@@ -1016,6 +1022,25 @@ class SubprocessIBKRClient:
                     error_type=error_type,
                     requires_restart=requires_restart,
                 )
+
+                # A timeout reported by the worker is as ambiguous as a timeout
+                # observed by the parent: the underlying broker request may
+                # still complete after the response is emitted. Never reuse
+                # that exact worker generation for another command.
+                if error_type == "TimeoutError":
+                    diagnostic = f"{error_type}: {error_msg}"
+                    if detail and detail != error_msg:
+                        diagnostic = f"{diagnostic} ({detail})"
+                    self._poison_generation(
+                        generation,
+                        (
+                            "worker-reported broker timeout: "
+                            f"{command_name} ({request_id}): {diagnostic}"
+                        ),
+                    )
+                    if requires_restart:
+                        raise IBKRTimeoutRequiresGatewayRestartError(diagnostic)
+                    raise IBKRTimeoutError(diagnostic)
 
                 if requires_restart or error_type == "GatewayRequiresRestartError":
                     message = detail or error_msg
