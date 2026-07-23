@@ -8,6 +8,7 @@ with schema validation, environment-specific settings, and equity-specific const
 import hashlib
 import json
 import os
+import subprocess
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -26,6 +27,7 @@ logger = get_logger(__name__)
 PAPER_PORTS = frozenset({4002})
 LIVE_PORTS = frozenset({7496, 4001})
 PAPER_ONLY_EXECUTION_SOURCE = "paper_simulator"
+BACKTEST_EXECUTION_SOURCE = "offline_backtest"
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,17 @@ class RuntimeContract:
     ibkr_readonly: bool
     database_path: str
     account_alias: Optional[str]
+    account_type: str
+    model_artifact_set: str
+    build_id: str
+    state_namespace: str
+
+    @property
+    def database_identity(self) -> str:
+        """Return a stable, non-sensitive identity for the configured ledger."""
+        resolved = str(Path(self.database_path).expanduser().resolve(strict=False))
+        digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
+        return f"{self.state_namespace}:{digest}"
 
     @property
     def fingerprint(self) -> str:
@@ -59,8 +72,12 @@ class RuntimeContract:
             "ibkr_host": self.ibkr_host,
             "ibkr_port": self.ibkr_port,
             "ibkr_readonly": self.ibkr_readonly,
-            "database_path": self.database_path,
+            "database_identity": self.database_identity,
             "account_alias": self.account_alias,
+            "account_type": self.account_type,
+            "model_artifact_set": self.model_artifact_set,
+            "build_id": self.build_id,
+            "state_namespace": self.state_namespace,
             "live_capability": "disabled",
         }
         if include_fingerprint:
@@ -82,6 +99,43 @@ def _masked_account_alias(account: Optional[str]) -> Optional[str]:
     return f"***{clean[-4:]}" if len(clean) > 4 else "***"
 
 
+def _build_identifier(env: Mapping[str, str]) -> str:
+    """Resolve a non-secret build identity without trusting the working directory."""
+    configured = str(env.get("BUILD_ID") or env.get("GIT_SHA") or "").strip()
+    if configured:
+        return configured[:64]
+
+    project_root = Path(__file__).resolve().parents[1]
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_root), "rev-parse", "--short=12", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=True,
+        )
+        if result.stdout.strip():
+            return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "unversioned"
+
+
+def _model_artifact_identity(env: Mapping[str, str]) -> str:
+    """Resolve the operator-defined model set, clearly marking local defaults."""
+    configured = str(env.get("MODEL_ARTIFACT_SET", "")).strip()
+    if configured:
+        return configured[:128]
+    registry = str(env.get("ML_MODEL_REGISTRY_PATH", "model_registry")).strip()
+    resolved = str(Path(registry).expanduser().resolve(strict=False))
+    digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
+    return f"unversioned:{digest}"
+
+
+def _enabled(env: Mapping[str, str], name: str) -> bool:
+    return _normalized_value(env, name, "false") in {"true", "1", "yes", "on"}
+
+
 def load_runtime_contract_from_env(
     environ: Optional[Mapping[str, str]] = None,
 ) -> RuntimeContract:
@@ -101,10 +155,11 @@ def load_runtime_contract_from_env(
         raise ConfigValidationError(
             "Conflicting execution modes: EXECUTION_MODE and TRADING_MODE must match."
         )
-    if execution_mode != TradingMode.PAPER.value:
+    if execution_mode not in {TradingMode.PAPER.value, TradingMode.BACKTEST.value}:
         raise ConfigValidationError(
             "Live trading capability is disabled during remediation. "
-            "Set EXECUTION_MODE=paper and keep IBKR ReadOnlyApi=yes."
+            "Set EXECUTION_MODE=paper for the supervised runtime or backtest "
+            "for offline evaluation."
         )
 
     environment = _normalized_value(env, "ENVIRONMENT", "dev")
@@ -138,15 +193,89 @@ def load_runtime_contract_from_env(
             "Paper-only remediation requires IBKR_READONLY=true and IBC ReadOnlyApi=yes."
         )
 
+    account = str(env.get("IBKR_ACCOUNT", "")).strip()
+    account_type = _normalized_value(
+        env,
+        "IBKR_ACCOUNT_TYPE",
+        "paper" if execution_mode == TradingMode.PAPER.value else "offline",
+    )
+    if execution_mode == TradingMode.PAPER.value:
+        if not account:
+            raise ConfigValidationError(
+                "Supervised paper runtime requires IBKR_ACCOUNT to identify the expected account."
+            )
+        approved_accounts = {
+            item.strip()
+            for item in str(env.get("IBKR_APPROVED_ACCOUNTS", "")).split(",")
+            if item.strip()
+        }
+        if account not in approved_accounts:
+            raise ConfigValidationError(
+                "IBKR_ACCOUNT is not present in IBKR_APPROVED_ACCOUNTS; "
+                "refusing an unapproved broker account."
+            )
+        if account_type != "paper":
+            raise ConfigValidationError(
+                "Supervised paper runtime requires IBKR_ACCOUNT_TYPE=paper."
+            )
+
+    database_path = str(env.get("RT_DB_PATH", "trading_data.db")).strip()
+    if not database_path:
+        raise ConfigValidationError("RT_DB_PATH cannot be empty.")
+    state_namespace = _normalized_value(env, "RT_STATE_NAMESPACE", execution_mode)
+    if state_namespace != execution_mode:
+        raise ConfigValidationError(
+            "RT_STATE_NAMESPACE must match EXECUTION_MODE so paper/backtest state cannot collide."
+        )
+    live_database_path = str(env.get("LIVE_RT_DB_PATH", "")).strip()
+    if live_database_path:
+        paper_resolved = Path(database_path).expanduser().resolve(strict=False)
+        live_resolved = Path(live_database_path).expanduser().resolve(strict=False)
+        if paper_resolved == live_resolved:
+            raise ConfigValidationError(
+                "RT_DB_PATH and LIVE_RT_DB_PATH must identify different ledgers."
+            )
+
+    build_id = _build_identifier(env)
+    model_artifact_set = _model_artifact_identity(env)
+    if environment == Environment.PRODUCTION.value:
+        missing_gates = [
+            name
+            for name in (
+                "DASH_AUTH_ENABLED",
+                "MODEL_SIGNING_REQUIRED",
+                "MONITORING_ENABLE_ALERTS",
+                "BACKUP_READY",
+            )
+            if not _enabled(env, name)
+        ]
+        if missing_gates:
+            raise ConfigValidationError(
+                "Production-like runtime is blocked until these readiness gates are true: "
+                + ", ".join(missing_gates)
+            )
+        if build_id == "unversioned" or model_artifact_set.startswith("unversioned:"):
+            raise ConfigValidationError(
+                "Production-like runtime requires explicit BUILD_ID and MODEL_ARTIFACT_SET."
+            )
+
     return RuntimeContract(
         environment=environment,
         execution_mode=execution_mode,
-        execution_source=PAPER_ONLY_EXECUTION_SOURCE,
+        execution_source=(
+            PAPER_ONLY_EXECUTION_SOURCE
+            if execution_mode == TradingMode.PAPER.value
+            else BACKTEST_EXECUTION_SOURCE
+        ),
         ibkr_host=str(env.get("IBKR_HOST", "127.0.0.1")).strip(),
         ibkr_port=ibkr_port,
         ibkr_readonly=True,
-        database_path=str(env.get("RT_DB_PATH", "trading_data.db")).strip(),
-        account_alias=_masked_account_alias(env.get("IBKR_ACCOUNT")),
+        database_path=database_path,
+        account_alias=_masked_account_alias(account),
+        account_type=account_type,
+        model_artifact_set=model_artifact_set,
+        build_id=build_id,
+        state_namespace=state_namespace,
     )
 
 
@@ -596,6 +725,10 @@ def load_config_from_env() -> Config:
     """
     load_dotenv()
     runtime_contract = load_runtime_contract_from_env()
+    logger.info(
+        "Validated runtime contract: %s",
+        json.dumps(runtime_contract.public_dict(), sort_keys=True),
+    )
 
     # Use enhanced validation for critical risk parameters
     validator = ConfigValidator()

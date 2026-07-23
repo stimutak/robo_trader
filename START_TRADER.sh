@@ -42,8 +42,8 @@ fi
 # Load defaults from .env if present
 if [ -f "$SCRIPT_DIR/.env" ]; then
     # Read only the startup values we need instead of sourcing arbitrary shell.
-    SYMBOLS=$(grep "^SYMBOLS=" "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
-    ENV_IBKR_PORT=$(grep "^IBKR_PORT=" "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+    SYMBOLS=$(grep "^SYMBOLS=" "$SCRIPT_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '"' | tr -d "'" | xargs)
+    ENV_IBKR_PORT=$(grep "^IBKR_PORT=" "$SCRIPT_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '"' | tr -d "'" | xargs)
 fi
 
 # Fallback default if .env doesn't have SYMBOLS

@@ -63,6 +63,8 @@ ENV PYTHONUNBUFFERED=1
 # Default environment variables
 ENV EXECUTION_MODE=paper \
     TRADING_MODE=paper \
+    IBKR_HOST=127.0.0.1 \
+    IBKR_PORT=4002 \
     IBKR_READONLY=true \
     LOG_LEVEL=INFO \
     DASH_PORT=5555 \

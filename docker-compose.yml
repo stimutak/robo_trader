@@ -73,6 +73,7 @@ services:
   robo-trader:
     build: .
     container_name: robo_trader_main
+    profiles: ["unsupported-trader"]
     command: ["sh", "-c", "echo 'DISABLED: container trader startup is not yet supported' >&2; exit 2"]
     environment:
       - EXECUTION_MODE=paper
@@ -95,7 +96,7 @@ services:
       - dashboard
     networks:
       - robo_trader_network
-    restart: unless-stopped
+    restart: "no"
     deploy:
       resources:
         limits:

@@ -283,8 +283,10 @@ class TestPortResolution:
 
     def test_unknown_mode_is_rejected(self, monkeypatch: pytest.MonkeyPatch, cli_module) -> None:
         monkeypatch.setenv("EXECUTION_MODE", "backtest")
-        monkeypatch.delenv("TRADING_MODE", raising=False)
-        with pytest.raises(ValueError, match="disabled during remediation"):
+        monkeypatch.setenv("TRADING_MODE", "backtest")
+        monkeypatch.setenv("RT_STATE_NAMESPACE", "backtest")
+        monkeypatch.setenv("IBKR_ACCOUNT_TYPE", "offline")
+        with pytest.raises(ValueError, match="offline-only"):
             cli_module._resolve_target_port()
 
 

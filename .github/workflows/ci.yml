@@ -84,11 +84,17 @@ jobs:
     env:
       EXECUTION_MODE: paper
       TRADING_MODE: paper
+      ENVIRONMENT: dev
       IBKR_HOST: 127.0.0.1
       IBKR_PORT: "4002"
-      IBKR_CLIENT_ID: "123"
       IBKR_READONLY: "true"
-      ENVIRONMENT: dev
+      IBKR_CLIENT_ID: "123"
+      IBKR_ACCOUNT: DU_CI_PAPER
+      IBKR_APPROVED_ACCOUNTS: DU_CI_PAPER
+      IBKR_ACCOUNT_TYPE: paper
+      RT_STATE_NAMESPACE: paper
+      MODEL_ARTIFACT_SET: ci-fixtures
+      BUILD_ID: github-actions
     strategy:
       fail-fast: false
       matrix:

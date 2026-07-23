@@ -118,7 +118,13 @@ def _build_argparser() -> argparse.ArgumentParser:
 def _resolve_target_port() -> int:
     """Resolve the validated paper Gateway port from the runtime contract."""
     try:
-        return load_runtime_contract_from_env().ibkr_port
+        contract = load_runtime_contract_from_env()
+        if contract.execution_mode != "paper":
+            raise ValueError(
+                "Preflight starts the supervised broker runtime; "
+                "EXECUTION_MODE=backtest is offline-only."
+            )
+        return contract.ibkr_port
     except ConfigValidationError as exc:
         # Keep this helper's longstanding ValueError API while ensuring
         # preflight and the runner validate exactly the same environment.

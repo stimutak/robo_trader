@@ -33,7 +33,12 @@ def _paper_env(**overrides: str) -> dict[str, str]:
         "IBKR_PORT": "4002",
         "IBKR_READONLY": "true",
         "IBKR_ACCOUNT": "DU1234567",
+        "IBKR_APPROVED_ACCOUNTS": "DU1234567",
+        "IBKR_ACCOUNT_TYPE": "paper",
         "RT_DB_PATH": "data/paper.db",
+        "RT_STATE_NAMESPACE": "paper",
+        "MODEL_ARTIFACT_SET": "paper-models-v1",
+        "BUILD_ID": "abc123",
     }
     env.update(overrides)
     return env
@@ -47,8 +52,28 @@ def test_runtime_contract_accepts_only_consistent_paper_readonly():
     assert contract.ibkr_port == 4002
     assert contract.ibkr_readonly is True
     assert contract.account_alias == "***4567"
+    assert contract.account_type == "paper"
+    assert contract.model_artifact_set == "paper-models-v1"
+    assert contract.build_id == "abc123"
+    assert contract.database_identity.startswith("paper:")
     assert contract.public_dict()["live_capability"] == "disabled"
+    assert "database_path" not in contract.public_dict()
     assert len(contract.fingerprint) == 16
+
+
+def test_runtime_contract_accepts_offline_backtest_without_live_capability():
+    contract = load_runtime_contract_from_env(
+        _paper_env(
+            EXECUTION_MODE="backtest",
+            TRADING_MODE="backtest",
+            IBKR_ACCOUNT_TYPE="offline",
+            RT_STATE_NAMESPACE="backtest",
+        )
+    )
+
+    assert contract.execution_mode == "backtest"
+    assert contract.execution_source == "offline_backtest"
+    assert contract.public_dict()["live_capability"] == "disabled"
 
 
 @pytest.mark.parametrize(
@@ -76,11 +101,47 @@ def test_runtime_contract_fingerprint_excludes_full_account_number():
         ibkr_readonly=True,
         database_path="data/paper.db",
         account_alias="***4567",
+        account_type="paper",
+        model_artifact_set="paper-models-v1",
+        build_id="abc123",
+        state_namespace="paper",
     )
 
     public = contract.public_dict()
     assert "DU1234567" not in str(public)
     assert public["fingerprint"] == contract.fingerprint
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"IBKR_ACCOUNT": ""}, "requires IBKR_ACCOUNT"),
+        ({"IBKR_APPROVED_ACCOUNTS": "DU7654321"}, "unapproved broker account"),
+        ({"IBKR_ACCOUNT_TYPE": "live"}, "IBKR_ACCOUNT_TYPE=paper"),
+        ({"RT_STATE_NAMESPACE": "live"}, "must match EXECUTION_MODE"),
+        ({"LIVE_RT_DB_PATH": "data/paper.db"}, "different ledgers"),
+    ],
+)
+def test_runtime_contract_rejects_account_and_state_identity_drift(overrides, message):
+    with pytest.raises(ConfigValidationError, match=message):
+        load_runtime_contract_from_env(_paper_env(**overrides))
+
+
+def test_production_like_runtime_requires_all_readiness_gates():
+    env = _paper_env(ENVIRONMENT="production")
+    with pytest.raises(ConfigValidationError, match="readiness gates"):
+        load_runtime_contract_from_env(env)
+
+    env.update(
+        {
+            "DASH_AUTH_ENABLED": "true",
+            "MODEL_SIGNING_REQUIRED": "true",
+            "MONITORING_ENABLE_ALERTS": "true",
+            "BACKUP_READY": "true",
+        }
+    )
+    contract = load_runtime_contract_from_env(env)
+    assert contract.environment == "production"
 
 
 def test_dashboard_reader_defaults_to_runtime_database(monkeypatch, tmp_path):
@@ -132,8 +193,30 @@ def test_authoritative_launcher_fails_if_ibc_config_is_missing_before_process_ki
     assert 'export EXECUTION_MODE="paper"' in source
     assert 'export IBKR_READONLY="true"' in source
     assert 'ENV_IBKR_PORT=$(grep "^IBKR_PORT="' in source
+    assert "sed 's/[[:space:]]*#.*$//'" in source
     assert "supervised paper remediation requires IB Gateway port 4002" in source
     assert "4002|7497" not in source
+
+
+def test_authoritative_launcher_normalizes_commented_port(tmp_path):
+    source = (ROOT / "START_TRADER.sh").read_text()
+    port_loader = source.split("# Load defaults from .env if present", 1)[1].split(
+        "# Fallback default if .env doesn't have SYMBOLS", 1
+    )[0]
+    script = (
+        "set -e\n"
+        f"SCRIPT_DIR={str(tmp_path)!r}\n"
+        f"{port_loader}\n"
+        'test "$ENV_IBKR_PORT" = "4002"\n'
+    )
+    (tmp_path / ".env").write_text(
+        "SYMBOLS=AAPL,NVDA\nIBKR_PORT= 4002   # supervised Gateway\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_watchdog_delegates_restart_without_pre_killing_runner():
@@ -169,6 +252,23 @@ def test_dashboard_health_uses_only_the_contract_gateway_port():
 
     assert "runtime_contract.ibkr_port" in health_check
     assert "7497" not in health_check
+
+
+def test_dashboard_renders_non_dismissible_paper_runtime_identity(monkeypatch):
+    monkeypatch.setenv("DASH_AUTH_ENABLED", "false")
+    import app as dashboard_app
+
+    monkeypatch.setattr(dashboard_app, "AUTH_ENABLED", False)
+    response = dashboard_app.app.test_client().get("/")
+    body = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert 'id="runtime-identity-banner"' in body
+    assert "PAPER • READ ONLY • LIVE DISABLED" in body
+    assert "Ledger paper:" in body
+    assert "Models pytest-fixtures" in body
+    assert "Build pytest" in body
+    assert dashboard_app.runtime_contract.database_path not in body
 
 
 @pytest.mark.parametrize(

@@ -1146,6 +1146,26 @@ HTML_TEMPLATE = """
         .runner-stale-banner.visible {
             display: block;
         }
+        .runtime-identity-banner {
+            position: sticky;
+            top: 0;
+            z-index: 9000;
+            width: 100%;
+            background: #7c2d12;
+            border-bottom: 2px solid #fb923c;
+            color: #fff7ed;
+            padding: 8px 16px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            font-weight: 700;
+            line-height: 18px;
+            text-align: center;
+        }
+        .runtime-identity-banner .runtime-primary {
+            color: #fdba74;
+            font-size: 14px;
+            margin-right: 10px;
+        }
         /* Risk gauge bars (Risk tab) */
         .risk-gauge {
             height: 6px;
@@ -1202,6 +1222,16 @@ HTML_TEMPLATE = """
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
+    <div class="runtime-identity-banner" id="runtime-identity-banner" role="status">
+        <span class="runtime-primary">PAPER • READ ONLY • LIVE DISABLED</span>
+        Account {{ runtime_identity.account_alias or 'UNCONFIGURED' }} ·
+        {{ runtime_identity.account_type }} ·
+        Source {{ runtime_identity.execution_source }} ·
+        Ledger {{ runtime_identity.database_identity }} ·
+        Models {{ runtime_identity.model_artifact_set }} ·
+        Build {{ runtime_identity.build_id }} ·
+        Config {{ runtime_identity.fingerprint }}
+    </div>
     <!-- C4: runner-stale banner. Hidden by default; JS shows it when
          /api/runner/status reports healthy=false. -->
     <div class="runner-stale-banner" id="runner-stale-banner" role="alert" aria-live="assertive"></div>
@@ -4914,6 +4944,7 @@ def index():
     return render_template_string(
         HTML_TEMPLATE,
         ws_auth_token=os.getenv("WS_AUTH_TOKEN", "").strip(),
+        runtime_identity=runtime_contract.public_dict(),
     )
 
 
@@ -5600,6 +5631,10 @@ def status():
                 "ibkr_readonly": runtime_contract.ibkr_readonly,
                 "ibkr_port": runtime_contract.ibkr_port,
                 "account_alias": runtime_contract.account_alias,
+                "account_type": runtime_contract.account_type,
+                "database_identity": runtime_contract.database_identity,
+                "model_artifact_set": runtime_contract.model_artifact_set,
+                "build_id": runtime_contract.build_id,
                 "config_fingerprint": runtime_contract.fingerprint,
                 "live_capability": "disabled",
                 "session_start": datetime.now().isoformat(),

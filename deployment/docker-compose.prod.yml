@@ -70,6 +70,7 @@ services:
   trader:
     image: robo_trader:latest
     container_name: robo_trader_main_prod
+    profiles: ["unsupported-trader"]
     command: ["sh", "-c", "echo 'DISABLED: container trader startup is not yet supported' >&2; exit 2"]
     environment:
       # PR-01: production-like deployment remains paper/read-only only.
@@ -101,7 +102,7 @@ services:
         condition: service_healthy
     networks:
       - robo_trader_network
-    restart: always
+    restart: "no"
     deploy:
       resources:
         limits:
