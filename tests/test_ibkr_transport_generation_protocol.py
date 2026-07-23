@@ -409,6 +409,46 @@ async def test_historical_response_symbol_and_contract_identity_fail_closed(data
 
 
 @pytest.mark.asyncio
+async def test_historical_validation_poisons_exact_generation_before_stop(monkeypatch):
+    held = {}
+
+    def handler(process, request):
+        held.update(process=process, request=request)
+
+    client, process, generation = _attach_client(handler)
+    original_validate = client._validate_historical_response
+    observed = {}
+
+    def validate_while_serialized(symbol, data, responding_generation):
+        observed["lifecycle_locked"] = client._lifecycle_lock.locked()
+        observed["generation"] = responding_generation
+        return original_validate(symbol, data, responding_generation)
+
+    monkeypatch.setattr(client, "_validate_historical_response", validate_while_serialized)
+    fetch = asyncio.create_task(client.get_historical_bars("AAPL"))
+    while not process.stdin.writes:
+        await asyncio.sleep(0)
+
+    stop = asyncio.create_task(client.stop())
+    await asyncio.sleep(0)
+    assert not stop.done()
+
+    _feed(
+        process,
+        _response(
+            held["request"],
+            data=_valid_historical_data(contract_symbol="MSFT"),
+        ),
+    )
+    with pytest.raises(IBKRTransportPoisonedError):
+        await fetch
+    await stop
+
+    assert observed == {"lifecycle_locked": True, "generation": generation}
+    assert "qualified contract symbol mismatch" in generation.poisoned_reason
+
+
+@pytest.mark.asyncio
 async def test_worker_historical_response_uses_qualified_identity_and_aware_times(
     monkeypatch,
 ):

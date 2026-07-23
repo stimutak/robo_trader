@@ -1114,46 +1114,13 @@ class SubprocessIBKRClient:
         data = await self._execute_command({"command": "get_account_summary"})
         return data.get("summary", {})
 
-    async def get_historical_bars(
+    def _validate_historical_response(
         self,
         symbol: str,
-        duration: str = "2 D",
-        bar_size: str = "5 mins",
-        what_to_show: str = "TRADES",
-        use_rth: bool = True,
+        data: dict,
+        generation: Optional[_WorkerGeneration],
     ) -> list[dict]:
-        """
-        Get historical bars for a symbol.
-
-        Args:
-            symbol: Stock symbol
-            duration: IB duration string (e.g., "2 D", "1 W")
-            bar_size: IB bar size (e.g., "5 mins", "1 hour")
-            what_to_show: Data type (e.g., "TRADES", "MIDPOINT")
-            use_rth: Use regular trading hours only
-
-        Returns:
-            List of bar dictionaries with date, open, high, low, close, volume
-        """
-        if bar_size not in _INTRADAY_BAR_SIZES:
-            raise ValueError(
-                "Subprocess transport supports only intraday datetime bars; "
-                f"unsupported bar_size={bar_size!r}"
-            )
-        generation = self._generation
-        data = await self._execute_command(
-            {
-                "command": "get_historical_bars",
-                "params": {
-                    "symbol": symbol,
-                    "duration": duration,
-                    "bar_size": bar_size,
-                    "what_to_show": what_to_show,
-                    "use_rth": use_rth,
-                },
-            },
-            timeout=60.0,  # Historical data can take longer
-        )
+        """Validate and, on ambiguity, poison the exact responding generation."""
         requested = symbol.strip().upper()
         echoed = data.get("requested_symbol")
         contract = data.get("qualified_contract")
@@ -1204,6 +1171,49 @@ class SubprocessIBKRClient:
                 self._poison_generation(generation, integrity_error)
             raise IBKRTransportPoisonedError(integrity_error)
         return cast(list[dict], bars)
+
+    async def get_historical_bars(
+        self,
+        symbol: str,
+        duration: str = "2 D",
+        bar_size: str = "5 mins",
+        what_to_show: str = "TRADES",
+        use_rth: bool = True,
+    ) -> list[dict]:
+        """
+        Get historical bars for a symbol.
+
+        Args:
+            symbol: Stock symbol
+            duration: IB duration string (e.g., "2 D", "1 W")
+            bar_size: IB bar size (e.g., "5 mins", "1 hour")
+            what_to_show: Data type (e.g., "TRADES", "MIDPOINT")
+            use_rth: Use regular trading hours only
+
+        Returns:
+            List of bar dictionaries with date, open, high, low, close, volume
+        """
+        if bar_size not in _INTRADAY_BAR_SIZES:
+            raise ValueError(
+                "Subprocess transport supports only intraday datetime bars; "
+                f"unsupported bar_size={bar_size!r}"
+            )
+        async with self._lifecycle_lock:
+            generation = self._generation
+            data = await self._execute_command_unlocked(
+                {
+                    "command": "get_historical_bars",
+                    "params": {
+                        "symbol": symbol,
+                        "duration": duration,
+                        "bar_size": bar_size,
+                        "what_to_show": what_to_show,
+                        "use_rth": use_rth,
+                    },
+                },
+                timeout=60.0,  # Historical data can take longer
+            )
+            return self._validate_historical_response(symbol, data, generation)
 
     async def disconnect(self) -> None:
         """Disconnect from IBKR"""
