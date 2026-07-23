@@ -23,6 +23,23 @@ def _monitor() -> StopLossMonitor:
     )
 
 
+def test_progress_deadline_defaults_cover_retries_and_monitor_cadence() -> None:
+    monitor = StopLossMonitor(
+        executor=AsyncMock(),
+        risk_manager=MagicMock(),
+        portfolio_id="default",
+        order_timeout_seconds=5,
+    )
+
+    assert monitor.broker_attempt_timeout_seconds == 5
+    assert monitor.pending_drain_timeout_seconds == 3
+    assert monitor.queue_timeout_seconds >= (
+        monitor.max_execution_retries * monitor.broker_attempt_timeout_seconds
+        + (monitor.max_execution_retries - 1) * 0.5
+    )
+    assert monitor.settlement_timeout_seconds == 10
+
+
 async def _trailing_monitor() -> tuple[StopLossMonitor, object]:
     monitor = _monitor()
     position = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))

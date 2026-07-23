@@ -25,6 +25,17 @@ from robo_trader.runner_async import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _regular_hours_default():
+    """Keep order-admission tests independent of the host wall clock.
+
+    Tests for extended-hours behavior override this patch explicitly.
+    """
+
+    with patch("robo_trader.runner_async.is_extended_hours", return_value=False):
+        yield
+
+
 def _bars(dates: list[object], *, symbol: str | None = None) -> pd.DataFrame:
     size = len(dates)
     data: dict[str, object] = {

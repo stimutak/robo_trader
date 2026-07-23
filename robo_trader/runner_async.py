@@ -72,12 +72,22 @@ from .clients.subprocess_ibkr_client import (
     SubprocessIBKRClient,
 )
 from .connection_health import HealthStatus, get_gateway_recovery_lock
+from .database_validator import DatabaseValidator, ValidationError
 from .exceptions import KillSwitchTriggeredError
 from .portfolio import Portfolio, PositionSnapshot  # Import Portfolio class from portfolio.py file
 from .portfolio_pkg.portfolio_manager import AllocationMethod, MultiStrategyPortfolioManager
 from .risk.advanced_risk import AdvancedRiskManager, risk_monitor_task
 from .risk_manager import Position, RiskManager, create_risk_manager_from_config
-from .stop_loss_monitor import StopLossMonitor, StopStatus, StopType
+from .stop_loss_monitor import (
+    StopExecutionPhase,
+    StopExecutionPhaseRecord,
+    StopLossMonitor,
+    StopLossOrder,
+    StopStatus,
+    StopType,
+    _PendingStopTrigger,
+    validate_stop_loss_order,
+)
 from .strategies import MLStrategy, sma_crossover_signals
 from .strategies.ml_enhanced_strategy import MLEnhancedStrategy
 from .utils.connection_recovery import OrderRateLimiter
@@ -1356,6 +1366,17 @@ class AsyncRunner:
                     )
 
                 if state_matches_fill:
+                    # Reconcile a newer replacement before publishing the
+                    # reduced runtime position. While this await is blocked on
+                    # the monitor lock, the old position and replacement
+                    # quantities remain mutually consistent for runtime health
+                    # checks. Once it returns, both mutations below are
+                    # synchronous with no interleaving await.
+                    replacement_safe = await self._reconcile_replacement_stop_after_fill(
+                        stop,
+                        remaining_qty or 0,
+                        remaining_avg_cost,
+                    )
                     if remaining_qty:
                         self.positions[symbol] = Position(
                             symbol,
@@ -1365,11 +1386,6 @@ class AsyncRunner:
                     else:
                         del self.positions[symbol]
 
-                    replacement_safe = await self._reconcile_replacement_stop_after_fill(
-                        stop,
-                        remaining_qty or 0,
-                        remaining_avg_cost,
-                    )
                     if not replacement_safe:
                         emergency_reason = (
                             f"Unsafe replacement stop after broker fill for {symbol}: "
@@ -1464,18 +1480,23 @@ class AsyncRunner:
         if hasattr(self, "_setup_complete") and self._setup_complete:
             # Just verify connection is still alive
             if hasattr(self, "ib") and self.ib:
+                persistent_connection_healthy = False
                 try:
                     if hasattr(self.ib, "ping"):
                         ping_ok = await self.ib.ping()
                         if ping_ok:
-                            logger.info("✓ Persistent IBKR connection still active")
-                            return
+                            persistent_connection_healthy = True
                     elif hasattr(self.ib, "isConnected") and self.ib.isConnected():
-                        logger.info("✓ Persistent IBKR connection still active")
-                        return
+                        persistent_connection_healthy = True
                 except Exception as e:
                     logger.warning(f"Connection check failed: {e}, will reconnect")
                     self._setup_complete = False
+                if persistent_connection_healthy:
+                    self._assert_existing_position_protection(
+                        allow_runtime_tracked_states=True,
+                    )
+                    logger.info("✓ Persistent IBKR connection still active")
+                    return
 
         self.cfg = load_config()
 
@@ -1775,6 +1796,7 @@ class AsyncRunner:
                 # Without this, the runner sees a phantom position post-stop
                 # and blocks/breaks subsequent BUY and SELL signals.
                 position_closed_callback=self._on_stop_loss_executed,
+                order_timeout_seconds=self.cfg.execution.order_timeout_seconds,
             )
             await self.stop_loss_monitor.start_monitoring()
             if self.use_trailing_stop:
@@ -2009,7 +2031,11 @@ class AsyncRunner:
         # while the runner is actually trading.
         _clear_exit_audit()
 
-    def _assert_existing_position_protection(self) -> None:
+    def _assert_existing_position_protection(
+        self,
+        *,
+        allow_runtime_tracked_states: bool = False,
+    ) -> None:
         """Require monitor-owned, live-grade stop coverage for every holding.
 
         Historical bars and runner caches are intentionally excluded. The
@@ -2017,6 +2043,14 @@ class AsyncRunner:
         accepted a fresh broker event from the independent live-protective
         source. Until PR 3 installs that source, a holdings-bearing runner must
         abort setup rather than appear healthy with blind stops.
+
+        The persistent-runtime fast path may additionally accept an exact
+        active TRIGGERED stop that the monitor still owns as latched pending
+        evidence, an exact queued batch member, or the exact broker-in-flight
+        object. It may also accept an absent active stop during the narrow
+        post-fill settlement window when the exact in-flight stop is EXECUTED
+        and still matches the stale local position quantity. Cold setup and
+        recovery deliberately leave ``allow_runtime_tracked_states`` disabled.
         """
 
         positions = {
@@ -2024,8 +2058,6 @@ class AsyncRunner:
             for symbol, position in getattr(self, "positions", {}).items()
             if getattr(position, "quantity", 0) != 0
         }
-        if not positions:
-            return
 
         def fail(reason_code: str) -> NoReturn:
             raise UnprotectedExistingPositionsError(
@@ -2033,6 +2065,320 @@ class AsyncRunner:
                 len(positions),
                 reason_code,
             )
+
+        def validate_progress_window(
+            *,
+            started: object,
+            timeout: object,
+            deadline: object,
+            expected_timeout: object,
+            invalid_reason: str,
+            expired_reason: str,
+        ) -> None:
+            now = monitor._monotonic()
+            values = (now, started, timeout, deadline, expected_timeout)
+            if any(
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                for value in values
+            ):
+                fail(invalid_reason)
+            started_value = float(started)
+            timeout_value = float(timeout)
+            expected_timeout_value = float(expected_timeout)
+            deadline_value = float(deadline)
+            now_value = float(now)
+            if (
+                timeout_value <= 0
+                or not math.isclose(
+                    timeout_value,
+                    expected_timeout_value,
+                    rel_tol=1e-12,
+                    abs_tol=1e-9,
+                )
+                or deadline_value <= started_value
+                or not math.isclose(
+                    deadline_value,
+                    started_value + timeout_value,
+                    rel_tol=1e-12,
+                    abs_tol=1e-9,
+                )
+                or now_value < started_value
+            ):
+                fail(invalid_reason)
+            if now_value > deadline_value:
+                fail(expired_reason)
+
+        def validate_phase_record(
+            record: object,
+            stop: StopLossOrder,
+            expected_phase: StopExecutionPhase,
+            expected_timeout: object,
+            identity_reason: str,
+            invalid_reason: str,
+            expired_reason: str,
+        ) -> None:
+            if (
+                not isinstance(record, StopExecutionPhaseRecord)
+                or record.stop is not stop
+                or record.phase is not expected_phase
+            ):
+                fail(identity_reason)
+            validate_progress_window(
+                started=record.started_monotonic,
+                timeout=record.timeout_seconds,
+                deadline=record.deadline_monotonic,
+                expected_timeout=expected_timeout,
+                invalid_reason=invalid_reason,
+                expired_reason=expired_reason,
+            )
+
+        def has_authenticated_precreation_trigger(
+            stop: StopLossOrder,
+            symbol: str,
+            stop_key: str,
+        ) -> bool:
+            """Authenticate the narrow cached-quote trigger ordering exception."""
+            evidence_by_stop = getattr(monitor, "_latched_stop_crossings", None)
+            evidence = (
+                evidence_by_stop.get(id(stop)) if isinstance(evidence_by_stop, dict) else None
+            )
+            if (
+                not isinstance(evidence, _PendingStopTrigger)
+                or evidence.stop is not stop
+                or monitor._stop_key(symbol) != stop_key
+                or evidence.trigger_price != getattr(stop, "trigger_price", None)
+                or evidence.event_time != getattr(stop, "triggered_at", None)
+            ):
+                return False
+
+            receipt_order = evidence.receipt_order
+            symbol_orders = getattr(monitor, "price_receipt_orders", None)
+            monitor_order = getattr(monitor, "_price_receipt_order", None)
+            symbol_order = symbol_orders.get(symbol) if isinstance(symbol_orders, dict) else None
+            receipt_times = getattr(monitor, "price_receipt_monotonic", None)
+            latest_receipt = receipt_times.get(symbol) if isinstance(receipt_times, dict) else None
+            expected_timeout = getattr(
+                monitor,
+                "pending_drain_timeout_seconds",
+                None,
+            )
+            numeric_values = (
+                evidence.trigger_price,
+                evidence.receipt_monotonic,
+                evidence.drain_timeout_seconds,
+                evidence.drain_deadline_monotonic,
+                latest_receipt,
+                expected_timeout,
+            )
+            if (
+                any(
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                    or not math.isfinite(float(value))
+                    for value in numeric_values
+                )
+                or float(evidence.trigger_price) <= 0
+                or float(evidence.receipt_monotonic) < 0
+                or not isinstance(receipt_order, int)
+                or isinstance(receipt_order, bool)
+                or receipt_order <= 0
+                or not isinstance(symbol_order, int)
+                or isinstance(symbol_order, bool)
+                or not isinstance(monitor_order, int)
+                or isinstance(monitor_order, bool)
+                or not receipt_order <= symbol_order <= monitor_order
+                or float(latest_receipt) < float(evidence.receipt_monotonic)
+                or not math.isclose(
+                    float(evidence.drain_deadline_monotonic),
+                    float(evidence.receipt_monotonic) + float(evidence.drain_timeout_seconds),
+                    rel_tol=1e-12,
+                    abs_tol=1e-9,
+                )
+                or not math.isclose(
+                    float(evidence.drain_timeout_seconds),
+                    float(expected_timeout),
+                    rel_tol=1e-12,
+                    abs_tol=1e-9,
+                )
+            ):
+                return False
+            try:
+                if (
+                    not isinstance(evidence.event_time, datetime)
+                    or evidence.event_time.tzinfo is None
+                    or evidence.event_time.utcoffset() is None
+                ):
+                    return False
+                event_time = evidence.event_time.astimezone(timezone.utc)
+                current_time = monitor._utcnow()
+                if (
+                    not isinstance(current_time, datetime)
+                    or current_time.tzinfo is None
+                    or current_time.utcoffset() is None
+                ):
+                    return False
+                now_utc = current_time.astimezone(timezone.utc)
+                crossing_valid = monitor._price_crosses_stop(
+                    stop,
+                    evidence.trigger_price,
+                )
+            except Exception:
+                return False
+            return event_time <= now_utc and crossing_valid is True
+
+        def validate_stop_identity(
+            stop: object,
+            symbol: str,
+            stop_key: str,
+            reason_code: str,
+        ) -> StopLossOrder:
+            if not isinstance(stop, StopLossOrder):
+                fail(reason_code)
+            try:
+                normalized_symbol = DatabaseValidator.validate_symbol(stop.symbol)
+                expected_symbol = DatabaseValidator.validate_symbol(symbol)
+                derived_key = monitor._stop_key(stop.symbol)
+            except Exception:
+                fail(reason_code)
+            runner_portfolio = getattr(self, "portfolio_id", "default")
+            if (
+                stop.symbol != normalized_symbol
+                or symbol != expected_symbol
+                or stop.symbol != symbol
+                or derived_key != stop_key
+                or getattr(stop, "portfolio_id", None) != runner_portfolio
+                or getattr(monitor, "portfolio_id", None) != runner_portfolio
+            ):
+                fail(reason_code)
+            try:
+                validate_stop_loss_order(
+                    stop,
+                    now_utc=monitor._utcnow(),
+                    allow_authenticated_precreation_trigger=(
+                        has_authenticated_precreation_trigger(
+                            stop,
+                            symbol,
+                            stop_key,
+                        )
+                    ),
+                )
+            except Exception:
+                fail("stop_structure_invalid")
+            return stop
+
+        def validate_matching_position(
+            stop: StopLossOrder,
+            position: object,
+        ) -> None:
+            try:
+                validate_stop_loss_order(
+                    stop,
+                    position=position,
+                    now_utc=monitor._utcnow(),
+                    allow_authenticated_precreation_trigger=(
+                        has_authenticated_precreation_trigger(
+                            stop,
+                            stop.symbol,
+                            monitor._stop_key(stop.symbol),
+                        )
+                    ),
+                )
+            except Exception:
+                fail("position_structure_invalid")
+
+        def validate_pending_evidence(
+            evidence: object,
+            stop: StopLossOrder,
+            symbol: str,
+            stop_key: str,
+        ) -> None:
+            if not isinstance(evidence, _PendingStopTrigger) or evidence.stop is not stop:
+                fail("pending_trigger_identity_mismatch")
+            validate_stop_identity(
+                evidence.stop,
+                symbol,
+                stop_key,
+                "pending_trigger_identity_mismatch",
+            )
+            trigger_price = evidence.trigger_price
+            event_time = evidence.event_time
+            receipt_order = evidence.receipt_order
+            monitor_order = getattr(monitor, "_price_receipt_order", None)
+            symbol_orders = getattr(monitor, "price_receipt_orders", None)
+            symbol_order = symbol_orders.get(symbol) if isinstance(symbol_orders, dict) else None
+            if (
+                not isinstance(trigger_price, (int, float))
+                or isinstance(trigger_price, bool)
+                or not math.isfinite(float(trigger_price))
+                or float(trigger_price) <= 0
+                or not isinstance(event_time, datetime)
+                or event_time.tzinfo is None
+                or event_time.utcoffset() is None
+                or not isinstance(receipt_order, int)
+                or isinstance(receipt_order, bool)
+                or receipt_order <= 0
+                or not isinstance(symbol_order, int)
+                or isinstance(symbol_order, bool)
+                or not isinstance(monitor_order, int)
+                or isinstance(monitor_order, bool)
+                or not receipt_order <= symbol_order <= monitor_order
+                or getattr(stop, "trigger_price", None) != trigger_price
+                or not isinstance(getattr(stop, "triggered_at", None), datetime)
+                or stop.triggered_at.tzinfo is None
+                or stop.triggered_at.utcoffset() is None
+                or stop.triggered_at.astimezone(timezone.utc) != event_time.astimezone(timezone.utc)
+            ):
+                fail("pending_trigger_lineage_invalid")
+            now_utc = monitor._utcnow()
+            max_age = getattr(monitor, "max_price_age_seconds", None)
+            if (
+                not isinstance(now_utc, datetime)
+                or now_utc.tzinfo is None
+                or now_utc.utcoffset() is None
+                or not isinstance(max_age, (int, float))
+                or isinstance(max_age, bool)
+                or not math.isfinite(float(max_age))
+                or float(max_age) <= 0
+            ):
+                fail("pending_trigger_event_time_invalid")
+            event_age = (
+                now_utc.astimezone(timezone.utc) - event_time.astimezone(timezone.utc)
+            ).total_seconds()
+            if event_age < 0 or event_age > float(max_age):
+                fail("pending_trigger_event_time_stale")
+            crosses = getattr(monitor, "_price_crosses_stop", None)
+            try:
+                crossing_valid = callable(crosses) and crosses(stop, trigger_price)
+            except Exception:
+                crossing_valid = False
+            if crossing_valid is not True:
+                fail("pending_trigger_crossing_invalid")
+
+        def validate_latched_crossing(stop: StopLossOrder, reason_code: str) -> None:
+            trigger_price = getattr(stop, "trigger_price", None)
+            triggered_at = getattr(stop, "triggered_at", None)
+            if (
+                not isinstance(trigger_price, (int, float))
+                or isinstance(trigger_price, bool)
+                or not math.isfinite(float(trigger_price))
+                or float(trigger_price) <= 0
+                or not isinstance(triggered_at, datetime)
+                or triggered_at.tzinfo is None
+                or triggered_at.utcoffset() is None
+            ):
+                fail(reason_code)
+            crosses = getattr(monitor, "_price_crosses_stop", None)
+            try:
+                crossing_valid = callable(crosses) and crosses(stop, trigger_price)
+            except Exception:
+                crossing_valid = False
+            if crossing_valid is not True:
+                fail(reason_code)
+
+        if not positions and not allow_runtime_tracked_states:
+            return
 
         monitor = getattr(self, "stop_loss_monitor", None)
         if monitor is None:
@@ -2046,39 +2392,316 @@ class AsyncRunner:
             fail("stop_monitor_not_running")
 
         active_stops = getattr(monitor, "active_stops", None)
-        prices = getattr(monitor, "last_prices", None)
-        event_times = getattr(monitor, "price_event_times", None)
-        receipt_times = getattr(monitor, "price_receipt_monotonic", None)
-        if (
-            not isinstance(active_stops, dict)
-            or not isinstance(prices, dict)
-            or not isinstance(event_times, dict)
-            or not isinstance(receipt_times, dict)
-        ):
+        if not isinstance(active_stops, dict):
             fail("stop_monitor_state_invalid")
 
-        now_utc = monitor._utcnow()
-        now_monotonic = monitor._monotonic()
-        max_age = float(getattr(monitor, "max_price_age_seconds", 0))
-        if (
-            not isinstance(now_utc, datetime)
-            or now_utc.tzinfo is None
-            or now_utc.utcoffset() is None
-            or not math.isfinite(now_monotonic)
-            or not math.isfinite(max_age)
-            or max_age <= 0
-        ):
-            fail("stop_monitor_clock_invalid")
-        now_utc = now_utc.astimezone(timezone.utc)
+        pending_triggers: Dict[str, object] = {}
+        queued_stops: Dict[str, object] = {}
+        inflight_stops: Dict[str, object] = {}
+        validated_active_stops: Dict[str, StopLossOrder] = {}
+        validated_pending_stops: Dict[str, StopLossOrder] = {}
+        validated_queued_stops: Dict[str, StopLossOrder] = {}
+        validated_inflight_stops: Dict[str, StopLossOrder] = {}
+
+        if allow_runtime_tracked_states:
+            pending_state = getattr(monitor, "_pending_stop_triggers", None)
+            queued_state = getattr(monitor, "_queued_stop_orders", None)
+            inflight_state = getattr(monitor, "_inflight_stop_orders", None)
+            if (
+                not isinstance(pending_state, dict)
+                or not isinstance(queued_state, dict)
+                or not isinstance(inflight_state, dict)
+            ):
+                fail("stop_monitor_state_invalid")
+            pending_triggers = pending_state
+            queued_stops = queued_state
+            inflight_stops = inflight_state
+
+            # Runtime phase state is global safety state, not merely supporting
+            # evidence for the current position loop. Validate it before any
+            # empty-position return so an orphan stop cannot over-close or
+            # reverse exposure.
+            for stop_key, candidate in active_stops.items():
+                symbol = getattr(candidate, "symbol", "")
+                stop = validate_stop_identity(
+                    candidate,
+                    symbol,
+                    stop_key,
+                    "active_stop_identity_mismatch",
+                )
+                if symbol not in positions:
+                    fail("orphan_active_stop")
+                validate_matching_position(stop, positions[symbol])
+                validated_active_stops[stop_key] = stop
+
+            for stop_key, evidence in pending_triggers.items():
+                if not isinstance(evidence, _PendingStopTrigger):
+                    fail("pending_trigger_identity_mismatch")
+                candidate = evidence.stop
+                symbol = getattr(candidate, "symbol", "")
+                stop = validate_stop_identity(
+                    candidate,
+                    symbol,
+                    stop_key,
+                    "pending_trigger_identity_mismatch",
+                )
+                if active_stops.get(stop_key) is not stop:
+                    fail("pending_trigger_identity_mismatch")
+                if symbol not in positions:
+                    fail("orphan_pending_trigger")
+                validate_matching_position(stop, positions[symbol])
+                validated_pending_stops[stop_key] = stop
+
+            for stop_key, record in queued_stops.items():
+                if not isinstance(record, StopExecutionPhaseRecord):
+                    fail("queued_stop_identity_mismatch")
+                candidate = record.stop
+                symbol = getattr(candidate, "symbol", "")
+                stop = validate_stop_identity(
+                    candidate,
+                    symbol,
+                    stop_key,
+                    "queued_stop_identity_mismatch",
+                )
+                if symbol not in positions:
+                    fail("orphan_queued_stop")
+                validate_matching_position(stop, positions[symbol])
+                validated_queued_stops[stop_key] = stop
+
+            for stop_key, record in inflight_stops.items():
+                if not isinstance(record, StopExecutionPhaseRecord):
+                    fail("inflight_stop_identity_mismatch")
+                candidate = record.stop
+                symbol = getattr(candidate, "symbol", "")
+                identity_reason = (
+                    "post_fill_identity_mismatch"
+                    if record.phase is StopExecutionPhase.POST_FILL_SETTLEMENT
+                    else "broker_stop_identity_mismatch"
+                )
+                stop = validate_stop_identity(
+                    candidate,
+                    symbol,
+                    stop_key,
+                    identity_reason,
+                )
+                if (
+                    symbol not in positions
+                    and record.phase is not StopExecutionPhase.POST_FILL_SETTLEMENT
+                ):
+                    fail("orphan_broker_stop")
+                if symbol in positions:
+                    validate_matching_position(stop, positions[symbol])
+                validated_inflight_stops[stop_key] = stop
+
+            latched_crossings = getattr(monitor, "_latched_stop_crossings", None)
+            if not isinstance(latched_crossings, dict):
+                fail("stop_monitor_state_invalid")
+            for identity_key, evidence in latched_crossings.items():
+                if (
+                    not isinstance(evidence, _PendingStopTrigger)
+                    or type(identity_key) is not int
+                    or identity_key != id(evidence.stop)
+                ):
+                    fail("latched_crossing_identity_mismatch")
+                stop = evidence.stop
+                symbol = getattr(stop, "symbol", "")
+                try:
+                    stop_key = monitor._stop_key(symbol)
+                except Exception:
+                    fail("latched_crossing_identity_mismatch")
+                validate_stop_identity(
+                    stop,
+                    symbol,
+                    stop_key,
+                    "latched_crossing_identity_mismatch",
+                )
+                if not has_authenticated_precreation_trigger(
+                    stop,
+                    symbol,
+                    stop_key,
+                ):
+                    fail("latched_crossing_lineage_invalid")
+
+                pending_owner = pending_triggers.get(stop_key)
+                queued_owner = queued_stops.get(stop_key)
+                inflight_owner = inflight_stops.get(stop_key)
+                exact_pending_owner = pending_owner is evidence
+                exact_queued_owner = (
+                    isinstance(queued_owner, StopExecutionPhaseRecord) and queued_owner.stop is stop
+                )
+                exact_inflight_owner = (
+                    isinstance(inflight_owner, StopExecutionPhaseRecord)
+                    and inflight_owner.stop is stop
+                )
+                exact_active_owner = active_stops.get(stop_key) is stop
+                if pending_owner is not None and pending_owner is not evidence:
+                    fail("latched_crossing_identity_mismatch")
+                if not (
+                    exact_pending_owner
+                    or exact_queued_owner
+                    or exact_inflight_owner
+                    or exact_active_owner
+                ):
+                    fail("orphan_latched_crossing")
+                if not (exact_pending_owner or exact_queued_owner or exact_inflight_owner):
+                    fail("latched_crossing_progress_untracked")
+                now_monotonic = monitor._monotonic()
+                if (
+                    not isinstance(now_monotonic, (int, float))
+                    or isinstance(now_monotonic, bool)
+                    or not math.isfinite(float(now_monotonic))
+                    or float(now_monotonic) < float(evidence.receipt_monotonic)
+                ):
+                    fail("latched_crossing_lineage_invalid")
+
+            for stop_key, stop in validated_active_stops.items():
+                exact_owners = sum(
+                    owner is stop
+                    for owner in (
+                        validated_pending_stops.get(stop_key),
+                        validated_queued_stops.get(stop_key),
+                        validated_inflight_stops.get(stop_key),
+                    )
+                )
+                if stop.status is StopStatus.TRIGGERED:
+                    if exact_owners == 0:
+                        fail("active_stop_trigger_untracked")
+                    if exact_owners != 1:
+                        fail("active_stop_trigger_ownership_conflict")
+                elif stop.status is StopStatus.PENDING and exact_owners:
+                    fail("active_stop_trigger_ownership_conflict")
+
+            for stop_key, stop in validated_pending_stops.items():
+                if stop.status is not StopStatus.TRIGGERED:
+                    fail("pending_trigger_state_invalid")
+                evidence = pending_triggers[stop_key]
+                validate_pending_evidence(evidence, stop, stop.symbol, stop_key)
+                validate_progress_window(
+                    started=evidence.receipt_monotonic,
+                    timeout=evidence.drain_timeout_seconds,
+                    deadline=evidence.drain_deadline_monotonic,
+                    expected_timeout=getattr(
+                        monitor,
+                        "pending_drain_timeout_seconds",
+                        None,
+                    ),
+                    invalid_reason="pending_trigger_progress_invalid",
+                    expired_reason="pending_trigger_progress_expired",
+                )
+
+            for stop_key, stop in validated_queued_stops.items():
+                if stop.status is not StopStatus.TRIGGERED:
+                    fail("queued_stop_state_invalid")
+                validate_latched_crossing(stop, "queued_stop_crossing_invalid")
+                validate_phase_record(
+                    queued_stops[stop_key],
+                    stop,
+                    StopExecutionPhase.QUEUED,
+                    getattr(monitor, "queue_timeout_seconds", None),
+                    "queued_stop_identity_mismatch",
+                    "queued_stop_progress_invalid",
+                    "queued_stop_progress_expired",
+                )
+
+            for stop_key, stop in validated_inflight_stops.items():
+                record = inflight_stops[stop_key]
+                if record.phase is StopExecutionPhase.BROKER_WAIT:
+                    active_replacement = active_stops.get(stop_key)
+                    cancelled_for_replacement = (
+                        stop.status is StopStatus.CANCELLED
+                        and isinstance(active_replacement, StopLossOrder)
+                        and active_replacement is not stop
+                        and active_replacement.status is StopStatus.PENDING
+                    )
+                    if stop.status is not StopStatus.TRIGGERED and not cancelled_for_replacement:
+                        fail("broker_stop_state_invalid")
+                    validate_latched_crossing(stop, "broker_stop_crossing_invalid")
+                    validate_phase_record(
+                        record,
+                        stop,
+                        StopExecutionPhase.BROKER_WAIT,
+                        getattr(monitor, "broker_attempt_timeout_seconds", None),
+                        "broker_stop_identity_mismatch",
+                        "broker_stop_progress_invalid",
+                        "broker_stop_progress_expired",
+                    )
+                elif record.phase is StopExecutionPhase.POST_FILL_SETTLEMENT:
+                    if stop.status is not StopStatus.EXECUTED:
+                        fail("post_fill_state_invalid")
+                    validate_latched_crossing(stop, "post_fill_crossing_invalid")
+                    validate_phase_record(
+                        record,
+                        stop,
+                        StopExecutionPhase.POST_FILL_SETTLEMENT,
+                        getattr(monitor, "settlement_timeout_seconds", None),
+                        "post_fill_identity_mismatch",
+                        "post_fill_progress_invalid",
+                        "post_fill_progress_expired",
+                    )
+                else:
+                    fail("inflight_stop_phase_invalid")
 
         for symbol, position in positions.items():
-            stop = active_stops.get(monitor._stop_key(symbol))
+            stop_key = monitor._stop_key(symbol)
+            stop = active_stops.get(stop_key)
             if stop is None:
+                if allow_runtime_tracked_states:
+                    settlement_record = inflight_stops.get(stop_key)
+                    if (
+                        isinstance(settlement_record, StopExecutionPhaseRecord)
+                        and settlement_record.phase is StopExecutionPhase.POST_FILL_SETTLEMENT
+                        and settlement_record.stop.status is StopStatus.EXECUTED
+                        and stop_key not in pending_triggers
+                        and stop_key not in queued_stops
+                    ):
+                        settlement_stop = validated_inflight_stops[stop_key]
+                        if settlement_stop.position_qty != position.quantity:
+                            fail("post_fill_settlement_quantity_mismatch")
+                        continue
                 fail("active_stop_missing")
-            if getattr(stop, "status", None) is not StopStatus.PENDING:
-                fail("active_stop_not_pending")
+            stop = validate_stop_identity(
+                stop,
+                symbol,
+                stop_key,
+                "active_stop_identity_mismatch",
+            )
+            validate_matching_position(stop, position)
             if getattr(stop, "position_qty", None) != position.quantity:
                 fail("active_stop_quantity_mismatch")
+
+            stop_status = getattr(stop, "status", None)
+            if stop_status is StopStatus.TRIGGERED and allow_runtime_tracked_states:
+                # The broker crossing was validated before it was latched.
+                # Current quote freshness may expire while its close waits in
+                # the monitor queue or at the broker.
+                continue
+            if stop_status is not StopStatus.PENDING:
+                fail("active_stop_not_pending")
+
+            prices = getattr(monitor, "last_prices", None)
+            event_times = getattr(monitor, "price_event_times", None)
+            receipt_times = getattr(monitor, "price_receipt_monotonic", None)
+            if (
+                not isinstance(prices, dict)
+                or not isinstance(event_times, dict)
+                or not isinstance(receipt_times, dict)
+            ):
+                fail("stop_monitor_state_invalid")
+
+            now_utc = monitor._utcnow()
+            now_monotonic = monitor._monotonic()
+            max_age = float(getattr(monitor, "max_price_age_seconds", 0))
+            if (
+                not isinstance(now_utc, datetime)
+                or now_utc.tzinfo is None
+                or now_utc.utcoffset() is None
+                or not math.isfinite(now_monotonic)
+                or not math.isfinite(max_age)
+                or max_age <= 0
+            ):
+                fail("stop_monitor_clock_invalid")
+            now_utc = now_utc.astimezone(timezone.utc)
+
             price = prices.get(symbol)
             event_time = event_times.get(symbol)
             receipt_time = receipt_times.get(symbol)
@@ -2100,6 +2723,13 @@ class AsyncRunner:
             receipt_age = now_monotonic - float(receipt_time)
             if event_age < 0 or receipt_age < 0 or event_age > max_age or receipt_age > max_age:
                 fail("protective_price_stale")
+            crosses = getattr(monitor, "_price_crosses_stop", None)
+            try:
+                pending_already_crossed = True if not callable(crosses) else crosses(stop, price)
+            except Exception:
+                pending_already_crossed = True
+            if pending_already_crossed is not False:
+                fail("pending_stop_already_crossed")
             if not self._has_live_protective_feed(symbol):
                 fail("live_protective_feed_unavailable")
 
@@ -2761,11 +3391,6 @@ class AsyncRunner:
         # symbol is rejected before reaching `Stock(symbol, "SMART", "USD")` or
         # the database. Validation is cheap and idempotent.
         try:
-            from robo_trader.database_validator import (
-                DatabaseValidator,
-                ValidationError,
-            )
-
             symbol = DatabaseValidator.validate_symbol(symbol)
         except ValidationError as e:
             logger.error(f"Rejected invalid symbol from upstream: {symbol!r}: {e}")

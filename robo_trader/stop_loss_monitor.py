@@ -14,6 +14,7 @@ Features:
 """
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -90,6 +91,133 @@ class StopLossOrder:
             self.high_water_mark = self.entry_price
 
 
+def _positive_finite_number(value: object, field_name: str) -> float:
+    """Return a finite positive numeric value or reject ambiguous coercions."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must not be bool")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field_name} must be numeric") from exc
+    if not math.isfinite(numeric) or numeric <= 0:
+        raise ValueError(f"{field_name} must be finite and positive")
+    return numeric
+
+
+def _aware_utc(value: object, field_name: str) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field_name} must be timezone-aware")
+    return value.astimezone(timezone.utc)
+
+
+def validate_stop_position(
+    position: object,
+    expected_symbol: str,
+) -> Position:
+    """Validate the canonical position shape required by a protective stop."""
+    if not isinstance(position, Position):
+        raise ValueError("position must be a Position")
+    try:
+        normalized_symbol = DatabaseValidator.validate_symbol(position.symbol)
+        normalized_expected = DatabaseValidator.validate_symbol(expected_symbol)
+    except ValidationError as exc:
+        raise ValueError("position symbol is invalid") from exc
+    if (
+        position.symbol != normalized_symbol
+        or expected_symbol != normalized_expected
+        or position.symbol != expected_symbol
+    ):
+        raise ValueError("position symbol does not match stop symbol")
+    if type(position.quantity) is not int or position.quantity == 0:
+        raise ValueError("position quantity must be a nonzero canonical int")
+    _positive_finite_number(position.avg_price, "position.avg_price")
+    return position
+
+
+def validate_stop_loss_order(
+    stop: object,
+    *,
+    position: Optional[Position] = None,
+    now_utc: Optional[datetime] = None,
+    allow_authenticated_precreation_trigger: bool = False,
+) -> StopLossOrder:
+    """Validate structural and economic stop invariants without mutating state."""
+    if not isinstance(stop, StopLossOrder):
+        raise ValueError("stop must be a StopLossOrder")
+    if not isinstance(stop.stop_type, StopType):
+        raise ValueError("stop_type must be a StopType")
+    if not isinstance(stop.status, StopStatus):
+        raise ValueError("status must be a StopStatus")
+    if type(stop.position_qty) is not int or stop.position_qty == 0:
+        raise ValueError("stop quantity must be a nonzero canonical int")
+
+    _positive_finite_number(stop.entry_price, "entry_price")
+    stop_price = _positive_finite_number(stop.stop_price, "stop_price")
+    created_at = _aware_utc(stop.created_at, "created_at")
+    current_time = _aware_utc(now_utc, "now_utc") if now_utc is not None else None
+    if current_time is not None and created_at > current_time + timedelta(seconds=5):
+        raise ValueError("created_at is in the future")
+
+    trigger_price = stop.trigger_price
+    triggered_at = stop.triggered_at
+    requires_trigger = stop.status in {StopStatus.TRIGGERED, StopStatus.EXECUTED}
+    has_partial_trigger = (trigger_price is None) != (triggered_at is None)
+    if has_partial_trigger:
+        raise ValueError("trigger price and timestamp must be recorded together")
+    if requires_trigger and trigger_price is None:
+        raise ValueError("triggered stop is missing crossing evidence")
+    if stop.status is StopStatus.PENDING and trigger_price is not None:
+        raise ValueError("pending stop cannot retain crossing evidence")
+    if trigger_price is not None:
+        _positive_finite_number(trigger_price, "trigger_price")
+        trigger_time = _aware_utc(triggered_at, "triggered_at")
+        if trigger_time < created_at and not allow_authenticated_precreation_trigger:
+            raise ValueError("triggered_at precedes created_at")
+        if current_time is not None and trigger_time > current_time + timedelta(seconds=5):
+            raise ValueError("triggered_at is in the future")
+
+    if stop.stop_type is StopType.FIXED:
+        if (
+            stop.trailing_amount is not None
+            or stop.trailing_percent is not None
+            or stop.high_water_mark is not None
+        ):
+            raise ValueError("fixed stop cannot contain trailing fields")
+    else:
+        high_water_mark = _positive_finite_number(
+            stop.high_water_mark,
+            "high_water_mark",
+        )
+        if stop.position_qty > 0 and stop_price >= high_water_mark:
+            raise ValueError("long trailing stop must remain below high-water mark")
+        if stop.position_qty < 0 and stop_price <= high_water_mark:
+            raise ValueError("short trailing stop must remain above high-water mark")
+        if stop.stop_type is StopType.TRAILING:
+            _positive_finite_number(stop.trailing_amount, "trailing_amount")
+            if stop.trailing_percent is not None:
+                raise ValueError("amount trailing stop cannot contain trailing_percent")
+        else:
+            if stop.trailing_amount is not None:
+                raise ValueError("percent trailing stop cannot contain trailing_amount")
+            trailing_percent = _positive_finite_number(
+                stop.trailing_percent,
+                "trailing_percent",
+            )
+            if trailing_percent >= 1:
+                raise ValueError("trailing_percent must be less than 1")
+
+    if position is not None:
+        validate_stop_position(position, stop.symbol)
+        # Entry and average cost may legitimately differ after partial fills or
+        # replacement, but both must independently remain real positive prices.
+        _positive_finite_number(position.avg_price, "position.avg_price")
+
+    # Crossing entry is not itself invalid: a profitable ratcheted stop may
+    # protect above/below its original entry. The current accepted quote is
+    # authoritative at assertion time.
+    return stop
+
+
 @dataclass
 class StopLossMetrics:
     """Metrics for stop-loss monitoring."""
@@ -114,6 +242,27 @@ class _PendingStopTrigger:
     event_time: datetime
     receipt_monotonic: float
     receipt_order: int
+    drain_timeout_seconds: float
+    drain_deadline_monotonic: float
+
+
+class StopExecutionPhase(str, Enum):
+    """Bounded monitor-owned phases after a stop trigger is latched."""
+
+    QUEUED = "queued"
+    BROKER_WAIT = "broker_wait"
+    POST_FILL_SETTLEMENT = "post_fill_settlement"
+
+
+@dataclass(frozen=True)
+class StopExecutionPhaseRecord:
+    """Immutable exact-object ownership plus a monotonic progress deadline."""
+
+    stop: StopLossOrder = field(compare=False, repr=False)
+    phase: StopExecutionPhase
+    started_monotonic: float
+    timeout_seconds: float
+    deadline_monotonic: float
 
 
 class StopLossMonitor:
@@ -133,6 +282,10 @@ class StopLossMonitor:
         position_closed_callback: Optional[
             Callable[["StopLossOrder", "ExecutionResult"], Awaitable[None]]
         ] = None,
+        order_timeout_seconds: float = 30.0,
+        pending_drain_timeout_seconds: Optional[float] = None,
+        queue_timeout_seconds: Optional[float] = None,
+        settlement_timeout_seconds: Optional[float] = None,
     ):
         """
         Initialize stop-loss monitor.
@@ -148,6 +301,11 @@ class StopLossMonitor:
                 `portfolio.update_fill`, and DB persistence so that a phantom
                 position does not block subsequent BUY/SELL signals.
                 (TCN-H4 followup audit fix.)
+            order_timeout_seconds: Configured upper bound for one broker-order
+                progress phase.
+            pending_drain_timeout_seconds: Optional pending-latch drain bound.
+            queue_timeout_seconds: Optional sequential queue progress bound.
+            settlement_timeout_seconds: Optional post-fill callback bound.
         """
         self.executor = executor
         self.risk_manager = risk_manager
@@ -176,6 +334,19 @@ class StopLossMonitor:
         self.price_receipt_orders: Dict[str, int] = {}
         self._price_receipt_order = 0
         self._pending_stop_triggers: Dict[str, _PendingStopTrigger] = {}
+        # Immutable crossing evidence is retained by exact stop identity until
+        # tracked execution finishes. This authenticates the narrow case where
+        # a newly-added stop legitimately triggers from an already-accepted
+        # cached quote whose broker event time predates stop creation.
+        self._latched_stop_crossings: Dict[int, _PendingStopTrigger] = {}
+        # Entire triggered batches are published here synchronously before the
+        # monitor awaits the first broker call. This preserves exact ownership
+        # for later stops waiting behind an in-flight stop.
+        self._queued_stop_orders: Dict[str, StopExecutionPhaseRecord] = {}
+        # Exact-object ownership for stops whose closing order is currently
+        # awaiting the broker. Runtime health checks may trust only an active
+        # TRIGGERED stop that is this same tracked object.
+        self._inflight_stop_orders: Dict[str, StopExecutionPhaseRecord] = {}
         # Serialize quote ordering and trigger draining. No broker I/O occurs
         # while this lock is held.
         self._price_update_lock = asyncio.Lock()
@@ -189,8 +360,69 @@ class StopLossMonitor:
         self.max_price_age_seconds = 10  # Require fresh prices
         self.max_execution_retries = 3
         self.emergency_shutdown_on_failure = True
+        self.broker_attempt_timeout_seconds = self._validate_progress_timeout(
+            order_timeout_seconds,
+            "order_timeout_seconds",
+        )
+        self.pending_drain_timeout_seconds = self._validate_progress_timeout(
+            (
+                pending_drain_timeout_seconds
+                if pending_drain_timeout_seconds is not None
+                else min(
+                    self.broker_attempt_timeout_seconds,
+                    max(2.0, self.check_interval_seconds * 3),
+                )
+            ),
+            "pending_drain_timeout_seconds",
+        )
+        self.queue_timeout_seconds = self._validate_progress_timeout(
+            (
+                queue_timeout_seconds
+                if queue_timeout_seconds is not None
+                else (
+                    self.max_execution_retries * self.broker_attempt_timeout_seconds
+                    + (self.max_execution_retries - 1) * 0.5
+                    + self.check_interval_seconds
+                )
+            ),
+            "queue_timeout_seconds",
+        )
+        self.settlement_timeout_seconds = self._validate_progress_timeout(
+            (
+                settlement_timeout_seconds
+                if settlement_timeout_seconds is not None
+                else self.broker_attempt_timeout_seconds * 2
+            ),
+            "settlement_timeout_seconds",
+        )
 
         logger.info(f"Stop-loss monitor initialized for portfolio={self.portfolio_id}")
+
+    @staticmethod
+    def _validate_progress_timeout(value: object, field_name: str) -> float:
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or float(value) <= 0
+        ):
+            raise ValueError(f"{field_name} must be a positive finite number")
+        return float(value)
+
+    def _new_phase_record(
+        self,
+        stop: StopLossOrder,
+        phase: StopExecutionPhase,
+        timeout_seconds: float,
+    ) -> StopExecutionPhaseRecord:
+        started = self._monotonic()
+        return StopExecutionPhaseRecord(
+            stop=stop,
+            phase=phase,
+            started_monotonic=started,
+            timeout_seconds=timeout_seconds,
+            deadline_monotonic=started + timeout_seconds,
+        )
 
     def _stop_key(self, symbol: str) -> str:
         """Generate composite key for stop-loss storage (portfolio:symbol)."""
@@ -228,9 +460,13 @@ class StopLossMonitor:
             stop_percent = DatabaseValidator._validate_numeric(
                 stop_percent, "stop_percent", min_val=0.001, max_val=0.5
             )
+            validate_stop_position(position, symbol)
         except ValidationError as e:
             logger.error(f"Invalid stop-loss parameters: {e}")
             raise
+        except ValueError as e:
+            logger.error(f"Invalid position for stop-loss: {e}")
+            raise ValidationError(str(e)) from e
 
         # Calculate stop price based on position direction
         # Convert avg_price to float if it's a Decimal to avoid type mismatch
@@ -251,11 +487,20 @@ class StopLossMonitor:
             stop_price=stop_price,
             entry_price=avg_price_float,  # Use float, not Decimal
             stop_type=stop_type,
-            created_at=datetime.now(),
+            created_at=self._utcnow(),
             portfolio_id=self.portfolio_id,
             trailing_amount=trailing_amount,
             trailing_percent=trailing_percent,
         )
+        try:
+            validate_stop_loss_order(
+                stop_order,
+                position=position,
+                now_utc=self._utcnow(),
+            )
+        except ValueError as e:
+            logger.error(f"Invalid stop-loss structure: {e}")
+            raise ValidationError(str(e)) from e
 
         # Cancel existing stop for this symbol if any
         stop_key = self._stop_key(symbol)
@@ -266,6 +511,13 @@ class StopLossMonitor:
             logger.info(
                 f"Cancelled existing stop-loss for {symbol} (portfolio={self.portfolio_id})"
             )
+            queued = self._queued_stop_orders.get(stop_key)
+            inflight = self._inflight_stop_orders.get(stop_key)
+            if not (
+                (queued is not None and queued.stop is old_stop)
+                or (inflight is not None and inflight.stop is old_stop)
+            ):
+                self._latched_stop_crossings.pop(id(old_stop), None)
 
         # Add new stop
         self._pending_stop_triggers.pop(stop_key, None)
@@ -373,13 +625,19 @@ class StopLossMonitor:
                     stop.status = StopStatus.TRIGGERED
                     stop.triggered_at = event_time
                     stop.trigger_price = price
-                    self._pending_stop_triggers[stop_key] = _PendingStopTrigger(
+                    evidence = _PendingStopTrigger(
                         stop=stop,
                         trigger_price=price,
                         event_time=event_time,
                         receipt_monotonic=receipt_monotonic,
                         receipt_order=receipt_order,
+                        drain_timeout_seconds=self.pending_drain_timeout_seconds,
+                        drain_deadline_monotonic=(
+                            receipt_monotonic + self.pending_drain_timeout_seconds
+                        ),
                     )
+                    self._pending_stop_triggers[stop_key] = evidence
+                    self._latched_stop_crossings[id(stop)] = evidence
                     self.metrics.triggered_today += 1
                     logger.warning(
                         "Latched stop-loss crossing for %s at %.2f "
@@ -521,6 +779,33 @@ class StopLossMonitor:
                     stop.status = StopStatus.TRIGGERED
                     stop.triggered_at = event_time
                     stop.trigger_price = current_price
+                    receipt_order = self.price_receipt_orders.get(stop.symbol)
+                    if (
+                        not isinstance(receipt_order, int)
+                        or isinstance(receipt_order, bool)
+                        or receipt_order <= 0
+                    ):
+                        logger.error(
+                            "Missing accepted-quote receipt lineage for %s; "
+                            "refusing cached stop trigger",
+                            stop.symbol,
+                        )
+                        stop.status = StopStatus.PENDING
+                        stop.triggered_at = None
+                        stop.trigger_price = None
+                        continue
+                    evidence = _PendingStopTrigger(
+                        stop=stop,
+                        trigger_price=current_price,
+                        event_time=event_time,
+                        receipt_monotonic=receipt_time,
+                        receipt_order=receipt_order,
+                        drain_timeout_seconds=self.pending_drain_timeout_seconds,
+                        drain_deadline_monotonic=(
+                            receipt_time + self.pending_drain_timeout_seconds
+                        ),
+                    )
+                    self._latched_stop_crossings[id(stop)] = evidence
                     triggered.append(stop)
                     self.metrics.triggered_today += 1
 
@@ -596,6 +881,16 @@ class StopLossMonitor:
                     attempt + 1,
                 )
                 return False
+            self._inflight_stop_orders[stop_key] = self._new_phase_record(
+                stop,
+                StopExecutionPhase.BROKER_WAIT,
+                self.broker_attempt_timeout_seconds,
+            )
+            # PR1A deliberately does not wrap this await in a retrying timeout:
+            # cancellation after an ambiguous broker outcome could duplicate a
+            # filled exit. The runtime phase deadline makes health fail closed;
+            # broker idempotency/ambiguity resolution and concurrent exit
+            # scheduling are explicitly PR2-owned.
             try:
                 result = await self.executor.place_order_async(order)
             except Exception as e:
@@ -620,6 +915,11 @@ class StopLossMonitor:
             # Broker-fill commit point. Nothing after result.ok may re-enter
             # the retry loop: bookkeeping failures cannot make an already
             # filled closing order safe to submit again.
+            self._inflight_stop_orders[stop_key] = self._new_phase_record(
+                stop,
+                StopExecutionPhase.POST_FILL_SETTLEMENT,
+                self.settlement_timeout_seconds,
+            )
             try:
                 stop.status = StopStatus.EXECUTED
                 stop.executed_at = self._utcnow()
@@ -706,6 +1006,23 @@ class StopLossMonitor:
 
         return False
 
+    async def _execute_tracked_stop(self, stop: StopLossOrder) -> bool:
+        """Execute one stop while publishing exact in-flight ownership."""
+        stop_key = self._stop_key(stop.symbol)
+        queued_record = self._queued_stop_orders.get(stop_key)
+        if queued_record is not None and queued_record.stop is stop:
+            del self._queued_stop_orders[stop_key]
+        try:
+            return await self.execute_stop_loss(stop)
+        finally:
+            inflight_record = self._inflight_stop_orders.get(stop_key)
+            if inflight_record is not None and inflight_record.stop is stop:
+                del self._inflight_stop_orders[stop_key]
+            queued_record = self._queued_stop_orders.get(stop_key)
+            if queued_record is not None and queued_record.stop is stop:
+                del self._queued_stop_orders[stop_key]
+            self._latched_stop_crossings.pop(id(stop), None)
+
     async def monitor_stops(self) -> None:
         """
         Main monitoring loop - checks stops continuously.
@@ -722,11 +1039,30 @@ class StopLossMonitor:
                 # Check all stops
                 triggered = await self.check_stops()
 
-                # Execute triggered stops
+                # Publish the complete exact-object batch before the first
+                # broker await. Later stops remain verifiably monitor-owned
+                # while an earlier stop is in flight. Execution remains
+                # intentionally sequential in PR1A: these phase deadlines
+                # bound starvation and make runtime health fail closed. Safe
+                # concurrent stop execution, including same-symbol replacement
+                # and transport serialization, is explicitly PR2-owned.
                 for stop in triggered:
-                    success = await self.execute_stop_loss(stop)
-                    if not success:
-                        logger.error(f"Failed to execute stop-loss for {stop.symbol}")
+                    self._queued_stop_orders[self._stop_key(stop.symbol)] = self._new_phase_record(
+                        stop,
+                        StopExecutionPhase.QUEUED,
+                        self.queue_timeout_seconds,
+                    )
+                try:
+                    for stop in triggered:
+                        success = await self._execute_tracked_stop(stop)
+                        if not success:
+                            logger.error(f"Failed to execute stop-loss for {stop.symbol}")
+                finally:
+                    for stop in triggered:
+                        stop_key = self._stop_key(stop.symbol)
+                        queued_record = self._queued_stop_orders.get(stop_key)
+                        if queued_record is not None and queued_record.stop is stop:
+                            del self._queued_stop_orders[stop_key]
 
                 # Brief sleep before next check
                 await asyncio.sleep(self.check_interval_seconds)
@@ -783,6 +1119,7 @@ class StopLossMonitor:
         if stop_key in self.active_stops:
             stop = self.active_stops[stop_key]
             self._pending_stop_triggers.pop(stop_key, None)
+            self._latched_stop_crossings.pop(id(stop), None)
             stop.status = StopStatus.CANCELLED
             del self.active_stops[stop_key]
             self.stop_history.append(stop)
