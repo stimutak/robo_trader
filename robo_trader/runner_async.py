@@ -108,6 +108,10 @@ class SymbolCycleAbortError(RuntimeError):
     """A transport-integrity failure requires cancellation of the symbol cycle."""
 
 
+class RecoverableBrokerDisconnectError(SymbolCycleAbortError):
+    """Authoritative pre-request disconnect; abort this cycle, then reconnect."""
+
+
 class UnprotectedExistingPositionsError(RuntimeError):
     """Existing holdings lack verified, live-grade stop-loss protection."""
 
@@ -951,6 +955,18 @@ class AsyncRunner:
         if event is None:
             self._symbol_cycle_abort_event = asyncio.Event()
             event = self._symbol_cycle_abort_event
+        # Publish the concrete cause before the event. This synchronous
+        # provisional write prevents a sibling that observes the event from
+        # inventing a generic terminal error while we wait to serialize with
+        # order admission. The lock below re-applies terminal precedence.
+        current = getattr(self, "_symbol_cycle_abort_error", None)
+        terminal_dominates_recoverable = (
+            isinstance(current, RecoverableBrokerDisconnectError)
+            and cause is not None
+            and not isinstance(cause, RecoverableBrokerDisconnectError)
+        )
+        if cause is not None and (current is None or terminal_dominates_recoverable):
+            self._symbol_cycle_abort_error = cause
         # Publish abort intent before queueing for admission. A previously
         # queued order waiter may acquire the lock first, but it will observe
         # this event and reject instead of crossing the placement boundary.
@@ -961,8 +977,103 @@ class AsyncRunner:
             self._order_admission_lock = asyncio.Lock()
             lock = self._order_admission_lock
         async with lock:
-            if cause is not None and getattr(self, "_symbol_cycle_abort_error", None) is None:
+            current = getattr(self, "_symbol_cycle_abort_error", None)
+            terminal_dominates_recoverable = (
+                isinstance(current, RecoverableBrokerDisconnectError)
+                and cause is not None
+                and not isinstance(cause, RecoverableBrokerDisconnectError)
+            )
+            if cause is not None and (current is None or terminal_dominates_recoverable):
                 self._symbol_cycle_abort_error = cause
+
+    async def _claim_cycle_broker_request(self, symbol: str) -> asyncio.Task:
+        """Atomically admit one market-data request or classify disconnect risk."""
+        lock = getattr(self, "_broker_request_admission_lock", None)
+        if lock is None:
+            self._broker_request_admission_lock = asyncio.Lock()
+            lock = self._broker_request_admission_lock
+        async with lock:
+            active_requests = getattr(self, "_active_cycle_broker_requests", None)
+            if not isinstance(active_requests, set):
+                self._active_cycle_broker_requests = set()
+                active_requests = self._active_cycle_broker_requests
+
+            prior_abort = getattr(self, "_broker_request_abort_error", None)
+            if getattr(self, "_broker_request_admission_closed", False):
+                if isinstance(prior_abort, SymbolCycleAbortError):
+                    raise prior_abort
+                raise SymbolCycleAbortError("broker request admission is closed")
+
+            abort_event = getattr(self, "_symbol_cycle_abort_event", None)
+            if abort_event is not None and abort_event.is_set():
+                cause = getattr(self, "_symbol_cycle_abort_error", None)
+                if isinstance(cause, SymbolCycleAbortError):
+                    raise cause
+                raise SymbolCycleAbortError("symbol cycle is already aborting")
+
+            try:
+                connected = not hasattr(self.ib, "is_connected") or self.ib.is_connected
+            except Exception as error:
+                terminal = SymbolCycleAbortError(
+                    f"broker connection state is ambiguous before fetching {symbol}"
+                )
+                self._broker_request_admission_closed = True
+                self._broker_request_abort_error = terminal
+                if abort_event is None:
+                    self._symbol_cycle_abort_event = asyncio.Event()
+                    abort_event = self._symbol_cycle_abort_event
+                abort_event.set()
+                raise terminal from error
+
+            if not connected:
+                error = IBKRDisconnectedError("is_connected=False before fetch")
+                health = getattr(self, "health", None)
+                if health is not None:
+                    health.record_failure(error, "fetch_and_store_data")
+
+                # Publish admission closure synchronously with observing the
+                # disconnect. New sibling requests/orders cannot cross while
+                # the eventual cycle-abort latch waits for its serialization
+                # lock.
+                self._broker_request_admission_closed = True
+                if abort_event is None:
+                    self._symbol_cycle_abort_event = asyncio.Event()
+                    abort_event = self._symbol_cycle_abort_event
+                abort_event.set()
+
+                active_orders = {
+                    task
+                    for task in getattr(self, "_order_admitted_tasks", set())
+                    if isinstance(task, asyncio.Task) and not task.done()
+                }
+                active_broker_requests = {
+                    task
+                    for task in active_requests
+                    if isinstance(task, asyncio.Task) and not task.done()
+                }
+                if active_broker_requests or active_orders:
+                    cause: SymbolCycleAbortError = SymbolCycleAbortError(
+                        f"broker disconnected before fetching {symbol} while "
+                        "another broker request was active; outcome is ambiguous"
+                    )
+                else:
+                    cause = RecoverableBrokerDisconnectError(
+                        f"broker disconnected before fetching {symbol}"
+                    )
+                self._broker_request_abort_error = cause
+                raise cause from error
+
+            current_task = asyncio.current_task()
+            if current_task is None:  # pragma: no cover - asyncio invariant
+                raise SymbolCycleAbortError("broker request has no owning task")
+            active_requests.add(current_task)
+            return current_task
+
+    def _release_cycle_broker_request(self, owner: asyncio.Task) -> None:
+        """Release an exact request claim without introducing an await gap."""
+        active_requests = getattr(self, "_active_cycle_broker_requests", None)
+        if isinstance(active_requests, set):
+            active_requests.discard(owner)
 
     async def _place_order_with_circuit_breaker(self, order: Order):
         """
@@ -3258,25 +3369,21 @@ class AsyncRunner:
             )
             return None
 
-        # Check connection health; surface failure to ConnectionHealth and let the
-        # background monitor (or next cycle) handle recovery — do NOT reconnect here.
-        if hasattr(self.ib, "is_connected") and not self.ib.is_connected:
-            logger.warning(f"Connection lost before fetching {symbol}; deferring to health monitor")
-            error = IBKRDisconnectedError("is_connected=False before fetch")
-            if getattr(self, "health", None) is not None:
-                self.health.record_failure(
-                    error,
-                    "fetch_and_store_data",
-                )
-            raise SymbolCycleAbortError(f"broker disconnected before fetching {symbol}") from error
+        # Check connection health before starting a request. The cycle boundary
+        # classifies an authoritative pre-request disconnect as recoverable
+        # only when no sibling broker request/order is already active.
+        request_owner = await self._claim_cycle_broker_request(symbol)
 
         try:
             start_time = asyncio.get_event_loop().time()
-            with Timer("data_fetch", self.monitor):
-                # Fetch historical bars using IB connection directly
-                df = await self._fetch_historical_bars(
-                    symbol=symbol, duration=self.duration, bar_size=self.bar_size
-                )
+            try:
+                with Timer("data_fetch", self.monitor):
+                    # Fetch historical bars using IB connection directly
+                    df = await self._fetch_historical_bars(
+                        symbol=symbol, duration=self.duration, bar_size=self.bar_size
+                    )
+            finally:
+                self._release_cycle_broker_request(request_owner)
 
             # Record API call metrics to ProductionMonitor (Phase 4 P2)
             if self.production_monitor:
@@ -4527,6 +4634,11 @@ class AsyncRunner:
             self._symbol_cycle_abort_error = None
             self._cycle_worker_tasks = set()
             self._order_admitted_tasks = set()
+            self._active_cycle_broker_requests = set()
+            self._broker_request_admission_closed = False
+            self._broker_request_abort_error = None
+            if not hasattr(self, "_broker_request_admission_lock"):
+                self._broker_request_admission_lock = asyncio.Lock()
 
         async def process_with_semaphore(symbol: str) -> SymbolResult:
             async with semaphore:
@@ -4535,6 +4647,9 @@ class AsyncRunner:
                     self._cycle_worker_tasks.add(current_task)
                 try:
                     if self._symbol_cycle_abort_event.is_set():
+                        prior_cause = getattr(self, "_symbol_cycle_abort_error", None)
+                        if isinstance(prior_cause, SymbolCycleAbortError):
+                            raise prior_cause
                         raise SymbolCycleAbortError(
                             "shared broker transport was already declared unusable"
                         )
@@ -4632,6 +4747,13 @@ class AsyncRunner:
                     children_drained = True
                     if cancellation_received:
                         raise asyncio.CancelledError
+                    # An already-admitted sibling may discover a terminal
+                    # ambiguity while the parent is draining it. Re-read the
+                    # authoritative latch so a previously observed recoverable
+                    # disconnect cannot mask that later terminal cause.
+                    latched_abort = getattr(self, "_symbol_cycle_abort_error", None)
+                    if isinstance(latched_abort, SymbolCycleAbortError):
+                        cycle_abort = latched_abort
                     logger.critical(
                         "event=symbol_cycle_aborted reason=%r "
                         "note=downstream_cycle_work_suppressed",
@@ -6645,6 +6767,43 @@ async def run_continuous(
                         raise  # propagate to outer while-loop handler for graceful shutdown
                     except UnprotectedExistingPositionsError:
                         raise
+                    except RecoverableBrokerDisconnectError as disconnect_err:
+                        # is_connected=False was observed before any broker
+                        # request began, so no protocol/generation/order outcome
+                        # is ambiguous. The symbol cycle was still cancelled
+                        # and drained fail-closed; now use the established
+                        # persistent recovery path instead of terminating the
+                        # process as though the worker generation were poisoned.
+                        if portfolio_runner.health is not None:
+                            portfolio_runner.health._status = HealthStatus.UNHEALTHY
+                        logger.warning(
+                            "event=cycle_authoritative_disconnect "
+                            "portfolio=%s error=%r action=recover_connection",
+                            portfolio_id,
+                            disconnect_err,
+                        )
+                        try:
+                            recovered = await portfolio_runner.recover_connection(
+                                f"authoritative pre-fetch disconnect: {disconnect_err}"
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as recovery_err:
+                            portfolio_runner._recovery_exhausted = True
+                            raise RecoveryExhaustedError(
+                                f"portfolio={portfolio_id} authoritative disconnect "
+                                "recovery raised; exiting for watchdog restart"
+                            ) from recovery_err
+                        if not recovered:
+                            portfolio_runner._recovery_exhausted = True
+                            raise RecoveryExhaustedError(
+                                f"portfolio={portfolio_id} authoritative disconnect "
+                                "recovery exhausted; exiting for watchdog restart"
+                            ) from disconnect_err
+                        logger.info(
+                            "event=cycle_disconnect_recovered portfolio=%s",
+                            portfolio_id,
+                        )
                     except SymbolCycleAbortError as cycle_err:
                         # A symbol-cycle abort means the shared broker worker
                         # generation is no longer trustworthy. Treat it as a

@@ -19,6 +19,7 @@ from robo_trader.monitoring.performance import PerformanceMonitor
 from robo_trader.runner_async import (
     AsyncRunner,
     MarketDataContractError,
+    RecoverableBrokerDisconnectError,
     SymbolCycleAbortError,
     SymbolResult,
     run_continuous,
@@ -454,6 +455,48 @@ async def test_transport_timeout_reports_health_and_aborts() -> None:
     runner.db.batch_store_market_data.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_authoritative_pre_fetch_disconnect_is_recoverable_cycle_abort() -> None:
+    runner = _runner_for_fetch(AssertionError("broker request must not start"))
+    runner.ib.is_connected = False
+
+    with patch("robo_trader.runner_async.is_trading_allowed", return_value=True):
+        with pytest.raises(RecoverableBrokerDisconnectError):
+            await runner.fetch_and_store_data("AAPL")
+
+    runner.health.record_failure.assert_called_once()
+    runner._fetch_historical_bars.assert_not_awaited()
+    runner.db.batch_store_market_data.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_with_inflight_broker_request_is_terminal() -> None:
+    request_started = asyncio.Event()
+    release_request = asyncio.Event()
+
+    async def gated_fetch(**_kwargs):
+        request_started.set()
+        await release_request.wait()
+        raise AssertionError("test request should be cancelled")
+
+    runner = _runner_for_fetch(AssertionError("unused"))
+    runner._fetch_historical_bars = AsyncMock(side_effect=gated_fetch)
+
+    with patch("robo_trader.runner_async.is_trading_allowed", return_value=True):
+        inflight = asyncio.create_task(runner.fetch_and_store_data("AAPL"))
+        await request_started.wait()
+        runner.ib.is_connected = False
+        with pytest.raises(SymbolCycleAbortError) as caught:
+            await runner.fetch_and_store_data("MSFT")
+
+    assert not isinstance(caught.value, RecoverableBrokerDisconnectError)
+    assert "another broker request was active" in str(caught.value)
+    inflight.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await inflight
+    assert runner._active_cycle_broker_requests == set()
+
+
 def _runner_for_parallel(process_symbol) -> AsyncRunner:
     runner = AsyncRunner.__new__(AsyncRunner)
     runner._cycle_executed_buys_lock = asyncio.Lock()
@@ -643,6 +686,84 @@ async def test_transport_abort_cancels_remaining_symbols() -> None:
         await runner.run_parallel(["AAPL", "MSFT"])
 
     assert reached_second is False
+    runner.update_position_market_prices.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recoverable_disconnect_aborts_parallel_cycle_before_downstream() -> None:
+    reached_second = False
+
+    async def process(symbol: str):
+        nonlocal reached_second
+        if symbol == "AAPL":
+            raise RecoverableBrokerDisconnectError("disconnected before request")
+        reached_second = True
+        raise AssertionError("remaining symbol must not run")
+
+    runner = _runner_for_parallel(process)
+    with pytest.raises(
+        RecoverableBrokerDisconnectError,
+        match="disconnected before request",
+    ):
+        await runner.run_parallel(["AAPL", "MSFT"])
+
+    assert reached_second is False
+    runner.update_position_market_prices.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_terminal_abort_dominates_simultaneous_recoverable_disconnect() -> None:
+    both_ready = asyncio.Event()
+    ready = 0
+
+    async def process(symbol: str):
+        nonlocal ready
+        ready += 1
+        if ready == 2:
+            both_ready.set()
+        await both_ready.wait()
+        if symbol == "AAPL":
+            raise RecoverableBrokerDisconnectError("plain disconnect")
+        raise SymbolCycleAbortError("request identity became ambiguous")
+
+    runner = _runner_for_parallel(process)
+    runner.max_concurrent_symbols = 2
+
+    with pytest.raises(SymbolCycleAbortError, match="request identity became ambiguous") as caught:
+        await runner.run_parallel(["AAPL", "MSFT"])
+
+    assert not isinstance(caught.value, RecoverableBrokerDisconnectError)
+    runner.update_position_market_prices.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_terminal_abort_discovered_during_drain_overrides_recoverable() -> None:
+    terminal_task_admitted = asyncio.Event()
+
+    async def process(symbol: str):
+        if symbol == "AAPL":
+            await terminal_task_admitted.wait()
+            raise RecoverableBrokerDisconnectError("early recoverable disconnect")
+
+        current_task = asyncio.current_task()
+        assert current_task is not None
+        runner._order_admitted_tasks.add(current_task)
+        terminal_task_admitted.set()
+        await asyncio.sleep(0.05)
+        raise SymbolCycleAbortError("late terminal ambiguity")
+
+    runner = _runner_for_parallel(process)
+    runner.max_concurrent_symbols = 2
+
+    with pytest.raises(SymbolCycleAbortError, match="late terminal ambiguity") as caught:
+        await runner.run_parallel(["AAPL", "MSFT"])
+
+    assert not isinstance(caught.value, RecoverableBrokerDisconnectError)
+    assert isinstance(runner._symbol_cycle_abort_error, SymbolCycleAbortError)
+    assert not isinstance(
+        runner._symbol_cycle_abort_error,
+        RecoverableBrokerDisconnectError,
+    )
     runner.update_position_market_prices.assert_not_awaited()
 
 
@@ -1009,6 +1130,189 @@ async def test_symbol_cycle_abort_suppresses_all_run_level_downstream_work() -> 
     runner.update_account_summary.assert_not_awaited()
     runner.monitor.log_performance_summary.assert_not_awaited()
     runner.teardown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_recoverable_disconnect_suppresses_all_run_level_downstream_work() -> None:
+    runner = AsyncRunner.__new__(AsyncRunner)
+    runner.setup = AsyncMock()
+    runner.teardown = AsyncMock()
+    runner.positions = {}
+    runner.cfg = SimpleNamespace(symbols=["AAPL"])
+    runner.max_concurrent_symbols = 1
+    runner.ai_analyst = None
+    runner.run_parallel = AsyncMock(
+        side_effect=RecoverableBrokerDisconnectError("plain disconnect")
+    )
+    runner.market_data_cache = OrderedDict()
+    runner.pairs_strategy = MagicMock()
+    runner.pairs_strategy.analyze_pairs = AsyncMock()
+    runner.stat_arb_strategy = MagicMock()
+    runner.stat_arb_strategy.calculate_arbitrage_scores = AsyncMock()
+    runner.update_account_summary = AsyncMock()
+    runner.monitor = MagicMock()
+    runner.monitor.log_performance_summary = AsyncMock()
+    runner.use_correlation_sizing = False
+
+    with patch("robo_trader.runner_async.is_trading_allowed", return_value=True):
+        with pytest.raises(RecoverableBrokerDisconnectError, match="plain disconnect"):
+            await runner.run(["AAPL"])
+
+    runner.pairs_strategy.analyze_pairs.assert_not_awaited()
+    runner.stat_arb_strategy.calculate_arbitrage_scores.assert_not_awaited()
+    runner.update_account_summary.assert_not_awaited()
+    runner.monitor.log_performance_summary.assert_not_awaited()
+    runner.teardown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_continuous_authoritative_disconnect_recovers_without_watchdog_exit() -> None:
+    runner = MagicMock()
+    runner.recovery_in_progress = False
+    runner._recovery_exhausted = False
+    runner.health = MagicMock()
+    runner.health.status = HealthStatus.HEALTHY
+    runner.health._status = HealthStatus.HEALTHY
+    runner.run = AsyncMock(
+        side_effect=RecoverableBrokerDisconnectError("disconnected before request")
+    )
+    runner.recover_connection = AsyncMock(return_value=True)
+    runner._safe_disconnect = AsyncMock()
+    runner.teardown = AsyncMock()
+    runner.cleanup = AsyncMock()
+    portfolio = SimpleNamespace(
+        id="default",
+        name="Default",
+        starting_cash=100000,
+        symbols=["AAPL"],
+        active=True,
+    )
+
+    with (
+        patch("signal.signal"),
+        patch("robo_trader.runner_async.AsyncRunner", return_value=runner),
+        patch("robo_trader.runner_async._setup_continuous_runner", new_callable=AsyncMock),
+        patch("robo_trader.runner_async.is_trading_allowed", return_value=True),
+        patch(
+            "robo_trader.multiuser.portfolio_config.load_portfolio_configs",
+            return_value=[portfolio],
+        ),
+        patch(
+            "robo_trader.runner_async.sleep_unless_shutdown",
+            new_callable=AsyncMock,
+            side_effect=asyncio.CancelledError,
+        ),
+        patch("robo_trader.runner_async._write_exit_audit"),
+        patch("robo_trader.runner_async._fire_runner_exit_alert"),
+    ):
+        await run_continuous(symbols=["AAPL"], interval_seconds=1)
+
+    runner.run.assert_awaited_once_with(["AAPL"])
+    runner.recover_connection.assert_awaited_once()
+    runner._safe_disconnect.assert_not_awaited()
+    assert runner._recovery_exhausted is False
+    runner.teardown.assert_awaited_once_with(full_cleanup=False)
+    runner.cleanup.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_continuous_authoritative_disconnect_exits_when_recovery_exhausts() -> None:
+    runner = MagicMock()
+    runner.recovery_in_progress = False
+    runner._recovery_exhausted = False
+    runner.health = MagicMock()
+    runner.health.status = HealthStatus.HEALTHY
+    runner.health._status = HealthStatus.HEALTHY
+    runner.run = AsyncMock(
+        side_effect=RecoverableBrokerDisconnectError("disconnected before request")
+    )
+    runner.recover_connection = AsyncMock(return_value=False)
+    runner._safe_disconnect = AsyncMock()
+    runner.teardown = AsyncMock()
+    runner.cleanup = AsyncMock()
+    portfolio = SimpleNamespace(
+        id="default",
+        name="Default",
+        starting_cash=100000,
+        symbols=["AAPL"],
+        active=True,
+    )
+
+    with (
+        patch("signal.signal"),
+        patch("robo_trader.runner_async.AsyncRunner", return_value=runner),
+        patch("robo_trader.runner_async._setup_continuous_runner", new_callable=AsyncMock),
+        patch("robo_trader.runner_async.is_trading_allowed", return_value=True),
+        patch(
+            "robo_trader.multiuser.portfolio_config.load_portfolio_configs",
+            return_value=[portfolio],
+        ),
+        patch(
+            "robo_trader.runner_async.sleep_unless_shutdown",
+            new_callable=AsyncMock,
+        ) as sleep,
+        patch("robo_trader.runner_async._write_exit_audit"),
+        patch("robo_trader.runner_async._fire_runner_exit_alert"),
+    ):
+        await run_continuous(symbols=["AAPL"], interval_seconds=1)
+
+    runner.run.assert_awaited_once_with(["AAPL"])
+    runner.recover_connection.assert_awaited_once()
+    assert runner._recovery_exhausted is True
+    runner._safe_disconnect.assert_not_awaited()
+    runner.teardown.assert_not_awaited()
+    sleep.assert_not_awaited()
+    runner.cleanup.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_continuous_authoritative_disconnect_exits_when_recovery_raises() -> None:
+    runner = MagicMock()
+    runner.recovery_in_progress = False
+    runner._recovery_exhausted = False
+    runner.health = MagicMock()
+    runner.health.status = HealthStatus.HEALTHY
+    runner.health._status = HealthStatus.HEALTHY
+    runner.run = AsyncMock(
+        side_effect=RecoverableBrokerDisconnectError("disconnected before request")
+    )
+    runner.recover_connection = AsyncMock(side_effect=RuntimeError("recovery infrastructure"))
+    runner._safe_disconnect = AsyncMock()
+    runner.teardown = AsyncMock()
+    runner.cleanup = AsyncMock()
+    portfolio = SimpleNamespace(
+        id="default",
+        name="Default",
+        starting_cash=100000,
+        symbols=["AAPL"],
+        active=True,
+    )
+
+    with (
+        patch("signal.signal"),
+        patch("robo_trader.runner_async.AsyncRunner", return_value=runner),
+        patch("robo_trader.runner_async._setup_continuous_runner", new_callable=AsyncMock),
+        patch("robo_trader.runner_async.is_trading_allowed", return_value=True),
+        patch(
+            "robo_trader.multiuser.portfolio_config.load_portfolio_configs",
+            return_value=[portfolio],
+        ),
+        patch(
+            "robo_trader.runner_async.sleep_unless_shutdown",
+            new_callable=AsyncMock,
+        ) as sleep,
+        patch("robo_trader.runner_async._write_exit_audit"),
+        patch("robo_trader.runner_async._fire_runner_exit_alert"),
+    ):
+        await run_continuous(symbols=["AAPL"], interval_seconds=1)
+
+    runner.run.assert_awaited_once_with(["AAPL"])
+    runner.recover_connection.assert_awaited_once()
+    assert runner._recovery_exhausted is True
+    runner._safe_disconnect.assert_not_awaited()
+    runner.teardown.assert_not_awaited()
+    sleep.assert_not_awaited()
+    runner.cleanup.assert_awaited_once()
 
 
 @pytest.mark.asyncio
