@@ -22,6 +22,22 @@ WATCHDOG_LOG_MAX_SIZE=10485760  # 10MB max log size
 STALE_MINUTES="${1:-5}"  # Default 5 minutes
 CHECK_INTERVAL=60        # Check every 60 seconds
 LOCKFILE="$PROJECT_DIR/.watchdog.lock"
+RUNNER_EXIT_AUDIT="$PROJECT_DIR/data/runner_exit.json"
+RESTART_POLICY="$SCRIPT_DIR/watchdog_restart_policy.py"
+RESTART_GUARD="$SCRIPT_DIR/watchdog_restart_guard.sh"
+PYTHON3_BIN="$PROJECT_DIR/.venv/bin/python3"
+if [ ! -x "$PYTHON3_BIN" ]; then
+    PYTHON3_BIN="$(command -v python3 2>/dev/null || true)"
+fi
+LAST_TERMINAL_SAFETY_REASON=""
+if [ -f "$RESTART_GUARD" ]; then
+    # shellcheck source=watchdog_restart_guard.sh
+    source "$RESTART_GUARD"
+else
+    # A missing policy guard must never turn an existing exit audit into
+    # permission to restart.
+    watchdog_restart_allowed_for_policy_rc() { return 1; }
+fi
 
 # Layer 6: escalation when restart attempts repeatedly fail (e.g., Gateway 2FA wall).
 # Before this layer, the watchdog would silently retry forever — that's how the
@@ -253,6 +269,38 @@ notify_user() {
 
 restart_trader() {
     # Returns 0 if the restart appears successful (runner alive after wait), 1 otherwise.
+    # A deliberate terminal safety exit must survive the supervisor boundary.
+    # Manual START_TRADER.sh remains available after the missing protection is
+    # deployed, but the watchdog must not loop through Gateway/2FA meanwhile.
+    if ! is_runner_alive && [ -f "$RUNNER_EXIT_AUDIT" ]; then
+        local policy_output
+        local policy_rc
+        if [ -n "$PYTHON3_BIN" ] && [ -x "$PYTHON3_BIN" ] && [ -f "$RESTART_POLICY" ]; then
+            policy_output="$("$PYTHON3_BIN" "$RESTART_POLICY" "$RUNNER_EXIT_AUDIT" 2>/dev/null)"
+            policy_rc=$?
+        else
+            policy_output="restart_policy_unavailable"
+            policy_rc=21
+        fi
+
+        if ! watchdog_restart_allowed_for_policy_rc "$policy_rc"; then
+            local policy_reason
+            policy_reason=$(echo "$policy_output" | head -1 | tr -cd '[:alnum:]_.-')
+            if [ -z "$policy_reason" ]; then
+                policy_reason="restart_policy_invalid"
+            fi
+            if [ "$policy_reason" != "$LAST_TERMINAL_SAFETY_REASON" ]; then
+                log "TERMINAL SAFETY BLOCK: watchdog restart suppressed (reason=$policy_reason)"
+                notify_user "RoboTrader safety block" \
+                    "Automatic restart suppressed: $policy_reason. Keep trader stopped until protection is restored, then run START_TRADER.sh manually."
+                LAST_TERMINAL_SAFETY_REASON="$policy_reason"
+            fi
+            reset_failures
+            return 2
+        fi
+    fi
+    LAST_TERMINAL_SAFETY_REASON=""
+
     log "RESTARTING trader due to stall..."
 
     # Delegate the complete restart to the authoritative launcher. It validates
@@ -354,7 +402,6 @@ while true; do
                 fi
             fi
         else
-            log "Runner not running during trading hours - starting..."
             restart_trader
         fi
     fi

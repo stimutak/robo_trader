@@ -25,10 +25,10 @@ from dotenv import load_dotenv  # isort:skip
 
 load_dotenv()  # noqa: E402 - must run before imports that use os.getenv()
 from dataclasses import dataclass  # isort:skip  # noqa: E402
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, NoReturn, Optional, Tuple
 
 import pandas as pd
 from ib_async import Stock
@@ -77,7 +77,7 @@ from .portfolio import Portfolio, PositionSnapshot  # Import Portfolio class fro
 from .portfolio_pkg.portfolio_manager import AllocationMethod, MultiStrategyPortfolioManager
 from .risk.advanced_risk import AdvancedRiskManager, risk_monitor_task
 from .risk_manager import Position, RiskManager, create_risk_manager_from_config
-from .stop_loss_monitor import StopLossMonitor, StopType
+from .stop_loss_monitor import StopLossMonitor, StopStatus, StopType
 from .strategies import MLStrategy, sma_crossover_signals
 from .strategies.ml_enhanced_strategy import MLEnhancedStrategy
 from .utils.connection_recovery import OrderRateLimiter
@@ -96,6 +96,19 @@ class MarketDataIdentityError(MarketDataContractError):
 
 class SymbolCycleAbortError(RuntimeError):
     """A transport-integrity failure requires cancellation of the symbol cycle."""
+
+
+class UnprotectedExistingPositionsError(RuntimeError):
+    """Existing holdings lack verified, live-grade stop-loss protection."""
+
+    def __init__(self, portfolio_id: str, position_count: int, reason_code: str):
+        self.portfolio_id = str(portfolio_id)
+        self.position_count = int(position_count)
+        self.reason_code = str(reason_code)
+        super().__init__(
+            f"portfolio={self.portfolio_id} existing_position_count={self.position_count} "
+            f"reason={self.reason_code}"
+        )
 
 
 _UNVERIFIED_PRICE_RATIO_LIMIT = 1.75
@@ -1656,6 +1669,7 @@ class AsyncRunner:
 
         # Load existing positions from database to prevent duplicate buying
         await self.load_existing_positions()
+        self._assert_existing_position_protection()
 
         # Mark setup as complete for persistent connections
         self._setup_complete = True
@@ -1665,6 +1679,101 @@ class AsyncRunner:
         # stale exit-audit file so the dashboard/watchdog reads "no exit"
         # while the runner is actually trading.
         _clear_exit_audit()
+
+    def _assert_existing_position_protection(self) -> None:
+        """Require monitor-owned, live-grade stop coverage for every holding.
+
+        Historical bars and runner caches are intentionally excluded. The
+        protection contract is satisfied only after StopLossMonitor itself has
+        accepted a fresh broker event from the independent live-protective
+        source. Until PR 3 installs that source, a holdings-bearing runner must
+        abort setup rather than appear healthy with blind stops.
+        """
+
+        positions = {
+            symbol: position
+            for symbol, position in getattr(self, "positions", {}).items()
+            if getattr(position, "quantity", 0) != 0
+        }
+        if not positions:
+            return
+
+        def fail(reason_code: str) -> NoReturn:
+            raise UnprotectedExistingPositionsError(
+                getattr(self, "portfolio_id", "default"),
+                len(positions),
+                reason_code,
+            )
+
+        monitor = getattr(self, "stop_loss_monitor", None)
+        if monitor is None:
+            fail("stop_monitor_missing")
+        monitor_task = getattr(monitor, "monitor_task", None)
+        if (
+            getattr(monitor, "monitoring_active", False) is not True
+            or monitor_task is None
+            or monitor_task.done()
+        ):
+            fail("stop_monitor_not_running")
+
+        active_stops = getattr(monitor, "active_stops", None)
+        prices = getattr(monitor, "last_prices", None)
+        event_times = getattr(monitor, "price_event_times", None)
+        receipt_times = getattr(monitor, "price_receipt_monotonic", None)
+        if (
+            not isinstance(active_stops, dict)
+            or not isinstance(prices, dict)
+            or not isinstance(event_times, dict)
+            or not isinstance(receipt_times, dict)
+        ):
+            fail("stop_monitor_state_invalid")
+
+        now_utc = monitor._utcnow()
+        now_monotonic = monitor._monotonic()
+        max_age = float(getattr(monitor, "max_price_age_seconds", 0))
+        if (
+            not isinstance(now_utc, datetime)
+            or now_utc.tzinfo is None
+            or now_utc.utcoffset() is None
+            or not math.isfinite(now_monotonic)
+            or not math.isfinite(max_age)
+            or max_age <= 0
+        ):
+            fail("stop_monitor_clock_invalid")
+        now_utc = now_utc.astimezone(timezone.utc)
+
+        for symbol, position in positions.items():
+            stop = active_stops.get(monitor._stop_key(symbol))
+            if stop is None:
+                fail("active_stop_missing")
+            if getattr(stop, "status", None) is not StopStatus.PENDING:
+                fail("active_stop_not_pending")
+            if getattr(stop, "position_qty", None) != position.quantity:
+                fail("active_stop_quantity_mismatch")
+            if not self._has_live_protective_feed(symbol):
+                fail("live_protective_feed_unavailable")
+
+            price = prices.get(symbol)
+            event_time = event_times.get(symbol)
+            receipt_time = receipt_times.get(symbol)
+            if (
+                not isinstance(price, (int, float))
+                or isinstance(price, bool)
+                or not math.isfinite(float(price))
+                or float(price) <= 0
+                or not isinstance(event_time, datetime)
+                or event_time.tzinfo is None
+                or event_time.utcoffset() is None
+                or not isinstance(receipt_time, (int, float))
+                or isinstance(receipt_time, bool)
+                or not math.isfinite(float(receipt_time))
+            ):
+                fail("protective_price_state_invalid")
+
+            event_age = (now_utc - event_time.astimezone(timezone.utc)).total_seconds()
+            receipt_age = now_monotonic - float(receipt_time)
+            if event_age < 0 or receipt_age < 0 or event_age > max_age or receipt_age > max_age:
+                fail("protective_price_stale")
 
     async def load_existing_positions(self):
         """Load existing positions and account state from database on startup."""
@@ -1751,9 +1860,17 @@ class AsyncRunner:
                                 f"(entry=${entry_price:.2f}, stop=${stop_price:.2f})"
                             )
                     except Exception as e:
-                        logger.error(
-                            f"Failed to create stop-loss for existing position {symbol}: {e}"
+                        logger.critical(
+                            "event=existing_position_stop_registration_failed "
+                            "portfolio=%s exception_type=%s",
+                            self.portfolio_id,
+                            type(e).__name__,
                         )
+                        raise UnprotectedExistingPositionsError(
+                            self.portfolio_id,
+                            len(self.positions),
+                            "stop_registration_failed",
+                        ) from e
 
             if self.positions:
                 logger.info(
@@ -1768,11 +1885,19 @@ class AsyncRunner:
             self.session_start_equity = float(await self.portfolio.equity(market_prices))
             logger.info(f"Session start equity: ${self.session_start_equity:,.2f}")
 
+        except UnprotectedExistingPositionsError:
+            raise
         except Exception as e:
-            logger.error(f"Failed to load existing positions from database: {e}")
-            logger.warning("Starting with empty positions - may result in duplicate trades!")
-            # Fallback to config default if load fails
-            self.session_start_equity = float(self.cfg.default_cash)
+            logger.critical(
+                "event=existing_position_load_failed portfolio=%s exception_type=%s",
+                self.portfolio_id,
+                type(e).__name__,
+            )
+            raise UnprotectedExistingPositionsError(
+                self.portfolio_id,
+                len(self.positions),
+                "position_load_failed",
+            ) from e
 
     async def _fetch_historical_bars(
         self,
@@ -3689,7 +3814,14 @@ class AsyncRunner:
 
     async def run(self, symbols: Optional[List[str]] = None):
         """Main run method - process all symbols and update account."""
-        await self.setup()
+        try:
+            await self.setup()
+        except UnprotectedExistingPositionsError:
+            # setup() can fail after starting IBKR, DB, health, and stop-monitor
+            # resources. A one-shot caller has no outer runner registry to
+            # clean those partial resources, so cleanup must be local.
+            await self.cleanup()
+            raise
         try:
             # Check market status
             if not is_trading_allowed():
@@ -4553,84 +4685,112 @@ class AsyncRunner:
 
     async def cleanup(self):
         """Clean up resources when runner is done."""
-        try:
-            # Stop the persistent health monitor first so it can't fire
-            # during the rest of cleanup.
-            if getattr(self, "health", None) is not None:
-                try:
-                    await self.health.stop_monitoring()
-                except Exception:
-                    logger.warning("Stopping health monitor in cleanup raised", exc_info=True)
+        cleanup_failures = 0
+
+        def record_failure(resource: str) -> None:
+            nonlocal cleanup_failures
+            cleanup_failures += 1
+            logger.warning(
+                "event=runner_cleanup_resource_failed resource=%s",
+                resource,
+                exc_info=True,
+            )
+
+        async def cancel_task(task: Optional[asyncio.Task], resource: str) -> None:
+            if task is None or task.done():
+                return
+            try:
+                task.cancel()
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                record_failure(resource)
+
+        # Every resource is isolated. A failed stop-monitor shutdown must never
+        # prevent the IBKR subprocess or database from being closed after a
+        # fail-closed setup abort.
+        if getattr(self, "health", None) is not None:
+            try:
+                await self.health.stop_monitoring()
+            except Exception:
+                record_failure("connection_health")
+            finally:
                 self.health = None
 
-            # Cancel subprocess monitor task if running
-            if self.subprocess_monitor_task and not self.subprocess_monitor_task.done():
-                self.subprocess_monitor_task.cancel()
-                try:
-                    await self.subprocess_monitor_task
-                except asyncio.CancelledError:
-                    pass
+        await cancel_task(
+            getattr(self, "subprocess_monitor_task", None),
+            "subprocess_monitor_task",
+        )
+        await cancel_task(
+            getattr(self, "risk_monitor_task", None),
+            "risk_monitor_task",
+        )
+        await cancel_task(
+            getattr(self, "cleanup_task", None),
+            "database_cleanup_task",
+        )
 
-            # Cancel risk monitor task if running
-            if self.risk_monitor_task and not self.risk_monitor_task.done():
-                self.risk_monitor_task.cancel()
-                try:
-                    await self.risk_monitor_task
-                except asyncio.CancelledError:
-                    pass
-
-            # DB-R2-L2: cancel periodic cleanup task if running
-            if self.cleanup_task and not self.cleanup_task.done():
-                self.cleanup_task.cancel()
-                try:
-                    await self.cleanup_task
-                except asyncio.CancelledError:
-                    pass
-
-            # Stop and cleanup stop-loss monitor
-            if self.stop_loss_monitor:
-                logger.info("Stopping stop-loss monitor...")
-                await self.stop_loss_monitor.stop_monitoring()
-                metrics = self.stop_loss_monitor.get_metrics()
+        stop_monitor = getattr(self, "stop_loss_monitor", None)
+        if stop_monitor is not None:
+            logger.info("Stopping stop-loss monitor...")
+            try:
+                await stop_monitor.stop_monitoring()
+            except Exception:
+                record_failure("stop_loss_monitor")
+            try:
+                metrics = stop_monitor.get_metrics()
                 logger.info(
                     f"Stop-loss metrics - Triggered: {metrics.triggered_today}, "
                     f"Executed: {metrics.executed_today}, Failed: {metrics.failed_today}, "
                     f"Prevented loss: ${metrics.total_prevented_loss:.2f}"
                 )
+            except Exception:
+                record_failure("stop_loss_metrics")
 
-            # Save advanced risk manager state
-            if self.use_advanced_risk and self.advanced_risk:
+        if getattr(self, "use_advanced_risk", False) and getattr(self, "advanced_risk", None):
+            try:
                 state_file = Path("data/risk_state.json")
                 state_file.parent.mkdir(exist_ok=True)
                 self.advanced_risk.save_state(state_file)
                 logger.info("Advanced risk manager state saved")
+            except Exception:
+                record_failure("advanced_risk_state")
 
-            # Disconnect from IBKR (subprocess client)
-            if hasattr(self, "ib") and self.ib:
-                logger.info("Disconnecting from IBKR...")
-                # Check if it's subprocess client or legacy IB client
-                if hasattr(self.ib, "disconnect"):
-                    # Subprocess client has async disconnect()
-                    if asyncio.iscoroutinefunction(self.ib.disconnect):
-                        await self.ib.disconnect()
-                    else:
-                        self.ib.disconnect()
-                # Also stop the subprocess if it exists
-                if hasattr(self.ib, "stop"):
-                    await self.ib.stop()
+        ib_client = getattr(self, "ib", None)
+        if ib_client is not None:
+            logger.info("Disconnecting from IBKR...")
+            if hasattr(ib_client, "disconnect"):
+                try:
+                    disconnect_result = ib_client.disconnect()
+                    if inspect.isawaitable(disconnect_result):
+                        await disconnect_result
+                except Exception:
+                    record_failure("ibkr_disconnect")
+            if hasattr(ib_client, "stop"):
+                try:
+                    stop_result = ib_client.stop()
+                    if inspect.isawaitable(stop_result):
+                        await stop_result
                     logger.info("Stopped IBKR subprocess")
+                except Exception:
+                    record_failure("ibkr_subprocess")
 
-            # Close database connections
-            if hasattr(self, "db") and self.db:
-                await self.db.close()
+        database = getattr(self, "db", None)
+        if database is not None:
+            try:
+                await database.close()
+            except Exception:
+                record_failure("database")
 
-            # Stop WebSocket updates
-            if hasattr(self, "ws_client"):
-                self.ws_client.stop()
+        websocket = getattr(self, "ws_client", None)
+        if websocket is not None:
+            try:
+                websocket.stop()
+            except Exception:
+                record_failure("websocket")
 
-            logger.info("Cleanup completed")
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
+        logger.info("Cleanup completed (resource_failures=%d)", cleanup_failures)
 
     async def _safe_disconnect(self) -> None:
         """Disconnect IBKR cleanly when possible; never crash Gateway.
@@ -5201,6 +5361,17 @@ def _raise_if_recovery_exhausted(runners: Dict[str, AsyncRunner]) -> None:
             )
 
 
+async def _setup_continuous_runner(runner: AsyncRunner) -> None:
+    """Set up a newly-created continuous runner without leaking on safety abort."""
+
+    try:
+        await runner.setup()
+        await runner._attach_health_monitor()
+    except UnprotectedExistingPositionsError:
+        await runner.cleanup()
+        raise
+
+
 async def run_continuous(
     symbols: Optional[List[str]] = None,
     duration: str = "1 D",
@@ -5255,6 +5426,7 @@ async def run_continuous(
     # cycle and reused across all subsequent cycles. The IBKR connection
     # lives inside the runner and persists.
     runners: dict[str, AsyncRunner] = {}
+    fatal_safety_exit_written = False
 
     try:
         while not shutdown_flag:
@@ -5363,8 +5535,7 @@ async def run_continuous(
                             use_smart_execution=use_smart_execution,
                             portfolio_id=portfolio_id,
                         )
-                        await new_runner.setup()
-                        await new_runner._attach_health_monitor()
+                        await _setup_continuous_runner(new_runner)
                         runners[portfolio_id] = new_runner
                     portfolio_runner = runners[portfolio_id]
 
@@ -5401,6 +5572,8 @@ async def run_continuous(
                         await portfolio_runner.run(portfolio_symbols)
                     except KillSwitchTriggeredError:
                         raise  # propagate to outer while-loop handler for graceful shutdown
+                    except UnprotectedExistingPositionsError:
+                        raise
                     except Exception as cycle_err:
                         logger.exception(
                             "event=cycle_error portfolio=%s error=%r",
@@ -5450,6 +5623,37 @@ async def run_continuous(
                 )
                 shutdown_flag = True
                 break
+            except UnprotectedExistingPositionsError as e:
+                # A holdings-bearing runner without exact live stop coverage is
+                # a durable safety block, not a transient cycle error. Record a
+                # sanitized reason and terminate nonzero instead of retrying
+                # forever in-process.
+                logger.critical(
+                    "event=run_continuous_exit_unprotected_positions "
+                    "portfolio=%s position_count=%d reason=%s",
+                    e.portfolio_id,
+                    e.position_count,
+                    e.reason_code,
+                )
+                _write_exit_audit(
+                    "unprotected_existing_positions",
+                    exit_code=6,
+                    extra={
+                        "portfolio_id": e.portfolio_id,
+                        "position_count": e.position_count,
+                        "reason_code": e.reason_code,
+                    },
+                )
+                _fire_runner_exit_alert(
+                    "unprotected_existing_positions",
+                    {
+                        "portfolio_id": e.portfolio_id,
+                        "position_count": e.position_count,
+                        "reason_code": e.reason_code,
+                    },
+                )
+                fatal_safety_exit_written = True
+                raise SystemExit(6) from e
             except Exception as e:
                 logger.error(f"Error in trading cycle: {e}")
                 # If connection error at the outer level, let ConnectionHealth +
@@ -5476,8 +5680,9 @@ async def run_continuous(
         # overwrite a more specific exit reason written from elsewhere
         # if it was set in the same second. (We always write, and consumers
         # can read the most recent reason.)
-        _write_exit_audit("clean_shutdown", exit_code=0)
-        _fire_runner_exit_alert("clean_shutdown", None)
+        if not fatal_safety_exit_written:
+            _write_exit_audit("clean_shutdown", exit_code=0)
+            _fire_runner_exit_alert("clean_shutdown", None)
 
 
 def check_gateway_zombies(port: int = 4002) -> bool:
@@ -5667,6 +5872,31 @@ def main() -> None:
                     force_connect=args.force_connect,
                 )
             )
+    except UnprotectedExistingPositionsError as e:
+        logger.critical(
+            "event=runner_exit_unprotected_positions portfolio=%s " "position_count=%d reason=%s",
+            e.portfolio_id,
+            e.position_count,
+            e.reason_code,
+        )
+        _write_exit_audit(
+            "unprotected_existing_positions",
+            exit_code=6,
+            extra={
+                "portfolio_id": e.portfolio_id,
+                "position_count": e.position_count,
+                "reason_code": e.reason_code,
+            },
+        )
+        _fire_runner_exit_alert(
+            "unprotected_existing_positions",
+            {
+                "portfolio_id": e.portfolio_id,
+                "position_count": e.position_count,
+                "reason_code": e.reason_code,
+            },
+        )
+        raise SystemExit(6) from e
     except SystemExit:
         # B2: SystemExit propagates from pre-flight failures and similar
         # explicit-exit paths. They've already written their own audit
