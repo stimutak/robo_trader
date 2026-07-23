@@ -22,7 +22,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional, cast
 
@@ -331,7 +331,7 @@ class SubprocessIBKRClient:
                     return False
 
                 self._connected = True
-                self._last_activity = datetime.now()
+                self._last_activity = datetime.now(timezone.utc)
                 self._gateway_api_down_detail = None
                 self._gateway_failure_generation_id = None
                 return True
@@ -746,7 +746,9 @@ class SubprocessIBKRClient:
                 # Write to debug file for detailed analysis
                 if generation.debug_log_file:
                     try:
-                        generation.debug_log_file.write(f"{datetime.now().isoformat()}: {line}")
+                        generation.debug_log_file.write(
+                            f"{datetime.now(timezone.utc).isoformat()}: {line}"
+                        )
                         generation.debug_log_file.flush()
                     except Exception:
                         pass  # Don't let debug logging break the main flow
@@ -1155,8 +1157,8 @@ class SubprocessIBKRClient:
                             self._connected = True
                             self._connection_identity = requested_identity
                             self._connection_generation_id = generation.generation_id
-                            self._connection_start_time = datetime.now()
-                            self._last_activity = datetime.now()
+                            self._connection_start_time = datetime.now(timezone.utc)
+                            self._last_activity = datetime.now(timezone.utc)
                             self._gateway_api_down_detail = None
                             self._gateway_failure_generation_id = None
                         else:

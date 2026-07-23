@@ -2,7 +2,7 @@ import asyncio
 import json
 import queue
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -759,6 +759,10 @@ async def test_repeated_connect_is_idempotent_and_conflicting_identity_is_reject
         client.connect(port=4002, client_id=7, readonly=True),
     )
     assert results == [True, True]
+    assert client._connection_start_time is not None
+    assert client._connection_start_time.utcoffset() == timedelta(0)
+    assert client._last_activity is not None
+    assert client._last_activity.utcoffset() == timedelta(0)
     assert len(process.stdin.writes) == 2
 
     with pytest.raises(IBKRConnectionConflictError, match="stop\\(\\).*start"):
