@@ -1,11 +1,13 @@
-# Robo Trader - ML-Driven Production Trading Platform
+# Robo Trader - ML-Driven Paper Trading Research Platform
 
 > ## ⚠️ CRITICAL: SYSTEM NOT READY FOR LIVE TRADING ⚠️
 > **This system has critical safety issues that MUST be resolved before any live trading.**  
 > **See [PRODUCTION_READINESS_PLAN.md](PRODUCTION_READINESS_PLAN.md) for the mandatory action plan.**  
 > **Current Production Readiness Score: 5/10 - PAPER TRADING ONLY**
 >
-> All developers MUST follow the production readiness plan until completion.
+> Runtime execution is limited to the supervised, local IB Gateway paper
+> topology with broker-side read-only enforcement. Live execution is disabled.
+> Docker and Kubernetes trader services are unsupported and intentionally inert.
 
 > ## 🛡️ Security Audit Completed 2026-05-10
 > A comprehensive multi-agent security audit (commit `e528431`) addressed 53 of 57 findings across six attack surfaces. **If you are returning to dev work or onboarding a new machine, read [DEV_SETUP.md](DEV_SETUP.md) first** — particularly **[Section 3: What CHANGED for developers post-audit](DEV_SETUP.md#3-what-changed-for-developers-post-audit)**.
@@ -18,7 +20,9 @@
 >
 > **Headlines (things that now behave differently):** stop-losses actually trigger (keying bug fixed); IBKR Gateway is now read-only at the broker level; AI BUY requires ML corroboration; pairs trading goes through full risk validation; dashboard auth is fail-closed with CSRF protection; HMAC integrity verification on all model artifact loads.
 
-A production-grade algorithmic trading system with IBKR integration, featuring advanced ML infrastructure, async architecture, and comprehensive risk management. Paper trading by default with strict capital preservation controls.
+An algorithmic-trading research system with IBKR integration, advanced ML
+infrastructure, async architecture, and risk controls. The current supported
+runtime is paper-only and read-only.
 
 ## 🚀 Current Status
 
@@ -40,7 +44,7 @@ See `IMPLEMENTATION_PLAN.md` for the complete 16-week roadmap.
 - ✅ **Parallel Processing**: 3x throughput improvement
 - ✅ **Async Database**: SQLite with connection pooling
 - ✅ **Performance Monitoring**: Real-time metrics dashboard
-- ✅ **TWS Connection Issues**: Resolved with subprocess-based approach
+- ✅ **Gateway Connection Management**: Supervised by the authoritative launcher
 
 ### ML Infrastructure (Phase 2 - Complete)
 - ✅ **Feature Engineering**: 25+ technical indicators with time series
@@ -70,8 +74,8 @@ See `IMPLEMENTATION_PLAN.md` for the complete 16-week roadmap.
 
 ### Prerequisites
 - Python 3.9+ (tested on 3.13)
-- Interactive Brokers TWS or IB Gateway
-- IBKR Paper Trading Account (recommended for testing)
+- Interactive Brokers IB Gateway configured for paper mode on port 4002
+- IBKR Paper Trading Account (required)
 
 ### Installation
 
@@ -99,7 +103,7 @@ cp .env.example .env
 
 ### Running the System
 
-**Recommended: Use the automated startup script**
+**Required: use the authoritative startup script**
 
 ```bash
 # Start with default symbols (from user_settings.json)
@@ -117,34 +121,26 @@ The startup script automatically:
 - ✅ Starts trading system
 - ✅ Monitors startup health
 
-**Manual startup (advanced users):**
+**Do not start components manually.** `./START_TRADER.sh` is the only supported
+way to start or restart the Gateway, runner, dashboard, and WebSocket service.
+Do not run `python3 app.py`, `python3 -m robo_trader.runner_async`,
+`scripts/start_gateway.sh`, or a Docker/Kubernetes trader service. Those paths
+either bypass supervision or are intentionally inert.
 
 ```bash
-# Always activate virtual environment first
-source venv/bin/activate
+# Diagnostics are read-only
+python3 scripts/gateway_manager.py status
+lsof -nP -iTCP:4002 -sTCP:CLOSE_WAIT
 
-# Option 1: Run async trading system with parallel processing
-python -m robo_trader.runner_async --symbols AAPL,NVDA,TSLA
-
-# Option 2: Run with ML Enhanced Strategy (regime detection + multi-timeframe)
-python -m robo_trader.runner_async --symbols AAPL,NVDA --use-ml-enhanced
-
-# Option 3: Run with dashboard (port 5555)
-export DASH_PORT=5555
-python app.py
-
-# Option 4: Test ML pipeline
-python test_ml_pipeline.py
-
-# Option 5: Test ML Enhanced Strategy
-python test_ml_enhanced_strategy.py
+# Tests use python3 / the project virtual environment
+.venv/bin/python -m pytest tests/ -q
 ```
 
 **Diagnostic tools:**
 
 ```bash
-# Test Gateway connectivity
-./force_gateway_reconnect.sh
+# Inspect Gateway status without restarting it
+python3 scripts/gateway_manager.py status
 
 # Full system diagnostics
 python diagnose_gateway_api.py
@@ -243,15 +239,16 @@ Create a `.env` file:
 ```bash
 # IBKR Connection
 IBKR_HOST=127.0.0.1
-IBKR_PORT=7497              # TWS Paper: 7497, Live: 7496
+IBKR_PORT=4002              # IB Gateway paper port
 IBKR_CLIENT_ID=123
-IBKR_READONLY=true          # Keep Gateway/TWS in read-only mode
+IBKR_READONLY=true          # Keep the paper Gateway in read-only mode
 IBKR_TIMEOUT=10.0           # Handshake timeout (seconds)
 IBKR_SSL_MODE=auto          # auto | require (TLS only) | disabled (plain TCP)
 IBKR_FORCE_DISCONNECT=0     # Leave disabled; set to 1 only for controlled test scripts
 
 # Trading Mode
-EXECUTION_MODE=paper         # paper or live
+EXECUTION_MODE=paper         # Live capability is disabled during remediation
+TRADING_MODE=paper           # Temporary legacy alias; must match
 ENVIRONMENT=dev              # dev, staging, or production
 
 # Risk Management
@@ -384,14 +381,14 @@ metrics = pm.get_portfolio_metrics()
 ### ⏳ Phase 4: Production Hardening
 - Advanced risk management
 - Production monitoring stack
-- Docker deployment
+- Container build and monitoring scaffolding (trader remains inert)
 - Security & compliance
 - CI/CD pipeline
 
 ## 🛡️ Safety Features
 
 ### Capital Preservation
-- **Paper Trading Default**: Live requires explicit config
+- **Paper-Only Runtime**: Live capability is disabled during remediation
 - **Pre-Trade Validation**: 10 risk rule checks
 - **Emergency Shutdown**: Auto-triggers on violations
 - **Position Limits**: Configurable per-trade risk
@@ -409,9 +406,13 @@ metrics = pm.get_portfolio_metrics()
 9. Volume limit
 10. Market cap limit
 
-## 🚦 Production Checklist
+## 🚦 Live-Release Gate
 
-Before going live:
+Live trading is not enabled by configuration or by completing this checklist.
+It requires the remediation plan's explicit live-trading release gate and a
+separately reviewed execution capability.
+
+- [ ] Remediation release gate explicitly completed
 - [ ] All tests passing
 - [ ] 30+ days profitable paper trading
 - [ ] Risk limits configured
@@ -427,9 +428,9 @@ Before going live:
 
 **WebSocket Connection Issues**
 ```bash
-# Set plain text logging for dashboard
-export MONITORING_LOG_FORMAT=plain
-python app.py
+# Inspect the supervised services, then restart the whole system if required
+tail -f robo_trader.log
+./START_TRADER.sh
 ```
 
 **ML Pipeline Errors**
@@ -442,13 +443,13 @@ ls trained_models/
 
 **IBKR Connection Failed**
 ```bash
-# Use automated diagnostics (RECOMMENDED)
-./force_gateway_reconnect.sh
-python diagnose_gateway_api.py
+# Use read-only diagnostics
+python3 scripts/gateway_manager.py status
+python3 diagnose_gateway_api.py
 
 # Or manual checks:
-# Verify TWS/Gateway running
-# Check port (Paper: 4002, Live: 4001)
+# Verify the supervised paper Gateway is running
+# Check the supported paper Gateway port (4002)
 # Enable API in Gateway settings:
 #   File → Global Configuration → API → Settings
 #   ☑️ Enable ActiveX and Socket Clients
@@ -462,7 +463,7 @@ python diagnose_gateway_api.py
 - **Cause:** Gateway API socket clients not enabled or Gateway in bad state
 - **Solution:**
   1. Check Gateway API settings (see above)
-  2. Run `./force_gateway_reconnect.sh` to test
+  2. Run `python3 scripts/gateway_manager.py status`
   3. Use `./START_TRADER.sh` for automatic zombie cleanup
   4. Restart Gateway if needed (requires 2FA)
 - **Prevention:** Always use `START_TRADER.sh` for clean startup
@@ -474,11 +475,11 @@ python diagnose_gateway_api.py
 - **Guardrail:** `robo_trader` now short-circuits retries and surfaces this message instead of looping.
 - **Optional:** Set `IBKR_FORCE_DISCONNECT=1` only when you explicitly want to call `ib.disconnect()` (e.g., in isolated tests).
 
-**TWS API Timeout Issues (RESOLVED 2025-09-23)**
+**Legacy TWS API Timeout Issue (historical, TWS unsupported)**
 - Issue: `patchAsyncio()` caused API handshake timeouts
 - Solution: Subprocess-based IBKR operations for async isolation
 - Files: `robo_trader/clients/sync_ibkr_wrapper.py`
-- Monitor: Check for stuck connections, restart TWS periodically
+- Current operation: use IB Gateway through `./START_TRADER.sh`; do not run TWS
 
 ## 📚 Documentation
 
@@ -487,7 +488,9 @@ python diagnose_gateway_api.py
 - `CLAUDE.md`: Project guidelines and startup commands
 - `REAL_ISSUE_ANALYSIS.md`: Gateway connection troubleshooting
 - `START_TRADER.sh`: Automated startup script with zombie cleanup
-- `force_gateway_reconnect.sh`: Gateway connectivity testing
+- `scripts/start_gateway.sh`: quarantined alternate Gateway launcher
+- `scripts/utilities/ibkr_connection_monitor.py`: quarantined alternate monitor
+- `force_gateway_reconnect.sh`: quarantined legacy restart utility
 - `diagnose_gateway_api.py`: Comprehensive diagnostics
 - `CRITICAL_BUG_FIXES_SUMMARY.md`: Summary of recent critical fixes
 - `tests/test_critical_bug_fixes.py`: Regression suite for critical fixes
@@ -521,6 +524,4 @@ This software is for educational purposes. Trading involves substantial risk of 
 
 ---
 
-**System Status**: ✅ TWS Connection Issues Resolved, Phase 3 Continuing
-**Version**: 2.1.0 (TWS Connection Fix)
-**Last Updated**: 2025-09-23
+**System Status**: Paper-only/read-only supervised runtime; live disabled

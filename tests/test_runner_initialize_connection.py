@@ -22,6 +22,7 @@ def make_runner_skeleton():
     runner.cfg.ibkr.host = "127.0.0.1"
     runner.cfg.ibkr.port = 4002
     runner.cfg.ibkr.client_id = 1
+    runner.cfg.ibkr.account = "DU_TEST_PAPER"
     runner._client_id = 1
     runner.portfolio_id = "default"
     runner.ib = None
@@ -41,7 +42,7 @@ async def test_initialize_connection_starts_subprocess_and_connects():
     fake_client.start = AsyncMock()
     fake_client.connect = AsyncMock(return_value=True)  # bool, not dict
     fake_client.is_connected = True  # @property on real client — plain attr in mock
-    fake_client.get_accounts = AsyncMock(return_value=["DUN264991"])
+    fake_client.get_accounts = AsyncMock(return_value=["DU_TEST_PAPER"])
     fake_client.stop = AsyncMock()
 
     with (

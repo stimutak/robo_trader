@@ -644,7 +644,7 @@ class SubprocessIBKRClient:
         # expose a post-handshake "is readonly" flag, so we cannot verify
         # programmatically here. The authoritative read-only enforcement is
         # IBC's ReadOnlyApi=yes (verified at startup by START_TRADER.sh and
-        # scripts/start_gateway.sh). This client always passes readonly=True.
+        # START_TRADER.sh). This client always passes readonly=True.
         if self._connected:
             logger.info(
                 "IBKR client connection: readonly flag was requested",
@@ -844,7 +844,7 @@ class SubprocessIBKRClient:
             We assume that an IB reconnect cannot cause duplicate orders
             because this client always connects in ``readonly=True`` mode and
             the Gateway side enforces ``ReadOnlyApi=yes`` (verified at
-            startup by ``START_TRADER.sh`` and ``scripts/start_gateway.sh``,
+            startup by ``START_TRADER.sh``,
             see also ``connect()`` below). If this client is ever extended
             to place orders, the reconnect path MUST be revisited — repeating
             an order command after a transient disconnect could double-fill.

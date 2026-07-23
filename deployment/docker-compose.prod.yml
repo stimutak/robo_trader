@@ -38,6 +38,23 @@ services:
     ports:
       - "5555:5555"
     environment:
+      # Monitoring scaffolding still loads the paper-only runtime contract.
+      # Require the operator to name the account, namespace, ledger, models,
+      # and build instead of presenting fabricated deployment identity.
+      - ENVIRONMENT=${ENVIRONMENT:?Set ENVIRONMENT for the dashboard}
+      - EXECUTION_MODE=paper
+      - TRADING_MODE=paper
+      - IBKR_HOST=${IBKR_HOST:?Set IBKR_HOST for the supervised paper Gateway}
+      - IBKR_PORT=4002
+      - IBKR_READONLY=true
+      - IBKR_CLIENT_ID=${IBKR_CLIENT_ID:?Set a dedicated dashboard IBKR_CLIENT_ID}
+      - IBKR_ACCOUNT=${IBKR_ACCOUNT:?Set the expected paper IBKR_ACCOUNT}
+      - IBKR_APPROVED_ACCOUNTS=${IBKR_APPROVED_ACCOUNTS:?Allowlist the paper IBKR_ACCOUNT}
+      - IBKR_ACCOUNT_TYPE=paper
+      - RT_STATE_NAMESPACE=${RT_STATE_NAMESPACE:?Set RT_STATE_NAMESPACE to paper}
+      - RT_DB_PATH=${RT_DB_PATH:?Set the container paper ledger path}
+      - MODEL_ARTIFACT_SET=${MODEL_ARTIFACT_SET:?Identify the paper model artifact set}
+      - BUILD_ID=${BUILD_ID:?Identify the rendered build}
       - DASH_PORT=5555
       - WEBSOCKET_URL=ws://websocket:8765
       - LOG_LEVEL=WARNING
@@ -70,11 +87,15 @@ services:
   trader:
     image: robo_trader:latest
     container_name: robo_trader_main_prod
-    command: python3 -m robo_trader.runner_async --symbols ${TRADING_SYMBOLS}
+    profiles: ["unsupported-trader"]
+    command: ["sh", "-c", "echo 'DISABLED: container trader startup is not yet supported' >&2; exit 2"]
     environment:
-      - TRADING_MODE=live
+      # PR-01: production-like deployment remains paper/read-only only.
+      - EXECUTION_MODE=paper
+      - TRADING_MODE=paper
       - IBKR_HOST=${IBKR_HOST}
-      - IBKR_PORT=${IBKR_PORT:-4001}  # Live trading port
+      - IBKR_PORT=${IBKR_PORT:-4002}
+      - IBKR_READONLY=true
       - IBKR_CLIENT_ID=${IBKR_CLIENT_ID:-1}
       - LOG_LEVEL=WARNING
       - WEBSOCKET_URL=ws://websocket:8765
@@ -98,7 +119,7 @@ services:
         condition: service_healthy
     networks:
       - robo_trader_network
-    restart: always
+    restart: "no"
     deploy:
       resources:
         limits:

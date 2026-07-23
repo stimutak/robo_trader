@@ -3,26 +3,48 @@
 # RoboTrader Startup Script
 #
 # This script ensures clean startup by:
-# 1. Starting Gateway via IBC if not running
-# 2. Killing all existing Python trader processes
+# 1. Gracefully stopping the existing trading runner
+# 2. Starting Gateway via IBC if not running
 # 3. Cleaning up zombie CLOSE_WAIT connections
 # 4. Automatically restarting Gateway if zombies block API
-# 5. Starting the trading system
+# 5. Running the preflight safety gate
+# 6. Replacing monitoring processes and starting the trading system
 #
 # Usage:
 #   ./START_TRADER.sh                    # Start with default symbols
 #   ./START_TRADER.sh "AAPL,NVDA"        # Start with custom symbols
 #
 # Gateway Management:
-#   ./scripts/start_gateway.sh           # Start Gateway via IBC
-#   python3 scripts/gateway_manager.py status  # Check Gateway status
+#   ./START_TRADER.sh                         # Supervised lifecycle entry
+#   python3 scripts/gateway_manager.py status # Read-only diagnostics
 #
 
 set -e
 
-PORT=4002
+PORT="${IBKR_PORT:-}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MAX_GATEWAY_RETRIES=3
+
+# Serialize every manual/watchdog invocation and internal Gateway recovery
+# before any path can quiesce the runner or manipulate Gateway. On the first
+# invocation Python acquires the atomic advisory lock and execs this script,
+# leaving FD 200 owned by this Bash process for its complete lifetime.
+LOCK_PYTHON=$(command -v python3 2>/dev/null || true)
+if [ -z "$LOCK_PYTHON" ]; then
+    echo "FATAL: python3 is required for the atomic runtime lifecycle lock." >&2
+    exit 75
+fi
+if [ -z "${ROBOTRADER_RUNTIME_LIFECYCLE_FD:-}" ]; then
+    exec "$LOCK_PYTHON" "$SCRIPT_DIR/robo_trader/runtime_lifecycle_lock.py" \
+        --exec-launcher "$SCRIPT_DIR/START_TRADER.sh" -- "$@"
+    echo "FATAL: could not enter the atomic runtime lifecycle wrapper." >&2
+    exit 75
+fi
+if ! "$LOCK_PYTHON" "$SCRIPT_DIR/robo_trader/runtime_lifecycle_lock.py" \
+    --validate-fd "$ROBOTRADER_RUNTIME_LIFECYCLE_FD"; then
+    echo "FATAL: inherited runtime lifecycle lock validation failed." >&2
+    exit 75
+fi
 
 # Resolve lsof to an absolute path and refuse to run without it.
 # The watchdog launches us under launchd, whose PATH omits /usr/sbin (where lsof
@@ -41,12 +63,22 @@ fi
 
 # Load defaults from .env if present
 if [ -f "$SCRIPT_DIR/.env" ]; then
-    # Source only SYMBOLS to avoid polluting environment
-    SYMBOLS=$(grep "^SYMBOLS=" "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+    # Read only the startup values we need instead of sourcing arbitrary shell.
+    SYMBOLS=$(grep "^SYMBOLS=" "$SCRIPT_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '"' | tr -d "'" | xargs)
+    ENV_IBKR_PORT=$(grep "^IBKR_PORT=" "$SCRIPT_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '"' | tr -d "'" | xargs)
 fi
 
 # Fallback default if .env doesn't have SYMBOLS
 SYMBOLS="${SYMBOLS:-AAPL,NVDA,TSLA}"
+PORT="${PORT:-${ENV_IBKR_PORT:-4002}}"
+case "$PORT" in
+    4002)
+        ;;
+    *)
+        echo "FATAL: supervised paper remediation requires IB Gateway port 4002; got '$PORT'." >&2
+        exit 4
+        ;;
+esac
 
 # Parse arguments (override .env if provided)
 # --force="<reason>" is forwarded to the preflight gate so the documented
@@ -70,31 +102,156 @@ echo "RoboTrader Startup Script"
 echo "=========================================="
 echo ""
 
+validate_ibc_safety_config() {
+    local config_path="$1"
+    local counts
+    local readonly_count
+    local readonly_valid
+    local trading_mode_count
+    local trading_mode_valid
+
+    # Count every active assignment for each safety-critical key, not merely
+    # the expected value. This rejects duplicate-good and good-plus-conflicting
+    # entries instead of relying on whichever duplicate IBC happens to honor.
+    counts=$(awk '
+        function trim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            return value
+        }
+        BEGIN {
+            readonly_count = 0
+            readonly_valid = 0
+            trading_mode_count = 0
+            trading_mode_valid = 0
+        }
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            if (line ~ /^[[:space:]]*([#;]|$)/) {
+                next
+            }
+            separator = index(line, "=")
+            if (separator == 0) {
+                next
+            }
+            key = tolower(trim(substr(line, 1, separator - 1)))
+            value = tolower(trim(substr(line, separator + 1)))
+            if (key == "readonlyapi") {
+                readonly_count++
+                if (value == "yes") {
+                    readonly_valid++
+                }
+            } else if (key == "tradingmode") {
+                trading_mode_count++
+                if (value == "paper") {
+                    trading_mode_valid++
+                }
+            }
+        }
+        END {
+            print readonly_count, readonly_valid, trading_mode_count, trading_mode_valid
+        }
+    ' "$config_path") || return 1
+
+    read -r readonly_count readonly_valid trading_mode_count trading_mode_valid <<< "$counts"
+    if [ "$readonly_count" -ne 1 ] || [ "$readonly_valid" -ne 1 ]; then
+        echo "IBC config must contain exactly one active ReadOnlyApi=yes assignment; found ${readonly_count:-0} ReadOnlyApi assignment(s)."
+        return 1
+    fi
+    if [ "$trading_mode_count" -ne 1 ] || [ "$trading_mode_valid" -ne 1 ]; then
+        echo "IBC config must contain exactly one active TradingMode=paper assignment; found ${trading_mode_count:-0} TradingMode assignment(s)."
+        return 1
+    fi
+}
+
 # SECURITY: Verify Gateway-side read-only enforcement is configured.
 # RoboTrader relies on IBC's ReadOnlyApi=yes as a primary safety net against
 # any code path (intentional or accidental) that might attempt to submit
 # live orders. If the active config has been modified to permit writes, abort.
 IBC_INI="${SCRIPT_DIR}/config/ibc/config.ini"
-# NEW-IB-H1.1: Use anchored, case-insensitive regex with end-anchor.
-# - Old grep ('^ReadOnlyApi=yes') matched 'ReadOnlyApi=yesno' (no end anchor)
-#   and rejected 'ReadOnlyApi=Yes' (case-sensitive) even though IBC honors it.
-# - The -E + -i flags + start/end anchors + tolerated whitespace fix all three.
-if [ -f "$IBC_INI" ] && ! grep -Eqi '^[[:space:]]*readonlyapi[[:space:]]*=[[:space:]]*yes[[:space:]]*$' "$IBC_INI"; then
-    echo "FATAL: IBC config has ReadOnlyApi != yes." >&2
-    echo "       RoboTrader requires Gateway-side read-only enforcement." >&2
+# Normalize key/value case and whitespace, then require exactly one active
+# assignment for each safety setting. A duplicate expected value is ambiguous
+# just like an explicitly conflicting value, so both fail closed.
+if [ ! -f "$IBC_INI" ]; then
+    echo "FATAL: IBC config not found." >&2
     echo "       File: $IBC_INI" >&2
-    echo "       To fix: set 'ReadOnlyApi=yes' and re-run." >&2
+    echo "       Copy config/ibc/config.ini.template and configure the paper account first." >&2
+    exit 4
+fi
+IBC_VALIDATION_ERROR=""
+if ! IBC_VALIDATION_ERROR="$(validate_ibc_safety_config "$IBC_INI")"; then
+    echo "FATAL: invalid IBC paper/read-only safety configuration." >&2
+    echo "       $IBC_VALIDATION_ERROR" >&2
+    echo "       File: $IBC_INI" >&2
+    echo "       Require one ReadOnlyApi=yes and one TradingMode=paper assignment." >&2
     exit 4
 fi
 
+# PR-01 containment contract. Export both the canonical variables and the
+# temporary legacy alias so every child observes the same paper/read-only
+# identity. load_dotenv() does not override these exported values.
+export EXECUTION_MODE="paper"
+export TRADING_MODE="paper"
+export IBKR_PORT="$PORT"
+export IBKR_READONLY="true"
 
-# Step 1: Kill existing Python processes first
-echo "1. Killing existing trader processes..."
-pkill -9 -f "runner_async" 2>/dev/null && echo "   ✓ Killed runner_async" || echo "   ✓ No runner_async running"
-pkill -9 -f "app.py" 2>/dev/null && echo "   ✓ Killed dashboard" || echo "   ✓ No dashboard running"
-pkill -9 -f "websocket_server" 2>/dev/null && echo "   ✓ Killed websocket_server" || echo "   ✓ No websocket_server running"
-sleep 2
-echo ""
+
+# Stop a matching process group gracefully, then fail closed if even SIGKILL
+# cannot remove it. The bounded TERM wait lets runner teardown disconnect its
+# persistent IBKR socket before any Gateway/socket/zombie inspection occurs.
+stop_processes_gracefully() {
+    local label="$1"
+    local pattern="$2"
+    local wait_seconds="${3:-10}"
+    local pids
+    local remaining
+    local waited=0
+
+    pids=$(pgrep -f "$pattern" 2>/dev/null || true)
+    if [ -z "$pids" ]; then
+        echo "   ✓ No $label running"
+        return 0
+    fi
+
+    echo "   Requesting graceful stop for $label (SIGTERM)..."
+    for pid in $pids; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+
+    while [ "$waited" -lt "$wait_seconds" ]; do
+        remaining=$(pgrep -f "$pattern" 2>/dev/null || true)
+        if [ -z "$remaining" ]; then
+            echo "   ✓ Stopped $label gracefully"
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    remaining=$(pgrep -f "$pattern" 2>/dev/null || true)
+    if [ -z "$remaining" ]; then
+        echo "   ✓ Stopped $label gracefully"
+        return 0
+    fi
+
+    if [ -n "$remaining" ]; then
+        echo "   ⚠️  $label did not stop within ${wait_seconds}s; forcing SIGKILL"
+        for pid in $remaining; do
+            kill -KILL "$pid" 2>/dev/null || true
+        done
+        sleep 1
+    fi
+
+    remaining=$(pgrep -f "$pattern" 2>/dev/null || true)
+    if [ -n "$remaining" ]; then
+        echo "FATAL: unable to stop $label process(es): $remaining" >&2
+        return 1
+    fi
+
+    echo "   ✓ Forced stop complete for $label"
+}
+
 
 # Function to start Gateway via IBC
 start_gateway() {
@@ -154,7 +311,8 @@ start_gateway() {
 
     # Launch Gateway inline (blocks until Gateway exits or we Ctrl+C)
     cd "$IBC_PATH"
-    ./gatewaystartmacos.sh -inline &
+    # Long-lived descendants must not inherit the launcher's lifecycle lock.
+    ./gatewaystartmacos.sh -inline 200>&- &
     IBC_PID=$!
 
     # Wait for Gateway to start and API port to open
@@ -224,6 +382,15 @@ rotate_log() {
         mv -f "$f" "$f.1" || true
     fi
 }
+
+# Step 1: Quiesce the only process allowed to hold the trading connection.
+# This MUST precede Gateway status, LISTEN, CLOSE_WAIT, and preflight checks:
+# the old persistent runner can otherwise make healthy sockets look stale or
+# continue trading after a safety-gate BLOCK. Keep dashboard/WebSocket alive so
+# operators retain monitoring while Gateway recovery and preflight run.
+echo "1. Stopping existing trading runner..."
+stop_processes_gracefully "runner_async" "robo_trader[./]runner_async"
+echo ""
 
 # Step 2: Check/Start Gateway with retry logic
 echo "2. Checking Gateway status..."
@@ -326,7 +493,7 @@ if [ "$API_CONNECTED" = false ]; then
     echo "Manual troubleshooting:"
     echo "  1. Check Gateway is fully started (shows 'IB Gateway - READY')"
     echo "  2. Verify 2FA was completed on your phone"
-    echo "  3. Try: python3 scripts/gateway_manager.py restart"
+    echo "  3. Re-run: ./START_TRADER.sh"
     echo ""
     exit 1
 fi
@@ -420,13 +587,21 @@ case "$PREFLIGHT_RC" in
         echo "=========================================="
         echo ""
         echo "Preflight reported blocking issues above (exit code $PREFLIGHT_RC)."
-        echo "Resolve each one and re-run ./START_TRADER.sh, or"
-        echo "bypass with: $PYTHON scripts/preflight_check.py --force \"<reason>\""
-        echo "(then re-run ./START_TRADER.sh — bypass is per-invocation, not persistent)"
+        echo "Resolve each one and re-run ./START_TRADER.sh, or use the audited"
+        echo "single-invocation bypass: ./START_TRADER.sh --force=\"<reason>\""
+        echo "(the bypass is per invocation and does not persist)"
         echo ""
         exit 1
         ;;
 esac
+echo ""
+
+# Replace monitoring only after a preflight pass or audited bypass. A BLOCK
+# exits above with the runner stopped but the existing dashboard/WebSocket
+# still available for diagnosis.
+echo "4.6. Replacing monitoring processes..."
+stop_processes_gracefully "dashboard" '(^|[/[:space:]])app[.]py([[:space:]]|$)'
+stop_processes_gracefully "websocket_server" "robo_trader[./]websocket_server"
 echo ""
 
 # Step 5: Start dashboard (includes WebSocket server)
@@ -438,7 +613,7 @@ export DASH_PORT=5555
 # generation, then truncate on each start so these can't grow unbounded
 # across restarts while still preserving the prior attempt's crash output.
 rotate_log "$SCRIPT_DIR/dashboard_stdout.log"
-$PYTHON app.py > "$SCRIPT_DIR/dashboard_stdout.log" 2>&1 &
+$PYTHON app.py > "$SCRIPT_DIR/dashboard_stdout.log" 2>&1 200>&- &
 DASH_PID=$!
 sleep 2
 
@@ -465,7 +640,7 @@ export LOG_FILE="$SCRIPT_DIR/robo_trader.log"
 # market hours the runner now sleeps until open (extended hours still
 # covered by ENABLE_EXTENDED_HOURS via is_trading_allowed).
 rotate_log "$SCRIPT_DIR/runner_stdout.log"
-$PYTHON -m robo_trader.runner_async --symbols "$SYMBOLS" > "$SCRIPT_DIR/runner_stdout.log" 2>&1 &
+$PYTHON -m robo_trader.runner_async --symbols "$SYMBOLS" > "$SCRIPT_DIR/runner_stdout.log" 2>&1 200>&- &
 TRADER_PID=$!
 
 echo "   ✓ Trading system started (PID: $TRADER_PID)"
@@ -490,9 +665,9 @@ if ps -p $TRADER_PID > /dev/null; then
     echo "View dashboard: http://localhost:5555"
     echo "WebSocket: ws://localhost:8765"
     echo ""
-    echo "To stop:"
-    echo "  pkill -9 -f runner_async"
-    echo "  pkill -9 -f app.py"
+    echo "To stop gracefully:"
+    echo "  pkill -TERM -f 'robo_trader[./]runner_async'"
+    echo "  pkill -TERM -f '(^|[/[:space:]])app[.]py([[:space:]]|$)'"
     echo ""
 
     # Step 8: Verify the launchd watchdog is loaded.

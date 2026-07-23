@@ -201,7 +201,7 @@ class SecureConfig:
         config["port"] = int(port_str)
 
         # Validate port for mode
-        paper_ports = [7497, 4002]
+        paper_ports = [4002]
         live_ports = [7496, 4001]
         if config["port"] in paper_ports:
             logger.info(f"Using paper trading port: {config['port']}")

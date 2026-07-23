@@ -41,6 +41,23 @@ services:
     ports:
       - "5555:5555"
     environment:
+      # The dashboard imports the same fail-closed runtime contract as the
+      # runner. Identity-bearing values must come from the operator; Compose
+      # must never invent an account or ledger.
+      - ENVIRONMENT=${ENVIRONMENT:?Set ENVIRONMENT for the dashboard}
+      - EXECUTION_MODE=paper
+      - TRADING_MODE=paper
+      - IBKR_HOST=${IBKR_HOST:?Set IBKR_HOST for the supervised paper Gateway}
+      - IBKR_PORT=4002
+      - IBKR_READONLY=true
+      - IBKR_CLIENT_ID=${IBKR_CLIENT_ID:?Set a dedicated dashboard IBKR_CLIENT_ID}
+      - IBKR_ACCOUNT=${IBKR_ACCOUNT:?Set the expected paper IBKR_ACCOUNT}
+      - IBKR_APPROVED_ACCOUNTS=${IBKR_APPROVED_ACCOUNTS:?Allowlist the paper IBKR_ACCOUNT}
+      - IBKR_ACCOUNT_TYPE=paper
+      - RT_STATE_NAMESPACE=${RT_STATE_NAMESPACE:?Set RT_STATE_NAMESPACE to paper}
+      - RT_DB_PATH=${RT_DB_PATH:?Set the container paper ledger path}
+      - MODEL_ARTIFACT_SET=${MODEL_ARTIFACT_SET:?Identify the paper model artifact set}
+      - BUILD_ID=${BUILD_ID:?Identify the rendered build}
       - DASH_PORT=5555
       - WEBSOCKET_URL=ws://websocket:8765
       - LOG_LEVEL=INFO
@@ -73,11 +90,14 @@ services:
   robo-trader:
     build: .
     container_name: robo_trader_main
-    command: python3 -m robo_trader.runner_async --symbols ${TRADING_SYMBOLS:-AAPL,NVDA,TSLA}
+    profiles: ["unsupported-trader"]
+    command: ["sh", "-c", "echo 'DISABLED: container trader startup is not yet supported' >&2; exit 2"]
     environment:
-      - TRADING_MODE=${TRADING_MODE:-paper}
+      - EXECUTION_MODE=paper
+      - TRADING_MODE=paper
+      - IBKR_READONLY=true
       - IBKR_HOST=${IBKR_HOST:-127.0.0.1}
-      - IBKR_PORT=${IBKR_PORT:-7497}
+      - IBKR_PORT=${IBKR_PORT:-4002}
       - IBKR_CLIENT_ID=${IBKR_CLIENT_ID:-1}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - WEBSOCKET_URL=ws://websocket:8765
@@ -93,7 +113,7 @@ services:
       - dashboard
     networks:
       - robo_trader_network
-    restart: unless-stopped
+    restart: "no"
     deploy:
       resources:
         limits:

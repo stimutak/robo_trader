@@ -1108,15 +1108,12 @@ class AsyncRunner:
                     logger.error(
                         "The dashboard or another process may have created a zombie connection."
                     )
-                    logger.error("Please restart Gateway manually and try again:")
-                    logger.error("  1. Kill this process: Ctrl+C")
-                    logger.error(
-                        "  2. Restart Gateway: python3 scripts/gateway_manager.py restart --paper"
-                    )
-                    logger.error("  3. Complete 2FA on your phone")
-                    logger.error("  4. Run: ./START_TRADER.sh")
+                    logger.error("Restore the supervised stack:")
+                    logger.error("  1. Stop this process with Ctrl+C")
+                    logger.error("  2. Run: ./START_TRADER.sh")
+                    logger.error("  3. Complete IBKR Mobile 2FA if prompted")
                     raise RuntimeError(
-                        "Gateway-owned zombie connections detected. Manual Gateway restart required."
+                        "Gateway-owned zombie connections detected; supervised restart required."
                     )
         else:
             logger.info("✓ No zombie connections found")
@@ -1167,6 +1164,7 @@ class AsyncRunner:
                 circuit_breaker_config=circuit_config,
                 ssl_mode=self.cfg.ibkr.ssl_mode,
             )
+            await self._validate_connected_managed_account(self.ib)
             logger.info("✓ IBKR connection established successfully with robust connection")
             logger.info("=" * 60)
 
@@ -1177,6 +1175,19 @@ class AsyncRunner:
             )
 
         except ConnectionError as e:
+            rejected_client = getattr(self, "ib", None)
+            if rejected_client is not None:
+                try:
+                    stop_result = rejected_client.stop()
+                    if asyncio.iscoroutine(stop_result):
+                        await stop_result
+                except Exception:
+                    logger.warning(
+                        "Failed to stop rejected IBKR client during account containment",
+                        exc_info=True,
+                    )
+                finally:
+                    self.ib = None
             logger.error(f"❌ IBKR CONNECTION FAILED: {e}")
             logger.error("Cannot proceed without IBKR connection")
             sys.exit(1)
@@ -4178,21 +4189,84 @@ class AsyncRunner:
             await _cleanup(client)
             raise ConnectionError("is_connected never returned True after 2s+ stabilization")
 
-        # Get accounts for logging - connect() returns bool, accounts come from get_accounts()
         try:
-            accounts = await client.get_accounts()
+            await self._validate_connected_managed_account(client)
         except Exception:
-            accounts = []
+            await _cleanup(client)
+            raise
 
         self.subprocess_client = client
         self.ib = client
         logger.info(
-            "event=connection_initialized client_id=%s accounts=%s",
+            "event=connection_initialized client_id=%s managed_account_count=1",
             client_id,
-            accounts,
         )
 
         await self._attach_health_monitor()
+
+    @staticmethod
+    def _masked_account_identifier(account: object) -> str:
+        """Return a stable operator alias without exposing a broker account ID."""
+        normalized = str(account or "").strip()
+        if len(normalized) <= 4:
+            return "****"
+        return f"***{normalized[-4:]}"
+
+    async def _validate_connected_managed_account(self, client) -> list[str]:
+        """Fail closed unless Gateway exposes exactly the configured paper account.
+
+        The runtime contract validates the configured account and allowlist, but
+        those are self-declared values.  This check binds that contract to the
+        account identity reported by the connected Gateway.  It deliberately
+        rejects empty, additional, and ambiguous managed-account sets until the
+        later broker-reconciliation phase explicitly supports them.
+        """
+        expected_account = str(getattr(self.cfg.ibkr, "account", "") or "").strip()
+        expected_alias = self._masked_account_identifier(expected_account)
+        if not expected_account:
+            logger.critical(
+                "event=managed_account_validation_failed reason=missing_configured_account"
+            )
+            raise ConnectionError(
+                "Connected IBKR account cannot be verified: configured account is missing"
+            )
+
+        try:
+            reported_accounts = await client.get_accounts()
+        except Exception as exc:
+            logger.critical(
+                "event=managed_account_validation_failed reason=account_fetch_error "
+                "exception_type=%s",
+                type(exc).__name__,
+            )
+            raise ConnectionError(
+                "Connected IBKR account cannot be verified: managed-account query failed"
+            ) from None
+
+        normalized_accounts = [
+            str(account).strip() for account in (reported_accounts or []) if str(account).strip()
+        ]
+        if len(normalized_accounts) != 1 or normalized_accounts[0] != expected_account:
+            connected_aliases = [
+                self._masked_account_identifier(account) for account in normalized_accounts
+            ]
+            logger.critical(
+                "event=managed_account_validation_failed reason=identity_mismatch "
+                "expected_alias=%s connected_count=%s connected_aliases=%s",
+                expected_alias,
+                len(normalized_accounts),
+                connected_aliases,
+            )
+            raise ConnectionError(
+                "Connected IBKR managed-account identity does not match the "
+                "approved single-account runtime contract"
+            )
+
+        logger.info(
+            "event=managed_account_validated account_alias=%s connected_count=1",
+            expected_alias,
+        )
+        return normalized_accounts
 
     async def _attach_health_monitor(self) -> None:
         """Wire ConnectionHealth onto an existing self.ib.
@@ -4929,7 +5003,7 @@ def main() -> None:
     parser.add_argument(
         "--confirm-live",
         action="store_true",
-        help="Required confirmation flag for live mode",
+        help="Disabled compatibility flag; live trading is unavailable during remediation",
     )
     parser.add_argument("--sma-fast", type=int, default=10, help="Fast SMA window")
     parser.add_argument("--sma-slow", type=int, default=20, help="Slow SMA window")
@@ -4994,8 +5068,13 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config()
-    if cfg.execution.mode == "live" and not args.confirm_live:
-        raise SystemExit("Refusing to run in live mode without --confirm-live")
+    if args.confirm_live:
+        raise SystemExit(
+            "Live trading capability is disabled during remediation; "
+            "--confirm-live cannot enable it."
+        )
+    if cfg.execution.mode.value != "paper" or not cfg.ibkr.readonly:
+        raise SystemExit("Refusing to run outside the validated paper/read-only contract")
 
     # Check for zombie connections before starting
     # Gateway-owned zombies will be handled in setup() by triggering Gateway restart

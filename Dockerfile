@@ -61,7 +61,11 @@ ENV PYTHONPATH=/app:$PYTHONPATH
 ENV PYTHONUNBUFFERED=1
 
 # Default environment variables
-ENV TRADING_MODE=paper \
+ENV EXECUTION_MODE=paper \
+    TRADING_MODE=paper \
+    IBKR_HOST=127.0.0.1 \
+    IBKR_PORT=4002 \
+    IBKR_READONLY=true \
     LOG_LEVEL=INFO \
     DASH_PORT=5555 \
     WEBSOCKET_PORT=8765 \
@@ -74,5 +78,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
 # Set entrypoint
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
-# Default command (can be overridden)
-CMD ["python3", "-m", "robo_trader.runner_async"]
+# PR-01 containment: container order-writing topology is unsupported until the
+# paper-container and deployment PRs provide the same preflight/supervision
+# contract as START_TRADER.sh.
+CMD ["sh", "-c", "echo 'DISABLED: container trader startup is not yet supported' >&2; exit 2"]

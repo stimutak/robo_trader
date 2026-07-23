@@ -20,6 +20,7 @@ def make_runner_skeleton_for_init():
     runner.cfg.ibkr.host = "127.0.0.1"
     runner.cfg.ibkr.port = 4002
     runner.cfg.ibkr.client_id = 1
+    runner.cfg.ibkr.account = "DU_TEST_PAPER"
     runner._client_id = 1
     runner.portfolio_id = "default"
     runner.ib = None
@@ -38,7 +39,7 @@ async def test_initialize_connection_creates_health_module():
     fake_client.start = AsyncMock()
     fake_client.connect = AsyncMock(return_value=True)  # bool, not dict (post Task 6 fix)
     fake_client.is_connected = True  # @property on real client — plain attr in mock
-    fake_client.get_accounts = AsyncMock(return_value=[])
+    fake_client.get_accounts = AsyncMock(return_value=["DU_TEST_PAPER"])
     fake_client.ping = AsyncMock(return_value=True)
     fake_client.stop = AsyncMock()
 
@@ -71,7 +72,7 @@ async def test_initialize_connection_replaces_existing_health_module():
     fake_client.start = AsyncMock()
     fake_client.connect = AsyncMock(return_value=True)
     fake_client.is_connected = True
-    fake_client.get_accounts = AsyncMock(return_value=[])
+    fake_client.get_accounts = AsyncMock(return_value=["DU_TEST_PAPER"])
     fake_client.ping = AsyncMock(return_value=True)
     fake_client.stop = AsyncMock()
 

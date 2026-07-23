@@ -5,11 +5,14 @@ This module provides a comprehensive configuration system for the equity trading
 with schema validation, environment-specific settings, and equity-specific constraints.
 """
 
+import hashlib
+import json
 import os
+import subprocess
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Mapping, Optional
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -19,6 +22,267 @@ from .utils.config_validator import ConfigValidator, EnhancedTradingConfig
 from .utils.secure_config import ConfigValidationError, SecureConfig
 
 logger = get_logger(__name__)
+
+
+PAPER_PORTS = frozenset({4002})
+LIVE_PORTS = frozenset({7496, 4001})
+PAPER_ONLY_EXECUTION_SOURCE = "paper_simulator"
+BACKTEST_EXECUTION_SOURCE = "offline_backtest"
+
+
+@dataclass(frozen=True)
+class RuntimeContract:
+    """Validated, non-secret runtime identity for the containment phase.
+
+    Live order placement is intentionally unavailable.  This contract is
+    shared by the runner and dashboard so mode/port/read-only status cannot
+    drift between environment aliases or be presented as a hard-coded value.
+    """
+
+    environment: str
+    execution_mode: str
+    execution_source: str
+    ibkr_host: str
+    ibkr_port: int
+    ibkr_readonly: bool
+    database_path: str
+    account_alias: Optional[str]
+    account_type: str
+    model_artifact_set: str
+    build_id: str
+    state_namespace: str
+
+    @property
+    def database_identity(self) -> str:
+        """Return a stable, non-sensitive identity for the configured ledger."""
+        resolved = str(Path(self.database_path).expanduser().resolve(strict=False))
+        digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
+        return f"{self.state_namespace}:{digest}"
+
+    @property
+    def fingerprint(self) -> str:
+        payload = json.dumps(self.public_dict(include_fingerprint=False), sort_keys=True)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+    def public_dict(self, *, include_fingerprint: bool = True) -> Dict[str, object]:
+        result: Dict[str, object] = {
+            "environment": self.environment,
+            "mode": self.execution_mode,
+            "execution_source": self.execution_source,
+            "ibkr_host": self.ibkr_host,
+            "ibkr_port": self.ibkr_port,
+            "ibkr_readonly": self.ibkr_readonly,
+            "database_identity": self.database_identity,
+            "account_alias": self.account_alias,
+            "account_type": self.account_type,
+            "model_artifact_set": self.model_artifact_set,
+            "build_id": self.build_id,
+            "state_namespace": self.state_namespace,
+            "live_capability": "disabled",
+        }
+        if include_fingerprint:
+            result["fingerprint"] = self.fingerprint
+        return result
+
+
+def _normalized_value(env: Mapping[str, str], name: str, default: str) -> str:
+    value = env.get(name, default)
+    return str(value).strip().lower()
+
+
+def _masked_account_alias(account: Optional[str]) -> Optional[str]:
+    if not account:
+        return None
+    clean = account.strip()
+    if not clean:
+        return None
+    return f"***{clean[-4:]}" if len(clean) > 4 else "***"
+
+
+def _build_identifier(env: Mapping[str, str]) -> str:
+    """Resolve a non-secret build identity without trusting the working directory."""
+    configured = str(env.get("BUILD_ID") or env.get("GIT_SHA") or "").strip()
+    if configured:
+        return configured[:64]
+
+    project_root = Path(__file__).resolve().parents[1]
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_root), "rev-parse", "--short=12", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=True,
+        )
+        if result.stdout.strip():
+            return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "unversioned"
+
+
+def _model_artifact_identity(env: Mapping[str, str]) -> str:
+    """Resolve the operator-defined model set, clearly marking local defaults."""
+    configured = str(env.get("MODEL_ARTIFACT_SET", "")).strip()
+    if configured:
+        return configured[:128]
+    registry = str(env.get("ML_MODEL_REGISTRY_PATH", "model_registry")).strip()
+    resolved = str(Path(registry).expanduser().resolve(strict=False))
+    digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
+    return f"unversioned:{digest}"
+
+
+def _enabled(env: Mapping[str, str], name: str) -> bool:
+    return _normalized_value(env, name, "false") in {"true", "1", "yes", "on"}
+
+
+def load_runtime_contract_from_env(
+    environ: Optional[Mapping[str, str]] = None,
+) -> RuntimeContract:
+    """Load and fail-closed validate the current paper-only runtime contract.
+
+    ``EXECUTION_MODE`` and ``ENVIRONMENT`` are canonical.  The legacy
+    ``TRADING_MODE`` and ``TRADING_ENV`` aliases may remain during migration,
+    but a conflict is fatal.  Live execution is rejected unconditionally until
+    the dedicated live-adapter PR introduces a separately reviewed capability.
+    """
+
+    env = os.environ if environ is None else environ
+
+    execution_mode = _normalized_value(env, "EXECUTION_MODE", "paper")
+    legacy_mode = env.get("TRADING_MODE")
+    if legacy_mode is not None and legacy_mode.strip().lower() != execution_mode:
+        raise ConfigValidationError(
+            "Conflicting execution modes: EXECUTION_MODE and TRADING_MODE must match."
+        )
+    if execution_mode not in {TradingMode.PAPER.value, TradingMode.BACKTEST.value}:
+        raise ConfigValidationError(
+            "Live trading capability is disabled during remediation. "
+            "Set EXECUTION_MODE=paper for the supervised runtime or backtest "
+            "for offline evaluation."
+        )
+
+    environment = _normalized_value(env, "ENVIRONMENT", "dev")
+    legacy_environment = env.get("TRADING_ENV")
+    if legacy_environment is not None:
+        normalized_legacy = legacy_environment.strip().lower()
+        aliases = {"development": "dev", "prod": "production"}
+        normalized_legacy = aliases.get(normalized_legacy, normalized_legacy)
+        normalized_environment = aliases.get(environment, environment)
+        if normalized_legacy != normalized_environment:
+            raise ConfigValidationError(
+                "Conflicting environments: ENVIRONMENT and TRADING_ENV must match."
+            )
+        environment = normalized_environment
+
+    port_raw = str(env.get("IBKR_PORT", "4002")).strip()
+    try:
+        ibkr_port = int(port_raw)
+    except ValueError as exc:
+        raise ConfigValidationError(f"IBKR_PORT must be an integer, got {port_raw!r}") from exc
+    if ibkr_port not in PAPER_PORTS:
+        raise ConfigValidationError(
+            f"Paper-only remediation requires an IBKR paper port {sorted(PAPER_PORTS)}, "
+            f"got {ibkr_port}."
+        )
+
+    readonly_raw = _normalized_value(env, "IBKR_READONLY", "true")
+    ibkr_readonly = readonly_raw in {"true", "1", "yes", "on"}
+    if not ibkr_readonly:
+        raise ConfigValidationError(
+            "Paper-only remediation requires IBKR_READONLY=true and IBC ReadOnlyApi=yes."
+        )
+
+    account = str(env.get("IBKR_ACCOUNT", "")).strip()
+    account_type = _normalized_value(
+        env,
+        "IBKR_ACCOUNT_TYPE",
+        "paper" if execution_mode == TradingMode.PAPER.value else "offline",
+    )
+    if execution_mode == TradingMode.PAPER.value:
+        if not account:
+            raise ConfigValidationError(
+                "Supervised paper runtime requires IBKR_ACCOUNT to identify the expected account."
+            )
+        if not account.upper().startswith("DU"):
+            raise ConfigValidationError(
+                "Supervised paper runtime currently supports only IBKR paper account "
+                "identifiers with the DU prefix; live-format U accounts cannot "
+                "self-declare as paper."
+            )
+        approved_accounts = {
+            item.strip()
+            for item in str(env.get("IBKR_APPROVED_ACCOUNTS", "")).split(",")
+            if item.strip()
+        }
+        if account not in approved_accounts:
+            raise ConfigValidationError(
+                "IBKR_ACCOUNT is not present in IBKR_APPROVED_ACCOUNTS; "
+                "refusing an unapproved broker account."
+            )
+        if account_type != "paper":
+            raise ConfigValidationError(
+                "Supervised paper runtime requires IBKR_ACCOUNT_TYPE=paper."
+            )
+
+    database_path = str(env.get("RT_DB_PATH", "trading_data.db")).strip()
+    if not database_path:
+        raise ConfigValidationError("RT_DB_PATH cannot be empty.")
+    state_namespace = _normalized_value(env, "RT_STATE_NAMESPACE", execution_mode)
+    if state_namespace != execution_mode:
+        raise ConfigValidationError(
+            "RT_STATE_NAMESPACE must match EXECUTION_MODE so paper/backtest state cannot collide."
+        )
+    live_database_path = str(env.get("LIVE_RT_DB_PATH", "")).strip()
+    if live_database_path:
+        paper_resolved = Path(database_path).expanduser().resolve(strict=False)
+        live_resolved = Path(live_database_path).expanduser().resolve(strict=False)
+        if paper_resolved == live_resolved:
+            raise ConfigValidationError(
+                "RT_DB_PATH and LIVE_RT_DB_PATH must identify different ledgers."
+            )
+
+    build_id = _build_identifier(env)
+    model_artifact_set = _model_artifact_identity(env)
+    if environment == Environment.PRODUCTION.value:
+        missing_gates = [
+            name
+            for name in (
+                "DASH_AUTH_ENABLED",
+                "MODEL_SIGNING_REQUIRED",
+                "MONITORING_ENABLE_ALERTS",
+                "BACKUP_READY",
+            )
+            if not _enabled(env, name)
+        ]
+        if missing_gates:
+            raise ConfigValidationError(
+                "Production-like runtime is blocked until these readiness gates are true: "
+                + ", ".join(missing_gates)
+            )
+        if build_id == "unversioned" or model_artifact_set.startswith("unversioned:"):
+            raise ConfigValidationError(
+                "Production-like runtime requires explicit BUILD_ID and MODEL_ARTIFACT_SET."
+            )
+
+    return RuntimeContract(
+        environment=environment,
+        execution_mode=execution_mode,
+        execution_source=(
+            PAPER_ONLY_EXECUTION_SOURCE
+            if execution_mode == TradingMode.PAPER.value
+            else BACKTEST_EXECUTION_SOURCE
+        ),
+        ibkr_host=str(env.get("IBKR_HOST", "127.0.0.1")).strip(),
+        ibkr_port=ibkr_port,
+        ibkr_readonly=True,
+        database_path=database_path,
+        account_alias=_masked_account_alias(account),
+        account_type=account_type,
+        model_artifact_set=model_artifact_set,
+        build_id=build_id,
+        state_namespace=state_namespace,
+    )
 
 
 class TradingMode(str, Enum):
@@ -265,7 +529,7 @@ class IBKRConfig(BaseModel):
     """Interactive Brokers configuration."""
 
     host: str = Field(default="127.0.0.1", description="IBKR Gateway/TWS host")
-    port: int = Field(default=7497, ge=1, le=65535, description="IBKR Gateway/TWS port")
+    port: int = Field(default=4002, ge=1, le=65535, description="IBKR Gateway port")
     client_id: int = Field(default=123, ge=0, le=999, description="IBKR client ID")
     account: Optional[str] = Field(default=None, description="IBKR account number")
     readonly: bool = Field(default=True, description="Connect in read-only mode")
@@ -280,8 +544,7 @@ class IBKRConfig(BaseModel):
     @model_validator(mode="after")
     def validate_port_for_mode(self) -> "IBKRConfig":
         """Validate port matches trading mode."""
-        # TWS Paper: 7497, TWS Live: 7496
-        # Gateway Paper: 4002, Gateway Live: 4001
+        # The supervised containment path manages IB Gateway paper on 4002.
         allowed_ssl_modes = {"auto", "require", "disabled"}
         if self.ssl_mode not in allowed_ssl_modes:
             raise ValueError(f"ssl_mode must be one of {sorted(allowed_ssl_modes)}")
@@ -429,10 +692,14 @@ class Config(BaseModel):
     @model_validator(mode="after")
     def validate_config_consistency(self) -> "Config":
         """Validate configuration consistency across sections."""
-        # Ensure paper mode uses paper ports
-        if self.execution.mode == TradingMode.PAPER:
-            if self.ibkr.port in [7496, 4001]:  # Live ports
-                raise ValueError("Paper mode requires paper trading port (7497 or 4002)")
+        # PR-01 containment: live order placement is intentionally unavailable.
+        # Reject direct Config(...) construction too, not just environment loads.
+        if self.execution.mode == TradingMode.LIVE:
+            raise ValueError("Live trading capability is disabled during remediation")
+        if self.execution.mode == TradingMode.PAPER and self.ibkr.port not in PAPER_PORTS:
+            raise ValueError(f"Paper mode requires a paper trading port: {sorted(PAPER_PORTS)}")
+        if self.execution.mode == TradingMode.PAPER and not self.ibkr.readonly:
+            raise ValueError("Paper mode requires IBKR read-only client permissions")
 
         # Ensure production has proper monitoring
         if self.environment == Environment.PRODUCTION:
@@ -463,14 +730,19 @@ def load_config_from_env() -> Config:
         ConfigValidationError: If configuration fails validation
     """
     load_dotenv()
+    runtime_contract = load_runtime_contract_from_env()
+    logger.info(
+        "Validated runtime contract: %s",
+        json.dumps(runtime_contract.public_dict(), sort_keys=True),
+    )
 
     # Use enhanced validation for critical risk parameters
     validator = ConfigValidator()
 
     config_dict = {
-        "environment": os.getenv("ENVIRONMENT", "dev"),
+        "environment": runtime_contract.environment,
         "execution": {
-            "mode": os.getenv("EXECUTION_MODE", "paper"),
+            "mode": runtime_contract.execution_mode,
             "account_type": os.getenv("EXECUTION_ACCOUNT_TYPE", "equity"),
             "max_daily_trades": int(os.getenv("EXECUTION_MAX_DAILY_TRADES", "100")),
             "position_timeout_hours": int(os.getenv("EXECUTION_POSITION_TIMEOUT", "24")),
@@ -528,17 +800,15 @@ def load_config_from_env() -> Config:
             "bar_size": os.getenv("DATA_BAR_SIZE", "5 mins"),
         },
         "ibkr": {
-            "host": SecureConfig.get_secure_config("IBKR_HOST", required=True, mask_in_logs=False),
-            "port": int(
-                SecureConfig.get_secure_config("IBKR_PORT", required=True, mask_in_logs=False)
-            ),
+            "host": runtime_contract.ibkr_host,
+            "port": runtime_contract.ibkr_port,
             "client_id": int(
                 SecureConfig.get_secure_config("IBKR_CLIENT_ID", required=True, mask_in_logs=True)
             ),
             "account": SecureConfig.get_secure_config(
                 "IBKR_ACCOUNT", required=False, mask_in_logs=True
             ),
-            "readonly": os.getenv("IBKR_READONLY", "true").lower() == "true",
+            "readonly": runtime_contract.ibkr_readonly,
             "timeout": float(os.getenv("IBKR_TIMEOUT", "10.0")),
             "ssl_mode": os.getenv("IBKR_SSL_MODE", "auto").strip().lower(),
         },
@@ -599,14 +869,14 @@ def load_config_from_env() -> Config:
     # Validation is now handled by SecureConfig.get_secure_config() above
     # Additional validation for port/mode consistency
     port = config_dict["ibkr"]["port"]
-    paper_ports = [7497, 4002]
-    live_ports = [7496, 4001]
+    paper_ports = PAPER_PORTS
+    live_ports = LIVE_PORTS
 
     mode = config_dict["execution"]["mode"]
     if mode == "paper" and port in live_ports:
         raise ConfigValidationError(
             f"Paper mode configured but using live trading port {port}. "
-            f"Use port 7497 (TWS) or 4002 (Gateway) for paper trading."
+            f"Use supervised IB Gateway paper port 4002."
         )
     elif mode == "live" and port in paper_ports:
         raise ConfigValidationError(
@@ -665,18 +935,14 @@ def get_config_for_environment(env: Environment) -> Config:
     base_config.environment = env
 
     if env == Environment.PRODUCTION:
-        # Production overrides
-        base_config.execution.mode = TradingMode.LIVE
+        # PR-01 containment: production-like monitoring may be exercised in
+        # paper mode, but no environment preset can enable broker writes.
+        base_config.execution.mode = TradingMode.PAPER
         base_config.risk.max_position_pct = 0.01  # More conservative
         base_config.risk.max_daily_loss_pct = 0.003
         base_config.monitoring.enable_alerts = True
         base_config.monitoring.log_level = "INFO"
-        # B-12 (branch audit, HIGH): the previous unconditional assignment
-        # `base_config.ibkr.readonly = False` silently disabled the read-only
-        # safety net whenever ENVIRONMENT=production was set. Live trading
-        # now requires an explicit, separately-named consent flag.
-        if os.getenv("IBKR_LIVE_ALLOW_ORDERS", "").strip().lower() == "true":
-            base_config.ibkr.readonly = False
+        base_config.ibkr.readonly = True
 
     elif env == Environment.STAGING:
         # Staging overrides

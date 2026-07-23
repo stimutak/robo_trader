@@ -48,6 +48,9 @@ except Exception:  # noqa: BLE001
 
 logger = get_logger(__name__)
 
+_INTERNAL_GATEWAY_RECOVERY_ENV = "ROBOTRADER_INTERNAL_GATEWAY_RECOVERY"
+_INTERNAL_GATEWAY_RECOVERY_VALUE = "1"
+
 
 def kill_zombie_connections(port: int = 7497) -> None:
     """Kill zombie CLOSE_WAIT connections on specified port.
@@ -486,13 +489,17 @@ def restart_gateway_for_zombies(port: int = 4002, timeout: int = 180) -> bool:
             logger.error(f"Gateway manager script not found: {gateway_manager_path}")
             return False
 
-        # Call gateway_manager.py restart command
+        # This marker admits only the runner's supervised persistent-connection
+        # recovery path through gateway_manager.py's operator CLI gate.
+        recovery_env = os.environ.copy()
+        recovery_env[_INTERNAL_GATEWAY_RECOVERY_ENV] = _INTERNAL_GATEWAY_RECOVERY_VALUE
         result = subprocess.run(
             [sys.executable, gateway_manager_path, "restart", trading_mode_flag],
             capture_output=True,
             text=True,
             timeout=timeout,
             cwd=script_dir,
+            env=recovery_env,
         )
 
         if result.returncode == 0:
@@ -677,7 +684,7 @@ class RobustConnectionManager:
                         if not restart_success:
                             raise ConnectionError(
                                 "Gateway-owned zombie connections detected. "
-                                "Automatic restart failed. Please restart Gateway manually: "
+                                "Automatic restart failed. Restore the supervised stack with "
                                 "./START_TRADER.sh"
                             )
                         logger.info("✅ Gateway restarted - zombies cleared")
@@ -762,8 +769,8 @@ class RobustConnectionManager:
                     else:
                         raise ConnectionError(
                             "IBKR Gateway API layer is unresponsive. "
-                            "Automatic restart failed. Please restart Gateway manually: "
-                            "python3 scripts/gateway_manager.py restart"
+                            "Automatic restart failed. Restore the supervised stack with "
+                            "./START_TRADER.sh"
                         ) from e
                 except Exception as e:
                     last_exception = e

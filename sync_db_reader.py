@@ -7,13 +7,13 @@ Hardened for concurrent access with the async trader:
 - Uses short retry/backoff on SQLITE_BUSY/locked errors
 """
 
+import os
 import sqlite3
 import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 from robo_trader.database_validator import ValidationError, validate_portfolio_id
-
 
 DEFAULT_PORTFOLIO_ID = "default"
 
@@ -25,8 +25,8 @@ class SyncDatabaseReader:
     Default portfolio_id='default' for backward compatibility.
     """
 
-    def __init__(self, db_path="trading_data.db"):
-        self.db_path = db_path
+    def __init__(self, db_path: Optional[str] = None):
+        self.db_path = db_path or os.getenv("RT_DB_PATH", "trading_data.db")
 
     def _make_uri(self, read_only: bool = True) -> str:
         """Build a SQLite URI for the database path."""
@@ -128,20 +128,21 @@ class SyncDatabaseReader:
     def get_all_positions(self) -> List[Dict]:
         """Get all positions across ALL portfolios."""
         try:
-            rows = self._fetch_all(
-                """
+            rows = self._fetch_all("""
                 SELECT portfolio_id, symbol, quantity, avg_cost, market_price, timestamp
                 FROM positions
                 WHERE quantity != 0
-                """
-            )
+                """)
             return [dict(row) for row in rows]
         except Exception as e:
             print(f"Error getting all positions: {e}")
             return []
 
     def get_recent_trades(
-        self, limit: int = 100, symbol: Optional[str] = None, days: Optional[int] = None,
+        self,
+        limit: int = 100,
+        symbol: Optional[str] = None,
+        days: Optional[int] = None,
         portfolio_id: str = DEFAULT_PORTFOLIO_ID,
     ) -> List[Dict]:
         """Get recent trades, optionally filtered by symbol and recent days.
@@ -250,7 +251,9 @@ class SyncDatabaseReader:
             print(f"Error getting signals: {e}")
             return []
 
-    def get_equity_history(self, days: int = 365, portfolio_id: str = DEFAULT_PORTFOLIO_ID) -> List[Dict]:
+    def get_equity_history(
+        self, days: int = 365, portfolio_id: str = DEFAULT_PORTFOLIO_ID
+    ) -> List[Dict]:
         """Get equity history for charting portfolio value over time.
 
         Returns list of daily snapshots ordered by date ascending (oldest first).
@@ -277,14 +280,14 @@ class SyncDatabaseReader:
     def get_portfolios(self) -> List[Dict]:
         """Get all portfolio definitions."""
         try:
-            rows = self._fetch_all(
-                """
+            rows = self._fetch_all("""
                 SELECT id, name, starting_cash, symbols, active, created_at
                 FROM portfolios
                 ORDER BY created_at ASC
-                """
-            )
+                """)
             return [dict(row) for row in rows]
         except Exception as e:
             print(f"Error getting portfolios: {e}")
-            return [{"id": "default", "name": "Default Portfolio", "starting_cash": 100000, "active": 1}]
+            return [
+                {"id": "default", "name": "Default Portfolio", "starting_cash": 100000, "active": 1}
+            ]

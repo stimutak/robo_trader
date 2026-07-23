@@ -10,6 +10,7 @@ import hmac
 import json
 import os
 import secrets
+import shutil
 import signal
 import subprocess
 import threading
@@ -43,7 +44,7 @@ os.environ["LOG_FILE"] = os.getenv(
 from robo_trader.analytics.performance import PerformanceAnalyzer  # noqa: E402
 
 # Import our modules - using lazy imports to avoid startup issues
-from robo_trader.config import load_config  # noqa: E402
+from robo_trader.config import load_config, load_runtime_contract_from_env  # noqa: E402
 
 # Lazy imports to avoid blocking startup
 from robo_trader.database_async import AsyncTradingDatabase  # noqa: E402
@@ -98,6 +99,7 @@ _strategies_cache_lock = threading.Lock()
 
 # Configuration
 config = load_config()
+runtime_contract = load_runtime_contract_from_env()
 DEFAULT_CAPITAL = float(os.getenv("DEFAULT_CASH", getattr(config, "default_cash", 100000)))
 # W-H1: auth on by default. Empty hash with auth enabled is a hard error.
 AUTH_ENABLED = os.getenv("DASH_AUTH_ENABLED", "true").lower() == "true"
@@ -497,7 +499,9 @@ def _request_is_https() -> bool:
         return True
     if request.is_secure:
         return True
-    forwarded_proto = (request.headers.get("X-Forwarded-Proto", "") or "").split(",")[0].strip().lower()
+    forwarded_proto = (
+        (request.headers.get("X-Forwarded-Proto", "") or "").split(",")[0].strip().lower()
+    )
     return forwarded_proto == "https"
 
 
@@ -585,7 +589,7 @@ def validate_portfolio(f):
             import sqlite3
 
             try:
-                with sqlite3.connect(str(Path("trading_data.db"))) as conn:
+                with sqlite3.connect(runtime_contract.database_path) as conn:
                     conn.execute("PRAGMA busy_timeout=5000")
                     # Check account table first, then portfolios definition table
                     cursor = conn.execute(
@@ -1145,6 +1149,26 @@ HTML_TEMPLATE = """
         .runner-stale-banner.visible {
             display: block;
         }
+        .runtime-identity-banner {
+            position: sticky;
+            top: 0;
+            z-index: 9000;
+            width: 100%;
+            background: #7c2d12;
+            border-bottom: 2px solid #fb923c;
+            color: #fff7ed;
+            padding: 8px 16px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            font-weight: 700;
+            line-height: 18px;
+            text-align: center;
+        }
+        .runtime-identity-banner .runtime-primary {
+            color: #fdba74;
+            font-size: 14px;
+            margin-right: 10px;
+        }
         /* Risk gauge bars (Risk tab) */
         .risk-gauge {
             height: 6px;
@@ -1201,6 +1225,16 @@ HTML_TEMPLATE = """
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
+    <div class="runtime-identity-banner" id="runtime-identity-banner" role="status">
+        <span class="runtime-primary">{{ runtime_identity.mode|upper }} • READ ONLY • LIVE DISABLED</span>
+        Account {{ runtime_identity.account_alias or 'UNCONFIGURED' }} ·
+        {{ runtime_identity.account_type }} ·
+        Source {{ runtime_identity.execution_source }} ·
+        Ledger {{ runtime_identity.database_identity }} ·
+        Models {{ runtime_identity.model_artifact_set }} ·
+        Build {{ runtime_identity.build_id }} ·
+        Config {{ runtime_identity.fingerprint }}
+    </div>
     <!-- C4: runner-stale banner. Hidden by default; JS shows it when
          /api/runner/status reports healthy=false. -->
     <div class="runner-stale-banner" id="runner-stale-banner" role="alert" aria-live="assertive"></div>
@@ -2426,6 +2460,10 @@ HTML_TEMPLATE = """
                 if (data.status === 'started') {
                     updateStatus('running');
                     addLog('Trading started');
+                } else {
+                    const message = data.action || data.message ||
+                        data.error || 'Use ./START_TRADER.sh';
+                    addLog(`Start disabled: ${message}`);
                 }
             } catch (error) {
                 console.error('Error starting trading:', error);
@@ -2442,6 +2480,10 @@ HTML_TEMPLATE = """
                 if (data.status === 'stopped') {
                     updateStatus('stopped');
                     addLog('Trading stopped');
+                } else {
+                    const message = data.action || data.message ||
+                        data.error || 'Use supervised shutdown';
+                    addLog(`Stop disabled: ${message}`);
                 }
             } catch (error) {
                 console.error('Error stopping trading:', error);
@@ -4905,6 +4947,7 @@ def index():
     return render_template_string(
         HTML_TEMPLATE,
         ws_auth_token=os.getenv("WS_AUTH_TOKEN", "").strip(),
+        runtime_identity=runtime_contract.public_dict(),
     )
 
 
@@ -5356,12 +5399,41 @@ def market_status():
     return jsonify(result)
 
 
+def _resolve_lsof_binary():
+    """Resolve lsof without relying on the reduced launchd/container PATH."""
+    discovered = shutil.which("lsof")
+    if discovered:
+        return str(Path(discovered).resolve())
+
+    macos_fallback = Path("/usr/sbin/lsof")
+    if macos_fallback.is_file() and os.access(macos_fallback, os.X_OK):
+        return str(macos_fallback)
+    return None
+
+
+def _lsof_has_state(lsof_binary, gateway_port, state):
+    """Return whether lsof found ``state`` or raise for an unusable diagnostic."""
+    result = subprocess.run(
+        [lsof_binary, "-nP", f"-iTCP:{gateway_port}", f"-sTCP:{state}"],
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+    if result.returncode == 0:
+        return state in result.stdout
+    if result.returncode == 1:
+        return False
+    raise RuntimeError(f"lsof exited with status {result.returncode}")
+
+
 def check_ibkr_connection():
     """
-    Check TWS/Gateway connection using lsof (no zombies).
+    Check the supervised paper Gateway connection using lsof (no zombies).
 
-    Checks both TWS (port 7497) and Gateway (port 4002) to see which is running.
-    Also checks for ESTABLISHED connections to distinguish between:
+    Checks only the port in the validated runtime contract. During containment
+    that is IB Gateway paper on 4002; an unrelated TWS listener must never make
+    the dashboard claim the supervised topology is healthy. Also checks for
+    ESTABLISHED connections to distinguish between:
     - Gateway available (listening) but no active API connection
     - Gateway available AND runner has active API connection
 
@@ -5371,85 +5443,55 @@ def check_ibkr_connection():
     IMPORTANT: Do NOT use socket.connect_ex() here - it creates zombie connections
     that block subsequent IBKR API handshakes!
     """
-    import subprocess
-
-    tws_healthy = False
     gateway_healthy = False
-    api_connected = False  # True if there's an ESTABLISHED connection to Gateway/TWS
-    status_msg = "Unknown"
+    api_connected = False
+    diagnostic_available = True
+    diagnostic_error = None
+    gateway_port = str(runtime_contract.ibkr_port)
+    lsof_binary = _resolve_lsof_binary()
 
-    # Check TWS (port 7497) using lsof
-    try:
-        result = subprocess.run(
-            ["lsof", "-nP", "-iTCP:7497", "-sTCP:LISTEN"], capture_output=True, text=True, timeout=2
-        )
-        if result.returncode == 0 and "LISTEN" in result.stdout:
-            tws_healthy = True
-    except Exception as e:
-        logger.debug(f"TWS health check error: {e}")
+    if lsof_binary is None:
+        diagnostic_available = False
+        diagnostic_error = "lsof is unavailable"
+    else:
+        # Check the contract Gateway port using a non-connecting lsof probe.
+        try:
+            gateway_healthy = _lsof_has_state(lsof_binary, gateway_port, "LISTEN")
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            diagnostic_available = False
+            diagnostic_error = f"lsof listener probe failed: {exc}"
+            logger.warning(f"Gateway diagnostic unavailable: {exc}")
 
-    # Check Gateway (port 4002) using lsof
-    try:
-        result = subprocess.run(
-            ["lsof", "-nP", "-iTCP:4002", "-sTCP:LISTEN"], capture_output=True, text=True, timeout=2
-        )
-        if result.returncode == 0 and "LISTEN" in result.stdout:
-            gateway_healthy = True
-    except Exception as e:
-        logger.debug(f"Gateway health check error: {e}")
-
-    # Check for ESTABLISHED connections (actual API connections)
-    # This tells us if the runner currently has an active connection to Gateway/TWS
-    try:
-        # Check for established connections on port 4002 (Gateway) or 7497 (TWS)
-        result = subprocess.run(
-            ["lsof", "-nP", "-iTCP:4002", "-sTCP:ESTABLISHED"],
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-        if result.returncode == 0 and "ESTABLISHED" in result.stdout:
-            api_connected = True
-        else:
-            # Also check TWS port
-            result = subprocess.run(
-                ["lsof", "-nP", "-iTCP:7497", "-sTCP:ESTABLISHED"],
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            if result.returncode == 0 and "ESTABLISHED" in result.stdout:
-                api_connected = True
-    except Exception as e:
-        logger.debug(f"API connection check error: {e}")
+        # An ESTABLISHED query is meaningful only when the listener diagnostic
+        # itself succeeded. This remains observational and opens no TCP socket.
+        if diagnostic_available:
+            try:
+                api_connected = _lsof_has_state(lsof_binary, gateway_port, "ESTABLISHED")
+            except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+                diagnostic_available = False
+                diagnostic_error = f"lsof API-session probe failed: {exc}"
+                logger.warning(f"Gateway API-session diagnostic unavailable: {exc}")
 
     # Determine status message - be clear about the distinction
-    if api_connected:
-        if gateway_healthy:
-            status_msg = "Gateway API connected (port 4002)"
-        elif tws_healthy:
-            status_msg = "TWS API connected (port 7497)"
-        else:
-            status_msg = "API connected"
-    elif gateway_healthy or tws_healthy:
-        # Gateway/TWS is running but no active API connection
-        if gateway_healthy and tws_healthy:
-            status_msg = "Gateway & TWS available (no active API session)"
-        elif gateway_healthy:
-            status_msg = "Gateway available (no active API session)"
-        else:
-            status_msg = "TWS available (no active API session)"
+    if not diagnostic_available:
+        status_msg = "Gateway diagnostic unavailable"
+    elif api_connected:
+        status_msg = f"Gateway API connected (port {gateway_port})"
+    elif gateway_healthy:
+        status_msg = "Gateway available (no active API session)"
     else:
-        status_msg = "No TWS/Gateway detected"
+        status_msg = "No supervised Gateway detected"
 
     return {
         "connected": api_connected,  # Now means actually connected, not just available
         "gateway_available": gateway_healthy,  # Gateway is listening
-        "tws_available": tws_healthy,  # TWS is listening
+        "tws_available": False,  # Backwards-compatible field; TWS is unsupported.
         "api_connected": api_connected,  # Active ESTABLISHED connection exists
         "status": status_msg,
-        "tws_running": tws_healthy,  # Keep for backwards compat
+        "tws_running": False,  # Backwards-compatible field; TWS is unsupported.
         "gateway_running": gateway_healthy,  # Keep for backwards compat
+        "diagnostic_available": diagnostic_available,
+        "diagnostic_error": diagnostic_error,
     }
 
 
@@ -5508,7 +5550,7 @@ def status():
     # Build clear status message
     runner_running = runner_actually_running
 
-    # Check TWS/Gateway health with sync approach (no zombies)
+    # Check the supervised Gateway health with sync approach (no zombies)
     # Do this FIRST so we can use it in status messages
     ibkr_check = check_ibkr_connection()
     api_connected = ibkr_check.get("api_connected", False)  # Active ESTABLISHED connection
@@ -5517,11 +5559,12 @@ def status():
     ibkr_status_msg = ibkr_check.get("status", "Unknown")
     tws_running = ibkr_check.get("tws_running", False)
     gateway_running = ibkr_check.get("gateway_running", False)
+    gateway_diagnostic_available = ibkr_check.get("diagnostic_available", False)
 
     # Build clear status message based on actual connection state
     if not runner_running:
         status_message = "⚠️ Runner not started - No trading activity"
-        status_detail = "Start the runner with: python3 -m robo_trader.runner_async"
+        status_detail = "Start locally with the authoritative ./START_TRADER.sh launcher"
     elif not market_open:
         status_message = "💤 Market Closed - Runner sleeping"
         # Calculate time until market open
@@ -5536,17 +5579,22 @@ def status():
         # Runner is running, market is open, AND we have an active API connection
         status_message = "✅ Market Open - API Connected"
         status_detail = "Runner has active IBKR API connection and is processing data"
-    elif gateway_available or tws_available:
+    elif gateway_available:
         # Runner is running, market is open, but NO active API connection
-        # This is the per-cycle mode - connects only during trading cycles
-        status_message = "🔄 Market Open - Waiting for cycle"
+        status_message = "🔄 Market Open - API session not confirmed"
         status_detail = (
-            "Gateway available. Runner connects per-cycle for stability (no active API session now)"
+            "Gateway is available, but the dashboard cannot confirm " "an active runner API session"
+        )
+    elif not gateway_diagnostic_available:
+        status_message = "⚠️ Market Open - Gateway status unavailable"
+        status_detail = (
+            "Runner is running, but the non-connecting lsof diagnostic is unavailable. "
+            "This does not establish that Gateway is down."
         )
     else:
-        # Runner is running, market is open, but no Gateway/TWS
+        # Runner is running, market is open, but no supervised Gateway
         status_message = "⚠️ Market Open - No Gateway"
-        status_detail = "Runner is running but Gateway/TWS not detected. Check IBKR Gateway."
+        status_detail = "Runner is running but IB Gateway was not detected."
 
     # Get symbol count from user_settings.json
     symbols_count = 0
@@ -5613,7 +5661,17 @@ def status():
                 "api_connected": api_connected,  # Explicit: active ESTABLISHED connection
                 "gateway_available": gateway_available,  # Gateway is listening (can connect)
                 "market_open": market_open,
-                "mode": "paper",
+                "mode": runtime_contract.execution_mode,
+                "execution_source": runtime_contract.execution_source,
+                "ibkr_readonly": runtime_contract.ibkr_readonly,
+                "ibkr_port": runtime_contract.ibkr_port,
+                "account_alias": runtime_contract.account_alias,
+                "account_type": runtime_contract.account_type,
+                "database_identity": runtime_contract.database_identity,
+                "model_artifact_set": runtime_contract.model_artifact_set,
+                "build_id": runtime_contract.build_id,
+                "config_fingerprint": runtime_contract.fingerprint,
+                "live_capability": "disabled",
                 "session_start": datetime.now().isoformat(),
                 "message": status_message,
                 "detail": status_detail,
@@ -7278,22 +7336,25 @@ def strategies_status():
     except Exception:
         # C-9: don't leak exception detail to clients; log full traceback.
         logger.exception("strategy_status failed")
-        return jsonify(
-            {
-                "active_strategies": {
-                    "ml_enhanced": {"enabled": True, "error": "internal_error"},
-                    "microstructure": {"enabled": False},
-                    "portfolio_manager": {
-                        "enabled": True,
-                        "allocation_method": "Equal Weight",
-                        "strategies_count": 4,
+        return (
+            jsonify(
+                {
+                    "active_strategies": {
+                        "ml_enhanced": {"enabled": True, "error": "internal_error"},
+                        "microstructure": {"enabled": False},
+                        "portfolio_manager": {
+                            "enabled": True,
+                            "allocation_method": "Equal Weight",
+                            "strategies_count": 4,
+                        },
+                        "smart_execution": {"enabled": True},
                     },
-                    "smart_execution": {"enabled": True},
-                },
-                "performance_by_strategy": {},
-                "error": "internal_error",
-            }
-        ), 500
+                    "performance_by_strategy": {},
+                    "error": "internal_error",
+                }
+            ),
+            500,
+        )
 
 
 @app.route("/api/microstructure/metrics")
@@ -7618,16 +7679,23 @@ def get_risk_status():
     except Exception:
         # C-9: don't leak exception detail to clients; log full traceback.
         logger.exception("risk_status failed")
-        return jsonify(
-            {
-                "enabled": True,
-                "error": "internal_error",
-                "kelly_sizing": {"enabled": True, "current_positions": {}, "portfolio_kelly": 0},
-                "kill_switches": {"active": False, "limits": {}},
-                "correlation_limits": {},
-                "risk_metrics": {},
-            }
-        ), 500
+        return (
+            jsonify(
+                {
+                    "enabled": True,
+                    "error": "internal_error",
+                    "kelly_sizing": {
+                        "enabled": True,
+                        "current_positions": {},
+                        "portfolio_kelly": 0,
+                    },
+                    "kill_switches": {"active": False, "limits": {}},
+                    "correlation_limits": {},
+                    "risk_metrics": {},
+                }
+            ),
+            500,
+        )
 
 
 @app.route("/api/risk/kelly/<symbol>")
@@ -7748,51 +7816,29 @@ def get_kelly_parameters(symbol):
 @requires_auth
 @csrf_required
 def control_kill_switch():
-    """Control kill switch (reset / disable / status).
-
-    B-13 (branch audit, HIGH): previously the `reset` action returned
-    success without touching the actual KillSwitch state, so the UI lied
-    to operators. Now we either:
-      - Drive the on-disk kill_switch_state.json + kill_switch.lock that
-        `KillSwitch` reads (this matches the persistence contract added by
-        R2-M1/M2), or
-      - Return 501 Not Implemented so the operator knows to use the CLI.
-    We pick the file-driven path so the UI is honest.
-    """
+    """Report kill-switch status while containment keeps resets local-only."""
     action = (request.json or {}).get("action", "status")
     state_path = Path("data/kill_switch_state.json")
     lock_path = Path("data/kill_switch.lock")
 
     if action == "reset":
-        # Drive the same on-disk state that KillSwitch._load_persisted_state
-        # reads. Removing both files mirrors KillSwitch.reset().
-        try:
-            cleared_state = False
-            cleared_lock = False
-            if state_path.exists():
-                state_path.unlink()
-                cleared_state = True
-            if lock_path.exists():
-                lock_path.unlink()
-                cleared_lock = True
-            logger.warning(
-                "kill-switch reset via dashboard",
-                cleared_state=cleared_state,
-                cleared_lock=cleared_lock,
-                remote_addr=request.remote_addr,
-            )
-            return jsonify(
+        # PR-01 containment: a dashboard request must never clear persisted
+        # safety state. Reset remains a supervised local operator procedure
+        # until elevated authorization and durable audit controls are built.
+        return (
+            jsonify(
                 {
-                    "success": True,
-                    "message": "Kill switch reset",
-                    "status": "active",
-                    "cleared_state_file": cleared_state,
-                    "cleared_lock_file": cleared_lock,
+                    "success": False,
+                    "error": "kill_switch_reset_disabled",
+                    "message": (
+                        "Dashboard kill-switch reset is disabled during remediation; "
+                        "use the supervised local operator procedure only after "
+                        "reconciling broker state."
+                    ),
                 }
-            )
-        except OSError:
-            logger.exception("kill-switch reset failed")
-            return jsonify({"success": False, "error": "internal_error"}), 500
+            ),
+            409,
+        )
     elif action == "disable":
         # "disable" is intentionally not supported via API — disabling the
         # kill switch without an audit trail is operator-error territory.
@@ -7957,9 +8003,7 @@ def get_safety_thresholds():
 @requires_auth
 @csrf_required
 def start_trading():
-    """Start trading with proper Gateway checks and zombie cleanup."""
-    global trading_status
-
+    """Reject dashboard startup while the single-launcher contract is enforced."""
     # Load symbols from user settings
     global default_symbols
     try:
@@ -7997,88 +8041,35 @@ def start_trading():
             400,
         )
 
-    # Use the start_runner.sh script for proper startup with Gateway checks
-    script_path = os.path.join(os.path.dirname(__file__), "scripts", "start_runner.sh")
-    symbols_str = ",".join(symbols)
-
-    try:
-        # Run the startup script and capture output
-        result = subprocess.run(
-            [script_path, symbols_str],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-
-        if result.returncode == 0:
-            trading_status = "running"
-            trading_log.append(
-                f"{datetime.now().strftime('%H:%M:%S')} - Trading started for {symbols_str}"
-            )
-            # W-M5: log subprocess output server-side only, do not return to client.
-            app.logger.info("start_runner stdout: %s", result.stdout)
-            if result.stderr:
-                app.logger.info("start_runner stderr: %s", result.stderr)
-            return jsonify(
-                {
-                    "status": "started",
-                    "symbols": symbols_str.split(","),
-                }
-            )
-        else:
-            trading_log.append(
-                f"{datetime.now().strftime('%H:%M:%S')} - Failed to start (rc={result.returncode})"
-            )
-            app.logger.warning("start_runner failed rc=%s stdout=%s stderr=%s",
-                               result.returncode, result.stdout, result.stderr)
-            return (
-                jsonify({"status": "error", "error": "start_failed"}),
-                500,
-            )
-
-    except subprocess.TimeoutExpired:
-        return jsonify({"status": "error", "error": "Startup timed out"}), 500
-    except Exception as e:
-        logger.error(f"Error starting trading: {e}")
-        # Don't expose internal error details to client
-        return jsonify({"status": "error", "error": "Failed to start trading system"}), 500
+    logger.warning("Dashboard start rejected: authoritative launcher required")
+    return (
+        jsonify(
+            {
+                "status": "disabled",
+                "error": "authoritative_launcher_required",
+                "action": "Run ./START_TRADER.sh from the RoboTrader host.",
+            }
+        ),
+        409,
+    )
 
 
 @app.route("/api/stop", methods=["POST"])
 @requires_auth
 @csrf_required
 def stop_trading():
-    """Stop trading - kills all runner processes."""
-    global trading_status, trading_process
-
-    try:
-        # Kill all runner processes (more reliable than just terminating one)
-        result = subprocess.run(
-            ["pkill", "-9", "-f", "runner_async"],
-            capture_output=True,
-            text=True,
-        )
-
-        # W-M5: log subprocess output server-side, do not return it to client.
-        app.logger.info("pkill runner_async rc=%s stdout=%s stderr=%s",
-                        result.returncode, result.stdout, result.stderr)
-
-        # Also terminate tracked process if any
-        if trading_process:
-            try:
-                trading_process.terminate()
-            except Exception:
-                pass
-            trading_process = None
-
-        trading_status = "stopped"
-        trading_log.append(f"{datetime.now().strftime('%H:%M:%S')} - Trading stopped")
-
-        return jsonify({"status": "stopped"})
-
-    except Exception as e:
-        logger.error(f"Error stopping trading: {e}")
-        return jsonify({"status": "error", "error": "stop_failed"}), 500
+    """Reject dashboard stop while graceful supervised shutdown is unfinished."""
+    logger.warning("Dashboard stop rejected: supervised shutdown required")
+    return (
+        jsonify(
+            {
+                "status": "disabled",
+                "error": "supervised_shutdown_required",
+                "action": "Use the documented local operator shutdown procedure.",
+            }
+        ),
+        409,
+    )
 
 
 @app.route("/api/logs")

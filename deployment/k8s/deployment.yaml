@@ -7,7 +7,10 @@ metadata:
     app: robo-trader
     version: v1
 spec:
-  replicas: 1  # Single instance for trading
+  # Kubernetes is not a supported trader runtime during remediation. Keep the
+  # workload scaled to zero, and make the container fail closed if an operator
+  # manually scales it before the deployment-readiness phase is complete.
+  replicas: 0
   strategy:
     type: Recreate  # Avoid multiple traders
   selector:
@@ -32,6 +35,11 @@ spec:
       - name: trader
         image: ghcr.io/stimutak/robo_trader:latest
         imagePullPolicy: Always
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          echo "Kubernetes trader startup is unsupported during remediation; refusing to run." >&2
+          exit 2
         ports:
         - name: http
           containerPort: 8080
@@ -45,6 +53,17 @@ spec:
             configMapKeyRef:
               name: robo-trader-config
               key: environment
+        - name: ENVIRONMENT
+          valueFrom:
+            configMapKeyRef:
+              name: robo-trader-config
+              key: environment
+        - name: EXECUTION_MODE
+          value: "paper"
+        - name: TRADING_MODE
+          value: "paper"
+        - name: IBKR_READONLY
+          value: "true"
         - name: LOG_LEVEL
           valueFrom:
             configMapKeyRef:

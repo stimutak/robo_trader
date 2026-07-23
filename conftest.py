@@ -32,6 +32,21 @@ _test_db_fd, _test_db_path = tempfile.mkstemp(
 os.close(_test_db_fd)
 os.environ["RT_DB_PATH"] = _test_db_path
 os.environ["RT_TEST_MODE"] = "1"
+# Keep collection and subprocess-based tests independent of a developer's
+# local .env. Individual safety tests override or remove these values when
+# exercising fail-closed cases.
+os.environ["EXECUTION_MODE"] = "paper"
+os.environ["TRADING_MODE"] = "paper"
+os.environ["IBKR_HOST"] = "127.0.0.1"
+os.environ["IBKR_PORT"] = "4002"
+os.environ["IBKR_READONLY"] = "true"
+os.environ.setdefault("IBKR_CLIENT_ID", "123")
+os.environ["IBKR_ACCOUNT"] = "DU_TEST_PAPER"
+os.environ["IBKR_APPROVED_ACCOUNTS"] = "DU_TEST_PAPER"
+os.environ["IBKR_ACCOUNT_TYPE"] = "paper"
+os.environ["RT_STATE_NAMESPACE"] = "paper"
+os.environ["MODEL_ARTIFACT_SET"] = "pytest-fixtures"
+os.environ["BUILD_ID"] = "pytest"
 # -------------------------------------------------------------------------
 
 

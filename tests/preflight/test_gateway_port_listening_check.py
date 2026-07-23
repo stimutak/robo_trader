@@ -76,13 +76,15 @@ class TestGatewayPortListeningCheckBlock:
         assert "not listening" in result.message
         assert result.details["lsof_returncode"] == 1
 
-    def test_block_remediation_names_start_gateway_path(self, mock_lsof, preflight_context):
+    def test_block_remediation_names_only_supervised_start_path(self, mock_lsof, preflight_context):
         mock_lsof(returncode=1, stdout="")
 
         result = GatewayPortListeningCheck().run(preflight_context)
 
         # Remediation must point the operator at the canonical fix.
-        assert "start_gateway" in result.remediation
+        assert "./START_TRADER.sh" in result.remediation
+        assert "gateway_manager.py start" not in result.remediation
+        assert "start_gateway.sh" not in result.remediation
         assert "2FA" in result.remediation
 
     def test_returns_block_when_lsof_times_out(self, mock_lsof, preflight_context):

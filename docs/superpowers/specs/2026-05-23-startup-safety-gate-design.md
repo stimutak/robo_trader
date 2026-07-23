@@ -601,7 +601,12 @@ This handles Monday-after-Friday (0–1 trading days) correctly, AND catches "ha
 
 ### 7.5 GatewayPortListeningCheck (G4)
 
-**Why this check exists.** START_TRADER.sh tries to bring up Gateway and waits for `lsof -sTCP:LISTEN` on port 4002. If Gateway never came up successfully (2FA failure, license issue, IBC misconfig), START_TRADER fails its own check and exits before preflight runs. **But:** the watchdog can invoke runner_async directly in restart mode, bypassing START_TRADER. In that path, preflight is the first line of defense.
+**Why this check exists.** START_TRADER.sh tries to bring up Gateway and waits
+for `lsof -sTCP:LISTEN` on port 4002. If Gateway never came up successfully
+(2FA failure, license issue, IBC misconfig), START_TRADER fails its own check and
+exits before preflight runs. The watchdog also delegates exclusively to
+START_TRADER.sh; the duplicate check remains a fail-closed defense against
+state changing between shell validation and preflight.
 
 **Inputs:**
 - `lsof -nP -iTCP:<port> -sTCP:LISTEN` (port from `EXECUTION_MODE`: `4002` for paper, `4001` for live, default 4002)
@@ -613,7 +618,9 @@ This handles Monday-after-Friday (0–1 trading days) correctly, AND catches "ha
 - lsof times out → BLOCK ("port check timed out — system likely overloaded")
 - lsof binary missing → BLOCK ("lsof not installed — required for safety checks"; should never happen on macOS, but worth catching)
 
-**Remediation:** "Gateway API port 4002 is not listening. Run `./scripts/start_gateway.sh` or `python3 scripts/gateway_manager.py start --paper` to bring it up. If 2FA is pending, check your IBKR Mobile app."
+**Remediation:** "Gateway API port 4002 is not listening. Run
+`./START_TRADER.sh` to restore the supervised stack. If 2FA is pending, check
+your IBKR Mobile app."
 
 **Critical constraint (CLAUDE.md, 2025-12-06 row):** Use `lsof`, never `socket.connect_ex`. The latter creates a zombie connection that blocks subsequent API handshakes — exactly the failure class we're checking *for*. The implementation MUST go through `subprocess.run(["lsof", ...])` — there is NO Python-API alternative that is safe.
 
@@ -629,10 +636,10 @@ This handles Monday-after-Friday (0–1 trading days) correctly, AND catches "ha
 - Output empty → PASS
 - Any line in output → BLOCK with the zombie count and PIDs
 
-**Remediation:** "Found N zombie connections on port <port>. These will block API handshakes. Either:
-- Kill Python-owned zombies: `python3 scripts/gateway_manager.py clear-zombies`
-- For Gateway-owned zombies: restart Gateway with `python3 scripts/gateway_manager.py restart`
-- Then re-run ./START_TRADER.sh"
+**Remediation:** "Found N zombie connections on port <port>. These will block
+API handshakes. Route Python-owned cleanup and Gateway-owned recovery through
+`./START_TRADER.sh`; component-level lifecycle commands are not an operator
+interface."
 
 **Edge case:** Race with START_TRADER.sh's own zombie cleanup. Preflight runs after step 3 of the shell script, so this should not occur, but if it does the message is still actionable.
 

@@ -258,22 +258,125 @@ class TestOutputFormat:
 class TestPortResolution:
     def test_paper_mode_uses_4002(self, monkeypatch: pytest.MonkeyPatch, cli_module) -> None:
         monkeypatch.setenv("EXECUTION_MODE", "paper")
+        monkeypatch.setenv("IBKR_PORT", "4002")
         assert cli_module._resolve_target_port() == 4002
 
-    def test_live_mode_uses_4001(self, monkeypatch: pytest.MonkeyPatch, cli_module) -> None:
+    def test_tws_paper_port_is_rejected_without_supervision(
+        self, monkeypatch: pytest.MonkeyPatch, cli_module
+    ) -> None:
+        monkeypatch.setenv("EXECUTION_MODE", "paper")
+        monkeypatch.setenv("IBKR_PORT", "7497")
+        with pytest.raises(ValueError, match="paper port.*4002"):
+            cli_module._resolve_target_port()
+
+    def test_live_mode_is_rejected(self, monkeypatch: pytest.MonkeyPatch, cli_module) -> None:
         monkeypatch.setenv("EXECUTION_MODE", "live")
-        assert cli_module._resolve_target_port() == 4001
+        monkeypatch.setenv("TRADING_MODE", "live")
+        with pytest.raises(ValueError, match="disabled during remediation"):
+            cli_module._resolve_target_port()
 
     def test_unset_defaults_to_paper(self, monkeypatch: pytest.MonkeyPatch, cli_module) -> None:
         monkeypatch.delenv("EXECUTION_MODE", raising=False)
+        monkeypatch.delenv("TRADING_MODE", raising=False)
+        monkeypatch.delenv("IBKR_PORT", raising=False)
         assert cli_module._resolve_target_port() == 4002
 
-    def test_unknown_mode_defaults_to_paper(
-        self, monkeypatch: pytest.MonkeyPatch, cli_module
-    ) -> None:
+    def test_unknown_mode_is_rejected(self, monkeypatch: pytest.MonkeyPatch, cli_module) -> None:
         monkeypatch.setenv("EXECUTION_MODE", "backtest")
-        # Anything that isn't "live" → paper (4002)
-        assert cli_module._resolve_target_port() == 4002
+        monkeypatch.setenv("TRADING_MODE", "backtest")
+        monkeypatch.setenv("RT_STATE_NAMESPACE", "backtest")
+        monkeypatch.setenv("IBKR_ACCOUNT_TYPE", "offline")
+        with pytest.raises(ValueError, match="offline-only"):
+            cli_module._resolve_target_port()
+
+
+# ---------------------------------------------------------------------------
+# Resolved .env + process environment contract
+# ---------------------------------------------------------------------------
+
+
+_PAPER_ENV_FILE = """\
+EXECUTION_MODE=paper
+TRADING_MODE=paper
+IBKR_PORT=4002
+IBKR_READONLY=true
+IBKR_ACCOUNT=DU_FILE_PAPER
+IBKR_APPROVED_ACCOUNTS=DU_FILE_PAPER
+IBKR_ACCOUNT_TYPE=paper
+RT_STATE_NAMESPACE=paper
+"""
+
+
+class TestResolvedEnvironment:
+    def test_env_file_only_builds_context(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cli_module
+    ) -> None:
+        (tmp_path / ".env").write_text(_PAPER_ENV_FILE, encoding="utf-8")
+        monkeypatch.setattr(cli_module.os, "environ", {})
+
+        context = cli_module._build_context(tmp_path)
+
+        assert context.target_port == 4002
+        assert context.env["IBKR_ACCOUNT"] == "DU_FILE_PAPER"
+        assert context.env["IBKR_APPROVED_ACCOUNTS"] == "DU_FILE_PAPER"
+
+    def test_process_environment_overrides_env_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cli_module
+    ) -> None:
+        (tmp_path / ".env").write_text(
+            _PAPER_ENV_FILE.replace("IBKR_PORT=4002", "IBKR_PORT=7497").replace(
+                "DU_FILE_PAPER", "DU_STALE_FILE"
+            ),
+            encoding="utf-8",
+        )
+        process_env = {
+            "IBKR_PORT": "4002",
+            "IBKR_ACCOUNT": "DU_PROCESS_PAPER",
+            "IBKR_APPROVED_ACCOUNTS": "DU_PROCESS_PAPER",
+        }
+        monkeypatch.setattr(cli_module.os, "environ", process_env)
+
+        context = cli_module._build_context(tmp_path)
+
+        assert context.target_port == 4002
+        assert context.env["IBKR_PORT"] == "4002"
+        assert context.env["IBKR_ACCOUNT"] == "DU_PROCESS_PAPER"
+        assert context.env["IBKR_APPROVED_ACCOUNTS"] == "DU_PROCESS_PAPER"
+
+    def test_malformed_env_file_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cli_module
+    ) -> None:
+        (tmp_path / ".env").write_text(
+            _PAPER_ENV_FILE.replace("IBKR_PORT=4002", "IBKR_PORT=not-a-port"),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(cli_module.os, "environ", {})
+
+        with pytest.raises(ValueError, match="IBKR_PORT must be an integer"):
+            cli_module._build_context(tmp_path)
+
+    def test_env_entry_without_value_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cli_module
+    ) -> None:
+        (tmp_path / ".env").write_text(
+            _PAPER_ENV_FILE + "BROKEN_SETTING\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(cli_module.os, "environ", {})
+
+        with pytest.raises(
+            cli_module.ConfigValidationError,
+            match="Malformed .env entries.*BROKEN_SETTING",
+        ):
+            cli_module._build_context(tmp_path)
+
+    def test_missing_env_and_process_contract_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cli_module
+    ) -> None:
+        monkeypatch.setattr(cli_module.os, "environ", {})
+
+        with pytest.raises(ValueError, match="requires IBKR_ACCOUNT"):
+            cli_module._build_context(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +385,24 @@ class TestPortResolution:
 
 
 class TestPreflightFailureCode3:
+    def test_force_cannot_bypass_malformed_runtime_contract(
+        self, patch_checks_and_root, capsys, cli_module
+    ) -> None:
+        root = patch_checks_and_root([_StubCheck("ok")], env={})
+        (root / ".env").write_text(
+            _PAPER_ENV_FILE.replace("IBKR_PORT=4002", "IBKR_PORT=not-a-port"),
+            encoding="utf-8",
+        )
+
+        rc = cli_module.main(["--force", "operator reviewed malformed configuration"])
+
+        assert rc == 3
+        assert not (root / "data" / "preflight_bypass.log").exists()
+        assert not (root / "data" / ".preflight_last_ok").exists()
+        err = capsys.readouterr().err
+        assert "preflight itself failed" in err
+        assert "IBKR_PORT must be an integer" in err
+
     def test_uncaught_exception_in_build_context_exits_three(
         self, monkeypatch: pytest.MonkeyPatch, capsys, cli_module
     ) -> None:

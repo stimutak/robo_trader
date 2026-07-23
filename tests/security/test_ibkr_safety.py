@@ -76,11 +76,8 @@ def test_start_trader_checks_readonly():
     assert (
         "ReadOnlyApi=yes" in text
     ), "START_TRADER.sh must reference 'ReadOnlyApi=yes' for the safety check."
-    # NEW-IB-H1.1: The check must be the anchored, case-insensitive grep -E
-    # variant. The bare '^ReadOnlyApi=yes' grep is fragile (matches yesno,
-    # rejects 'Yes'). We require the new form.
-    assert "grep -Eqi" in text and "readonlyapi" in text.lower(), (
-        "START_TRADER.sh must use the anchored, case-insensitive ReadOnlyApi grep " "(NEW-IB-H1.1)."
+    assert "validate_ibc_safety_config" in text and "readonlyapi" in text.lower(), (
+        "START_TRADER.sh must normalize and cardinality-check ReadOnlyApi " "(NEW-IB-H1.1)."
     )
     assert "exit 4" in text, (
         "START_TRADER.sh must exit non-zero (audit prescribes 4) when the "
@@ -95,12 +92,14 @@ def test_start_gateway_script_checks_readonly():
     assert script_path.exists()
 
     text = script_path.read_text()
+    is_quarantined = "DISABLED:" in text and "exit 2" in text
     # NEW-IB-H1.1: anchored, case-insensitive grep.
-    assert "grep -Eqi" in text and "readonlyapi" in text.lower(), (
-        "scripts/start_gateway.sh must verify ReadOnlyApi=yes via anchored, "
-        "case-insensitive grep (NEW-IB-H1.1)."
+    has_readonly_guard = "grep -Eqi" in text and "readonlyapi" in text.lower()
+    assert is_quarantined or has_readonly_guard, (
+        "scripts/start_gateway.sh must be inert or verify ReadOnlyApi=yes via "
+        "anchored, case-insensitive grep (NEW-IB-H1.1)."
     )
-    assert "exit 3" in text, "scripts/start_gateway.sh must exit non-zero on failed safety check."
+    assert ("exit 2" in text) if is_quarantined else ("exit 3" in text)
 
 
 # ---------------------------------------------------------------------------
@@ -113,12 +112,13 @@ def test_start_gateway_chmod_and_umask():
     created config.ini and set a restrictive umask (audit IB-L2)."""
     script_path = PROJECT_ROOT / "scripts" / "start_gateway.sh"
     text = script_path.read_text()
+    is_quarantined = "DISABLED:" in text and "exit 2" in text
 
-    assert "umask 077" in text, (
+    assert is_quarantined or "umask 077" in text, (
         "scripts/start_gateway.sh must set 'umask 077' to keep credential "
         "files group/other-readable-proof."
     )
-    assert 'chmod 600 "$IBC_INI"' in text, (
+    assert is_quarantined or 'chmod 600 "$IBC_INI"' in text, (
         "scripts/start_gateway.sh must chmod 600 the freshly-created "
         "IBC config (it contains plaintext IBKR credentials)."
     )
@@ -213,16 +213,16 @@ def test_subprocess_client_source_has_relative_to_check():
 
 def test_force_gateway_reconnect_uses_mktemp():
     """force_gateway_reconnect.sh must create its temp script via mktemp,
-    not at a predictable /tmp/test_gateway_accept.py path (audit IB-L1)."""
+    or remain fully quarantined (audit IB-L1 / PR-01)."""
     script_path = PROJECT_ROOT / "force_gateway_reconnect.sh"
     assert script_path.exists()
 
     text = script_path.read_text()
 
-    # Must call mktemp.
-    assert (
-        "mktemp" in text
-    ), "force_gateway_reconnect.sh must use mktemp instead of a hardcoded path."
+    is_quarantined = "DISABLED:" in text and "exit 2" in text
+    assert is_quarantined or "mktemp" in text, (
+        "force_gateway_reconnect.sh must be inert or use mktemp instead of " "a hardcoded path."
+    )
 
     # The old hardcoded path must not be present as a write target. The
     # comment-only mention in cleanup is fine, but we should not see
@@ -234,10 +234,11 @@ def test_force_gateway_reconnect_uses_mktemp():
         "python3 /tmp/test_gateway_accept.py" not in text
     ), "force_gateway_reconnect.sh must not exec from a predictable path."
 
-    # And it should clean up via trap.
-    assert (
+    # An active implementation must clean up via trap. The quarantined stub
+    # creates no temporary file.
+    assert is_quarantined or (
         "trap" in text and 'rm -f "$TMPFILE"' in text
-    ), "force_gateway_reconnect.sh must clean up its tempfile via trap."
+    ), "force_gateway_reconnect.sh must be inert or clean up its tempfile via trap."
 
 
 # ---------------------------------------------------------------------------
@@ -497,16 +498,20 @@ async def test_subprocess_client_rejects_symlinked_external_venv(monkeypatch, tm
 
 
 def test_start_runner_sh_enforces_readonly_ibn_m3():
-    """IBN-M3: scripts/start_runner.sh (the dashboard "Start" button path) must
-    apply the same anchored case-insensitive ReadOnlyApi=yes grep that
-    START_TRADER.sh and start_gateway.sh now use.
+    """IBN-M3: the legacy dashboard launcher must not bypass read-only safety.
+
+    PR-01 quarantines this alternate path entirely.  If it is ever restored,
+    the original anchored ReadOnlyApi validation remains mandatory.
     """
     import pathlib
 
     text = pathlib.Path("scripts/start_runner.sh").read_text()
-    assert (
-        "grep -Eqi" in text and "readonlyapi" in text.lower()
-    ), "start_runner.sh must include the same ReadOnlyApi grep guard as the other start paths"
+    is_quarantined = "DISABLED:" in text and "exit 2" in text and "pkill" not in text
+    has_readonly_guard = "grep -Eqi" in text and "readonlyapi" in text.lower()
+    assert is_quarantined or has_readonly_guard, (
+        "start_runner.sh must be inert or include the same ReadOnlyApi guard "
+        "as the authoritative launcher"
+    )
 
 
 def test_gateway_manager_start_refuses_without_readonly_ibn_h1():
@@ -521,11 +526,76 @@ def test_gateway_manager_start_refuses_without_readonly_ibn_h1():
 
     source = inspect.getsource(gm.start_gateway)
     assert (
-        "_READONLY_API_RE" in source
-    ), "start_gateway must reference _READONLY_API_RE before launching the Gateway"
+        "_ibc_safety_file_error" in source
+    ), "start_gateway must validate the complete IBC safety contract before launching Gateway"
     # It's the same regex used by show_status, so cross-check it works.
     assert gm._READONLY_API_RE.search("ReadOnlyApi=yes") is not None
     assert gm._READONLY_API_RE.search("ReadOnlyApi=no") is None
+
+
+@pytest.mark.parametrize(
+    ("config_text", "accepted"),
+    [
+        ("ReadOnlyApi=yes\nTradingMode=paper\n", True),
+        (" readonlyapi = YES \n tradingmode = PAPER \n", True),
+        ("TradingMode=paper\n", False),
+        ("ReadOnlyApi=yes\n", False),
+        ("ReadOnlyApi=no\nTradingMode=paper\n", False),
+        ("ReadOnlyApi=yes\nTradingMode=live\n", False),
+        ("ReadOnlyApi=yes\nReadOnlyApi=yes\nTradingMode=paper\n", False),
+        ("ReadOnlyApi=yes\nReadOnlyApi=no\nTradingMode=paper\n", False),
+        ("ReadOnlyApi=yes\nTradingMode=paper\nTradingMode=paper\n", False),
+        ("ReadOnlyApi=yes\nTradingMode=paper\nTradingMode=live\n", False),
+    ],
+)
+def test_gateway_manager_requires_unambiguous_ibc_safety_settings(config_text, accepted):
+    import scripts.gateway_manager as gm
+
+    assert (gm._ibc_safety_config_error(config_text) is None) is accepted
+
+
+def test_gateway_manager_restart_validates_before_stopping_gateway(monkeypatch, tmp_path):
+    import scripts.gateway_manager as gm
+
+    unsafe_config = tmp_path / "config.ini"
+    unsafe_config.write_text(
+        "ReadOnlyApi=yes\nReadOnlyApi=no\nTradingMode=paper\n",
+        encoding="utf-8",
+    )
+    stopped = False
+
+    def record_stop():
+        nonlocal stopped
+        stopped = True
+        return True
+
+    monkeypatch.setattr(gm, "IBC_CONFIG", unsafe_config)
+    monkeypatch.setattr(gm, "stop_gateway", record_stop)
+
+    assert gm.restart_gateway("paper") is False
+    assert stopped is False
+
+
+def test_gateway_manager_start_validates_before_running_gateway_shortcut(monkeypatch, tmp_path):
+    import scripts.gateway_manager as gm
+
+    unsafe_config = tmp_path / "config.ini"
+    unsafe_config.write_text(
+        "ReadOnlyApi=yes\nTradingMode=paper\nTradingMode=live\n",
+        encoding="utf-8",
+    )
+    process_checked = False
+
+    def record_process_check():
+        nonlocal process_checked
+        process_checked = True
+        return True
+
+    monkeypatch.setattr(gm, "IBC_CONFIG", unsafe_config)
+    monkeypatch.setattr(gm, "is_gateway_running", record_process_check)
+
+    assert gm.start_gateway("paper") is False
+    assert process_checked is False
 
 
 def test_gateway_manager_start_uses_env_allowlist_ibn_h2():
@@ -550,6 +620,221 @@ def test_gateway_manager_start_uses_env_allowlist_ibn_h2():
     assert (
         "os.environ.copy()" not in code_only
     ), "start_gateway code must not call os.environ.copy() (IBN-H2)."
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["gateway_manager.py", "start", "--paper"],
+        ["gateway_manager.py", "stop"],
+        ["gateway_manager.py", "restart", "--paper"],
+        ["gateway_manager.py", "restart", "--help"],
+        ["gateway_manager.py", "clear-zombies"],
+    ],
+)
+def test_gateway_manager_operator_lifecycle_commands_fail_closed(monkeypatch, capsys, argv):
+    """Operators must enter every Gateway lifecycle through START_TRADER."""
+    import scripts.gateway_manager as gm
+
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.delenv(gm._INTERNAL_LIFECYCLE_ENV, raising=False)
+    monkeypatch.setattr(gm, "PLATFORM", "Darwin")
+    monkeypatch.setattr(
+        gm,
+        "start_gateway",
+        lambda *args, **kwargs: pytest.fail("direct lifecycle command executed"),
+    )
+    monkeypatch.setattr(
+        gm,
+        "stop_gateway",
+        lambda *args, **kwargs: pytest.fail("direct lifecycle command executed"),
+    )
+    monkeypatch.setattr(
+        gm,
+        "restart_gateway",
+        lambda *args, **kwargs: pytest.fail("direct lifecycle command executed"),
+    )
+    monkeypatch.setattr(
+        gm,
+        "get_zombie_connections",
+        lambda *args, **kwargs: pytest.fail("direct lifecycle command executed"),
+    )
+
+    assert gm.main() == 2
+    captured = capsys.readouterr()
+    assert "./START_TRADER.sh" in captured.err
+    assert "Refusing direct Gateway lifecycle command" in captured.err
+
+
+def test_gateway_manager_status_remains_operator_available(monkeypatch):
+    """The read-only status command remains callable without an internal marker."""
+    import scripts.gateway_manager as gm
+
+    called = False
+
+    def record_status():
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(sys, "argv", ["gateway_manager.py", "status"])
+    monkeypatch.delenv(gm._INTERNAL_LIFECYCLE_ENV, raising=False)
+    monkeypatch.setattr(gm, "PLATFORM", "Darwin")
+    monkeypatch.setattr(gm, "show_status", record_status)
+
+    assert gm.main() == 0
+    assert called is True
+
+
+def test_gateway_manager_internal_recovery_marker_allows_restart(monkeypatch):
+    """Persistent recovery may retain the existing internal restart function."""
+    import scripts.gateway_manager as gm
+
+    called = False
+
+    def record_restart(mode):
+        nonlocal called
+        called = True
+        assert mode == "paper"
+        return True
+
+    monkeypatch.setattr(sys, "argv", ["gateway_manager.py", "restart", "--paper"])
+    monkeypatch.setenv(gm._INTERNAL_LIFECYCLE_ENV, gm._INTERNAL_LIFECYCLE_VALUE)
+    monkeypatch.setattr(gm, "_parent_is_runner", lambda: True)
+    monkeypatch.setattr(gm, "PLATFORM", "Darwin")
+    lifecycle_events = []
+
+    class FakeLifecycleLock:
+        def __init__(self, path):
+            lifecycle_events.append(("created", path))
+
+        def acquire(self):
+            lifecycle_events.append(("acquired", None))
+            return True
+
+        def release(self):
+            lifecycle_events.append(("released", None))
+
+    monkeypatch.setattr(gm, "RuntimeLifecycleLock", FakeLifecycleLock)
+    monkeypatch.setattr(gm, "restart_gateway", record_restart)
+
+    assert gm.main() == 0
+    assert called is True
+    assert [event[0] for event in lifecycle_events] == ["created", "acquired", "released"]
+
+
+def test_gateway_manager_internal_recovery_rejects_held_lifecycle_lock(monkeypatch, capsys):
+    """A launcher-owned lock blocks an otherwise-authorized recovery child."""
+    import scripts.gateway_manager as gm
+
+    class HeldLifecycleLock:
+        def __init__(self, path):
+            self.path = path
+
+        def acquire(self):
+            return False
+
+        def release(self):
+            pytest.fail("an unacquired lock must not be released")
+
+    monkeypatch.setattr(sys, "argv", ["gateway_manager.py", "restart", "--paper"])
+    monkeypatch.setenv(gm._INTERNAL_LIFECYCLE_ENV, gm._INTERNAL_LIFECYCLE_VALUE)
+    monkeypatch.setattr(gm, "_parent_is_runner", lambda: True)
+    monkeypatch.setattr(gm, "PLATFORM", "Darwin")
+    monkeypatch.setattr(gm, "RuntimeLifecycleLock", HeldLifecycleLock)
+    monkeypatch.setattr(
+        gm,
+        "restart_gateway",
+        lambda *args, **kwargs: pytest.fail("concurrent recovery executed"),
+    )
+
+    assert gm.main() == 75
+    assert "Refusing concurrent Gateway recovery" in capsys.readouterr().err
+
+
+def test_gateway_manager_marker_without_runner_parent_is_rejected(monkeypatch, capsys):
+    """An operator cannot unlock lifecycle commands by setting the marker."""
+    import scripts.gateway_manager as gm
+
+    monkeypatch.setattr(sys, "argv", ["gateway_manager.py", "restart", "--paper"])
+    monkeypatch.setenv(gm._INTERNAL_LIFECYCLE_ENV, gm._INTERNAL_LIFECYCLE_VALUE)
+    monkeypatch.setattr(gm, "_parent_is_runner", lambda: False)
+    monkeypatch.setattr(gm, "PLATFORM", "Darwin")
+    monkeypatch.setattr(
+        gm,
+        "restart_gateway",
+        lambda *args, **kwargs: pytest.fail("direct lifecycle command executed"),
+    )
+
+    assert gm.main() == 2
+    assert "Refusing direct Gateway lifecycle command" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("/usr/bin/python3 -m robo_trader.runner_async --symbols AAPL", True),
+        ("/usr/bin/python3 /repo/robo_trader/runner_async.py", True),
+        ("/bin/zsh -l", False),
+        ("/usr/bin/python3 scripts/gateway_manager.py restart --paper", False),
+    ],
+)
+def test_gateway_manager_parent_runner_check(monkeypatch, command, expected):
+    """Internal lifecycle authorization is tied to the actual parent command."""
+    import scripts.gateway_manager as gm
+
+    monkeypatch.setattr(
+        gm.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, command, ""),
+    )
+
+    assert gm._parent_is_runner() is expected
+
+
+def test_gateway_manager_public_help_hides_lifecycle_commands(monkeypatch, capsys):
+    """The public CLI advertises status only."""
+    import scripts.gateway_manager as gm
+
+    monkeypatch.setattr(sys, "argv", ["gateway_manager.py", "--help"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        gm.main()
+
+    assert exc_info.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "{status}" in help_text
+    assert "{start" not in help_text
+    assert "clear-zombies" not in help_text
+
+
+def test_gateway_manager_lifecycle_lock_matches_authoritative_launcher():
+    """Shell startup and runner recovery use the same atomic lock module."""
+    import scripts.gateway_manager as gm
+
+    launcher = (PROJECT_ROOT / "START_TRADER.sh").read_text()
+
+    assert '"$SCRIPT_DIR/robo_trader/runtime_lifecycle_lock.py"' in launcher
+    assert 'mkdir "$STARTUP_LOCK' not in launcher
+    assert gm._RUNTIME_LIFECYCLE_LOCK_PATH == Path(f"/tmp/robotrader-runtime-{os.getuid()}.lock")
+
+
+def test_robust_connection_sets_internal_marker_for_gateway_recovery(monkeypatch):
+    """The runner's persistent recovery explicitly identifies its child."""
+    import robo_trader.utils.robust_connection as rc
+
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+
+    monkeypatch.setattr(rc.os.path, "exists", lambda path: True)
+    monkeypatch.setattr(rc.subprocess, "run", fake_run)
+
+    assert rc.restart_gateway_for_zombies(port=4002, timeout=1) is False
+    assert "restart" in captured["argv"]
+    assert captured["env"][rc._INTERNAL_GATEWAY_RECOVERY_ENV] == rc._INTERNAL_GATEWAY_RECOVERY_VALUE
 
 
 # ---------------------------------------------------------------------------

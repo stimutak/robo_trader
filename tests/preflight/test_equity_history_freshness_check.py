@@ -86,14 +86,127 @@ def _freeze_market_time(monkeypatch: pytest.MonkeyPatch, when: datetime) -> None
     )
 
 
+def _create_equity_db(db_path: Path, timestamp: str) -> None:
+    """Create a minimal ledger with one equity snapshot at ``timestamp``."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("""
+            CREATE TABLE equity_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id TEXT NOT NULL DEFAULT 'default',
+                date TEXT NOT NULL,
+                equity REAL NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """)
+        conn.execute(
+            "INSERT INTO equity_history "
+            "(portfolio_id, date, equity, timestamp) VALUES (?, ?, ?, ?)",
+            ("default", timestamp[:10], 100_000.0, timestamp),
+        )
+
+
 class TestDBFileMissing:
     def test_missing_db_blocks(self, preflight_context: PreflightContext) -> None:
         # tmp_path has no trading_data.db by default.
         result = EquityHistoryFreshnessCheck().run(preflight_context)
         assert result.status is CheckStatus.BLOCK
-        assert "trading_data.db not found" in result.message
-        assert "START_TRADER.sh" in result.remediation
+        assert "configured trading database not found" in result.message
+        assert "Do not create or replace" in result.remediation
         assert result.details["db_path"].endswith("trading_data.db")
+
+
+class TestConfiguredDBPath:
+    def test_relative_path_is_resolved_from_project_root(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        now = datetime(2026, 5, 20, 10, 30, 0)
+        db_path = tmp_path / "data" / "paper-ledger.db"
+        _create_equity_db(db_path, now.strftime("%Y-%m-%d %H:%M:%S"))
+        context = PreflightContext.for_test(
+            tmp_path,
+            env={"RT_DB_PATH": "data/paper-ledger.db"},
+        )
+        _freeze_market_time(monkeypatch, now)
+
+        result = EquityHistoryFreshnessCheck().run(context)
+
+        assert result.status is CheckStatus.PASS
+        assert result.details["db_path"] == str(db_path)
+        assert str(db_path) in result.message
+
+    def test_absolute_path_is_preserved(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        now = datetime(2026, 5, 20, 10, 30, 0)
+        db_path = tmp_path / "external" / "paper-ledger.db"
+        _create_equity_db(db_path, now.strftime("%Y-%m-%d %H:%M:%S"))
+        unrelated_root = tmp_path / "project"
+        context = PreflightContext.for_test(
+            unrelated_root,
+            env={"RT_DB_PATH": str(db_path)},
+        )
+        _freeze_market_time(monkeypatch, now)
+
+        result = EquityHistoryFreshnessCheck().run(context)
+
+        assert result.status is CheckStatus.PASS
+        assert result.details["db_path"] == str(db_path)
+        assert str(unrelated_root) not in result.details["db_path"]
+
+    def test_fresh_default_ledger_does_not_mask_missing_configured_ledger(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        now = datetime(2026, 5, 20, 10, 30, 0)
+        _create_equity_db(
+            tmp_path / "trading_data.db",
+            now.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        configured_path = tmp_path / "data" / "missing-paper-ledger.db"
+        context = PreflightContext.for_test(
+            tmp_path,
+            env={"RT_DB_PATH": "data/missing-paper-ledger.db"},
+        )
+        _freeze_market_time(monkeypatch, now)
+
+        result = EquityHistoryFreshnessCheck().run(context)
+
+        assert result.status is CheckStatus.BLOCK
+        assert result.details["db_path"] == str(configured_path)
+        assert str(configured_path) in result.message
+        assert str(configured_path) in result.remediation
+
+    def test_fresh_default_ledger_does_not_mask_stale_configured_ledger(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        now = datetime(2026, 5, 20, 10, 30, 0)
+        _create_equity_db(
+            tmp_path / "trading_data.db",
+            now.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        configured_path = tmp_path / "ledgers" / "paper.db"
+        _create_equity_db(configured_path, "2026-05-13 16:30:00")
+        context = PreflightContext.for_test(
+            tmp_path,
+            env={"RT_DB_PATH": "ledgers/paper.db"},
+        )
+        _freeze_market_time(monkeypatch, now)
+
+        result = EquityHistoryFreshnessCheck().run(context)
+
+        assert result.status is CheckStatus.BLOCK
+        assert result.details["db_path"] == str(configured_path)
+        assert result.details["trading_days_elapsed"] == 5
+        assert str(configured_path) in result.message
+        assert str(configured_path) in result.remediation
 
 
 class TestEmptyTable:

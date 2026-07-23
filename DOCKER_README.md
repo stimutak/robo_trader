@@ -50,9 +50,10 @@ The Docker setup includes:
 
 Key variables in `.env`:
 
-- `TRADING_MODE`: paper or live trading
+- `EXECUTION_MODE`: fixed to `paper` during remediation
+- `TRADING_MODE`: temporary legacy alias, also fixed to `paper`
 - `IBKR_HOST`: IBKR Gateway/TWS host
-- `IBKR_PORT`: 7497 (paper) or 4001 (live)
+- `IBKR_PORT`: 4002 for the supported IB Gateway paper topology
 - `TRADING_SYMBOLS`: Comma-separated symbol list
 - `RISK_MAX_POSITION_SIZE`: Maximum position size in USD
 

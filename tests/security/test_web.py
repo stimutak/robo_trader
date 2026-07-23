@@ -138,22 +138,24 @@ def test_websocket_xss_helper_escapes_html(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_start_trading_does_not_leak_subprocess_output(monkeypatch):
+def test_start_trading_is_disabled_and_does_not_spawn_subprocess(monkeypatch):
     app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
     client = app_mod.app.test_client()
     token = "csrf-token-value"
     client.set_cookie("csrf_token", token, domain="localhost")
 
     fake = MagicMock(returncode=0, stdout="SECRET STDOUT TOKEN", stderr="SECRET STDERR TOKEN")
-    with patch("subprocess.run", return_value=fake):
+    with patch("subprocess.run", return_value=fake) as mock_run:
         resp = client.post(
             "/api/start",
             json={"symbols": ["AAPL"]},
             headers={"X-CSRF-Token": token},
         )
 
-    assert resp.status_code == 200
+    assert resp.status_code == 409
     payload = resp.get_json() or {}
+    assert payload.get("error") == "authoritative_launcher_required"
+    mock_run.assert_not_called()
     # No raw subprocess fields leaked.
     assert "output" not in payload
     assert "stdout" not in payload
@@ -216,6 +218,47 @@ def test_security_headers_present_on_json_endpoint(monkeypatch):
     assert resp.headers.get("X-Frame-Options") == "DENY"
     assert resp.headers.get("X-Content-Type-Options") == "nosniff"
     assert "frame-ancestors 'none'" in resp.headers.get("Content-Security-Policy", "")
+
+
+def test_gateway_diagnostic_uses_resolved_absolute_lsof(monkeypatch):
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    monkeypatch.setattr(app_mod, "_resolve_lsof_binary", lambda: "/usr/sbin/lsof")
+    probes = [
+        MagicMock(
+            returncode=0,
+            stdout="java 123 trader TCP *:4002 (LISTEN)\n",
+            stderr="",
+        ),
+        MagicMock(
+            returncode=0,
+            stdout="python3 456 trader TCP 127.0.0.1:4002 (ESTABLISHED)\n",
+            stderr="",
+        ),
+    ]
+
+    with patch.object(app_mod.subprocess, "run", side_effect=probes) as run:
+        status = app_mod.check_ibkr_connection()
+
+    assert status["diagnostic_available"] is True
+    assert status["gateway_available"] is True
+    assert status["api_connected"] is True
+    assert len(run.call_args_list) == 2
+    assert all(call.args[0][0] == "/usr/sbin/lsof" for call in run.call_args_list)
+
+
+def test_missing_lsof_is_reported_as_unavailable_not_gateway_down(monkeypatch):
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    monkeypatch.setattr(app_mod, "_resolve_lsof_binary", lambda: None)
+
+    with patch.object(app_mod.subprocess, "run") as run:
+        status = app_mod.check_ibkr_connection()
+
+    run.assert_not_called()
+    assert status["diagnostic_available"] is False
+    assert status["gateway_available"] is False
+    assert status["api_connected"] is False
+    assert status["status"] == "Gateway diagnostic unavailable"
+    assert status["diagnostic_error"] == "lsof is unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +489,55 @@ def test_kill_switch_status_reflects_state_file_b_13(tmp_path, monkeypatch):
     )
     body = resp.get_json()
     assert body is not None and body.get("triggered") is True, body
+
+
+def test_authenticated_kill_switch_reset_is_inert_during_remediation(tmp_path, monkeypatch):
+    """Even valid dashboard credentials and CSRF cannot clear safety state."""
+    monkeypatch.chdir(tmp_path)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    state_path = data_dir / "kill_switch_state.json"
+    lock_path = data_dir / "kill_switch.lock"
+    state_bytes = b'{"triggered": true, "reason": "position loss"}\n'
+    lock_bytes = b"deny-by-default\n"
+    state_path.write_bytes(state_bytes)
+    lock_path.write_bytes(lock_bytes)
+
+    app_mod = _reload_app(
+        monkeypatch,
+        DASH_AUTH_ENABLED="true",
+        DASH_USER="admin",
+        DASH_PASS_HASH=_password_hash("correctpass"),
+    )
+    client = app_mod.app.test_client()
+    token = "kill-switch-reset-token-32-chars"
+    credentials = base64.b64encode(b"admin:correctpass").decode()
+    headers = {
+        "Authorization": f"Basic {credentials}",
+        "X-CSRF-Token": token,
+    }
+    client.set_cookie("csrf_token", token, domain="localhost")
+
+    reset_response = client.post(
+        "/api/risk/kill-switch",
+        json={"action": "reset"},
+        headers=headers,
+    )
+
+    assert reset_response.status_code == 409
+    assert reset_response.get_json()["error"] == "kill_switch_reset_disabled"
+    assert state_path.read_bytes() == state_bytes
+    assert lock_path.read_bytes() == lock_bytes
+
+    status_response = client.post(
+        "/api/risk/kill-switch",
+        json={"action": "status"},
+        headers=headers,
+    )
+    assert status_response.status_code == 200
+    assert status_response.get_json()["triggered"] is True
+    assert state_path.read_bytes() == state_bytes
+    assert lock_path.read_bytes() == lock_bytes
 
 
 def test_start_endpoint_rejects_bad_symbol_b_9(monkeypatch):

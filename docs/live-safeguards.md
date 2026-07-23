@@ -1,25 +1,21 @@
-## Live Safeguards (Opt-in Only)
+## Live Trading Status: Disabled
 
-Paper mode is the default and recommended operation. Live mode requires explicit action and compliance with the following safeguards.
+Live order placement is intentionally unavailable during the remediation
+program defined in `docs/ROBOTRADER_REMEDIATION_PLAN_2026-07-20.md`.
 
-### Requirements
-1. All tests pass in CI.
-2. Risk checks identical to paper mode.
-3. `TRADING_MODE=live` in environment.
-4. Explicit runtime confirmation flag (e.g., `--confirm-live`).
-5. Max notional per order/day configured and enforced.
-6. Dry-run preview step before any session.
-7. Clear rollback switch to stop trading immediately.
+Current enforced boundary:
 
-### Operator Checklist
-- Verify environment values.
-- Confirm account, margin, and symbols.
-- Review throttling/pacing limits for IBKR.
-- Run dry-run and inspect planned orders.
-- Enable monitoring and alerts.
+1. `EXECUTION_MODE=paper` is canonical.
+2. The temporary `TRADING_MODE` alias must also be `paper`.
+3. Only supervised IB Gateway paper port 4002 is accepted; TWS port 7497 has no managed lifecycle.
+4. `IBKR_READONLY=true` is required.
+5. IBC must contain `ReadOnlyApi=yes`.
+6. `LiveExecutor` cannot be instantiated.
+7. `--confirm-live` is retained only as a compatibility flag and is rejected.
+8. The dashboard cannot start, stop, or restart the trading process.
+9. `START_TRADER.sh` is the only authorized full-system launcher.
 
-### Non-Goals
-- No predictive guarantees; prefer explainable logic.
-- No bypass of risk checks.
-
-
+The former opt-in checklist was not a complete live-order lifecycle and must not
+be restored. Live capability will be designed in PRs 11 and 12 of the
+remediation plan, then qualified through failure testing and a paper soak before
+the separately approved limited canary in PR 15.

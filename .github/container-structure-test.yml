@@ -23,6 +23,20 @@ metadataTest:
   workdir: /app
   entrypoint:
     - /usr/local/bin/entrypoint.sh
+  cmd:
+    - sh
+    - -c
+    - "echo 'DISABLED: container trader startup is not yet supported' >&2; exit 2"
   envVars:
+    - key: EXECUTION_MODE
+      value: paper
+    - key: TRADING_MODE
+      value: paper
+    - key: IBKR_HOST
+      value: 127.0.0.1
+    - key: IBKR_PORT
+      value: "4002"
+    - key: IBKR_READONLY
+      value: "true"
     - key: PYTHONUNBUFFERED
       value: "1"

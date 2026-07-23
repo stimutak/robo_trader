@@ -40,7 +40,20 @@ jobs:
       contents: read
       security-events: write
     env:
+      ENVIRONMENT: test
       EXECUTION_MODE: paper
+      TRADING_MODE: paper
+      IBKR_HOST: 127.0.0.1
+      IBKR_PORT: "4002"
+      IBKR_READONLY: "true"
+      IBKR_CLIENT_ID: "123"
+      IBKR_ACCOUNT: DU_CI_PAPER
+      IBKR_APPROVED_ACCOUNTS: DU_CI_PAPER
+      IBKR_ACCOUNT_TYPE: paper
+      RT_STATE_NAMESPACE: paper
+      RT_DB_PATH: /app/data/ci-paper.db
+      MODEL_ARTIFACT_SET: ci-fixtures
+      BUILD_ID: github-actions
 
     steps:
       - name: Checkout code
@@ -81,7 +94,7 @@ jobs:
         with:
           sarif_file: 'trivy-results.sarif'
 
-      - name: Test Docker image
+      - name: Test Docker image imports
         run: |
           # Exercise the installed entrypoint with a harmless command. Docker
           # networking is disabled and the database check is skipped, so this
@@ -92,17 +105,62 @@ jobs:
             -e IBKR_HOST=127.0.0.1 \
             -e IBKR_PORT=4002 \
             -e IBKR_READONLY=true \
+            -e IBKR_CLIENT_ID=123 \
+            -e IBKR_ACCOUNT=DU_CI_PAPER \
+            -e IBKR_APPROVED_ACCOUNTS=DU_CI_PAPER \
+            -e IBKR_ACCOUNT_TYPE=paper \
+            -e RT_STATE_NAMESPACE=paper \
+            -e RT_DB_PATH=/app/data/ci-paper.db \
+            -e MODEL_ARTIFACT_SET=ci-fixtures \
+            -e BUILD_ID=github-actions \
+            -e ENVIRONMENT=test \
+            -e LOG_LEVEL=DEBUG \
             -e CHECK_DATABASE=false \
             robotrader:test python3 -c \
             "import sys; import robo_trader; from robo_trader.config import load_config; from robo_trader.risk.advanced_risk import AdvancedRiskManager; from robo_trader.monitoring.production_monitor import ProductionMonitor; print('All imports successful'); sys.exit(0)"
 
-      - name: Test docker compose
+      - name: Verify trader command is intentionally inert
+        run: |
+          set +e
+          output="$(docker run --rm --network none \
+            -e EXECUTION_MODE=paper \
+            -e TRADING_MODE=paper \
+            -e IBKR_HOST=127.0.0.1 \
+            -e IBKR_PORT=4002 \
+            -e IBKR_READONLY=true \
+            -e IBKR_CLIENT_ID=123 \
+            -e IBKR_ACCOUNT=DU_CI_PAPER \
+            -e IBKR_APPROVED_ACCOUNTS=DU_CI_PAPER \
+            -e IBKR_ACCOUNT_TYPE=paper \
+            -e RT_STATE_NAMESPACE=paper \
+            -e RT_DB_PATH=/app/data/ci-paper.db \
+            -e MODEL_ARTIFACT_SET=ci-fixtures \
+            -e BUILD_ID=github-actions \
+            -e ENVIRONMENT=test \
+            robotrader:test 2>&1)"
+          rc=$?
+          set -e
+
+          printf '%s\n' "$output"
+          test "$rc" -eq 2
+          grep -F "DISABLED: container trader startup is not yet supported" <<<"$output"
+
+      - name: Validate docker compose containment
         env:
+          ENVIRONMENT: test
           EXECUTION_MODE: paper
           TRADING_MODE: paper
           IBKR_HOST: 127.0.0.1
           IBKR_PORT: "4002"
           IBKR_READONLY: "true"
+          IBKR_CLIENT_ID: "123"
+          IBKR_ACCOUNT: DU_CI_PAPER
+          IBKR_APPROVED_ACCOUNTS: DU_CI_PAPER
+          IBKR_ACCOUNT_TYPE: paper
+          RT_STATE_NAMESPACE: paper
+          RT_DB_PATH: /app/data/ci-paper.db
+          MODEL_ARTIFACT_SET: ci-fixtures
+          BUILD_ID: github-actions
           TRADING_SYMBOLS: AAPL
           STRATEGY_ENABLED_STRATEGIES: momentum
           RISK_MAX_POSITION_SIZE: "1000"
@@ -110,10 +168,30 @@ jobs:
           RISK_MAX_DAILY_LOSS: "100"
           GRAFANA_PASSWORD: ci-render-only
         run: |
-          # Render both compose topologies. Never start services in CI: the
-          # runner topology is intentionally broker-dependent.
-          docker compose -f docker-compose.yml config
-          docker compose -f deployment/docker-compose.prod.yml config
+          docker compose --profile unsupported-trader \
+            -f docker-compose.yml config --format json \
+            > compose-dev.json
+          docker compose --profile unsupported-trader \
+            -f deployment/docker-compose.prod.yml config --format json \
+            > compose-prod.json
+
+          jq -e '
+            .services["robo-trader"].environment.EXECUTION_MODE == "paper" and
+            .services["robo-trader"].environment.TRADING_MODE == "paper" and
+            .services["robo-trader"].environment.IBKR_PORT == "4002" and
+            .services["robo-trader"].environment.IBKR_READONLY == "true" and
+            (.services["robo-trader"].command | join(" ") |
+              contains("container trader startup is not yet supported"))
+          ' compose-dev.json
+
+          jq -e '
+            .services.trader.environment.EXECUTION_MODE == "paper" and
+            .services.trader.environment.TRADING_MODE == "paper" and
+            .services.trader.environment.IBKR_PORT == "4002" and
+            .services.trader.environment.IBKR_READONLY == "true" and
+            (.services.trader.command | join(" ") |
+              contains("container trader startup is not yet supported"))
+          ' compose-prod.json
 
       - name: Move cache
         run: |
@@ -153,11 +231,20 @@ jobs:
 
       - name: Render compose topologies without starting services
         env:
+          ENVIRONMENT: test
           EXECUTION_MODE: paper
           TRADING_MODE: paper
           IBKR_HOST: 127.0.0.1
           IBKR_PORT: "4002"
           IBKR_READONLY: "true"
+          IBKR_CLIENT_ID: "123"
+          IBKR_ACCOUNT: DU_CI_PAPER
+          IBKR_APPROVED_ACCOUNTS: DU_CI_PAPER
+          IBKR_ACCOUNT_TYPE: paper
+          RT_STATE_NAMESPACE: paper
+          RT_DB_PATH: /app/data/ci-paper.db
+          MODEL_ARTIFACT_SET: ci-fixtures
+          BUILD_ID: github-actions
           TRADING_SYMBOLS: AAPL
           STRATEGY_ENABLED_STRATEGIES: momentum
           RISK_MAX_POSITION_SIZE: "1000"
@@ -165,5 +252,29 @@ jobs:
           RISK_MAX_DAILY_LOSS: "100"
           GRAFANA_PASSWORD: ci-render-only
         run: |
-          docker compose -f docker-compose.yml config --quiet
-          docker compose -f deployment/docker-compose.prod.yml config --quiet
+          docker compose \
+            --profile unsupported-trader \
+            -f docker-compose.yml \
+            config --format json > compose-dev.json
+          docker compose \
+            --profile unsupported-trader \
+            -f deployment/docker-compose.prod.yml \
+            config --format json > compose-prod.json
+
+          jq -e '
+            .services["robo-trader"].environment.EXECUTION_MODE == "paper" and
+            .services["robo-trader"].environment.TRADING_MODE == "paper" and
+            .services["robo-trader"].environment.IBKR_PORT == "4002" and
+            .services["robo-trader"].environment.IBKR_READONLY == "true" and
+            (.services["robo-trader"].command | join(" ") |
+              contains("container trader startup is not yet supported"))
+          ' compose-dev.json
+
+          jq -e '
+            .services.trader.environment.EXECUTION_MODE == "paper" and
+            .services.trader.environment.TRADING_MODE == "paper" and
+            .services.trader.environment.IBKR_PORT == "4002" and
+            .services.trader.environment.IBKR_READONLY == "true" and
+            (.services.trader.command | join(" ") |
+              contains("container trader startup is not yet supported"))
+          ' compose-prod.json
