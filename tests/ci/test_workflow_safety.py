@@ -26,6 +26,24 @@ def test_docker_ci_uses_paper_gateway_identity_for_rendering() -> None:
     assert "IBKR_PORT=7497" not in workflow
 
 
+def test_docker_ci_exercises_entrypoint_without_network_or_trader_start() -> None:
+    workflow = _workflow("docker.yml")
+    image_test = workflow.split("- name: Test Docker image", maxsplit=1)[1].split(
+        "- name: Test docker compose",
+        maxsplit=1,
+    )[0]
+
+    assert "docker run --rm --network none" in image_test
+    assert "--entrypoint" not in image_test
+    assert "-e EXECUTION_MODE=paper" in image_test
+    assert "-e TRADING_MODE=paper" in image_test
+    assert "-e IBKR_PORT=4002" in image_test
+    assert "-e IBKR_READONLY=true" in image_test
+    assert "-e CHECK_DATABASE=false" in image_test
+    assert "robotrader:test python3 -c" in image_test
+    assert "runner_async" not in image_test
+
+
 def test_primary_ci_reports_baseline_isort_debt_and_gates_changed_files() -> None:
     workflow = _workflow("ci.yml")
 

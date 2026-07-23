@@ -83,9 +83,17 @@ jobs:
 
       - name: Test Docker image
         run: |
-          # Override ENTRYPOINT so validation cannot launch the runner or make
-          # any broker connection. This is an image/import smoke test only.
-          docker run --rm --entrypoint python3 robotrader:test -c \
+          # Exercise the installed entrypoint with a harmless command. Docker
+          # networking is disabled and the database check is skipped, so this
+          # validates startup sequencing without broker or service reachability.
+          docker run --rm --network none \
+            -e EXECUTION_MODE=paper \
+            -e TRADING_MODE=paper \
+            -e IBKR_HOST=127.0.0.1 \
+            -e IBKR_PORT=4002 \
+            -e IBKR_READONLY=true \
+            -e CHECK_DATABASE=false \
+            robotrader:test python3 -c \
             "import sys; import robo_trader; from robo_trader.config import load_config; from robo_trader.risk.advanced_risk import AdvancedRiskManager; from robo_trader.monitoring.production_monitor import ProductionMonitor; print('All imports successful'); sys.exit(0)"
 
       - name: Test docker compose
