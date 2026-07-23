@@ -81,12 +81,31 @@ _WORKER_ENV_ALLOWLIST = frozenset(
         "WINDIR",
     }
 )
+_LSOF_EXECUTABLE_CANDIDATES: tuple[Path, ...] = (
+    Path("/usr/sbin/lsof"),
+    Path("/usr/bin/lsof"),
+)
 _WORKER_BOOTSTRAP = (
     "import runpy,sys;"
     "root=sys.argv[1];worker=sys.argv[2];"
     "sys.path.insert(0,root);"
     "runpy.run_path(worker,run_name='__main__')"
 )
+
+
+def _trusted_lsof_executable() -> Path:
+    """Return one fixed, non-symlinked system lsof executable or fail closed."""
+    for candidate in _LSOF_EXECUTABLE_CANDIDATES:
+        if not candidate.is_absolute() or candidate.is_symlink():
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved != candidate or not resolved.is_file() or not os.access(resolved, os.X_OK):
+            continue
+        return resolved
+    raise IBKRError("Trusted absolute lsof executable is unavailable")
 
 
 def _is_interpreter_path_safe(resolved: Path, project_root: Path) -> bool:
@@ -1420,20 +1439,38 @@ class SubprocessIBKRClient:
             tuple: (zombie_count, error_message)
         """
         try:
-            import subprocess as sp
+            lsof_executable = _trusted_lsof_executable()
+            lsof_env = {
+                name: os.environ[name] for name in _WORKER_ENV_ALLOWLIST if name in os.environ
+            }
 
-            # Use lsof to check for CLOSE_WAIT connections on the port
+            # Use one approved absolute lsof binary with no inherited secrets,
+            # PATH lookup, working directory, or file descriptors.
             result = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: sp.run(
-                    ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:CLOSE_WAIT"],
+                lambda: subprocess.run(
+                    [
+                        str(lsof_executable),
+                        "-nP",
+                        f"-iTCP:{port}",
+                        "-sTCP:CLOSE_WAIT",
+                    ],
                     capture_output=True,
                     text=True,
                     timeout=5,
+                    close_fds=True,
+                    cwd="/",
+                    env=lsof_env,
                 ),
             )
 
-            if not result.stdout.strip():
+            stdout = result.stdout.strip()
+            stderr = result.stderr.strip()
+            if result.returncode == 1 and not stdout and not stderr:
+                return 0, "No zombies detected"
+            if result.returncode != 0 or stderr:
+                raise IBKRError("Trusted lsof zombie check failed")
+            if not stdout:
                 return 0, "No zombies detected"
 
             # Count zombie connections (skip header line)
@@ -1447,18 +1484,14 @@ class SubprocessIBKRClient:
             if zombie_count > 0:
                 error_msg = f"Found {zombie_count} CLOSE_WAIT zombie connection(s) on port {port}"
                 logger.warning("Zombie connections detected", count=zombie_count, port=port)
-                for line in lines:
-                    logger.warning("Zombie connection", connection=line.strip())
                 return zombie_count, error_msg
 
             return 0, "No zombies detected"
 
-        except FileNotFoundError:
-            logger.warning("lsof command not available - cannot check for zombies")
-            return 0, "lsof not available"
-        except Exception as e:
-            logger.warning("Error checking for zombie connections", error=str(e))
-            return 0, f"Error checking zombies: {e}"
+        except IBKRError:
+            raise
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise IBKRError("Trusted lsof zombie check failed") from exc
 
     @property
     def zombies_detected_before_connect(self) -> bool:

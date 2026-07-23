@@ -266,6 +266,94 @@ async def test_subprocess_worker_launch_isolated_from_cwd_pythonpath_and_secrets
     assert child_env["ROBOTRADER_WORKER_GENERATION_ID"]
 
 
+@pytest.mark.asyncio
+async def test_zombie_check_uses_absolute_lsof_with_secret_free_environment(
+    monkeypatch,
+):
+    from robo_trader.clients import subprocess_ibkr_client as mod
+
+    trusted_lsof = Path("/usr/sbin/lsof")
+    monkeypatch.setattr(mod, "_trusted_lsof_executable", lambda: trusted_lsof)
+    monkeypatch.setenv("PATH", "/attacker-controlled")
+    monkeypatch.setenv("IBKR_PASSWORD", "broker-secret")
+    monkeypatch.setenv("DASHBOARD_PASSWORD_HASH", "dashboard-secret")
+    monkeypatch.setenv("MODEL_SIGNING_KEY", "model-secret")
+
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured.update(args=args, kwargs=kwargs)
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+
+    client = mod.SubprocessIBKRClient()
+    assert await client._check_zombie_connections(4002) == (0, "No zombies detected")
+
+    assert captured["args"][0] == str(trusted_lsof)
+    assert Path(captured["args"][0]).is_absolute()
+    assert captured["kwargs"]["cwd"] == "/"
+    assert captured["kwargs"]["close_fds"] is True
+    child_env = captured["kwargs"]["env"]
+    assert set(child_env) <= mod._WORKER_ENV_ALLOWLIST
+    assert "PATH" not in child_env
+    assert "IBKR_PASSWORD" not in child_env
+    assert "DASHBOARD_PASSWORD_HASH" not in child_env
+    assert "MODEL_SIGNING_KEY" not in child_env
+
+
+@pytest.mark.asyncio
+async def test_zombie_check_never_falls_back_to_path_lookup(monkeypatch, tmp_path):
+    from robo_trader.clients import subprocess_ibkr_client as mod
+
+    attacker_lsof = tmp_path / "lsof"
+    attacker_lsof.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    attacker_lsof.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(
+        mod,
+        "_LSOF_EXECUTABLE_CANDIDATES",
+        (tmp_path / "missing-approved-lsof",),
+    )
+
+    def unexpected_run(*args, **kwargs):
+        raise AssertionError("PATH-resolved lsof must never execute")
+
+    monkeypatch.setattr(mod.subprocess, "run", unexpected_run)
+
+    client = mod.SubprocessIBKRClient()
+    with pytest.raises(mod.IBKRError, match="Trusted absolute lsof executable is unavailable"):
+        await client._check_zombie_connections(4002)
+
+
+@pytest.mark.asyncio
+async def test_zombie_check_fails_closed_without_exposing_lsof_stderr(monkeypatch):
+    from robo_trader.clients import subprocess_ibkr_client as mod
+
+    raw_secret = "DU1234567 broker-secret"
+    monkeypatch.setattr(
+        mod,
+        "_trusted_lsof_executable",
+        lambda: Path("/usr/sbin/lsof"),
+    )
+    monkeypatch.setattr(
+        mod.subprocess,
+        "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(
+            args,
+            1,
+            stdout="",
+            stderr=raw_secret,
+        ),
+    )
+
+    client = mod.SubprocessIBKRClient()
+    with pytest.raises(mod.IBKRError, match="Trusted lsof zombie check failed") as exc_info:
+        await client._check_zombie_connections(4002)
+
+    assert raw_secret not in str(exc_info.value)
+
+
 def test_subprocess_client_source_has_relative_to_check():
     """Belt-and-suspenders: the source must contain the relative_to() guard
     that anchors VIRTUAL_ENV to the project root (audit IB-M1)."""

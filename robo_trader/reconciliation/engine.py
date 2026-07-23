@@ -232,6 +232,12 @@ def reconcile(
             ),
         )
     )
+    execution_scope = broker.execution_scope
+    scoped_local_trades = tuple(
+        trade
+        for trade in ledger.recent_trades
+        if execution_scope.start_at <= trade.timestamp <= execution_scope.end_at
+    )
     local_trade_evidence = tuple(
         NonComparableEvidence(
             evidence_type="local_trade",
@@ -248,7 +254,7 @@ def reconcile(
             },
         )
         for trade in sorted(
-            ledger.recent_trades,
+            scoped_local_trades,
             key=lambda item: (item.timestamp, item.portfolio_id, item.local_trade_id),
         )
     )

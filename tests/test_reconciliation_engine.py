@@ -403,6 +403,30 @@ def test_uncorrelated_local_trade_is_incomplete_even_without_broker_execution():
     assert report.execution_comparisons[0].evidence_type == "local_trade"
 
 
+def test_local_trade_before_broker_execution_window_is_not_compared():
+    historical_trade = LedgerTrade(
+        local_trade_id=42,
+        portfolio_id="default",
+        symbol="AAPL",
+        side="BUY",
+        quantity=Decimal("3"),
+        price=Decimal("100"),
+        timestamp=NOW - timedelta(hours=25),
+    )
+    report = reconcile(
+        _snapshot(),
+        _ledger(trades=(historical_trade,)),
+        runtime_fingerprint="runtime",
+        database_identity="paper:db",
+        expected_account_alias="***4567",
+        now=NOW,
+    )
+
+    assert report.status == "QUANTITY_COST_COMPARABLE_ONLY"
+    assert report.execution_comparisons == ()
+    assert "BROKER_EXECUTIONS_CANNOT_BE_IDENTITY_MATCHED_TO_LOCAL_TRADES" not in report.caveats
+
+
 def test_public_report_rejects_account_fragments_in_metadata_and_execution_evidence():
     with pytest.raises(BrokerEvidenceError, match="sensitive identity"):
         reconcile(
