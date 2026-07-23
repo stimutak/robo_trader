@@ -44,7 +44,7 @@ class FakeSubprocessClient:
         return True
 
     async def get_accounts(self):
-        return ["DUN264991"]
+        return ["DU_TEST_PAPER"]
 
     async def stop(self):
         type(self).stop_call_count += 1
@@ -64,6 +64,7 @@ async def test_persistent_runner_starts_subprocess_only_once_across_cycles():
     runner.cfg.ibkr.host = "127.0.0.1"
     runner.cfg.ibkr.port = 4002
     runner.cfg.ibkr.client_id = 1
+    runner.cfg.ibkr.account = "DU_TEST_PAPER"
     runner._client_id = 1
     runner.portfolio_id = "default"
     runner.ib = None

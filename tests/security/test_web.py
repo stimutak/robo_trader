@@ -450,6 +450,55 @@ def test_kill_switch_status_reflects_state_file_b_13(tmp_path, monkeypatch):
     assert body is not None and body.get("triggered") is True, body
 
 
+def test_authenticated_kill_switch_reset_is_inert_during_remediation(tmp_path, monkeypatch):
+    """Even valid dashboard credentials and CSRF cannot clear safety state."""
+    monkeypatch.chdir(tmp_path)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    state_path = data_dir / "kill_switch_state.json"
+    lock_path = data_dir / "kill_switch.lock"
+    state_bytes = b'{"triggered": true, "reason": "position loss"}\n'
+    lock_bytes = b"deny-by-default\n"
+    state_path.write_bytes(state_bytes)
+    lock_path.write_bytes(lock_bytes)
+
+    app_mod = _reload_app(
+        monkeypatch,
+        DASH_AUTH_ENABLED="true",
+        DASH_USER="admin",
+        DASH_PASS_HASH=_password_hash("correctpass"),
+    )
+    client = app_mod.app.test_client()
+    token = "kill-switch-reset-token-32-chars"
+    credentials = base64.b64encode(b"admin:correctpass").decode()
+    headers = {
+        "Authorization": f"Basic {credentials}",
+        "X-CSRF-Token": token,
+    }
+    client.set_cookie("csrf_token", token, domain="localhost")
+
+    reset_response = client.post(
+        "/api/risk/kill-switch",
+        json={"action": "reset"},
+        headers=headers,
+    )
+
+    assert reset_response.status_code == 409
+    assert reset_response.get_json()["error"] == "kill_switch_reset_disabled"
+    assert state_path.read_bytes() == state_bytes
+    assert lock_path.read_bytes() == lock_bytes
+
+    status_response = client.post(
+        "/api/risk/kill-switch",
+        json={"action": "status"},
+        headers=headers,
+    )
+    assert status_response.status_code == 200
+    assert status_response.get_json()["triggered"] is True
+    assert state_path.read_bytes() == state_bytes
+    assert lock_path.read_bytes() == lock_bytes
+
+
 def test_start_endpoint_rejects_bad_symbol_b_9(monkeypatch):
     """B-9: /api/start must reject invalid symbol strings BEFORE invoking
     the subprocess, so a 200-char payload or control character cannot flow

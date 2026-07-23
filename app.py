@@ -7771,51 +7771,29 @@ def get_kelly_parameters(symbol):
 @requires_auth
 @csrf_required
 def control_kill_switch():
-    """Control kill switch (reset / disable / status).
-
-    B-13 (branch audit, HIGH): previously the `reset` action returned
-    success without touching the actual KillSwitch state, so the UI lied
-    to operators. Now we either:
-      - Drive the on-disk kill_switch_state.json + kill_switch.lock that
-        `KillSwitch` reads (this matches the persistence contract added by
-        R2-M1/M2), or
-      - Return 501 Not Implemented so the operator knows to use the CLI.
-    We pick the file-driven path so the UI is honest.
-    """
+    """Report kill-switch status while containment keeps resets local-only."""
     action = (request.json or {}).get("action", "status")
     state_path = Path("data/kill_switch_state.json")
     lock_path = Path("data/kill_switch.lock")
 
     if action == "reset":
-        # Drive the same on-disk state that KillSwitch._load_persisted_state
-        # reads. Removing both files mirrors KillSwitch.reset().
-        try:
-            cleared_state = False
-            cleared_lock = False
-            if state_path.exists():
-                state_path.unlink()
-                cleared_state = True
-            if lock_path.exists():
-                lock_path.unlink()
-                cleared_lock = True
-            logger.warning(
-                "kill-switch reset via dashboard",
-                cleared_state=cleared_state,
-                cleared_lock=cleared_lock,
-                remote_addr=request.remote_addr,
-            )
-            return jsonify(
+        # PR-01 containment: a dashboard request must never clear persisted
+        # safety state. Reset remains a supervised local operator procedure
+        # until elevated authorization and durable audit controls are built.
+        return (
+            jsonify(
                 {
-                    "success": True,
-                    "message": "Kill switch reset",
-                    "status": "active",
-                    "cleared_state_file": cleared_state,
-                    "cleared_lock_file": cleared_lock,
+                    "success": False,
+                    "error": "kill_switch_reset_disabled",
+                    "message": (
+                        "Dashboard kill-switch reset is disabled during remediation; "
+                        "use the supervised local operator procedure only after "
+                        "reconciling broker state."
+                    ),
                 }
-            )
-        except OSError:
-            logger.exception("kill-switch reset failed")
-            return jsonify({"success": False, "error": "internal_error"}), 500
+            ),
+            409,
+        )
     elif action == "disable":
         # "disable" is intentionally not supported via API — disabling the
         # kill switch without an audit trail is operator-error territory.

@@ -40,7 +40,9 @@ import os
 import sys
 import traceback
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Mapping, Optional
+
+from dotenv import dotenv_values
 
 # When invoked via START_TRADER.sh, the cwd is the repo root.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -49,6 +51,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from robo_trader.config import load_runtime_contract_from_env  # noqa: E402
 from robo_trader.preflight import PreflightContext  # noqa: E402
 from robo_trader.preflight.checks import ALL_CHECKS  # noqa: E402
 from robo_trader.preflight.result import CheckStatus  # noqa: E402
@@ -58,7 +61,6 @@ from robo_trader.preflight.runner import (  # noqa: E402
     format_plaintext,
     run_all_checks,
 )
-from robo_trader.config import load_runtime_contract_from_env  # noqa: E402
 from robo_trader.utils.secure_config import ConfigValidationError  # noqa: E402
 
 # Reason denylist (spec §6.3 step 4): reject obviously-low-effort
@@ -115,10 +117,10 @@ def _build_argparser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_target_port() -> int:
+def _resolve_target_port(environ: Optional[Mapping[str, str]] = None) -> int:
     """Resolve the validated paper Gateway port from the runtime contract."""
     try:
-        contract = load_runtime_contract_from_env()
+        contract = load_runtime_contract_from_env(environ)
         if contract.execution_mode != "paper":
             raise ValueError(
                 "Preflight starts the supervised broker runtime; "
@@ -131,18 +133,40 @@ def _resolve_target_port() -> int:
         raise ValueError(str(exc)) from exc
 
 
+def _resolve_environment(project_root: Path) -> dict[str, str]:
+    """Return one fail-closed snapshot of ``.env`` overlaid by the process env.
+
+    ``START_TRADER.sh`` intentionally exports only a small containment subset,
+    while account identity and other runtime-contract values normally remain in
+    the checkout's ``.env`` file.  Read that file without mutating
+    ``os.environ``, then overlay the actual process environment so an operator
+    or launchd override remains authoritative.
+    """
+
+    dotenv_env = dotenv_values(project_root / ".env")
+    missing_values = sorted(key for key, value in dotenv_env.items() if value is None)
+    if missing_values:
+        raise ConfigValidationError(
+            "Malformed .env entries without values: " + ", ".join(missing_values)
+        )
+
+    resolved = {key: value for key, value in dotenv_env.items() if value is not None}
+    resolved.update(os.environ)
+    return resolved
+
+
 def _build_context(project_root: Path) -> PreflightContext:
     """Build the shared PreflightContext from the resolved env.
 
-    Env is snapshotted into a plain dict here so the checks see the same
-    state regardless of subprocess timing. We do NOT call ``load_dotenv``
-    in this script — START_TRADER.sh has already exported `.env` into
-    the shell environment by the time this runs.
+    Env is snapshotted into a plain dict here so contract validation and every
+    check see the same state regardless of subprocess timing.  Values exported
+    in the process environment override the checkout's ``.env`` file.
     """
+    resolved_env = _resolve_environment(project_root)
     return PreflightContext(
         project_root=project_root,
-        env=dict(os.environ),
-        target_port=_resolve_target_port(),
+        env=resolved_env,
+        target_port=_resolve_target_port(resolved_env),
         dry_run=False,
     )
 

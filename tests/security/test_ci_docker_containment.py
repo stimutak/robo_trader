@@ -74,3 +74,24 @@ def test_compose_traders_are_opt_in_inert_services():
         assert env["TRADING_MODE"] == "paper"
         assert env["IBKR_READONLY"] == "true"
         assert "4002" in env["IBKR_PORT"]
+
+
+def test_kubernetes_trader_is_scaled_to_zero_and_inert():
+    documents = list(
+        yaml.safe_load_all((ROOT / "deployment" / "k8s" / "deployment.yaml").read_text())
+    )
+    deployment = next(document for document in documents if document.get("kind") == "Deployment")
+    container = deployment["spec"]["template"]["spec"]["containers"][0]
+    launch = " ".join(
+        str(part)
+        for part in (
+            *container.get("command", []),
+            *container.get("args", []),
+        )
+    )
+
+    assert deployment["spec"]["replicas"] == 0
+    assert "unsupported during remediation" in launch
+    assert "exit 2" in launch
+    assert "runner_async" not in launch
+    assert "START_TRADER.sh" not in launch
