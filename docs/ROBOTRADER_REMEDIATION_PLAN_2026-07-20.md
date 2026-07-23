@@ -7,7 +7,14 @@ Target: safe supervised paper operation first, then remote read-only access, the
 
 Current execution baseline (2026-07-23): `main` includes the truthful Phase 0
 CI gates from PR #83 (`7f5de0a`) and runtime-stability fixes from PR #81
-(`b7e5005`). PR #82 is the active PR 1 containment change.
+(`b7e5005`). PR #82 completed PR 1 and merged as `393f533`. PR #80 is
+superseded and must not be merged or cherry-picked; its independent findings
+are assigned to later scoped PRs in
+`docs/branch_analysis/PR80_DISPOSITION_2026-07-23.md`. PR 1A is now the next
+gate because a read-only incident reconstruction proved that an uncorrelated
+timed-out broker response can be relabeled as another symbol and reach stop
+logic. PR 1B then supplies the non-mutating broker-versus-ledger evidence
+required before any restart decision.
 
 ## 1. Purpose
 
@@ -72,14 +79,18 @@ Recommended branch naming: `codex/pr-XX-short-name` or the team's equivalent fea
 The required order is:
 
 1. PR 1 preserves the safe paper-only boundary and removes destructive hazards.
-2. PRs 2 through 5 make active paper behavior safe and state authoritative.
-3. PR 6 repairs the evidence engine used to evaluate strategies.
-4. PR 7 unifies strategy and risk behavior on top of corrected data and state.
-5. PRs 8 through 10 establish remote security, reproducible delivery, and honest operations.
-6. PRs 11 and 12 add live order placement and broker-native protection behind a disabled gate.
-7. PR 13 proves failure behavior through soak and fault injection.
-8. PR 14 delivers an explicitly supported remote/cloud topology if still required.
-9. PR 15 permits only a tiny, manually armed live canary.
+2. PR 1A closes the active cross-symbol market-data contamination path before
+   any safety exit can be allowed through a kill switch.
+3. PR 1B adds non-mutating broker-versus-ledger reconciliation and resolves the
+   incident evidence gate without clearing safety state.
+4. PRs 2 through 5 make active paper behavior safe and state authoritative.
+5. PR 6 repairs the evidence engine used to evaluate strategies.
+6. PR 7 unifies strategy and risk behavior on top of corrected data and state.
+7. PRs 8 through 10 establish remote security, reproducible delivery, and honest operations.
+8. PRs 11 and 12 add live order placement and broker-native protection behind a disabled gate.
+9. PR 13 proves failure behavior through soak and fault injection.
+10. PR 14 delivers an explicitly supported remote/cloud topology if still required.
+11. PR 15 permits only a tiny, manually armed live canary.
 
 PRs may be prepared in parallel only when their files and safety contracts do not overlap. Merge order still follows the dependency chain.
 
@@ -144,6 +155,159 @@ Make the current paper/read-only boundary unambiguous, machine-enforced, and vis
 ### Rollback
 
 Revert only to the previous paper launcher. Never restore destructive utility behavior.
+
+## PR 1A - Fail closed on broker-data correlation
+
+### Objective
+
+Prevent a delayed or timed-out IBKR response from being assigned to another
+symbol, and prevent malformed historical timestamps from overwriting the
+evidence needed to detect contamination.
+
+This is an incident-driven prerequisite discovered on 2026-07-23. A timed-out
+historical-data request left a response in an uncorrelated FIFO queue. Later
+requests consumed shifted responses, a quote for one symbol was labeled as
+another symbol, and the mislabeled value immediately triggered position-loss
+and stop logic. The stop did not execute because the kill switch blocked all
+orders. Therefore PR 2 must not enable reduce-only exits until PR 1A is merged
+and verified.
+
+### Problems addressed
+
+- RT-010 and RT-033.
+- Subprocess requests and responses have no correlation identifier.
+- A timeout does not invalidate or drain the uncertain worker session.
+- Market-data responses are trusted without contract-symbol or conId
+  verification.
+- Historical bars persist a DataFrame RangeIndex instead of normalized market
+  timestamps, so later cycles overwrite history.
+- Cross-symbol contamination can reach risk checks, stop-loss logic, account
+  values, and the database.
+
+### Step-by-step work
+
+1. Version every command and response envelope with a worker-generation
+   identifier, request identifier, and command name.
+2. Match responses by request and worker-generation identifier; reject missing,
+   duplicate, stale, malformed, or unexpected identifiers.
+3. After any timeout or protocol uncertainty, terminate and recreate the worker
+   session and all response state before accepting another response. Never
+   automatically retry the uncertain request.
+4. Include requested and returned contract identity in each response: symbol,
+   conId, exchange, currency, request type, and observation timestamp.
+5. Reject mismatched or incomplete identities before updating risk, stops,
+   positions, account values, caches, or persistent state.
+6. Normalize historical bars to validated timezone-aware timestamps from the
+   broker payload. Reject RangeIndex, duplicate, non-monotonic, future, or
+   session-invalid timestamps.
+7. Make persistence append or upsert by the validated timestamp and contract
+   identity; never overwrite another symbol or cycle silently.
+8. Pass broker event time into freshness checks. Receipt time must not make a
+   stale bar appear current.
+9. Poison and disconnect the client generation on timeout, cancellation,
+   malformed envelopes, reader failure, or identity mismatch. Reject queued and
+   new commands until recovery creates an isolated generation.
+10. Abort the remaining symbol cycle after protocol poison and surface the
+    failure to connection health.
+
+### Required tests
+
+- A delayed response after timeout cannot satisfy the next request.
+- Out-of-order, duplicate, missing-ID, and unknown-ID responses fail closed.
+- A symbol or conId mismatch cannot reach risk or stop callbacks.
+- Timeout recovery starts a clean worker session and cannot reuse queued data.
+- Cancellation followed by a late response cannot affect another request.
+- Missing, wrong, duplicate, stale-generation, or malformed envelopes poison
+  the transport.
+- A deterministic three-symbol sequence proves no response shifting.
+- RangeIndex and malformed timestamps are rejected.
+- Valid timezone-aware bars persist without cross-cycle overwrite.
+- Cross-symbol payload duplication is detected before persistence.
+- Protocol failure produces no database write, cache update, latest-price
+  update, strategy call, trailing-stop adjustment, or stop execution.
+
+### Done means
+
+- Every accepted broker-data response is bound to the exact originating
+  request and contract.
+- A timeout cannot contaminate a later request.
+- Invalid data cannot reach trading, risk, stop, valuation, or persistence
+  consumers.
+- Historical rows retain auditable market timestamps.
+- The incident scenario passes deterministic failure-injection tests.
+
+### Non-goals
+
+- Do not migrate or rewrite historical rows.
+- Do not correct positions, account values, kill-switch state, or lock files.
+- Do not connect to the broker while running unit and failure-injection tests.
+- Defer broader source lineage, session policy, and real-time feed unification
+  to PR 3.
+
+## PR 1B - Add read-only broker-ledger reconciliation
+
+### Objective
+
+Produce the broker evidence required to explain the incident and authorize any
+later state correction without placing orders or mutating local data.
+
+### Problems addressed
+
+- No safe read-only broker-versus-ledger reconciliation command exists.
+- Preflight guidance points to a nonexistent reconciliation script.
+- The old synchronization utility is intentionally inert because it previously
+  deleted and replaced positions.
+- Local paper-executor fills and the IBKR paper account may represent different
+  systems, but the difference is not made explicit.
+
+### Step-by-step work
+
+1. Create a diagnostic-only command that explicitly requests an IBKR read-only
+   session on paper port 4002.
+2. Reuse the PR 1 runtime contract and verify the managed account exactly before
+   reading account data.
+3. Read and mask account identity, contract identity, positions, average cost,
+   open orders, and recent executions.
+4. Open SQLite in immutable or read-only mode and compute a portfolio-scoped
+   diff without invoking application write paths.
+5. Report source, timestamp, freshness, symbol, conId, exchange, currency,
+   quantity, cost, orders, and executions for each difference.
+6. Make order submission methods unavailable by construction and fail if the
+   Gateway or client cannot prove read-only operation.
+7. Prove that database, kill-switch, lock, bypass-log, and trading-log hashes
+   remain unchanged after the command.
+8. Replace the nonexistent preflight remediation reference with this command.
+9. Document that output is evidence only: it cannot clear a kill switch,
+   correct the ledger, or authorize startup.
+10. Run the affected-symbol reconciliation and obtain explicit operator
+    approval before designing any separate state-correction action.
+
+### Required tests
+
+- Paper port and read-only flags are mandatory and cannot be overridden.
+- The managed account must match the runtime contract.
+- Account identifiers and sensitive fields are masked in normal and error
+  output.
+- No order method is reachable.
+- SQLite is opened read-only and every relevant file hash remains unchanged.
+- Quantity, cost, contract, open-order, and recent-execution differences are
+  deterministic.
+- Missing, stale, or ambiguous broker data fails closed.
+- Preflight points only to the implemented diagnostic command.
+
+### Done means
+
+- A broker-versus-ledger snapshot can be produced without mutation.
+- The incident evidence has an explicit broker/account interpretation.
+- Any proposed state correction is a separate reviewed action requiring user
+  authorization and backup.
+
+### Operational gate
+
+The trader remains stopped after PR 1A and PR 1B until the affected symbol and
+account are reconciled, an operator reviews the evidence, and all ordinary
+`./START_TRADER.sh` preflight checks pass without deleting or bypassing safety
+state.
 
 ## PR 2 - Implement a reduce-only safety plane
 
@@ -878,6 +1042,8 @@ Use these identifiers in issues and PR descriptions.
 - RT-030: Mobile/cloud transport, accessibility, and topology are incomplete.
 - RT-031: Duplicate unfinished engines and runner modules create architecture drift.
 - RT-032: Documentation claims conflict with executable readiness.
+- RT-033: Uncorrelated or timed-out broker responses can be assigned to the
+  wrong symbol and reach risk, stop, valuation, or persistence consumers.
 
 # 8. Progress register
 
@@ -885,11 +1051,13 @@ Update after each merge.
 
 - Phase 0 CI truth gate: PR #83 merged on 2026-07-23 (`7f5de0a`)
 - Phase 0 runtime-stability prerequisite: PR #81 merged on 2026-07-23 (`b7e5005`)
-- PR 1: PR #82 is implementation-complete locally and awaiting hosted merge
-  gates. Local evidence on 2026-07-23: 1,046 passed, 5 skipped, 42% total
-  coverage; Black, isort, Flake8, Bandit, pip integrity, shell syntax, YAML
-  parsing, and diff checks passed. Two Docker Compose render tests were skipped
-  because Docker is unavailable on the local Mac and must pass in hosted CI.
+- PR 1: PR #82 merged on 2026-07-23 as `393f533`. Local evidence: 1,046
+  passed, 5 skipped, 42% total coverage; Black, isort, Flake8, Bandit, pip
+  integrity, shell syntax, YAML parsing, and diff checks passed. Hosted CI
+  passed Python 3.10 through 3.12 tests, production unit/integration/performance
+  matrices, lint, code quality, security, Trivy, Docker build, container
+  structure, and Docker Compose containment. All 15 review threads were
+  resolved.
   A two-phase review examined 11 initial findings: nine were confirmed and
   remediated, one dashboard `lsof` diagnostic was downgraded and remediated,
   and `RT_STATE_NAMESPACE` file-path isolation was safely deferred because
@@ -902,7 +1070,24 @@ Update after each merge.
   prevents Gateway, dashboard, or runner descendants from retaining it. The
   final independent review passed. The active runner already rejects backtest
   mode; separate non-paper safety state remains required before that mode may
-  use shared risk components.
+  use shared risk components. The external Claude review action did not review
+  code because its configured credential returned HTTP 401 with zero tokens;
+  this infrastructure failure is recorded on PR #82 and was not treated as
+  repository validation. PR #80 (`dd26ad5`, `edd0288`) is explicitly
+  superseded: no commit from that branch was merged. Its 11 review findings are
+  mapped to PRs 6, 8, 10, and 11 in the branch disposition record.
+- PR 1A: Not started. Added as an incident-driven prerequisite after read-only
+  evidence showed that a timed-out IBKR historical-data response could shift
+  later FIFO responses across symbols and feed a mislabeled quote into loss and
+  stop logic. Historical persistence also uses integer RangeIndex values and
+  overwrites prior cycles. The current kill switch, lock, and database evidence
+  must remain intact. Restart is prohibited until correlation, contract
+  validation, and timestamp persistence are complete.
+- PR 1B: Not started. A strictly read-only, account-verified broker-versus-ledger
+  diagnostic is required because the current preflight points to a nonexistent
+  command and the legacy position-sync utility is deliberately quarantined.
+  Restart remains prohibited until the incident is reconciled and reviewed
+  without modifying the database or safety files.
 - PR 2: Not started
 - PR 3: Not started
 - PR 4: Not started
