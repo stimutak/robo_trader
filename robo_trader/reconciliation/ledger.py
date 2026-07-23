@@ -286,15 +286,22 @@ class ImmutableLedgerReader:
             aggregates = self._aggregate(selected_positions, blockers, caveats)
 
             placeholders = ",".join("?" for _ in selected)
-            trade_rows = connection.execute(
-                f"""
+            # The only interpolated characters are one parameter marker per
+            # already-validated portfolio ID; every value remains SQL-bound.
+            trade_query = (
+                """
                 SELECT id, portfolio_id, symbol, side, quantity, price, timestamp,
                        typeof(quantity) AS quantity_type
                 FROM trades
-                WHERE portfolio_id IN ({placeholders})
+                WHERE portfolio_id IN ("""
+                + placeholders  # nosec B608
+                + """)
                 ORDER BY timestamp DESC, id DESC
                 LIMIT ?
-                """,
+                """
+            )
+            trade_rows = connection.execute(
+                trade_query,
                 (*selected, recent_trade_limit),
             ).fetchall()
             trades = []
