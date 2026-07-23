@@ -57,19 +57,29 @@ The audit established that `check_stops` was keyed wrong and never fired. Verify
 ```python
 # Run via: DASH_AUTH_ENABLED=false .venv/bin/python -c "<paste>"
 import asyncio
+from datetime import datetime, timezone
+from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock
+
+from robo_trader.risk_manager import Position
 from robo_trader.stop_loss_monitor import StopLossMonitor
 
 async def go():
-    m = StopLossMonitor()
+    m = StopLossMonitor(executor=AsyncMock(), risk_manager=MagicMock())
     # Open: $100 entry, 5% stop -> stop at $95
-    await m.add_stop_loss("AAPL", entry_price=100.0, quantity=10,
-                          stop_percent=0.05, portfolio_id="default")
+    position = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
+    await m.add_stop_loss("AAPL", position, stop_percent=0.05)
     # Update price ABOVE stop -> nothing fires
-    await m.update_price("AAPL", 99.0)
+    await m.update_price(
+        "AAPL", 99.0, source_timestamp=datetime.now(timezone.utc)
+    )
     triggered = await m.check_stops()
     assert triggered == [], f"unexpected fire: {triggered}"
     # Update price BELOW stop -> must fire
-    await m.update_price("AAPL", 94.5)
+    await asyncio.sleep(0.001)  # broker event times must strictly increase
+    await m.update_price(
+        "AAPL", 94.5, source_timestamp=datetime.now(timezone.utc)
+    )
     triggered = await m.check_stops()
     assert len(triggered) == 1, f"stop did not fire: {triggered}"
     print("PASS: stop-loss fires at the right price after keying fix")

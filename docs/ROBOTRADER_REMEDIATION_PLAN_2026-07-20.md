@@ -15,7 +15,8 @@ are assigned to later scoped PRs in
 gate because a read-only incident reconstruction proved that an uncorrelated
 timed-out broker response can be relabeled as another symbol and reach stop
 logic. PR 1B then supplies the non-mutating broker-versus-ledger evidence
-required before any restart decision.
+required for the later Gate A decision. Neither PR 1A nor PR 1B authorizes a
+restart.
 
 ## 1. Purpose
 
@@ -184,6 +185,13 @@ and verified.
   timestamps, so later cycles overwrite history.
 - Cross-symbol contamination can reach risk checks, stop-loss logic, account
   values, and the database.
+- Historical bars are not a live protective feed, and no independent
+  protective-price writer exists before PR 3. Existing holdings must therefore
+  abort startup instead of running with empty or stale stop-monitor prices.
+- Position-load and stop-registration failures can currently be logged and
+  treated as empty or partially protected state.
+- A fail-closed setup abort can leak resources or be restarted repeatedly by
+  the watchdog unless cleanup and supervision preserve the safety decision.
 
 ### Step-by-step work
 
@@ -210,6 +218,15 @@ and verified.
    new commands until recovery creates an isolated generation.
 10. Abort the remaining symbol cycle after protocol poison and surface the
     failure to connection health.
+11. Until PR 3 supplies and confirms an independent live protective feed, fail
+    setup for every nonzero existing position unless the stop monitor owns a
+    matching pending stop and a fresh accepted `live_protective` event.
+12. Treat database position-load and stop-registration uncertainty as fatal;
+    never fall back to an empty holdings view.
+13. Clean every partially initialized resource independently, exit nonzero with
+    a sanitized audit reason, and make the watchdog suppress automatic restart
+    for that exact terminal safety exit until an operator deliberately runs the
+    authoritative launcher after protection is restored.
 
 ### Required tests
 
@@ -226,6 +243,12 @@ and verified.
 - Cross-symbol payload duplication is detected before persistence.
 - Protocol failure produces no database write, cache update, latest-price
   update, strategy call, trailing-stop adjustment, or stop execution.
+- Existing holdings with no monitor-owned live event, a historical-only event,
+  a missing or mismatched stop, or stale/future timestamps fail setup.
+- Position-load and stop-registration failures are fatal.
+- A stop-monitor cleanup failure cannot prevent IBKR and database cleanup.
+- The watchdog policy suppresses the terminal unprotected-position restart and
+  permits ordinary nonterminal recovery.
 
 ### Done means
 
@@ -236,6 +259,8 @@ and verified.
   consumers.
 - Historical rows retain auditable market timestamps.
 - The incident scenario passes deterministic failure-injection tests.
+- A holdings-bearing runner cannot look healthy while its stops are blind, and
+  its terminal safety abort survives the process-supervisor boundary.
 
 ### Non-goals
 
@@ -306,10 +331,12 @@ designed, without placing orders or mutating local data.
 
 ### Operational gate
 
-The trader remains stopped after PR 1A and PR 1B until the affected symbol and
-account are reconciled, an operator reviews the evidence, and all ordinary
-`./START_TRADER.sh` preflight checks pass without deleting or bypassing safety
-state.
+The trader remains stopped after PR 1A and PR 1B. Reconciliation and operator
+review are necessary evidence, but they do not authorize startup. The first
+supervised paper start requires cumulative Gate A: PRs 1, 1A, 1B, 2 through 5,
+the relevant PR 7 controls, reviewed reconciliation, restore evidence, and all
+ordinary `./START_TRADER.sh` checks passing without deleting or bypassing
+safety state.
 
 ## PR 2 - Implement a reduce-only safety plane
 

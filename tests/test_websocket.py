@@ -14,11 +14,13 @@ async def test_and_listen():
 
     try:
         print(f"Connecting to {uri}...")
-        async with websockets.connect(uri) as websocket:
+        async with websockets.connect(uri, open_timeout=2.0) as websocket:
             print("✓ Connected successfully")
 
-            # Wait for initial message
-            message = await websocket.recv()
+            # This is an optional local integration probe. A server started by
+            # an earlier test may accept the socket without publishing an
+            # initial payload, so keep collection from hanging indefinitely.
+            message = await asyncio.wait_for(websocket.recv(), timeout=2.0)
             data = json.loads(message)
             print(f"✓ Received initial message: {data}")
 

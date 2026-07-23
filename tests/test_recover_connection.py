@@ -5,10 +5,12 @@ Gateway restart on attempt >=3, returns bool, mutex via _recovery_lock.
 """
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from robo_trader.connection_health import HealthStatus
 from robo_trader.runner_async import AsyncRunner
 
 
@@ -203,12 +205,24 @@ async def test_recovery_in_progress_flag_set_and_cleared():
 
 @pytest.mark.asyncio
 async def test_recovery_rewarms_stop_loss_monitor_with_cached_prices():
-    """C4: After a successful recovery, stop_loss_monitor.update_price must
-    be called for every active stop whose symbol exists in latest_prices.
-    This closes the 10-second freshness gate gap that otherwise blinds
-    stop-losses for the first 1-N cycles after reconnect."""
+    """Recovery offers each cached price together with its broker event time.
+
+    The real stop monitor remains authoritative about whether that event is
+    sufficiently fresh to accept.
+    """
     runner = make_runner_for_recovery(initialize_succeeds_on=1)
     runner.latest_prices = {"AAPL": 150.0, "NVDA": 500.0, "TSLA": 200.0}
+    event_time = datetime.now(timezone.utc)
+    runner.latest_price_times = {
+        "AAPL": event_time,
+        "NVDA": event_time,
+        "TSLA": event_time,
+    }
+    runner.latest_price_sources = {
+        "AAPL": "live_protective",
+        "NVDA": "live_protective",
+        "TSLA": "historical_bar",
+    }
 
     # Build a stop-loss monitor mock with active stops keyed by
     # portfolio:symbol but stop objects carrying bare symbols
@@ -227,16 +241,22 @@ async def test_recovery_rewarms_stop_loss_monitor_with_cached_prices():
     assert result is True
     # Both active stops have symbols present in latest_prices → both rewarmed
     assert runner.stop_loss_monitor.update_price.await_count == 2
-    rewarmed_calls = {call.args for call in runner.stop_loss_monitor.update_price.await_args_list}
-    assert ("AAPL", 150.0) in rewarmed_calls
-    assert ("NVDA", 500.0) in rewarmed_calls
+    rewarmed_symbols = {
+        call.args[0] for call in runner.stop_loss_monitor.update_price.await_args_list
+    }
+    assert rewarmed_symbols == {"AAPL", "NVDA"}
+    for call in runner.stop_loss_monitor.update_price.await_args_list:
+        assert call.kwargs["source_timestamp"] is event_time
 
 
 @pytest.mark.asyncio
 async def test_recovery_skips_stops_with_no_cached_price():
-    """If a stop's symbol isn't in latest_prices, skip it gracefully."""
+    """A missing required cached price prevents recovery from resuming."""
     runner = make_runner_for_recovery(initialize_succeeds_on=1)
     runner.latest_prices = {"AAPL": 150.0}  # only AAPL has a cached price
+    event_time = datetime.now(timezone.utc)
+    runner.latest_price_times = {"AAPL": event_time}
+    runner.latest_price_sources = {"AAPL": "live_protective"}
 
     stop_aapl = MagicMock(symbol="AAPL")
     stop_unknown = MagicMock(symbol="UNKNOWN")
@@ -248,18 +268,27 @@ async def test_recovery_skips_stops_with_no_cached_price():
     runner.stop_loss_monitor.update_price = AsyncMock()
 
     with patch("robo_trader.runner_async.asyncio.sleep", AsyncMock()):
-        await runner.recover_connection("test")
+        result = await runner.recover_connection("test")
 
-    # Only AAPL was rewarmed
-    runner.stop_loss_monitor.update_price.assert_awaited_once_with("AAPL", 150.0)
+    assert result is False
+    runner.stop_loss_monitor.update_price.assert_awaited_once_with(
+        "AAPL",
+        150.0,
+        source_timestamp=event_time,
+    )
 
 
 @pytest.mark.asyncio
 async def test_recovery_rewarm_handles_per_symbol_failures():
-    """If update_price raises for one symbol, the others must still rewarm.
-    A single broken stop cannot poison the entire rewarm pass."""
+    """All symbols are attempted, but any failure blocks recovery."""
     runner = make_runner_for_recovery(initialize_succeeds_on=1)
     runner.latest_prices = {"AAPL": 150.0, "NVDA": 500.0}
+    event_time = datetime.now(timezone.utc)
+    runner.latest_price_times = {"AAPL": event_time, "NVDA": event_time}
+    runner.latest_price_sources = {
+        "AAPL": "live_protective",
+        "NVDA": "live_protective",
+    }
 
     stop_aapl = MagicMock(symbol="AAPL")
     stop_nvda = MagicMock(symbol="NVDA")
@@ -269,20 +298,181 @@ async def test_recovery_rewarm_handles_per_symbol_failures():
         "default:NVDA": stop_nvda,
     }
 
-    async def update_price_fails_for_aapl(symbol, price):
+    async def update_price_fails_for_aapl(symbol, price, *, source_timestamp):
         if symbol == "AAPL":
             raise RuntimeError("intentional test failure")
+        return True
 
     runner.stop_loss_monitor.update_price = AsyncMock(side_effect=update_price_fails_for_aapl)
 
     with patch("robo_trader.runner_async.asyncio.sleep", AsyncMock()):
         result = await runner.recover_connection("test")
 
-    # Recovery still succeeded — rewarm errors do not fail the recovery
-    assert result is True
-    # Both update_price calls were attempted (NVDA wasn't skipped due to
-    # AAPL's failure)
+    assert result is False
+    # NVDA was still attempted so AAPL's failure did not hide other evidence.
     assert runner.stop_loss_monitor.update_price.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_recovery_accepts_exact_fresh_event_already_owned_by_monitor():
+    """A duplicate-timestamp rejection is safe when exact evidence is fresh."""
+    runner = make_runner_for_recovery(initialize_succeeds_on=1)
+    now = datetime(2026, 7, 23, 15, 0, 5, tzinfo=timezone.utc)
+    event_time = now - timedelta(seconds=2)
+    runner.latest_prices = {"AAPL": 150.0}
+    runner.latest_price_times = {"AAPL": event_time}
+    runner.latest_price_sources = {"AAPL": "live_protective"}
+    runner._protective_feed_status = {
+        "AAPL": {
+            "available": True,
+            "live_grade": True,
+            "source": "live_protective",
+        }
+    }
+    runner.stop_loss_monitor = MagicMock()
+    runner.stop_loss_monitor.active_stops = {"default:AAPL": MagicMock(symbol="AAPL")}
+    runner.stop_loss_monitor.update_price = AsyncMock(return_value=False)
+    runner.stop_loss_monitor.last_prices = {"AAPL": 150.0}
+    runner.stop_loss_monitor.price_event_times = {"AAPL": event_time}
+    runner.stop_loss_monitor.price_receipt_monotonic = {"AAPL": 998.0}
+    runner.stop_loss_monitor._utcnow = MagicMock(return_value=now)
+    runner.stop_loss_monitor._monotonic = MagicMock(return_value=1000.0)
+    runner.stop_loss_monitor.max_price_age_seconds = 10
+
+    with patch("robo_trader.runner_async.asyncio.sleep", AsyncMock()):
+        result = await runner.recover_connection("test")
+
+    assert result is True
+    runner.stop_loss_monitor.update_price.assert_awaited_once_with(
+        "AAPL",
+        150.0,
+        source_timestamp=event_time,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "monitor_price",
+        "cached_event_offset",
+        "monitor_event_offset",
+        "receipt_offset",
+        "publish_feed_status",
+    ),
+    [
+        (149.0, -2, -2, -2, True),  # different broker price
+        (150.0, -2, -1, -2, True),  # different broker event timestamp
+        (150.0, -11, -11, -2, True),  # stale broker event
+        (150.0, -2, -2, -11, True),  # stale monitor receipt
+        (150.0, 1, 1, -2, True),  # exact but future broker event
+        (150.0, -2, -2, -2, False),  # missing live-feed status
+    ],
+)
+async def test_recovery_rejects_nonexact_or_unfresh_monitor_evidence(
+    monitor_price,
+    cached_event_offset,
+    monitor_event_offset,
+    receipt_offset,
+    publish_feed_status,
+):
+    """Duplicate rejection cannot mask mismatched, stale, or future evidence."""
+    runner = make_runner_for_recovery(initialize_succeeds_on=1)
+    now = datetime(2026, 7, 23, 15, 0, 5, tzinfo=timezone.utc)
+    cached_event_time = now + timedelta(seconds=cached_event_offset)
+    runner.latest_prices = {"AAPL": 150.0}
+    runner.latest_price_times = {"AAPL": cached_event_time}
+    runner.latest_price_sources = {"AAPL": "live_protective"}
+    if publish_feed_status:
+        runner._protective_feed_status = {
+            "AAPL": {
+                "available": True,
+                "live_grade": True,
+                "source": "live_protective",
+            }
+        }
+    runner.stop_loss_monitor = MagicMock()
+    runner.stop_loss_monitor.active_stops = {"default:AAPL": MagicMock(symbol="AAPL")}
+    runner.stop_loss_monitor.update_price = AsyncMock(return_value=False)
+    runner.stop_loss_monitor.last_prices = {"AAPL": monitor_price}
+    runner.stop_loss_monitor.price_event_times = {
+        "AAPL": now + timedelta(seconds=monitor_event_offset)
+    }
+    runner.stop_loss_monitor.price_receipt_monotonic = {"AAPL": 1000.0 + receipt_offset}
+    runner.stop_loss_monitor._utcnow = MagicMock(return_value=now)
+    runner.stop_loss_monitor._monotonic = MagicMock(return_value=1000.0)
+    runner.stop_loss_monitor.max_price_age_seconds = 10
+
+    with patch("robo_trader.runner_async.asyncio.sleep", AsyncMock()):
+        result = await runner.recover_connection("test")
+
+    assert result is False
+    runner.stop_loss_monitor.update_price.assert_awaited_once()
+    assert runner._safe_disconnect.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_stale_cached_event_after_backoff_keeps_recovery_unhealthy():
+    runner = make_runner_for_recovery()
+    runner.portfolio_id = "default"
+    runner.positions = {}
+    event_time = datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc)
+    elapsed = 0
+    runner.latest_prices = {"AAPL": 150.0}
+    runner.latest_price_times = {"AAPL": event_time}
+    runner.latest_price_sources = {"AAPL": "live_protective"}
+    runner.stop_loss_monitor = MagicMock()
+    runner.stop_loss_monitor.active_stops = {"default:AAPL": MagicMock(symbol="AAPL")}
+
+    async def accept_only_fresh(_symbol, _price, *, source_timestamp):
+        age = (event_time + timedelta(seconds=elapsed) - source_timestamp).total_seconds()
+        return age <= 10
+
+    runner.stop_loss_monitor.update_price = AsyncMock(side_effect=accept_only_fresh)
+    runner.health = MagicMock()
+    runner.health._status = HealthStatus.UNHEALTHY
+    runner.health.record_success = MagicMock()
+    runner.advanced_risk = MagicMock()
+    runner.advanced_risk.kill_switch.triggered = True
+    runner.advanced_risk.kill_switch.trigger_reason = "Connection lost"
+
+    async def advance_clock(seconds):
+        nonlocal elapsed
+        elapsed += seconds
+
+    with patch("robo_trader.runner_async.asyncio.sleep", side_effect=advance_clock):
+        result = await runner.recover_connection("test")
+
+    assert elapsed == 15
+    assert result is False
+    assert runner.health._status is HealthStatus.UNHEALTHY
+    runner.health.record_success.assert_not_called()
+    runner.advanced_risk.kill_switch.reset.assert_not_called()
+    runner.initialize_connection.assert_awaited_once()
+    runner.stop_loss_monitor.update_price.assert_awaited_once()
+    assert runner._safe_disconnect.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_final_generic_post_connect_failure_disconnects_before_false():
+    runner = make_runner_for_recovery(initialize_succeeds_on=1)
+    runner.positions = {}
+    runner.health = MagicMock()
+    runner.health._status = HealthStatus.UNHEALTHY
+    runner.initialize_connection = AsyncMock()
+    runner._assert_existing_position_protection = MagicMock(
+        side_effect=RuntimeError("protection assertion infrastructure failed")
+    )
+
+    with patch("robo_trader.runner_async.asyncio.sleep", AsyncMock()):
+        result = await runner._recover_connection_locked("test", [0], 3)
+
+    assert result is False
+    runner.initialize_connection.assert_awaited_once()
+    assert runner.health._status is HealthStatus.UNHEALTHY
+    # One disconnect starts the attempt and the second immediately closes the
+    # connection that initialize_connection installed before the generic
+    # post-connect failure. There is no next attempt to clean it up.
+    assert runner._safe_disconnect.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -291,6 +481,7 @@ async def test_recovery_rewarm_no_op_when_no_stop_monitor():
     just means we have no stops to warm yet (early in startup, test
     scaffolding, etc.)."""
     runner = make_runner_for_recovery(initialize_succeeds_on=1)
+    runner.positions = {}
     runner.latest_prices = {"AAPL": 150.0}
     # explicitly no stop_loss_monitor
 
@@ -304,14 +495,16 @@ async def test_recovery_rewarm_no_op_when_no_stop_monitor():
 async def test_recovery_rewarm_no_op_when_active_stops_empty():
     """Empty active_stops must not crash and should be a quiet no-op."""
     runner = make_runner_for_recovery(initialize_succeeds_on=1)
+    runner.positions = {}
     runner.latest_prices = {"AAPL": 150.0}
     runner.stop_loss_monitor = MagicMock()
     runner.stop_loss_monitor.active_stops = {}
     runner.stop_loss_monitor.update_price = AsyncMock()
 
     with patch("robo_trader.runner_async.asyncio.sleep", AsyncMock()):
-        await runner.recover_connection("test")
+        result = await runner.recover_connection("test")
 
+    assert result is True
     runner.stop_loss_monitor.update_price.assert_not_awaited()
 
 

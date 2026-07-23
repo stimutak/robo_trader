@@ -10,14 +10,14 @@ ConnectionHealth.
 Per the persistent-connection invariant documented in CLAUDE.md, cycles
 MUST NOT initiate reconnects — only ConnectionHealth + recover_connection
 own that path. fetch_and_store_data must instead notify ConnectionHealth
-via record_failure() and return None cleanly.
+and abort remaining work in the shared-transport symbol cycle.
 """
 
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from robo_trader.runner_async import AsyncRunner
+from robo_trader.runner_async import AsyncRunner, SymbolCycleAbortError
 
 
 def make_runner_with_disconnected_ib():
@@ -35,20 +35,20 @@ def make_runner_with_disconnected_ib():
 
 
 @pytest.mark.asyncio
-async def test_fetch_and_store_data_records_failure_and_returns_none_without_reconnecting():
+async def test_fetch_and_store_data_records_failure_and_aborts_without_reconnecting():
     """When self.ib.is_connected is False, fetch_and_store_data must:
     1. NOT attempt to reconnect (no restart_subprocess, no recover_connection).
     2. Notify ConnectionHealth via record_failure() with context="fetch_and_store_data".
-    3. Return None cleanly so the caller can move on.
+    3. Raise the narrow cycle-abort signal so other symbols are cancelled.
     """
     runner = make_runner_with_disconnected_ib()
 
     # Force is_trading_allowed() to True so we get past the market-hours gate
     # and reach the connection-health check we're testing.
     with patch("robo_trader.runner_async.is_trading_allowed", return_value=True):
-        result = await runner.fetch_and_store_data("AAPL")
+        with pytest.raises(SymbolCycleAbortError):
+            await runner.fetch_and_store_data("AAPL")
 
-    assert result is None
     assert runner.health.record_failure.called is True
 
     # The second positional arg must be the context string identifying the call site.
@@ -57,17 +57,16 @@ async def test_fetch_and_store_data_records_failure_and_returns_none_without_rec
 
 
 @pytest.mark.asyncio
-async def test_fetch_and_store_data_tolerates_missing_health_attribute():
+async def test_fetch_and_store_data_aborts_with_missing_health_attribute():
     """ConnectionHealth is attached by _attach_health_monitor() which runs
     after initialize_connection(). If fetch_and_store_data somehow runs
-    before that (or self.health is None), it must NOT raise."""
+    before that (or self.health is None), it must still abort safely."""
     runner = make_runner_with_disconnected_ib()
     runner.health = None  # Simulate pre-attach state
 
     with patch("robo_trader.runner_async.is_trading_allowed", return_value=True):
-        result = await runner.fetch_and_store_data("AAPL")
-
-    assert result is None
+        with pytest.raises(SymbolCycleAbortError):
+            await runner.fetch_and_store_data("AAPL")
 
 
 def test_runner_has_no_restart_subprocess_attribute():

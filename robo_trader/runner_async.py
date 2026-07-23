@@ -12,7 +12,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import inspect
+import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -22,10 +25,10 @@ from dotenv import load_dotenv  # isort:skip
 
 load_dotenv()  # noqa: E402 - must run before imports that use os.getenv()
 from dataclasses import dataclass  # isort:skip  # noqa: E402
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, NoReturn, Optional, Tuple
 
 import pandas as pd
 from ib_async import Stock
@@ -59,20 +62,71 @@ except ImportError:
     ws_client = None
     WEBSOCKET_ENABLED = False
 from .circuit_breaker import CircuitBreaker
-from .clients.subprocess_ibkr_client import SubprocessIBKRClient
+from .clients.subprocess_ibkr_client import (
+    GatewayRequiresRestartError,
+    IBKRConnectionConflictError,
+    IBKRDisconnectedError,
+    IBKRTimeoutError,
+    IBKRTransportPoisonedError,
+    SubprocessCrashError,
+    SubprocessIBKRClient,
+)
 from .connection_health import HealthStatus, get_gateway_recovery_lock
+from .database_validator import DatabaseValidator, ValidationError
 from .exceptions import KillSwitchTriggeredError
 from .portfolio import Portfolio, PositionSnapshot  # Import Portfolio class from portfolio.py file
 from .portfolio_pkg.portfolio_manager import AllocationMethod, MultiStrategyPortfolioManager
 from .risk.advanced_risk import AdvancedRiskManager, risk_monitor_task
 from .risk_manager import Position, RiskManager, create_risk_manager_from_config
-from .stop_loss_monitor import StopLossMonitor, StopType
+from .stop_loss_monitor import (
+    StopExecutionPhase,
+    StopExecutionPhaseRecord,
+    StopLossMonitor,
+    StopLossOrder,
+    StopStatus,
+    StopType,
+    _PendingStopTrigger,
+    validate_stop_loss_order,
+)
 from .strategies import MLStrategy, sma_crossover_signals
 from .strategies.ml_enhanced_strategy import MLEnhancedStrategy
 from .utils.connection_recovery import OrderRateLimiter
 
 # Initialize logger early for use in import error handling
 logger = get_logger(__name__)
+
+
+class MarketDataContractError(ValueError):
+    """Broker bars failed the runner's fail-closed event-time contract."""
+
+
+class MarketDataIdentityError(MarketDataContractError):
+    """Broker response identity is ambiguous or contradicts the request."""
+
+
+class SymbolCycleAbortError(RuntimeError):
+    """A transport-integrity failure requires cancellation of the symbol cycle."""
+
+
+class RecoverableBrokerDisconnectError(SymbolCycleAbortError):
+    """Authoritative pre-request disconnect; abort this cycle, then reconnect."""
+
+
+class UnprotectedExistingPositionsError(RuntimeError):
+    """Existing holdings lack verified, live-grade stop-loss protection."""
+
+    def __init__(self, portfolio_id: str, position_count: int, reason_code: str):
+        self.portfolio_id = str(portfolio_id)
+        self.position_count = int(position_count)
+        self.reason_code = str(reason_code)
+        super().__init__(
+            f"portfolio={self.portfolio_id} existing_position_count={self.position_count} "
+            f"reason={self.reason_code}"
+        )
+
+
+_UNVERIFIED_PRICE_RATIO_LIMIT = 1.75
+
 
 # Import AI analyst for news-driven trading
 try:
@@ -418,6 +472,10 @@ class AsyncRunner:
         self.portfolio_manager: Optional[MultiStrategyPortfolioManager] = None
         self.positions: Dict[str, Position] = {}
         self.latest_prices: Dict[str, float] = {}
+        self.latest_price_times: Dict[str, datetime] = {}
+        self.latest_price_sources: Dict[str, str] = {}
+        self._trusted_bar_closes: Dict[str, float] = {}
+        self._protective_feed_status: Dict[str, dict] = {}
         self.daily_pnl = 0.0
         self.daily_executed_notional = 0.0
         # TC-M7: track today's starting unrealized P&L so the daily-loss check
@@ -448,6 +506,14 @@ class AsyncRunner:
         # This set is checked before any BUY order is placed
         self._pending_orders: set = set()
         self._pending_orders_lock = asyncio.Lock()
+        # A transport abort and final order admission serialize on this lock.
+        # A task that has started synchronous placement drains accounting; a
+        # task that has not crossed admission fails closed.
+        self._order_admission_lock = asyncio.Lock()
+        self._symbol_cycle_abort_event = asyncio.Event()
+        self._cycle_worker_tasks: set[asyncio.Task] = set()
+        self._order_admitted_tasks: set[asyncio.Task] = set()
+        self._run_parallel_lock = asyncio.Lock()
 
         # ADDITIONAL PROTECTION: Track symbols that have executed BUY orders this cycle
         # This is a more aggressive duplicate prevention mechanism
@@ -717,6 +783,298 @@ class AsyncRunner:
             logger.error(f"Error in _trading_blocked: {exc}")
         return False, ""
 
+    @staticmethod
+    def _rejected_order_result(message: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            ok=False,
+            message=message,
+            msg=message,
+            fill_price=None,
+        )
+
+    def _order_increases_exposure(self, order: Order) -> bool:
+        """Conservatively classify entry intents for temporary session gates."""
+        side = str(getattr(order, "side", "") or "").upper()
+        return side in {"BUY", "SELL_SHORT"}
+
+    def _has_live_protective_feed(self, symbol: str) -> bool:
+        """Return whether monitor-accepted live protection is still fresh.
+
+        Provenance flags are necessary but never sufficient: order admission
+        trusts the stop monitor's accepted event and monotonic receipt state,
+        evaluated against its own validated clocks and maximum age. Missing,
+        malformed, stale, or future state fails closed.
+        """
+        statuses = getattr(self, "_protective_feed_status", None)
+        if not isinstance(statuses, dict):
+            return False
+        status = statuses.get(symbol)
+        if not (
+            isinstance(status, dict)
+            and status.get("available") is True
+            and status.get("live_grade") is True
+            and status.get("source") == "live_protective"
+        ):
+            return False
+
+        monitor = getattr(self, "stop_loss_monitor", None)
+        prices = getattr(monitor, "last_prices", None)
+        event_times = getattr(monitor, "price_event_times", None)
+        receipt_times = getattr(monitor, "price_receipt_monotonic", None)
+        utcnow = getattr(monitor, "_utcnow", None)
+        monotonic = getattr(monitor, "_monotonic", None)
+        max_age = getattr(monitor, "max_price_age_seconds", None)
+        if (
+            not isinstance(prices, dict)
+            or not isinstance(event_times, dict)
+            or not isinstance(receipt_times, dict)
+            or not callable(utcnow)
+            or not callable(monotonic)
+            or not isinstance(max_age, (int, float))
+            or isinstance(max_age, bool)
+            or not math.isfinite(float(max_age))
+            or float(max_age) <= 0
+        ):
+            return False
+
+        try:
+            now_utc = utcnow()
+            now_monotonic = monotonic()
+        except Exception:
+            return False
+        price = prices.get(symbol)
+        event_time = event_times.get(symbol)
+        receipt_time = receipt_times.get(symbol)
+        if (
+            not isinstance(now_utc, datetime)
+            or now_utc.tzinfo is None
+            or now_utc.utcoffset() is None
+            or not isinstance(now_monotonic, (int, float))
+            or isinstance(now_monotonic, bool)
+            or not math.isfinite(float(now_monotonic))
+            or not isinstance(price, (int, float))
+            or isinstance(price, bool)
+            or not math.isfinite(float(price))
+            or float(price) <= 0
+            or not isinstance(event_time, datetime)
+            or event_time.tzinfo is None
+            or event_time.utcoffset() is None
+            or not isinstance(receipt_time, (int, float))
+            or isinstance(receipt_time, bool)
+            or not math.isfinite(float(receipt_time))
+        ):
+            return False
+
+        event_age = (
+            now_utc.astimezone(timezone.utc) - event_time.astimezone(timezone.utc)
+        ).total_seconds()
+        receipt_age = float(now_monotonic) - float(receipt_time)
+        return 0 <= event_age <= float(max_age) and 0 <= receipt_age <= float(max_age)
+
+    def _monitor_owns_exact_fresh_protective_event(
+        self,
+        symbol: str,
+        price: object,
+        event_time: object,
+    ) -> bool:
+        """Return whether the monitor already owns this exact live event.
+
+        ``StopLossMonitor.update_price`` deliberately rejects a repeated
+        broker timestamp. Recovery may therefore receive ``False`` when the
+        exact cached event was accepted immediately before the disconnect.
+        That rejection is safe to treat as satisfied only when the monitor's
+        independently-clocked state is still fresh and matches both the
+        cached event timestamp and price exactly.
+        """
+        if not self._has_live_protective_feed(symbol):
+            return False
+        if (
+            not isinstance(price, (int, float))
+            or isinstance(price, bool)
+            or not math.isfinite(float(price))
+            or float(price) <= 0
+            or not isinstance(event_time, datetime)
+            or event_time.tzinfo is None
+            or event_time.utcoffset() is None
+        ):
+            return False
+
+        monitor = self.stop_loss_monitor
+        monitor_price = monitor.last_prices.get(symbol)
+        monitor_event_time = monitor.price_event_times.get(symbol)
+        if (
+            not isinstance(monitor_price, (int, float))
+            or isinstance(monitor_price, bool)
+            or not math.isfinite(float(monitor_price))
+            or not isinstance(monitor_event_time, datetime)
+            or monitor_event_time.tzinfo is None
+            or monitor_event_time.utcoffset() is None
+        ):
+            return False
+        return float(monitor_price) == float(price) and monitor_event_time.astimezone(
+            timezone.utc
+        ) == event_time.astimezone(timezone.utc)
+
+    def _pairs_execution_admitted(self, pair: object) -> bool:
+        """Fail closed until pairs have an atomic two-leg execution lifecycle."""
+        if (
+            not isinstance(pair, (tuple, list))
+            or len(pair) != 2
+            or not all(self._has_live_protective_feed(str(symbol)) for symbol in pair)
+        ):
+            logger.error(
+                "Pairs signal blocked before state mutation: both legs require "
+                "an admitted live-protective feed; pair=%r",
+                pair,
+            )
+            return False
+        # Pairs currently mutate strategy state before either leg is admitted
+        # or filled and have no safe partial-leg commit/rollback contract.
+        # Quarantine execution rather than leave phantom active pairs or
+        # untracked one-leg exposure. PR 11 owns the durable, idempotent,
+        # broker-confirmed multi-leg lifecycle.
+        logger.error(
+            "Pairs execution quarantined pending atomic two-leg lifecycle; pair=%r",
+            pair,
+        )
+        return False
+
+    async def _latch_symbol_cycle_abort(
+        self,
+        cause: Optional[SymbolCycleAbortError] = None,
+    ) -> None:
+        """Serialize transport abort with the final placement admission gate.
+
+        The first causal abort is retained under the same lock that closes
+        order admission. Later siblings may observe the already-poisoned
+        transport and raise their own, less-specific aborts; those secondary
+        errors must not overwrite the diagnostic that caused the cycle to
+        fail closed.
+        """
+        event = getattr(self, "_symbol_cycle_abort_event", None)
+        if event is None:
+            self._symbol_cycle_abort_event = asyncio.Event()
+            event = self._symbol_cycle_abort_event
+        # Publish the concrete cause before the event. This synchronous
+        # provisional write prevents a sibling that observes the event from
+        # inventing a generic terminal error while we wait to serialize with
+        # order admission. The lock below re-applies terminal precedence.
+        current = getattr(self, "_symbol_cycle_abort_error", None)
+        terminal_dominates_recoverable = (
+            isinstance(current, RecoverableBrokerDisconnectError)
+            and cause is not None
+            and not isinstance(cause, RecoverableBrokerDisconnectError)
+        )
+        if cause is not None and (current is None or terminal_dominates_recoverable):
+            self._symbol_cycle_abort_error = cause
+        # Publish abort intent before queueing for admission. A previously
+        # queued order waiter may acquire the lock first, but it will observe
+        # this event and reject instead of crossing the placement boundary.
+        event.set()
+
+        lock = getattr(self, "_order_admission_lock", None)
+        if lock is None:
+            self._order_admission_lock = asyncio.Lock()
+            lock = self._order_admission_lock
+        async with lock:
+            current = getattr(self, "_symbol_cycle_abort_error", None)
+            terminal_dominates_recoverable = (
+                isinstance(current, RecoverableBrokerDisconnectError)
+                and cause is not None
+                and not isinstance(cause, RecoverableBrokerDisconnectError)
+            )
+            if cause is not None and (current is None or terminal_dominates_recoverable):
+                self._symbol_cycle_abort_error = cause
+
+    async def _claim_cycle_broker_request(self, symbol: str) -> asyncio.Task:
+        """Atomically admit one market-data request or classify disconnect risk."""
+        lock = getattr(self, "_broker_request_admission_lock", None)
+        if lock is None:
+            self._broker_request_admission_lock = asyncio.Lock()
+            lock = self._broker_request_admission_lock
+        async with lock:
+            active_requests = getattr(self, "_active_cycle_broker_requests", None)
+            if not isinstance(active_requests, set):
+                self._active_cycle_broker_requests = set()
+                active_requests = self._active_cycle_broker_requests
+
+            prior_abort = getattr(self, "_broker_request_abort_error", None)
+            if getattr(self, "_broker_request_admission_closed", False):
+                if isinstance(prior_abort, SymbolCycleAbortError):
+                    raise prior_abort
+                raise SymbolCycleAbortError("broker request admission is closed")
+
+            abort_event = getattr(self, "_symbol_cycle_abort_event", None)
+            if abort_event is not None and abort_event.is_set():
+                cause = getattr(self, "_symbol_cycle_abort_error", None)
+                if isinstance(cause, SymbolCycleAbortError):
+                    raise cause
+                raise SymbolCycleAbortError("symbol cycle is already aborting")
+
+            try:
+                connected = not hasattr(self.ib, "is_connected") or self.ib.is_connected
+            except Exception as error:
+                terminal = SymbolCycleAbortError(
+                    f"broker connection state is ambiguous before fetching {symbol}"
+                )
+                self._broker_request_admission_closed = True
+                self._broker_request_abort_error = terminal
+                if abort_event is None:
+                    self._symbol_cycle_abort_event = asyncio.Event()
+                    abort_event = self._symbol_cycle_abort_event
+                abort_event.set()
+                raise terminal from error
+
+            if not connected:
+                error = IBKRDisconnectedError("is_connected=False before fetch")
+                health = getattr(self, "health", None)
+                if health is not None:
+                    health.record_failure(error, "fetch_and_store_data")
+
+                # Publish admission closure synchronously with observing the
+                # disconnect. New sibling requests/orders cannot cross while
+                # the eventual cycle-abort latch waits for its serialization
+                # lock.
+                self._broker_request_admission_closed = True
+                if abort_event is None:
+                    self._symbol_cycle_abort_event = asyncio.Event()
+                    abort_event = self._symbol_cycle_abort_event
+                abort_event.set()
+
+                active_orders = {
+                    task
+                    for task in getattr(self, "_order_admitted_tasks", set())
+                    if isinstance(task, asyncio.Task) and not task.done()
+                }
+                active_broker_requests = {
+                    task
+                    for task in active_requests
+                    if isinstance(task, asyncio.Task) and not task.done()
+                }
+                if active_broker_requests or active_orders:
+                    cause: SymbolCycleAbortError = SymbolCycleAbortError(
+                        f"broker disconnected before fetching {symbol} while "
+                        "another broker request was active; outcome is ambiguous"
+                    )
+                else:
+                    cause = RecoverableBrokerDisconnectError(
+                        f"broker disconnected before fetching {symbol}"
+                    )
+                self._broker_request_abort_error = cause
+                raise cause from error
+
+            current_task = asyncio.current_task()
+            if current_task is None:  # pragma: no cover - asyncio invariant
+                raise SymbolCycleAbortError("broker request has no owning task")
+            active_requests.add(current_task)
+            return current_task
+
+    def _release_cycle_broker_request(self, owner: asyncio.Task) -> None:
+        """Release an exact request claim without introducing an await gap."""
+        active_requests = getattr(self, "_active_cycle_broker_requests", None)
+        if isinstance(active_requests, set):
+            active_requests.discard(owner)
+
     async def _place_order_with_circuit_breaker(self, order: Order):
         """
         Execute order with circuit breaker protection.
@@ -738,9 +1096,7 @@ class AsyncRunner:
                 f"Order rejected: non-finite price={_price!r} or qty={_qty!r} "
                 f"for {order.symbol}"
             )
-            return SimpleNamespace(
-                ok=False, message="Non-finite price or quantity", fill_price=None
-            )
+            return self._rejected_order_result("Non-finite price or quantity")
 
         # TC-M1 / TC-M6: centralized trading-blocked gate. This catches every
         # path that places an order, including SELL/closing flows, pairs trading,
@@ -759,21 +1115,61 @@ class AsyncRunner:
             if _last is None or (_now - _last) >= self._kill_switch_log_throttle_seconds:
                 logger.error(f"Order blocked by trading_blocked gate for {order.symbol}: {reason}")
                 self._kill_switch_log_last[_key] = _now
-            return SimpleNamespace(ok=False, message=f"Trading blocked: {reason}", fill_price=None)
+            return self._rejected_order_result(f"Trading blocked: {reason}")
 
         # Check if circuit breaker allows the request
         if not await self.circuit_breaker.can_proceed():
             logger.error(f"Circuit breaker OPEN - order rejected for {order.symbol}")
-            return SimpleNamespace(ok=False, message="Circuit breaker open", fill_price=None)
+            return self._rejected_order_result("Circuit breaker open")
 
         # Apply rate limiting before order execution
         await self.rate_limiter.acquire()
         logger.debug(f"Rate limit acquired for {order.symbol} order")
 
         try:
-            # Execute the order
-            with Timer("order_execution", self.monitor):
-                result = self.executor.place_order(order)
+            lock = getattr(self, "_order_admission_lock", None)
+            if lock is None:
+                self._order_admission_lock = asyncio.Lock()
+                lock = self._order_admission_lock
+            async with lock:
+                abort_event = getattr(self, "_symbol_cycle_abort_event", None)
+                if abort_event is not None and abort_event.is_set():
+                    logger.error(
+                        "Order admission blocked after broker transport abort for %s",
+                        order.symbol,
+                    )
+                    return self._rejected_order_result(
+                        "Order admission blocked: broker transport unavailable"
+                    )
+                if not self._has_live_protective_feed(order.symbol):
+                    logger.error(
+                        "Order admission blocked for %s: no admitted " "live-protective feed",
+                        order.symbol,
+                    )
+                    return self._rejected_order_result(
+                        "Order admission blocked: live protective feed unavailable"
+                    )
+                if is_extended_hours() and self._order_increases_exposure(order):
+                    logger.warning(
+                        "Extended-hours entry blocked for %s until session-aware "
+                        "market data lands in PR 3",
+                        order.symbol,
+                    )
+                    return self._rejected_order_result(
+                        "Entry blocked: extended-hours session data unavailable"
+                    )
+
+                # Synchronous paper placement is the point of no return. Hold
+                # admission through the call so an abort is ordered either
+                # before it (no fill) or after it (caller drains accounting).
+                current_task = asyncio.current_task()
+                cycle_workers: set[asyncio.Task] = getattr(self, "_cycle_worker_tasks", set())
+                if current_task is not None and current_task in cycle_workers:
+                    if not hasattr(self, "_order_admitted_tasks"):
+                        self._order_admitted_tasks = set()
+                    self._order_admitted_tasks.add(current_task)
+                with Timer("order_execution", self.monitor):
+                    result = self.executor.place_order(order)
 
             # Record success/failure with circuit breaker
             if result.ok:
@@ -886,6 +1282,110 @@ class AsyncRunner:
                 )
                 return False
 
+    async def _reconcile_replacement_stop_after_fill(
+        self,
+        filled_stop,
+        remaining_qty: int,
+        remaining_avg_cost: float,
+    ) -> bool:
+        """Resize or cancel a newer stop after an older stop fills.
+
+        A replacement can be installed while the old stop's broker request is
+        in flight. It must not be deleted by the old completion, but retaining
+        its pre-fill quantity could over-close the now-smaller position.
+        """
+        monitor = getattr(self, "stop_loss_monitor", None)
+        active_stops = getattr(monitor, "active_stops", None)
+        stop_key_fn = getattr(monitor, "_stop_key", None)
+        if not isinstance(active_stops, dict) or not callable(stop_key_fn):
+            return remaining_qty == 0
+
+        async def reconcile() -> bool:
+            stop_key = stop_key_fn(filled_stop.symbol)
+            replacement = active_stops.get(stop_key)
+            if replacement is None:
+                return remaining_qty == 0
+            if replacement is filled_stop:
+                return remaining_qty == 0
+
+            if remaining_qty == 0:
+                if active_stops.get(stop_key) is replacement:
+                    return bool(monitor.cancel_stop(filled_stop.symbol))
+                return False
+
+            replacement_qty = getattr(replacement, "position_qty", None)
+            if (
+                not isinstance(replacement_qty, int)
+                or isinstance(replacement_qty, bool)
+                or replacement_qty * remaining_qty <= 0
+                or not math.isfinite(float(remaining_avg_cost))
+                or remaining_avg_cost <= 0
+            ):
+                return False
+
+            new_stop_price = getattr(replacement, "stop_price", None)
+            if replacement.stop_type == StopType.FIXED:
+                stop_percent = getattr(replacement, "max_loss_percent", None)
+                if (
+                    not isinstance(stop_percent, (int, float))
+                    or isinstance(stop_percent, bool)
+                    or not math.isfinite(float(stop_percent))
+                    or not 0 < float(stop_percent) < 1
+                ):
+                    return False
+                if remaining_qty > 0:
+                    new_stop_price = remaining_avg_cost * (1 - float(stop_percent))
+                else:
+                    new_stop_price = remaining_avg_cost * (1 + float(stop_percent))
+            elif replacement.stop_type == StopType.TRAILING:
+                trailing_amount = getattr(replacement, "trailing_amount", None)
+                if (
+                    not isinstance(trailing_amount, (int, float))
+                    or isinstance(trailing_amount, bool)
+                    or not math.isfinite(float(trailing_amount))
+                    or float(trailing_amount) <= 0
+                ):
+                    return False
+            elif replacement.stop_type == StopType.TRAILING_PERCENT:
+                trailing_percent = getattr(replacement, "trailing_percent", None)
+                if (
+                    not isinstance(trailing_percent, (int, float))
+                    or isinstance(trailing_percent, bool)
+                    or not math.isfinite(float(trailing_percent))
+                    or not 0 < float(trailing_percent) < 1
+                ):
+                    return False
+            else:
+                return False
+            if (
+                not isinstance(new_stop_price, (int, float))
+                or isinstance(new_stop_price, bool)
+                or not math.isfinite(float(new_stop_price))
+                or float(new_stop_price) <= 0
+            ):
+                return False
+
+            new_max_loss_amount = abs(remaining_qty * (remaining_avg_cost - float(new_stop_price)))
+            new_max_loss_percent = abs(
+                (float(new_stop_price) - remaining_avg_cost) / remaining_avg_cost
+            )
+
+            # All validation is complete. Publish the replacement state as one
+            # synchronous critical section so a rejected resize cannot leave a
+            # partially-mutated stop capable of over-closing.
+            replacement.position_qty = remaining_qty
+            replacement.entry_price = remaining_avg_cost
+            replacement.stop_price = float(new_stop_price)
+            replacement.max_loss_amount = new_max_loss_amount
+            replacement.max_loss_percent = new_max_loss_percent
+            return True
+
+        price_lock = getattr(monitor, "_price_update_lock", None)
+        if price_lock is not None and hasattr(price_lock, "__aenter__"):
+            async with price_lock:
+                return await reconcile()
+        return await reconcile()
+
     async def _on_stop_loss_executed(self, stop, result) -> None:
         """Callback invoked by StopLossMonitor after a successful stop-loss fill.
 
@@ -917,40 +1417,57 @@ class AsyncRunner:
         except Exception:
             fill_price = float(stop.stop_price)
 
-        # Use the same pending-orders lock the BUY/SELL paths use so any
-        # concurrent BUY/SELL on this symbol observes a consistent view.
+        # Use the same pending-orders lock the BUY/SELL paths use so the
+        # position is compared with the quantity the stop actually closed
+        # before any state mutation. A newer/larger same-direction position is
+        # reduced only by the fill; absent, reversed, or too-small state is
+        # treated as divergence and preserved for broker reconciliation.
         try:
+            emergency_reason = None
             async with self._pending_orders_lock:
-                # 1. Drop in-memory position (if present).
-                if symbol in self.positions:
-                    try:
-                        del self.positions[symbol]
-                    except Exception as e:  # pragma: no cover - defensive
-                        logger.error(
-                            f"_on_stop_loss_executed: failed to drop {symbol} "
-                            f"from self.positions: {e}"
-                        )
-
-                # 2. Sync portfolio cash/P&L with the closing fill.
+                current = self.positions.get(symbol)
+                current_qty = getattr(current, "quantity", None)
+                state_matches_fill = False
+                remaining_qty = None
+                remaining_avg_cost = 0.0
+                divergence_reason = "absent_opposite_or_too_small_position"
                 try:
-                    if self.portfolio is not None:
-                        await self.portfolio.update_fill(symbol, side, qty, fill_price)
-                except Exception as e:
-                    logger.error(
-                        f"_on_stop_loss_executed: portfolio.update_fill failed "
-                        f"for {symbol} {side} {qty}@{fill_price}: {e}"
+                    same_direction = current is not None and (
+                        (stop.position_qty > 0 and current_qty > 0)
+                        or (stop.position_qty < 0 and current_qty < 0)
+                    )
+                    enough_quantity = same_direction and abs(current_qty) >= qty
+                    if enough_quantity:
+                        remaining_qty = current_qty - stop.position_qty
+                        if remaining_qty:
+                            remaining_avg_cost = float(current.avg_price)
+                            if not math.isfinite(remaining_avg_cost) or remaining_avg_cost <= 0:
+                                raise ValueError("invalid remaining average cost")
+                        state_matches_fill = True
+                except Exception as state_err:
+                    divergence_reason = repr(state_err)
+                    state_matches_fill = False
+
+                if not state_matches_fill:
+                    emergency_reason = (
+                        f"Broker stop fill state divergence for {symbol}: "
+                        f"filled signed_qty={stop.position_qty}, "
+                        f"runtime signed_qty={current_qty!r}"
+                    )
+                    logger.critical(
+                        "event=stop_fill_state_divergence symbol=%s "
+                        "stop_qty=%r current_qty=%r reason=%s "
+                        "action=preserve_runtime_position_and_reconcile",
+                        symbol,
+                        getattr(stop, "position_qty", None),
+                        current_qty,
+                        divergence_reason,
                     )
 
-                # 3. Persist position closure to DB.
-                try:
-                    if self.db is not None:
-                        await self.db.update_position(symbol, 0, 0.0, fill_price)
-                except Exception as e:
-                    logger.error(
-                        f"_on_stop_loss_executed: db.update_position failed " f"for {symbol}: {e}"
-                    )
-
-                # 4. Record the trade row so audit/PnL queries see the close.
+                # Record the irrevocable broker fill exactly once even when
+                # local position state has diverged. This audit row is safer
+                # than silently losing the fill; reconciliation can then repair
+                # position state without inventing another broker order.
                 try:
                     if self.db is not None:
                         await self.db.record_trade(symbol, side, qty, fill_price, 0)
@@ -959,19 +1476,112 @@ class AsyncRunner:
                         f"_on_stop_loss_executed: db.record_trade failed " f"for {symbol}: {e}"
                     )
 
-                # 5. Mark advanced-risk-manager position as closed (if used).
-                try:
-                    if self.use_advanced_risk and self.advanced_risk:
-                        self.advanced_risk.update_position(symbol, qty, fill_price, side)
-                except Exception as e:
-                    logger.error(
-                        f"_on_stop_loss_executed: advanced_risk update failed " f"for {symbol}: {e}"
+                if state_matches_fill:
+                    # Reconcile a newer replacement before publishing the
+                    # reduced runtime position. While this await is blocked on
+                    # the monitor lock, the old position and replacement
+                    # quantities remain mutually consistent for runtime health
+                    # checks. Once it returns, both mutations below are
+                    # synchronous with no interleaving await.
+                    replacement_safe = await self._reconcile_replacement_stop_after_fill(
+                        stop,
+                        remaining_qty or 0,
+                        remaining_avg_cost,
+                    )
+                    if remaining_qty:
+                        self.positions[symbol] = Position(
+                            symbol,
+                            remaining_qty,
+                            remaining_avg_cost,
+                        )
+                    else:
+                        del self.positions[symbol]
+
+                    if not replacement_safe:
+                        emergency_reason = (
+                            f"Unsafe replacement stop after broker fill for {symbol}: "
+                            f"remaining signed_qty={remaining_qty or 0}"
+                        )
+                        logger.critical(
+                            "event=stop_fill_replacement_reconcile_failed "
+                            "symbol=%s remaining_qty=%s "
+                            "action=emergency_shutdown_and_reconcile",
+                            symbol,
+                            remaining_qty or 0,
+                        )
+
+                    try:
+                        if self.portfolio is not None:
+                            await self.portfolio.update_fill(
+                                symbol,
+                                side,
+                                qty,
+                                fill_price,
+                            )
+                    except Exception as e:
+                        logger.error(
+                            f"_on_stop_loss_executed: portfolio.update_fill failed "
+                            f"for {symbol} {side} {qty}@{fill_price}: {e}"
+                        )
+
+                    try:
+                        if self.db is not None:
+                            await self.db.update_position(
+                                symbol,
+                                remaining_qty or 0,
+                                remaining_avg_cost if remaining_qty else 0.0,
+                                fill_price,
+                            )
+                    except Exception as e:
+                        logger.error(
+                            f"_on_stop_loss_executed: db.update_position failed "
+                            f"for {symbol}: {e}"
+                        )
+
+                    try:
+                        if self.use_advanced_risk and self.advanced_risk:
+                            self.advanced_risk.update_position(
+                                symbol,
+                                qty,
+                                fill_price,
+                                side,
+                            )
+                    except Exception as e:
+                        logger.error(
+                            f"_on_stop_loss_executed: advanced_risk update failed "
+                            f"for {symbol}: {e}"
+                        )
+
+            if emergency_reason:
+                emergency_callback = getattr(
+                    getattr(self, "stop_loss_monitor", None),
+                    "emergency_shutdown",
+                    None,
+                )
+                if callable(emergency_callback):
+                    try:
+                        await emergency_callback(emergency_reason)
+                    except Exception as emergency_err:
+                        logger.critical(
+                            "event=stop_fill_emergency_callback_failed " "symbol=%s error=%r",
+                            symbol,
+                            emergency_err,
+                        )
+                else:
+                    logger.critical(
+                        "event=stop_fill_emergency_callback_missing symbol=%s",
+                        symbol,
                     )
 
-            logger.info(
-                f"Stop-loss state sync complete for {symbol}: closed {side} "
-                f"{qty}@${fill_price:.2f}"
-            )
+            if state_matches_fill:
+                logger.info(
+                    "Stop-loss state sync complete for %s: %s %s@%.2f " "remaining_qty=%s",
+                    symbol,
+                    side,
+                    qty,
+                    fill_price,
+                    remaining_qty or 0,
+                )
         except Exception as outer:  # pragma: no cover - defensive
             logger.error(f"_on_stop_loss_executed top-level failure for {symbol}: {outer}")
 
@@ -981,18 +1591,23 @@ class AsyncRunner:
         if hasattr(self, "_setup_complete") and self._setup_complete:
             # Just verify connection is still alive
             if hasattr(self, "ib") and self.ib:
+                persistent_connection_healthy = False
                 try:
                     if hasattr(self.ib, "ping"):
                         ping_ok = await self.ib.ping()
                         if ping_ok:
-                            logger.info("✓ Persistent IBKR connection still active")
-                            return
+                            persistent_connection_healthy = True
                     elif hasattr(self.ib, "isConnected") and self.ib.isConnected():
-                        logger.info("✓ Persistent IBKR connection still active")
-                        return
+                        persistent_connection_healthy = True
                 except Exception as e:
                     logger.warning(f"Connection check failed: {e}, will reconnect")
                     self._setup_complete = False
+                if persistent_connection_healthy:
+                    self._assert_existing_position_protection(
+                        allow_runtime_tracked_states=True,
+                    )
+                    logger.info("✓ Persistent IBKR connection still active")
+                    return
 
         self.cfg = load_config()
 
@@ -1292,6 +1907,7 @@ class AsyncRunner:
                 # Without this, the runner sees a phantom position post-stop
                 # and blocks/breaks subsequent BUY and SELL signals.
                 position_closed_callback=self._on_stop_loss_executed,
+                order_timeout_seconds=self.cfg.execution.order_timeout_seconds,
             )
             await self.stop_loss_monitor.start_monitoring()
             if self.use_trailing_stop:
@@ -1515,6 +2131,7 @@ class AsyncRunner:
 
         # Load existing positions from database to prevent duplicate buying
         await self.load_existing_positions()
+        self._assert_existing_position_protection()
 
         # Mark setup as complete for persistent connections
         self._setup_complete = True
@@ -1524,6 +2141,708 @@ class AsyncRunner:
         # stale exit-audit file so the dashboard/watchdog reads "no exit"
         # while the runner is actually trading.
         _clear_exit_audit()
+
+    def _assert_existing_position_protection(
+        self,
+        *,
+        allow_runtime_tracked_states: bool = False,
+    ) -> None:
+        """Require monitor-owned, live-grade stop coverage for every holding.
+
+        Historical bars and runner caches are intentionally excluded. The
+        protection contract is satisfied only after StopLossMonitor itself has
+        accepted a fresh broker event from the independent live-protective
+        source. Until PR 3 installs that source, a holdings-bearing runner must
+        abort setup rather than appear healthy with blind stops.
+
+        The persistent-runtime fast path may additionally accept an exact
+        active TRIGGERED stop that the monitor still owns as latched pending
+        evidence, an exact queued batch member, or the exact broker-in-flight
+        object. It may also accept an absent active stop during the narrow
+        post-fill settlement window when the exact in-flight stop is EXECUTED
+        and still matches the stale local position quantity. Cold setup and
+        recovery deliberately leave ``allow_runtime_tracked_states`` disabled.
+        """
+
+        positions = {
+            symbol: position
+            for symbol, position in getattr(self, "positions", {}).items()
+            if getattr(position, "quantity", 0) != 0
+        }
+
+        def fail(reason_code: str) -> NoReturn:
+            raise UnprotectedExistingPositionsError(
+                getattr(self, "portfolio_id", "default"),
+                len(positions),
+                reason_code,
+            )
+
+        def validate_progress_window(
+            *,
+            started: object,
+            timeout: object,
+            deadline: object,
+            expected_timeout: object,
+            invalid_reason: str,
+            expired_reason: str,
+        ) -> None:
+            now = monitor._monotonic()
+            values = (now, started, timeout, deadline, expected_timeout)
+            if any(
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                for value in values
+            ):
+                fail(invalid_reason)
+            started_value = float(started)
+            timeout_value = float(timeout)
+            expected_timeout_value = float(expected_timeout)
+            deadline_value = float(deadline)
+            now_value = float(now)
+            if (
+                timeout_value <= 0
+                or not math.isclose(
+                    timeout_value,
+                    expected_timeout_value,
+                    rel_tol=1e-12,
+                    abs_tol=1e-9,
+                )
+                or deadline_value <= started_value
+                or not math.isclose(
+                    deadline_value,
+                    started_value + timeout_value,
+                    rel_tol=1e-12,
+                    abs_tol=1e-9,
+                )
+                or now_value < started_value
+            ):
+                fail(invalid_reason)
+            if now_value > deadline_value:
+                fail(expired_reason)
+
+        def validate_phase_record(
+            record: object,
+            stop: StopLossOrder,
+            expected_phase: StopExecutionPhase,
+            expected_timeout: object,
+            identity_reason: str,
+            invalid_reason: str,
+            expired_reason: str,
+        ) -> None:
+            if (
+                not isinstance(record, StopExecutionPhaseRecord)
+                or record.stop is not stop
+                or record.phase is not expected_phase
+            ):
+                fail(identity_reason)
+            validate_progress_window(
+                started=record.started_monotonic,
+                timeout=record.timeout_seconds,
+                deadline=record.deadline_monotonic,
+                expected_timeout=expected_timeout,
+                invalid_reason=invalid_reason,
+                expired_reason=expired_reason,
+            )
+
+        def has_authenticated_precreation_trigger(
+            stop: StopLossOrder,
+            symbol: str,
+            stop_key: str,
+        ) -> bool:
+            """Authenticate the narrow cached-quote trigger ordering exception."""
+            evidence_by_stop = getattr(monitor, "_latched_stop_crossings", None)
+            evidence = (
+                evidence_by_stop.get(id(stop)) if isinstance(evidence_by_stop, dict) else None
+            )
+            if (
+                not isinstance(evidence, _PendingStopTrigger)
+                or evidence.stop is not stop
+                or monitor._stop_key(symbol) != stop_key
+                or evidence.trigger_price != getattr(stop, "trigger_price", None)
+                or evidence.event_time != getattr(stop, "triggered_at", None)
+            ):
+                return False
+
+            receipt_order = evidence.receipt_order
+            symbol_orders = getattr(monitor, "price_receipt_orders", None)
+            monitor_order = getattr(monitor, "_price_receipt_order", None)
+            symbol_order = symbol_orders.get(symbol) if isinstance(symbol_orders, dict) else None
+            receipt_times = getattr(monitor, "price_receipt_monotonic", None)
+            latest_receipt = receipt_times.get(symbol) if isinstance(receipt_times, dict) else None
+            expected_timeout = getattr(
+                monitor,
+                "pending_drain_timeout_seconds",
+                None,
+            )
+            numeric_values = (
+                evidence.trigger_price,
+                evidence.receipt_monotonic,
+                evidence.drain_timeout_seconds,
+                evidence.drain_deadline_monotonic,
+                latest_receipt,
+                expected_timeout,
+            )
+            if (
+                any(
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                    or not math.isfinite(float(value))
+                    for value in numeric_values
+                )
+                or float(evidence.trigger_price) <= 0
+                or float(evidence.receipt_monotonic) < 0
+                or not isinstance(receipt_order, int)
+                or isinstance(receipt_order, bool)
+                or receipt_order <= 0
+                or not isinstance(symbol_order, int)
+                or isinstance(symbol_order, bool)
+                or not isinstance(monitor_order, int)
+                or isinstance(monitor_order, bool)
+                or not receipt_order <= symbol_order <= monitor_order
+                or float(latest_receipt) < float(evidence.receipt_monotonic)
+                or not math.isclose(
+                    float(evidence.drain_deadline_monotonic),
+                    float(evidence.receipt_monotonic) + float(evidence.drain_timeout_seconds),
+                    rel_tol=1e-12,
+                    abs_tol=1e-9,
+                )
+                or not math.isclose(
+                    float(evidence.drain_timeout_seconds),
+                    float(expected_timeout),
+                    rel_tol=1e-12,
+                    abs_tol=1e-9,
+                )
+            ):
+                return False
+            try:
+                if (
+                    not isinstance(evidence.event_time, datetime)
+                    or evidence.event_time.tzinfo is None
+                    or evidence.event_time.utcoffset() is None
+                ):
+                    return False
+                event_time = evidence.event_time.astimezone(timezone.utc)
+                current_time = monitor._utcnow()
+                if (
+                    not isinstance(current_time, datetime)
+                    or current_time.tzinfo is None
+                    or current_time.utcoffset() is None
+                ):
+                    return False
+                now_utc = current_time.astimezone(timezone.utc)
+                crossing_valid = monitor._price_crosses_stop(
+                    stop,
+                    evidence.trigger_price,
+                )
+            except Exception:
+                return False
+            return event_time <= now_utc and crossing_valid is True
+
+        def validate_stop_identity(
+            stop: object,
+            symbol: str,
+            stop_key: str,
+            reason_code: str,
+        ) -> StopLossOrder:
+            if not isinstance(stop, StopLossOrder):
+                fail(reason_code)
+            try:
+                normalized_symbol = DatabaseValidator.validate_symbol(stop.symbol)
+                expected_symbol = DatabaseValidator.validate_symbol(symbol)
+                derived_key = monitor._stop_key(stop.symbol)
+            except Exception:
+                fail(reason_code)
+            runner_portfolio = getattr(self, "portfolio_id", "default")
+            if (
+                stop.symbol != normalized_symbol
+                or symbol != expected_symbol
+                or stop.symbol != symbol
+                or derived_key != stop_key
+                or getattr(stop, "portfolio_id", None) != runner_portfolio
+                or getattr(monitor, "portfolio_id", None) != runner_portfolio
+            ):
+                fail(reason_code)
+            try:
+                validate_stop_loss_order(
+                    stop,
+                    now_utc=monitor._utcnow(),
+                    allow_authenticated_precreation_trigger=(
+                        has_authenticated_precreation_trigger(
+                            stop,
+                            symbol,
+                            stop_key,
+                        )
+                    ),
+                )
+            except Exception:
+                fail("stop_structure_invalid")
+            return stop
+
+        def validate_matching_position(
+            stop: StopLossOrder,
+            position: object,
+        ) -> None:
+            try:
+                validate_stop_loss_order(
+                    stop,
+                    position=position,
+                    now_utc=monitor._utcnow(),
+                    allow_authenticated_precreation_trigger=(
+                        has_authenticated_precreation_trigger(
+                            stop,
+                            stop.symbol,
+                            monitor._stop_key(stop.symbol),
+                        )
+                    ),
+                )
+            except Exception:
+                fail("position_structure_invalid")
+
+        def validate_pending_evidence(
+            evidence: object,
+            stop: StopLossOrder,
+            symbol: str,
+            stop_key: str,
+        ) -> None:
+            if not isinstance(evidence, _PendingStopTrigger) or evidence.stop is not stop:
+                fail("pending_trigger_identity_mismatch")
+            validate_stop_identity(
+                evidence.stop,
+                symbol,
+                stop_key,
+                "pending_trigger_identity_mismatch",
+            )
+            trigger_price = evidence.trigger_price
+            event_time = evidence.event_time
+            receipt_order = evidence.receipt_order
+            monitor_order = getattr(monitor, "_price_receipt_order", None)
+            symbol_orders = getattr(monitor, "price_receipt_orders", None)
+            symbol_order = symbol_orders.get(symbol) if isinstance(symbol_orders, dict) else None
+            if (
+                not isinstance(trigger_price, (int, float))
+                or isinstance(trigger_price, bool)
+                or not math.isfinite(float(trigger_price))
+                or float(trigger_price) <= 0
+                or not isinstance(event_time, datetime)
+                or event_time.tzinfo is None
+                or event_time.utcoffset() is None
+                or not isinstance(receipt_order, int)
+                or isinstance(receipt_order, bool)
+                or receipt_order <= 0
+                or not isinstance(symbol_order, int)
+                or isinstance(symbol_order, bool)
+                or not isinstance(monitor_order, int)
+                or isinstance(monitor_order, bool)
+                or not receipt_order <= symbol_order <= monitor_order
+                or getattr(stop, "trigger_price", None) != trigger_price
+                or not isinstance(getattr(stop, "triggered_at", None), datetime)
+                or stop.triggered_at.tzinfo is None
+                or stop.triggered_at.utcoffset() is None
+                or stop.triggered_at.astimezone(timezone.utc) != event_time.astimezone(timezone.utc)
+            ):
+                fail("pending_trigger_lineage_invalid")
+            now_utc = monitor._utcnow()
+            max_age = getattr(monitor, "max_price_age_seconds", None)
+            if (
+                not isinstance(now_utc, datetime)
+                or now_utc.tzinfo is None
+                or now_utc.utcoffset() is None
+                or not isinstance(max_age, (int, float))
+                or isinstance(max_age, bool)
+                or not math.isfinite(float(max_age))
+                or float(max_age) <= 0
+            ):
+                fail("pending_trigger_event_time_invalid")
+            event_age = (
+                now_utc.astimezone(timezone.utc) - event_time.astimezone(timezone.utc)
+            ).total_seconds()
+            if event_age < 0 or event_age > float(max_age):
+                fail("pending_trigger_event_time_stale")
+            crosses = getattr(monitor, "_price_crosses_stop", None)
+            try:
+                crossing_valid = callable(crosses) and crosses(stop, trigger_price)
+            except Exception:
+                crossing_valid = False
+            if crossing_valid is not True:
+                fail("pending_trigger_crossing_invalid")
+
+        def validate_latched_crossing(stop: StopLossOrder, reason_code: str) -> None:
+            trigger_price = getattr(stop, "trigger_price", None)
+            triggered_at = getattr(stop, "triggered_at", None)
+            if (
+                not isinstance(trigger_price, (int, float))
+                or isinstance(trigger_price, bool)
+                or not math.isfinite(float(trigger_price))
+                or float(trigger_price) <= 0
+                or not isinstance(triggered_at, datetime)
+                or triggered_at.tzinfo is None
+                or triggered_at.utcoffset() is None
+            ):
+                fail(reason_code)
+            crosses = getattr(monitor, "_price_crosses_stop", None)
+            try:
+                crossing_valid = callable(crosses) and crosses(stop, trigger_price)
+            except Exception:
+                crossing_valid = False
+            if crossing_valid is not True:
+                fail(reason_code)
+
+        if not positions and not allow_runtime_tracked_states:
+            return
+
+        monitor = getattr(self, "stop_loss_monitor", None)
+        if monitor is None:
+            fail("stop_monitor_missing")
+        monitor_task = getattr(monitor, "monitor_task", None)
+        if (
+            getattr(monitor, "monitoring_active", False) is not True
+            or monitor_task is None
+            or monitor_task.done()
+        ):
+            fail("stop_monitor_not_running")
+
+        active_stops = getattr(monitor, "active_stops", None)
+        if not isinstance(active_stops, dict):
+            fail("stop_monitor_state_invalid")
+
+        pending_triggers: Dict[str, object] = {}
+        queued_stops: Dict[str, object] = {}
+        inflight_stops: Dict[str, object] = {}
+        validated_active_stops: Dict[str, StopLossOrder] = {}
+        validated_pending_stops: Dict[str, StopLossOrder] = {}
+        validated_queued_stops: Dict[str, StopLossOrder] = {}
+        validated_inflight_stops: Dict[str, StopLossOrder] = {}
+
+        if allow_runtime_tracked_states:
+            pending_state = getattr(monitor, "_pending_stop_triggers", None)
+            queued_state = getattr(monitor, "_queued_stop_orders", None)
+            inflight_state = getattr(monitor, "_inflight_stop_orders", None)
+            if (
+                not isinstance(pending_state, dict)
+                or not isinstance(queued_state, dict)
+                or not isinstance(inflight_state, dict)
+            ):
+                fail("stop_monitor_state_invalid")
+            pending_triggers = pending_state
+            queued_stops = queued_state
+            inflight_stops = inflight_state
+
+            # Runtime phase state is global safety state, not merely supporting
+            # evidence for the current position loop. Validate it before any
+            # empty-position return so an orphan stop cannot over-close or
+            # reverse exposure.
+            for stop_key, candidate in active_stops.items():
+                symbol = getattr(candidate, "symbol", "")
+                stop = validate_stop_identity(
+                    candidate,
+                    symbol,
+                    stop_key,
+                    "active_stop_identity_mismatch",
+                )
+                if symbol not in positions:
+                    fail("orphan_active_stop")
+                validate_matching_position(stop, positions[symbol])
+                validated_active_stops[stop_key] = stop
+
+            for stop_key, evidence in pending_triggers.items():
+                if not isinstance(evidence, _PendingStopTrigger):
+                    fail("pending_trigger_identity_mismatch")
+                candidate = evidence.stop
+                symbol = getattr(candidate, "symbol", "")
+                stop = validate_stop_identity(
+                    candidate,
+                    symbol,
+                    stop_key,
+                    "pending_trigger_identity_mismatch",
+                )
+                if active_stops.get(stop_key) is not stop:
+                    fail("pending_trigger_identity_mismatch")
+                if symbol not in positions:
+                    fail("orphan_pending_trigger")
+                validate_matching_position(stop, positions[symbol])
+                validated_pending_stops[stop_key] = stop
+
+            for stop_key, record in queued_stops.items():
+                if not isinstance(record, StopExecutionPhaseRecord):
+                    fail("queued_stop_identity_mismatch")
+                candidate = record.stop
+                symbol = getattr(candidate, "symbol", "")
+                stop = validate_stop_identity(
+                    candidate,
+                    symbol,
+                    stop_key,
+                    "queued_stop_identity_mismatch",
+                )
+                if symbol not in positions:
+                    fail("orphan_queued_stop")
+                validate_matching_position(stop, positions[symbol])
+                validated_queued_stops[stop_key] = stop
+
+            for stop_key, record in inflight_stops.items():
+                if not isinstance(record, StopExecutionPhaseRecord):
+                    fail("inflight_stop_identity_mismatch")
+                candidate = record.stop
+                symbol = getattr(candidate, "symbol", "")
+                identity_reason = (
+                    "post_fill_identity_mismatch"
+                    if record.phase is StopExecutionPhase.POST_FILL_SETTLEMENT
+                    else "broker_stop_identity_mismatch"
+                )
+                stop = validate_stop_identity(
+                    candidate,
+                    symbol,
+                    stop_key,
+                    identity_reason,
+                )
+                if (
+                    symbol not in positions
+                    and record.phase is not StopExecutionPhase.POST_FILL_SETTLEMENT
+                ):
+                    fail("orphan_broker_stop")
+                if symbol in positions:
+                    validate_matching_position(stop, positions[symbol])
+                validated_inflight_stops[stop_key] = stop
+
+            latched_crossings = getattr(monitor, "_latched_stop_crossings", None)
+            if not isinstance(latched_crossings, dict):
+                fail("stop_monitor_state_invalid")
+            for identity_key, evidence in latched_crossings.items():
+                if (
+                    not isinstance(evidence, _PendingStopTrigger)
+                    or type(identity_key) is not int
+                    or identity_key != id(evidence.stop)
+                ):
+                    fail("latched_crossing_identity_mismatch")
+                stop = evidence.stop
+                symbol = getattr(stop, "symbol", "")
+                try:
+                    stop_key = monitor._stop_key(symbol)
+                except Exception:
+                    fail("latched_crossing_identity_mismatch")
+                validate_stop_identity(
+                    stop,
+                    symbol,
+                    stop_key,
+                    "latched_crossing_identity_mismatch",
+                )
+                if not has_authenticated_precreation_trigger(
+                    stop,
+                    symbol,
+                    stop_key,
+                ):
+                    fail("latched_crossing_lineage_invalid")
+
+                pending_owner = pending_triggers.get(stop_key)
+                queued_owner = queued_stops.get(stop_key)
+                inflight_owner = inflight_stops.get(stop_key)
+                exact_pending_owner = pending_owner is evidence
+                exact_queued_owner = (
+                    isinstance(queued_owner, StopExecutionPhaseRecord) and queued_owner.stop is stop
+                )
+                exact_inflight_owner = (
+                    isinstance(inflight_owner, StopExecutionPhaseRecord)
+                    and inflight_owner.stop is stop
+                )
+                exact_active_owner = active_stops.get(stop_key) is stop
+                if pending_owner is not None and pending_owner is not evidence:
+                    fail("latched_crossing_identity_mismatch")
+                if not (
+                    exact_pending_owner
+                    or exact_queued_owner
+                    or exact_inflight_owner
+                    or exact_active_owner
+                ):
+                    fail("orphan_latched_crossing")
+                if not (exact_pending_owner or exact_queued_owner or exact_inflight_owner):
+                    fail("latched_crossing_progress_untracked")
+                now_monotonic = monitor._monotonic()
+                if (
+                    not isinstance(now_monotonic, (int, float))
+                    or isinstance(now_monotonic, bool)
+                    or not math.isfinite(float(now_monotonic))
+                    or float(now_monotonic) < float(evidence.receipt_monotonic)
+                ):
+                    fail("latched_crossing_lineage_invalid")
+
+            for stop_key, stop in validated_active_stops.items():
+                exact_owners = sum(
+                    owner is stop
+                    for owner in (
+                        validated_pending_stops.get(stop_key),
+                        validated_queued_stops.get(stop_key),
+                        validated_inflight_stops.get(stop_key),
+                    )
+                )
+                if stop.status is StopStatus.TRIGGERED:
+                    if exact_owners == 0:
+                        fail("active_stop_trigger_untracked")
+                    if exact_owners != 1:
+                        fail("active_stop_trigger_ownership_conflict")
+                elif stop.status is StopStatus.PENDING and exact_owners:
+                    fail("active_stop_trigger_ownership_conflict")
+
+            for stop_key, stop in validated_pending_stops.items():
+                if stop.status is not StopStatus.TRIGGERED:
+                    fail("pending_trigger_state_invalid")
+                evidence = pending_triggers[stop_key]
+                validate_pending_evidence(evidence, stop, stop.symbol, stop_key)
+                validate_progress_window(
+                    started=evidence.receipt_monotonic,
+                    timeout=evidence.drain_timeout_seconds,
+                    deadline=evidence.drain_deadline_monotonic,
+                    expected_timeout=getattr(
+                        monitor,
+                        "pending_drain_timeout_seconds",
+                        None,
+                    ),
+                    invalid_reason="pending_trigger_progress_invalid",
+                    expired_reason="pending_trigger_progress_expired",
+                )
+
+            for stop_key, stop in validated_queued_stops.items():
+                if stop.status is not StopStatus.TRIGGERED:
+                    fail("queued_stop_state_invalid")
+                validate_latched_crossing(stop, "queued_stop_crossing_invalid")
+                validate_phase_record(
+                    queued_stops[stop_key],
+                    stop,
+                    StopExecutionPhase.QUEUED,
+                    getattr(monitor, "queue_timeout_seconds", None),
+                    "queued_stop_identity_mismatch",
+                    "queued_stop_progress_invalid",
+                    "queued_stop_progress_expired",
+                )
+
+            for stop_key, stop in validated_inflight_stops.items():
+                record = inflight_stops[stop_key]
+                if record.phase is StopExecutionPhase.BROKER_WAIT:
+                    active_replacement = active_stops.get(stop_key)
+                    cancelled_for_replacement = (
+                        stop.status is StopStatus.CANCELLED
+                        and isinstance(active_replacement, StopLossOrder)
+                        and active_replacement is not stop
+                        and active_replacement.status is StopStatus.PENDING
+                    )
+                    if stop.status is not StopStatus.TRIGGERED and not cancelled_for_replacement:
+                        fail("broker_stop_state_invalid")
+                    validate_latched_crossing(stop, "broker_stop_crossing_invalid")
+                    validate_phase_record(
+                        record,
+                        stop,
+                        StopExecutionPhase.BROKER_WAIT,
+                        getattr(monitor, "broker_attempt_timeout_seconds", None),
+                        "broker_stop_identity_mismatch",
+                        "broker_stop_progress_invalid",
+                        "broker_stop_progress_expired",
+                    )
+                elif record.phase is StopExecutionPhase.POST_FILL_SETTLEMENT:
+                    if stop.status is not StopStatus.EXECUTED:
+                        fail("post_fill_state_invalid")
+                    validate_latched_crossing(stop, "post_fill_crossing_invalid")
+                    validate_phase_record(
+                        record,
+                        stop,
+                        StopExecutionPhase.POST_FILL_SETTLEMENT,
+                        getattr(monitor, "settlement_timeout_seconds", None),
+                        "post_fill_identity_mismatch",
+                        "post_fill_progress_invalid",
+                        "post_fill_progress_expired",
+                    )
+                else:
+                    fail("inflight_stop_phase_invalid")
+
+        for symbol, position in positions.items():
+            stop_key = monitor._stop_key(symbol)
+            stop = active_stops.get(stop_key)
+            if stop is None:
+                if allow_runtime_tracked_states:
+                    settlement_record = inflight_stops.get(stop_key)
+                    if (
+                        isinstance(settlement_record, StopExecutionPhaseRecord)
+                        and settlement_record.phase is StopExecutionPhase.POST_FILL_SETTLEMENT
+                        and settlement_record.stop.status is StopStatus.EXECUTED
+                        and stop_key not in pending_triggers
+                        and stop_key not in queued_stops
+                    ):
+                        settlement_stop = validated_inflight_stops[stop_key]
+                        if settlement_stop.position_qty != position.quantity:
+                            fail("post_fill_settlement_quantity_mismatch")
+                        continue
+                fail("active_stop_missing")
+            stop = validate_stop_identity(
+                stop,
+                symbol,
+                stop_key,
+                "active_stop_identity_mismatch",
+            )
+            validate_matching_position(stop, position)
+            if getattr(stop, "position_qty", None) != position.quantity:
+                fail("active_stop_quantity_mismatch")
+
+            stop_status = getattr(stop, "status", None)
+            if stop_status is StopStatus.TRIGGERED and allow_runtime_tracked_states:
+                # The broker crossing was validated before it was latched.
+                # Current quote freshness may expire while its close waits in
+                # the monitor queue or at the broker.
+                continue
+            if stop_status is not StopStatus.PENDING:
+                fail("active_stop_not_pending")
+
+            prices = getattr(monitor, "last_prices", None)
+            event_times = getattr(monitor, "price_event_times", None)
+            receipt_times = getattr(monitor, "price_receipt_monotonic", None)
+            if (
+                not isinstance(prices, dict)
+                or not isinstance(event_times, dict)
+                or not isinstance(receipt_times, dict)
+            ):
+                fail("stop_monitor_state_invalid")
+
+            now_utc = monitor._utcnow()
+            now_monotonic = monitor._monotonic()
+            max_age = float(getattr(monitor, "max_price_age_seconds", 0))
+            if (
+                not isinstance(now_utc, datetime)
+                or now_utc.tzinfo is None
+                or now_utc.utcoffset() is None
+                or not math.isfinite(now_monotonic)
+                or not math.isfinite(max_age)
+                or max_age <= 0
+            ):
+                fail("stop_monitor_clock_invalid")
+            now_utc = now_utc.astimezone(timezone.utc)
+
+            price = prices.get(symbol)
+            event_time = event_times.get(symbol)
+            receipt_time = receipt_times.get(symbol)
+            if (
+                not isinstance(price, (int, float))
+                or isinstance(price, bool)
+                or not math.isfinite(float(price))
+                or float(price) <= 0
+                or not isinstance(event_time, datetime)
+                or event_time.tzinfo is None
+                or event_time.utcoffset() is None
+                or not isinstance(receipt_time, (int, float))
+                or isinstance(receipt_time, bool)
+                or not math.isfinite(float(receipt_time))
+            ):
+                fail("protective_price_state_invalid")
+
+            event_age = (now_utc - event_time.astimezone(timezone.utc)).total_seconds()
+            receipt_age = now_monotonic - float(receipt_time)
+            if event_age < 0 or receipt_age < 0 or event_age > max_age or receipt_age > max_age:
+                fail("protective_price_stale")
+            crosses = getattr(monitor, "_price_crosses_stop", None)
+            try:
+                pending_already_crossed = True if not callable(crosses) else crosses(stop, price)
+            except Exception:
+                pending_already_crossed = True
+            if pending_already_crossed is not False:
+                fail("pending_stop_already_crossed")
+            if not self._has_live_protective_feed(symbol):
+                fail("live_protective_feed_unavailable")
 
     async def load_existing_positions(self):
         """Load existing positions and account state from database on startup."""
@@ -1610,9 +2929,17 @@ class AsyncRunner:
                                 f"(entry=${entry_price:.2f}, stop=${stop_price:.2f})"
                             )
                     except Exception as e:
-                        logger.error(
-                            f"Failed to create stop-loss for existing position {symbol}: {e}"
+                        logger.critical(
+                            "event=existing_position_stop_registration_failed "
+                            "portfolio=%s exception_type=%s",
+                            self.portfolio_id,
+                            type(e).__name__,
                         )
+                        raise UnprotectedExistingPositionsError(
+                            self.portfolio_id,
+                            len(self.positions),
+                            "stop_registration_failed",
+                        ) from e
 
             if self.positions:
                 logger.info(
@@ -1627,11 +2954,19 @@ class AsyncRunner:
             self.session_start_equity = float(await self.portfolio.equity(market_prices))
             logger.info(f"Session start equity: ${self.session_start_equity:,.2f}")
 
+        except UnprotectedExistingPositionsError:
+            raise
         except Exception as e:
-            logger.error(f"Failed to load existing positions from database: {e}")
-            logger.warning("Starting with empty positions - may result in duplicate trades!")
-            # Fallback to config default if load fails
-            self.session_start_equity = float(self.cfg.default_cash)
+            logger.critical(
+                "event=existing_position_load_failed portfolio=%s exception_type=%s",
+                self.portfolio_id,
+                type(e).__name__,
+            )
+            raise UnprotectedExistingPositionsError(
+                self.portfolio_id,
+                len(self.positions),
+                "position_load_failed",
+            ) from e
 
     async def _fetch_historical_bars(
         self,
@@ -1670,43 +3005,285 @@ class AsyncRunner:
             if not bars:
                 return pd.DataFrame()
 
-            # Convert list of dicts to DataFrame
+            # Convert list of dicts to DataFrame. Normalization below is
+            # intentionally shared with the legacy client so every consumer
+            # receives the same event-time contract.
             df = pd.DataFrame(bars)
-            if not df.empty:
-                # Ensure columns are lowercase
-                df.columns = [col.lower() for col in df.columns]
-                # Sort by date
-                if "date" in df.columns:
-                    df = df.sort_values("date")
         else:
             # Legacy IB client - use synchronous methods
             if not self.ib.isConnected():
                 raise ConnectionError("Not connected to IBKR")
 
             contract = Stock(symbol, "SMART", "USD")
-            qualified = self.ib.qualifyContracts(contract)
-            if not qualified:
-                return pd.DataFrame()
+            if hasattr(self.ib, "qualifyContractsAsync"):
+                qualified = self.ib.qualifyContractsAsync(contract)
+            elif hasattr(self.ib, "qualifyContracts"):
+                qualified = self.ib.qualifyContracts(contract)
+            else:
+                raise MarketDataContractError(
+                    "IBKR client exposes no contract qualification method"
+                )
+            if inspect.isawaitable(qualified):
+                qualified = await qualified
+            qualified_contract = self._validate_qualified_contract(symbol, qualified)
 
-            bars = self.ib.reqHistoricalData(
-                qualified[0],
-                endDateTime="",
-                durationStr=duration,
-                barSizeSetting=bar_size,
-                whatToShow=what_to_show,
-                useRTH=use_rth,
-                formatDate=1,
-            )
+            request_kwargs = {
+                "endDateTime": "",
+                "durationStr": duration,
+                "barSizeSetting": bar_size,
+                "whatToShow": what_to_show,
+                "useRTH": use_rth,
+                # UTC-aware datetime values; formatDate=1 is local/ambiguous.
+                "formatDate": 2,
+            }
+            if hasattr(self.ib, "reqHistoricalDataAsync"):
+                bars = self.ib.reqHistoricalDataAsync(
+                    qualified_contract,
+                    **request_kwargs,
+                )
+            elif hasattr(self.ib, "reqHistoricalData"):
+                bars = self.ib.reqHistoricalData(
+                    qualified_contract,
+                    **request_kwargs,
+                )
+            else:
+                raise MarketDataContractError("IBKR client exposes no historical-data method")
+            if inspect.isawaitable(bars):
+                bars = await bars
 
             if not bars:
                 return pd.DataFrame()
 
             df = pd.DataFrame(bars)
-            if not df.empty:
-                df.columns = [col.lower() for col in df.columns]
-                df = df.sort_values("date")
 
-        return df
+        return self._normalize_broker_bars(symbol, df, bar_size)
+
+    @staticmethod
+    def _bar_interval_seconds(bar_size: str) -> int:
+        """Return the requested bar interval in seconds, conservatively."""
+        value = str(bar_size).strip().lower().split()
+        if not value:
+            return 60
+        try:
+            amount = int(value[0])
+        except (TypeError, ValueError):
+            return 60
+        unit = value[1] if len(value) > 1 else "min"
+        if unit.startswith("sec"):
+            return amount
+        if unit.startswith("min"):
+            return amount * 60
+        if unit.startswith("hour"):
+            return amount * 3600
+        if unit.startswith("day"):
+            return amount * 86400
+        return 60
+
+    @classmethod
+    def _require_intraday_bar_size(cls, bar_size: str) -> None:
+        """Reject daily-or-coarser bars from the active trading runtime."""
+        normalized = str(bar_size).strip().lower()
+        interval_seconds = cls._bar_interval_seconds(normalized)
+        if (
+            interval_seconds >= 86400
+            or "day" in normalized
+            or "week" in normalized
+            or "month" in normalized
+            or re.fullmatch(r"\d+\s*(d|w|wk|wks|mo|mos)", normalized) is not None
+        ):
+            raise MarketDataContractError(
+                "active trading requires timezone-aware intraday datetime bars; "
+                "daily-or-coarser bars are unsupported"
+            )
+
+    @staticmethod
+    def _validate_qualified_contract(symbol: str, contracts: object) -> object:
+        """Validate the legacy client's qualified Stock identity fail closed."""
+        requested = symbol.strip().upper()
+        if not isinstance(contracts, (list, tuple)) or len(contracts) != 1:
+            raise MarketDataIdentityError(
+                f"IBKR contract qualification was not unique for {symbol}"
+            )
+        contract = contracts[0]
+        con_id = getattr(contract, "conId", None)
+        if (
+            contract is None
+            or isinstance(con_id, bool)
+            or not isinstance(con_id, int)
+            or con_id <= 0
+        ):
+            raise MarketDataIdentityError(
+                f"IBKR returned an invalid qualified contract for {symbol}"
+            )
+
+        contract_symbol = str(getattr(contract, "symbol", "") or "").strip().upper()
+        local_symbol = str(getattr(contract, "localSymbol", "") or "").strip().upper()
+        if contract_symbol != requested or local_symbol != requested:
+            raise MarketDataIdentityError(
+                f"IBKR qualified contract identity does not match {symbol}"
+            )
+        if str(getattr(contract, "secType", "") or "").strip().upper() != "STK":
+            raise MarketDataIdentityError("IBKR qualified contract is not a stock")
+        if str(getattr(contract, "currency", "") or "").strip().upper() != "USD":
+            raise MarketDataIdentityError("IBKR qualified contract currency is not USD")
+        if str(getattr(contract, "exchange", "") or "").strip().upper() != "SMART":
+            raise MarketDataIdentityError("IBKR qualified contract does not preserve SMART routing")
+        return contract
+
+    @classmethod
+    def _normalize_broker_bars(
+        cls,
+        symbol: str,
+        frame: pd.DataFrame,
+        bar_size: str,
+        *,
+        now: Optional[pd.Timestamp] = None,
+    ) -> pd.DataFrame:
+        """Validate broker bars and return a UTC-aware, time-indexed frame.
+
+        This is the sanctioned AsyncRunner's last trust boundary before bars
+        can reach persistence, caches, strategies, risk, or protective-stop
+        logic. Alternate engines are outside the supported runtime topology
+        and remain scheduled for quarantine in PR 7. This boundary rejects
+        ambiguity instead of sorting, localizing, or otherwise guessing what
+        the broker meant.
+        """
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            return pd.DataFrame()
+        cls._require_intraday_bar_size(bar_size)
+
+        normalized = frame.copy()
+        lowered = [str(column).lower() for column in normalized.columns]
+        if len(lowered) != len(set(lowered)):
+            raise MarketDataIdentityError("broker bar columns are identity-ambiguous")
+        normalized.columns = lowered
+
+        if "symbol" in normalized.columns:
+            raw_identities = normalized["symbol"].tolist()
+            if any(pd.isna(value) or not str(value).strip() for value in raw_identities):
+                raise MarketDataIdentityError("broker bars contain missing symbol identity")
+            identities = {str(value).strip().upper() for value in raw_identities}
+            if identities != {symbol.upper()}:
+                raise MarketDataIdentityError(
+                    f"broker bar identity does not uniquely match {symbol}"
+                )
+
+        if "date" not in normalized.columns:
+            # A RangeIndex here is the historic corruption path: its row
+            # numbers were persisted as market timestamps.
+            if isinstance(normalized.index, pd.RangeIndex):
+                raise MarketDataContractError("broker bars have RangeIndex and no date values")
+            raise MarketDataContractError("broker bars have no explicit date values")
+
+        timestamps = []
+        for value in normalized["date"].tolist():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                raise MarketDataContractError("numeric broker timestamps are ambiguous")
+            try:
+                timestamp = pd.Timestamp(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise MarketDataContractError(f"invalid broker timestamp: {value!r}") from exc
+            if pd.isna(timestamp):
+                raise MarketDataContractError("broker timestamp is missing")
+            if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+                raise MarketDataContractError("timezone-naive broker timestamp rejected")
+            timestamps.append(timestamp.tz_convert("UTC"))
+
+        index = pd.DatetimeIndex(timestamps, name="timestamp")
+        if not index.is_unique:
+            raise MarketDataContractError("duplicate broker timestamps rejected")
+        if not index.is_monotonic_increasing:
+            raise MarketDataContractError("reversed or out-of-order broker timestamps rejected")
+
+        if isinstance(normalized.index, pd.DatetimeIndex):
+            existing = normalized.index
+            if existing.tz is None:
+                raise MarketDataContractError("timezone-naive broker index rejected")
+            if not existing.tz_convert("UTC").equals(index):
+                raise MarketDataIdentityError("broker date column and index disagree")
+        elif not isinstance(normalized.index, pd.RangeIndex):
+            raise MarketDataIdentityError("broker row identity is ambiguous")
+
+        current = now if now is not None else pd.Timestamp.now(tz="UTC")
+        current = pd.Timestamp(current)
+        if current.tzinfo is None or current.utcoffset() is None:
+            raise ValueError("validation clock must be timezone-aware")
+        current = current.tz_convert("UTC")
+        latest = index[-1]
+        if latest > current:
+            raise MarketDataContractError("broker bars contain a future timestamp")
+        interval_seconds = cls._bar_interval_seconds(bar_size)
+        default_max_age = max(180, (interval_seconds * 2) + 30)
+        try:
+            max_age_seconds = float(os.getenv("MARKET_DATA_MAX_AGE_SECONDS", str(default_max_age)))
+        except (TypeError, ValueError):
+            max_age_seconds = float(default_max_age)
+        if not math.isfinite(max_age_seconds) or max_age_seconds <= 0:
+            raise MarketDataContractError("MARKET_DATA_MAX_AGE_SECONDS must be positive")
+        if (current - latest).total_seconds() > max_age_seconds:
+            raise MarketDataContractError(
+                f"stale broker bars rejected (age={(current - latest).total_seconds():.1f}s)"
+            )
+
+        required = ("open", "high", "low", "close", "volume")
+        missing = [column for column in required if column not in normalized.columns]
+        if missing:
+            raise MarketDataContractError(f"broker bars missing fields: {', '.join(missing)}")
+        for column in required:
+            numeric = pd.to_numeric(normalized[column], errors="coerce")
+            if numeric.isna().any() or not numeric.map(math.isfinite).all():
+                raise MarketDataContractError(f"broker bar {column} contains invalid values")
+            normalized[column] = numeric
+        if (normalized[["open", "high", "low", "close"]] <= 0).any().any():
+            raise MarketDataContractError("broker OHLC values must be positive")
+        if (normalized["volume"] < 0).any():
+            raise MarketDataContractError("broker volume cannot be negative")
+        if (normalized["high"] < normalized[["open", "low", "close"]].max(axis=1)).any() or (
+            normalized["low"] > normalized[["open", "high", "close"]].min(axis=1)
+        ).any():
+            raise MarketDataContractError("broker OHLC ordering is invalid")
+
+        normalized = normalized.drop(columns=["date"])
+        normalized.index = index
+        return normalized
+
+    def _validate_cross_bar_anomaly(self, symbol: str, frame: pd.DataFrame) -> None:
+        """Quarantine split-like discontinuities before any downstream side effect.
+
+        Corporate-action adjustment is not yet authoritative. Any OHLC move at
+        or beyond 1.75x (or its reciprocal) therefore fails closed. This catches
+        common 2:1, 3:1, and 4:1 splits while leaving authoritative corporate
+        action handling to PR 3.
+        """
+        limit = _UNVERIFIED_PRICE_RATIO_LIMIT
+        reciprocal = 1.0 / limit
+        ohlc = frame[["open", "high", "low", "close"]].astype(float)
+        closes = frame["close"].astype(float)
+
+        intrabar_spread = ohlc.max(axis=1) / ohlc.min(axis=1)
+        # max(OHLC) / min(OHLC) is always >= 1 for the positive prices
+        # validated above, so only the upper anomaly bound is meaningful.
+        if (intrabar_spread >= limit).any():
+            raise MarketDataContractError(
+                f"intrabar OHLC anomaly quarantined for {symbol}: "
+                "possible bad tick or corporate action"
+            )
+
+        previous_close = closes.shift(1)
+        adjacent = ohlc.div(previous_close, axis=0).iloc[1:]
+        if ((adjacent >= limit) | (adjacent <= reciprocal)).any().any():
+            raise MarketDataContractError(
+                f"cross-bar OHLC anomaly quarantined for {symbol}: " "possible corporate action"
+            )
+
+        trusted = getattr(self, "_trusted_bar_closes", {}).get(symbol)
+        if trusted is not None:
+            latest_ratios = ohlc.iloc[-1] / float(trusted)
+            if ((latest_ratios >= limit) | (latest_ratios <= reciprocal)).any():
+                raise MarketDataContractError(
+                    f"latest bar OHLC anomaly quarantined for {symbol}: "
+                    "possible corporate action"
+                )
 
     async def teardown(self, full_cleanup: bool = False):
         """Clean up resources after a run cycle.
@@ -1792,24 +3369,21 @@ class AsyncRunner:
             )
             return None
 
-        # Check connection health; surface failure to ConnectionHealth and let the
-        # background monitor (or next cycle) handle recovery — do NOT reconnect here.
-        if hasattr(self.ib, "is_connected") and not self.ib.is_connected:
-            logger.warning(f"Connection lost before fetching {symbol}; deferring to health monitor")
-            if getattr(self, "health", None) is not None:
-                self.health.record_failure(
-                    RuntimeError("is_connected=False before fetch"),
-                    "fetch_and_store_data",
-                )
-            return None
+        # Check connection health before starting a request. The cycle boundary
+        # classifies an authoritative pre-request disconnect as recoverable
+        # only when no sibling broker request/order is already active.
+        request_owner = await self._claim_cycle_broker_request(symbol)
 
         try:
             start_time = asyncio.get_event_loop().time()
-            with Timer("data_fetch", self.monitor):
-                # Fetch historical bars using IB connection directly
-                df = await self._fetch_historical_bars(
-                    symbol=symbol, duration=self.duration, bar_size=self.bar_size
-                )
+            try:
+                with Timer("data_fetch", self.monitor):
+                    # Fetch historical bars using IB connection directly
+                    df = await self._fetch_historical_bars(
+                        symbol=symbol, duration=self.duration, bar_size=self.bar_size
+                    )
+            finally:
+                self._release_cycle_broker_request(request_owner)
 
             # Record API call metrics to ProductionMonitor (Phase 4 P2)
             if self.production_monitor:
@@ -1821,6 +3395,7 @@ class AsyncRunner:
             if df.empty:
                 logger.warning(f"No data returned for {symbol}")
                 return None
+            self._validate_cross_bar_anomaly(symbol, df)
 
             # Store market data in database
             logger.info(f"Fetched {len(df)} bars for {symbol}")
@@ -1847,19 +3422,44 @@ class AsyncRunner:
                 with Timer("database_write", self.monitor):
                     await self.db.batch_store_market_data(batch_data)
                 self.monitor.record_data_points(len(batch_data))
+            if not hasattr(self, "_trusted_bar_closes"):
+                self._trusted_bar_closes = {}
+            self._trusted_bar_closes[symbol] = float(df["close"].iloc[-1])
 
+            health = getattr(self, "health", None)
+            if health is not None:
+                health.record_success()
             return df
 
+        except MarketDataIdentityError as e:
+            logger.error(f"Rejected identity-ambiguous broker data for {symbol}: {e}")
+            health = getattr(self, "health", None)
+            if health is not None:
+                health.record_failure(e, "fetch_and_store_data:identity")
+            raise SymbolCycleAbortError(
+                f"broker response identity failed while fetching {symbol}"
+            ) from e
+        except MarketDataContractError as e:
+            logger.error(f"Rejected broker data for {symbol}: {e}")
+            return None
+        except (
+            IBKRTransportPoisonedError,
+            IBKRTimeoutError,
+            SubprocessCrashError,
+            GatewayRequiresRestartError,
+            IBKRDisconnectedError,
+            IBKRConnectionConflictError,
+            ConnectionError,
+        ) as e:
+            logger.error(f"Broker transport failed while fetching {symbol}: {e}")
+            health = getattr(self, "health", None)
+            if health is not None:
+                health.record_failure(e, "fetch_and_store_data")
+            raise SymbolCycleAbortError(
+                f"broker transport integrity failed while fetching {symbol}"
+            ) from e
         except Exception as e:
-            error_str = str(e)
             logger.error(f"Failed to fetch data for {symbol}: {e}")
-
-            # If connection error, mark as disconnected to trigger reconnect on next fetch
-            if "ConnectionError" in error_str or "Not connected" in error_str:
-                if hasattr(self.ib, "_connected"):
-                    self.ib._connected = False
-                logger.warning("Marked connection as disconnected for next retry")
-
             return None
 
     def _manage_cache_size(self):
@@ -1898,11 +3498,6 @@ class AsyncRunner:
         # symbol is rejected before reaching `Stock(symbol, "SMART", "USD")` or
         # the database. Validation is cheap and idempotent.
         try:
-            from robo_trader.database_validator import (
-                DatabaseValidator,
-                ValidationError,
-            )
-
             symbol = DatabaseValidator.validate_symbol(symbol)
         except ValidationError as e:
             logger.error(f"Rejected invalid symbol from upstream: {symbol!r}: {e}")
@@ -1937,32 +3532,69 @@ class AsyncRunner:
                 message="No data available",
             )
 
-        # Cache market data for pairs/stat arb analysis with LRU eviction
+        latest_price = float(df["close"].iloc[-1])
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise MarketDataContractError(
+                "validated broker bars lost their timezone-aware DatetimeIndex"
+            )
+        latest_timestamp = df.index[-1].to_pydatetime()
+        if latest_timestamp.tzinfo is None or latest_timestamp.utcoffset() is None:
+            raise MarketDataContractError(
+                "validated broker bars contain a timezone-naive latest timestamp"
+            )
+        latest_timestamp = latest_timestamp.astimezone(timezone.utc)
+
+        # Historical bars are validated observations, but they are not a
+        # live-grade protective feed. A one-minute bar carries its bar event
+        # time and cannot honestly satisfy StopLossMonitor's ten-second quote
+        # contract throughout the minute. Keep observational state current,
+        # but never manufacture protection from retrieval time or let this
+        # source reach strategy/order paths. PR 3 owns the independent quote
+        # or realtime-bar feed that will open this gate.
         if symbol in self.market_data_cache:
             self.market_data_cache.move_to_end(symbol)
         self.market_data_cache[symbol] = df
         self._manage_cache_size()
+        self.latest_prices[symbol] = latest_price
+        if not hasattr(self, "latest_price_times"):
+            self.latest_price_times = {}
+        self.latest_price_times[symbol] = latest_timestamp
+        if not hasattr(self, "latest_price_sources"):
+            self.latest_price_sources = {}
+        self.latest_price_sources[symbol] = "historical_bar"
 
-        # Send real-time price update via WebSocket
-        latest_price = None
-        if df is not None and not df.empty:
-            latest_price = float(df["close"].iloc[-1])
-            self.latest_prices[symbol] = latest_price
+        if WEBSOCKET_ENABLED and ws_client:
+            try:
+                ws_client.send_market_update(symbol, latest_price)
+                logger.info(f"Sent WebSocket update for {symbol}: ${latest_price:.2f}")
+            except Exception as e:
+                logger.error(f"Could not send WebSocket update: {e}")
 
-            if WEBSOCKET_ENABLED and ws_client:
-                try:
-                    ws_client.send_market_update(symbol, latest_price)
-                    logger.info(f"Sent WebSocket update for {symbol}: ${latest_price:.2f}")
-                except Exception as e:
-                    logger.error(f"Could not send WebSocket update: {e}")
+        # Update advanced risk manager with latest prices
+        if self.use_advanced_risk and self.advanced_risk and latest_price:
+            self.advanced_risk.update_market_prices({symbol: latest_price})
 
-            # Update advanced risk manager with latest prices
-            if self.use_advanced_risk and self.advanced_risk and latest_price:
-                self.advanced_risk.update_market_prices({symbol: latest_price})
-
-            # Update stop-loss monitor with latest price
-            if self.stop_loss_monitor and latest_price:
-                await self.stop_loss_monitor.update_price(symbol, latest_price)
+        if not hasattr(self, "_protective_feed_status"):
+            self._protective_feed_status = {}
+        self._protective_feed_status[symbol] = {
+            "available": False,
+            "live_grade": False,
+            "source": "historical_bar",
+            "source_timestamp": latest_timestamp.isoformat(),
+            "reason": "independent_live_protective_feed_pending_pr3",
+        }
+        logger.error(
+            "Protective feed unavailable for %s: historical bars are "
+            "observational only; strategy and order paths blocked",
+            symbol,
+        )
+        return self._blocked_result(
+            symbol,
+            0,
+            latest_price,
+            "Protective feed unavailable: historical bars are observational only",
+            df,
+        )
 
         # Generate trading signal
         with Timer("signal_generation", self.monitor):
@@ -2969,6 +4601,15 @@ class AsyncRunner:
         )
 
     async def run_parallel(self, symbols: List[str]) -> List[SymbolResult]:
+        """Serialize complete symbol cycles so abort state cannot be reset early."""
+        if not hasattr(self, "_run_parallel_lock"):
+            self._run_parallel_lock = asyncio.Lock()
+        if self._run_parallel_lock.locked():
+            raise RuntimeError("run_parallel cycle is already active")
+        async with self._run_parallel_lock:
+            return await self._run_parallel_locked(symbols)
+
+    async def _run_parallel_locked(self, symbols: List[str]) -> List[SymbolResult]:
         """Process multiple symbols in parallel with concurrency control."""
         # TC-L4: clear cycle-level executed-buys set at the start of each cycle
         # so the protection re-applies fresh per cycle (it accumulated across
@@ -2986,18 +4627,153 @@ class AsyncRunner:
             pass
 
         semaphore = asyncio.Semaphore(self.max_concurrent_symbols)
+        if not hasattr(self, "_order_admission_lock"):
+            self._order_admission_lock = asyncio.Lock()
+        async with self._order_admission_lock:
+            self._symbol_cycle_abort_event = asyncio.Event()
+            self._symbol_cycle_abort_error = None
+            self._cycle_worker_tasks = set()
+            self._order_admitted_tasks = set()
+            self._active_cycle_broker_requests = set()
+            self._broker_request_admission_closed = False
+            self._broker_request_abort_error = None
+            if not hasattr(self, "_broker_request_admission_lock"):
+                self._broker_request_admission_lock = asyncio.Lock()
 
         async def process_with_semaphore(symbol: str) -> SymbolResult:
             async with semaphore:
-                result = await self.process_symbol(symbol)
-                self.monitor.record_symbol_processed(
-                    symbol, success=result.executed or result.signal == 0
-                )
-                return result
+                current_task = asyncio.current_task()
+                if current_task is not None:
+                    self._cycle_worker_tasks.add(current_task)
+                try:
+                    if self._symbol_cycle_abort_event.is_set():
+                        prior_cause = getattr(self, "_symbol_cycle_abort_error", None)
+                        if isinstance(prior_cause, SymbolCycleAbortError):
+                            raise prior_cause
+                        raise SymbolCycleAbortError(
+                            "shared broker transport was already declared unusable"
+                        )
+                    result = await self.process_symbol(symbol)
+                except SymbolCycleAbortError as exc:
+                    await self._latch_symbol_cycle_abort(exc)
+                    raise
+                else:
+                    self.monitor.record_symbol_processed(
+                        symbol, success=result.executed or result.signal == 0
+                    )
+                    return result
+                finally:
+                    if current_task is not None:
+                        self._order_admitted_tasks.discard(current_task)
+                        self._cycle_worker_tasks.discard(current_task)
 
-        # Process all symbols concurrently with exception safety
-        tasks = [process_with_semaphore(symbol) for symbol in symbols]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Process concurrently, but fail the entire remaining cycle closed if
+        # one symbol proves the shared broker transport generation unusable.
+        tasks = [
+            asyncio.create_task(process_with_semaphore(symbol), name=f"symbol:{symbol}")
+            for symbol in symbols
+        ]
+        if not tasks:
+            await self.update_position_market_prices({})
+            return []
+        task_indexes = {task: index for index, task in enumerate(tasks)}
+        results: List[object] = [None] * len(tasks)
+
+        async def cancel_non_admitted_and_drain() -> bool:
+            """Stop pre-admission work and join all point-of-no-return tasks.
+
+            Taking the admission lock after the abort latch gives a stable
+            admitted-task snapshot: no new placement can cross the gate after
+            the event is set. Non-admitted siblings are cancellation-safe,
+            while admitted siblings are allowed to finish fill accounting.
+            The concrete drain task is shielded so repeated parent
+            cancellation cannot split a fill from its durable accounting.
+            Return whether cancellation arrived during the shielded drain so
+            the caller can preserve it after every child has settled.
+            """
+
+            async with self._order_admission_lock:
+                admitted = set(getattr(self, "_order_admitted_tasks", set()))
+            for task in tasks:
+                if not task.done() and task not in admitted:
+                    task.cancel()
+
+            async def drain_children() -> None:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            drain_task = asyncio.create_task(
+                drain_children(),
+                name="symbol-cycle-accounting-drain",
+            )
+            cancellation_received = False
+            while not drain_task.done():
+                try:
+                    await asyncio.shield(drain_task)
+                except asyncio.CancelledError:
+                    cancellation_received = True
+                    continue
+            return cancellation_received
+
+        children_drained = False
+        try:
+            pending = set(tasks)
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    index = task_indexes[task]
+                    try:
+                        results[index] = task.result()
+                    except Exception as exc:
+                        results[index] = exc
+
+                cycle_abort = getattr(self, "_symbol_cycle_abort_error", None)
+                if cycle_abort is None:
+                    cycle_abort = next(
+                        (
+                            results[task_indexes[task]]
+                            for task in done
+                            if isinstance(
+                                results[task_indexes[task]],
+                                SymbolCycleAbortError,
+                            )
+                        ),
+                        None,
+                    )
+                if cycle_abort is not None:
+                    cancellation_received = await cancel_non_admitted_and_drain()
+                    children_drained = True
+                    if cancellation_received:
+                        raise asyncio.CancelledError
+                    # An already-admitted sibling may discover a terminal
+                    # ambiguity while the parent is draining it. Re-read the
+                    # authoritative latch so a previously observed recoverable
+                    # disconnect cannot mask that later terminal cause.
+                    latched_abort = getattr(self, "_symbol_cycle_abort_error", None)
+                    if isinstance(latched_abort, SymbolCycleAbortError):
+                        cycle_abort = latched_abort
+                    logger.critical(
+                        "event=symbol_cycle_aborted reason=%r "
+                        "note=downstream_cycle_work_suppressed",
+                        str(cycle_abort),
+                    )
+                    raise cycle_abort
+        except SymbolCycleAbortError:
+            # The abort path already latched admission and drained every child.
+            raise
+        except asyncio.CancelledError:
+            # asyncio.wait does not propagate cancellation into children. Latch
+            # admission first, cancel only tasks that never crossed the
+            # point-of-no-return, and drain admitted tasks through accounting.
+            await self._latch_symbol_cycle_abort()
+            if not children_drained:
+                await cancel_non_admitted_and_drain()
+            raise
+        except BaseException:
+            await cancel_non_admitted_and_drain()
+            raise
 
         # Handle exceptions and collect valid results
         valid_results = []
@@ -3011,7 +4787,8 @@ class AsyncRunner:
                     traceback.format_exception(type(result), result, result.__traceback__)
                 )
                 logger.error(f"Task failed for symbol {symbol}: {result}\nTraceback:\n{tb_str}")
-                # Continue processing other symbols, don't crash the entire run
+                # Ordinary per-symbol failures are isolated. Transport-level
+                # SymbolCycleAbortError was propagated above after child drain.
                 continue
             else:
                 valid_results.append(result)
@@ -3169,7 +4946,14 @@ class AsyncRunner:
 
     async def run(self, symbols: Optional[List[str]] = None):
         """Main run method - process all symbols and update account."""
-        await self.setup()
+        try:
+            await self.setup()
+        except UnprotectedExistingPositionsError:
+            # setup() can fail after starting IBKR, DB, health, and stop-monitor
+            # resources. A one-shot caller has no outer runner registry to
+            # clean those partial resources, so cleanup must be local.
+            await self.cleanup()
+            raise
         try:
             # Check market status
             if not is_trading_allowed():
@@ -3392,8 +5176,12 @@ class AsyncRunner:
                                         )
                                         continue
 
-                                    # Update internal position tracking
-                                    self.pairs_strategy.update_position(pair, signal)
+                                    # Keep analysis available, but quarantine
+                                    # execution before any pairs state mutation
+                                    # until both legs have an atomic,
+                                    # broker-confirmed lifecycle.
+                                    if not self._pairs_execution_admitted(pair):
+                                        continue
 
                                     # Get current prices - fallback to market_data_cache if not in current_prices
                                     price_a = current_prices.get(symbol_a, 0)
@@ -4029,84 +5817,112 @@ class AsyncRunner:
 
     async def cleanup(self):
         """Clean up resources when runner is done."""
-        try:
-            # Stop the persistent health monitor first so it can't fire
-            # during the rest of cleanup.
-            if getattr(self, "health", None) is not None:
-                try:
-                    await self.health.stop_monitoring()
-                except Exception:
-                    logger.warning("Stopping health monitor in cleanup raised", exc_info=True)
+        cleanup_failures = 0
+
+        def record_failure(resource: str) -> None:
+            nonlocal cleanup_failures
+            cleanup_failures += 1
+            logger.warning(
+                "event=runner_cleanup_resource_failed resource=%s",
+                resource,
+                exc_info=True,
+            )
+
+        async def cancel_task(task: Optional[asyncio.Task], resource: str) -> None:
+            if task is None or task.done():
+                return
+            try:
+                task.cancel()
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                record_failure(resource)
+
+        # Every resource is isolated. A failed stop-monitor shutdown must never
+        # prevent the IBKR subprocess or database from being closed after a
+        # fail-closed setup abort.
+        if getattr(self, "health", None) is not None:
+            try:
+                await self.health.stop_monitoring()
+            except Exception:
+                record_failure("connection_health")
+            finally:
                 self.health = None
 
-            # Cancel subprocess monitor task if running
-            if self.subprocess_monitor_task and not self.subprocess_monitor_task.done():
-                self.subprocess_monitor_task.cancel()
-                try:
-                    await self.subprocess_monitor_task
-                except asyncio.CancelledError:
-                    pass
+        await cancel_task(
+            getattr(self, "subprocess_monitor_task", None),
+            "subprocess_monitor_task",
+        )
+        await cancel_task(
+            getattr(self, "risk_monitor_task", None),
+            "risk_monitor_task",
+        )
+        await cancel_task(
+            getattr(self, "cleanup_task", None),
+            "database_cleanup_task",
+        )
 
-            # Cancel risk monitor task if running
-            if self.risk_monitor_task and not self.risk_monitor_task.done():
-                self.risk_monitor_task.cancel()
-                try:
-                    await self.risk_monitor_task
-                except asyncio.CancelledError:
-                    pass
-
-            # DB-R2-L2: cancel periodic cleanup task if running
-            if self.cleanup_task and not self.cleanup_task.done():
-                self.cleanup_task.cancel()
-                try:
-                    await self.cleanup_task
-                except asyncio.CancelledError:
-                    pass
-
-            # Stop and cleanup stop-loss monitor
-            if self.stop_loss_monitor:
-                logger.info("Stopping stop-loss monitor...")
-                await self.stop_loss_monitor.stop_monitoring()
-                metrics = self.stop_loss_monitor.get_metrics()
+        stop_monitor = getattr(self, "stop_loss_monitor", None)
+        if stop_monitor is not None:
+            logger.info("Stopping stop-loss monitor...")
+            try:
+                await stop_monitor.stop_monitoring()
+            except Exception:
+                record_failure("stop_loss_monitor")
+            try:
+                metrics = stop_monitor.get_metrics()
                 logger.info(
                     f"Stop-loss metrics - Triggered: {metrics.triggered_today}, "
                     f"Executed: {metrics.executed_today}, Failed: {metrics.failed_today}, "
                     f"Prevented loss: ${metrics.total_prevented_loss:.2f}"
                 )
+            except Exception:
+                record_failure("stop_loss_metrics")
 
-            # Save advanced risk manager state
-            if self.use_advanced_risk and self.advanced_risk:
+        if getattr(self, "use_advanced_risk", False) and getattr(self, "advanced_risk", None):
+            try:
                 state_file = Path("data/risk_state.json")
                 state_file.parent.mkdir(exist_ok=True)
                 self.advanced_risk.save_state(state_file)
                 logger.info("Advanced risk manager state saved")
+            except Exception:
+                record_failure("advanced_risk_state")
 
-            # Disconnect from IBKR (subprocess client)
-            if hasattr(self, "ib") and self.ib:
-                logger.info("Disconnecting from IBKR...")
-                # Check if it's subprocess client or legacy IB client
-                if hasattr(self.ib, "disconnect"):
-                    # Subprocess client has async disconnect()
-                    if asyncio.iscoroutinefunction(self.ib.disconnect):
-                        await self.ib.disconnect()
-                    else:
-                        self.ib.disconnect()
-                # Also stop the subprocess if it exists
-                if hasattr(self.ib, "stop"):
-                    await self.ib.stop()
+        ib_client = getattr(self, "ib", None)
+        if ib_client is not None:
+            logger.info("Disconnecting from IBKR...")
+            if hasattr(ib_client, "disconnect"):
+                try:
+                    disconnect_result = ib_client.disconnect()
+                    if inspect.isawaitable(disconnect_result):
+                        await disconnect_result
+                except Exception:
+                    record_failure("ibkr_disconnect")
+            if hasattr(ib_client, "stop"):
+                try:
+                    stop_result = ib_client.stop()
+                    if inspect.isawaitable(stop_result):
+                        await stop_result
                     logger.info("Stopped IBKR subprocess")
+                except Exception:
+                    record_failure("ibkr_subprocess")
 
-            # Close database connections
-            if hasattr(self, "db") and self.db:
-                await self.db.close()
+        database = getattr(self, "db", None)
+        if database is not None:
+            try:
+                await database.close()
+            except Exception:
+                record_failure("database")
 
-            # Stop WebSocket updates
-            if hasattr(self, "ws_client"):
-                self.ws_client.stop()
+        websocket = getattr(self, "ws_client", None)
+        if websocket is not None:
+            try:
+                websocket.stop()
+            except Exception:
+                record_failure("websocket")
 
-            logger.info("Cleanup completed")
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
+        logger.info("Cleanup completed (resource_failures=%d)", cleanup_failures)
 
     async def _safe_disconnect(self) -> None:
         """Disconnect IBKR cleanly when possible; never crash Gateway.
@@ -4314,29 +6130,36 @@ class AsyncRunner:
             )
             self._recovery_exhausted = True
 
-    async def _rewarm_stop_loss_prices_after_recovery(self) -> None:
-        """Push cached prices from self.latest_prices into the stop-loss
-        monitor's active stops after a successful reconnect.
+    async def _rewarm_stop_loss_prices_after_recovery(self) -> bool:
+        """Offer cached live protective events after a successful reconnect.
 
-        The stop-loss monitor's freshness gate is 10 seconds — if no price
-        tick arrives that fast after recovery, stops go blind until the
-        next cycle finishes processing each symbol. Rewarming from the
-        in-memory price cache (which survives recovery — _safe_disconnect
-        and initialize_connection do not touch it) closes that gap.
+        Reconnect must not manufacture freshness for historical closes.
+        Provenance is therefore mandatory and only ``live_protective`` events
+        may be offered to the stop monitor. The monitor independently rejects
+        any source event older than its ten-second threshold.
 
-        Defensive: skips when attributes don't exist (e.g., minimal test
-        runners). Each update_price call is independently wrapped so a
-        single symbol's failure cannot poison the others.
+        Flat/no-stop runtimes deliberately succeed without a rewarm. If active
+        stops exist, every stop must accept its live-protective event; partial,
+        stale, missing, or failed updates return False so recovery remains
+        fail-closed. Calls remain independent so one failure does not hide
+        evidence about the other active stops.
         """
         stop_monitor = getattr(self, "stop_loss_monitor", None)
-        prices = getattr(self, "latest_prices", None)
-        if stop_monitor is None or prices is None:
-            logger.debug("event=stop_loss_prices_rewarm_skipped reason=missing_attributes")
-            return
-
-        active_stops = getattr(stop_monitor, "active_stops", None)
+        active_stops = getattr(stop_monitor, "active_stops", None) if stop_monitor else None
         if not active_stops:
-            return
+            logger.debug("event=stop_loss_prices_rewarm_skipped reason=no_active_stops")
+            return True
+
+        prices = getattr(self, "latest_prices", None)
+        price_times = getattr(self, "latest_price_times", None)
+        price_sources = getattr(self, "latest_price_sources", None)
+        if not all(isinstance(value, dict) for value in (prices, price_times, price_sources)):
+            logger.error(
+                "event=stop_loss_prices_rewarm_incomplete "
+                "reason=missing_or_invalid_cache active_stop_count=%d",
+                len(active_stops),
+            )
+            return False
 
         rewarmed = 0
         skipped = 0
@@ -4344,12 +6167,38 @@ class AsyncRunner:
         # objects carry the bare symbol on .symbol.
         for stop in list(active_stops.values()):
             symbol = getattr(stop, "symbol", None)
-            if symbol is None or symbol not in prices:
+            if symbol is None or symbol not in prices or symbol not in price_times:
+                skipped += 1
+                continue
+            if price_sources.get(symbol) != "live_protective":
+                logger.warning(
+                    "event=stop_loss_price_rewarm_skipped symbol=%s "
+                    "reason=non_protective_source source=%r",
+                    symbol,
+                    price_sources.get(symbol),
+                )
                 skipped += 1
                 continue
             try:
-                await stop_monitor.update_price(symbol, prices[symbol])
-                rewarmed += 1
+                accepted = await stop_monitor.update_price(
+                    symbol,
+                    prices[symbol],
+                    source_timestamp=price_times[symbol],
+                )
+                if accepted:
+                    rewarmed += 1
+                elif self._monitor_owns_exact_fresh_protective_event(
+                    symbol,
+                    prices[symbol],
+                    price_times[symbol],
+                ):
+                    logger.info(
+                        "event=stop_loss_price_rewarm_already_current symbol=%s",
+                        symbol,
+                    )
+                    rewarmed += 1
+                else:
+                    skipped += 1
             except Exception as e:
                 logger.warning(
                     "event=stop_loss_price_rewarm_failed symbol=%s error=%r",
@@ -4362,6 +6211,7 @@ class AsyncRunner:
             rewarmed,
             skipped,
         )
+        return skipped == 0 and rewarmed == len(active_stops)
 
     def _maybe_auto_reset_kill_switch_after_recovery(self) -> None:
         """Auto-reset the AdvancedRiskManager kill switch iff it was
@@ -4415,9 +6265,11 @@ class AsyncRunner:
     async def recover_connection(self, reason: str) -> bool:
         """Re-establish IBKR connection after ConnectionHealth reports unhealthy.
 
-        Returns True if recovered, False if all 5 backoff attempts failed.
-        On False, the caller should exit run_continuous and let the watchdog
-        do process-level restart.
+        Returns True only when the connection and required active-stop
+        protection are both restored. Returns False when connection attempts
+        are exhausted or protective rewarming/validation fails. On False, the
+        caller should exit run_continuous and let the watchdog do process-level
+        restart.
 
         Per 2026-05-16 design spec:
         - Backoff: [15, 30, 60, 120, 300] seconds
@@ -4526,26 +6378,67 @@ class AsyncRunner:
 
             try:
                 await self.initialize_connection()
-                logger.info("event=recovery_succeeded attempt=%d", attempt)
+                health = getattr(self, "health", None)
+                if health is not None:
+                    # initialize_connection installs a new monitor whose
+                    # default state is HEALTHY. Recovery is not complete until
+                    # active stop protection has been re-established.
+                    health._status = HealthStatus.RECOVERING
                 # C4: rewarm stop_loss_monitor with cached prices from
                 # latest_prices so the freshness check
                 # (max_price_age_seconds=10) passes for the next
                 # check. Without this, stop-losses go blind for the
                 # first 1–N cycles after recovery because they require
                 # a recent price tick to evaluate.
-                await self._rewarm_stop_loss_prices_after_recovery()
+                rewarmed = await self._rewarm_stop_loss_prices_after_recovery()
+                if not rewarmed:
+                    active_stop_count = len(
+                        getattr(getattr(self, "stop_loss_monitor", None), "active_stops", {})
+                    )
+                    raise UnprotectedExistingPositionsError(
+                        getattr(self, "portfolio_id", "default"),
+                        active_stop_count,
+                        "recovery_stop_rewarm_incomplete",
+                    )
+                self._assert_existing_position_protection()
                 # H1: auto-clear kill switch if it was tripped by a
                 # connection-related transient (now resolved).
                 # Loss-based triggers are preserved — those are real
                 # safety stops and a recovery doesn't change them.
                 self._maybe_auto_reset_kill_switch_after_recovery()
+                if health is not None and callable(getattr(health, "record_success", None)):
+                    health.record_success()
+                logger.info("event=recovery_succeeded attempt=%d", attempt)
                 return True
+            except UnprotectedExistingPositionsError as e:
+                health = getattr(self, "health", None)
+                if health is not None:
+                    health._status = HealthStatus.UNHEALTHY
+                logger.critical(
+                    "event=recovery_protection_failed attempt=%d reason_code=%s "
+                    "position_count=%d note=connection_not_resumed",
+                    attempt,
+                    e.reason_code,
+                    e.position_count,
+                )
+                await self._safe_disconnect()
+                return False
             except Exception as e:
+                health = getattr(self, "health", None)
+                if health is not None:
+                    health._status = HealthStatus.UNHEALTHY
                 logger.warning(
                     "event=recovery_attempt_failed attempt=%d error=%r",
                     attempt,
                     e,
                 )
+                # initialize_connection may already have installed a new
+                # subprocess before a later recovery step fails (protection
+                # assertion, kill-switch reset, health transition, or health
+                # monitor attachment). Disconnect immediately on every generic
+                # failure so even the final attempt cannot return False while
+                # a post-failure broker session remains active.
+                await self._safe_disconnect()
 
         logger.error(
             "event=recovery_exhausted attempts=%d reason=%r",
@@ -4661,6 +6554,17 @@ def _raise_if_recovery_exhausted(runners: Dict[str, AsyncRunner]) -> None:
             )
 
 
+async def _setup_continuous_runner(runner: AsyncRunner) -> None:
+    """Set up a newly-created continuous runner without leaking on safety abort."""
+
+    try:
+        await runner.setup()
+        await runner._attach_health_monitor()
+    except UnprotectedExistingPositionsError:
+        await runner.cleanup()
+        raise
+
+
 async def run_continuous(
     symbols: Optional[List[str]] = None,
     duration: str = "1 D",
@@ -4715,6 +6619,7 @@ async def run_continuous(
     # cycle and reused across all subsequent cycles. The IBKR connection
     # lives inside the runner and persists.
     runners: dict[str, AsyncRunner] = {}
+    fatal_safety_exit_written = False
 
     try:
         while not shutdown_flag:
@@ -4823,8 +6728,7 @@ async def run_continuous(
                             use_smart_execution=use_smart_execution,
                             portfolio_id=portfolio_id,
                         )
-                        await new_runner.setup()
-                        await new_runner._attach_health_monitor()
+                        await _setup_continuous_runner(new_runner)
                         runners[portfolio_id] = new_runner
                     portfolio_runner = runners[portfolio_id]
 
@@ -4861,6 +6765,68 @@ async def run_continuous(
                         await portfolio_runner.run(portfolio_symbols)
                     except KillSwitchTriggeredError:
                         raise  # propagate to outer while-loop handler for graceful shutdown
+                    except UnprotectedExistingPositionsError:
+                        raise
+                    except RecoverableBrokerDisconnectError as disconnect_err:
+                        # is_connected=False was observed before any broker
+                        # request began, so no protocol/generation/order outcome
+                        # is ambiguous. The symbol cycle was still cancelled
+                        # and drained fail-closed; now use the established
+                        # persistent recovery path instead of terminating the
+                        # process as though the worker generation were poisoned.
+                        if portfolio_runner.health is not None:
+                            portfolio_runner.health._status = HealthStatus.UNHEALTHY
+                        logger.warning(
+                            "event=cycle_authoritative_disconnect "
+                            "portfolio=%s error=%r action=recover_connection",
+                            portfolio_id,
+                            disconnect_err,
+                        )
+                        try:
+                            recovered = await portfolio_runner.recover_connection(
+                                f"authoritative pre-fetch disconnect: {disconnect_err}"
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as recovery_err:
+                            portfolio_runner._recovery_exhausted = True
+                            raise RecoveryExhaustedError(
+                                f"portfolio={portfolio_id} authoritative disconnect "
+                                "recovery raised; exiting for watchdog restart"
+                            ) from recovery_err
+                        if not recovered:
+                            portfolio_runner._recovery_exhausted = True
+                            raise RecoveryExhaustedError(
+                                f"portfolio={portfolio_id} authoritative disconnect "
+                                "recovery exhausted; exiting for watchdog restart"
+                            ) from disconnect_err
+                        logger.info(
+                            "event=cycle_disconnect_recovered portfolio=%s",
+                            portfolio_id,
+                        )
+                    except SymbolCycleAbortError as cycle_err:
+                        # A symbol-cycle abort means the shared broker worker
+                        # generation is no longer trustworthy. Treat it as a
+                        # terminal recovery condition for this process instead
+                        # of feeding it through the ordinary cycle-error path:
+                        # direct record_failure() transitions can otherwise
+                        # leave ConnectionHealth UNHEALTHY without scheduling
+                        # recovery, and the loop would skip forever.
+                        if portfolio_runner.health is not None:
+                            portfolio_runner.health._status = HealthStatus.UNHEALTHY
+                        portfolio_runner._recovery_exhausted = True
+                        logger.critical(
+                            "event=cycle_transport_abort portfolio=%s error=%r "
+                            "note=disconnecting_and_exiting_for_watchdog",
+                            portfolio_id,
+                            cycle_err,
+                        )
+                        await portfolio_runner._safe_disconnect()
+                        raise RecoveryExhaustedError(
+                            f"portfolio={portfolio_id} broker transport generation "
+                            "was poisoned; exiting run_continuous so watchdog can "
+                            "restart the process"
+                        ) from cycle_err
                     except Exception as cycle_err:
                         logger.exception(
                             "event=cycle_error portfolio=%s error=%r",
@@ -4910,6 +6876,37 @@ async def run_continuous(
                 )
                 shutdown_flag = True
                 break
+            except UnprotectedExistingPositionsError as e:
+                # A holdings-bearing runner without exact live stop coverage is
+                # a durable safety block, not a transient cycle error. Record a
+                # sanitized reason and terminate nonzero instead of retrying
+                # forever in-process.
+                logger.critical(
+                    "event=run_continuous_exit_unprotected_positions "
+                    "portfolio=%s position_count=%d reason=%s",
+                    e.portfolio_id,
+                    e.position_count,
+                    e.reason_code,
+                )
+                _write_exit_audit(
+                    "unprotected_existing_positions",
+                    exit_code=6,
+                    extra={
+                        "portfolio_id": e.portfolio_id,
+                        "position_count": e.position_count,
+                        "reason_code": e.reason_code,
+                    },
+                )
+                _fire_runner_exit_alert(
+                    "unprotected_existing_positions",
+                    {
+                        "portfolio_id": e.portfolio_id,
+                        "position_count": e.position_count,
+                        "reason_code": e.reason_code,
+                    },
+                )
+                fatal_safety_exit_written = True
+                raise SystemExit(6) from e
             except Exception as e:
                 logger.error(f"Error in trading cycle: {e}")
                 # If connection error at the outer level, let ConnectionHealth +
@@ -4936,8 +6933,9 @@ async def run_continuous(
         # overwrite a more specific exit reason written from elsewhere
         # if it was set in the same second. (We always write, and consumers
         # can read the most recent reason.)
-        _write_exit_audit("clean_shutdown", exit_code=0)
-        _fire_runner_exit_alert("clean_shutdown", None)
+        if not fatal_safety_exit_written:
+            _write_exit_audit("clean_shutdown", exit_code=0)
+            _fire_runner_exit_alert("clean_shutdown", None)
 
 
 def check_gateway_zombies(port: int = 4002) -> bool:
@@ -5127,6 +7125,31 @@ def main() -> None:
                     force_connect=args.force_connect,
                 )
             )
+    except UnprotectedExistingPositionsError as e:
+        logger.critical(
+            "event=runner_exit_unprotected_positions portfolio=%s " "position_count=%d reason=%s",
+            e.portfolio_id,
+            e.position_count,
+            e.reason_code,
+        )
+        _write_exit_audit(
+            "unprotected_existing_positions",
+            exit_code=6,
+            extra={
+                "portfolio_id": e.portfolio_id,
+                "position_count": e.position_count,
+                "reason_code": e.reason_code,
+            },
+        )
+        _fire_runner_exit_alert(
+            "unprotected_existing_positions",
+            {
+                "portfolio_id": e.portfolio_id,
+                "position_count": e.position_count,
+                "reason_code": e.reason_code,
+            },
+        )
+        raise SystemExit(6) from e
     except SystemExit:
         # B2: SystemExit propagates from pre-flight failures and similar
         # explicit-exit paths. They've already written their own audit
