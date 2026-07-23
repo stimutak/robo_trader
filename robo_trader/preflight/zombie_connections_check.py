@@ -24,21 +24,11 @@ zombie on the port — i.e. a naive Python probe would *create* the
 exact failure class this check exists to detect. ``lsof`` reads
 kernel socket tables without opening any socket.
 
-Why both Python-zombie AND Gateway-zombie remediation paths
------------------------------------------------------------
-Spec §7.6: zombies come from two sources.
-
-- A prior Python process (runner, sweep script) that opened a socket
-  and exited without ``close()`` — these clear with
-  ``python3 scripts/gateway_manager.py clear-zombies``.
-- The Gateway itself holding stale half-open sockets — these only
-  clear with a full Gateway restart
-  (``python3 scripts/gateway_manager.py restart``).
-
-We can't tell the two apart from ``lsof`` output alone (the owning PID
-in column 2 distinguishes them, but the operator-actionable answer is
-"try the cheap option first, then the expensive one"), so the
-remediation lists both in order of escalating cost.
+Supervised remediation
+----------------------
+Zombies can be owned by a prior Python process or by Gateway itself.
+Operator remediation always routes through ``./START_TRADER.sh`` so cleanup
+and Gateway recovery stay inside the preflight and paper/read-only contract.
 """
 
 from __future__ import annotations
@@ -150,13 +140,11 @@ class ZombieConnectionsCheck:
         return (
             f"{count_phrase} on port {port}. These will block the runner's "
             "next ib.connect() handshake and cause a silent restart loop.\n\n"
-            "Try the cheap fix first (Python-owned zombies):\n"
-            "  python3 scripts/gateway_manager.py clear-zombies\n\n"
-            "If zombies persist, the Gateway itself is holding stale sockets "
-            "— restart it:\n"
-            "  python3 scripts/gateway_manager.py restart\n"
-            "  (this requires 2FA approval on your IBKR Mobile app)\n\n"
-            "Then re-run ./START_TRADER.sh."
+            "Restore the supervised stack with:\n"
+            "  ./START_TRADER.sh\n\n"
+            "The supervised startup handles Python-owned cleanup and Gateway "
+            "recovery while enforcing preflight and paper/read-only safety. "
+            "If Gateway recovery is needed, approve 2FA in your IBKR Mobile app."
         )
 
 

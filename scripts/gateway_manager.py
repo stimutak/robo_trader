@@ -9,12 +9,11 @@ macOS and Windows platforms. It uses IBC (IB Controller) to:
 - Restart Gateway (clears zombie connections)
 - Check Gateway status
 
-Usage:
-    python3 gateway_manager.py start [--paper|--live]
-    python3 gateway_manager.py stop
-    python3 gateway_manager.py restart [--paper|--live]
+Operator usage:
     python3 gateway_manager.py status
-    python3 gateway_manager.py clear-zombies
+
+Gateway lifecycle commands are reserved for supervised startup and internal
+persistent-connection recovery. Operators must use ./START_TRADER.sh.
 
 Environment Variables:
     IBKR_USERNAME - Your IBKR username (or set in config.ini)
@@ -48,6 +47,13 @@ PLATFORM = platform.system()  # 'Darwin' for macOS, 'Windows' for Windows
 
 # Project root
 PROJECT_ROOT = Path(__file__).parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from robo_trader.runtime_lifecycle_lock import (  # noqa: E402
+    RuntimeLifecycleLock,
+    runtime_lifecycle_lock_path,
+)
 
 # IBC paths - config stored in project for portability
 if PLATFORM == "Darwin":
@@ -75,6 +81,44 @@ else:
 # API ports
 PAPER_PORT = 4002
 LIVE_PORT = 4001
+
+# Lifecycle commands exist only for the runner's persistent-connection recovery
+# path; they are not an operator API. Recovery supplies an explicit marker and
+# the child independently verifies that its parent is the trading runner.
+_INTERNAL_LIFECYCLE_ENV = "ROBOTRADER_INTERNAL_GATEWAY_RECOVERY"
+_INTERNAL_LIFECYCLE_VALUE = "1"
+_LIFECYCLE_COMMANDS = frozenset({"start", "stop", "restart", "clear-zombies"})
+_RUNTIME_LIFECYCLE_LOCK_PATH = runtime_lifecycle_lock_path()
+
+
+def _parent_is_runner() -> bool:
+    """Return whether the direct parent is the supervised trading runner."""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(os.getppid()), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+    if result.returncode != 0:
+        return False
+    return bool(
+        re.search(
+            r"(?:^|[ /])(?:robo_trader[./]runner_async|runner_async[.]py)(?:[ ]|$)",
+            result.stdout,
+        )
+    )
+
+
+def _internal_lifecycle_authorized() -> bool:
+    """Return whether this process was launched by supervised recovery."""
+    return (
+        os.environ.get(_INTERNAL_LIFECYCLE_ENV) == _INTERNAL_LIFECYCLE_VALUE and _parent_is_runner()
+    )
 
 
 def _ibc_safety_config_error(config_text: str) -> Optional[str]:
@@ -271,7 +315,7 @@ def start_gateway(trading_mode: str = "paper", version: Optional[str] = None) ->
             return True
         else:
             print(f"WARNING: Gateway running but port {port} not listening.")
-            print("Consider restarting Gateway.")
+            print("Run ./START_TRADER.sh to restore the supervised stack.")
             return False
 
     # Find Gateway version
@@ -484,7 +528,10 @@ def show_status():
                 z for z in zombies if z.get("command", "").lower().startswith("python")
             ]
             if gateway_zombies:
-                print(f"  WARNING: {len(gateway_zombies)} Gateway zombie(s) - RESTART GATEWAY")
+                print(
+                    f"  WARNING: {len(gateway_zombies)} Gateway zombie(s) - "
+                    "run ./START_TRADER.sh"
+                )
             if python_zombies:
                 print(f"  WARNING: {len(python_zombies)} Python zombie(s) - can be cleared")
 
@@ -513,80 +560,24 @@ def show_status():
     print(f"IBC Directory: {IBC_DIR}")
 
 
-def main():
-    # Hard refusal moved here from module import time so the module stays
-    # importable on unsupported platforms (e.g. Linux CI) for unit testing.
-    if PLATFORM not in ("Darwin", "Windows"):
-        print(f"Unsupported platform: {PLATFORM}")
-        sys.exit(1)
-    parser = argparse.ArgumentParser(
-        description="IB Gateway Manager for RoboTrader",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-    gateway_manager.py start --paper    Start Gateway in paper trading mode
-    gateway_manager.py restart          Restart Gateway (clears zombies)
-    gateway_manager.py status           Show Gateway status
-    gateway_manager.py clear-zombies    Kill Python zombie connections
-        """,
-    )
-
-    subparsers = parser.add_subparsers(dest="command", help="Command to run")
-
-    # Start command
-    start_parser = subparsers.add_parser("start", help="Start Gateway")
-    start_parser.add_argument(
-        "--paper", action="store_true", default=True, help="Use paper trading mode (default)"
-    )
-    start_parser.add_argument(
-        "--live", action="store_true", help="Disabled during the remediation program"
-    )
-    start_parser.add_argument("--version", help="Gateway version to use")
-
-    # Stop command
-    subparsers.add_parser("stop", help="Stop Gateway")
-
-    # Restart command
-    restart_parser = subparsers.add_parser("restart", help="Restart Gateway")
-    restart_parser.add_argument(
-        "--paper", action="store_true", default=True, help="Use paper trading mode (default)"
-    )
-    restart_parser.add_argument(
-        "--live", action="store_true", help="Disabled during the remediation program"
-    )
-
-    # Status command
-    subparsers.add_parser("status", help="Show Gateway status")
-
-    # Clear zombies command
-    clear_parser = subparsers.add_parser("clear-zombies", help="Clear Python zombie connections")
-    clear_parser.add_argument("--port", type=int, default=PAPER_PORT, help="API port to check")
-
-    args = parser.parse_args()
-
-    if not args.command:
-        parser.print_help()
-        return 1
-
+def _dispatch_command(args: argparse.Namespace) -> int:
+    """Execute an already-authorized Gateway command."""
     if args.command == "start":
         mode = "live" if args.live else "paper"
-        success = start_gateway(mode, args.version)
-        return 0 if success else 1
+        return 0 if start_gateway(mode, args.version) else 1
 
-    elif args.command == "stop":
-        success = stop_gateway()
-        return 0 if success else 1
+    if args.command == "stop":
+        return 0 if stop_gateway() else 1
 
-    elif args.command == "restart":
+    if args.command == "restart":
         mode = "live" if args.live else "paper"
-        success = restart_gateway(mode)
-        return 0 if success else 1
+        return 0 if restart_gateway(mode) else 1
 
-    elif args.command == "status":
+    if args.command == "status":
         show_status()
         return 0
 
-    elif args.command == "clear-zombies":
+    if args.command == "clear-zombies":
         port = args.port
         zombies = get_zombie_connections(port)
         if not zombies:
@@ -601,13 +592,88 @@ Examples:
         gateway_zombies = len(remaining) - killed
         if gateway_zombies > 0:
             print(f"\nWARNING: {gateway_zombies} Gateway zombie(s) remain.")
-            print("These can only be cleared by restarting Gateway.")
-            print("Run: python3 scripts/gateway_manager.py restart")
+            print("Run ./START_TRADER.sh to restore the supervised stack.")
             return 1
 
-        return 0
-
     return 0
+
+
+def main():
+    # Refuse operator lifecycle entry before argparse handles subcommand help
+    # or validation. Even `gateway_manager.py restart --help` must point to the
+    # sole operator lifecycle entry rather than advertise component controls.
+    requested_command = sys.argv[1] if len(sys.argv) > 1 else None
+    if requested_command in _LIFECYCLE_COMMANDS and not _internal_lifecycle_authorized():
+        print(
+            f"Refusing direct Gateway lifecycle command '{requested_command}'.\n"
+            "Use ./START_TRADER.sh so preflight, paper/read-only checks, "
+            "and the full supervised stack lifecycle are enforced.",
+            file=sys.stderr,
+        )
+        return 2
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "IB Gateway status for RoboTrader. "
+            "Use ./START_TRADER.sh for all lifecycle operations."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    gateway_manager.py status           Show Gateway status
+
+Gateway start, stop, restart, and zombie cleanup are managed by:
+    ./START_TRADER.sh
+        """,
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+    subparsers.add_parser("status", help="Show Gateway status")
+
+    # Keep lifecycle commands entirely out of operator help. They are parsed
+    # only after the marker and parent-process checks above authorize recovery.
+    if requested_command in _LIFECYCLE_COMMANDS:
+        start_parser = subparsers.add_parser("start", help=argparse.SUPPRESS)
+        start_parser.add_argument("--paper", action="store_true", default=True)
+        start_parser.add_argument("--live", action="store_true")
+        start_parser.add_argument("--version")
+
+        subparsers.add_parser("stop", help=argparse.SUPPRESS)
+
+        restart_parser = subparsers.add_parser("restart", help=argparse.SUPPRESS)
+        restart_parser.add_argument("--paper", action="store_true", default=True)
+        restart_parser.add_argument("--live", action="store_true")
+
+        clear_parser = subparsers.add_parser("clear-zombies", help=argparse.SUPPRESS)
+        clear_parser.add_argument("--port", type=int, default=PAPER_PORT)
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 1
+
+    # Keep the module importable on unsupported platforms (e.g. Linux CI),
+    # while refusing any authorized lifecycle or status implementation there.
+    if PLATFORM not in ("Darwin", "Windows"):
+        print(f"Unsupported platform: {PLATFORM}")
+        return 1
+
+    if args.command not in _LIFECYCLE_COMMANDS:
+        return _dispatch_command(args)
+
+    lifecycle_lock = RuntimeLifecycleLock(_RUNTIME_LIFECYCLE_LOCK_PATH)
+    if not lifecycle_lock.acquire():
+        print(
+            "Refusing concurrent Gateway recovery: another supervised runtime "
+            f"lifecycle owns {_RUNTIME_LIFECYCLE_LOCK_PATH}.",
+            file=sys.stderr,
+        )
+        return 75
+    try:
+        return _dispatch_command(args)
+    finally:
+        lifecycle_lock.release()
 
 
 if __name__ == "__main__":

@@ -131,7 +131,7 @@ The system uses **IBC (IB Controller)** for automated Gateway management. Gatewa
 - `START_TRADER.sh` automatically starts Gateway via IBC if not running
 - Detects zombie CLOSE_WAIT connections that block API handshakes
 - Automatically restarts Gateway to clear zombies (up to 3 retries)
-- Tests actual API connectivity before proceeding
+- Verifies the paper API port is listening before proceeding
 - Only requires manual 2FA on your phone when Gateway starts
 
 **IBC Configuration:**
@@ -146,7 +146,7 @@ The system uses **IBC (IB Controller)** for automated Gateway management. Gatewa
 
 # Debugging/diagnostic commands:
 python3 scripts/gateway_manager.py status   # Check Gateway status
-python3 scripts/gateway_manager.py restart  # Force restart Gateway
+./START_TRADER.sh                           # Supervised restart (Gateway + full stack)
 lsof -nP -iTCP:4002 -sTCP:CLOSE_WAIT        # Check for zombies
 tail -f config/ibc/logs/*.txt               # View Gateway logs
 ```

@@ -886,16 +886,23 @@ Update after each merge.
 - Phase 0 CI truth gate: PR #83 merged on 2026-07-23 (`7f5de0a`)
 - Phase 0 runtime-stability prerequisite: PR #81 merged on 2026-07-23 (`b7e5005`)
 - PR 1: PR #82 is implementation-complete locally and awaiting hosted merge
-  gates. Local evidence on 2026-07-23: 1,020 passed, 5 skipped, 42% total
+  gates. Local evidence on 2026-07-23: 1,046 passed, 5 skipped, 42% total
   coverage; Black, isort, Flake8, Bandit, pip integrity, shell syntax, YAML
   parsing, and diff checks passed. Two Docker Compose render tests were skipped
   because Docker is unavailable on the local Mac and must pass in hosted CI.
-  A two-phase review examined 11 findings: nine were confirmed and remediated,
-  one dashboard `lsof` diagnostic was downgraded and remediated, and
-  `RT_STATE_NAMESPACE` file-path isolation was safely deferred because changing
-  the legacy paper kill-switch path could bypass the currently triggered state.
-  The active runner already rejects backtest mode; separate non-paper safety
-  state remains required before that mode may use shared risk components.
+  A two-phase review examined 11 initial findings: nine were confirmed and
+  remediated, one dashboard `lsof` diagnostic was downgraded and remediated,
+  and `RT_STATE_NAMESPACE` file-path isolation was safely deferred because
+  changing the legacy paper kill-switch path could bypass the currently
+  triggered state. The challenger then rejected three successive lifecycle
+  designs until startup ordering, the operator-facing Gateway CLI, concurrent
+  launcher/recovery races, and lock ownership were all fail-closed. The final
+  design acquires one kernel advisory lock, transfers it to the launcher with
+  an inherited descriptor, validates that descriptor before runtime work, and
+  prevents Gateway, dashboard, or runner descendants from retaining it. The
+  final independent review passed. The active runner already rejects backtest
+  mode; separate non-paper safety state remains required before that mode may
+  use shared risk components.
 - PR 2: Not started
 - PR 3: Not started
 - PR 4: Not started

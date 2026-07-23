@@ -124,10 +124,9 @@ class GatewayPortListeningCheck:
         return (
             f"Gateway API port {port} is not listening. Without it the runner "
             "cannot connect to IBKR and will spin in a restart loop.\n\n"
-            "To bring it up:\n"
-            "  ./scripts/start_gateway.sh\n"
-            "    (or)\n"
-            "  python3 scripts/gateway_manager.py start --paper\n\n"
+            "Restore the supervised stack with:\n"
+            "  ./START_TRADER.sh\n\n"
             "If 2FA is pending, check your IBKR Mobile app on your phone.\n"
-            "Once Gateway is up, re-run ./START_TRADER.sh."
+            "Do not start or restart Gateway with a component-level command; "
+            "START_TRADER.sh enforces preflight and paper/read-only safety."
         )

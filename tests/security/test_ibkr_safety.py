@@ -622,6 +622,221 @@ def test_gateway_manager_start_uses_env_allowlist_ibn_h2():
     ), "start_gateway code must not call os.environ.copy() (IBN-H2)."
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["gateway_manager.py", "start", "--paper"],
+        ["gateway_manager.py", "stop"],
+        ["gateway_manager.py", "restart", "--paper"],
+        ["gateway_manager.py", "restart", "--help"],
+        ["gateway_manager.py", "clear-zombies"],
+    ],
+)
+def test_gateway_manager_operator_lifecycle_commands_fail_closed(monkeypatch, capsys, argv):
+    """Operators must enter every Gateway lifecycle through START_TRADER."""
+    import scripts.gateway_manager as gm
+
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.delenv(gm._INTERNAL_LIFECYCLE_ENV, raising=False)
+    monkeypatch.setattr(gm, "PLATFORM", "Darwin")
+    monkeypatch.setattr(
+        gm,
+        "start_gateway",
+        lambda *args, **kwargs: pytest.fail("direct lifecycle command executed"),
+    )
+    monkeypatch.setattr(
+        gm,
+        "stop_gateway",
+        lambda *args, **kwargs: pytest.fail("direct lifecycle command executed"),
+    )
+    monkeypatch.setattr(
+        gm,
+        "restart_gateway",
+        lambda *args, **kwargs: pytest.fail("direct lifecycle command executed"),
+    )
+    monkeypatch.setattr(
+        gm,
+        "get_zombie_connections",
+        lambda *args, **kwargs: pytest.fail("direct lifecycle command executed"),
+    )
+
+    assert gm.main() == 2
+    captured = capsys.readouterr()
+    assert "./START_TRADER.sh" in captured.err
+    assert "Refusing direct Gateway lifecycle command" in captured.err
+
+
+def test_gateway_manager_status_remains_operator_available(monkeypatch):
+    """The read-only status command remains callable without an internal marker."""
+    import scripts.gateway_manager as gm
+
+    called = False
+
+    def record_status():
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(sys, "argv", ["gateway_manager.py", "status"])
+    monkeypatch.delenv(gm._INTERNAL_LIFECYCLE_ENV, raising=False)
+    monkeypatch.setattr(gm, "PLATFORM", "Darwin")
+    monkeypatch.setattr(gm, "show_status", record_status)
+
+    assert gm.main() == 0
+    assert called is True
+
+
+def test_gateway_manager_internal_recovery_marker_allows_restart(monkeypatch):
+    """Persistent recovery may retain the existing internal restart function."""
+    import scripts.gateway_manager as gm
+
+    called = False
+
+    def record_restart(mode):
+        nonlocal called
+        called = True
+        assert mode == "paper"
+        return True
+
+    monkeypatch.setattr(sys, "argv", ["gateway_manager.py", "restart", "--paper"])
+    monkeypatch.setenv(gm._INTERNAL_LIFECYCLE_ENV, gm._INTERNAL_LIFECYCLE_VALUE)
+    monkeypatch.setattr(gm, "_parent_is_runner", lambda: True)
+    monkeypatch.setattr(gm, "PLATFORM", "Darwin")
+    lifecycle_events = []
+
+    class FakeLifecycleLock:
+        def __init__(self, path):
+            lifecycle_events.append(("created", path))
+
+        def acquire(self):
+            lifecycle_events.append(("acquired", None))
+            return True
+
+        def release(self):
+            lifecycle_events.append(("released", None))
+
+    monkeypatch.setattr(gm, "RuntimeLifecycleLock", FakeLifecycleLock)
+    monkeypatch.setattr(gm, "restart_gateway", record_restart)
+
+    assert gm.main() == 0
+    assert called is True
+    assert [event[0] for event in lifecycle_events] == ["created", "acquired", "released"]
+
+
+def test_gateway_manager_internal_recovery_rejects_held_lifecycle_lock(monkeypatch, capsys):
+    """A launcher-owned lock blocks an otherwise-authorized recovery child."""
+    import scripts.gateway_manager as gm
+
+    class HeldLifecycleLock:
+        def __init__(self, path):
+            self.path = path
+
+        def acquire(self):
+            return False
+
+        def release(self):
+            pytest.fail("an unacquired lock must not be released")
+
+    monkeypatch.setattr(sys, "argv", ["gateway_manager.py", "restart", "--paper"])
+    monkeypatch.setenv(gm._INTERNAL_LIFECYCLE_ENV, gm._INTERNAL_LIFECYCLE_VALUE)
+    monkeypatch.setattr(gm, "_parent_is_runner", lambda: True)
+    monkeypatch.setattr(gm, "PLATFORM", "Darwin")
+    monkeypatch.setattr(gm, "RuntimeLifecycleLock", HeldLifecycleLock)
+    monkeypatch.setattr(
+        gm,
+        "restart_gateway",
+        lambda *args, **kwargs: pytest.fail("concurrent recovery executed"),
+    )
+
+    assert gm.main() == 75
+    assert "Refusing concurrent Gateway recovery" in capsys.readouterr().err
+
+
+def test_gateway_manager_marker_without_runner_parent_is_rejected(monkeypatch, capsys):
+    """An operator cannot unlock lifecycle commands by setting the marker."""
+    import scripts.gateway_manager as gm
+
+    monkeypatch.setattr(sys, "argv", ["gateway_manager.py", "restart", "--paper"])
+    monkeypatch.setenv(gm._INTERNAL_LIFECYCLE_ENV, gm._INTERNAL_LIFECYCLE_VALUE)
+    monkeypatch.setattr(gm, "_parent_is_runner", lambda: False)
+    monkeypatch.setattr(gm, "PLATFORM", "Darwin")
+    monkeypatch.setattr(
+        gm,
+        "restart_gateway",
+        lambda *args, **kwargs: pytest.fail("direct lifecycle command executed"),
+    )
+
+    assert gm.main() == 2
+    assert "Refusing direct Gateway lifecycle command" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("/usr/bin/python3 -m robo_trader.runner_async --symbols AAPL", True),
+        ("/usr/bin/python3 /repo/robo_trader/runner_async.py", True),
+        ("/bin/zsh -l", False),
+        ("/usr/bin/python3 scripts/gateway_manager.py restart --paper", False),
+    ],
+)
+def test_gateway_manager_parent_runner_check(monkeypatch, command, expected):
+    """Internal lifecycle authorization is tied to the actual parent command."""
+    import scripts.gateway_manager as gm
+
+    monkeypatch.setattr(
+        gm.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, command, ""),
+    )
+
+    assert gm._parent_is_runner() is expected
+
+
+def test_gateway_manager_public_help_hides_lifecycle_commands(monkeypatch, capsys):
+    """The public CLI advertises status only."""
+    import scripts.gateway_manager as gm
+
+    monkeypatch.setattr(sys, "argv", ["gateway_manager.py", "--help"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        gm.main()
+
+    assert exc_info.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "{status}" in help_text
+    assert "{start" not in help_text
+    assert "clear-zombies" not in help_text
+
+
+def test_gateway_manager_lifecycle_lock_matches_authoritative_launcher():
+    """Shell startup and runner recovery use the same atomic lock module."""
+    import scripts.gateway_manager as gm
+
+    launcher = (PROJECT_ROOT / "START_TRADER.sh").read_text()
+
+    assert '"$SCRIPT_DIR/robo_trader/runtime_lifecycle_lock.py"' in launcher
+    assert 'mkdir "$STARTUP_LOCK' not in launcher
+    assert gm._RUNTIME_LIFECYCLE_LOCK_PATH == Path(f"/tmp/robotrader-runtime-{os.getuid()}.lock")
+
+
+def test_robust_connection_sets_internal_marker_for_gateway_recovery(monkeypatch):
+    """The runner's persistent recovery explicitly identifies its child."""
+    import robo_trader.utils.robust_connection as rc
+
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+
+    monkeypatch.setattr(rc.os.path, "exists", lambda path: True)
+    monkeypatch.setattr(rc.subprocess, "run", fake_run)
+
+    assert rc.restart_gateway_for_zombies(port=4002, timeout=1) is False
+    assert "restart" in captured["argv"]
+    assert captured["env"][rc._INTERNAL_GATEWAY_RECOVERY_ENV] == rc._INTERNAL_GATEWAY_RECOVERY_VALUE
+
+
 # ---------------------------------------------------------------------------
 # Branch-audit (claude/security-audit-5tFIY) round-3
 # ---------------------------------------------------------------------------

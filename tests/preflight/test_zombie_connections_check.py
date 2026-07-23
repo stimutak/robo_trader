@@ -135,17 +135,13 @@ def test_returns_block_when_lsof_not_installed(mock_lsof, preflight_context):
 # -- remediation text contracts ----------------------------------------------
 
 
-def test_remediation_includes_both_cleanup_paths(mock_lsof, preflight_context):
-    """Spec §7.6 mandates BOTH the Python-zombie clear path AND Gateway restart.
-
-    Operator should see the cheap fix first, then the escalation.
-    """
+def test_remediation_names_only_supervised_cleanup_path(mock_lsof, preflight_context):
+    """Operators must enter cleanup and Gateway recovery through START_TRADER."""
     mock_lsof(returncode=0, stdout=_ONE_ZOMBIE)
     result = ZombieConnectionsCheck().run(preflight_context)
-    assert "clear-zombies" in result.remediation
-    assert "gateway_manager.py restart" in result.remediation
-    # And the canonical re-entry point.
-    assert "START_TRADER.sh" in result.remediation
+    assert "./START_TRADER.sh" in result.remediation
+    assert "clear-zombies" not in result.remediation
+    assert "gateway_manager.py" not in result.remediation
 
 
 def test_remediation_includes_port_number(mock_lsof, preflight_context):

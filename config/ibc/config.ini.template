@@ -17,7 +17,7 @@
 #
 # To enable order placement (NOT recommended) set ReadOnlyApi=no AND
 # AllowBlindTrading=yes -- but this disables a primary safety net and the
-# system's startup self-checks (START_TRADER.sh, scripts/start_gateway.sh)
+# system's authoritative startup self-check (START_TRADER.sh)
 # will refuse to launch.
 #
 # DO NOT change ReadOnlyApi from "yes" without a deliberate, audited reason.

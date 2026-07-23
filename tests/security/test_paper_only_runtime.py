@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -185,20 +187,128 @@ def test_production_preset_remains_paper_and_readonly(monkeypatch):
     assert config.ibkr.port == 4002
 
 
-def test_authoritative_launcher_validates_ibc_and_preflight_before_process_kill():
+def _launcher_stop_function(source: str) -> str:
+    return (
+        "stop_processes_gracefully() {"
+        + source.split("stop_processes_gracefully() {", 1)[1].split(
+            "\n}\n\n\n# Function to start Gateway", 1
+        )[0]
+        + "\n}\n"
+    )
+
+
+def test_authoritative_launcher_quiesces_runner_before_gateway_and_preflight():
     source = (ROOT / "START_TRADER.sh").read_text()
     missing_guard = source.index('if [ ! -f "$IBC_INI" ]')
+    lifecycle_lock = source.index('--validate-fd "$ROBOTRADER_RUNTIME_LIFECYCLE_FD"')
+    runner_stop = source.index(
+        'stop_processes_gracefully "runner_async" "robo_trader[./]runner_async"'
+    )
+    gateway_checks = source.index('echo "2. Checking Gateway status..."')
+    port_check = source.index("if ! is_port_listening;", gateway_checks)
+    zombie_check = source.index("ZOMBIES=$(check_zombies)", gateway_checks)
     preflight_gate = source.index('case "$PREFLIGHT_RC" in')
-    first_process_kill = source.index('pkill -9 -f "runner_async"')
+    monitoring_stop = source.index('stop_processes_gracefully "dashboard"')
+    dashboard_start = source.index("$PYTHON app.py >")
+    runner_start = source.index("$PYTHON -m robo_trader.runner_async")
 
-    assert missing_guard < first_process_kill
-    assert preflight_gate < first_process_kill
+    assert lifecycle_lock < missing_guard < runner_stop
+    assert runner_stop < gateway_checks < port_check
+    assert runner_stop < zombie_check < preflight_gate
+    assert preflight_gate < monitoring_stop < dashboard_start < runner_start
     assert 'export EXECUTION_MODE="paper"' in source
     assert 'export IBKR_READONLY="true"' in source
     assert 'ENV_IBKR_PORT=$(grep "^IBKR_PORT="' in source
     assert "sed 's/[[:space:]]*#.*$//'" in source
     assert "supervised paper remediation requires IB Gateway port 4002" in source
     assert "4002|7497" not in source
+
+
+def test_authoritative_launcher_preserves_monitoring_on_preflight_block():
+    source = (ROOT / "START_TRADER.sh").read_text()
+    preflight_case = source.index('case "$PREFLIGHT_RC" in')
+    preflight_case_source = source[preflight_case : source.index("esac", preflight_case)]
+    blocked_exit = source.index("exit 1", preflight_case)
+    dashboard_stop = source.index('stop_processes_gracefully "dashboard"')
+    websocket_stop = source.index('stop_processes_gracefully "websocket_server"')
+
+    assert preflight_case < blocked_exit < dashboard_stop
+    assert preflight_case < blocked_exit < websocket_stop
+    assert "\npkill -9 -f" not in source
+    assert "gateway_manager.py restart" not in source
+    assert "./scripts/start_gateway.sh" not in source
+    assert "scripts/preflight_check.py --force" not in preflight_case_source
+    assert './START_TRADER.sh --force=\\"<reason>\\"' in source
+
+
+def test_launcher_stop_helper_uses_bounded_term_then_kill_fallback():
+    source = (ROOT / "START_TRADER.sh").read_text()
+    stop_function = _launcher_stop_function(source)
+
+    term = stop_function.index('kill -TERM "$pid"')
+    bounded_wait = stop_function.index('while [ "$waited" -lt "$wait_seconds" ]')
+    kill_fallback = stop_function.index('kill -KILL "$pid"')
+    final_check = stop_function.index("FATAL: unable to stop $label")
+
+    assert term < bounded_wait < kill_fallback < final_check
+
+
+def test_launcher_execs_under_atomic_lifecycle_lock():
+    source = (ROOT / "START_TRADER.sh").read_text()
+
+    assert '"$SCRIPT_DIR/robo_trader/runtime_lifecycle_lock.py"' in source
+    assert 'exec "$LOCK_PYTHON"' in source
+    assert '--exec-launcher "$SCRIPT_DIR/START_TRADER.sh"' in source
+    assert '--validate-fd "$ROBOTRADER_RUNTIME_LIFECYCLE_FD"' in source
+    assert "STARTUP_LOCK_HOLDER_PID" not in source
+    assert 'mkdir "$STARTUP_LOCK' not in source
+    assert source.count("200>&- &") == 3
+
+
+@pytest.mark.parametrize("ignores_term", [False, True])
+def test_launcher_stop_helper_graceful_first_behavior(tmp_path, ignores_term):
+    source = (ROOT / "START_TRADER.sh").read_text()
+    stop_function = _launcher_stop_function(source)
+    process_pattern = f"rt-startup-order-{uuid.uuid4().hex}"
+    term_marker = tmp_path / "term-received"
+    trap = (
+        "trap '' TERM" if ignores_term else "trap 'printf received > \"$TERM_MARKER\"; exit 0' TERM"
+    )
+    worker = subprocess.Popen(
+        ["bash", "-c", f"{trap}; while :; do sleep 0.1; done", process_pattern],
+        env={"PATH": "/usr/bin:/bin", "TERM_MARKER": str(term_marker)},
+    )
+    try:
+        time.sleep(0.1)
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"{stop_function}\n" 'stop_processes_gracefully test-runner "$PROCESS_PATTERN" 1',
+            ],
+            env={"PATH": "/usr/bin:/bin", "PROCESS_PATTERN": process_pattern},
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        worker.wait(timeout=2)
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+            worker.wait(timeout=2)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Requesting graceful stop" in result.stdout
+    if ignores_term:
+        assert not term_marker.exists()
+        assert "forcing SIGKILL" in result.stdout
+        assert "Forced stop complete" in result.stdout
+        assert worker.returncode == -9
+    else:
+        assert term_marker.read_text() == "received"
+        assert "Stopped test-runner gracefully" in result.stdout
+        assert "forcing SIGKILL" not in result.stdout
 
 
 @pytest.mark.parametrize(

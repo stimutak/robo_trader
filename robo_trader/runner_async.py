@@ -1108,15 +1108,12 @@ class AsyncRunner:
                     logger.error(
                         "The dashboard or another process may have created a zombie connection."
                     )
-                    logger.error("Please restart Gateway manually and try again:")
-                    logger.error("  1. Kill this process: Ctrl+C")
-                    logger.error(
-                        "  2. Restart Gateway: python3 scripts/gateway_manager.py restart --paper"
-                    )
-                    logger.error("  3. Complete 2FA on your phone")
-                    logger.error("  4. Run: ./START_TRADER.sh")
+                    logger.error("Restore the supervised stack:")
+                    logger.error("  1. Stop this process with Ctrl+C")
+                    logger.error("  2. Run: ./START_TRADER.sh")
+                    logger.error("  3. Complete IBKR Mobile 2FA if prompted")
                     raise RuntimeError(
-                        "Gateway-owned zombie connections detected. Manual Gateway restart required."
+                        "Gateway-owned zombie connections detected; supervised restart required."
                     )
         else:
             logger.info("✓ No zombie connections found")

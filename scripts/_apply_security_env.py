@@ -35,6 +35,7 @@ def _refuse_sudo() -> None:
         # Non-POSIX — geteuid not available; skip.
         pass
 
+
 # Keys we will set if missing (and report their fate). Values may be
 # generated; "GENERATE" means produce a random token.
 DESIRED: dict[str, str] = {
@@ -114,16 +115,11 @@ def main() -> int:
             if key in OVERWRITE and existing != new_val:
                 rows[idx[key]] = (key, new_val)
                 updated.append(key)
-            elif (
-                target == "GENERATE"
-                and (existing == "" or existing.startswith("<TODO"))
-            ):
+            elif target == "GENERATE" and (existing == "" or existing.startswith("<TODO")):
                 # Fill in a previously-empty generated slot.
                 rows[idx[key]] = (key, new_val)
                 updated.append(key)
-            elif target == "<TODO_SET_THIS>" and (
-                existing == "" or existing.startswith("<TODO")
-            ):
+            elif target == "<TODO_SET_THIS>" and (existing == "" or existing.startswith("<TODO")):
                 rows[idx[key]] = (key, new_val)
                 todo.append(key)
             else:
@@ -159,9 +155,7 @@ def main() -> int:
                 if stripped != "AllowBlindTrading=no":
                     ini_lines[i] = "AllowBlindTrading=no"
                     flipped.append("AllowBlindTrading=no")
-        new_ini = "\n".join(ini_lines) + (
-            "\n" if ini_text.endswith("\n") else ""
-        )
+        new_ini = "\n".join(ini_lines) + ("\n" if ini_text.endswith("\n") else "")
         if new_ini != ini_text:
             write_env_atomic(IBC_INI_PATH, new_ini)
             print(f"\n{IBC_INI_PATH} flipped: {flipped}")
@@ -171,7 +165,7 @@ def main() -> int:
         print(
             f"\nNOTE: {IBC_INI_PATH} not found. "
             "Copy from config/ibc/config.ini.template and re-run, "
-            "or it'll be created on next ./scripts/start_gateway.sh."
+            "or it will be created during supervised ./START_TRADER.sh setup."
         )
 
     return 0

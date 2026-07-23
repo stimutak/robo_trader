@@ -3,19 +3,20 @@
 # RoboTrader Startup Script
 #
 # This script ensures clean startup by:
-# 1. Starting Gateway via IBC if not running
-# 2. Killing all existing Python trader processes
+# 1. Gracefully stopping the existing trading runner
+# 2. Starting Gateway via IBC if not running
 # 3. Cleaning up zombie CLOSE_WAIT connections
 # 4. Automatically restarting Gateway if zombies block API
-# 5. Starting the trading system
+# 5. Running the preflight safety gate
+# 6. Replacing monitoring processes and starting the trading system
 #
 # Usage:
 #   ./START_TRADER.sh                    # Start with default symbols
 #   ./START_TRADER.sh "AAPL,NVDA"        # Start with custom symbols
 #
 # Gateway Management:
-#   ./scripts/start_gateway.sh           # Start Gateway via IBC
-#   python3 scripts/gateway_manager.py status  # Check Gateway status
+#   ./START_TRADER.sh                         # Supervised lifecycle entry
+#   python3 scripts/gateway_manager.py status # Read-only diagnostics
 #
 
 set -e
@@ -23,6 +24,27 @@ set -e
 PORT="${IBKR_PORT:-}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MAX_GATEWAY_RETRIES=3
+
+# Serialize every manual/watchdog invocation and internal Gateway recovery
+# before any path can quiesce the runner or manipulate Gateway. On the first
+# invocation Python acquires the atomic advisory lock and execs this script,
+# leaving FD 200 owned by this Bash process for its complete lifetime.
+LOCK_PYTHON=$(command -v python3 2>/dev/null || true)
+if [ -z "$LOCK_PYTHON" ]; then
+    echo "FATAL: python3 is required for the atomic runtime lifecycle lock." >&2
+    exit 75
+fi
+if [ -z "${ROBOTRADER_RUNTIME_LIFECYCLE_FD:-}" ]; then
+    exec "$LOCK_PYTHON" "$SCRIPT_DIR/robo_trader/runtime_lifecycle_lock.py" \
+        --exec-launcher "$SCRIPT_DIR/START_TRADER.sh" -- "$@"
+    echo "FATAL: could not enter the atomic runtime lifecycle wrapper." >&2
+    exit 75
+fi
+if ! "$LOCK_PYTHON" "$SCRIPT_DIR/robo_trader/runtime_lifecycle_lock.py" \
+    --validate-fd "$ROBOTRADER_RUNTIME_LIFECYCLE_FD"; then
+    echo "FATAL: inherited runtime lifecycle lock validation failed." >&2
+    exit 75
+fi
 
 # Resolve lsof to an absolute path and refuse to run without it.
 # The watchdog launches us under launchd, whose PATH omits /usr/sbin (where lsof
@@ -175,6 +197,62 @@ export IBKR_PORT="$PORT"
 export IBKR_READONLY="true"
 
 
+# Stop a matching process group gracefully, then fail closed if even SIGKILL
+# cannot remove it. The bounded TERM wait lets runner teardown disconnect its
+# persistent IBKR socket before any Gateway/socket/zombie inspection occurs.
+stop_processes_gracefully() {
+    local label="$1"
+    local pattern="$2"
+    local wait_seconds="${3:-10}"
+    local pids
+    local remaining
+    local waited=0
+
+    pids=$(pgrep -f "$pattern" 2>/dev/null || true)
+    if [ -z "$pids" ]; then
+        echo "   ✓ No $label running"
+        return 0
+    fi
+
+    echo "   Requesting graceful stop for $label (SIGTERM)..."
+    for pid in $pids; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+
+    while [ "$waited" -lt "$wait_seconds" ]; do
+        remaining=$(pgrep -f "$pattern" 2>/dev/null || true)
+        if [ -z "$remaining" ]; then
+            echo "   ✓ Stopped $label gracefully"
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    remaining=$(pgrep -f "$pattern" 2>/dev/null || true)
+    if [ -z "$remaining" ]; then
+        echo "   ✓ Stopped $label gracefully"
+        return 0
+    fi
+
+    if [ -n "$remaining" ]; then
+        echo "   ⚠️  $label did not stop within ${wait_seconds}s; forcing SIGKILL"
+        for pid in $remaining; do
+            kill -KILL "$pid" 2>/dev/null || true
+        done
+        sleep 1
+    fi
+
+    remaining=$(pgrep -f "$pattern" 2>/dev/null || true)
+    if [ -n "$remaining" ]; then
+        echo "FATAL: unable to stop $label process(es): $remaining" >&2
+        return 1
+    fi
+
+    echo "   ✓ Forced stop complete for $label"
+}
+
+
 # Function to start Gateway via IBC
 start_gateway() {
     echo "   Starting Gateway via IBC..."
@@ -233,7 +311,8 @@ start_gateway() {
 
     # Launch Gateway inline (blocks until Gateway exits or we Ctrl+C)
     cd "$IBC_PATH"
-    ./gatewaystartmacos.sh -inline &
+    # Long-lived descendants must not inherit the launcher's lifecycle lock.
+    ./gatewaystartmacos.sh -inline 200>&- &
     IBC_PID=$!
 
     # Wait for Gateway to start and API port to open
@@ -303,6 +382,15 @@ rotate_log() {
         mv -f "$f" "$f.1" || true
     fi
 }
+
+# Step 1: Quiesce the only process allowed to hold the trading connection.
+# This MUST precede Gateway status, LISTEN, CLOSE_WAIT, and preflight checks:
+# the old persistent runner can otherwise make healthy sockets look stale or
+# continue trading after a safety-gate BLOCK. Keep dashboard/WebSocket alive so
+# operators retain monitoring while Gateway recovery and preflight run.
+echo "1. Stopping existing trading runner..."
+stop_processes_gracefully "runner_async" "robo_trader[./]runner_async"
+echo ""
 
 # Step 2: Check/Start Gateway with retry logic
 echo "2. Checking Gateway status..."
@@ -405,7 +493,7 @@ if [ "$API_CONNECTED" = false ]; then
     echo "Manual troubleshooting:"
     echo "  1. Check Gateway is fully started (shows 'IB Gateway - READY')"
     echo "  2. Verify 2FA was completed on your phone"
-    echo "  3. Try: python3 scripts/gateway_manager.py restart"
+    echo "  3. Re-run: ./START_TRADER.sh"
     echo ""
     exit 1
 fi
@@ -499,23 +587,21 @@ case "$PREFLIGHT_RC" in
         echo "=========================================="
         echo ""
         echo "Preflight reported blocking issues above (exit code $PREFLIGHT_RC)."
-        echo "Resolve each one and re-run ./START_TRADER.sh, or"
-        echo "bypass with: $PYTHON scripts/preflight_check.py --force \"<reason>\""
-        echo "(then re-run ./START_TRADER.sh — bypass is per-invocation, not persistent)"
+        echo "Resolve each one and re-run ./START_TRADER.sh, or use the audited"
+        echo "single-invocation bypass: ./START_TRADER.sh --force=\"<reason>\""
+        echo "(the bypass is per invocation and does not persist)"
         echo ""
         exit 1
         ;;
 esac
 echo ""
 
-# Stop the prior application processes only after the preflight gate has
-# authorized this launch. A kill-switch or stale-equity BLOCK must leave the
-# existing supervised runtime available for inspection and recovery.
-echo "4.6. Stopping existing trader processes..."
-pkill -9 -f "runner_async" 2>/dev/null && echo "   ✓ Killed runner_async" || echo "   ✓ No runner_async running"
-pkill -9 -f "app.py" 2>/dev/null && echo "   ✓ Killed dashboard" || echo "   ✓ No dashboard running"
-pkill -9 -f "websocket_server" 2>/dev/null && echo "   ✓ Killed websocket_server" || echo "   ✓ No websocket_server running"
-sleep 2
+# Replace monitoring only after a preflight pass or audited bypass. A BLOCK
+# exits above with the runner stopped but the existing dashboard/WebSocket
+# still available for diagnosis.
+echo "4.6. Replacing monitoring processes..."
+stop_processes_gracefully "dashboard" '(^|[/[:space:]])app[.]py([[:space:]]|$)'
+stop_processes_gracefully "websocket_server" "robo_trader[./]websocket_server"
 echo ""
 
 # Step 5: Start dashboard (includes WebSocket server)
@@ -527,7 +613,7 @@ export DASH_PORT=5555
 # generation, then truncate on each start so these can't grow unbounded
 # across restarts while still preserving the prior attempt's crash output.
 rotate_log "$SCRIPT_DIR/dashboard_stdout.log"
-$PYTHON app.py > "$SCRIPT_DIR/dashboard_stdout.log" 2>&1 &
+$PYTHON app.py > "$SCRIPT_DIR/dashboard_stdout.log" 2>&1 200>&- &
 DASH_PID=$!
 sleep 2
 
@@ -554,7 +640,7 @@ export LOG_FILE="$SCRIPT_DIR/robo_trader.log"
 # market hours the runner now sleeps until open (extended hours still
 # covered by ENABLE_EXTENDED_HOURS via is_trading_allowed).
 rotate_log "$SCRIPT_DIR/runner_stdout.log"
-$PYTHON -m robo_trader.runner_async --symbols "$SYMBOLS" > "$SCRIPT_DIR/runner_stdout.log" 2>&1 &
+$PYTHON -m robo_trader.runner_async --symbols "$SYMBOLS" > "$SCRIPT_DIR/runner_stdout.log" 2>&1 200>&- &
 TRADER_PID=$!
 
 echo "   ✓ Trading system started (PID: $TRADER_PID)"
@@ -579,9 +665,9 @@ if ps -p $TRADER_PID > /dev/null; then
     echo "View dashboard: http://localhost:5555"
     echo "WebSocket: ws://localhost:8765"
     echo ""
-    echo "To stop:"
-    echo "  pkill -9 -f runner_async"
-    echo "  pkill -9 -f app.py"
+    echo "To stop gracefully:"
+    echo "  pkill -TERM -f 'robo_trader[./]runner_async'"
+    echo "  pkill -TERM -f '(^|[/[:space:]])app[.]py([[:space:]]|$)'"
     echo ""
 
     # Step 8: Verify the launchd watchdog is loaded.
