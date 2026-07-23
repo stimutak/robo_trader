@@ -100,6 +100,6 @@ if ps -p $RUNNER_PID > /dev/null 2>&1; then
     exit 0
 else
     echo "   ERROR: Runner failed to start"
-    echo "   Check robo_trader.log for details"
+    echo "   Check $RUNNER_STDOUT_LOG first, then $LOG_FILE for details"
     exit 1
 fi

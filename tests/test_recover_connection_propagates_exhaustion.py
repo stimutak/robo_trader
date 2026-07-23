@@ -27,6 +27,7 @@ import pytest
 from robo_trader.runner_async import (
     AsyncRunner,
     RecoveryExhaustedError,
+    _continuous_wait_should_stop,
     _raise_if_recovery_exhausted,
 )
 
@@ -139,6 +140,20 @@ def test_recovery_exhaustion_helper_checks_all_long_lived_runners():
         _raise_if_recovery_exhausted({"healthy": healthy_runner, "failed": failed_runner})
 
 
+def test_continuous_wait_stops_for_shutdown_or_any_exhausted_runner():
+    healthy_runner = MagicMock()
+    healthy_runner._recovery_exhausted = False
+    failed_runner = MagicMock()
+    failed_runner._recovery_exhausted = True
+
+    assert not _continuous_wait_should_stop(False, {"healthy": healthy_runner})
+    assert _continuous_wait_should_stop(True, {"healthy": healthy_runner})
+    assert _continuous_wait_should_stop(
+        False,
+        {"healthy": healthy_runner, "failed": failed_runner},
+    )
+
+
 def test_cycle_loop_contains_recovery_exhausted_check():
     """Guard against future refactors silently dropping the cycle-loop
     check. The actual lines of code matter here — this is the only
@@ -169,6 +184,17 @@ def test_recovery_exhaustion_is_checked_before_market_closed_wait():
     market_closed_branch = src.index("if not is_trading_allowed() and not force_connect")
 
     assert top_level_check < market_closed_branch
+
+
+def test_every_continuous_loop_wait_observes_recovery_exhaustion():
+    """No long wait may watch only the shutdown flag."""
+    import inspect
+
+    from robo_trader import runner_async
+
+    src = inspect.getsource(runner_async.run_continuous)
+    assert src.count("_continuous_wait_should_stop(shutdown_flag, runners)") == 5
+    assert "lambda: shutdown_flag" not in src
 
 
 def test_run_continuous_catches_recovery_exhausted_at_outer_level():

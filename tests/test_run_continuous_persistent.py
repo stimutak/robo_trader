@@ -102,7 +102,11 @@ async def test_persistent_runner_starts_subprocess_only_once_across_cycles():
 import pytest
 
 from robo_trader.exceptions import KillSwitchTriggeredError
-from robo_trader.runner_async import intercycle_wait_seconds, sleep_unless_shutdown
+from robo_trader.runner_async import (
+    _continuous_wait_should_stop,
+    intercycle_wait_seconds,
+    sleep_unless_shutdown,
+)
 
 
 class TestSleepUnlessShutdown:
@@ -142,6 +146,26 @@ class TestSleepUnlessShutdown:
             await sleep_unless_shutdown(1800.0, lambda: stop["v"], poll_seconds=1.0)
 
         # Must return right after the flag flips (3 poll chunks), not after ~1800.
+        assert calls["n"] == 3
+
+    @pytest.mark.asyncio
+    async def test_returns_early_when_recovery_exhausts_mid_sleep(self):
+        calls = {"n": 0}
+        runner = MagicMock()
+        runner._recovery_exhausted = False
+
+        async def fake_sleep(_d):
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                runner._recovery_exhausted = True
+
+        with patch("asyncio.sleep", side_effect=fake_sleep):
+            await sleep_unless_shutdown(
+                1800.0,
+                lambda: _continuous_wait_should_stop(False, {"default": runner}),
+                poll_seconds=1.0,
+            )
+
         assert calls["n"] == 3
 
     @pytest.mark.asyncio

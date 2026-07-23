@@ -204,6 +204,15 @@ def test_claude_md_mentions_watchdog_install():
     assert "install_watchdog.sh" in content, "CLAUDE.md must reference scripts/install_watchdog.sh"
 
 
+def test_start_runner_failure_points_to_both_log_sinks():
+    """Pre-logger startup failures are visible in runner_stdout.log first."""
+    content = (SCRIPTS_DIR / "start_runner.sh").read_text()
+    failure_block = content.split('echo "   ERROR: Runner failed to start"', maxsplit=1)[1]
+
+    assert "$RUNNER_STDOUT_LOG" in failure_block
+    assert "$LOG_FILE" in failure_block
+
+
 # ---------------------------------------------------------------------------
 # START_TRADER.sh must warn loudly if the watchdog isn't loaded
 # ---------------------------------------------------------------------------

@@ -4547,7 +4547,7 @@ async def sleep_unless_shutdown(
     (up to 1800s for the overnight closed-market branch, or intercycle_wait for
     the inter-cycle wait) therefore delays a graceful shutdown by up to its full
     duration. Sleeping in poll_seconds chunks and re-checking should_stop() caps
-    that delay at ~poll_seconds. Pass `lambda: shutdown_flag` for should_stop.
+    that delay at ~poll_seconds.
     """
     if should_stop():
         return
@@ -4559,6 +4559,14 @@ async def sleep_unless_shutdown(
         remaining -= chunk
         if should_stop():
             return
+
+
+def _continuous_wait_should_stop(
+    shutdown_requested: bool,
+    runners: Dict[str, AsyncRunner],
+) -> bool:
+    """Return whether a continuous-loop wait must end promptly."""
+    return shutdown_requested or any(runner._recovery_exhausted for runner in runners.values())
 
 
 def _raise_if_recovery_exhausted(runners: Dict[str, AsyncRunner]) -> None:
@@ -4655,7 +4663,10 @@ async def run_continuous(
                     if session in ["after-hours", "pre-market"]:
                         wait_time = 120  # 2 minutes during extended hours
                         logger.info(f"Extended hours ({session}). Polling every 2 minutes...")
-                        await sleep_unless_shutdown(wait_time, lambda: shutdown_flag)
+                        await sleep_unless_shutdown(
+                            wait_time,
+                            lambda: _continuous_wait_should_stop(shutdown_flag, runners),
+                        )
                         continue
                     # Within 1 hour of open: moderate polling (5 min)
                     elif seconds_to_open < 3600:
@@ -4664,7 +4675,10 @@ async def run_continuous(
                             f"Market opens in {seconds_to_open/60:.0f} min. "
                             "Polling every 5 minutes..."
                         )
-                        await sleep_unless_shutdown(wait_time, lambda: shutdown_flag)
+                        await sleep_unless_shutdown(
+                            wait_time,
+                            lambda: _continuous_wait_should_stop(shutdown_flag, runners),
+                        )
                         continue
                     else:
                         # Market fully closed (overnight/weekend): long wait
@@ -4673,7 +4687,10 @@ async def run_continuous(
                             f"Market {session}. Next open in {seconds_to_open/3600:.1f} hours. "
                             f"Sleeping {wait_time/60:.1f} minutes..."
                         )
-                        await sleep_unless_shutdown(wait_time, lambda: shutdown_flag)
+                        await sleep_unless_shutdown(
+                            wait_time,
+                            lambda: _continuous_wait_should_stop(shutdown_flag, runners),
+                        )
                         continue
                 elif force_connect and not is_trading_allowed():
                     logger.warning(
@@ -4795,7 +4812,10 @@ async def run_continuous(
                     logger.info(
                         f"Waiting {intercycle_wait/60:.1f} minutes before next iteration..."
                     )
-                    await sleep_unless_shutdown(intercycle_wait, lambda: shutdown_flag)
+                    await sleep_unless_shutdown(
+                        intercycle_wait,
+                        lambda: _continuous_wait_should_stop(shutdown_flag, runners),
+                    )
 
             except asyncio.CancelledError:
                 logger.info("Trading loop cancelled")
@@ -4824,7 +4844,10 @@ async def run_continuous(
                 # owns its connection lifecycle.
                 if not shutdown_flag:
                     logger.info("Waiting 1 minute before retry...")
-                    await sleep_unless_shutdown(60, lambda: shutdown_flag)
+                    await sleep_unless_shutdown(
+                        60,
+                        lambda: _continuous_wait_should_stop(shutdown_flag, runners),
+                    )
 
     finally:
         # Final cleanup: all portfolios get full disconnect on process exit
