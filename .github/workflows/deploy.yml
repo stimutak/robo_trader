@@ -77,6 +77,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -101,6 +103,31 @@ jobs:
       - name: Report legacy test import-order debt
         continue-on-error: true
         run: isort --check-only --diff tests
+
+      - name: Collect changed Python files
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
+        run: |
+          base_sha="${PR_BASE_SHA:-${PUSH_BASE_SHA:-}}"
+          if ! git cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
+            base_sha="$(git rev-parse HEAD^)"
+          fi
+          git diff --name-only --diff-filter=ACMR "$base_sha" "$GITHUB_SHA" \
+            | awk '/\.py$/' \
+            > changed-python.txt
+          echo "Changed Python files:"
+          cat changed-python.txt
+
+      - name: Gate changed Python files
+        run: |
+          if [[ ! -s changed-python.txt ]]; then
+            echo "No changed Python files."
+            exit 0
+          fi
+          xargs black --check < changed-python.txt
+          xargs isort --check-only --diff < changed-python.txt
+          xargs flake8 < changed-python.txt
         
       - name: Report legacy type debt
         # Full-package mypy remains visible while the existing backlog is paid

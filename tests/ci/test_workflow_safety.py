@@ -36,6 +36,18 @@ def test_primary_ci_reports_baseline_isort_debt_and_gates_changed_files() -> Non
     assert "xargs isort --check-only --diff" in workflow
 
 
+def test_deploy_ci_gates_all_changed_python_entrypoints() -> None:
+    workflow = _workflow("deploy.yml")
+
+    assert "fetch-depth: 0" in workflow
+    assert "Collect changed Python files" in workflow
+    assert "awk '/\\.py$/'" in workflow
+    assert "Gate changed Python files" in workflow
+    assert "xargs black --check" in workflow
+    assert "xargs isort --check-only --diff" in workflow
+    assert "xargs flake8" in workflow
+
+
 def test_mypy_and_supply_chain_debt_are_explicitly_advisory() -> None:
     workflow = _workflow("production-ci.yml")
 
