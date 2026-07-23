@@ -20,7 +20,6 @@ import sys
 from pathlib import Path
 
 import pytest
-import yaml
 
 from robo_trader import logger as logger_mod
 
@@ -134,10 +133,16 @@ def test_log_console_false_forces_mirror_off_on_tty(monkeypatch, restore_root_lo
     ),
 )
 def test_container_dashboard_explicitly_keeps_console_logging(compose_path):
-    compose = yaml.safe_load((PROJECT_ROOT / compose_path).read_text())
-    environment = compose["services"]["dashboard"]["environment"]
+    lines = (PROJECT_ROOT / compose_path).read_text().splitlines()
+    start = lines.index("  dashboard:") + 1
+    dashboard_lines = []
+    for line in lines[start:]:
+        if line.startswith("  ") and not line.startswith("    ") and line.strip():
+            break
+        dashboard_lines.append(line)
+    dashboard_service = "\n".join(dashboard_lines)
 
-    assert "LOG_CONSOLE=true" in environment
+    assert "- LOG_CONSOLE=true" in dashboard_service
 
 
 @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
