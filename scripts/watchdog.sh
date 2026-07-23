@@ -30,6 +30,9 @@ if [ ! -x "$PYTHON3_BIN" ]; then
     PYTHON3_BIN="$(command -v python3 2>/dev/null || true)"
 fi
 LAST_TERMINAL_SAFETY_REASON=""
+# Session-bound restart authorization. This value is updated only after this
+# watchdog has directly observed exactly one live runner process.
+LAST_OBSERVED_RUNNER_PID=""
 if [ -f "$RESTART_GUARD" ]; then
     # shellcheck source=watchdog_restart_guard.sh
     source "$RESTART_GUARD"
@@ -272,11 +275,21 @@ restart_trader() {
     # A deliberate terminal safety exit must survive the supervisor boundary.
     # Manual START_TRADER.sh remains available after the missing protection is
     # deployed, but the watchdog must not loop through Gateway/2FA meanwhile.
-    if ! is_runner_alive && [ -f "$RUNNER_EXIT_AUDIT" ]; then
+    # Always ask the policy when the runner is absent. A missing audit is not
+    # evidence that a restart is safe: the terminal-exit audit is deliberately
+    # best-effort, so disk exhaustion, permissions, or SIGKILL can leave no
+    # file. In that ambiguous state the watchdog stays stopped and requires a
+    # manual START_TRADER.sh run. A successful manual startup clears stale
+    # audit state after its safety setup completes.
+    if ! is_runner_alive; then
         local policy_output
         local policy_rc
         if [ -n "$PYTHON3_BIN" ] && [ -x "$PYTHON3_BIN" ] && [ -f "$RESTART_POLICY" ]; then
-            policy_output="$("$PYTHON3_BIN" "$RESTART_POLICY" "$RUNNER_EXIT_AUDIT" 2>/dev/null)"
+            local expected_runner_pid="${LAST_OBSERVED_RUNNER_PID:-unavailable}"
+            policy_output="$(
+                "$PYTHON3_BIN" "$RESTART_POLICY" \
+                    "$RUNNER_EXIT_AUDIT" "$expected_runner_pid" 2>/dev/null
+            )"
             policy_rc=$?
         else
             policy_output="restart_policy_unavailable"
@@ -365,6 +378,19 @@ while true; do
 
     if is_trading_time; then
         if is_runner_alive; then
+            # Bind any subsequent exit audit to the exact process this
+            # watchdog observed alive. Multiple matches are ambiguous and
+            # intentionally clear the identity, forcing a manual restart if
+            # they all disappear.
+            observed_runner_pids=$(pgrep -f "python.*runner_async" 2>/dev/null || true)
+            observed_runner_count=$(printf '%s\n' "$observed_runner_pids" | awk 'NF {count++} END {print count+0}')
+            if [ "$observed_runner_count" -eq 1 ] && [[ "$observed_runner_pids" =~ ^[0-9]+$ ]]; then
+                LAST_OBSERVED_RUNNER_PID="$observed_runner_pids"
+            else
+                LAST_OBSERVED_RUNNER_PID=""
+                log "WARNING: runner identity ambiguous; automatic restart will remain blocked if runner exits"
+            fi
+
             # Runner is alive — if we previously escalated, clear that state and
             # notify the user that recovery happened (so they know the alert is resolved).
             if [ "$failure_count" -ge "$ESCALATION_THRESHOLD" ]; then

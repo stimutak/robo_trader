@@ -6,10 +6,11 @@ import inspect
 import json
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -18,7 +19,9 @@ from robo_trader.risk_manager import Position
 from robo_trader.runner_async import (
     AsyncRunner,
     UnprotectedExistingPositionsError,
+    _clear_exit_audit,
     _setup_continuous_runner,
+    _write_exit_audit,
     run_continuous,
 )
 from robo_trader.stop_loss_monitor import StopStatus
@@ -285,9 +288,16 @@ def test_continuous_loop_treats_unprotected_positions_as_nonretryable() -> None:
     assert "if not fatal_safety_exit_written:" in source
 
 
-def _run_watchdog_policy(audit: Path) -> subprocess.CompletedProcess[str]:
+def _run_watchdog_policy(
+    audit: Path, expected_pid: int | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(WATCHDOG_POLICY), str(audit)],
+        [
+            sys.executable,
+            str(WATCHDOG_POLICY),
+            str(audit),
+            "unavailable" if expected_pid is None else str(expected_pid),
+        ],
         text=True,
         capture_output=True,
         check=False,
@@ -311,22 +321,215 @@ def test_watchdog_policy_suppresses_terminal_protection_restart(tmp_path: Path) 
     assert result.stdout.strip() == "unprotected_existing_positions"
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {"reason": "clean_shutdown", "exit_code": 0},
-        {"reason": "unprotected_existing_positions", "exit_code": 1},
-        {"reason": "recovery_exhausted", "exit_code": 6},
-    ],
-)
-def test_watchdog_policy_allows_nonterminal_exit(tmp_path: Path, payload: dict) -> None:
+def test_watchdog_policy_blocks_missing_exit_audit(tmp_path: Path) -> None:
+    """An audit-write failure must never become automatic restart permission."""
+
+    result = _run_watchdog_policy(tmp_path / "runner_exit.json")
+
+    assert result.returncode == 21
+    assert result.stdout.strip() == "exit_audit_missing"
+
+
+def test_watchdog_policy_keeps_stale_terminal_safety_exit_blocked(tmp_path: Path) -> None:
+    """Only a verified manual startup may clear a terminal safety stop."""
+
     audit = tmp_path / "runner_exit.json"
-    audit.write_text(json.dumps(payload))
+    audit.write_text(
+        json.dumps(
+            {
+                "timestamp": 1,
+                "reason": "unprotected_existing_positions",
+                "exit_code": 6,
+            }
+        )
+    )
 
     result = _run_watchdog_policy(audit)
 
+    assert result.returncode == 20
+    assert result.stdout.strip() == "unprotected_existing_positions"
+
+
+@pytest.mark.parametrize(
+    ("reason", "exit_code"),
+    [
+        ("clean_shutdown", 0),
+        ("keyboard_interrupt", 0),
+        ("pre_flight_gateway_unreachable", 1),
+        ("sigint", 0),
+        ("sigterm", 0),
+        ("unhandled_exception", 2),
+    ],
+)
+def test_watchdog_policy_allows_known_fresh_exit_from_observed_runner(
+    tmp_path: Path, reason: str, exit_code: int
+) -> None:
+    audit = tmp_path / "runner_exit.json"
+    audit.write_text(
+        json.dumps(
+            {
+                "timestamp": time.time(),
+                "pid": 4242,
+                "reason": reason,
+                "exit_code": exit_code,
+            }
+        )
+    )
+
+    result = _run_watchdog_policy(audit, expected_pid=4242)
+
     assert result.returncode == 0
     assert result.stdout.strip() == "nonterminal_exit"
+
+
+@pytest.mark.parametrize(
+    ("reason", "exit_code"),
+    [
+        ("made_up_exit", 0),
+        ("unprotected_existing_positions", 1),
+        ("recovery_exhausted", 6),
+        ("unhandled_exception", 0),
+    ],
+)
+def test_watchdog_policy_blocks_unknown_or_wrong_exit_pair(
+    tmp_path: Path, reason: str, exit_code: int
+) -> None:
+    audit = tmp_path / "runner_exit.json"
+    audit.write_text(
+        json.dumps(
+            {
+                "timestamp": time.time(),
+                "pid": 4242,
+                "reason": reason,
+                "exit_code": exit_code,
+            }
+        )
+    )
+
+    result = _run_watchdog_policy(audit, expected_pid=4242)
+
+    assert result.returncode == 21
+    assert result.stdout.strip() == "exit_audit_unknown_pair"
+
+
+def test_watchdog_policy_blocks_stale_nonterminal_audit(tmp_path: Path) -> None:
+    audit = tmp_path / "runner_exit.json"
+    audit.write_text(
+        json.dumps(
+            {
+                "timestamp": time.time() - 301,
+                "pid": 4242,
+                "reason": "unhandled_exception",
+                "exit_code": 2,
+            }
+        )
+    )
+
+    result = _run_watchdog_policy(audit, expected_pid=4242)
+
+    assert result.returncode == 21
+    assert result.stdout.strip() == "exit_audit_stale"
+
+
+def test_watchdog_policy_blocks_nonterminal_audit_from_unobserved_runner(
+    tmp_path: Path,
+) -> None:
+    audit = tmp_path / "runner_exit.json"
+    audit.write_text(
+        json.dumps(
+            {
+                "timestamp": time.time(),
+                "pid": 4242,
+                "reason": "unhandled_exception",
+                "exit_code": 2,
+            }
+        )
+    )
+
+    result = _run_watchdog_policy(audit)
+
+    assert result.returncode == 21
+    assert result.stdout.strip() == "runner_pid_unobserved"
+
+
+def test_watchdog_policy_blocks_nonterminal_audit_from_different_runner(
+    tmp_path: Path,
+) -> None:
+    audit = tmp_path / "runner_exit.json"
+    audit.write_text(
+        json.dumps(
+            {
+                "timestamp": time.time(),
+                "pid": 1111,
+                "reason": "unhandled_exception",
+                "exit_code": 2,
+            }
+        )
+    )
+
+    result = _run_watchdog_policy(audit, expected_pid=2222)
+
+    assert result.returncode == 21
+    assert result.stdout.strip() == "runner_pid_mismatch"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "timestamp": True,
+            "pid": 4242,
+            "reason": "unhandled_exception",
+            "exit_code": 2,
+        },
+        {
+            "timestamp": float("inf"),
+            "pid": 4242,
+            "reason": "unhandled_exception",
+            "exit_code": 2,
+        },
+        {
+            "timestamp": 1,
+            "pid": True,
+            "reason": "unhandled_exception",
+            "exit_code": 2,
+        },
+        {
+            "timestamp": 1,
+            "reason": "unhandled_exception",
+            "exit_code": 2,
+        },
+    ],
+)
+def test_watchdog_policy_requires_complete_finite_nonterminal_evidence(
+    tmp_path: Path, payload: dict
+) -> None:
+    audit = tmp_path / "runner_exit.json"
+    audit.write_text(json.dumps(payload))
+
+    result = _run_watchdog_policy(audit, expected_pid=4242)
+
+    assert result.returncode == 21
+    assert result.stdout.strip() == "exit_audit_invalid_schema"
+
+
+def test_watchdog_policy_blocks_future_nonterminal_audit(tmp_path: Path) -> None:
+    audit = tmp_path / "runner_exit.json"
+    audit.write_text(
+        json.dumps(
+            {
+                "timestamp": time.time() + 60,
+                "pid": 4242,
+                "reason": "unhandled_exception",
+                "exit_code": 2,
+            }
+        )
+    )
+
+    result = _run_watchdog_policy(audit, expected_pid=4242)
+
+    assert result.returncode == 21
+    assert result.stdout.strip() == "exit_audit_from_future"
 
 
 def test_watchdog_policy_blocks_untrusted_existing_audit(tmp_path: Path) -> None:
@@ -389,6 +592,205 @@ def test_watchdog_calls_policy_before_authoritative_launcher() -> None:
         '"$PROJECT_DIR/START_TRADER.sh"'
     )
     assert "return 2" in restart_body
+
+
+def test_watchdog_missing_audit_blocks_launcher_after_audit_write_failure(
+    tmp_path: Path,
+) -> None:
+    """Exercise the real missing-audit policy through the shell boundary."""
+
+    source = (ROOT / "scripts" / "watchdog.sh").read_text()
+    restart_function = (
+        "restart_trader() {" + source.split("restart_trader() {", 1)[1].split("# Main loop", 1)[0]
+    )
+    audit = tmp_path / "runner_exit.json"
+    capture = tmp_path / "watchdog.log"
+    launcher = tmp_path / "START_TRADER.sh"
+    launcher.write_text(f"#!/bin/bash\necho LAUNCHER_RAN >> {capture!s}\n")
+    launcher.chmod(0o700)
+
+    harness = f"""
+RUNNER_EXIT_AUDIT={audit!s}
+PYTHON3_BIN={sys.executable!s}
+RESTART_POLICY={WATCHDOG_POLICY!s}
+PROJECT_DIR={tmp_path!s}
+WATCHDOG_LOG={capture!s}
+CAPTURE={capture!s}
+LAST_TERMINAL_SAFETY_REASON=""
+LAST_OBSERVED_RUNNER_PID=4242
+RESTART_VERIFY_WAIT=0
+is_runner_alive() {{ return 1; }}
+watchdog_restart_allowed_for_policy_rc() {{ [ "$1" -eq 0 ]; }}
+log() {{ printf '%s\\n' "$1" >> "$CAPTURE"; }}
+notify_user() {{ :; }}
+reset_failures() {{ :; }}
+get_failure_count() {{ echo 0; }}
+set_failure_count() {{ :; }}
+{restart_function}
+restart_trader
+rc=$?
+printf 'RETURN_CODE=%s\\n' "$rc" >> "$CAPTURE"
+"""
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    log_output = capture.read_text()
+    assert (
+        "AUTOMATIC RESTART REQUEST DENIED: launcher not invoked "
+        "(restart_rc=2, policy_rc=21, reason=exit_audit_missing)" in log_output
+    )
+    assert "RETURN_CODE=2" in log_output
+    assert "LAUNCHER_RAN" not in log_output
+
+
+def test_watchdog_audited_ordinary_crash_still_invokes_launcher(tmp_path: Path) -> None:
+    """A trusted non-terminal exit remains automatically recoverable."""
+
+    source = (ROOT / "scripts" / "watchdog.sh").read_text()
+    restart_function = (
+        "restart_trader() {" + source.split("restart_trader() {", 1)[1].split("# Main loop", 1)[0]
+    )
+    audit = tmp_path / "runner_exit.json"
+    audit.write_text(
+        json.dumps(
+            {
+                "timestamp": time.time(),
+                "pid": 4242,
+                "reason": "unhandled_exception",
+                "exit_code": 2,
+            }
+        )
+    )
+    capture = tmp_path / "watchdog.log"
+    launcher = tmp_path / "START_TRADER.sh"
+    launcher.write_text(f"#!/bin/bash\necho LAUNCHER_RAN >> {capture!s}\n")
+    launcher.chmod(0o700)
+
+    harness = f"""
+RUNNER_EXIT_AUDIT={audit!s}
+PYTHON3_BIN={sys.executable!s}
+RESTART_POLICY={WATCHDOG_POLICY!s}
+PROJECT_DIR={tmp_path!s}
+WATCHDOG_LOG={capture!s}
+FAILURE_STATE_FILE={tmp_path / ".watchdog_failures"!s}
+CAPTURE={capture!s}
+LAST_TERMINAL_SAFETY_REASON=""
+LAST_OBSERVED_RUNNER_PID=4242
+RESTART_VERIFY_WAIT=0
+runner_checks=0
+is_runner_alive() {{
+    runner_checks=$((runner_checks + 1))
+    [ "$runner_checks" -ge 2 ]
+}}
+watchdog_restart_allowed_for_policy_rc() {{ [ "$1" -eq 0 ]; }}
+log() {{ printf '%s\\n' "$1" >> "$CAPTURE"; }}
+notify_user() {{ :; }}
+reset_failures() {{ :; }}
+get_failure_count() {{ echo 0; }}
+set_failure_count() {{ :; }}
+{restart_function}
+restart_trader
+rc=$?
+printf 'RETURN_CODE=%s\\n' "$rc" >> "$CAPTURE"
+"""
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    log_output = capture.read_text()
+    assert "LAUNCHER_RAN" in log_output
+    assert "Restart verified: runner_async is alive" in log_output
+    assert "RETURN_CODE=0" in log_output
+
+
+def test_watchdog_clear_failure_then_terminal_write_failure_blocks_stale_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prior session's audit cannot authorize restart for a later runner."""
+
+    source = (ROOT / "scripts" / "watchdog.sh").read_text()
+    restart_function = (
+        "restart_trader() {" + source.split("restart_trader() {", 1)[1].split("# Main loop", 1)[0]
+    )
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    audit = data_dir / "runner_exit.json"
+    audit.write_text(
+        json.dumps(
+            {
+                "timestamp": time.time(),
+                "pid": 1111,
+                "reason": "unhandled_exception",
+                "exit_code": 2,
+            }
+        )
+    )
+    stale_payload = audit.read_text()
+    monkeypatch.chdir(tmp_path)
+
+    # Exercise both real best-effort helpers: setup cannot clear PID 1111's
+    # record, then PID 2222's terminal path cannot replace it.
+    with patch.object(Path, "unlink", side_effect=PermissionError("read-only")):
+        _clear_exit_audit()
+    with patch.object(Path, "write_text", side_effect=OSError("disk full")):
+        _write_exit_audit(
+            "unprotected_existing_positions",
+            exit_code=6,
+            extra={"portfolio_id": "default", "position_count": 1},
+        )
+    assert audit.read_text() == stale_payload
+
+    capture = tmp_path / "watchdog.log"
+    launcher = tmp_path / "START_TRADER.sh"
+    launcher.write_text(f"#!/bin/bash\necho LAUNCHER_RAN >> {capture!s}\n")
+    launcher.chmod(0o700)
+
+    harness = f"""
+RUNNER_EXIT_AUDIT={audit!s}
+PYTHON3_BIN={sys.executable!s}
+RESTART_POLICY={WATCHDOG_POLICY!s}
+PROJECT_DIR={tmp_path!s}
+WATCHDOG_LOG={capture!s}
+CAPTURE={capture!s}
+LAST_TERMINAL_SAFETY_REASON=""
+LAST_OBSERVED_RUNNER_PID=2222
+RESTART_VERIFY_WAIT=0
+is_runner_alive() {{ return 1; }}
+watchdog_restart_allowed_for_policy_rc() {{ [ "$1" -eq 0 ]; }}
+log() {{ printf '%s\\n' "$1" >> "$CAPTURE"; }}
+notify_user() {{ :; }}
+reset_failures() {{ :; }}
+get_failure_count() {{ echo 0; }}
+set_failure_count() {{ :; }}
+{restart_function}
+restart_trader
+rc=$?
+printf 'RETURN_CODE=%s\\n' "$rc" >> "$CAPTURE"
+"""
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    log_output = capture.read_text()
+    assert (
+        "AUTOMATIC RESTART REQUEST DENIED: launcher not invoked "
+        "(restart_rc=2, policy_rc=21, reason=runner_pid_mismatch)" in log_output
+    )
+    assert "RETURN_CODE=2" in log_output
+    assert "LAUNCHER_RAN" not in log_output
 
 
 def test_watchdog_logs_terminal_restart_request_without_claiming_launcher_ran(

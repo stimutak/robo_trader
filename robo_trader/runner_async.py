@@ -1161,6 +1161,110 @@ class AsyncRunner:
                 )
                 return False
 
+    async def _reconcile_replacement_stop_after_fill(
+        self,
+        filled_stop,
+        remaining_qty: int,
+        remaining_avg_cost: float,
+    ) -> bool:
+        """Resize or cancel a newer stop after an older stop fills.
+
+        A replacement can be installed while the old stop's broker request is
+        in flight. It must not be deleted by the old completion, but retaining
+        its pre-fill quantity could over-close the now-smaller position.
+        """
+        monitor = getattr(self, "stop_loss_monitor", None)
+        active_stops = getattr(monitor, "active_stops", None)
+        stop_key_fn = getattr(monitor, "_stop_key", None)
+        if not isinstance(active_stops, dict) or not callable(stop_key_fn):
+            return remaining_qty == 0
+
+        async def reconcile() -> bool:
+            stop_key = stop_key_fn(filled_stop.symbol)
+            replacement = active_stops.get(stop_key)
+            if replacement is None:
+                return remaining_qty == 0
+            if replacement is filled_stop:
+                return remaining_qty == 0
+
+            if remaining_qty == 0:
+                if active_stops.get(stop_key) is replacement:
+                    return bool(monitor.cancel_stop(filled_stop.symbol))
+                return False
+
+            replacement_qty = getattr(replacement, "position_qty", None)
+            if (
+                not isinstance(replacement_qty, int)
+                or isinstance(replacement_qty, bool)
+                or replacement_qty * remaining_qty <= 0
+                or not math.isfinite(float(remaining_avg_cost))
+                or remaining_avg_cost <= 0
+            ):
+                return False
+
+            new_stop_price = getattr(replacement, "stop_price", None)
+            if replacement.stop_type == StopType.FIXED:
+                stop_percent = getattr(replacement, "max_loss_percent", None)
+                if (
+                    not isinstance(stop_percent, (int, float))
+                    or isinstance(stop_percent, bool)
+                    or not math.isfinite(float(stop_percent))
+                    or not 0 < float(stop_percent) < 1
+                ):
+                    return False
+                if remaining_qty > 0:
+                    new_stop_price = remaining_avg_cost * (1 - float(stop_percent))
+                else:
+                    new_stop_price = remaining_avg_cost * (1 + float(stop_percent))
+            elif replacement.stop_type == StopType.TRAILING:
+                trailing_amount = getattr(replacement, "trailing_amount", None)
+                if (
+                    not isinstance(trailing_amount, (int, float))
+                    or isinstance(trailing_amount, bool)
+                    or not math.isfinite(float(trailing_amount))
+                    or float(trailing_amount) <= 0
+                ):
+                    return False
+            elif replacement.stop_type == StopType.TRAILING_PERCENT:
+                trailing_percent = getattr(replacement, "trailing_percent", None)
+                if (
+                    not isinstance(trailing_percent, (int, float))
+                    or isinstance(trailing_percent, bool)
+                    or not math.isfinite(float(trailing_percent))
+                    or not 0 < float(trailing_percent) < 1
+                ):
+                    return False
+            else:
+                return False
+            if (
+                not isinstance(new_stop_price, (int, float))
+                or isinstance(new_stop_price, bool)
+                or not math.isfinite(float(new_stop_price))
+                or float(new_stop_price) <= 0
+            ):
+                return False
+
+            new_max_loss_amount = abs(remaining_qty * (remaining_avg_cost - float(new_stop_price)))
+            new_max_loss_percent = abs(
+                (float(new_stop_price) - remaining_avg_cost) / remaining_avg_cost
+            )
+
+            # All validation is complete. Publish the replacement state as one
+            # synchronous critical section so a rejected resize cannot leave a
+            # partially-mutated stop capable of over-closing.
+            replacement.position_qty = remaining_qty
+            replacement.entry_price = remaining_avg_cost
+            replacement.stop_price = float(new_stop_price)
+            replacement.max_loss_amount = new_max_loss_amount
+            replacement.max_loss_percent = new_max_loss_percent
+            return True
+
+        price_lock = getattr(monitor, "_price_update_lock", None)
+        if price_lock is not None and hasattr(price_lock, "__aenter__"):
+            async with price_lock:
+                return await reconcile()
+        return await reconcile()
+
     async def _on_stop_loss_executed(self, stop, result) -> None:
         """Callback invoked by StopLossMonitor after a successful stop-loss fill.
 
@@ -1192,40 +1296,57 @@ class AsyncRunner:
         except Exception:
             fill_price = float(stop.stop_price)
 
-        # Use the same pending-orders lock the BUY/SELL paths use so any
-        # concurrent BUY/SELL on this symbol observes a consistent view.
+        # Use the same pending-orders lock the BUY/SELL paths use so the
+        # position is compared with the quantity the stop actually closed
+        # before any state mutation. A newer/larger same-direction position is
+        # reduced only by the fill; absent, reversed, or too-small state is
+        # treated as divergence and preserved for broker reconciliation.
         try:
+            emergency_reason = None
             async with self._pending_orders_lock:
-                # 1. Drop in-memory position (if present).
-                if symbol in self.positions:
-                    try:
-                        del self.positions[symbol]
-                    except Exception as e:  # pragma: no cover - defensive
-                        logger.error(
-                            f"_on_stop_loss_executed: failed to drop {symbol} "
-                            f"from self.positions: {e}"
-                        )
-
-                # 2. Sync portfolio cash/P&L with the closing fill.
+                current = self.positions.get(symbol)
+                current_qty = getattr(current, "quantity", None)
+                state_matches_fill = False
+                remaining_qty = None
+                remaining_avg_cost = 0.0
+                divergence_reason = "absent_opposite_or_too_small_position"
                 try:
-                    if self.portfolio is not None:
-                        await self.portfolio.update_fill(symbol, side, qty, fill_price)
-                except Exception as e:
-                    logger.error(
-                        f"_on_stop_loss_executed: portfolio.update_fill failed "
-                        f"for {symbol} {side} {qty}@{fill_price}: {e}"
+                    same_direction = current is not None and (
+                        (stop.position_qty > 0 and current_qty > 0)
+                        or (stop.position_qty < 0 and current_qty < 0)
+                    )
+                    enough_quantity = same_direction and abs(current_qty) >= qty
+                    if enough_quantity:
+                        remaining_qty = current_qty - stop.position_qty
+                        if remaining_qty:
+                            remaining_avg_cost = float(current.avg_price)
+                            if not math.isfinite(remaining_avg_cost) or remaining_avg_cost <= 0:
+                                raise ValueError("invalid remaining average cost")
+                        state_matches_fill = True
+                except Exception as state_err:
+                    divergence_reason = repr(state_err)
+                    state_matches_fill = False
+
+                if not state_matches_fill:
+                    emergency_reason = (
+                        f"Broker stop fill state divergence for {symbol}: "
+                        f"filled signed_qty={stop.position_qty}, "
+                        f"runtime signed_qty={current_qty!r}"
+                    )
+                    logger.critical(
+                        "event=stop_fill_state_divergence symbol=%s "
+                        "stop_qty=%r current_qty=%r reason=%s "
+                        "action=preserve_runtime_position_and_reconcile",
+                        symbol,
+                        getattr(stop, "position_qty", None),
+                        current_qty,
+                        divergence_reason,
                     )
 
-                # 3. Persist position closure to DB.
-                try:
-                    if self.db is not None:
-                        await self.db.update_position(symbol, 0, 0.0, fill_price)
-                except Exception as e:
-                    logger.error(
-                        f"_on_stop_loss_executed: db.update_position failed " f"for {symbol}: {e}"
-                    )
-
-                # 4. Record the trade row so audit/PnL queries see the close.
+                # Record the irrevocable broker fill exactly once even when
+                # local position state has diverged. This audit row is safer
+                # than silently losing the fill; reconciliation can then repair
+                # position state without inventing another broker order.
                 try:
                     if self.db is not None:
                         await self.db.record_trade(symbol, side, qty, fill_price, 0)
@@ -1234,19 +1355,106 @@ class AsyncRunner:
                         f"_on_stop_loss_executed: db.record_trade failed " f"for {symbol}: {e}"
                     )
 
-                # 5. Mark advanced-risk-manager position as closed (if used).
-                try:
-                    if self.use_advanced_risk and self.advanced_risk:
-                        self.advanced_risk.update_position(symbol, qty, fill_price, side)
-                except Exception as e:
-                    logger.error(
-                        f"_on_stop_loss_executed: advanced_risk update failed " f"for {symbol}: {e}"
+                if state_matches_fill:
+                    if remaining_qty:
+                        self.positions[symbol] = Position(
+                            symbol,
+                            remaining_qty,
+                            remaining_avg_cost,
+                        )
+                    else:
+                        del self.positions[symbol]
+
+                    replacement_safe = await self._reconcile_replacement_stop_after_fill(
+                        stop,
+                        remaining_qty or 0,
+                        remaining_avg_cost,
+                    )
+                    if not replacement_safe:
+                        emergency_reason = (
+                            f"Unsafe replacement stop after broker fill for {symbol}: "
+                            f"remaining signed_qty={remaining_qty or 0}"
+                        )
+                        logger.critical(
+                            "event=stop_fill_replacement_reconcile_failed "
+                            "symbol=%s remaining_qty=%s "
+                            "action=emergency_shutdown_and_reconcile",
+                            symbol,
+                            remaining_qty or 0,
+                        )
+
+                    try:
+                        if self.portfolio is not None:
+                            await self.portfolio.update_fill(
+                                symbol,
+                                side,
+                                qty,
+                                fill_price,
+                            )
+                    except Exception as e:
+                        logger.error(
+                            f"_on_stop_loss_executed: portfolio.update_fill failed "
+                            f"for {symbol} {side} {qty}@{fill_price}: {e}"
+                        )
+
+                    try:
+                        if self.db is not None:
+                            await self.db.update_position(
+                                symbol,
+                                remaining_qty or 0,
+                                remaining_avg_cost if remaining_qty else 0.0,
+                                fill_price,
+                            )
+                    except Exception as e:
+                        logger.error(
+                            f"_on_stop_loss_executed: db.update_position failed "
+                            f"for {symbol}: {e}"
+                        )
+
+                    try:
+                        if self.use_advanced_risk and self.advanced_risk:
+                            self.advanced_risk.update_position(
+                                symbol,
+                                qty,
+                                fill_price,
+                                side,
+                            )
+                    except Exception as e:
+                        logger.error(
+                            f"_on_stop_loss_executed: advanced_risk update failed "
+                            f"for {symbol}: {e}"
+                        )
+
+            if emergency_reason:
+                emergency_callback = getattr(
+                    getattr(self, "stop_loss_monitor", None),
+                    "emergency_shutdown",
+                    None,
+                )
+                if callable(emergency_callback):
+                    try:
+                        await emergency_callback(emergency_reason)
+                    except Exception as emergency_err:
+                        logger.critical(
+                            "event=stop_fill_emergency_callback_failed " "symbol=%s error=%r",
+                            symbol,
+                            emergency_err,
+                        )
+                else:
+                    logger.critical(
+                        "event=stop_fill_emergency_callback_missing symbol=%s",
+                        symbol,
                     )
 
-            logger.info(
-                f"Stop-loss state sync complete for {symbol}: closed {side} "
-                f"{qty}@${fill_price:.2f}"
-            )
+            if state_matches_fill:
+                logger.info(
+                    "Stop-loss state sync complete for %s: %s %s@%.2f " "remaining_qty=%s",
+                    symbol,
+                    side,
+                    qty,
+                    fill_price,
+                    remaining_qty or 0,
+                )
         except Exception as outer:  # pragma: no cover - defensive
             logger.error(f"_on_stop_loss_executed top-level failure for {symbol}: {outer}")
 

@@ -105,6 +105,17 @@ class StopLossMetrics:
     trailing_adjustments_today: int = 0
 
 
+@dataclass(frozen=True)
+class _PendingStopTrigger:
+    """Immutable, validated crossing evidence awaiting monitor-loop handling."""
+
+    stop: StopLossOrder = field(compare=False, repr=False)
+    trigger_price: float
+    event_time: datetime
+    receipt_monotonic: float
+    receipt_order: int
+
+
 class StopLossMonitor:
     """
     Active stop-loss monitoring and execution system.
@@ -158,6 +169,16 @@ class StopLossMonitor:
         self.last_prices: Dict[str, float] = {}
         self.price_event_times: Dict[str, datetime] = {}
         self.price_receipt_monotonic: Dict[str, float] = {}
+        # Broker feeds can publish multiple quotes with the same (often
+        # second-resolution) event timestamp.  Preserve their local arrival
+        # order independently of the monotonic clock, whose resolution is not
+        # guaranteed to distinguish adjacent callbacks.
+        self.price_receipt_orders: Dict[str, int] = {}
+        self._price_receipt_order = 0
+        self._pending_stop_triggers: Dict[str, _PendingStopTrigger] = {}
+        # Serialize quote ordering and trigger draining. No broker I/O occurs
+        # while this lock is held.
+        self._price_update_lock = asyncio.Lock()
 
         # Metrics
         self.metrics = StopLossMetrics()
@@ -247,6 +268,7 @@ class StopLossMonitor:
             )
 
         # Add new stop
+        self._pending_stop_triggers.pop(stop_key, None)
         self.active_stops[stop_key] = stop_order
         self.metrics.total_stops += 1
         self.metrics.active_stops = len(self.active_stops)
@@ -299,41 +321,84 @@ class StopLossMonitor:
             return False
 
         event_time = source_timestamp.astimezone(timezone.utc)
-        event_age = (self._utcnow() - event_time).total_seconds()
-        if event_age < 0:
-            logger.error("Rejected price update for %s: future source timestamp", symbol)
-            return False
-        if event_age > self.max_price_age_seconds:
-            logger.warning(
-                "Rejected stale price update for %s (event age: %.1fs)",
-                symbol,
-                event_age,
-            )
-            return False
+        async with self._price_update_lock:
+            event_age = (self._utcnow() - event_time).total_seconds()
+            if event_age < 0:
+                logger.error("Rejected price update for %s: future source timestamp", symbol)
+                return False
+            if event_age > self.max_price_age_seconds:
+                logger.warning(
+                    "Rejected stale price update for %s (event age: %.1fs)",
+                    symbol,
+                    event_age,
+                )
+                return False
 
-        previous_event_time = self.price_event_times.get(symbol)
-        if previous_event_time is not None and event_time <= previous_event_time:
-            logger.warning(
-                "Rejected non-increasing price event for %s: %s <= %s",
-                symbol,
-                event_time.isoformat(),
-                previous_event_time.isoformat(),
-            )
-            return False
+            previous_event_time = self.price_event_times.get(symbol)
+            if previous_event_time is not None and event_time < previous_event_time:
+                logger.warning(
+                    "Rejected out-of-order price event for %s: %s < %s",
+                    symbol,
+                    event_time.isoformat(),
+                    previous_event_time.isoformat(),
+                )
+                return False
 
-        self.last_prices[symbol] = price
-        self.price_event_times[symbol] = event_time
-        self.price_receipt_monotonic[symbol] = self._monotonic()
+            # A sequence, rather than the clock value, is the authoritative
+            # tie-breaker for quotes sharing a broker timestamp. This is
+            # strictly increasing even when time.monotonic() returns the same
+            # tick. Every arrival is accepted because a coarse broker timestamp
+            # cannot distinguish a replay from a legitimate value revisited in
+            # the same interval. Event age remains authoritative, so repeated
+            # callbacks cannot make an old broker event fresh.
+            receipt_monotonic = self._monotonic()
+            self._price_receipt_order += 1
+            receipt_order = self._price_receipt_order
+            self.last_prices[symbol] = price
+            self.price_event_times[symbol] = event_time
+            self.price_receipt_monotonic[symbol] = receipt_monotonic
+            self.price_receipt_orders[symbol] = receipt_order
 
-        # Update trailing stops if needed
-        stop_key = self._stop_key(symbol)
-        if stop_key in self.active_stops:
-            stop = self.active_stops[stop_key]
-            if stop.stop_type in [StopType.TRAILING, StopType.TRAILING_PERCENT]:
-                await self._update_trailing_stop(stop, price)
+            stop_key = self._stop_key(symbol)
+            stop = self.active_stops.get(stop_key)
+            if (
+                stop is not None
+                and stop.status == StopStatus.PENDING
+                and stop_key not in self._pending_stop_triggers
+            ):
+                if stop.stop_type in [StopType.TRAILING, StopType.TRAILING_PERCENT]:
+                    self._update_trailing_stop(stop, price)
+
+                if self._price_crosses_stop(stop, price):
+                    stop.status = StopStatus.TRIGGERED
+                    stop.triggered_at = event_time
+                    stop.trigger_price = price
+                    self._pending_stop_triggers[stop_key] = _PendingStopTrigger(
+                        stop=stop,
+                        trigger_price=price,
+                        event_time=event_time,
+                        receipt_monotonic=receipt_monotonic,
+                        receipt_order=receipt_order,
+                    )
+                    self.metrics.triggered_today += 1
+                    logger.warning(
+                        "Latched stop-loss crossing for %s at %.2f "
+                        "(stop=%.2f event=%s receipt_order=%d)",
+                        symbol,
+                        price,
+                        stop.stop_price,
+                        event_time.isoformat(),
+                        receipt_order,
+                    )
         return True
 
-    async def _update_trailing_stop(self, stop: StopLossOrder, current_price: float) -> None:
+    @staticmethod
+    def _price_crosses_stop(stop: StopLossOrder, price: float) -> bool:
+        if stop.position_qty > 0:
+            return price <= stop.stop_price
+        return price >= stop.stop_price
+
+    def _update_trailing_stop(self, stop: StopLossOrder, current_price: float) -> None:
         """
         Update trailing stop based on current price.
 
@@ -388,69 +453,78 @@ class StopLossMonitor:
         Returns:
             List of triggered stop-loss orders
         """
-        triggered = []
+        async with self._price_update_lock:
+            triggered = []
 
-        for stop_key, stop in list(self.active_stops.items()):
-            if stop.status != StopStatus.PENDING:
-                continue
-
-            # Get current price (last_prices is keyed by bare symbol, not composite key)
-            current_price = self.last_prices.get(stop.symbol)
-            if not current_price:
-                logger.warning(f"No price data for {stop.symbol}, cannot check stop-loss")
-                continue
-
-            event_time = self.price_event_times.get(stop.symbol)
-            receipt_time = self.price_receipt_monotonic.get(stop.symbol)
-            if event_time is None or receipt_time is None:
-                logger.warning(f"No timestamp data for {stop.symbol}, cannot check stop-loss")
-                continue
-
-            # Event age protects against stale broker data. Monotonic receipt
-            # age stays correct if the host wall clock moves backwards.
-            event_age_seconds = (self._utcnow() - event_time).total_seconds()
-            receipt_age_seconds = self._monotonic() - receipt_time
-            if (
-                event_age_seconds < 0
-                or receipt_age_seconds < 0
-                or event_age_seconds > self.max_price_age_seconds
-                or receipt_age_seconds > self.max_price_age_seconds
-            ):
-                logger.warning(
-                    "Stale price data for %s (event_age=%.1fs receipt_age=%.1fs)",
-                    stop.symbol,
-                    event_age_seconds,
-                    receipt_age_seconds,
-                )
-                continue
-
-            # Check if stop triggered
-            triggered_flag = False
-
-            if stop.position_qty > 0:  # Long position
-                if current_price <= stop.stop_price:
-                    triggered_flag = True
-                    logger.warning(
-                        f"STOP-LOSS TRIGGERED for {stop.symbol} LONG: "
-                        f"price ${current_price:.2f} <= stop ${stop.stop_price:.2f}"
-                    )
-
-            else:  # Short position
-                if current_price >= stop.stop_price:
-                    triggered_flag = True
-                    logger.warning(
-                        f"STOP-LOSS TRIGGERED for {stop.symbol} SHORT: "
-                        f"price ${current_price:.2f} >= stop ${stop.stop_price:.2f}"
-                    )
-
-            if triggered_flag:
-                stop.status = StopStatus.TRIGGERED
-                stop.triggered_at = datetime.now()
-                stop.trigger_price = current_price
+            # Crossings validated during quote ingestion are authoritative.
+            # Drain each object once before consulting the mutable latest-price
+            # cache, which may already contain a later recovery quote.
+            for stop_key, evidence in list(self._pending_stop_triggers.items()):
+                del self._pending_stop_triggers[stop_key]
+                stop = evidence.stop
+                if self.active_stops.get(stop_key) is not stop:
+                    continue
+                if stop.status != StopStatus.TRIGGERED:
+                    continue
+                # The frozen evidence remains authoritative even if unrelated
+                # code touched mutable display fields on the stop object while
+                # it waited for the monitor-loop drain.
+                stop.trigger_price = evidence.trigger_price
+                stop.triggered_at = evidence.event_time
                 triggered.append(stop)
-                self.metrics.triggered_today += 1
 
-        return triggered
+            for stop_key, stop in list(self.active_stops.items()):
+                if stop.status != StopStatus.PENDING:
+                    continue
+
+                # Get current price (last_prices is keyed by bare symbol, not
+                # composite key). This fallback covers a stop added after the
+                # most recent accepted quote.
+                current_price = self.last_prices.get(stop.symbol)
+                if not current_price:
+                    logger.warning(f"No price data for {stop.symbol}, cannot check stop-loss")
+                    continue
+
+                event_time = self.price_event_times.get(stop.symbol)
+                receipt_time = self.price_receipt_monotonic.get(stop.symbol)
+                if event_time is None or receipt_time is None:
+                    logger.warning(f"No timestamp data for {stop.symbol}, cannot check stop-loss")
+                    continue
+
+                # Event age protects against stale broker data. Monotonic receipt
+                # age stays correct if the host wall clock moves backwards.
+                event_age_seconds = (self._utcnow() - event_time).total_seconds()
+                receipt_age_seconds = self._monotonic() - receipt_time
+                if (
+                    event_age_seconds < 0
+                    or receipt_age_seconds < 0
+                    or event_age_seconds > self.max_price_age_seconds
+                    or receipt_age_seconds > self.max_price_age_seconds
+                ):
+                    logger.warning(
+                        "Stale price data for %s (event_age=%.1fs receipt_age=%.1fs)",
+                        stop.symbol,
+                        event_age_seconds,
+                        receipt_age_seconds,
+                    )
+                    continue
+
+                if self._price_crosses_stop(stop, current_price):
+                    logger.warning(
+                        "STOP-LOSS TRIGGERED for %s %s: price $%.2f %s stop $%.2f",
+                        stop.symbol,
+                        "LONG" if stop.position_qty > 0 else "SHORT",
+                        current_price,
+                        "<=" if stop.position_qty > 0 else ">=",
+                        stop.stop_price,
+                    )
+                    stop.status = StopStatus.TRIGGERED
+                    stop.triggered_at = event_time
+                    stop.trigger_price = current_price
+                    triggered.append(stop)
+                    self.metrics.triggered_today += 1
+
+            return triggered
 
     async def execute_stop_loss(self, stop: StopLossOrder) -> bool:
         """
@@ -462,6 +536,19 @@ class StopLossMonitor:
         Returns:
             bool: True if execution successful
         """
+        stop_key = self._stop_key(stop.symbol)
+        if self.active_stops.get(stop_key) is not stop or stop.status in {
+            StopStatus.CANCELLED,
+            StopStatus.EXECUTED,
+            StopStatus.FAILED,
+        }:
+            logger.warning(
+                "Refusing obsolete stop execution for %s: status=%s",
+                stop.symbol,
+                stop.status.value,
+            )
+            return False
+
         logger.critical(
             f"EXECUTING STOP-LOSS for {stop.symbol}: "
             f"closing {'LONG' if stop.position_qty > 0 else 'SHORT'} "
@@ -494,69 +581,23 @@ class StopLossMonitor:
         # notional cap hit). Refusing to close a losing position because new
         # entries are blocked would be the worst possible behavior.
         for attempt in range(self.max_execution_retries):
+            # A prior definitive rejection may be followed by cancellation or
+            # replacement during retry backoff. Revalidate immediately before
+            # every broker call so an obsolete close is never resubmitted.
+            if self.active_stops.get(stop_key) is not stop or stop.status in {
+                StopStatus.CANCELLED,
+                StopStatus.EXECUTED,
+                StopStatus.FAILED,
+            }:
+                logger.warning(
+                    "Abandoning obsolete stop retry for %s: status=%s " "attempt=%d",
+                    stop.symbol,
+                    stop.status.value,
+                    attempt + 1,
+                )
+                return False
             try:
                 result = await self.executor.place_order_async(order)
-
-                if result.ok:
-                    stop.status = StopStatus.EXECUTED
-                    stop.executed_at = datetime.now()
-                    stop.execution_price = result.fill_price
-
-                    # Calculate prevented loss
-                    if stop.position_qty > 0:  # Long
-                        prevented_loss = abs(
-                            stop.position_qty * (stop.trigger_price - stop.stop_price)
-                        )
-                    else:  # Short
-                        prevented_loss = abs(
-                            stop.position_qty * (stop.stop_price - stop.trigger_price)
-                        )
-
-                    self.metrics.executed_today += 1
-                    self.metrics.total_prevented_loss += prevented_loss
-                    self.metrics.largest_prevented_loss = max(
-                        self.metrics.largest_prevented_loss, prevented_loss
-                    )
-
-                    # Remove from active stops (use composite key)
-                    stop_key = self._stop_key(stop.symbol)
-                    del self.active_stops[stop_key]
-                    self.stop_history.append(stop)
-                    self.metrics.active_stops = len(self.active_stops)
-
-                    logger.info(
-                        f"Stop-loss executed successfully for {stop.symbol}: "
-                        f"filled at ${result.fill_price:.2f}, "
-                        f"prevented loss: ${prevented_loss:.2f}"
-                    )
-
-                    # TCN-H4 (followup audit): notify the runner so it can
-                    # update self.positions, portfolio.update_fill, and persist
-                    # to DB. Without this hook a phantom position would remain
-                    # in the runtime, blocking subsequent BUY/SELL signals.
-                    # Failures in the callback MUST NOT crash the monitor loop:
-                    # the stop-loss already filled with the broker.
-                    if self.position_closed_callback is not None:
-                        try:
-                            await self.position_closed_callback(stop, result)
-                        except Exception as cb_err:  # pragma: no cover - defensive
-                            logger.error(
-                                f"position_closed_callback failed for {stop.symbol}: "
-                                f"{cb_err} — runtime state may diverge from broker. "
-                                f"Reconcile via load_existing_positions() on restart."
-                            )
-
-                    return True
-
-                else:
-                    logger.error(
-                        f"Stop-loss execution failed for {stop.symbol} "
-                        f"(attempt {attempt + 1}/{self.max_execution_retries}): {result.message}"
-                    )
-
-                    if attempt < self.max_execution_retries - 1:
-                        await asyncio.sleep(0.5)  # Brief delay before retry
-
             except Exception as e:
                 logger.error(
                     f"Exception during stop-loss execution for {stop.symbol} "
@@ -565,6 +606,90 @@ class StopLossMonitor:
 
                 if attempt < self.max_execution_retries - 1:
                     await asyncio.sleep(0.5)
+                continue
+
+            if not result.ok:
+                logger.error(
+                    f"Stop-loss execution failed for {stop.symbol} "
+                    f"(attempt {attempt + 1}/{self.max_execution_retries}): {result.message}"
+                )
+                if attempt < self.max_execution_retries - 1:
+                    await asyncio.sleep(0.5)  # Brief delay before retry
+                continue
+
+            # Broker-fill commit point. Nothing after result.ok may re-enter
+            # the retry loop: bookkeeping failures cannot make an already
+            # filled closing order safe to submit again.
+            try:
+                stop.status = StopStatus.EXECUTED
+                stop.executed_at = self._utcnow()
+                stop.execution_price = result.fill_price
+            except Exception as state_err:  # pragma: no cover - defensive
+                logger.error(
+                    "Post-fill stop state update failed for %s: %r; "
+                    "order remains irrevocably filled",
+                    stop.symbol,
+                    state_err,
+                )
+
+            prevented_loss = 0.0
+            try:
+                if stop.position_qty > 0:  # Long
+                    prevented_loss = abs(stop.position_qty * (stop.trigger_price - stop.stop_price))
+                else:  # Short
+                    prevented_loss = abs(stop.position_qty * (stop.stop_price - stop.trigger_price))
+                self.metrics.executed_today += 1
+                self.metrics.total_prevented_loss += prevented_loss
+                self.metrics.largest_prevented_loss = max(
+                    self.metrics.largest_prevented_loss, prevented_loss
+                )
+            except Exception as metrics_err:
+                logger.error(
+                    "Post-fill stop metrics failed for %s: %r; " "order remains irrevocably filled",
+                    stop.symbol,
+                    metrics_err,
+                )
+
+            try:
+                if self.active_stops.get(stop_key) is stop:
+                    del self.active_stops[stop_key]
+                elif stop_key in self.active_stops:
+                    logger.warning(
+                        "Preserving replacement stop after filled prior stop: symbol=%s",
+                        stop.symbol,
+                    )
+                if not any(historical is stop for historical in self.stop_history):
+                    self.stop_history.append(stop)
+                self.metrics.active_stops = len(self.active_stops)
+            except Exception as cleanup_err:
+                logger.error(
+                    "Post-fill stop cleanup failed for %s: %r; "
+                    "preserving current active-stop state",
+                    stop.symbol,
+                    cleanup_err,
+                )
+
+            logger.info(
+                "Stop-loss executed successfully for %s: fill_price=%r " "prevented_loss=%.2f",
+                stop.symbol,
+                result.fill_price,
+                prevented_loss,
+            )
+
+            # TCN-H4 (followup audit): notify the runner so it can update
+            # self.positions, portfolio.update_fill, and persist to DB.
+            # This callback is attempted exactly once after the broker fill.
+            if self.position_closed_callback is not None:
+                try:
+                    await self.position_closed_callback(stop, result)
+                except Exception as cb_err:  # pragma: no cover - defensive
+                    logger.error(
+                        f"position_closed_callback failed for {stop.symbol}: "
+                        f"{cb_err} — runtime state may diverge from broker. "
+                        f"Reconcile via load_existing_positions() on restart."
+                    )
+
+            return True
 
         # Execution failed after all retries
         stop.status = StopStatus.FAILED
@@ -657,6 +782,7 @@ class StopLossMonitor:
         stop_key = self._stop_key(symbol)
         if stop_key in self.active_stops:
             stop = self.active_stops[stop_key]
+            self._pending_stop_triggers.pop(stop_key, None)
             stop.status = StopStatus.CANCELLED
             del self.active_stops[stop_key]
             self.stop_history.append(stop)

@@ -7,12 +7,14 @@ finding ID it pins.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -690,6 +692,196 @@ async def test_stop_loss_callback_failure_does_not_crash_monitor_tcn_h4() -> Non
     assert ok is True
 
 
+class _GatedSuccessfulExecutor:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+
+    async def place_order_async(self, order: Order) -> ExecutionResult:
+        self.calls += 1
+        self.started.set()
+        await self.release.wait()
+        return ExecutionResult(True, "filled", fill_price=order.price)
+
+
+@pytest.mark.asyncio
+async def test_filled_old_stop_preserves_replacement_without_retry() -> None:
+    executor = _GatedSuccessfulExecutor()
+    callback_calls = 0
+
+    async def callback(_stop, _result) -> None:
+        nonlocal callback_calls
+        callback_calls += 1
+
+    monitor = StopLossMonitor(
+        executor=executor,
+        risk_manager=_StubRiskManager(),
+        position_closed_callback=callback,
+    )
+    position = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
+    old_stop = await monitor.add_stop_loss("AAPL", position, stop_percent=0.02)
+    old_stop.trigger_price = 97.0
+
+    execution = asyncio.create_task(monitor.execute_stop_loss(old_stop))
+    await executor.started.wait()
+    replacement = await monitor.add_stop_loss("AAPL", position, stop_percent=0.05)
+    executor.release.set()
+
+    assert await execution is True
+    assert executor.calls == 1
+    assert callback_calls == 1
+    assert old_stop.status.name == "EXECUTED"
+    assert monitor.active_stops["default:AAPL"] is replacement
+    assert sum(item is old_stop for item in monitor.stop_history) == 1
+
+
+@pytest.mark.asyncio
+async def test_filled_cancelled_stop_is_not_resubmitted() -> None:
+    executor = _GatedSuccessfulExecutor()
+    monitor = StopLossMonitor(
+        executor=executor,
+        risk_manager=_StubRiskManager(),
+    )
+    position = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
+    stop = await monitor.add_stop_loss("AAPL", position, stop_percent=0.02)
+    stop.trigger_price = 97.0
+
+    execution = asyncio.create_task(monitor.execute_stop_loss(stop))
+    await executor.started.wait()
+    assert monitor.cancel_stop("AAPL") is True
+    executor.release.set()
+
+    assert await execution is True
+    assert executor.calls == 1
+    assert stop.status.name == "EXECUTED"
+    assert "default:AAPL" not in monitor.active_stops
+    assert sum(item is stop for item in monitor.stop_history) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_replacement_from_trigger_batch_cannot_execute() -> None:
+    executor = _GatedSuccessfulExecutor()
+    monitor = StopLossMonitor(
+        executor=executor,
+        risk_manager=_StubRiskManager(),
+    )
+    position = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
+    stop = await monitor.add_stop_loss("AAPL", position, stop_percent=0.02)
+    stop.trigger_price = 97.0
+    assert monitor.cancel_stop("AAPL") is True
+
+    assert await monitor.execute_stop_loss(stop) is False
+    assert executor.calls == 0
+
+
+class _DefinitiveRejectExecutor:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def place_order_async(self, _order: Order) -> ExecutionResult:
+        self.calls += 1
+        return ExecutionResult(False, "definitive rejection")
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_reject_backoff_prevents_obsolete_retry(monkeypatch) -> None:
+    executor = _DefinitiveRejectExecutor()
+    monitor = StopLossMonitor(
+        executor=executor,
+        risk_manager=_StubRiskManager(),
+    )
+    position = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
+    stop = await monitor.add_stop_loss("AAPL", position, stop_percent=0.02)
+    stop.trigger_price = 97.0
+    retry_sleep_started = asyncio.Event()
+    release_retry_sleep = asyncio.Event()
+
+    async def controlled_retry_sleep(_seconds) -> None:
+        retry_sleep_started.set()
+        await release_retry_sleep.wait()
+
+    monkeypatch.setattr(
+        "robo_trader.stop_loss_monitor.asyncio.sleep",
+        controlled_retry_sleep,
+    )
+    execution = asyncio.create_task(monitor.execute_stop_loss(stop))
+    await retry_sleep_started.wait()
+    assert monitor.cancel_stop("AAPL") is True
+    release_retry_sleep.set()
+
+    assert await execution is False
+    assert executor.calls == 1
+    assert stop.status.name == "CANCELLED"
+    assert monitor.metrics.failed_today == 0
+
+
+@pytest.mark.asyncio
+async def test_replacement_during_reject_backoff_prevents_old_retry(monkeypatch) -> None:
+    executor = _DefinitiveRejectExecutor()
+    monitor = StopLossMonitor(
+        executor=executor,
+        risk_manager=_StubRiskManager(),
+    )
+    position = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
+    old_stop = await monitor.add_stop_loss("AAPL", position, stop_percent=0.02)
+    old_stop.trigger_price = 97.0
+    retry_sleep_started = asyncio.Event()
+    release_retry_sleep = asyncio.Event()
+
+    async def controlled_retry_sleep(_seconds) -> None:
+        retry_sleep_started.set()
+        await release_retry_sleep.wait()
+
+    monkeypatch.setattr(
+        "robo_trader.stop_loss_monitor.asyncio.sleep",
+        controlled_retry_sleep,
+    )
+    execution = asyncio.create_task(monitor.execute_stop_loss(old_stop))
+    await retry_sleep_started.wait()
+    replacement = await monitor.add_stop_loss("AAPL", position, stop_percent=0.05)
+    release_retry_sleep.set()
+
+    assert await execution is False
+    assert executor.calls == 1
+    assert old_stop.status.name == "CANCELLED"
+    assert monitor.active_stops["default:AAPL"] is replacement
+    assert replacement.status.name == "PENDING"
+    assert monitor.metrics.failed_today == 0
+
+
+@pytest.mark.asyncio
+async def test_post_fill_cleanup_exception_never_resubmits_order() -> None:
+    class _ExplodingHistory(list):
+        def append(self, _item) -> None:
+            raise RuntimeError("history unavailable")
+
+    executor = _GatedSuccessfulExecutor()
+    callback_calls = 0
+
+    async def callback(_stop, _result) -> None:
+        nonlocal callback_calls
+        callback_calls += 1
+
+    monitor = StopLossMonitor(
+        executor=executor,
+        risk_manager=_StubRiskManager(),
+        position_closed_callback=callback,
+    )
+    position = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
+    stop = await monitor.add_stop_loss("AAPL", position, stop_percent=0.02)
+    stop.trigger_price = 97.0
+    monitor.stop_history = _ExplodingHistory()
+
+    execution = asyncio.create_task(monitor.execute_stop_loss(stop))
+    await executor.started.wait()
+    executor.release.set()
+
+    assert await execution is True
+    assert executor.calls == 1
+    assert callback_calls == 1
+
+
 @pytest.mark.asyncio
 async def test_runner_on_stop_loss_executed_updates_state_tcn_h4() -> None:
     """TCN-H4: AsyncRunner._on_stop_loss_executed must clear self.positions,
@@ -775,6 +967,289 @@ async def test_runner_on_stop_loss_executed_short_uses_buy_to_cover_tcn_h4() -> 
     runner.portfolio.update_fill.assert_awaited_once_with("TSLA", "BUY_TO_COVER", 5, 210.6)
     args, _ = runner.db.record_trade.call_args
     assert args[1] == "BUY_TO_COVER"
+
+
+def _runner_for_stop_fill(position: Position | None):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from robo_trader.runner_async import AsyncRunner
+
+    runner = AsyncRunner.__new__(AsyncRunner)
+    AsyncRunner.__init__(runner)
+    runner.positions = {} if position is None else {position.symbol: position}
+    runner.portfolio = MagicMock()
+    runner.portfolio.update_fill = AsyncMock(return_value=None)
+    runner.db = MagicMock()
+    runner.db.update_position = AsyncMock(return_value=None)
+    runner.db.record_trade = AsyncMock(return_value=None)
+    runner.use_advanced_risk = False
+    runner.advanced_risk = None
+    return runner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("current_qty", "stop_qty", "expected_qty", "expected_side"),
+    [
+        (15, 10, 5, "SELL"),
+        (-8, -5, -3, "BUY_TO_COVER"),
+    ],
+)
+async def test_runner_stop_fill_reduces_only_filled_quantity(
+    current_qty,
+    stop_qty,
+    expected_qty,
+    expected_side,
+) -> None:
+    from robo_trader.stop_loss_monitor import StopLossOrder
+
+    current = Position(symbol="AAPL", quantity=current_qty, avg_price=Decimal("123.45"))
+    runner = _runner_for_stop_fill(current)
+    monitor = _build_monitor()
+    replacement = await monitor.add_stop_loss(
+        "AAPL",
+        current,
+        stop_percent=0.05,
+        stop_type=StopType.FIXED,
+    )
+    runner.stop_loss_monitor = monitor
+    stop = StopLossOrder(
+        symbol="AAPL",
+        position_qty=stop_qty,
+        stop_price=100.0,
+        entry_price=123.45,
+        stop_type=StopType.FIXED,
+        created_at=datetime.now(),
+    )
+    result = ExecutionResult(True, "filled", fill_price=99.0)
+
+    await runner._on_stop_loss_executed(stop, result)
+
+    assert runner.positions["AAPL"].quantity == expected_qty
+    assert float(runner.positions["AAPL"].avg_price) == pytest.approx(123.45)
+    assert replacement.position_qty == expected_qty
+    runner.db.record_trade.assert_awaited_once_with(
+        "AAPL",
+        expected_side,
+        abs(stop_qty),
+        99.0,
+        0,
+    )
+    runner.db.update_position.assert_awaited_once_with(
+        "AAPL",
+        expected_qty,
+        123.45,
+        99.0,
+    )
+    runner.portfolio.update_fill.assert_awaited_once_with(
+        "AAPL",
+        expected_side,
+        abs(stop_qty),
+        99.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_stop_fill_exact_quantity_closes_position() -> None:
+    from robo_trader.stop_loss_monitor import StopLossOrder
+
+    current = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
+    runner = _runner_for_stop_fill(current)
+    stop = StopLossOrder(
+        symbol="AAPL",
+        position_qty=10,
+        stop_price=98.0,
+        entry_price=100.0,
+        stop_type=StopType.FIXED,
+        created_at=datetime.now(),
+    )
+    result = ExecutionResult(True, "filled", fill_price=97.5)
+
+    await runner._on_stop_loss_executed(stop, result)
+
+    assert "AAPL" not in runner.positions
+    runner.db.record_trade.assert_awaited_once()
+    runner.db.update_position.assert_awaited_once_with("AAPL", 0, 0.0, 97.5)
+
+
+@pytest.mark.asyncio
+async def test_runner_partial_old_fill_resizes_newer_replacement_stop() -> None:
+    from robo_trader.stop_loss_monitor import StopLossOrder
+
+    current = Position(symbol="AAPL", quantity=20, avg_price=Decimal("100"))
+    runner = _runner_for_stop_fill(current)
+    monitor = _build_monitor()
+    replacement = await monitor.add_stop_loss(
+        "AAPL",
+        current,
+        stop_percent=0.05,
+        stop_type=StopType.FIXED,
+    )
+    runner.stop_loss_monitor = monitor
+    old_stop = StopLossOrder(
+        symbol="AAPL",
+        position_qty=10,
+        stop_price=98.0,
+        entry_price=100.0,
+        stop_type=StopType.FIXED,
+        created_at=datetime.now(),
+    )
+
+    await runner._on_stop_loss_executed(
+        old_stop,
+        ExecutionResult(True, "filled", fill_price=97.5),
+    )
+
+    assert runner.positions["AAPL"].quantity == 10
+    assert monitor.active_stops["default:AAPL"] is replacement
+    assert replacement.position_qty == 10
+    assert replacement.entry_price == pytest.approx(100.0)
+    assert replacement.stop_price == pytest.approx(95.0)
+
+
+@pytest.mark.asyncio
+async def test_runner_exact_old_fill_cancels_newer_replacement_stop() -> None:
+    from robo_trader.stop_loss_monitor import StopLossOrder, StopStatus
+
+    current = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
+    runner = _runner_for_stop_fill(current)
+    monitor = _build_monitor()
+    replacement = await monitor.add_stop_loss(
+        "AAPL",
+        current,
+        stop_percent=0.05,
+        stop_type=StopType.FIXED,
+    )
+    runner.stop_loss_monitor = monitor
+    old_stop = StopLossOrder(
+        symbol="AAPL",
+        position_qty=10,
+        stop_price=98.0,
+        entry_price=100.0,
+        stop_type=StopType.FIXED,
+        created_at=datetime.now(),
+    )
+
+    await runner._on_stop_loss_executed(
+        old_stop,
+        ExecutionResult(True, "filled", fill_price=97.5),
+    )
+
+    assert "AAPL" not in runner.positions
+    assert "default:AAPL" not in monitor.active_stops
+    assert replacement.status is StopStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_runner_partial_fill_without_replacement_triggers_emergency() -> None:
+    from robo_trader.stop_loss_monitor import StopLossOrder
+
+    current = Position(symbol="AAPL", quantity=20, avg_price=Decimal("100"))
+    runner = _runner_for_stop_fill(current)
+    monitor = _build_monitor()
+    monitor.emergency_shutdown = AsyncMock(return_value=None)
+    runner.stop_loss_monitor = monitor
+    old_stop = StopLossOrder(
+        symbol="AAPL",
+        position_qty=10,
+        stop_price=98.0,
+        entry_price=100.0,
+        stop_type=StopType.FIXED,
+        created_at=datetime.now(),
+    )
+
+    await runner._on_stop_loss_executed(
+        old_stop,
+        ExecutionResult(True, "filled", fill_price=97.5),
+    )
+
+    assert runner.positions["AAPL"].quantity == 10
+    monitor.emergency_shutdown.assert_awaited_once()
+    assert "remaining signed_qty=10" in monitor.emergency_shutdown.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_runner_unsafe_replacement_triggers_emergency_without_partial_mutation() -> None:
+    from robo_trader.stop_loss_monitor import StopLossOrder
+
+    current = Position(symbol="AAPL", quantity=20, avg_price=Decimal("100"))
+    runner = _runner_for_stop_fill(current)
+    monitor = _build_monitor()
+    monitor.emergency_shutdown = AsyncMock(return_value=None)
+    unsafe_replacement = await monitor.add_stop_loss(
+        "AAPL",
+        Position(symbol="AAPL", quantity=-20, avg_price=Decimal("100")),
+        stop_percent=0.05,
+        stop_type=StopType.FIXED,
+    )
+    original_replacement_state = (
+        unsafe_replacement.position_qty,
+        unsafe_replacement.entry_price,
+        unsafe_replacement.stop_price,
+    )
+    runner.stop_loss_monitor = monitor
+    old_stop = StopLossOrder(
+        symbol="AAPL",
+        position_qty=10,
+        stop_price=98.0,
+        entry_price=100.0,
+        stop_type=StopType.FIXED,
+        created_at=datetime.now(),
+    )
+
+    await runner._on_stop_loss_executed(
+        old_stop,
+        ExecutionResult(True, "filled", fill_price=97.5),
+    )
+
+    assert runner.positions["AAPL"].quantity == 10
+    assert (
+        unsafe_replacement.position_qty,
+        unsafe_replacement.entry_price,
+        unsafe_replacement.stop_price,
+    ) == original_replacement_state
+    monitor.emergency_shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "current",
+    [
+        None,
+        Position(symbol="AAPL", quantity=-10, avg_price=Decimal("100")),
+        Position(symbol="AAPL", quantity=5, avg_price=Decimal("100")),
+    ],
+    ids=["absent", "opposite", "too-small"],
+)
+async def test_runner_stop_fill_divergence_preserves_current_state_and_records_trade(
+    current,
+    caplog,
+) -> None:
+    from robo_trader.stop_loss_monitor import StopLossOrder
+
+    runner = _runner_for_stop_fill(current)
+    runner.stop_loss_monitor = SimpleNamespace(
+        emergency_shutdown=AsyncMock(return_value=None),
+    )
+    before = runner.positions.get("AAPL")
+    stop = StopLossOrder(
+        symbol="AAPL",
+        position_qty=10,
+        stop_price=98.0,
+        entry_price=100.0,
+        stop_type=StopType.FIXED,
+        created_at=datetime.now(),
+    )
+    result = ExecutionResult(True, "filled", fill_price=97.5)
+
+    await runner._on_stop_loss_executed(stop, result)
+
+    assert runner.positions.get("AAPL") is before
+    runner.db.record_trade.assert_awaited_once_with("AAPL", "SELL", 10, 97.5, 0)
+    runner.db.update_position.assert_not_awaited()
+    runner.portfolio.update_fill.assert_not_awaited()
+    runner.stop_loss_monitor.emergency_shutdown.assert_awaited_once()
+    assert "event=stop_fill_state_divergence" in caplog.text
 
 
 # ---------------------------------------------------------------------------
