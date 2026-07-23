@@ -64,7 +64,7 @@ def test_docker_workflow_watches_every_image_input() -> None:
     for image_input in (
         "Dockerfile",
         ".dockerignore",
-        "deployment/entrypoint.sh",
+        "deployment/**",
         "requirements*.txt",
         "robo_trader/**",
         "scripts/**",
