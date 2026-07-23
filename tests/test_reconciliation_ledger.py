@@ -94,16 +94,65 @@ def test_reader_connection_authorizer_denies_writes_and_attach(tmp_path):
     ("suffix", "expected"),
     [
         ("-wal", "WAL"),
-        ("-shm", "shared-memory"),
         ("-journal", "rollback journal"),
     ],
 )
-def test_reader_rejects_symlink_and_nonempty_sqlite_sidecars(tmp_path, suffix, expected):
+def test_reader_rejects_nonempty_unapplied_sqlite_sidecars(tmp_path, suffix, expected):
     database = tmp_path / "ledger.db"
     _create_ledger(database)
     Path(f"{database}{suffix}").write_bytes(b"uncommitted")
     with pytest.raises(LedgerSafetyError, match=expected):
         ImmutableLedgerReader(tmp_path, "ledger.db")
+
+
+def test_reader_accepts_regular_nonempty_shm_when_wal_is_empty(tmp_path):
+    database = tmp_path / "ledger.db"
+    _create_ledger(database)
+    Path(f"{database}-wal").write_bytes(b"")
+    Path(f"{database}-shm").write_bytes(bytes(32 * 1024))
+
+    snapshot = ImmutableLedgerReader(tmp_path, "ledger.db").read(["default"])
+
+    assert snapshot.selected_portfolio_ids == ("default",)
+
+
+@pytest.mark.parametrize(
+    ("suffix", "expected"),
+    [
+        ("-wal", "WAL"),
+        ("-shm", "shared-memory"),
+        ("-journal", "rollback journal"),
+    ],
+)
+def test_reader_rejects_symlinked_sqlite_sidecars(tmp_path, suffix, expected):
+    database = tmp_path / "ledger.db"
+    _create_ledger(database)
+    Path(f"{database}{suffix}").symlink_to(database)
+
+    with pytest.raises(LedgerSafetyError, match=expected):
+        ImmutableLedgerReader(tmp_path, "ledger.db")
+
+
+def test_reader_rejects_nonregular_shm_sidecar(tmp_path):
+    database = tmp_path / "ledger.db"
+    _create_ledger(database)
+    Path(f"{database}-shm").mkdir()
+
+    with pytest.raises(LedgerSafetyError, match="shared-memory"):
+        ImmutableLedgerReader(tmp_path, "ledger.db")
+
+
+def test_integrity_guard_rejects_accepted_nonempty_shm_mutation(tmp_path):
+    database = tmp_path / "configured.db"
+    _create_ledger(database)
+    shm = Path(f"{database}-shm")
+    shm.write_bytes(bytes(32 * 1024))
+    paths = protected_evidence_paths(tmp_path, {"RT_DB_PATH": "configured.db"})
+
+    with pytest.raises(IntegrityViolation):
+        with EvidenceIntegrityGuard(paths):
+            ImmutableLedgerReader(tmp_path, "configured.db").read(["default"])
+            shm.write_bytes(b"changed")
 
 
 def test_reader_rejects_symlink_database(tmp_path):

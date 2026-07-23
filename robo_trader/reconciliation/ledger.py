@@ -68,19 +68,27 @@ def resolve_database_path(project_root: Path, database_path: str) -> Path:
         raise LedgerSafetyError("ledger database is missing") from exc
     if not resolved.is_file():
         raise LedgerSafetyError("ledger database is not a regular file")
+    # A regular SQLite -shm file is a fixed-size WAL index and may remain
+    # nonempty after a clean checkpoint. Only a nonempty WAL or rollback
+    # journal represents unapplied state; the outer integrity guard still
+    # rejects any sidecar that changes during collection.
     sidecars = (
-        ("WAL", Path(f"{resolved}-wal")),
-        ("shared-memory sidecar", Path(f"{resolved}-shm")),
-        ("rollback journal", Path(f"{resolved}-journal")),
+        ("WAL", Path(f"{resolved}-wal"), True),
+        ("shared-memory sidecar", Path(f"{resolved}-shm"), False),
+        ("rollback journal", Path(f"{resolved}-journal"), True),
     )
-    for label, sidecar in sidecars:
+    for label, sidecar, must_be_empty in sidecars:
         try:
             metadata = sidecar.lstat()
         except FileNotFoundError:
             continue
         except OSError as exc:
             raise LedgerSafetyError(f"ledger {label} cannot be inspected") from exc
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) or metadata.st_size:
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or (must_be_empty and metadata.st_size)
+        ):
             raise LedgerSafetyError(
                 f"ledger has an ambiguous {label}; immutable reconciliation would be incomplete"
             )
