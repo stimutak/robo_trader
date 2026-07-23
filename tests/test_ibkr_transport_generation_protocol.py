@@ -244,6 +244,43 @@ async def test_malformed_and_duplicate_responses_poison_generation():
     assert duplicate_generation.poisoned_reason == "duplicate response"
 
 
+def test_poisoning_active_generation_clears_all_cached_connection_health_state():
+    client, _, generation = _attach_client(lambda process, request: None)
+    client._connected = True
+    client._connection_identity = ("127.0.0.1", 4002, 7, True)
+    client._connection_start_time = datetime.now(timezone.utc)
+    client._last_activity = datetime.now(timezone.utc)
+
+    client._poison_generation(generation, "simulated transport ambiguity")
+
+    assert client.is_connected is False
+    assert client._connection_identity is None
+    assert client._connection_start_time is None
+    assert client._last_activity is None
+
+
+def test_poisoning_old_generation_cannot_clear_replacement_connection_state():
+    client, _, old_generation = _attach_client(lambda process, request: None, "old")
+    replacement_process = _FakeProcess(lambda process, request: None)
+    replacement_generation = _WorkerGeneration("replacement", replacement_process)
+    client.process = replacement_process
+    client._generation = replacement_generation
+    identity = ("127.0.0.1", 4002, 8, True)
+    started = datetime.now(timezone.utc)
+    activity = datetime.now(timezone.utc)
+    client._connected = True
+    client._connection_identity = identity
+    client._connection_start_time = started
+    client._last_activity = activity
+
+    client._poison_generation(old_generation, "late old-generation failure")
+
+    assert client.is_connected is True
+    assert client._connection_identity == identity
+    assert client._connection_start_time == started
+    assert client._last_activity == activity
+
+
 @pytest.mark.asyncio
 async def test_new_generation_cannot_consume_old_generation_response():
     old_held = {}

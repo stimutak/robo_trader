@@ -508,6 +508,8 @@ class SubprocessIBKRClient:
         if self._generation is generation:
             self._connected = False
             self._connection_identity = None
+            self._connection_start_time = None
+            self._last_activity = None
         logger.error(
             "Poisoning IBKR worker generation",
             generation_id=generation.generation_id,
