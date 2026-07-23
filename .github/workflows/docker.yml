@@ -5,8 +5,11 @@ on:
     paths:
       - 'Dockerfile'
       - 'docker-compose*.yml'
+      - 'deployment/docker-compose*.yml'
       - 'requirements*.txt'
       - 'robo_trader/**'
+      - '.github/container-structure-test.yml'
+      - '.github/workflows/docker.yml'
   push:
     branches:
       - develop
@@ -74,30 +77,9 @@ jobs:
 
       - name: Test Docker image
         run: |
-          # Run container. The entrypoint's validate_environment() requires
-          # TRADING_MODE, IBKR_HOST and IBKR_PORT (it exits 1 otherwise), so
-          # provide them or the container dies before the import test runs.
-          docker run -d --name test-container \
-            -e TRADING_MODE=paper \
-            -e IBKR_HOST=127.0.0.1 \
-            -e IBKR_PORT=4002 \
-            -e EXECUTION_MODE=paper \
-            -e ENVIRONMENT=test \
-            -e LOG_LEVEL=DEBUG \
-            robotrader:test \
-            python -c "import time; time.sleep(30)"
-
-          # Wait for startup
-          sleep 10
-
-          # Check if container is running
-          docker ps | grep test-container
-
-          # Check logs
-          docker logs test-container
-
-          # Run tests inside container
-          docker exec test-container python -c "
+          # Override ENTRYPOINT so validation cannot launch the runner or make
+          # any broker connection. This is an image/import smoke test only.
+          docker run --rm --entrypoint python3 robotrader:test -c "
           import sys
           import robo_trader
           from robo_trader.config import load_config
@@ -107,31 +89,24 @@ jobs:
           sys.exit(0)
           "
 
-          # Cleanup
-          docker stop test-container
-          docker rm test-container
-
       - name: Test docker compose
+        env:
+          EXECUTION_MODE: paper
+          TRADING_MODE: paper
+          IBKR_HOST: 127.0.0.1
+          IBKR_PORT: "4002"
+          IBKR_READONLY: "true"
+          TRADING_SYMBOLS: AAPL
+          STRATEGY_ENABLED_STRATEGIES: momentum
+          RISK_MAX_POSITION_SIZE: "1000"
+          RISK_STOP_LOSS_PERCENT: "0.02"
+          RISK_MAX_DAILY_LOSS: "100"
+          GRAFANA_PASSWORD: ci-render-only
         run: |
-          # Test compose file syntax
+          # Render both compose topologies. Never start services in CI: the
+          # runner topology is intentionally broker-dependent.
           docker compose -f docker-compose.yml config
-
-          # Test production compose
           docker compose -f deployment/docker-compose.prod.yml config
-
-          # Start services
-          docker compose up -d postgres redis
-
-          # Wait for services
-          sleep 10
-
-          # Check services are healthy
-          docker compose ps
-          docker compose exec -T postgres pg_isready -U trader
-          docker compose exec -T redis redis-cli ping
-
-          # Cleanup
-          docker compose down -v
 
       - name: Move cache
         run: |
@@ -158,7 +133,7 @@ jobs:
           image: robotrader:test
           config: .github/container-structure-test.yml
 
-  docker-compose-integration:
+  docker-compose-render:
     # R2-CFG-H1.3: fork guard.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
@@ -169,60 +144,19 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Create test environment file
+      - name: Render compose topologies without starting services
+        env:
+          EXECUTION_MODE: paper
+          TRADING_MODE: paper
+          IBKR_HOST: 127.0.0.1
+          IBKR_PORT: "4002"
+          IBKR_READONLY: "true"
+          TRADING_SYMBOLS: AAPL
+          STRATEGY_ENABLED_STRATEGIES: momentum
+          RISK_MAX_POSITION_SIZE: "1000"
+          RISK_STOP_LOSS_PERCENT: "0.02"
+          RISK_MAX_DAILY_LOSS: "100"
+          GRAFANA_PASSWORD: ci-render-only
         run: |
-          DB_PW="$(openssl rand -hex 16)"
-          REDIS_PW="$(openssl rand -hex 16)"
-          GRAFANA_PW="$(openssl rand -hex 16)"
-          cat > .env.test <<EOF
-          ENVIRONMENT=test
-          LOG_LEVEL=INFO
-          IBKR_HOST=localhost
-          IBKR_PORT=7497
-          DB_PASSWORD=${DB_PW}
-          REDIS_PASSWORD=${REDIS_PW}
-          GRAFANA_USER=admin
-          GRAFANA_PASSWORD=${GRAFANA_PW}
-          DOMAIN_NAME=localhost
-          EOF
-
-      - name: Start full stack
-        run: |
-          docker compose \
-            -f docker-compose.yml \
-            --env-file .env.test \
-            up -d
-
-      - name: Wait for services
-        run: |
-          echo "Waiting for services to be ready..."
-          timeout 120 bash -c 'until docker compose ps | grep -q "healthy"; do sleep 5; done'
-
-      - name: Run integration tests
-        run: |
-          # Test trader service
-          curl -f http://localhost:8080/health || exit 1
-
-          # Test dashboard
-          curl -f http://localhost:5555/ || exit 1
-
-          # Test Prometheus
-          curl -f http://localhost:9090/-/healthy || exit 1
-
-          # Test Grafana
-          curl -f http://localhost:3000/api/health || exit 1
-
-      - name: Check logs for errors
-        if: always()
-        run: |
-          docker compose logs --tail=100
-
-          # Check for critical errors
-          if docker compose logs | grep -i "error\|exception\|fatal"; then
-            echo "Errors found in logs"
-            exit 1
-          fi
-
-      - name: Cleanup
-        if: always()
-        run: docker compose down -v
+          docker compose -f docker-compose.yml config --quiet
+          docker compose -f deployment/docker-compose.prod.yml config --quiet

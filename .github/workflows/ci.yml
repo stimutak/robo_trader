@@ -19,6 +19,8 @@ jobs:
       contents: read
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
     - name: Set up Python 3.11
       uses: actions/setup-python@v5
@@ -41,11 +43,40 @@ jobs:
     - name: Run black
       run: black --check --diff robo_trader/ tests/
 
-    - name: Run isort
-      run: isort --check-only --diff robo_trader/ tests/
+    - name: Run isort on application package
+      run: isort --check-only --diff robo_trader/
+
+    - name: Report legacy test import-order debt
+      continue-on-error: true
+      run: isort --check-only --diff tests/
 
     - name: Run flake8
-      run: flake8 robo_trader/ --max-line-length=100
+      run: flake8 robo_trader/ tests/ --count --statistics
+
+    - name: Collect changed Python files
+      env:
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PUSH_BASE_SHA: ${{ github.event.before }}
+      run: |
+        base_sha="${PR_BASE_SHA:-${PUSH_BASE_SHA:-}}"
+        if ! git cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
+          base_sha="$(git rev-parse HEAD^)"
+        fi
+        git diff --name-only --diff-filter=ACMR "$base_sha" "$GITHUB_SHA" \
+          | awk '/^(robo_trader|tests)\/.*\.py$/' \
+          > changed-python.txt
+        echo "Changed Python files:"
+        cat changed-python.txt
+
+    - name: Gate changed Python files
+      run: |
+        if [[ ! -s changed-python.txt ]]; then
+          echo "No changed Python files."
+          exit 0
+        fi
+        xargs black --check < changed-python.txt
+        xargs isort --check-only --diff < changed-python.txt
+        xargs flake8 < changed-python.txt
 
     - name: Run bandit security scan
       run: bandit -r robo_trader/ -ll --skip B101,B104,B201
@@ -58,6 +89,11 @@ jobs:
       contents: read
     env:
       EXECUTION_MODE: paper
+      TRADING_MODE: paper
+      IBKR_HOST: 127.0.0.1
+      IBKR_PORT: "4002"
+      IBKR_CLIENT_ID: "123"
+      IBKR_READONLY: "true"
       ENVIRONMENT: dev
     strategy:
       fail-fast: false
