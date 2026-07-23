@@ -242,13 +242,10 @@ def test_symlinked_env_is_rejected_before_parsing_or_provider_construction(
     assert payload["authorizes_startup"] is False
 
 
-def test_connection_gate_blocks_unsafe_port_readonly_and_zero_client_before_provider(
-    tmp_path, capsys
-):
+def test_connection_gate_blocks_unsafe_port_and_readonly_before_provider(tmp_path, capsys):
     for key, value in (
         ("IBKR_PORT", "4001"),
         ("IBKR_READONLY", "false"),
-        ("IBKR_CLIENT_ID", "0"),
     ):
         project = tmp_path / key.lower()
         _, env = _project(project)

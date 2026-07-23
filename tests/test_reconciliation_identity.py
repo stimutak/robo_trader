@@ -57,7 +57,6 @@ def test_reconciliation_client_id_is_dedicated_required_configuration(tmp_path, 
         ({"IBKR_RECONCILIATION_CLIENT_ID": "0"}, "between 1 and 999"),
         ({"IBKR_RECONCILIATION_CLIENT_ID": "7"}, "distinct"),
         ({"IBKR_RECONCILIATION_CLIENT_ID": "not-an-integer"}, "must be an integer"),
-        ({"IBKR_CLIENT_ID": "0"}, "trading broker client ID must be between"),
     ],
 )
 def test_reconciliation_client_id_must_be_positive_and_distinct(
@@ -68,3 +67,15 @@ def test_reconciliation_client_id_must_be_positive_and_distinct(
 
     with pytest.raises(RuntimeSafetyError, match=message):
         validate_runtime_safety(tmp_path, _environment(**overrides))
+
+
+def test_reconciliation_allows_existing_zero_trading_client_id(tmp_path, runtime_contract):
+    del runtime_contract
+    _project(tmp_path)
+
+    context = validate_runtime_safety(
+        tmp_path,
+        _environment(IBKR_CLIENT_ID="0"),
+    )
+
+    assert context.diagnostic_connection.client_id == 997

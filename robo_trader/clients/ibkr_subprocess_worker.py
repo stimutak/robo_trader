@@ -348,10 +348,10 @@ async def handle_connect(params: dict) -> dict:
             "error": "Diagnostic worker requires readonly exactly true",
             "error_type": "ValueError",
         }
-    if isinstance(client_id, bool) or not isinstance(client_id, int) or client_id <= 0:
+    if isinstance(client_id, bool) or not isinstance(client_id, int) or client_id < 0:
         return {
             "status": "error",
-            "error": "Diagnostic worker requires a positive client ID",
+            "error": "Diagnostic worker requires a non-negative client ID",
             "error_type": "ValueError",
         }
     if ib is not None and ib.isConnected():

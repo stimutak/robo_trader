@@ -451,7 +451,6 @@ async def test_worker_command_routes_atomic_snapshot(fake_ib):
     [
         {"port": 4001, "readonly": True, "client_id": 7},
         {"port": 4002, "readonly": 1, "client_id": 7},
-        {"port": 4002, "readonly": True, "client_id": 0},
         {"port": 4002, "readonly": True, "client_id": True},
     ],
 )
@@ -464,6 +463,44 @@ async def test_worker_diagnostic_connect_rejects_before_ib_client_creation(monke
 
     assert result["status"] == "error"
     factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_worker_accepts_existing_zero_client_id(monkeypatch):
+    observed = {}
+
+    class ConnectIB:
+        def __init__(self):
+            self.client = SimpleNamespace(serverVersion=lambda: 180)
+
+        async def connectAsync(self, **kwargs):
+            observed.update(kwargs)
+
+        def isConnected(self):
+            return True
+
+        def managedAccounts(self):
+            return [ACCOUNT]
+
+    monkeypatch.setattr(worker, "ib", None)
+    monkeypatch.setattr(worker, "worker_connection_identity", None)
+    monkeypatch.setattr(worker, "gateway_api_down", False)
+    monkeypatch.setattr(worker, "IB", ConnectIB)
+    monkeypatch.setattr(worker.asyncio, "sleep", AsyncMock())
+
+    response = await worker.handle_connect(
+        {
+            "host": "127.0.0.1",
+            "port": 4002,
+            "client_id": 0,
+            "readonly": True,
+            "timeout": 1.0,
+        }
+    )
+
+    assert response["status"] == "success"
+    assert observed["clientId"] == 0
+    assert response["data"]["client_id"] == 0
 
 
 @pytest.mark.asyncio

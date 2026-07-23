@@ -222,8 +222,8 @@ def validate_runtime_safety(
         trading_client_id = int(raw_trading_client_id)
     except ValueError as exc:
         raise RuntimeSafetyError("trading broker client ID must be an integer") from exc
-    if not 1 <= trading_client_id <= 999:
-        raise RuntimeSafetyError("trading broker client ID must be between 1 and 999")
+    if not 0 <= trading_client_id <= 999:
+        raise RuntimeSafetyError("trading broker client ID must be between 0 and 999")
     if client_id == trading_client_id:
         raise RuntimeSafetyError(
             "diagnostic broker client ID must be distinct from the trading client ID"
