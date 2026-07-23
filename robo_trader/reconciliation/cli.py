@@ -108,9 +108,7 @@ async def run_reconciliation(
             finally:
                 if provider is not None:
                     try:
-                        cleanup_cancelled = await await_cleanup_required(
-                            asyncio.wait_for(provider.close(), timeout=10.0)
-                        )
+                        cleanup_cancelled = await await_cleanup_required(provider.close())
                     except Exception as exc:
                         raise BrokerEvidenceError(
                             "broker diagnostic transport cleanup failed"

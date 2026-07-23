@@ -490,6 +490,32 @@ async def test_provider_close_is_shielded_from_cancellation(tmp_path):
     assert provider.closed is True
 
 
+@pytest.mark.asyncio
+async def test_provider_close_has_no_outer_timeout(tmp_path, monkeypatch):
+    """The production transport owns its bounded, multi-stage shutdown."""
+    _, env = _project(tmp_path)
+    observed_timeouts = []
+    real_wait_for = asyncio.wait_for
+
+    async def recording_wait_for(awaitable, *, timeout):
+        observed_timeouts.append(timeout)
+        return await real_wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(cli_module.asyncio, "wait_for", recording_wait_for)
+    provider = FakeProvider(_broker_snapshot())
+
+    await run_reconciliation(
+        ["default"],
+        project_root=tmp_path,
+        process_environ=env,
+        provider_factory=lambda runtime: provider,
+        now=NOW,
+    )
+
+    assert observed_timeouts == [60.0]
+    assert provider.closed is True
+
+
 def test_provider_error_is_redacted_and_cleanup_runs(tmp_path, capsys):
     _, env = _project(tmp_path)
     provider = FakeProvider(error=RuntimeError(f"credential {RAW_ACCOUNT} secret"))
