@@ -24,8 +24,8 @@ from .errors import (
     ReconciliationError,
     RuntimeSafetyError,
 )
-from .identity import resolve_environment, validate_runtime_safety
 from .ibkr_adapter import diagnostic_provider_factory
+from .identity import resolve_environment, validate_runtime_safety
 from .integrity import EvidenceIntegrityGuard, protected_evidence_paths
 from .ledger import ImmutableLedgerReader, validate_portfolio_ids
 from .models import ReconciliationReport

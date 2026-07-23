@@ -10,6 +10,7 @@ from robo_trader.clients import ibkr_subprocess_worker as worker
 from robo_trader.clients import subprocess_ibkr_client as client_module
 from robo_trader.clients.subprocess_ibkr_client import (
     BrokerSnapshotAccountMismatchError,
+    IBKRTimeoutError,
     IBKRTransportPoisonedError,
     SubprocessCrashError,
     SubprocessIBKRClient,
@@ -234,9 +235,9 @@ async def test_worker_snapshot_rechecks_account_and_suppresses_sensitive_errors(
     result = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
 
     assert result == {
-        "status": "error",
+        "status": worker.PROTOCOL_ERROR_STATUS,
         "error": "Broker snapshot collection failed",
-        "error_type": "ValueError",
+        "error_type": worker.PROTOCOL_ERROR_TYPE,
     }
     assert ACCOUNT not in result["error"]
     assert "DU_WRONG_ACCOUNT" not in result["error"]
@@ -247,7 +248,7 @@ async def test_worker_wrong_expected_account_performs_zero_data_reads(fake_ib):
     result = await worker.handle_get_broker_snapshot({"expected_account": "DU_WRONG_ACCOUNT"})
 
     assert result["status"] == "error"
-    assert result["error_type"] == "ValueError"
+    assert result["error_type"] == "BrokerSnapshotAccountMismatchError"
     assert not any(
         call.startswith("req") or call in {"accountValues", "qualifyContractsAsync"}
         for call in fake_ib.calls
@@ -284,8 +285,8 @@ async def test_worker_rejects_mid_collection_position_mutation(fake_ib, monkeypa
     monkeypatch.setattr(fake_ib, "reqPositionsAsync", changing_positions)
     result = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
 
-    assert result["status"] == "error"
-    assert result["error_type"] == "ValueError"
+    assert result["status"] == worker.PROTOCOL_ERROR_STATUS
+    assert result["error_type"] == worker.PROTOCOL_ERROR_TYPE
     assert reads == 2
 
 
@@ -342,8 +343,8 @@ async def test_worker_rejects_any_emitted_order_state_mutation(fake_ib, monkeypa
 
     result = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
 
-    assert result["status"] == "error"
-    assert result["error_type"] == "ValueError"
+    assert result["status"] == worker.PROTOCOL_ERROR_STATUS
+    assert result["error_type"] == worker.PROTOCOL_ERROR_TYPE
     assert reads == 2
 
 
@@ -358,8 +359,8 @@ async def test_worker_rejects_cross_account_execution(fake_ib, monkeypatch):
 
     monkeypatch.setattr(fake_ib, "reqExecutionsAsync", wrong_execution)
     result = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
-    assert result["status"] == "error"
-    assert result["error_type"] == "ValueError"
+    assert result["status"] == worker.PROTOCOL_ERROR_STATUS
+    assert result["error_type"] == worker.PROTOCOL_ERROR_TYPE
     assert "DU_WRONG_ACCOUNT" not in result["error"]
 
 
@@ -496,6 +497,116 @@ def _connected_client(monkeypatch, payload):
     execute = AsyncMock(return_value=payload)
     monkeypatch.setattr(client, "_execute_command_unlocked", execute)
     return client, execute
+
+
+def _transport_response_client(response, *, swap_generation=False):
+    """Route one synthetic worker result through the real parent classifier."""
+    client = SubprocessIBKRClient()
+    process = SimpleNamespace(poll=lambda: None)
+    generation = _WorkerGeneration(
+        generation_id="snapshot-transport-generation",
+        process=process,
+    )
+
+    class ImmediateResponseStdin:
+        def write(self, _value):
+            if swap_generation:
+                client._generation = SimpleNamespace(
+                    generation_id="replacement-generation",
+                )
+            with generation.state_lock:
+                pending = next(iter(generation.pending.values()))
+            pending.future.set_result(dict(response))
+
+        def flush(self):
+            return None
+
+    process.stdin = ImmediateResponseStdin()
+    client.process = process
+    client._generation = generation
+    return client, generation
+
+
+@pytest.mark.asyncio
+async def test_worker_snapshot_timeout_preserves_parent_timeout_poison(fake_ib, monkeypatch):
+    async def timeout_positions():
+        raise TimeoutError("snapshot timeout with sensitive diagnostic context")
+
+    monkeypatch.setattr(fake_ib, "reqPositionsAsync", timeout_positions)
+    worker_response = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert worker_response == {
+        "status": "error",
+        "error": "Broker snapshot collection timed out",
+        "error_type": "TimeoutError",
+    }
+    assert ACCOUNT not in worker_response["error"]
+
+    client, generation = _transport_response_client(worker_response)
+    with pytest.raises(IBKRTimeoutError, match="Broker snapshot collection timed out"):
+        await client._execute_command_unlocked({"command": "get_broker_snapshot"})
+
+    assert generation.poisoned_reason is not None
+    assert "worker-reported broker timeout" in generation.poisoned_reason
+    assert "get_broker_snapshot" in generation.poisoned_reason
+
+
+@pytest.mark.asyncio
+async def test_worker_snapshot_protocol_error_poisons_exact_parent_generation(fake_ib, monkeypatch):
+    original = fake_ib.reqPositionsAsync
+    reads = 0
+
+    async def changing_positions():
+        nonlocal reads
+        reads += 1
+        positions = await original()
+        if reads == 2:
+            positions[0].position = "11"
+        return positions
+
+    monkeypatch.setattr(fake_ib, "reqPositionsAsync", changing_positions)
+    worker_response = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert worker_response["status"] == worker.PROTOCOL_ERROR_STATUS
+    assert worker_response["error_type"] == worker.PROTOCOL_ERROR_TYPE
+
+    client, original_generation = _transport_response_client(
+        worker_response,
+        swap_generation=True,
+    )
+    with pytest.raises(IBKRTransportPoisonedError, match="Unknown worker response status"):
+        await client._execute_command_unlocked({"command": "get_broker_snapshot"})
+
+    assert original_generation.poisoned_reason == "unknown response status"
+    assert client._generation.generation_id == "replacement-generation"
+
+
+@pytest.mark.asyncio
+async def test_worker_snapshot_account_mismatch_is_safely_classified_and_poisoned(
+    fake_ib,
+):
+    worker_response = await worker.handle_get_broker_snapshot(
+        {"expected_account": "DU_EXPECTED_SECRET"}
+    )
+
+    assert worker_response == {
+        "status": "error",
+        "error": "Broker snapshot account mismatch",
+        "error_type": "BrokerSnapshotAccountMismatchError",
+    }
+    assert ACCOUNT not in worker_response["error"]
+    assert "DU_EXPECTED_SECRET" not in worker_response["error"]
+
+    client, generation = _transport_response_client(worker_response)
+    with pytest.raises(
+        BrokerSnapshotAccountMismatchError,
+        match="Broker snapshot account mismatch",
+    ) as exc_info:
+        await client._execute_command_unlocked({"command": "get_broker_snapshot"})
+
+    assert ACCOUNT not in str(exc_info.value)
+    assert "DU_EXPECTED_SECRET" not in str(exc_info.value)
+    assert generation.poisoned_reason == ("worker-reported broker snapshot account mismatch")
 
 
 @pytest.mark.asyncio
