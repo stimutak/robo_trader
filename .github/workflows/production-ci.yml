@@ -173,7 +173,7 @@ jobs:
           base_sha="$(git rev-parse HEAD^)"
         fi
         git diff --name-only --diff-filter=ACMR "$base_sha" "$GITHUB_SHA" \
-          | awk '/^(robo_trader|tests)\/.*\.py$/' \
+          | awk '/\.py$/' \
           > changed-python.txt
         echo "Changed Python files:"
         cat changed-python.txt
@@ -207,10 +207,16 @@ jobs:
     
     - name: Report dependency vulnerabilities
       # The former command scanned only the quality-tool environment. Scan the
-      # runtime requirements and keep this advisory until a reviewed exception
-      # baseline allows an actionable blocking supply-chain gate.
+      # base and production runtime requirements and keep this advisory until a
+      # reviewed exception baseline allows an actionable blocking supply-chain
+      # gate.
       continue-on-error: true
-      run: safety check -r requirements.txt --json
+      run: |
+        status=0
+        for requirements_file in requirements.txt requirements-prod.txt; do
+          safety check -r "$requirements_file" --json || status=$?
+        done
+        exit "$status"
 
   # Docker build and scan
   docker-build:

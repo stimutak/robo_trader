@@ -128,10 +128,15 @@ jobs:
           
       - name: Run security scan
         # The inherited gate scanned only the freshly installed `safety`
-        # package, not project dependencies. Scan the tracked runtime inputs
+        # package, not project dependencies. Scan both tracked runtime inputs
         # and report the result until a reviewed vulnerability baseline exists.
         continue-on-error: true
-        run: safety check -r requirements.txt --json
+        run: |
+          status=0
+          for requirements_file in requirements.txt requirements-prod.txt; do
+            safety check -r "$requirements_file" --json || status=$?
+          done
+          exit "$status"
           
       - name: Run Bandit security linter
         run: |

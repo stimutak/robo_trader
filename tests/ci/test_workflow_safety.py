@@ -32,6 +32,7 @@ def test_primary_ci_reports_baseline_isort_debt_and_gates_changed_files() -> Non
     assert "Report legacy test import-order debt" in workflow
     assert "continue-on-error: true" in workflow
     assert "Gate changed Python files" in workflow
+    assert "awk '/\\.py$/'" in workflow
     assert "xargs isort --check-only --diff" in workflow
 
 
@@ -41,7 +42,26 @@ def test_mypy_and_supply_chain_debt_are_explicitly_advisory() -> None:
     assert "Report type debt in changed application files" in workflow
     assert "Report dependency vulnerabilities" in workflow
     assert workflow.count("continue-on-error: true") >= 3
-    assert "safety check -r requirements.txt --json" in workflow
+    assert "requirements.txt requirements-prod.txt" in workflow
+    assert 'safety check -r "$requirements_file" --json' in workflow
+
+
+def test_docker_workflow_watches_every_image_input() -> None:
+    workflow = _workflow("docker.yml")
+
+    for image_input in (
+        "Dockerfile",
+        ".dockerignore",
+        "deployment/entrypoint.sh",
+        "requirements*.txt",
+        "robo_trader/**",
+        "scripts/**",
+        "app.py",
+        "START_TRADER.sh",
+        "robotrader_favicon.ico",
+        "config/ibc/config.ini.template",
+    ):
+        assert f"- '{image_input}'" in workflow
 
 
 def test_container_structure_policy_exists() -> None:

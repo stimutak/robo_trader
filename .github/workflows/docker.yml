@@ -4,10 +4,17 @@ on:
   pull_request:
     paths:
       - 'Dockerfile'
+      - '.dockerignore'
       - 'docker-compose*.yml'
       - 'deployment/docker-compose*.yml'
+      - 'deployment/entrypoint.sh'
       - 'requirements*.txt'
       - 'robo_trader/**'
+      - 'scripts/**'
+      - 'app.py'
+      - 'START_TRADER.sh'
+      - 'robotrader_favicon.ico'
+      - 'config/ibc/config.ini.template'
       - '.github/container-structure-test.yml'
       - '.github/workflows/docker.yml'
   push:

@@ -63,7 +63,7 @@ jobs:
           base_sha="$(git rev-parse HEAD^)"
         fi
         git diff --name-only --diff-filter=ACMR "$base_sha" "$GITHUB_SHA" \
-          | awk '/^(robo_trader|tests)\/.*\.py$/' \
+          | awk '/\.py$/' \
           > changed-python.txt
         echo "Changed Python files:"
         cat changed-python.txt
