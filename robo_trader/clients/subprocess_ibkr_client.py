@@ -194,60 +194,147 @@ class SubprocessIBKRClient:
         self.process: Optional[subprocess.Popen] = None
         self.lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
+        self._connection_state_lock = threading.Lock()
         self._connected = False
         self._connection_identity: Optional[tuple[str, int, int, bool]] = None
+        self._connection_generation_id: Optional[str] = None
         self._generation: Optional[_WorkerGeneration] = None
         self._reader_thread: Optional[threading.Thread] = None
         self._stderr_reader_thread: Optional[threading.Thread] = None
         self._last_activity: Optional[datetime] = None
         self._connection_start_time: Optional[datetime] = None
         self._gateway_api_down_detail: Optional[str] = None
+        self._gateway_failure_generation_id: Optional[str] = None
         self._debug_log_file = None  # For capturing worker stderr to file
         self._debug_log_path: Optional[str] = None  # D-3: randomized tempfile path
         self._zombies_detected_before_connect = (
             False  # Track if zombies were present before connect
         )
 
-    def _clear_cached_connection_state(self) -> None:
-        """Forget broker-session state after an authoritative negative probe."""
+    def _clear_connection_tuple_locked(self) -> None:
+        """Clear connected-session fields while holding the state lock."""
         self._connected = False
         self._connection_identity = None
+        self._connection_generation_id = None
         self._connection_start_time = None
+        self._last_activity = None
 
-    def _accept_ping_response(self, data: dict) -> bool:
+    def _clear_cached_connection_state(
+        self,
+        *,
+        generation: Optional[_WorkerGeneration] = None,
+        clear_gateway_detail: bool = True,
+    ) -> bool:
+        """Atomically forget state, optionally only for its bound generation."""
+        with self._connection_state_lock:
+            if generation is not None:
+                generation_id = generation.generation_id
+                if self._connection_generation_id not in (None, generation_id) or (
+                    self._connection_generation_id is None and self._generation is not generation
+                ):
+                    return False
+            else:
+                generation_id = None
+
+            self._clear_connection_tuple_locked()
+            if clear_gateway_detail and (
+                generation is None or self._gateway_failure_generation_id in (None, generation_id)
+            ):
+                self._gateway_api_down_detail = None
+                self._gateway_failure_generation_id = None
+            return True
+
+    def _connection_state_snapshot(
+        self,
+    ) -> tuple[
+        bool,
+        Optional[tuple[str, int, int, bool]],
+        Optional[str],
+        Optional[datetime],
+        Optional[datetime],
+        Optional[str],
+    ]:
+        """Return one internally consistent cached-state snapshot."""
+        with self._connection_state_lock:
+            return (
+                self._connected,
+                self._connection_identity,
+                self._connection_generation_id,
+                self._connection_start_time,
+                self._last_activity,
+                self._gateway_api_down_detail,
+            )
+
+    def _record_gateway_failure(
+        self,
+        generation: _WorkerGeneration,
+        detail: str,
+    ) -> bool:
+        """Bind a Gateway-down diagnosis to the exact responding generation."""
+        with generation.state_lock:
+            if generation.poisoned_reason is not None:
+                return False
+            with self._connection_state_lock:
+                if self._generation is not generation or self._connection_generation_id not in (
+                    None,
+                    generation.generation_id,
+                ):
+                    return False
+                self._clear_connection_tuple_locked()
+                self._gateway_api_down_detail = detail
+                self._gateway_failure_generation_id = generation.generation_id
+                return True
+
+    def _accept_ping_response(
+        self,
+        data: dict,
+        generation: _WorkerGeneration,
+    ) -> bool:
         """Update cached state from a lifecycle-serialized worker ping."""
-        if data.get("gateway_api_down"):
-            detail = data.get("detail") or "Gateway API layer reported down by worker ping"
-            self._gateway_api_down_detail = detail
-            self._clear_cached_connection_state()
-            logger.error("Worker ping reports Gateway API down", detail=detail)
-            return False
+        with generation.state_lock:
+            if generation.poisoned_reason is not None:
+                self._clear_cached_connection_state(generation=generation)
+                return False
+            with self._connection_state_lock:
+                # A stale response must never mutate replacement state.
+                if (
+                    self._generation is not generation
+                    or self._connection_generation_id != generation.generation_id
+                ):
+                    return False
 
-        # This response proves the previous Gateway-down diagnosis is no
-        # longer current, even if the broker session itself remains down.
-        self._gateway_api_down_detail = None
-        if data.get("pong") is not True or data.get("connected") is not True:
-            self._clear_cached_connection_state()
-            logger.warning(
-                "Worker is responsive but broker session is disconnected",
-                pong=data.get("pong"),
-                connected=data.get("connected"),
-            )
-            return False
+                if data.get("gateway_api_down"):
+                    detail = data.get("detail") or "Gateway API layer reported down by worker ping"
+                    self._clear_connection_tuple_locked()
+                    self._gateway_api_down_detail = detail
+                    self._gateway_failure_generation_id = generation.generation_id
+                    logger.error("Worker ping reports Gateway API down", detail=detail)
+                    return False
 
-        # A ping proves liveness, not which validated account/host/port owns
-        # the session. Never reconstruct authorization from pong alone.
-        if not self._connected or self._connection_identity is None:
-            self._clear_cached_connection_state()
-            logger.warning(
-                "Worker reports a broker session without validated connection identity; "
-                "explicit reconnect required"
-            )
-            return False
+                if data.get("pong") is not True or data.get("connected") is not True:
+                    self._clear_connection_tuple_locked()
+                    self._gateway_api_down_detail = None
+                    self._gateway_failure_generation_id = None
+                    logger.warning(
+                        "Worker is responsive but broker session is disconnected",
+                        pong=data.get("pong"),
+                        connected=data.get("connected"),
+                    )
+                    return False
 
-        self._connected = True
-        self._last_activity = datetime.now()
-        return True
+                if self._connection_identity is None:
+                    self._clear_connection_tuple_locked()
+                    logger.warning(
+                        "Worker reports a broker session without validated "
+                        "connection identity; explicit reconnect required"
+                    )
+                    return False
+
+                self._connected = True
+                self._last_activity = datetime.now()
+                self._gateway_api_down_detail = None
+                self._gateway_failure_generation_id = None
+                return True
 
     async def start(self) -> None:
         """Serialize worker creation against commands and shutdown."""
@@ -256,7 +343,12 @@ class SubprocessIBKRClient:
 
     async def _start_unlocked(self) -> None:
         """Start the subprocess worker with threading-based I/O."""
-        if self._generation and self._generation.poisoned_reason:
+        current_generation = self._generation
+        current_poison = None
+        if current_generation:
+            with current_generation.state_lock:
+                current_poison = current_generation.poisoned_reason
+        if current_poison:
             await self._stop_unlocked()
         if self.process and self.process.poll() is None:
             logger.warning("Subprocess already running")
@@ -404,7 +496,15 @@ class SubprocessIBKRClient:
                 env=worker_env,
             )
             generation = _WorkerGeneration(generation_id, self.process)
-            self._generation = generation
+            with self._connection_state_lock:
+                # Installing a worker is an authoritative disconnected state.
+                # Synchronizing the pointer swap with cached state prevents a
+                # delayed poison from the previous worker from clearing state
+                # subsequently bound to this generation.
+                self._clear_connection_tuple_locked()
+                self._gateway_api_down_detail = None
+                self._gateway_failure_generation_id = None
+                self._generation = generation
 
             logger.info(
                 "IBKR subprocess worker started",
@@ -472,8 +572,16 @@ class SubprocessIBKRClient:
                 for thread in (generation.stdout_thread, generation.stderr_thread):
                     if thread and thread.is_alive():
                         thread.join(timeout=1.0)
-            if self._generation is generation:
-                self._generation = None
+            with self._connection_state_lock:
+                if generation is not None and self._generation is generation:
+                    self._generation = None
+                    self._clear_connection_tuple_locked()
+                    if self._gateway_failure_generation_id in (
+                        None,
+                        generation.generation_id,
+                    ):
+                        self._gateway_api_down_detail = None
+                        self._gateway_failure_generation_id = None
             if self.process is process:
                 self.process = None
             self._debug_log_file = None
@@ -487,6 +595,11 @@ class SubprocessIBKRClient:
             generation.poisoned_reason = reason
             pending = list(generation.pending.values())
             generation.pending.clear()
+            # Poisoning is an authoritative fail-closed transition. Clear the
+            # generation-bound session state before exposing the poison or
+            # notifying callbacks, using the global lock order
+            # generation.state_lock -> _connection_state_lock.
+            self._clear_cached_connection_state(generation=generation)
 
         error = IBKRTransportPoisonedError(f"IBKR worker generation poisoned: {reason}")
         for request in pending:
@@ -505,11 +618,6 @@ class SubprocessIBKRClient:
                 # still continue and reap the ambiguous worker generation.
                 pass
 
-        if self._generation is generation:
-            self._connected = False
-            self._connection_identity = None
-            self._connection_start_time = None
-            self._last_activity = None
         logger.error(
             "Poisoning IBKR worker generation",
             generation_id=generation.generation_id,
@@ -674,18 +782,22 @@ class SubprocessIBKRClient:
         generation = self._generation
         process = generation.process if generation else self.process
         if not process:
+            self._clear_cached_connection_state(generation=generation)
             return
 
         logger.info("Stopping IBKR subprocess worker", pid=process.pid)
 
         try:
-            if self._connected:
+            connected, _, bound_generation_id, _, _, _ = self._connection_state_snapshot()
+            if connected and (
+                generation is None or bound_generation_id == generation.generation_id
+            ):
                 logger.debug("Sending disconnect command to worker")
                 await self._execute_command_unlocked({"command": "disconnect"}, timeout=5.0)
         except Exception as e:
             logger.warning("Disconnect command failed during shutdown", error=str(e))
         finally:
-            self._connected = False
+            self._clear_cached_connection_state(generation=generation)
 
         # Signal reader threads to stop
         if generation:
@@ -749,10 +861,16 @@ class SubprocessIBKRClient:
 
         if self.process is process:
             self.process = None
-        if self._generation is generation:
-            self._generation = None
-        self._connected = False
-        self._connection_identity = None
+        with self._connection_state_lock:
+            if self._generation is generation:
+                self._generation = None
+                self._clear_connection_tuple_locked()
+                if generation is None or self._gateway_failure_generation_id in (
+                    None,
+                    generation.generation_id,
+                ):
+                    self._gateway_api_down_detail = None
+                    self._gateway_failure_generation_id = None
 
         # Ensure debug log file is closed (belt-and-suspenders cleanup)
         debug_log_file = generation.debug_log_file if generation else self._debug_log_file
@@ -899,7 +1017,8 @@ class SubprocessIBKRClient:
 
                 if requires_restart or error_type == "GatewayRequiresRestartError":
                     message = detail or error_msg
-                    self._gateway_api_down_detail = message or "Gateway API layer reported down"
+                    gateway_detail = message or "Gateway API layer reported down"
+                    self._record_gateway_failure(generation, gateway_detail)
                     raise GatewayRequiresRestartError(message)
                 if error_type in {"ConnectionError", "NotConnectedError"}:
                     raise IBKRDisconnectedError(error_msg)
@@ -986,18 +1105,20 @@ class SubprocessIBKRClient:
 
             async with self._lifecycle_lock:
                 generation = self._generation
-                if self._connected:
-                    if not (
-                        generation
-                        and generation.poisoned_reason is None
-                        and generation.process.poll() is None
-                    ):
+                if generation is None:
+                    raise SubprocessCrashError("Subprocess generation is unavailable")
+                connected_state, _, _, _, _, _ = self._connection_state_snapshot()
+                if connected_state:
+                    with generation.state_lock:
+                        poison = generation.poisoned_reason
+                    if poison is not None or generation.process.poll() is not None:
                         raise SubprocessCrashError("Connected worker generation is not healthy")
                     ping_data = await self._execute_command_unlocked(
                         {"command": "ping"}, timeout=5.0
                     )
-                    if self._accept_ping_response(ping_data):
-                        if self._connection_identity != requested_identity:
+                    if self._accept_ping_response(ping_data, generation):
+                        _, cached_identity, _, _, _, _ = self._connection_state_snapshot()
+                        if cached_identity != requested_identity:
                             raise IBKRConnectionConflictError(
                                 "Worker is already connected with different "
                                 "host/port/client_id/readonly parameters; call stop() "
@@ -1018,12 +1139,30 @@ class SubprocessIBKRClient:
                         client_id=client_id,
                     )
                 data = await self._execute_command_unlocked(command, timeout=extended_timeout)
-                self._connected = data.get("connected", False)
-                if self._connected:
-                    self._connection_identity = requested_identity
-                    self._connection_start_time = datetime.now()
-                    self._last_activity = datetime.now()
-                    self._gateway_api_down_detail = None
+                connected = data.get("connected", False)
+                with generation.state_lock:
+                    poison = generation.poisoned_reason
+                    if poison:
+                        raise IBKRTransportPoisonedError(
+                            f"IBKR worker generation poisoned: {poison}"
+                        )
+                    with self._connection_state_lock:
+                        if self._generation is not generation:
+                            raise IBKRTransportPoisonedError(
+                                "IBKR worker generation changed during connect"
+                            )
+                        if connected:
+                            self._connected = True
+                            self._connection_identity = requested_identity
+                            self._connection_generation_id = generation.generation_id
+                            self._connection_start_time = datetime.now()
+                            self._last_activity = datetime.now()
+                            self._gateway_api_down_detail = None
+                            self._gateway_failure_generation_id = None
+                        else:
+                            self._clear_connection_tuple_locked()
+                            self._gateway_api_down_detail = None
+                            self._gateway_failure_generation_id = None
 
                 connection_duration = time.time() - connection_start
                 logger.info(
@@ -1032,8 +1171,6 @@ class SubprocessIBKRClient:
                 )
 
         except GatewayRequiresRestartError:
-            self._connected = False
-            self._connection_identity = None
             connection_duration = time.time() - connection_start
             logger.error(
                 "Connection failed - Gateway restart required",
@@ -1044,9 +1181,10 @@ class SubprocessIBKRClient:
         accounts = data.get("accounts", [])
         server_version = data.get("server_version")
 
+        connected_state, _, _, _, _, _ = self._connection_state_snapshot()
         logger.info(
             "Connected to IBKR via subprocess",
-            connected=self._connected,
+            connected=connected_state,
             accounts=accounts,
             server_version=server_version,
             duration_seconds=f"{time.time() - connection_start:.2f}",
@@ -1057,7 +1195,7 @@ class SubprocessIBKRClient:
         # programmatically here. The authoritative read-only enforcement is
         # IBC's ReadOnlyApi=yes (verified at startup by START_TRADER.sh and
         # START_TRADER.sh). This client always passes readonly=True.
-        if self._connected:
+        if connected_state:
             logger.info(
                 "IBKR client connection: readonly flag was requested",
                 readonly_requested=readonly,
@@ -1067,7 +1205,7 @@ class SubprocessIBKRClient:
                 ),
             )
 
-        return self._connected
+        return connected_state
 
     async def _check_zombie_connections(self, port: int) -> tuple[int, str]:
         """
@@ -1241,9 +1379,14 @@ class SubprocessIBKRClient:
     async def disconnect(self) -> None:
         """Disconnect from IBKR"""
         async with self._lifecycle_lock:
-            if not self._connected:
+            generation = self._generation
+            connected, _, bound_generation_id, _, _, _ = self._connection_state_snapshot()
+            if not connected or (
+                generation is not None and bound_generation_id != generation.generation_id
+            ):
+                self._clear_cached_connection_state(generation=generation)
                 return
-            self._connected = False
+            self._clear_cached_connection_state(generation=generation)
             logger.info("Disconnecting from IBKR via subprocess")
             try:
                 await self._execute_command_unlocked({"command": "disconnect"}, timeout=5.0)
@@ -1261,8 +1404,11 @@ class SubprocessIBKRClient:
         """
         try:
             async with self._lifecycle_lock:
+                generation = self._generation
+                if generation is None:
+                    return False
                 data = await self._execute_command_unlocked({"command": "ping"}, timeout=5.0)
-                return self._accept_ping_response(data)
+                return self._accept_ping_response(data, generation)
         except Exception as e:
             logger.warning("Ping failed", error=str(e))
             return False
@@ -1286,10 +1432,11 @@ class SubprocessIBKRClient:
                 logger.debug("Health check passed: Worker is responsive")
                 return True
             else:
-                if self._gateway_api_down_detail:
+                _, _, _, _, _, gateway_detail = self._connection_state_snapshot()
+                if gateway_detail:
                     logger.error(
                         "Health check failed: Gateway API reported down",
-                        detail=self._gateway_api_down_detail,
+                        detail=gateway_detail,
                     )
                 logger.warning("Health check failed: Ping returned false")
                 return False
@@ -1314,20 +1461,27 @@ class SubprocessIBKRClient:
             an order command after a transient disconnect could double-fill.
         """
         generation = self._generation
-        if generation and generation.poisoned_reason:
+        poison_reason = None
+        if generation:
+            with generation.state_lock:
+                poison_reason = generation.poisoned_reason
+        if poison_reason:
             raise IBKRTransportPoisonedError(
-                "Refusing automatic retry of poisoned worker generation: "
-                f"{generation.poisoned_reason}"
+                "Refusing automatic retry of poisoned worker generation: " f"{poison_reason}"
             )
         if not await self.health_check():
             generation = self._generation
-            if generation and generation.poisoned_reason:
+            poison_reason = None
+            if generation:
+                with generation.state_lock:
+                    poison_reason = generation.poisoned_reason
+            if poison_reason:
                 raise IBKRTransportPoisonedError(
-                    "Refusing automatic retry of poisoned worker generation: "
-                    f"{generation.poisoned_reason}"
+                    "Refusing automatic retry of poisoned worker generation: " f"{poison_reason}"
                 )
-            if self._gateway_api_down_detail:
-                raise GatewayRequiresRestartError(self._gateway_api_down_detail)
+            _, _, _, _, _, gateway_detail = self._connection_state_snapshot()
+            if gateway_detail:
+                raise GatewayRequiresRestartError(gateway_detail)
             logger.warning("Connection unhealthy, attempting reconnection...")
             # NEW-IB-L1: Idempotent because this client is read-only end-to-end.
             await self.stop()
@@ -1337,12 +1491,14 @@ class SubprocessIBKRClient:
     @property
     def is_connected(self) -> bool:
         """Check if connected to IBKR"""
-        return self._connected
+        connected, _, _, _, _, _ = self._connection_state_snapshot()
+        return connected
 
     @property
     def gateway_failure_detail(self) -> Optional[str]:
         """Return the last Gateway failure detail, if any."""
-        return self._gateway_api_down_detail
+        _, _, _, _, _, detail = self._connection_state_snapshot()
+        return detail
 
     async def __aenter__(self):
         """Async context manager entry"""

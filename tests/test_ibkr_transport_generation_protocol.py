@@ -248,6 +248,7 @@ def test_poisoning_active_generation_clears_all_cached_connection_health_state()
     client, _, generation = _attach_client(lambda process, request: None)
     client._connected = True
     client._connection_identity = ("127.0.0.1", 4002, 7, True)
+    client._connection_generation_id = generation.generation_id
     client._connection_start_time = datetime.now(timezone.utc)
     client._last_activity = datetime.now(timezone.utc)
 
@@ -263,22 +264,93 @@ def test_poisoning_old_generation_cannot_clear_replacement_connection_state():
     client, _, old_generation = _attach_client(lambda process, request: None, "old")
     replacement_process = _FakeProcess(lambda process, request: None)
     replacement_generation = _WorkerGeneration("replacement", replacement_process)
-    client.process = replacement_process
-    client._generation = replacement_generation
     identity = ("127.0.0.1", 4002, 8, True)
     started = datetime.now(timezone.utc)
     activity = datetime.now(timezone.utc)
-    client._connected = True
-    client._connection_identity = identity
-    client._connection_start_time = started
-    client._last_activity = activity
 
-    client._poison_generation(old_generation, "late old-generation failure")
+    # Force the old poison to wait before its atomic state transition, install
+    # the replacement under the connection lock, then release the old
+    # generation. The delayed generation-bound clear must be a no-op.
+    with old_generation.state_lock:
+        poison_thread = threading.Thread(
+            target=client._poison_generation,
+            args=(old_generation, "late old-generation failure"),
+        )
+        poison_thread.start()
+        with client._connection_state_lock:
+            client.process = replacement_process
+            client._generation = replacement_generation
+            client._connected = True
+            client._connection_identity = identity
+            client._connection_generation_id = replacement_generation.generation_id
+            client._connection_start_time = started
+            client._last_activity = activity
+
+    poison_thread.join(timeout=1)
+    assert poison_thread.is_alive() is False
 
     assert client.is_connected is True
     assert client._connection_identity == identity
+    assert client._connection_generation_id == replacement_generation.generation_id
     assert client._connection_start_time == started
     assert client._last_activity == activity
+
+
+def test_poison_clears_connection_state_before_notifying_pending_futures():
+    client, _, generation = _attach_client(lambda process, request: None)
+    notification_entered = threading.Event()
+    release_notification = threading.Event()
+
+    class BlockingLoop:
+        def call_soon_threadsafe(self, callback):
+            notification_entered.set()
+            assert release_notification.wait(timeout=1)
+            callback()
+
+    class PendingFuture:
+        def __init__(self):
+            self.error = None
+
+        def done(self):
+            return self.error is not None
+
+        def set_exception(self, error):
+            self.error = error
+
+    pending_future = PendingFuture()
+    with generation.state_lock:
+        generation.pending["blocked"] = SimpleNamespace(
+            loop=BlockingLoop(),
+            future=pending_future,
+        )
+    with client._connection_state_lock:
+        client._connected = True
+        client._connection_identity = ("127.0.0.1", 4002, 7, True)
+        client._connection_generation_id = generation.generation_id
+        client._connection_start_time = datetime.now(timezone.utc)
+        client._last_activity = datetime.now(timezone.utc)
+
+    poison_thread = threading.Thread(
+        target=client._poison_generation,
+        args=(generation, "forced notification race"),
+    )
+    poison_thread.start()
+    assert notification_entered.wait(timeout=1)
+
+    assert generation.poisoned_reason == "forced notification race"
+    assert client._connection_state_snapshot() == (
+        False,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+    release_notification.set()
+    poison_thread.join(timeout=1)
+    assert poison_thread.is_alive() is False
+    assert isinstance(pending_future.error, IBKRTransportPoisonedError)
 
 
 @pytest.mark.asyncio
@@ -656,9 +728,10 @@ async def test_disconnected_ping_drives_health_failure_and_clean_reconnect():
             raise AssertionError(f"unexpected command: {request['command']}")
         _feed(process, _response(request, data=data))
 
-    client, _, _ = _attach_client(handler)
+    client, _, generation = _attach_client(handler)
     client._connected = True
     client._connection_identity = ("127.0.0.1", 4002, 7, True)
+    client._connection_generation_id = generation.generation_id
     client._connection_start_time = datetime.now(timezone.utc)
     health = ConnectionHealth(client, max_consecutive_failures=1)
 
@@ -702,9 +775,10 @@ async def test_connect_probes_and_replaces_stale_cached_session():
             raise AssertionError(f"unexpected command: {request['command']}")
         _feed(process, _response(request, data=data))
 
-    client, _, _ = _attach_client(handler)
+    client, _, generation = _attach_client(handler)
     client._connected = True
     client._connection_identity = ("127.0.0.1", 4002, 7, True)
+    client._connection_generation_id = generation.generation_id
 
     async def no_zombies(port):
         return 0, "none"
@@ -715,10 +789,12 @@ async def test_connect_probes_and_replaces_stale_cached_session():
 
 
 def test_ping_clears_stale_gateway_failure_on_plain_disconnect():
-    client = SubprocessIBKRClient()
+    client, _, generation = _attach_client(lambda process, request: None)
     client._connected = True
     client._connection_identity = ("127.0.0.1", 4002, 7, True)
+    client._connection_generation_id = generation.generation_id
     client._gateway_api_down_detail = "old gateway failure"
+    client._gateway_failure_generation_id = generation.generation_id
 
     assert (
         client._accept_ping_response(
@@ -727,7 +803,8 @@ def test_ping_clears_stale_gateway_failure_on_plain_disconnect():
                 "connected": False,
                 "gateway_api_down": False,
                 "detail": "",
-            }
+            },
+            generation,
         )
         is False
     )
@@ -736,7 +813,8 @@ def test_ping_clears_stale_gateway_failure_on_plain_disconnect():
 
 
 def test_ping_cannot_reauthorize_session_without_validated_identity():
-    client = SubprocessIBKRClient()
+    client, _, generation = _attach_client(lambda process, request: None)
+    client._connection_generation_id = generation.generation_id
 
     assert (
         client._accept_ping_response(
@@ -745,12 +823,189 @@ def test_ping_cannot_reauthorize_session_without_validated_identity():
                 "connected": True,
                 "gateway_api_down": False,
                 "detail": "",
-            }
+            },
+            generation,
         )
         is False
     )
     assert client.is_connected is False
     assert client._connection_identity is None
+
+
+def test_stale_ping_cannot_mutate_replacement_connection_or_gateway_detail():
+    client, _, old_generation = _attach_client(lambda process, request: None, "old")
+    replacement_process = _FakeProcess(lambda process, request: None)
+    replacement = _WorkerGeneration("replacement", replacement_process)
+    identity = ("127.0.0.1", 4002, 8, True)
+    started = datetime.now(timezone.utc)
+    activity = datetime.now(timezone.utc)
+    with client._connection_state_lock:
+        client.process = replacement_process
+        client._generation = replacement
+        client._connected = True
+        client._connection_identity = identity
+        client._connection_generation_id = replacement.generation_id
+        client._connection_start_time = started
+        client._last_activity = activity
+        client._gateway_api_down_detail = "replacement detail"
+        client._gateway_failure_generation_id = replacement.generation_id
+
+    assert (
+        client._accept_ping_response(
+            {
+                "pong": True,
+                "connected": False,
+                "gateway_api_down": True,
+                "detail": "stale detail",
+            },
+            old_generation,
+        )
+        is False
+    )
+    assert client._connection_state_snapshot() == (
+        True,
+        identity,
+        replacement.generation_id,
+        started,
+        activity,
+        "replacement detail",
+    )
+
+
+def test_poisoned_generation_ping_cannot_refresh_or_reauthorize_state():
+    client, _, generation = _attach_client(lambda process, request: None)
+    stale_activity = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    with client._connection_state_lock:
+        client._connected = True
+        client._connection_identity = ("127.0.0.1", 4002, 7, True)
+        client._connection_generation_id = generation.generation_id
+        client._last_activity = stale_activity
+    with generation.state_lock:
+        generation.poisoned_reason = "already ambiguous"
+
+    assert (
+        client._accept_ping_response(
+            {
+                "pong": True,
+                "connected": True,
+                "gateway_api_down": False,
+                "detail": "",
+            },
+            generation,
+        )
+        is False
+    )
+    assert client.is_connected is False
+    assert client._last_activity is None
+
+
+def test_stale_gateway_failure_cannot_clear_or_label_replacement_state():
+    client, _, old_generation = _attach_client(lambda process, request: None, "old")
+    replacement_process = _FakeProcess(lambda process, request: None)
+    replacement = _WorkerGeneration("replacement", replacement_process)
+    identity = ("127.0.0.1", 4002, 8, True)
+    with client._connection_state_lock:
+        client.process = replacement_process
+        client._generation = replacement
+        client._connected = True
+        client._connection_identity = identity
+        client._connection_generation_id = replacement.generation_id
+
+    assert client._record_gateway_failure(old_generation, "old Gateway failure") is False
+    assert client.is_connected is True
+    assert client._connection_identity == identity
+    assert client.gateway_failure_detail is None
+
+
+@pytest.mark.asyncio
+async def test_false_connect_response_clears_entire_current_generation_tuple():
+    def handler(process, request):
+        assert request["command"] == "connect"
+        _feed(
+            process,
+            _response(
+                request,
+                data={
+                    "connected": False,
+                    "accounts": [],
+                    "client_id": 7,
+                    "server_version": None,
+                },
+            ),
+        )
+
+    client, _, generation = _attach_client(handler)
+    with client._connection_state_lock:
+        client._connected = False
+        client._connection_identity = ("127.0.0.1", 4002, 7, True)
+        client._connection_generation_id = generation.generation_id
+        client._connection_start_time = datetime.now(timezone.utc)
+        client._last_activity = datetime.now(timezone.utc)
+        client._gateway_api_down_detail = "stale"
+        client._gateway_failure_generation_id = generation.generation_id
+
+    async def no_zombies(port):
+        return 0, "none"
+
+    client._check_zombie_connections = no_zombies
+    assert await client.connect(port=4002, client_id=7, readonly=True) is False
+    assert client._connection_state_snapshot() == (
+        False,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_poison_before_connect_bind_cannot_reauthorize_generation(monkeypatch):
+    client, _, generation = _attach_client(lambda process, request: None)
+
+    async def no_zombies(port):
+        return 0, "none"
+
+    async def poison_then_respond(command, timeout=30.0):
+        client._poison_generation(generation, "ambiguous connect response")
+        return {
+            "connected": True,
+            "accounts": ["DU123"],
+            "client_id": 7,
+            "server_version": 180,
+        }
+
+    client._check_zombie_connections = no_zombies
+    monkeypatch.setattr(client, "_execute_command_unlocked", poison_then_respond)
+
+    with pytest.raises(IBKRTransportPoisonedError, match="ambiguous connect response"):
+        await client.connect(port=4002, client_id=7, readonly=True)
+    assert client.is_connected is False
+    assert client._connection_identity is None
+    assert client._connection_generation_id is None
+
+
+@pytest.mark.asyncio
+async def test_stop_without_process_clears_all_stale_cached_state():
+    client = SubprocessIBKRClient()
+    with client._connection_state_lock:
+        client._connected = True
+        client._connection_identity = ("127.0.0.1", 4002, 7, True)
+        client._connection_generation_id = "missing"
+        client._connection_start_time = datetime.now(timezone.utc)
+        client._last_activity = datetime.now(timezone.utc)
+        client._gateway_api_down_detail = "stale failure"
+        client._gateway_failure_generation_id = "missing"
+
+    await client.stop()
+    assert client._connection_state_snapshot() == (
+        False,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
 
 
 @pytest.mark.asyncio
