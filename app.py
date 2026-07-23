@@ -499,7 +499,9 @@ def _request_is_https() -> bool:
         return True
     if request.is_secure:
         return True
-    forwarded_proto = (request.headers.get("X-Forwarded-Proto", "") or "").split(",")[0].strip().lower()
+    forwarded_proto = (
+        (request.headers.get("X-Forwarded-Proto", "") or "").split(",")[0].strip().lower()
+    )
     return forwarded_proto == "https"
 
 
@@ -5581,8 +5583,7 @@ def status():
         # Runner is running, market is open, but NO active API connection
         status_message = "🔄 Market Open - API session not confirmed"
         status_detail = (
-            "Gateway is available, but the dashboard cannot confirm "
-            "an active runner API session"
+            "Gateway is available, but the dashboard cannot confirm " "an active runner API session"
         )
     elif not gateway_diagnostic_available:
         status_message = "⚠️ Market Open - Gateway status unavailable"
@@ -7335,22 +7336,25 @@ def strategies_status():
     except Exception:
         # C-9: don't leak exception detail to clients; log full traceback.
         logger.exception("strategy_status failed")
-        return jsonify(
-            {
-                "active_strategies": {
-                    "ml_enhanced": {"enabled": True, "error": "internal_error"},
-                    "microstructure": {"enabled": False},
-                    "portfolio_manager": {
-                        "enabled": True,
-                        "allocation_method": "Equal Weight",
-                        "strategies_count": 4,
+        return (
+            jsonify(
+                {
+                    "active_strategies": {
+                        "ml_enhanced": {"enabled": True, "error": "internal_error"},
+                        "microstructure": {"enabled": False},
+                        "portfolio_manager": {
+                            "enabled": True,
+                            "allocation_method": "Equal Weight",
+                            "strategies_count": 4,
+                        },
+                        "smart_execution": {"enabled": True},
                     },
-                    "smart_execution": {"enabled": True},
-                },
-                "performance_by_strategy": {},
-                "error": "internal_error",
-            }
-        ), 500
+                    "performance_by_strategy": {},
+                    "error": "internal_error",
+                }
+            ),
+            500,
+        )
 
 
 @app.route("/api/microstructure/metrics")
@@ -7675,16 +7679,23 @@ def get_risk_status():
     except Exception:
         # C-9: don't leak exception detail to clients; log full traceback.
         logger.exception("risk_status failed")
-        return jsonify(
-            {
-                "enabled": True,
-                "error": "internal_error",
-                "kelly_sizing": {"enabled": True, "current_positions": {}, "portfolio_kelly": 0},
-                "kill_switches": {"active": False, "limits": {}},
-                "correlation_limits": {},
-                "risk_metrics": {},
-            }
-        ), 500
+        return (
+            jsonify(
+                {
+                    "enabled": True,
+                    "error": "internal_error",
+                    "kelly_sizing": {
+                        "enabled": True,
+                        "current_positions": {},
+                        "portfolio_kelly": 0,
+                    },
+                    "kill_switches": {"active": False, "limits": {}},
+                    "correlation_limits": {},
+                    "risk_metrics": {},
+                }
+            ),
+            500,
+        )
 
 
 @app.route("/api/risk/kelly/<symbol>")
@@ -7993,8 +8004,6 @@ def get_safety_thresholds():
 @csrf_required
 def start_trading():
     """Reject dashboard startup while the single-launcher contract is enforced."""
-    global trading_status
-
     # Load symbols from user settings
     global default_symbols
     try:
