@@ -1223,7 +1223,7 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="runtime-identity-banner" id="runtime-identity-banner" role="status">
-        <span class="runtime-primary">PAPER • READ ONLY • LIVE DISABLED</span>
+        <span class="runtime-primary">{{ runtime_identity.mode|upper }} • READ ONLY • LIVE DISABLED</span>
         Account {{ runtime_identity.account_alias or 'UNCONFIGURED' }} ·
         {{ runtime_identity.account_type }} ·
         Source {{ runtime_identity.execution_source }} ·
