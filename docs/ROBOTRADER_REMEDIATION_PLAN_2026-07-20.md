@@ -13,9 +13,14 @@ PR 1A and merged as `4cafb782cbf43ff4397f1b89b42d5f657eceea8e`,
 closing the incident-driven broker-correlation and protected-runtime gate.
 PR #80 is superseded and must not be merged or cherry-picked; its independent
 findings are assigned to later scoped PRs in
-`docs/branch_analysis/PR80_DISPOSITION_2026-07-23.md`. PR 1B is next and must
-supply the non-mutating broker-versus-ledger evidence required for the later
-Gate A decision. Gate A remains closed and the trader remains stopped.
+`docs/branch_analysis/PR80_DISPOSITION_2026-07-23.md`. PR #90 completed the
+PR 1B diagnostic implementation and merged as
+`0d43006561071e27b217cb6d16f3c0a245a18655`. Its first real invocation from
+merged `main` failed closed before broker connection because the local runtime
+does not yet define an explicit paper-account identity and allow-list. Issue
+#92 tracks that local-only operator prerequisite. Protected evidence hashes
+were unchanged, no correction was attempted, Gate A remains closed, and the
+trader remains stopped. PR 2A is the next code change.
 
 ## 1. Purpose
 
@@ -336,6 +341,12 @@ supervised paper start requires cumulative Gate A: PRs 1, 1A, 1B, 2 through 5,
 the relevant PR 7 controls, reviewed reconciliation, restore evidence, and all
 ordinary `./START_TRADER.sh` checks passing without deleting or bypassing
 safety state.
+
+Current operational evidence (2026-07-23): the merged command failed closed
+before broker connection because the local runtime has no explicit paper
+account identity or allow-list. Issue #92 tracks the local-only configuration
+prerequisite. The blocked run changed none of the protected evidence files and
+does not satisfy the reviewed-reconciliation requirement above.
 
 ## PR 2 - Implement a reduce-only safety plane
 
@@ -1129,12 +1140,35 @@ Update after each merge.
   event-time, transport-poisoning, stop-protection, and fail-closed lifecycle
   scope. It does not authorize a restart. Gate A remains closed, the trader
   remains stopped, and PR 1B read-only reconciliation is next.
-- PR 1B: Not started. A strictly read-only, account-verified broker-versus-ledger
-  diagnostic is required because the current preflight points to a nonexistent
-  command and the legacy position-sync utility is deliberately quarantined.
-  Restart remains prohibited until the incident is reconciled and reviewed
-  without modifying the database or safety files.
-- PR 2: Not started
+- PR 1B: PR #90 merged on 2026-07-23 as
+  `0d43006561071e27b217cb6d16f3c0a245a18655` from exact reviewed head
+  `ae133c054721ea8ca656594053594e0ae43649d1`. The local full suite passed
+  1,564 tests with 5 skipped and 20 warnings. The final strict whole-PR review
+  returned PASS after 314 focused tests; the client-ID boundary review returned
+  PASS after 151 focused tests. All repository-owned hosted checks passed,
+  including Python 3.10 through 3.12 tests, production
+  unit/integration/performance matrices, lint, security, Docker, import
+  validation, Trivy, and SARIF upload. Earlier Codex reviews found cleanup and
+  shared client-ID compatibility defects; both were fixed and all threads were
+  resolved. The final-head Codex request could not run because the account
+  reached its code-review usage limit. The external Claude action again
+  provided no validation because its revoked OAuth credential returned HTTP
+  401 with zero tokens and zero cost.
+
+  The first real command was run from merged code against the stopped local
+  paper runtime. It did not connect to the broker: runtime validation blocked
+  because `.env` lacks `IBKR_ACCOUNT`, `IBKR_APPROVED_ACCOUNTS`, and
+  `IBKR_ACCOUNT_TYPE`. The report stated `mutated_state=false` and
+  `authorizes_startup=false`; independent before/after hashes of `.env`, the
+  ledger and SQLite sidecars, kill-switch state and lock, bypass log, and
+  trading log were unchanged. Issue #92 requires the operator to configure the
+  exact paper account and dedicated reconciliation client ID locally without
+  publishing the raw account number. Reconciliation remains incomplete, no
+  data or safety state was corrected, and this merge does not authorize
+  startup.
+- PR 2: Staged as dormant PR 2A (issue #91) followed by separately reviewed
+  runtime-integration PR 2B. PR 2A is next; neither stage is started or wired
+  into production runtime yet.
 - PR 3: Not started
 - PR 4: Not started
 - PR 5: Not started
