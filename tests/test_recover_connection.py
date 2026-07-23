@@ -217,6 +217,11 @@ async def test_recovery_rewarms_stop_loss_monitor_with_cached_prices():
         "NVDA": event_time,
         "TSLA": event_time,
     }
+    runner.latest_price_sources = {
+        "AAPL": "live_protective",
+        "NVDA": "live_protective",
+        "TSLA": "historical_bar",
+    }
 
     # Build a stop-loss monitor mock with active stops keyed by
     # portfolio:symbol but stop objects carrying bare symbols
@@ -250,6 +255,7 @@ async def test_recovery_skips_stops_with_no_cached_price():
     runner.latest_prices = {"AAPL": 150.0}  # only AAPL has a cached price
     event_time = datetime.now(timezone.utc)
     runner.latest_price_times = {"AAPL": event_time}
+    runner.latest_price_sources = {"AAPL": "live_protective"}
 
     stop_aapl = MagicMock(symbol="AAPL")
     stop_unknown = MagicMock(symbol="UNKNOWN")
@@ -279,6 +285,10 @@ async def test_recovery_rewarm_handles_per_symbol_failures():
     runner.latest_prices = {"AAPL": 150.0, "NVDA": 500.0}
     event_time = datetime.now(timezone.utc)
     runner.latest_price_times = {"AAPL": event_time, "NVDA": event_time}
+    runner.latest_price_sources = {
+        "AAPL": "live_protective",
+        "NVDA": "live_protective",
+    }
 
     stop_aapl = MagicMock(symbol="AAPL")
     stop_nvda = MagicMock(symbol="NVDA")

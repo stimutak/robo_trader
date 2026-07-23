@@ -157,8 +157,48 @@ async def test_stale_historical_close_is_not_rewarmed_as_protection(caplog) -> N
     runner.stop_loss_monitor = monitor
     runner.latest_prices = {"AAPL": 90.0}
     runner.latest_price_times = {"AAPL": now - timedelta(seconds=11)}
+    runner.latest_price_sources = {"AAPL": "historical_bar"}
 
     await runner._rewarm_stop_loss_prices_after_recovery()
 
     assert monitor.last_prices == {}
     assert "event=stop_loss_prices_rewarmed count=0 skipped=1" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_fresh_historical_close_is_never_rewarmed_as_live_protection(caplog) -> None:
+    monitor = _monitor()
+    position = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
+    await monitor.add_stop_loss("AAPL", position, stop_percent=0.02)
+    now = datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc)
+    monitor._utcnow = MagicMock(return_value=now)
+
+    runner = AsyncRunner.__new__(AsyncRunner)
+    runner.stop_loss_monitor = monitor
+    runner.latest_prices = {"AAPL": 90.0}
+    runner.latest_price_times = {"AAPL": now - timedelta(seconds=1)}
+    runner.latest_price_sources = {"AAPL": "historical_bar"}
+
+    await runner._rewarm_stop_loss_prices_after_recovery()
+
+    assert monitor.last_prices == {}
+    assert "reason=non_protective_source source='historical_bar'" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_fresh_live_protective_event_can_rewarm_stop_monitor() -> None:
+    monitor = _monitor()
+    position = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
+    await monitor.add_stop_loss("AAPL", position, stop_percent=0.02)
+    now = datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc)
+    monitor._utcnow = MagicMock(return_value=now)
+
+    runner = AsyncRunner.__new__(AsyncRunner)
+    runner.stop_loss_monitor = monitor
+    runner.latest_prices = {"AAPL": 99.0}
+    runner.latest_price_times = {"AAPL": now - timedelta(seconds=1)}
+    runner.latest_price_sources = {"AAPL": "live_protective"}
+
+    await runner._rewarm_stop_loss_prices_after_recovery()
+
+    assert monitor.last_prices == {"AAPL": 99.0}

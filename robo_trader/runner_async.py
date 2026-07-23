@@ -446,6 +446,7 @@ class AsyncRunner:
         self.positions: Dict[str, Position] = {}
         self.latest_prices: Dict[str, float] = {}
         self.latest_price_times: Dict[str, datetime] = {}
+        self.latest_price_sources: Dict[str, str] = {}
         self._trusted_bar_closes: Dict[str, float] = {}
         self._protective_feed_status: Dict[str, dict] = {}
         self.daily_pnl = 0.0
@@ -769,6 +770,43 @@ class AsyncRunner:
         side = str(getattr(order, "side", "") or "").upper()
         return side in {"BUY", "SELL_SHORT"}
 
+    def _has_live_protective_feed(self, symbol: str) -> bool:
+        """Return whether an exact symbol has an admitted live protection source."""
+        statuses = getattr(self, "_protective_feed_status", None)
+        if not isinstance(statuses, dict):
+            return False
+        status = statuses.get(symbol)
+        return (
+            isinstance(status, dict)
+            and status.get("available") is True
+            and status.get("live_grade") is True
+            and status.get("source") == "live_protective"
+        )
+
+    def _pairs_execution_admitted(self, pair: object) -> bool:
+        """Fail closed until pairs have an atomic two-leg execution lifecycle."""
+        if (
+            not isinstance(pair, (tuple, list))
+            or len(pair) != 2
+            or not all(self._has_live_protective_feed(str(symbol)) for symbol in pair)
+        ):
+            logger.error(
+                "Pairs signal blocked before state mutation: both legs require "
+                "an admitted live-protective feed; pair=%r",
+                pair,
+            )
+            return False
+        # Pairs currently mutate strategy state before either leg is admitted
+        # or filled and have no safe partial-leg commit/rollback contract.
+        # Quarantine execution rather than leave phantom active pairs or
+        # untracked one-leg exposure. PR 11 owns the durable, idempotent,
+        # broker-confirmed multi-leg lifecycle.
+        logger.error(
+            "Pairs execution quarantined pending atomic two-leg lifecycle; pair=%r",
+            pair,
+        )
+        return False
+
     async def _latch_symbol_cycle_abort(self) -> None:
         """Serialize transport abort with the final placement admission gate."""
         lock = getattr(self, "_order_admission_lock", None)
@@ -847,6 +885,14 @@ class AsyncRunner:
                     )
                     return self._rejected_order_result(
                         "Order admission blocked: broker transport unavailable"
+                    )
+                if not self._has_live_protective_feed(order.symbol):
+                    logger.error(
+                        "Order admission blocked for %s: no admitted " "live-protective feed",
+                        order.symbol,
+                    )
+                    return self._rejected_order_result(
+                        "Order admission blocked: live protective feed unavailable"
                     )
                 if is_extended_hours() and self._order_increases_exposure(order):
                     logger.warning(
@@ -2302,36 +2348,13 @@ class AsyncRunner:
         latest_price = float(df["close"].iloc[-1])
         latest_timestamp = df.index[-1].to_pydatetime()
 
-        # Protective freshness is a prerequisite for any strategy or order
-        # path. Historical bars remain an interim source until PR 3 adds an
-        # independent live-grade protective feed, so paper entries may pause.
-        if self.stop_loss_monitor and latest_price:
-            protective_available = await self.stop_loss_monitor.update_price(
-                symbol,
-                latest_price,
-                source_timestamp=latest_timestamp,
-            )
-            if not hasattr(self, "_protective_feed_status"):
-                self._protective_feed_status = {}
-            self._protective_feed_status[symbol] = {
-                "available": bool(protective_available),
-                "source_timestamp": latest_timestamp.isoformat(),
-            }
-            if not protective_available:
-                logger.error(
-                    "Protective feed unavailable for %s; strategy and order paths blocked",
-                    symbol,
-                )
-                return self._blocked_result(
-                    symbol,
-                    0,
-                    latest_price,
-                    "Protective feed unavailable: source event rejected",
-                    df,
-                )
-
-        # Cache and latest/risk consumers are downstream of both the data
-        # contract and protective-feed admission.
+        # Historical bars are validated observations, but they are not a
+        # live-grade protective feed. A one-minute bar carries its bar event
+        # time and cannot honestly satisfy StopLossMonitor's ten-second quote
+        # contract throughout the minute. Keep observational state current,
+        # but never manufacture protection from retrieval time or let this
+        # source reach strategy/order paths. PR 3 owns the independent quote
+        # or realtime-bar feed that will open this gate.
         if symbol in self.market_data_cache:
             self.market_data_cache.move_to_end(symbol)
         self.market_data_cache[symbol] = df
@@ -2340,6 +2363,9 @@ class AsyncRunner:
         if not hasattr(self, "latest_price_times"):
             self.latest_price_times = {}
         self.latest_price_times[symbol] = latest_timestamp
+        if not hasattr(self, "latest_price_sources"):
+            self.latest_price_sources = {}
+        self.latest_price_sources[symbol] = "historical_bar"
 
         if WEBSOCKET_ENABLED and ws_client:
             try:
@@ -2352,8 +2378,27 @@ class AsyncRunner:
         if self.use_advanced_risk and self.advanced_risk and latest_price:
             self.advanced_risk.update_market_prices({symbol: latest_price})
 
-        if hasattr(self, "_protective_feed_status") and self.stop_loss_monitor:
-            self._protective_feed_status[symbol]["available"] = True
+        if not hasattr(self, "_protective_feed_status"):
+            self._protective_feed_status = {}
+        self._protective_feed_status[symbol] = {
+            "available": False,
+            "live_grade": False,
+            "source": "historical_bar",
+            "source_timestamp": latest_timestamp.isoformat(),
+            "reason": "independent_live_protective_feed_pending_pr3",
+        }
+        logger.error(
+            "Protective feed unavailable for %s: historical bars are "
+            "observational only; strategy and order paths blocked",
+            symbol,
+        )
+        return self._blocked_result(
+            symbol,
+            0,
+            latest_price,
+            "Protective feed unavailable: historical bars are observational only",
+            df,
+        )
 
         # Generate trading signal
         with Timer("signal_generation", self.monitor):
@@ -3867,8 +3912,12 @@ class AsyncRunner:
                                         )
                                         continue
 
-                                    # Update internal position tracking
-                                    self.pairs_strategy.update_position(pair, signal)
+                                    # Keep analysis available, but quarantine
+                                    # execution before any pairs state mutation
+                                    # until both legs have an atomic,
+                                    # broker-confirmed lifecycle.
+                                    if not self._pairs_execution_admitted(pair):
+                                        continue
 
                                     # Get current prices - fallback to market_data_cache if not in current_prices
                                     price_a = current_prices.get(symbol_a, 0)
@@ -4790,12 +4839,12 @@ class AsyncRunner:
             self._recovery_exhausted = True
 
     async def _rewarm_stop_loss_prices_after_recovery(self) -> None:
-        """Offer cached broker events to stops after a successful reconnect.
+        """Offer cached live protective events after a successful reconnect.
 
-        The stop monitor independently rejects any source event older than
-        its protective-feed threshold. Reconnect must not manufacture
-        freshness for historical closes, so rejected events are counted as
-        skipped and never reported as rewarmed protection.
+        Reconnect must not manufacture freshness for historical closes.
+        Provenance is therefore mandatory and only ``live_protective`` events
+        may be offered to the stop monitor. The monitor independently rejects
+        any source event older than its ten-second threshold.
 
         Defensive: skips when attributes don't exist (e.g., minimal test
         runners). Each update_price call is independently wrapped so a
@@ -4804,7 +4853,8 @@ class AsyncRunner:
         stop_monitor = getattr(self, "stop_loss_monitor", None)
         prices = getattr(self, "latest_prices", None)
         price_times = getattr(self, "latest_price_times", None)
-        if stop_monitor is None or prices is None or price_times is None:
+        price_sources = getattr(self, "latest_price_sources", None)
+        if stop_monitor is None or prices is None or price_times is None or price_sources is None:
             logger.debug("event=stop_loss_prices_rewarm_skipped reason=missing_attributes")
             return
 
@@ -4819,6 +4869,15 @@ class AsyncRunner:
         for stop in list(active_stops.values()):
             symbol = getattr(stop, "symbol", None)
             if symbol is None or symbol not in prices or symbol not in price_times:
+                skipped += 1
+                continue
+            if price_sources.get(symbol) != "live_protective":
+                logger.warning(
+                    "event=stop_loss_price_rewarm_skipped symbol=%s "
+                    "reason=non_protective_source source=%r",
+                    symbol,
+                    price_sources.get(symbol),
+                )
                 skipped += 1
                 continue
             try:

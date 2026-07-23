@@ -263,19 +263,26 @@ async def test_bad_event_time_has_no_downstream_side_effects() -> None:
 
 
 @pytest.mark.asyncio
-async def test_protective_feed_rejection_blocks_strategy_and_executor() -> None:
+@pytest.mark.parametrize("bar_age_seconds", [5, 11, 30, 59])
+@pytest.mark.parametrize("monitor_enabled", [True, False])
+async def test_historical_bar_is_observational_and_always_blocks_trading(
+    bar_age_seconds: int,
+    monitor_enabled: bool,
+) -> None:
     runner = AsyncRunner.__new__(AsyncRunner)
+    timestamp = pd.Timestamp.now(tz="UTC") - pd.Timedelta(seconds=bar_age_seconds)
     frame = pd.DataFrame(
         {"open": [100.0], "high": [102.0], "low": [99.0], "close": [101.0], "volume": [1]},
-        index=pd.DatetimeIndex([pd.Timestamp.now(tz="UTC")], name="timestamp"),
+        index=pd.DatetimeIndex([timestamp], name="timestamp"),
     )
     runner.fetch_and_store_data = AsyncMock(return_value=frame)
     runner.market_data_cache = OrderedDict()
     runner.max_cache_size = 10
     runner.latest_prices = {}
     runner.latest_price_times = {}
-    runner.stop_loss_monitor = MagicMock()
-    runner.stop_loss_monitor.update_price = AsyncMock(return_value=False)
+    runner.stop_loss_monitor = MagicMock() if monitor_enabled else None
+    if runner.stop_loss_monitor:
+        runner.stop_loss_monitor.update_price = AsyncMock(return_value=False)
     runner.use_advanced_risk = True
     runner.advanced_risk = MagicMock()
     runner.use_ml_enhanced = True
@@ -288,9 +295,14 @@ async def test_protective_feed_rejection_blocks_strategy_and_executor() -> None:
     assert result.executed is False
     assert result.message.startswith("Protective feed unavailable")
     assert runner._protective_feed_status["AAPL"]["available"] is False
-    assert runner.market_data_cache == {}
-    assert runner.latest_prices == {}
-    runner.advanced_risk.update_market_prices.assert_not_called()
+    assert runner._protective_feed_status["AAPL"]["source"] == "historical_bar"
+    assert runner._protective_feed_status["AAPL"]["live_grade"] is False
+    assert runner.market_data_cache["AAPL"] is frame
+    assert runner.latest_prices == {"AAPL": 101.0}
+    assert runner.latest_price_sources == {"AAPL": "historical_bar"}
+    runner.advanced_risk.update_market_prices.assert_called_once_with({"AAPL": 101.0})
+    if runner.stop_loss_monitor:
+        runner.stop_loss_monitor.update_price.assert_not_awaited()
     runner.ml_enhanced_strategy.analyze.assert_not_awaited()
     runner.executor.place_order.assert_not_called()
 
@@ -379,6 +391,14 @@ def _configure_order_runtime(runner: AsyncRunner, executor_result=None) -> None:
     runner._order_admitted_tasks = set()
     runner._kill_switch_log_last = {}
     runner._kill_switch_log_throttle_seconds = 60
+    runner._protective_feed_status = {
+        symbol: {
+            "available": True,
+            "live_grade": True,
+            "source": "live_protective",
+        }
+        for symbol in ("AAPL", "MSFT", "TSLA", "NVDA")
+    }
     runner.risk = MagicMock(emergency_shutdown_triggered=False)
     runner.advanced_risk = None
     runner.circuit_breaker = MagicMock()
@@ -395,6 +415,89 @@ def _configure_order_runtime(runner: AsyncRunner, executor_result=None) -> None:
         message="filled",
     )
     runner.monitor = PerformanceMonitor()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["BUY", "SELL", "SELL_SHORT", "BUY_TO_COVER"])
+@pytest.mark.parametrize(
+    "status",
+    [
+        None,
+        {"available": False, "live_grade": False, "source": "historical_bar"},
+        {"available": True, "live_grade": False, "source": "live_protective"},
+        {"available": True, "live_grade": True, "source": "historical_bar"},
+    ],
+)
+async def test_central_order_admission_requires_exact_live_protection(
+    side: str,
+    status: dict | None,
+) -> None:
+    runner = AsyncRunner.__new__(AsyncRunner)
+    _configure_order_runtime(runner)
+    runner._protective_feed_status = {} if status is None else {"AAPL": status}
+
+    result = await runner._place_order_with_circuit_breaker(
+        Order(symbol="AAPL", quantity=1, side=side, price=100.0)
+    )
+
+    assert result.ok is False
+    assert "live protective feed unavailable" in result.message.lower()
+    runner.executor.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["BUY", "SELL", "SELL_SHORT", "BUY_TO_COVER"])
+async def test_central_order_admission_accepts_exact_live_protection(side: str) -> None:
+    runner = AsyncRunner.__new__(AsyncRunner)
+    _configure_order_runtime(runner)
+
+    result = await runner._place_order_with_circuit_breaker(
+        Order(symbol="AAPL", quantity=1, side=side, price=100.0)
+    )
+
+    assert result.ok is True
+    runner.executor.place_order.assert_called_once()
+
+
+def test_pairs_historical_cache_cannot_mutate_strategy_state() -> None:
+    runner = AsyncRunner.__new__(AsyncRunner)
+    runner.pairs_strategy = MagicMock()
+    runner._protective_feed_status = {
+        "AAPL": {
+            "available": False,
+            "live_grade": False,
+            "source": "historical_bar",
+        },
+        "MSFT": {
+            "available": False,
+            "live_grade": False,
+            "source": "historical_bar",
+        },
+    }
+
+    admitted = runner._pairs_execution_admitted(("AAPL", "MSFT"))
+
+    assert admitted is False
+    runner.pairs_strategy.update_position.assert_not_called()
+
+
+def test_pairs_live_protection_still_cannot_bypass_atomic_lifecycle_quarantine() -> None:
+    runner = AsyncRunner.__new__(AsyncRunner)
+    runner.pairs_strategy = MagicMock()
+    runner._protective_feed_status = {
+        symbol: {
+            "available": True,
+            "live_grade": True,
+            "source": "live_protective",
+        }
+        for symbol in ("AAPL", "MSFT")
+    }
+    pair = ("AAPL", "MSFT")
+
+    admitted = runner._pairs_execution_admitted(pair)
+
+    assert admitted is False
+    runner.pairs_strategy.update_position.assert_not_called()
 
 
 @pytest.mark.asyncio

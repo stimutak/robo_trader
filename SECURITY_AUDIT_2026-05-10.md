@@ -153,7 +153,10 @@ Each finding has a stable ID (`<surface>-<severity><n>`) for cross-referencing. 
       ...
       price_age = datetime.now() - self.price_update_times.get(stop.symbol, datetime.min)
   ```
-- **Test:** Add long stop at $100; `update_price("AAPL", 99.0)`; `check_stops()` must return the triggered stop.
+- **Test:** Add a long stop at $100; call
+  `update_price("AAPL", 99.0, source_timestamp=broker_event_time)` with a
+  timezone-aware, fresh broker event time; `check_stops()` must return the
+  triggered stop.
 
 #### `TC-H3` — HIGH | Pairs trading bypasses every risk gate
 - **CWE-862** | Confidence 10/10 | `runner_async.py:2862-2930, 2962-3030`
@@ -420,7 +423,7 @@ pytest tests/security/ -v
 
 | Test | Asserts | Targets |
 |---|---|---|
-| `test_stop_loss_triggers_after_keying_fix` | After `update_price(symbol, below_stop)`, `check_stops()` returns the triggered stop | TC-H2 |
+| `test_stop_loss_triggers_after_keying_fix` | After `update_price(symbol, below_stop, source_timestamp=aware_broker_event_time)`, `check_stops()` returns the triggered stop | TC-H2 |
 | `test_max_daily_loss_uses_dollars_not_fraction` | With `max_daily_loss_pct=0.005`, cash=100k, `daily_pnl=-100` -> `(True, "OK")` | TC-H1 |
 | `test_validate_order_rejects_nan_inf` | `validate_order(price=float('nan'))` -> `(False, ...)` | TC-M4 |
 | `test_pairs_buy_calls_validate_order` | Mock validate_order; pairs BUY path triggers it | TC-H3 |
