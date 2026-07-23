@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -257,6 +258,8 @@ def test_open_orders_and_executions_are_deterministically_non_comparable():
         now=NOW,
     )
 
+    assert report.status == "BLOCKED"
+    assert "UNMATCHED_ACTIVE_BROKER_OPEN_ORDERS" in report.blockers
     assert report.open_order_comparisons[0].status == "not_comparable"
     assert "NO_BROKER_ORDER_ID" in report.open_order_comparisons[0].reason
     assert report.execution_comparisons[0].status == "not_comparable"
@@ -291,6 +294,136 @@ def test_open_orders_and_executions_are_deterministically_non_comparable():
         "start_at": (NOW - timedelta(hours=24, seconds=1)).isoformat(),
         "end_at": NOW.isoformat(),
     }
+
+
+def test_public_report_serializes_all_evidence_decimals_without_exponents():
+    small = Decimal("0.00000001")
+    contract = _contract("AAPL", 1)
+    order = BrokerOpenOrder(
+        order_id="20",
+        client_id=7,
+        contract=contract,
+        side="BUY",
+        quantity=Decimal("0.00000002"),
+        filled=small,
+        remaining=small,
+        order_type="LMT",
+        status="Submitted",
+        limit_price=small,
+        auxiliary_price=small,
+        average_fill_price=small,
+    )
+    execution = BrokerExecution(
+        execution_id="exec-1",
+        order_id="19",
+        contract=contract,
+        side="BOT",
+        quantity=small,
+        price=small,
+        average_price=small,
+        commission=small,
+        commission_currency="USD",
+        realized_pnl=small,
+        executed_at=NOW - timedelta(seconds=5),
+    )
+    trade = LedgerTrade(
+        local_trade_id=42,
+        portfolio_id="default",
+        symbol="AAPL",
+        side="BUY",
+        quantity=small,
+        price=small,
+        timestamp=NOW - timedelta(seconds=5),
+    )
+
+    report = reconcile(
+        _snapshot(orders=(order,), executions=(execution,)),
+        _ledger(trades=(trade,)),
+        runtime_fingerprint="runtime",
+        database_identity="paper:db",
+        expected_account_alias="***4567",
+        now=NOW,
+    )
+    public_json = json.dumps(report.public_dict(), sort_keys=True)
+
+    assert "1E-8" not in public_json
+    assert "2E-8" not in public_json
+    assert "0.00000001" in public_json
+    assert "0.00000002" in public_json
+
+
+def test_uncorrelated_broker_execution_is_incomplete_even_when_positions_match():
+    execution = BrokerExecution(
+        execution_id="exec-1",
+        order_id="19",
+        contract=_contract("AAPL", 1),
+        side="BOT",
+        quantity=Decimal("3"),
+        price=Decimal("100"),
+        executed_at=NOW - timedelta(seconds=5),
+    )
+    report = reconcile(
+        _snapshot(
+            BrokerPosition(_contract("AAPL", 1), Decimal("3"), Decimal("100")),
+            executions=(execution,),
+        ),
+        _ledger(_local("AAPL", "3", "100")),
+        runtime_fingerprint="runtime",
+        database_identity="paper:db",
+        expected_account_alias="***4567",
+        now=NOW,
+    )
+
+    assert report.status == "INCOMPLETE"
+    assert report.status != "QUANTITY_COST_COMPARABLE_ONLY"
+    assert "BROKER_EXECUTIONS_CANNOT_BE_IDENTITY_MATCHED_TO_LOCAL_TRADES" in report.caveats
+
+
+def test_uncorrelated_local_trade_is_incomplete_even_without_broker_execution():
+    trade = LedgerTrade(
+        local_trade_id=42,
+        portfolio_id="default",
+        symbol="AAPL",
+        side="BUY",
+        quantity=Decimal("3"),
+        price=Decimal("100"),
+        timestamp=NOW - timedelta(seconds=5),
+    )
+    report = reconcile(
+        _snapshot(),
+        _ledger(trades=(trade,)),
+        runtime_fingerprint="runtime",
+        database_identity="paper:db",
+        expected_account_alias="***4567",
+        now=NOW,
+    )
+
+    assert report.status == "INCOMPLETE"
+    assert report.status != "QUANTITY_COST_COMPARABLE_ONLY"
+    assert report.execution_comparisons[0].evidence_type == "local_trade"
+
+
+def test_public_report_rejects_account_fragments_in_metadata_and_execution_evidence():
+    with pytest.raises(BrokerEvidenceError, match="sensitive identity"):
+        reconcile(
+            _snapshot(),
+            _ledger(),
+            runtime_fingerprint="runtime-DU1234567",
+            database_identity="paper:db",
+            expected_account_alias="***4567",
+            now=NOW,
+        )
+
+    with pytest.raises(BrokerEvidenceError, match="sensitive identity"):
+        BrokerExecution(
+            execution_id="exec-DU1234567-fill",
+            order_id="19",
+            contract=_contract("AAPL", 1),
+            side="BOT",
+            quantity=Decimal("3"),
+            price=Decimal("100"),
+            executed_at=NOW - timedelta(seconds=5),
+        )
 
 
 def test_duplicate_order_identity_is_rejected_even_when_contracts_differ():

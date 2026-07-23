@@ -287,10 +287,14 @@ def _cleanup_on_exit():
     if ib is not None:
         print("atexit: Disconnecting from IBKR...", file=sys.stderr, flush=True)
         try:
-            safe_disconnect(ib)
+            safe_disconnect(
+                ib,
+                context="diagnostic_worker:atexit",
+                log_exception_details=False,
+            )
             print("atexit: Disconnected successfully", file=sys.stderr, flush=True)
-        except Exception as e:
-            print(f"atexit: Disconnect error: {e}", file=sys.stderr, flush=True)
+        except Exception:
+            print("atexit: Disconnect error", file=sys.stderr, flush=True)
         ib = None
 
 
@@ -371,7 +375,11 @@ async def handle_connect(params: dict) -> dict:
             }
 
         if ib is not None:
-            safe_disconnect(ib)
+            safe_disconnect(
+                ib,
+                context="diagnostic_worker:replace_connection",
+                log_exception_details=False,
+            )
             ib = None
 
         # Create new IB instance
@@ -431,17 +439,17 @@ async def handle_connect(params: dict) -> dict:
             except AttributeError:
                 # client.serverVersion() not available yet - handshake incomplete
                 pass
-            except (ConnectionError, OSError) as e:
+            except (ConnectionError, OSError):
                 # Connection-related errors during handshake
                 print(
-                    f"DEBUG: serverVersion() connection error: {e}",
+                    "DEBUG: serverVersion() connection error",
                     file=sys.stderr,
                     flush=True,
                 )
             except Exception as e:
                 # Unexpected error - log but continue polling
                 print(
-                    f"DEBUG: serverVersion() unexpected error ({type(e).__name__}): {e}",
+                    "DEBUG: serverVersion() unexpected error " f"({type(e).__name__})",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -535,19 +543,30 @@ async def handle_connect(params: dict) -> dict:
         ib = None
         worker_connection_identity = None
 
-        error_text = str(e).lower()
-        if isinstance(e, TimeoutError) or "timeout" in error_text:
+        is_timeout = isinstance(e, TimeoutError) or "timeout" in str(e).lower()
+        if is_timeout:
             gateway_api_down = True
             gateway_failure_detail = (
                 "Handshake timed out at "
                 f"{datetime.utcnow().isoformat()}Z. Restart IB Gateway before retrying."
             )
 
+        # Broker/client exceptions can contain account identifiers or other
+        # connection secrets. The diagnostic transport needs only a stable
+        # classification; never serialize the exception text or traceback.
+        if is_timeout:
+            safe_error = "Diagnostic broker connection timed out"
+            safe_error_type = "TimeoutError"
+        elif isinstance(e, (ConnectionError, OSError)):
+            safe_error = "Diagnostic broker connection failed"
+            safe_error_type = "ConnectionError"
+        else:
+            safe_error = "Diagnostic broker connection failed"
+            safe_error_type = "BrokerConnectionError"
         return {
             "status": "error",
-            "error": str(e),
-            "error_type": type(e).__name__,
-            "traceback": traceback.format_exc(),
+            "error": safe_error,
+            "error_type": safe_error_type,
             "requires_restart": gateway_api_down,
             "detail": gateway_failure_detail if gateway_api_down else "",
         }
@@ -827,11 +846,13 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
             acctCode=account,
             time=execution_filter_time,
         )
-        fills = await ib.reqExecutionsAsync(execution_filter)
         # The wire filter has no upper-bound field. Capture a broker-clock
-        # upper bound immediately after the response rather than extending the
-        # evidence window to the much later snapshot retrieval timestamp.
+        # upper bound before issuing the request. A fill can arrive while the
+        # lower-bound-only request is in flight; such a later fill must make
+        # the snapshot fail closed rather than be silently omitted or falsely
+        # claimed as covered by an after-the-fact cutoff.
         execution_window_end = await _request_broker_time()
+        fills = await ib.reqExecutionsAsync(execution_filter)
         if not ib.isConnected():
             raise ConnectionError("Broker disconnected during snapshot collection")
         executions_data = []
@@ -852,6 +873,9 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
             contract_identity = await _qualified_stock_identity(fill.contract)
             execution_time = getattr(execution, "time", None) or getattr(fill, "time", None)
             executed_at = _aware_iso(execution_time)
+            executed_at_value = datetime.fromisoformat(executed_at)
+            if not execution_window_start <= executed_at_value <= execution_window_end:
+                raise ValueError("Broker execution is outside the declared evidence window")
             unavailable = {}
             broker_order_id, reason = _optional_identifier(
                 execution.orderId, "IBKR returned no broker order ID"
@@ -1043,14 +1067,22 @@ async def handle_disconnect() -> dict:
         if ib:
             # Properly disconnect to avoid zombie connections
             print("Disconnecting from IBKR...", file=sys.stderr, flush=True)
-            safe_disconnect(ib)
+            safe_disconnect(
+                ib,
+                context="diagnostic_worker:disconnect",
+                log_exception_details=False,
+            )
             ib = None
         worker_connection_identity = None
 
         return {"status": "success", "data": {"disconnected": True}}
 
-    except Exception as e:
-        return {"status": "error", "error": str(e), "error_type": type(e).__name__}
+    except Exception:
+        return {
+            "status": "error",
+            "error": "Diagnostic broker disconnect failed",
+            "error_type": "BrokerDisconnectionError",
+        }
 
 
 async def handle_ping() -> dict:
@@ -1347,10 +1379,14 @@ async def main():
         if ib is not None:
             print("Disconnecting from IBKR to prevent zombie...", file=sys.stderr, flush=True)
             try:
-                safe_disconnect(ib)
+                safe_disconnect(
+                    ib,
+                    context="diagnostic_worker:shutdown",
+                    log_exception_details=False,
+                )
                 print("Disconnected successfully", file=sys.stderr, flush=True)
-            except Exception as e:
-                print(f"Disconnect error (non-fatal): {e}", file=sys.stderr, flush=True)
+            except Exception:
+                print("Disconnect error (non-fatal)", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

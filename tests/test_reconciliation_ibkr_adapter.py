@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import MappingProxyType, SimpleNamespace
@@ -147,6 +148,18 @@ def test_transport_payload_maps_to_immutable_reconciliation_models():
         snapshot.open_orders[0].unavailable["stop_price"] = "changed"
 
 
+def test_adapter_accepts_worker_canonical_small_fixed_point_and_rejects_exponent():
+    payload = _payload()
+    payload["positions"][0]["quantity"] = "0.00000001"
+
+    snapshot = snapshot_from_transport(payload, expected_account=ACCOUNT)
+    assert snapshot.positions[0].quantity == Decimal("0.00000001")
+
+    payload["positions"][0]["quantity"] = "1E-8"
+    with pytest.raises(BrokerEvidenceError):
+        snapshot_from_transport(payload, expected_account=ACCOUNT)
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -283,6 +296,54 @@ async def test_factory_reaps_worker_when_connect_raises():
         await build_diagnostic_provider(_runtime(), transport_factory=lambda: transport)
 
     assert ACCOUNT not in str(exc_info.value)
+    transport.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_phase", ["start", "connect"])
+async def test_factory_cancellation_reaps_worker_and_propagates(cancel_phase):
+    transport = SimpleNamespace(
+        start=AsyncMock(),
+        connect=AsyncMock(return_value=True),
+        stop=AsyncMock(),
+    )
+    getattr(transport, cancel_phase).side_effect = asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await build_diagnostic_provider(_runtime(), transport_factory=lambda: transport)
+
+    transport.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_factory_cleanup_is_shielded_from_repeated_cancellation():
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def stop():
+        cleanup_started.set()
+        await release_cleanup.wait()
+        cleanup_finished.set()
+
+    transport = SimpleNamespace(
+        start=AsyncMock(side_effect=asyncio.CancelledError),
+        connect=AsyncMock(return_value=True),
+        stop=AsyncMock(side_effect=stop),
+    )
+    task = asyncio.create_task(
+        build_diagnostic_provider(_runtime(), transport_factory=lambda: transport)
+    )
+    await cleanup_started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+
+    release_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert cleanup_finished.is_set()
     transport.stop.assert_awaited_once()
 
 

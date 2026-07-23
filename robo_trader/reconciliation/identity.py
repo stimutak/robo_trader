@@ -208,16 +208,26 @@ def validate_runtime_safety(
     if getattr(contract, "account_alias", None) != expected_alias:
         raise RuntimeSafetyError("runtime account alias does not match the approved account")
 
-    raw_client_id = str(
-        resolved_env.get(
-            "IBKR_RECONCILIATION_CLIENT_ID",
-            resolved_env.get("IBKR_CLIENT_ID", "997"),
+    raw_client_id = str(resolved_env.get("IBKR_RECONCILIATION_CLIENT_ID", "")).strip()
+    if not raw_client_id:
+        raise RuntimeSafetyError(
+            "IBKR_RECONCILIATION_CLIENT_ID is required for the isolated diagnostic session"
         )
-    ).strip()
     try:
         client_id = int(raw_client_id)
     except ValueError as exc:
         raise RuntimeSafetyError("diagnostic broker client ID must be an integer") from exc
+    raw_trading_client_id = str(resolved_env.get("IBKR_CLIENT_ID", "")).strip()
+    try:
+        trading_client_id = int(raw_trading_client_id)
+    except ValueError as exc:
+        raise RuntimeSafetyError("trading broker client ID must be an integer") from exc
+    if not 1 <= trading_client_id <= 999:
+        raise RuntimeSafetyError("trading broker client ID must be between 1 and 999")
+    if client_id == trading_client_id:
+        raise RuntimeSafetyError(
+            "diagnostic broker client ID must be distinct from the trading client ID"
+        )
     diagnostic_connection = DiagnosticConnectionContract(
         host=str(getattr(contract, "ibkr_host", "127.0.0.1")),
         port=4002,

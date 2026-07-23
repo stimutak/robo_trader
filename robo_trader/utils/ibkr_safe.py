@@ -42,7 +42,12 @@ def _call_original_disconnect(ib: Any) -> None:
             disconnect_callable()
 
 
-def safe_disconnect(ib: Optional[Any], *, context: str = "") -> bool:
+def safe_disconnect(
+    ib: Optional[Any],
+    *,
+    context: str = "",
+    log_exception_details: bool = True,
+) -> bool:
     """
     Attempt to disconnect from IBKR without crashing the Gateway.
 
@@ -66,7 +71,10 @@ def safe_disconnect(ib: Optional[Any], *, context: str = "") -> bool:
                 logger.debug("safe_disconnect: connection already closed")
                 return False
         except Exception:  # noqa: BLE001
-            logger.debug("safe_disconnect: unable to confirm connection state", exc_info=True)
+            logger.debug(
+                "safe_disconnect: unable to confirm connection state",
+                exc_info=log_exception_details,
+            )
 
     if not _force_disconnect_enabled():
         location = context or "safe_disconnect"
@@ -82,7 +90,10 @@ def safe_disconnect(ib: Optional[Any], *, context: str = "") -> bool:
         logger.info("Forced ib.disconnect() executed in %s", context or "safe_disconnect")
         return True
     except Exception:  # noqa: BLE001
-        logger.warning("ib.disconnect() raised an exception", exc_info=True)
+        logger.warning(
+            "ib.disconnect() raised an exception",
+            exc_info=log_exception_details,
+        )
         return False
 
 

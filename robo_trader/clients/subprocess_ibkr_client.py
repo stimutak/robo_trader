@@ -66,6 +66,28 @@ _INTERPRETER_PREFIX_ALLOWLIST: tuple[Path, ...] = (
     Path("/Library/Frameworks/Python.framework"),
 )
 
+# The diagnostic worker receives broker connection parameters over its
+# request-correlated stdin transport. It does not need the dashboard, model,
+# database, IBC, or shell environment. Keep only non-secret locale settings
+# required for predictable text/time handling.
+_WORKER_ENV_ALLOWLIST = frozenset(
+    {
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+        # Required by CPython on Windows; harmless and non-secret elsewhere.
+        "SYSTEMROOT",
+        "WINDIR",
+    }
+)
+_WORKER_BOOTSTRAP = (
+    "import runpy,sys;"
+    "root=sys.argv[1];worker=sys.argv[2];"
+    "sys.path.insert(0,root);"
+    "runpy.run_path(worker,run_name='__main__')"
+)
+
 
 def _is_interpreter_path_safe(resolved: Path, project_root: Path) -> bool:
     """Return True if a resolved interpreter path is acceptable for exec."""
@@ -463,13 +485,6 @@ class SubprocessIBKRClient:
         if self._generation:
             await self._stop_unlocked()
 
-        # Find worker script
-        worker_script = Path(__file__).parent / "ibkr_subprocess_worker.py"
-        if not worker_script.exists():
-            raise FileNotFoundError(f"Worker script not found: {worker_script}")
-
-        logger.info("Starting IBKR subprocess worker", script=str(worker_script))
-
         # Start subprocess using the same Python interpreter.
         #
         # SECURITY (IB-M1 + NEW-IB-M1.1):
@@ -488,7 +503,19 @@ class SubprocessIBKRClient:
         # - NEW-IB-M1.1: Project root is now found via marker-file probing
         #   (pyproject.toml / START_TRADER.sh) instead of fragile
         #   parents[2] indexing — this stays correct if the file moves.
-        project_root = _find_project_root(Path(__file__))
+        project_root = _find_project_root(Path(__file__)).resolve()
+        worker_script = (
+            project_root / "robo_trader" / "clients" / "ibkr_subprocess_worker.py"
+        ).resolve(strict=True)
+        try:
+            worker_script.relative_to(project_root)
+        except ValueError as exc:
+            raise RuntimeError("IBKR worker script resolves outside the project root") from exc
+        if not worker_script.is_file():
+            raise FileNotFoundError(f"Worker script not found: {worker_script}")
+
+        logger.info("Starting IBKR subprocess worker", script=str(worker_script))
+
         project_venv_python = project_root / ".venv" / "bin" / "python3"
 
         python_exe = None
@@ -588,14 +615,33 @@ class SubprocessIBKRClient:
         generation: Optional[_WorkerGeneration] = None
         try:
             generation_id = uuid.uuid4().hex
-            worker_env = os.environ.copy()
-            worker_env["ROBOTRADER_WORKER_GENERATION_ID"] = generation_id
+            worker_env = {
+                name: os.environ[name] for name in _WORKER_ENV_ALLOWLIST if name in os.environ
+            }
+            worker_env.update(
+                {
+                    "PYTHONIOENCODING": "utf-8",
+                    "PYTHONSAFEPATH": "1",
+                    "PYTHONUNBUFFERED": "1",
+                    "ROBOTRADER_WORKER_GENERATION_ID": generation_id,
+                }
+            )
             # CRITICAL FIX: Use regular subprocess.Popen with threading instead of
             # asyncio.create_subprocess_exec to avoid event loop starvation in
             # busy async environments
-            # CRITICAL FIX 2: Launch as module with -m to ensure robo_trader/__init__.py
+            # Launch the exact resolved project worker under isolated mode.
+            # ``-I`` ignores PYTHONPATH, the user site, and the inherited current
+            # directory. The fixed bootstrap admits only the verified project
+            # root before executing the verified script path.
             self.process = subprocess.Popen(
-                [python_exe, "-m", "robo_trader.clients.ibkr_subprocess_worker"],
+                [
+                    python_exe,
+                    "-I",
+                    "-c",
+                    _WORKER_BOOTSTRAP,
+                    str(project_root),
+                    str(worker_script),
+                ],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,  # Capture stderr for logging
@@ -603,6 +649,7 @@ class SubprocessIBKRClient:
                 bufsize=1,  # Line buffered
                 close_fds=True,  # Don't inherit file descriptors
                 env=worker_env,
+                cwd=str(project_root),
             )
             generation = _WorkerGeneration(generation_id, self.process)
             generation.debug_log_file = debug_log_file
@@ -893,8 +940,8 @@ class SubprocessIBKRClient:
             ):
                 logger.debug("Sending disconnect command to worker")
                 await self._execute_command_unlocked({"command": "disconnect"}, timeout=5.0)
-        except Exception as e:
-            logger.warning("Disconnect command failed during shutdown", error=str(e))
+        except Exception:
+            logger.warning("Diagnostic broker disconnect failed during worker shutdown")
         finally:
             self._clear_cached_connection_state(generation=generation)
 
@@ -924,8 +971,8 @@ class SubprocessIBKRClient:
                 process.wait()
                 logger.warning("Worker killed via SIGKILL")
 
-            except Exception as e:
-                logger.error("Error during process termination", error=str(e))
+            except Exception:
+                logger.error("Error during diagnostic worker process termination")
                 # Ensure process is dead
                 try:
                     process.kill()
@@ -1098,6 +1145,35 @@ class SubprocessIBKRClient:
                 error_type = response.get("error_type", "IBKRError")
                 detail = response.get("detail") or ""
                 requires_restart = bool(response.get("requires_restart"))
+                if command_name in {"connect", "disconnect"}:
+                    # Treat the worker response as untrusted. Broker connection
+                    # libraries may embed account identifiers or credentials in
+                    # exception text, so neither logs nor raised exceptions may
+                    # reuse the worker's free-form fields.
+                    if command_name == "connect":
+                        allowed_error_types = {
+                            "TimeoutError",
+                            "ConnectionError",
+                            "NotConnectedError",
+                            "GatewayRequiresRestartError",
+                        }
+                        if error_type not in allowed_error_types:
+                            error_type = "BrokerConnectionError"
+                        error_msg = (
+                            "Diagnostic broker connection timed out"
+                            if error_type == "TimeoutError"
+                            else "Diagnostic broker connection failed"
+                        )
+                        detail = (
+                            "Gateway restart required after diagnostic connection failure"
+                            if requires_restart
+                            else ""
+                        )
+                    else:
+                        error_type = "BrokerDisconnectionError"
+                        error_msg = "Diagnostic broker disconnect failed"
+                        detail = ""
+                        requires_restart = False
 
                 logger.error(
                     "Command failed",
@@ -2020,8 +2096,8 @@ class SubprocessIBKRClient:
             logger.info("Disconnecting from IBKR via subprocess")
             try:
                 await self._execute_command_unlocked({"command": "disconnect"}, timeout=5.0)
-            except Exception as e:
-                logger.warning(f"Disconnect command failed, will terminate subprocess: {e}")
+            except Exception:
+                logger.warning("Diagnostic broker disconnect failed; terminating worker subprocess")
             await self._stop_unlocked()
         logger.info("Disconnected from IBKR")
 

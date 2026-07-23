@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 from decimal import Decimal
 from types import MappingProxyType
-from typing import Any, Mapping, Protocol
+from typing import Any, Awaitable, Mapping, Protocol
 
 from robo_trader.clients.subprocess_ibkr_client import SubprocessIBKRClient
 
@@ -18,6 +19,7 @@ from .models import (
     BrokerPosition,
     BrokerSnapshot,
     ContractIdentity,
+    canonical_decimal,
 )
 
 _TOP_LEVEL_KEYS = frozenset(
@@ -152,7 +154,7 @@ def _decimal(value: object, label: str) -> Decimal:
         parsed = Decimal(value)
     except Exception as exc:
         raise BrokerEvidenceError(f"diagnostic broker {label} is invalid") from exc
-    if not parsed.is_finite() or str(parsed) != value:
+    if not parsed.is_finite() or canonical_decimal(parsed) != value:
         raise BrokerEvidenceError(f"diagnostic broker {label} is invalid")
     return parsed
 
@@ -376,6 +378,28 @@ async def _stop_transport_required(
     raise BrokerEvidenceError("diagnostic broker transport cleanup failed") from last_error
 
 
+async def await_cleanup_required(cleanup: Awaitable[None]) -> bool:
+    """Finish required cleanup despite caller cancellation.
+
+    Return whether cancellation arrived while cleanup was shielded so the
+    caller can re-raise it only after the transport is known to be reaped.
+    """
+
+    cleanup_task = asyncio.ensure_future(cleanup)
+    cancellation_received = False
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            cancellation_received = True
+            continue
+    try:
+        cleanup_task.result()
+    except asyncio.CancelledError as exc:
+        raise BrokerEvidenceError("diagnostic broker cleanup was cancelled internally") from exc
+    return cancellation_received
+
+
 async def build_diagnostic_provider(
     runtime: RuntimeSafetyContext,
     *,
@@ -398,13 +422,19 @@ async def build_diagnostic_provider(
         )
         if connected is not True:
             raise BrokerEvidenceError("diagnostic broker connection was not established")
-    except Exception as exc:
+    except BaseException as exc:
         try:
-            await _stop_transport_required(transport)
+            cleanup_cancelled = await await_cleanup_required(_stop_transport_required(transport))
         except Exception as cleanup_exc:
             raise BrokerEvidenceError(
                 "diagnostic broker provider initialization cleanup failed"
             ) from cleanup_exc
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        if not isinstance(exc, Exception):
+            raise
+        if cleanup_cancelled:
+            raise asyncio.CancelledError
         raise BrokerEvidenceError("diagnostic broker provider initialization failed") from exc
     return IBKRDiagnosticSnapshotProvider(
         transport,

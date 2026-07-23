@@ -46,7 +46,10 @@ _REQUIRED_COLUMNS = {
 
 def validate_portfolio_ids(values: Iterable[str]) -> tuple[str, ...]:
     normalized = tuple(str(value).strip().lower() for value in values)
-    if not normalized or any(not _PORTFOLIO_ID.fullmatch(value) for value in normalized):
+    if not normalized or any(
+        not _PORTFOLIO_ID.fullmatch(value) or _ACCOUNT_FRAGMENT.search(value)
+        for value in normalized
+    ):
         raise LedgerSafetyError("one or more explicit portfolio IDs are invalid")
     if len(normalized) != len(set(normalized)):
         raise LedgerSafetyError("portfolio IDs must be unique")
@@ -194,7 +197,12 @@ class ImmutableLedgerReader:
                 ORDER BY portfolio_id
                 """).fetchall()
             known = tuple(str(row[0]) for row in known_rows)
-            if any(not _PORTFOLIO_ID.fullmatch(value) or value != value.lower() for value in known):
+            if any(
+                not _PORTFOLIO_ID.fullmatch(value)
+                or value != value.lower()
+                or _ACCOUNT_FRAGMENT.search(value)
+                for value in known
+            ):
                 raise LedgerSafetyError("ledger contains ambiguous portfolio identity")
             missing = sorted(set(selected) - set(known))
             if missing:

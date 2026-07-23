@@ -24,7 +24,7 @@ from .errors import (
     ReconciliationError,
     RuntimeSafetyError,
 )
-from .ibkr_adapter import diagnostic_provider_factory
+from .ibkr_adapter import await_cleanup_required, diagnostic_provider_factory
 from .identity import resolve_environment, validate_runtime_safety
 from .integrity import EvidenceIntegrityGuard, protected_evidence_paths
 from .ledger import ImmutableLedgerReader, validate_portfolio_ids
@@ -75,42 +75,57 @@ async def run_reconciliation(
 ) -> ReconciliationReport:
     """Run all local gates before constructing a broker provider."""
     selected = validate_portfolio_ids(portfolio_ids)
-    resolved_env = resolve_environment(project_root, process_environ)
-    evidence_paths = protected_evidence_paths(project_root, resolved_env)
-    with EvidenceIntegrityGuard(evidence_paths):
-        runtime = validate_runtime_safety(project_root, resolved_env)
-        contract = runtime.runtime_contract
-        reader = ImmutableLedgerReader(project_root, str(contract.database_path))
-        ledger = reader.read(selected)
+    env_path = project_root / ".env"
+    # Guard the path itself before resolving or parsing it. Symlinked .env files
+    # are rejected outright: resolving the target before the guard starts would
+    # leave a race where the link could be swapped and an untracked target parsed.
+    with EvidenceIntegrityGuard((env_path,)) as env_guard:
+        if env_path.is_symlink():
+            raise IntegrityViolation("runtime environment file must not be a symlink")
+        resolved_env = resolve_environment(project_root, process_environ)
+        env_guard.verify_unchanged()
+        evidence_paths = protected_evidence_paths(project_root, resolved_env)
+        with EvidenceIntegrityGuard(evidence_paths):
+            env_guard.verify_unchanged()
+            runtime = validate_runtime_safety(project_root, resolved_env)
+            contract = runtime.runtime_contract
+            reader = ImmutableLedgerReader(project_root, str(contract.database_path))
+            ledger = reader.read(selected)
 
-        provider: Optional[BrokerSnapshotProvider] = None
-        try:
-            provider = await _build_provider(provider_factory, runtime)
-            assert_read_only_provider_surface(provider)
-            snapshot = await asyncio.wait_for(
-                provider.get_broker_snapshot(
-                    runtime.expected_account_for_provider,
-                    max_age_seconds=30.0,
-                ),
-                timeout=60.0,
+            provider: Optional[BrokerSnapshotProvider] = None
+            try:
+                provider = await _build_provider(provider_factory, runtime)
+                assert_read_only_provider_surface(provider)
+                snapshot = await asyncio.wait_for(
+                    provider.get_broker_snapshot(
+                        runtime.expected_account_for_provider,
+                        max_age_seconds=30.0,
+                    ),
+                    timeout=60.0,
+                )
+            except Exception as exc:
+                raise BrokerEvidenceError("broker evidence collection failed") from exc
+            finally:
+                if provider is not None:
+                    try:
+                        cleanup_cancelled = await await_cleanup_required(
+                            asyncio.wait_for(provider.close(), timeout=10.0)
+                        )
+                    except Exception as exc:
+                        raise BrokerEvidenceError(
+                            "broker diagnostic transport cleanup failed"
+                        ) from exc
+                    if cleanup_cancelled:
+                        raise asyncio.CancelledError
+
+            return reconcile(
+                snapshot,
+                ledger,
+                runtime_fingerprint=str(contract.fingerprint),
+                database_identity=str(contract.database_identity),
+                expected_account_alias=runtime.account_alias,
+                now=now or datetime.now(timezone.utc),
             )
-        except Exception as exc:
-            raise BrokerEvidenceError("broker evidence collection failed") from exc
-        finally:
-            if provider is not None:
-                try:
-                    await asyncio.wait_for(provider.close(), timeout=10.0)
-                except Exception as exc:
-                    raise BrokerEvidenceError("broker diagnostic transport cleanup failed") from exc
-
-        return reconcile(
-            snapshot,
-            ledger,
-            runtime_fingerprint=str(contract.fingerprint),
-            database_identity=str(contract.database_identity),
-            expected_account_alias=runtime.account_alias,
-            now=now or datetime.now(timezone.utc),
-        )
 
 
 def _human_output(report: ReconciliationReport) -> str:

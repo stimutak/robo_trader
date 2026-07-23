@@ -183,17 +183,20 @@ async def test_worker_reported_timeout_poisons_exact_generation_for_every_comman
 
 
 @pytest.mark.asyncio
-async def test_worker_reported_gateway_timeout_preserves_both_recovery_signals():
+async def test_worker_reported_gateway_timeout_preserves_both_sanitized_recovery_signals():
+    raw_error = "handshake timeout DU_RAW_ACCOUNT"
+    raw_detail = "restart Gateway DU_RAW_ACCOUNT"
+
     def handler(process, request):
         _feed(
             process,
             _response(
                 request,
                 status="error",
-                error="handshake timeout sentinel",
+                error=raw_error,
                 error_type="TimeoutError",
                 requires_restart=True,
-                detail="restart Gateway diagnostic sentinel",
+                detail=raw_detail,
             ),
         )
 
@@ -201,15 +204,18 @@ async def test_worker_reported_gateway_timeout_preserves_both_recovery_signals()
 
     with pytest.raises(
         IBKRTimeoutRequiresGatewayRestartError,
-        match="restart Gateway diagnostic sentinel",
     ) as caught:
         await client._execute_command({"command": "connect"})
 
     assert isinstance(caught.value, IBKRTimeoutError)
     assert isinstance(caught.value, GatewayRequiresRestartError)
+    assert raw_error not in str(caught.value)
+    assert raw_detail not in str(caught.value)
+    assert "Gateway restart required" in str(caught.value)
     assert generation.poisoned_reason is not None
-    assert "handshake timeout sentinel" in generation.poisoned_reason
-    assert "restart Gateway diagnostic sentinel" in generation.poisoned_reason
+    assert raw_error not in generation.poisoned_reason
+    assert raw_detail not in generation.poisoned_reason
+    assert "Diagnostic broker connection timed out" in generation.poisoned_reason
 
 
 @pytest.mark.asyncio
@@ -1220,7 +1226,11 @@ async def test_worker_refuses_active_connect_and_cleans_stale_instance(monkeypat
     stale = Existing(False)
     disconnected = []
     monkeypatch.setattr(worker, "ib", stale)
-    monkeypatch.setattr(worker, "safe_disconnect", lambda value: disconnected.append(value))
+    monkeypatch.setattr(
+        worker,
+        "safe_disconnect",
+        lambda value, **_kwargs: disconnected.append(value),
+    )
     monkeypatch.setattr(
         worker,
         "IB",

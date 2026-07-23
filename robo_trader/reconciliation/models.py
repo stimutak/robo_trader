@@ -13,6 +13,7 @@ from .errors import BrokerEvidenceError
 
 _SYMBOL = re.compile(r"^[A-Z]{1,5}(?:\.[A-Z]{1,2})?$")
 _TEXT_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_PORTFOLIO_ID = re.compile(r"^[a-z0-9_-]{1,64}$")
 _ACCOUNT_SHAPED = re.compile(r"^(?:DU|U)\d+$", re.IGNORECASE)
 _ACCOUNT_FRAGMENT = re.compile(r"(?:DU|U)\d{4,}", re.IGNORECASE)
 
@@ -27,6 +28,29 @@ def _safe_text(value: object, field_name: str, *, max_length: int = 128) -> str:
     ):
         raise BrokerEvidenceError(f"{field_name} is invalid or contains sensitive identity")
     return text
+
+
+def _safe_portfolio_id(value: object, field_name: str) -> str:
+    text = str(value).strip()
+    if text != text.lower() or not _PORTFOLIO_ID.fullmatch(text) or _ACCOUNT_FRAGMENT.search(text):
+        raise BrokerEvidenceError(f"{field_name} is invalid or contains sensitive identity")
+    return text
+
+
+def _assert_public_safe(value: object, field_name: str) -> None:
+    """Reject account-shaped text before it can reach a public report."""
+    if isinstance(value, str):
+        if _ACCOUNT_FRAGMENT.search(value):
+            raise BrokerEvidenceError(f"{field_name} contains sensitive identity")
+        return
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            _assert_public_safe(str(key), field_name)
+            _assert_public_safe(nested, field_name)
+        return
+    if isinstance(value, (list, tuple)):
+        for nested in value:
+            _assert_public_safe(nested, field_name)
 
 
 def finite_decimal(value: Any, field_name: str) -> Decimal:
@@ -76,12 +100,14 @@ class ContractIdentity:
             raise BrokerEvidenceError(
                 "broker contract is not an explicitly qualified SMART/USD stock"
             )
-        if not _TEXT_ID.fullmatch(self.primary_exchange.strip()) or not _TEXT_ID.fullmatch(
-            self.trading_class.strip()
-        ):
+        primary_exchange = _safe_text(self.primary_exchange, "broker contract primary exchange")
+        trading_class = _safe_text(self.trading_class, "broker contract trading class")
+        if not _TEXT_ID.fullmatch(primary_exchange) or not _TEXT_ID.fullmatch(trading_class):
             raise BrokerEvidenceError("broker contract identity is incomplete")
         object.__setattr__(self, "symbol", symbol)
         object.__setattr__(self, "local_symbol", symbol)
+        object.__setattr__(self, "primary_exchange", primary_exchange)
+        object.__setattr__(self, "trading_class", trading_class)
 
     def public_dict(self) -> dict[str, object]:
         return {
@@ -205,10 +231,10 @@ class BrokerExecution:
     unavailable: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not _TEXT_ID.fullmatch(self.execution_id.strip()) or _ACCOUNT_SHAPED.fullmatch(
-            self.execution_id.strip()
-        ):
+        execution_id = _safe_text(self.execution_id, "broker execution identity")
+        if not _TEXT_ID.fullmatch(execution_id) or _ACCOUNT_SHAPED.fullmatch(execution_id):
             raise BrokerEvidenceError("broker execution identity is incomplete")
+        object.__setattr__(self, "execution_id", execution_id)
         if self.order_id is not None and (not self.order_id.isdigit() or len(self.order_id) > 20):
             raise BrokerEvidenceError("broker execution order identity is invalid")
         quantity = finite_decimal(self.quantity, "broker execution quantity")
@@ -352,6 +378,15 @@ class LedgerPosition:
     def __post_init__(self) -> None:
         object.__setattr__(
             self,
+            "portfolio_id",
+            _safe_portfolio_id(self.portfolio_id, "ledger portfolio identity"),
+        )
+        symbol = self.symbol.strip().upper()
+        if self.symbol != symbol or not _SYMBOL.fullmatch(symbol):
+            raise BrokerEvidenceError("ledger position symbol identity is invalid")
+        object.__setattr__(self, "symbol", symbol)
+        object.__setattr__(
+            self,
             "timestamp",
             aware_datetime(self.timestamp, "ledger position timestamp"),
         )
@@ -379,6 +414,15 @@ class LedgerTrade:
     def __post_init__(self) -> None:
         object.__setattr__(
             self,
+            "portfolio_id",
+            _safe_portfolio_id(self.portfolio_id, "ledger portfolio identity"),
+        )
+        symbol = self.symbol.strip().upper()
+        if self.symbol != symbol or not _SYMBOL.fullmatch(symbol):
+            raise BrokerEvidenceError("ledger trade symbol identity is invalid")
+        object.__setattr__(self, "symbol", symbol)
+        object.__setattr__(
+            self,
             "timestamp",
             aware_datetime(self.timestamp, "ledger trade timestamp"),
         )
@@ -394,6 +438,20 @@ class LedgerSnapshot:
     recent_trades: tuple[LedgerTrade, ...]
     blockers: tuple[str, ...] = ()
     caveats: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "selected_portfolio_ids",
+            "known_portfolio_ids",
+            "active_portfolio_ids",
+        ):
+            values = tuple(
+                _safe_portfolio_id(value, f"ledger {field_name}")
+                for value in getattr(self, field_name)
+            )
+            object.__setattr__(self, field_name, values)
+        _assert_public_safe(self.blockers, "ledger blockers")
+        _assert_public_safe(self.caveats, "ledger caveats")
 
 
 @dataclass(frozen=True)
@@ -423,6 +481,17 @@ class NonComparableEvidence:
     details: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        evidence_type = _safe_text(self.evidence_type, "evidence type")
+        broker_identifier = _safe_text(self.broker_identifier, "broker evidence identity")
+        symbol = self.symbol.strip().upper()
+        status = _safe_text(self.status, "evidence status")
+        reason = _safe_text(self.reason, "evidence reason")
+        if not _TEXT_ID.fullmatch(evidence_type) or not _TEXT_ID.fullmatch(broker_identifier):
+            raise BrokerEvidenceError("non-comparable evidence identity is invalid")
+        if self.symbol != symbol or not _SYMBOL.fullmatch(symbol):
+            raise BrokerEvidenceError("non-comparable evidence symbol is invalid")
+        _assert_public_safe(self.details, "non-comparable evidence details")
+
         def freeze(value: object) -> object:
             if isinstance(value, Mapping):
                 return MappingProxyType({str(key): freeze(nested) for key, nested in value.items()})
@@ -433,6 +502,11 @@ class NonComparableEvidence:
         frozen_details = freeze(self.details)
         if not isinstance(frozen_details, Mapping):
             raise BrokerEvidenceError("non-comparable evidence details are invalid")
+        object.__setattr__(self, "evidence_type", evidence_type)
+        object.__setattr__(self, "broker_identifier", broker_identifier)
+        object.__setattr__(self, "symbol", symbol)
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "reason", reason)
         object.__setattr__(self, "details", frozen_details)
 
 
@@ -453,6 +527,39 @@ class ReconciliationReport:
     ledger_snapshot: LedgerSnapshot
     mutated_state: bool = False
     authorizes_startup: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "generated_at",
+            aware_datetime(self.generated_at, "reconciliation report timestamp"),
+        )
+        runtime_fingerprint = _safe_text(
+            self.runtime_fingerprint, "runtime fingerprint", max_length=256
+        )
+        database_identity = _safe_text(self.database_identity, "database identity", max_length=256)
+        selected_portfolio_ids = tuple(
+            _safe_portfolio_id(value, "selected portfolio identity")
+            for value in self.selected_portfolio_ids
+        )
+        if self.status not in {
+            "BLOCKED",
+            "INCOMPLETE",
+            "MISMATCH",
+            "QUANTITY_COST_COMPARABLE_ONLY",
+        }:
+            raise BrokerEvidenceError("reconciliation report status is invalid")
+        if (
+            not self.account_alias.startswith("***")
+            or len(self.account_alias) > 7
+            or _ACCOUNT_FRAGMENT.search(self.account_alias)
+        ):
+            raise BrokerEvidenceError("reconciliation account alias is not masked")
+        _assert_public_safe(self.blockers, "reconciliation blockers")
+        _assert_public_safe(self.caveats, "reconciliation caveats")
+        object.__setattr__(self, "runtime_fingerprint", runtime_fingerprint)
+        object.__setattr__(self, "database_identity", database_identity)
+        object.__setattr__(self, "selected_portfolio_ids", selected_portfolio_ids)
 
     def public_dict(self) -> dict[str, object]:
         def position_dict(item: PositionComparison) -> dict[str, object]:

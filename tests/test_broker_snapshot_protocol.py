@@ -1,4 +1,5 @@
 import copy
+import json
 import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -10,12 +11,14 @@ from robo_trader.clients import ibkr_subprocess_worker as worker
 from robo_trader.clients import subprocess_ibkr_client as client_module
 from robo_trader.clients.subprocess_ibkr_client import (
     BrokerSnapshotAccountMismatchError,
+    IBKRError,
     IBKRTimeoutError,
     IBKRTransportPoisonedError,
     SubprocessCrashError,
     SubprocessIBKRClient,
     _WorkerGeneration,
 )
+from robo_trader.utils import ibkr_safe
 
 ACCOUNT = "DU_TEST_ACCOUNT"
 NOW = datetime.now(timezone.utc)
@@ -214,7 +217,7 @@ async def test_worker_snapshot_is_fresh_atomic_read_only_and_precise(fake_ib):
     assert "reqAllOpenOrdersAsync" in fake_ib.calls
     assert "reqExecutionsAsync" in fake_ib.calls
     execution_request_index = fake_ib.calls.index("reqExecutionsAsync")
-    assert fake_ib.calls[execution_request_index + 1] == "reqCurrentTimeAsync"
+    assert fake_ib.calls[execution_request_index - 1] == "reqCurrentTimeAsync"
     assert not any(
         token in call.lower()
         for call in fake_ib.calls
@@ -362,6 +365,27 @@ async def test_worker_rejects_cross_account_execution(fake_ib, monkeypatch):
     assert result["status"] == worker.PROTOCOL_ERROR_STATUS
     assert result["error_type"] == worker.PROTOCOL_ERROR_TYPE
     assert "DU_WRONG_ACCOUNT" not in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_worker_rejects_execution_after_pre_request_cutoff(fake_ib, monkeypatch):
+    original = fake_ib.reqExecutionsAsync
+
+    async def execution_after_cutoff(execution_filter):
+        fills = await original(execution_filter)
+        fills[0].execution.time = NOW + timedelta(days=1)
+        fills[0].time = NOW + timedelta(days=1)
+        return fills
+
+    monkeypatch.setattr(fake_ib, "reqExecutionsAsync", execution_after_cutoff)
+
+    result = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert result == {
+        "status": worker.PROTOCOL_ERROR_STATUS,
+        "error": "Broker snapshot collection failed",
+        "error_type": worker.PROTOCOL_ERROR_TYPE,
+    }
 
 
 @pytest.mark.asyncio
@@ -607,6 +631,138 @@ async def test_worker_snapshot_account_mismatch_is_safely_classified_and_poisone
     assert ACCOUNT not in str(exc_info.value)
     assert "DU_EXPECTED_SECRET" not in str(exc_info.value)
     assert generation.poisoned_reason == ("worker-reported broker snapshot account mismatch")
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_connect_failure_is_redacted_at_worker_and_parent(
+    monkeypatch,
+    capsys,
+    caplog,
+):
+    raw_identity = "DU1234567"
+
+    class LeakyConnectIB:
+        async def connectAsync(self, **_kwargs):
+            raise RuntimeError(f"broker rejected account {raw_identity}")
+
+    monkeypatch.setattr(worker, "IB", LeakyConnectIB)
+    monkeypatch.setattr(worker, "ib", None)
+    monkeypatch.setattr(worker, "gateway_api_down", False)
+    monkeypatch.setattr(worker, "gateway_failure_detail", "")
+
+    worker_response = await worker.handle_connect(
+        {
+            "host": "127.0.0.1",
+            "port": 4002,
+            "client_id": 7,
+            "readonly": True,
+            "timeout": 1.0,
+        }
+    )
+
+    serialized = json.dumps(worker_response)
+    assert raw_identity not in serialized
+    assert raw_identity not in capsys.readouterr().err
+    assert "traceback" not in worker_response
+    assert worker_response["error"] == "Diagnostic broker connection failed"
+
+    # Defense in depth: even an older or compromised worker response containing
+    # free-form sensitive text must be sanitized again by the parent.
+    worker_response["error"] = f"broker rejected account {raw_identity}"
+    worker_response["traceback"] = f"trace included {raw_identity}"
+    client, _generation = _transport_response_client(worker_response)
+    with pytest.raises(IBKRError) as exc_info:
+        await client._execute_command_unlocked({"command": "connect"})
+
+    assert raw_identity not in str(exc_info.value)
+    assert raw_identity not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_disconnect_failure_is_redacted_at_worker_and_parent(
+    monkeypatch,
+    capsys,
+    caplog,
+):
+    raw_identity = "DU_DISCONNECT_SECRET"
+
+    class ConnectedIB:
+        pass
+
+    monkeypatch.setattr(worker, "ib", ConnectedIB())
+    monkeypatch.setattr(
+        worker,
+        "safe_disconnect",
+        Mock(side_effect=RuntimeError(f"disconnect account {raw_identity}")),
+    )
+
+    worker_response = await worker.handle_disconnect()
+
+    assert worker_response == {
+        "status": "error",
+        "error": "Diagnostic broker disconnect failed",
+        "error_type": "BrokerDisconnectionError",
+    }
+    assert raw_identity not in json.dumps(worker_response)
+    assert raw_identity not in capsys.readouterr().err
+
+    # Treat disconnect responses as untrusted even if an older or compromised
+    # worker serializes a raw broker exception.
+    worker_response["error"] = f"disconnect account {raw_identity}"
+    worker_response["error_type"] = f"Leaky{raw_identity}"
+    worker_response["detail"] = f"detail {raw_identity}"
+    client, _generation = _transport_response_client(worker_response)
+    with pytest.raises(IBKRError) as exc_info:
+        await client._execute_command_unlocked({"command": "disconnect"})
+
+    assert raw_identity not in str(exc_info.value)
+    assert raw_identity not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_disconnect_real_helper_suppresses_exception_details(
+    monkeypatch,
+    capsys,
+    caplog,
+):
+    raw_identity = "DU123456789"
+
+    class ConnectedIB:
+        def isConnected(self):
+            return True
+
+        def disconnect(self):
+            return None
+
+    def leaky_disconnect(_ib):
+        raise RuntimeError(f"disconnect failed for account {raw_identity}")
+
+    connected_ib = ConnectedIB()
+    monkeypatch.setattr(worker, "ib", connected_ib)
+    monkeypatch.setattr(ibkr_safe, "_call_original_disconnect", leaky_disconnect)
+
+    worker_response = await worker.handle_disconnect()
+
+    assert worker_response == {"status": "success", "data": {"disconnected": True}}
+    assert raw_identity not in capsys.readouterr().err
+    assert raw_identity not in caplog.text
+    assert "ib.disconnect() raised an exception" in caplog.text
+
+
+def test_worker_exit_cleanup_stderr_redacts_disconnect_exception(monkeypatch, capsys):
+    raw_identity = "DU_EXIT_SECRET"
+    monkeypatch.setattr(worker, "ib", object())
+    monkeypatch.setattr(
+        worker,
+        "safe_disconnect",
+        Mock(side_effect=RuntimeError(f"cleanup account {raw_identity}")),
+    )
+
+    worker._cleanup_on_exit()
+
+    stderr = capsys.readouterr().err
+    assert raw_identity not in stderr
+    assert "Disconnect error" in stderr
 
 
 @pytest.mark.asyncio

@@ -10,7 +10,10 @@ from robo_trader.reconciliation.integrity import (
     EvidenceIntegrityGuard,
     protected_evidence_paths,
 )
-from robo_trader.reconciliation.ledger import ImmutableLedgerReader
+from robo_trader.reconciliation.ledger import (
+    ImmutableLedgerReader,
+    validate_portfolio_ids,
+)
 
 
 def _create_ledger(path: Path) -> None:
@@ -213,6 +216,21 @@ def test_reader_rejects_missing_schema_and_unknown_portfolio(tmp_path):
     _create_ledger(database)
     with pytest.raises(LedgerSafetyError, match="do not exist"):
         ImmutableLedgerReader(tmp_path, "ledger.db").read(["unknown"])
+
+
+def test_portfolio_identity_rejects_account_shaped_selected_and_stored_values(tmp_path):
+    with pytest.raises(LedgerSafetyError, match="portfolio IDs are invalid"):
+        validate_portfolio_ids(["du1234567"])
+
+    database = tmp_path / "ledger.db"
+    _create_ledger(database)
+    connection = sqlite3.connect(database)
+    connection.execute("INSERT INTO account VALUES ('desk-du1234567', 1000, 1000)")
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(LedgerSafetyError, match="ambiguous portfolio identity"):
+        ImmutableLedgerReader(tmp_path, "ledger.db").read(["default"])
 
 
 def test_evidence_guard_detects_content_appearance_and_disappearance(tmp_path):

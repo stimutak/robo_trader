@@ -39,6 +39,20 @@ _ORDER_CAPABILITY_NAMES = frozenset(
         "cancelOrder",
         "cancel_all_orders",
         "cancelAllOrders",
+        "modify_order",
+        "modifyOrder",
+        "replace_order",
+        "replaceOrder",
+        "cancel_replace_order",
+        "cancelReplaceOrder",
+        "exercise_option",
+        "exerciseOption",
+        "exercise_options",
+        "exerciseOptions",
+        "global_cancel",
+        "globalCancel",
+        "req_global_cancel",
+        "reqGlobalCancel",
     }
 )
 

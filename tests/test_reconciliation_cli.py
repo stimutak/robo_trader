@@ -1,22 +1,31 @@
+import asyncio
 import hashlib
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
+from robo_trader.reconciliation import cli as cli_module
 from robo_trader.reconciliation.cli import (
     EXIT_BLOCKED,
     EXIT_CLEAN_QUANTITY_COST,
+    EXIT_INTEGRITY_VIOLATION,
     build_parser,
     main,
+    run_reconciliation,
 )
 from robo_trader.reconciliation.identity import (
     mask_account_identifier,
     validate_runtime_safety,
 )
 from robo_trader.reconciliation.models import (
+    BrokerExecution,
     BrokerExecutionScope,
+    BrokerOpenOrder,
     BrokerPosition,
     BrokerSnapshot,
     ContractIdentity,
@@ -71,6 +80,8 @@ def _project(tmp_path: Path, *, valid_ibc: bool = True):
         "IBKR_HOST": "127.0.0.1",
         "IBKR_PORT": "4002",
         "IBKR_READONLY": "true",
+        "IBKR_CLIENT_ID": "7",
+        "IBKR_RECONCILIATION_CLIENT_ID": "997",
         "IBKR_ACCOUNT": RAW_ACCOUNT,
         "IBKR_APPROVED_ACCOUNTS": RAW_ACCOUNT,
         "IBKR_ACCOUNT_TYPE": "paper",
@@ -167,6 +178,66 @@ def test_invalid_ibc_blocks_before_provider_construction(tmp_path, capsys):
     output = capsys.readouterr().out
     assert RAW_ACCOUNT not in output
     payload = json.loads(output)
+    assert payload["mutated_state"] is False
+    assert payload["authorizes_startup"] is False
+
+
+def test_env_change_during_resolution_blocks_before_provider(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    _, env = _project(tmp_path)
+    constructed = []
+    real_resolve = cli_module.resolve_environment
+
+    def resolve_then_replace(project_root, process_environ):
+        resolved = real_resolve(project_root, process_environ)
+        (project_root / ".env").write_text("RT_DB_PATH=other.db\n")
+        return resolved
+
+    monkeypatch.setattr(cli_module, "resolve_environment", resolve_then_replace)
+    result = main(
+        ["--portfolio-id", "default", "--json"],
+        project_root=tmp_path,
+        process_environ=env,
+        provider_factory=lambda runtime: constructed.append(runtime),
+        now=NOW,
+    )
+
+    assert result == EXIT_INTEGRITY_VIOLATION
+    assert constructed == []
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error_code"] == "INTEGRITY_VIOLATION"
+    assert payload["mutated_state"] is False
+    assert payload["authorizes_startup"] is False
+
+
+def test_symlinked_env_is_rejected_before_parsing_or_provider_construction(
+    tmp_path,
+    capsys,
+):
+    _, env = _project(tmp_path)
+    raw_target = tmp_path / f"environment-{RAW_ACCOUNT}"
+    raw_target.write_text("RT_DB_PATH=other.db\n")
+    (tmp_path / ".env").symlink_to(raw_target)
+    constructed = []
+
+    result = main(
+        ["--portfolio-id", "default", "--json"],
+        project_root=tmp_path,
+        process_environ=env,
+        provider_factory=lambda runtime: constructed.append(runtime),
+        now=NOW,
+    )
+
+    assert result == EXIT_INTEGRITY_VIOLATION
+    assert constructed == []
+    output = capsys.readouterr().out
+    assert RAW_ACCOUNT not in output
+    payload = json.loads(output)
+    assert payload["error_code"] == "INTEGRITY_VIOLATION"
+    assert payload["message"] == "runtime environment file must not be a symlink"
     assert payload["mutated_state"] is False
     assert payload["authorizes_startup"] is False
 
@@ -281,6 +352,144 @@ def test_success_is_non_mutating_masks_account_and_closes_provider(tmp_path, cap
     assert payload["status"] == "QUANTITY_COST_COMPARABLE_ONLY"
 
 
+@pytest.mark.parametrize(
+    ("evidence_kind", "expected_status"),
+    [("open_order", "BLOCKED"), ("recent_execution", "INCOMPLETE")],
+)
+def test_unmatched_broker_activity_never_returns_success(
+    tmp_path,
+    capsys,
+    evidence_kind,
+    expected_status,
+):
+    _, env = _project(tmp_path)
+    snapshot = _broker_snapshot()
+    contract = snapshot.positions[0].contract
+    if evidence_kind == "open_order":
+        snapshot = replace(
+            snapshot,
+            open_orders=(
+                BrokerOpenOrder(
+                    order_id="101",
+                    client_id=7,
+                    contract=contract,
+                    side="BUY",
+                    quantity=Decimal("1"),
+                    filled=Decimal("0"),
+                    remaining=Decimal("1"),
+                    order_type="LMT",
+                    status="Submitted",
+                    limit_price=Decimal("99"),
+                    time_in_force="DAY",
+                    last_status_at=NOW,
+                ),
+            ),
+        )
+    else:
+        snapshot = replace(
+            snapshot,
+            recent_executions=(
+                BrokerExecution(
+                    execution_id="exec-101",
+                    order_id="101",
+                    contract=contract,
+                    side="BUY",
+                    quantity=Decimal("1"),
+                    price=Decimal("99"),
+                    executed_at=NOW - timedelta(minutes=1),
+                    client_id=7,
+                    execution_exchange="NASDAQ",
+                ),
+            ),
+        )
+
+    result = main(
+        ["--portfolio-id", "default", "--json"],
+        project_root=tmp_path,
+        process_environ=env,
+        provider_factory=lambda runtime: FakeProvider(snapshot),
+        now=NOW,
+    )
+
+    assert result == EXIT_BLOCKED
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == expected_status
+    assert payload["authorizes_startup"] is False
+
+
+@pytest.mark.asyncio
+async def test_snapshot_cancellation_closes_provider_before_propagating(tmp_path):
+    _, env = _project(tmp_path)
+    snapshot_started = asyncio.Event()
+    closed = asyncio.Event()
+
+    class CancellableProvider(FakeProvider):
+        async def get_broker_snapshot(self, expected_account, *, max_age_seconds):
+            del expected_account, max_age_seconds
+            snapshot_started.set()
+            await asyncio.Event().wait()
+
+        async def close(self):
+            self.closed = True
+            closed.set()
+
+    provider = CancellableProvider(_broker_snapshot())
+    task = asyncio.create_task(
+        run_reconciliation(
+            ["default"],
+            project_root=tmp_path,
+            process_environ=env,
+            provider_factory=lambda runtime: provider,
+            now=NOW,
+        )
+    )
+    await snapshot_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert closed.is_set()
+    assert provider.closed is True
+
+
+@pytest.mark.asyncio
+async def test_provider_close_is_shielded_from_cancellation(tmp_path):
+    _, env = _project(tmp_path)
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    close_finished = asyncio.Event()
+
+    class SlowCloseProvider(FakeProvider):
+        async def close(self):
+            close_started.set()
+            await release_close.wait()
+            self.closed = True
+            close_finished.set()
+
+    provider = SlowCloseProvider(_broker_snapshot())
+    task = asyncio.create_task(
+        run_reconciliation(
+            ["default"],
+            project_root=tmp_path,
+            process_environ=env,
+            provider_factory=lambda runtime: provider,
+            now=NOW,
+        )
+    )
+    await close_started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+
+    release_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert close_finished.is_set()
+    assert provider.closed is True
+
+
 def test_provider_error_is_redacted_and_cleanup_runs(tmp_path, capsys):
     _, env = _project(tmp_path)
     provider = FakeProvider(error=RuntimeError(f"credential {RAW_ACCOUNT} secret"))
@@ -301,14 +510,38 @@ def test_provider_error_is_redacted_and_cleanup_runs(tmp_path, capsys):
     assert json.loads(output)["error_code"] == "BROKER_EVIDENCE_BLOCK"
 
 
-def test_provider_with_order_capability_is_rejected_without_calling_it(tmp_path, capsys):
+@pytest.mark.parametrize(
+    "capability",
+    [
+        "place_order",
+        "cancel_order",
+        "modify_order",
+        "replace_order",
+        "exercise_options",
+        "globalCancel",
+        "req_global_cancel",
+        "reqGlobalCancel",
+    ],
+)
+def test_provider_with_order_capability_is_rejected_without_calling_it(
+    tmp_path,
+    capsys,
+    capability,
+):
     _, env = _project(tmp_path)
+    env.update(
+        {
+            "IBKR_CLIENT_ID": "1",
+            "IBKR_RECONCILIATION_CLIENT_ID": "71",
+        }
+    )
 
-    class UnsafeProvider(FakeProvider):
-        def place_order(self):
-            raise AssertionError("must never be called")
+    provider = FakeProvider(_broker_snapshot())
 
-    provider = UnsafeProvider(_broker_snapshot())
+    def forbidden_capability():
+        raise AssertionError("must never be called")
+
+    setattr(provider, capability, forbidden_capability)
     result = main(
         ["--portfolio-id", "default", "--json"],
         project_root=tmp_path,

@@ -12,6 +12,7 @@ from .models import (
     NonComparableEvidence,
     PositionComparison,
     ReconciliationReport,
+    canonical_decimal,
 )
 
 DEFAULT_COST_TOLERANCE = Decimal("0.01")
@@ -152,18 +153,24 @@ def reconcile(
                 "permanent_id": order.permanent_id,
                 "contract": order.contract.public_dict(),
                 "side": order.side,
-                "quantity": str(order.quantity),
-                "filled": str(order.filled),
-                "remaining": str(order.remaining),
+                "quantity": canonical_decimal(order.quantity),
+                "filled": canonical_decimal(order.filled),
+                "remaining": canonical_decimal(order.remaining),
                 "order_type": order.order_type,
                 "status": order.status,
                 "time_in_force": order.time_in_force,
-                "limit_price": str(order.limit_price) if order.limit_price is not None else None,
+                "limit_price": (
+                    canonical_decimal(order.limit_price) if order.limit_price is not None else None
+                ),
                 "auxiliary_price": (
-                    str(order.auxiliary_price) if order.auxiliary_price is not None else None
+                    canonical_decimal(order.auxiliary_price)
+                    if order.auxiliary_price is not None
+                    else None
                 ),
                 "average_fill_price": (
-                    str(order.average_fill_price) if order.average_fill_price is not None else None
+                    canonical_decimal(order.average_fill_price)
+                    if order.average_fill_price is not None
+                    else None
                 ),
                 "last_status_at": (
                     order.last_status_at.isoformat() if order.last_status_at else None
@@ -193,19 +200,25 @@ def reconcile(
                 "client_id": execution.client_id,
                 "contract": execution.contract.public_dict(),
                 "side": execution.side,
-                "quantity": str(execution.quantity),
-                "price": str(execution.price),
+                "quantity": canonical_decimal(execution.quantity),
+                "price": canonical_decimal(execution.price),
                 "average_price": (
-                    str(execution.average_price) if execution.average_price is not None else None
+                    canonical_decimal(execution.average_price)
+                    if execution.average_price is not None
+                    else None
                 ),
                 "executed_at": execution.executed_at.isoformat(),
                 "execution_exchange": execution.execution_exchange,
                 "commission": (
-                    str(execution.commission) if execution.commission is not None else None
+                    canonical_decimal(execution.commission)
+                    if execution.commission is not None
+                    else None
                 ),
                 "commission_currency": execution.commission_currency,
                 "realized_pnl": (
-                    str(execution.realized_pnl) if execution.realized_pnl is not None else None
+                    canonical_decimal(execution.realized_pnl)
+                    if execution.realized_pnl is not None
+                    else None
                 ),
                 "unavailable": dict(execution.unavailable),
             },
@@ -229,8 +242,8 @@ def reconcile(
             details={
                 "portfolio_id": trade.portfolio_id,
                 "side": trade.side,
-                "quantity": str(trade.quantity),
-                "price": str(trade.price),
+                "quantity": canonical_decimal(trade.quantity),
+                "price": canonical_decimal(trade.price),
                 "timestamp": trade.timestamp.isoformat(),
             },
         )
@@ -241,6 +254,7 @@ def reconcile(
     )
     executions = executions + local_trade_evidence
     if open_orders:
+        blockers.append("UNMATCHED_ACTIVE_BROKER_OPEN_ORDERS")
         caveats.append("BROKER_OPEN_ORDERS_CANNOT_BE_MATCHED_TO_LOCAL_LEDGER")
     if executions:
         caveats.append("BROKER_EXECUTIONS_CANNOT_BE_IDENTITY_MATCHED_TO_LOCAL_TRADES")
@@ -250,6 +264,8 @@ def reconcile(
     )
     if blockers:
         status = "BLOCKED"
+    elif executions:
+        status = "INCOMPLETE"
     elif quantity_cost_difference:
         status = "MISMATCH"
     else:
