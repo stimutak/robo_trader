@@ -770,7 +770,6 @@ def test_worker_exit_cleanup_stderr_redacts_disconnect_exception(monkeypatch, ca
     "kwargs",
     [
         {"port": 4001, "client_id": 7, "readonly": True},
-        {"port": 4002, "client_id": 0, "readonly": True},
         {"port": 4002, "client_id": True, "readonly": True},
         {"port": 4002, "client_id": 7, "readonly": 1},
     ],

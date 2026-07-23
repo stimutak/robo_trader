@@ -904,6 +904,35 @@ async def test_repeated_connect_is_idempotent_and_conflicting_identity_is_reject
 
 
 @pytest.mark.asyncio
+async def test_shared_transport_accepts_existing_zero_client_id():
+    def handler(process, request):
+        assert request["command"] == "connect"
+        assert request["params"]["client_id"] == 0
+        _feed(
+            process,
+            _response(
+                request,
+                data={
+                    "connected": True,
+                    "accounts": ["DU123"],
+                    "client_id": 0,
+                    "server_version": 180,
+                },
+            ),
+        )
+
+    client, _, _ = _attach_client(handler)
+
+    async def no_zombies(port):
+        return 0, "none"
+
+    client._check_zombie_connections = no_zombies
+
+    assert await client.connect(port=4002, client_id=0, readonly=True) is True
+    assert client._connection_identity == ("127.0.0.1", 4002, 0, True)
+
+
+@pytest.mark.asyncio
 async def test_disconnected_ping_drives_health_failure_and_clean_reconnect():
     state = {"connected": False}
     commands = []

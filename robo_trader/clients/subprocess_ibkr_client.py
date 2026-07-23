@@ -1276,8 +1276,8 @@ class SubprocessIBKRClient:
             raise ValueError("Diagnostic client requires IBKR paper port 4002")
         if readonly is not True:
             raise ValueError("Diagnostic client requires readonly exactly true")
-        if isinstance(client_id, bool) or not isinstance(client_id, int) or client_id <= 0:
-            raise ValueError("Diagnostic client requires a positive client ID")
+        if isinstance(client_id, bool) or not isinstance(client_id, int) or client_id < 0:
+            raise ValueError("Diagnostic client requires a non-negative client ID")
         command = {
             "command": "connect",
             "params": {
@@ -1293,7 +1293,7 @@ class SubprocessIBKRClient:
             "Connecting diagnostic IBKR subprocess",
             host=host,
             port=port,
-            client_id_alias="configured-positive-id",
+            client_id_alias="configured-client-id",
         )
 
         # ZOMBIE CONNECTION CHECK: Detect zombies before connection attempt
@@ -1352,7 +1352,7 @@ class SubprocessIBKRClient:
                             "Reusing matching IBKR subprocess connection",
                             host=host,
                             port=port,
-                            client_id_alias="configured-positive-id",
+                            client_id_alias="configured-client-id",
                             readonly=readonly,
                         )
                         return True
@@ -1360,7 +1360,7 @@ class SubprocessIBKRClient:
                         "Cached broker connection was stale; reconnecting worker session",
                         host=host,
                         port=port,
-                        client_id_alias="configured-positive-id",
+                        client_id_alias="configured-client-id",
                     )
                 data = await self._execute_command_unlocked(command, timeout=extended_timeout)
                 connected = data.get("connected", False)
