@@ -11,6 +11,7 @@ where API handshakes timeout despite successful TCP connections.
 
 import asyncio
 import atexit
+import inspect
 import json
 import os
 import queue
@@ -19,8 +20,8 @@ import sys
 import threading
 import time
 import traceback
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 # CRITICAL: Enable real disconnect BEFORE importing ib_async or ibkr_safe
 # This prevents zombie connections when the worker process exits
@@ -44,6 +45,121 @@ gateway_failure_detail = ""
 # run_in_executor race condition where orphaned threads consume data
 stdin_queue: queue.Queue = queue.Queue()
 stdin_reader_thread: Optional[threading.Thread] = None
+
+TRANSPORT_PROTOCOL_VERSION = 1
+WORKER_GENERATION_ID = os.environ.get("ROBOTRADER_WORKER_GENERATION_ID", "")
+INTRADAY_BAR_SIZES = {
+    "1 secs",
+    "5 secs",
+    "10 secs",
+    "15 secs",
+    "30 secs",
+    "1 min",
+    "2 mins",
+    "3 mins",
+    "5 mins",
+    "10 mins",
+    "15 mins",
+    "20 mins",
+    "30 mins",
+    "1 hour",
+    "2 hours",
+    "3 hours",
+    "4 hours",
+    "8 hours",
+}
+
+
+def _aware_iso(value: Any) -> str:
+    """Serialize a broker timestamp without silently losing timezone identity."""
+    if not isinstance(value, datetime):
+        raise TypeError("Broker timestamp is not a datetime")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("Broker timestamp is timezone-naive")
+    return value.isoformat()
+
+
+async def _qualify_one_contract(contract: Any) -> Any:
+    """Use the installed ib_async qualification API and require one identity."""
+    if ib is None:
+        raise ConnectionError("Not connected to IBKR")
+    qualify = getattr(ib, "qualifyContractsAsync", None)
+    if qualify is None:
+        qualify = getattr(ib, "qualifyContracts", None)
+    if qualify is None:
+        raise RuntimeError("IBKR client has no contract qualification API")
+    result = qualify(contract)
+    if inspect.isawaitable(result):
+        result = await result
+    if not isinstance(result, (list, tuple)) or len(result) != 1 or result[0] is None:
+        raise ValueError("Expected exactly one qualified contract")
+    qualified = result[0]
+    con_id = getattr(qualified, "conId", None)
+    if not isinstance(con_id, int) or isinstance(con_id, bool) or con_id <= 0:
+        raise ValueError("Qualified contract is missing a valid conId")
+    return qualified
+
+
+def _validate_stock_identity(qualified: Any, requested_symbol: str) -> None:
+    """Require the exact stock identity requested; implicit aliases are denied."""
+    requested = requested_symbol.strip().upper()
+    if str(getattr(qualified, "symbol", "")).strip().upper() != requested:
+        raise ValueError("Qualified contract symbol does not match request")
+    if str(getattr(qualified, "localSymbol", "")).strip().upper() != requested:
+        raise ValueError("Qualified localSymbol alias is not explicitly allowed")
+    if getattr(qualified, "secType", None) != "STK":
+        raise ValueError("Qualified contract is not STK")
+    if getattr(qualified, "currency", None) != "USD":
+        raise ValueError("Qualified contract currency is not USD")
+    if getattr(qualified, "exchange", None) != "SMART":
+        raise ValueError("Qualified contract exchange is not SMART")
+    if not getattr(qualified, "primaryExchange", None):
+        raise ValueError("Qualified contract is missing primary exchange")
+    if not getattr(qualified, "tradingClass", None):
+        raise ValueError("Qualified contract is missing trading class")
+
+
+async def _request_broker_time() -> datetime:
+    if ib is None:
+        raise ConnectionError("Not connected to IBKR")
+    request_time = getattr(ib, "reqCurrentTimeAsync", None)
+    if request_time is None:
+        request_time = getattr(ib, "reqCurrentTime", None)
+    if request_time is None:
+        raise RuntimeError("IBKR client has no current-time API")
+    result = request_time()
+    if inspect.isawaitable(result):
+        result = await result
+    if not isinstance(result, datetime):
+        raise TypeError("IBKR current-time response is not a datetime")
+    return result
+
+
+def _response_envelope(command: dict, response: dict) -> dict:
+    """Echo the immutable request identity on every worker response."""
+    return {
+        **response,
+        "protocol_version": TRANSPORT_PROTOCOL_VERSION,
+        "generation_id": command.get("generation_id", WORKER_GENERATION_ID),
+        "request_id": command.get("request_id"),
+        "command": command.get("command"),
+    }
+
+
+def _validate_command_envelope(command: Any) -> Optional[str]:
+    if not isinstance(command, dict):
+        return "Command envelope must be an object"
+    if command.get("protocol_version") != TRANSPORT_PROTOCOL_VERSION:
+        return "Unsupported transport protocol version"
+    if command.get("generation_id") != WORKER_GENERATION_ID:
+        return "Worker generation mismatch"
+    if not isinstance(command.get("request_id"), str) or not command["request_id"]:
+        return "Missing request ID"
+    if not isinstance(command.get("command"), str) or not command["command"]:
+        return "Missing command name"
+    if not isinstance(command.get("params", {}), dict):
+        return "Command params must be an object"
+    return None
 
 
 def _stdin_reader():
@@ -128,6 +244,15 @@ async def handle_connect(params: dict) -> dict:
                 "requires_restart": True,
                 "detail": gateway_failure_detail,
             }
+
+        if ib is not None:
+            if ib.isConnected():
+                raise RuntimeError(
+                    "Worker already has an active IBKR connection; "
+                    "client must stop/start before reconnecting"
+                )
+            safe_disconnect(ib)
+            ib = None
 
         # Create new IB instance
         ib = IB()
@@ -458,6 +583,11 @@ async def handle_get_historical_bars(params: dict) -> dict:
 
         if not symbol:
             raise ValueError("symbol parameter is required")
+        if bar_size not in INTRADAY_BAR_SIZES:
+            raise ValueError(
+                "Subprocess transport supports only intraday datetime bars; "
+                f"unsupported bar_size={bar_size!r}"
+            )
 
         # Create contract
         from ib_async import Stock
@@ -465,19 +595,19 @@ async def handle_get_historical_bars(params: dict) -> dict:
         contract = Stock(symbol, "SMART", "USD")
 
         # Qualify contract (must await - it's a coroutine in ib_async)
-        qualified = await ib.qualifyContractsAsync(contract)
-        if not qualified:
-            raise ValueError(f"Could not qualify contract for {symbol}")
+        qualified_contract = await _qualify_one_contract(contract)
+        _validate_stock_identity(qualified_contract, symbol)
+        broker_time = await _request_broker_time()
 
         # Request historical data (must await - it's a coroutine in ib_async)
         bars = await ib.reqHistoricalDataAsync(
-            qualified[0],
+            qualified_contract,
             endDateTime="",
             durationStr=duration,
             barSizeSetting=bar_size,
             whatToShow=what_to_show,
             useRTH=use_rth,
-            formatDate=1,
+            formatDate=2,
         )
 
         # Convert bars to dict format
@@ -485,9 +615,7 @@ async def handle_get_historical_bars(params: dict) -> dict:
         for bar in bars:
             bars_data.append(
                 {
-                    "date": (
-                        bar.date.isoformat() if hasattr(bar.date, "isoformat") else str(bar.date)
-                    ),
+                    "date": _aware_iso(bar.date),
                     "open": float(bar.open),
                     "high": float(bar.high),
                     "low": float(bar.low),
@@ -498,7 +626,26 @@ async def handle_get_historical_bars(params: dict) -> dict:
                 }
             )
 
-        return {"status": "success", "data": {"bars": bars_data}}
+        contract_identity = {
+            "symbol": qualified_contract.symbol,
+            "local_symbol": qualified_contract.localSymbol,
+            "con_id": int(qualified_contract.conId),
+            "security_type": qualified_contract.secType,
+            "exchange": qualified_contract.exchange,
+            "primary_exchange": qualified_contract.primaryExchange,
+            "currency": qualified_contract.currency,
+            "trading_class": qualified_contract.tradingClass,
+        }
+        return {
+            "status": "success",
+            "data": {
+                "bars": bars_data,
+                "requested_symbol": symbol,
+                "qualified_contract": contract_identity,
+                "broker_timestamp": _aware_iso(broker_time),
+                "retrieval_timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        }
 
     except Exception as e:
         return {
@@ -545,6 +692,23 @@ async def main():
     """Main loop - read commands from stdin, write responses to stdout"""
     global stdin_reader_thread
 
+    if not WORKER_GENERATION_ID:
+        print(
+            json.dumps(
+                {
+                    "protocol_version": TRANSPORT_PROTOCOL_VERSION,
+                    "generation_id": "",
+                    "request_id": None,
+                    "command": None,
+                    "status": "error",
+                    "error": "Missing worker generation ID",
+                    "error_type": "TransportProtocolError",
+                }
+            ),
+            flush=True,
+        )
+        return
+
     # Start dedicated stdin reader thread
     stdin_reader_thread = threading.Thread(target=_stdin_reader, daemon=True, name="StdinReader")
     stdin_reader_thread.start()
@@ -573,11 +737,27 @@ async def main():
             try:
                 command = json.loads(line.strip())
             except json.JSONDecodeError as e:
-                response = {
-                    "status": "error",
-                    "error": f"Invalid JSON: {e}",
-                    "error_type": "JSONDecodeError",
-                }
+                response = _response_envelope(
+                    {},
+                    {
+                        "status": "error",
+                        "error": f"Invalid JSON: {e}",
+                        "error_type": "JSONDecodeError",
+                    },
+                )
+                print(json.dumps(response), flush=True)
+                continue
+
+            envelope_error = _validate_command_envelope(command)
+            if envelope_error:
+                response = _response_envelope(
+                    command if isinstance(command, dict) else {},
+                    {
+                        "status": "error",
+                        "error": envelope_error,
+                        "error_type": "TransportProtocolError",
+                    },
+                )
                 print(json.dumps(response), flush=True)
                 continue
 
@@ -585,21 +765,33 @@ async def main():
             cmd = command.get("command", "unknown")
             print(f"DEBUG: Processing command: {cmd}", file=sys.stderr, flush=True)
 
-            # Handle command
-            response = await handle_command(command)
+            # Handle command. Even an unexpected handler exception must preserve
+            # the request identity so the client can correlate it unambiguously.
+            try:
+                response = await handle_command(command)
+            except Exception as exc:
+                response = {
+                    "status": "error",
+                    "error": f"Unhandled worker error: {exc}",
+                    "error_type": type(exc).__name__,
+                    "traceback": traceback.format_exc(),
+                }
 
             # Write response to stdout
-            print(json.dumps(response), flush=True)
+            print(json.dumps(_response_envelope(command, response)), flush=True)
 
     except KeyboardInterrupt:
         print("Received KeyboardInterrupt, shutting down...", file=sys.stderr, flush=True)
     except Exception as e:
-        error_response = {
-            "status": "error",
-            "error": f"Fatal error: {e}",
-            "error_type": type(e).__name__,
-            "traceback": traceback.format_exc(),
-        }
+        error_response = _response_envelope(
+            {},
+            {
+                "status": "error",
+                "error": f"Fatal error: {e}",
+                "error_type": type(e).__name__,
+                "traceback": traceback.format_exc(),
+            },
+        )
         print(json.dumps(error_response), flush=True)
     finally:
         # Cleanup on exit - MUST disconnect to avoid zombies

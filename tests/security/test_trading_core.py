@@ -8,7 +8,7 @@ finding ID it pins.
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -78,7 +78,11 @@ async def test_stop_loss_triggers_after_keying_fix() -> None:
     assert "default:AAPL" in monitor.active_stops
 
     # Push a price below the stop.
-    await monitor.update_price("AAPL", 90.0)
+    await monitor.update_price(
+        "AAPL",
+        90.0,
+        source_timestamp=datetime.now(timezone.utc),
+    )
     triggered = await monitor.check_stops()
 
     assert len(triggered) == 1

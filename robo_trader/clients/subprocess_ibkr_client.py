@@ -14,15 +14,17 @@ to avoid event loop starvation in busy async environments.
 import asyncio
 import json
 import os
-import queue
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import uuid
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, cast
 
 import structlog
 
@@ -91,8 +93,26 @@ class IBKRError(Exception):
     pass
 
 
-class IBKRTimeoutError(IBKRError):
-    """Raised when IBKR operation times out"""
+class IBKRTimeoutError(SubprocessCrashError, IBKRError):
+    """Raised when the subprocess transport times out and must be replaced."""
+
+    pass
+
+
+class IBKRTransportPoisonedError(SubprocessCrashError, IBKRError):
+    """Raised when request/response integrity for a worker generation is lost."""
+
+    pass
+
+
+class IBKRDisconnectedError(IBKRError):
+    """Raised when the worker reports that its broker session is disconnected."""
+
+    pass
+
+
+class IBKRConnectionConflictError(IBKRError):
+    """Raised when a connected worker is reused with different parameters."""
 
     pass
 
@@ -101,6 +121,55 @@ class GatewayRequiresRestartError(IBKRError):
     """Raised when the worker detects the Gateway API layer has crashed"""
 
     pass
+
+
+_TRANSPORT_PROTOCOL_VERSION = 1
+_INTRADAY_BAR_SIZES = {
+    "1 secs",
+    "5 secs",
+    "10 secs",
+    "15 secs",
+    "30 secs",
+    "1 min",
+    "2 mins",
+    "3 mins",
+    "5 mins",
+    "10 mins",
+    "15 mins",
+    "20 mins",
+    "30 mins",
+    "1 hour",
+    "2 hours",
+    "3 hours",
+    "4 hours",
+    "8 hours",
+}
+
+
+@dataclass
+class _PendingResponse:
+    command: str
+    loop: asyncio.AbstractEventLoop
+    future: asyncio.Future
+
+
+@dataclass
+class _WorkerGeneration:
+    """All response-routing state owned by one worker process generation."""
+
+    generation_id: str
+    process: subprocess.Popen
+    pending: dict[str, _PendingResponse] = field(default_factory=dict)
+    completed: set[str] = field(default_factory=set)
+    completed_order: deque[str] = field(default_factory=deque)
+    state_lock: threading.Lock = field(default_factory=threading.Lock)
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    poisoned_reason: Optional[str] = None
+    intentional_stop: bool = False
+    stdout_thread: Optional[threading.Thread] = None
+    stderr_thread: Optional[threading.Thread] = None
+    debug_log_file: Any = None
+    debug_log_path: Optional[str] = None
 
 
 class SubprocessIBKRClient:
@@ -124,11 +193,12 @@ class SubprocessIBKRClient:
     def __init__(self):
         self.process: Optional[subprocess.Popen] = None
         self.lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
         self._connected = False
-        self._response_queue: queue.Queue = queue.Queue()
+        self._connection_identity: Optional[tuple[str, int, int, bool]] = None
+        self._generation: Optional[_WorkerGeneration] = None
         self._reader_thread: Optional[threading.Thread] = None
         self._stderr_reader_thread: Optional[threading.Thread] = None
-        self._stop_reader = threading.Event()
         self._last_activity: Optional[datetime] = None
         self._connection_start_time: Optional[datetime] = None
         self._gateway_api_down_detail: Optional[str] = None
@@ -138,11 +208,48 @@ class SubprocessIBKRClient:
             False  # Track if zombies were present before connect
         )
 
+    def _clear_cached_connection_state(self) -> None:
+        """Forget broker-session state after an authoritative negative probe."""
+        self._connected = False
+        self._connection_identity = None
+        self._connection_start_time = None
+
+    def _accept_ping_response(self, data: dict) -> bool:
+        """Update cached state from a lifecycle-serialized worker ping."""
+        if data.get("gateway_api_down"):
+            detail = data.get("detail") or "Gateway API layer reported down by worker ping"
+            self._gateway_api_down_detail = detail
+            self._clear_cached_connection_state()
+            logger.error("Worker ping reports Gateway API down", detail=detail)
+            return False
+
+        if data.get("pong") is not True or data.get("connected") is not True:
+            self._clear_cached_connection_state()
+            logger.warning(
+                "Worker is responsive but broker session is disconnected",
+                pong=data.get("pong"),
+                connected=data.get("connected"),
+            )
+            return False
+
+        self._gateway_api_down_detail = None
+        self._last_activity = datetime.now()
+        return True
+
     async def start(self) -> None:
-        """Start the subprocess worker with threading-based I/O"""
+        """Serialize worker creation against commands and shutdown."""
+        async with self._lifecycle_lock:
+            await self._start_unlocked()
+
+    async def _start_unlocked(self) -> None:
+        """Start the subprocess worker with threading-based I/O."""
+        if self._generation and self._generation.poisoned_reason:
+            await self._stop_unlocked()
         if self.process and self.process.poll() is None:
             logger.warning("Subprocess already running")
             return
+        if self._generation:
+            await self._stop_unlocked()
 
         # Find worker script
         worker_script = Path(__file__).parent / "ibkr_subprocess_worker.py"
@@ -264,7 +371,11 @@ class SubprocessIBKRClient:
             debug_log_file = None
 
         # Wrap subprocess and thread startup in try block to ensure cleanup
+        generation: Optional[_WorkerGeneration] = None
         try:
+            generation_id = uuid.uuid4().hex
+            worker_env = os.environ.copy()
+            worker_env["ROBOTRADER_WORKER_GENERATION_ID"] = generation_id
             # CRITICAL FIX: Use regular subprocess.Popen with threading instead of
             # asyncio.create_subprocess_exec to avoid event loop starvation in
             # busy async environments
@@ -277,84 +388,243 @@ class SubprocessIBKRClient:
                 text=True,
                 bufsize=1,  # Line buffered
                 close_fds=True,  # Don't inherit file descriptors
+                env=worker_env,
+            )
+            generation = _WorkerGeneration(generation_id, self.process)
+            self._generation = generation
+
+            logger.info(
+                "IBKR subprocess worker started",
+                pid=self.process.pid,
+                generation_id=generation_id,
             )
 
-            logger.info("IBKR subprocess worker started", pid=self.process.pid)
-
             # Store debug log file only after successful subprocess start
+            generation.debug_log_file = debug_log_file
+            generation.debug_log_path = debug_log_path
             self._debug_log_file = debug_log_file
             self._debug_log_path = debug_log_path
 
             # Start reader threads to avoid blocking
-            self._stop_reader.clear()
             self._reader_thread = threading.Thread(
-                target=self._read_loop, daemon=True, name="IBKRSubprocessReader"
+                target=self._read_loop,
+                args=(generation,),
+                daemon=True,
+                name="IBKRSubprocessReader",
             )
+            generation.stdout_thread = self._reader_thread
             self._reader_thread.start()
 
             # Start stderr reader thread (this thread will manage debug_log_file lifecycle)
             self._stderr_reader_thread = threading.Thread(
-                target=self._stderr_read_loop, daemon=True, name="IBKRSubprocessStderrReader"
+                target=self._stderr_read_loop,
+                args=(generation,),
+                daemon=True,
+                name="IBKRSubprocessStderrReader",
             )
+            generation.stderr_thread = self._stderr_reader_thread
             self._stderr_reader_thread.start()
 
         except Exception:
-            # Clean up debug log file if subprocess/thread startup fails
-            if debug_log_file and not self._debug_log_file:
-                # File was opened but not yet handed to stderr reader thread
+            if generation:
+                generation.intentional_stop = True
+                generation.stop_event.set()
+            process = generation.process if generation else self.process
+            if process:
                 try:
-                    debug_log_file.close()
-                    logger.debug("Closed debug log file after startup failure")
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=1.0)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=1.0)
                 except Exception:
                     pass
-            # Re-raise the original exception
+                for stream in (
+                    getattr(process, "stdout", None),
+                    getattr(process, "stderr", None),
+                ):
+                    try:
+                        if stream:
+                            stream.close()
+                    except Exception:
+                        pass
+            if debug_log_file:
+                try:
+                    debug_log_file.close()
+                except Exception:
+                    pass
+            if generation:
+                for thread in (generation.stdout_thread, generation.stderr_thread):
+                    if thread and thread.is_alive():
+                        thread.join(timeout=1.0)
+            if self._generation is generation:
+                self._generation = None
+            if self.process is process:
+                self.process = None
+            self._debug_log_file = None
             raise
 
-    def _read_loop(self) -> None:
-        """Thread function to read subprocess stdout"""
+    def _poison_generation(self, generation: _WorkerGeneration, reason: str) -> None:
+        """Fail closed after transport ambiguity; a poisoned worker is never reused."""
+        with generation.state_lock:
+            if generation.poisoned_reason is not None:
+                return
+            generation.poisoned_reason = reason
+            pending = list(generation.pending.values())
+            generation.pending.clear()
+
+        error = IBKRTransportPoisonedError(f"IBKR worker generation poisoned: {reason}")
+        for request in pending:
+
+            def fail_pending(
+                future: asyncio.Future = request.future,
+                pending_error: Exception = error,
+            ) -> None:
+                if not future.done():
+                    future.set_exception(pending_error)
+
+            try:
+                request.loop.call_soon_threadsafe(fail_pending)
+            except RuntimeError:
+                # The owning loop is already closed; transport teardown must
+                # still continue and reap the ambiguous worker generation.
+                pass
+
+        if self._generation is generation:
+            self._connected = False
+            self._connection_identity = None
+        logger.error(
+            "Poisoning IBKR worker generation",
+            generation_id=generation.generation_id,
+            reason=reason,
+        )
+
+        def reap_poisoned_worker() -> None:
+            try:
+                if generation.process.poll() is not None:
+                    return
+                generation.process.terminate()
+                try:
+                    generation.process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    generation.process.kill()
+                    generation.process.wait(timeout=1.0)
+            except Exception as exc:
+                logger.warning("Failed to reap poisoned worker", error=str(exc))
+
+        threading.Thread(
+            target=reap_poisoned_worker,
+            daemon=True,
+            name=f"IBKRPoisonReaper-{generation.generation_id[:8]}",
+        ).start()
+
+    def _read_loop(self, generation: _WorkerGeneration) -> None:
+        """Read and route responses for exactly one worker generation."""
         try:
-            while not self._stop_reader.is_set() and self.process:
-                line = self.process.stdout.readline()
+            while not generation.stop_event.is_set():
+                line = generation.process.stdout.readline()
                 if not line:
+                    if not generation.intentional_stop:
+                        self._poison_generation(generation, "worker stdout closed")
                     break
 
                 line_stripped = line.strip()
                 if not line_stripped:
                     continue
 
-                # CRITICAL FIX: Filter out ib_async log messages that pollute stdout
-                # Only queue lines that look like JSON responses from our worker
-                if line_stripped.startswith('{"status":') or line_stripped.startswith(
-                    '{"timestamp":'
-                ):
-                    # ib_async logs start with {"timestamp": - log these but don't queue
-                    if line_stripped.startswith('{"timestamp":'):
-                        logger.debug("ib_async_stdout", message=line_stripped)
-                        continue
+                if line_stripped.startswith('{"timestamp":'):
+                    logger.debug("ib_async_stdout", message=line_stripped)
+                    continue
+                if not line_stripped.startswith("{"):
+                    self._poison_generation(generation, "malformed non-JSON worker response")
+                    break
 
-                    # Worker responses start with {"status": - queue these
-                    self._response_queue.put(line_stripped)
-                else:
-                    # Unknown format - log for debugging
-                    logger.warning("unexpected_stdout", message=line_stripped)
+                try:
+                    response = json.loads(line_stripped)
+                except (json.JSONDecodeError, TypeError) as exc:
+                    self._poison_generation(generation, f"malformed JSON response: {exc}")
+                    break
+
+                required = {
+                    "protocol_version",
+                    "generation_id",
+                    "request_id",
+                    "command",
+                    "status",
+                }
+                if not isinstance(response, dict) or not required.issubset(response):
+                    self._poison_generation(generation, "malformed response envelope")
+                    break
+                if response["protocol_version"] != _TRANSPORT_PROTOCOL_VERSION:
+                    self._poison_generation(generation, "response protocol version mismatch")
+                    break
+                if any(
+                    not isinstance(response.get(field), str) or not response[field]
+                    for field in ("generation_id", "request_id", "command", "status")
+                ):
+                    self._poison_generation(generation, "invalid response identity types")
+                    break
+                if response["generation_id"] != generation.generation_id:
+                    self._poison_generation(generation, "stale worker generation response")
+                    break
+
+                request_id = response["request_id"]
+                with generation.state_lock:
+                    if request_id in generation.completed:
+                        duplicate = True
+                        pending = None
+                    else:
+                        duplicate = False
+                        pending = generation.pending.get(request_id)
+
+                if duplicate:
+                    self._poison_generation(generation, "duplicate response")
+                    break
+                if pending is None:
+                    self._poison_generation(generation, "unknown response request ID")
+                    break
+                matched_pending = pending
+                if response["command"] != matched_pending.command:
+                    self._poison_generation(generation, "response command mismatch")
+                    break
+                with generation.state_lock:
+                    generation.pending.pop(request_id, None)
+                    generation.completed.add(request_id)
+                    generation.completed_order.append(request_id)
+                    while len(generation.completed_order) > 1024:
+                        expired = generation.completed_order.popleft()
+                        generation.completed.discard(expired)
+
+                def deliver_response(
+                    future: asyncio.Future = matched_pending.future,
+                    value: dict = response,
+                ) -> None:
+                    if not future.done():
+                        future.set_result(value)
+
+                matched_pending.loop.call_soon_threadsafe(deliver_response)
         except Exception as e:
             logger.error("Reader thread error", error=str(e))
+            if not generation.intentional_stop:
+                self._poison_generation(generation, f"reader failure: {e}")
         finally:
-            logger.debug("Reader thread exiting")
+            logger.debug("Reader thread exiting", generation_id=generation.generation_id)
 
-    def _stderr_read_loop(self) -> None:
+    def _stderr_read_loop(self, generation: _WorkerGeneration) -> None:
         """Thread function to read and log subprocess stderr"""
         try:
-            while not self._stop_reader.is_set() and self.process:
-                line = self.process.stderr.readline()
+            while not generation.stop_event.is_set():
+                line = generation.process.stderr.readline()
                 if not line:
                     break
 
                 # Write to debug file for detailed analysis
-                if self._debug_log_file:
+                if generation.debug_log_file:
                     try:
-                        self._debug_log_file.write(f"{datetime.now().isoformat()}: {line}")
-                        self._debug_log_file.flush()
+                        generation.debug_log_file.write(f"{datetime.now().isoformat()}: {line}")
+                        generation.debug_log_file.flush()
                     except Exception:
                         pass  # Don't let debug logging break the main flow
 
@@ -369,89 +639,125 @@ class SubprocessIBKRClient:
                         logger.warning("subprocess_stderr", message=line_stripped)
         except Exception as e:
             logger.error("Stderr reader thread error", error=str(e))
+            if not generation.intentional_stop:
+                self._poison_generation(generation, f"stderr reader failure: {e}")
         finally:
             logger.debug("Stderr reader thread exiting")
-            if self._debug_log_file:
+            if generation.debug_log_file:
                 try:
-                    self._debug_log_file.close()
+                    generation.debug_log_file.close()
                 except Exception:
                     pass
 
     async def stop(self) -> None:
-        """Stop the subprocess worker with graceful shutdown"""
-        if not self.process:
+        """Serialize shutdown against worker creation and commands."""
+        async with self._lifecycle_lock:
+            await self._stop_unlocked()
+
+    async def _stop_unlocked(self) -> None:
+        """Stop the subprocess worker with graceful shutdown."""
+        generation = self._generation
+        process = generation.process if generation else self.process
+        if not process:
             return
 
-        logger.info("Stopping IBKR subprocess worker", pid=self.process.pid)
+        logger.info("Stopping IBKR subprocess worker", pid=process.pid)
 
         try:
-            # Try graceful disconnect first (sends disconnect command to worker)
             if self._connected:
                 logger.debug("Sending disconnect command to worker")
-                await self.disconnect()
+                await self._execute_command_unlocked({"command": "disconnect"}, timeout=5.0)
         except Exception as e:
             logger.warning("Disconnect command failed during shutdown", error=str(e))
+        finally:
+            self._connected = False
 
         # Signal reader threads to stop
-        self._stop_reader.set()
+        if generation:
+            generation.intentional_stop = True
+            generation.stop_event.set()
 
         # Terminate process with graceful escalation (use run_in_executor to avoid blocking)
         def terminate_process():
             try:
                 # Send SIGTERM for graceful shutdown
                 logger.debug("Sending SIGTERM to worker process")
-                self.process.terminate()
+                process.terminate()
 
                 # Wait up to 3 seconds for graceful shutdown
-                self.process.wait(timeout=3.0)
+                process.wait(timeout=3.0)
                 logger.info("Worker terminated gracefully via SIGTERM")
 
             except subprocess.TimeoutExpired:
                 # Worker didn't respond to SIGTERM, escalate to SIGKILL
                 logger.warning(
                     "Worker did not respond to SIGTERM within 3s, sending SIGKILL",
-                    pid=self.process.pid,
+                    pid=process.pid,
                 )
-                self.process.kill()
-                self.process.wait()
+                process.kill()
+                process.wait()
                 logger.warning("Worker killed via SIGKILL")
 
             except Exception as e:
                 logger.error("Error during process termination", error=str(e))
                 # Ensure process is dead
                 try:
-                    self.process.kill()
-                    self.process.wait()
+                    process.kill()
+                    process.wait()
                 except Exception:
                     pass
 
         await asyncio.get_event_loop().run_in_executor(None, terminate_process)
-
-        # Wait for reader threads to finish
-        if self._reader_thread and self._reader_thread.is_alive():
-            logger.debug("Waiting for reader thread to finish")
-            await asyncio.get_event_loop().run_in_executor(None, self._reader_thread.join, 2.0)
-
-        if self._stderr_reader_thread and self._stderr_reader_thread.is_alive():
-            logger.debug("Waiting for stderr reader thread to finish")
-            await asyncio.get_event_loop().run_in_executor(
-                None, self._stderr_reader_thread.join, 2.0
-            )
-
-        self.process = None
-        self._connected = False
-
-        # Ensure debug log file is closed (belt-and-suspenders cleanup)
-        if self._debug_log_file:
+        for stream in (getattr(process, "stdout", None), getattr(process, "stderr", None)):
             try:
-                self._debug_log_file.close()
+                if stream:
+                    stream.close()
             except Exception:
                 pass
+
+        # Wait for reader threads to finish
+        stdout_thread = generation.stdout_thread if generation else self._reader_thread
+        stderr_thread = generation.stderr_thread if generation else self._stderr_reader_thread
+        if stdout_thread and stdout_thread.is_alive():
+            logger.debug("Waiting for reader thread to finish")
+            await asyncio.to_thread(stdout_thread.join, 2.0)
+
+        if stderr_thread and stderr_thread.is_alive():
+            logger.debug("Waiting for stderr reader thread to finish")
+            await asyncio.to_thread(stderr_thread.join, 2.0)
+        if (stdout_thread and stdout_thread.is_alive()) or (
+            stderr_thread and stderr_thread.is_alive()
+        ):
+            raise SubprocessCrashError(
+                "Worker reader thread did not stop; refusing generation replacement"
+            )
+
+        if self.process is process:
+            self.process = None
+        if self._generation is generation:
+            self._generation = None
+        self._connected = False
+        self._connection_identity = None
+
+        # Ensure debug log file is closed (belt-and-suspenders cleanup)
+        debug_log_file = generation.debug_log_file if generation else self._debug_log_file
+        if debug_log_file:
+            try:
+                debug_log_file.close()
+            except Exception:
+                pass
+            if generation:
+                generation.debug_log_file = None
             self._debug_log_file = None
 
         logger.info("IBKR subprocess worker stopped cleanly")
 
     async def _execute_command(self, command: dict, timeout: float = 30.0) -> dict:
+        """Serialize a command against generation start and stop."""
+        async with self._lifecycle_lock:
+            return await self._execute_command_unlocked(command, timeout)
+
+    async def _execute_command_unlocked(self, command: dict, timeout: float = 30.0) -> dict:
         """
         Send command to subprocess and wait for response.
 
@@ -468,52 +774,90 @@ class SubprocessIBKRClient:
             IBKRError: If command fails
         """
         async with self.lock:
-            # Check subprocess is running
-            if not self.process or self.process.poll() is not None:
+            generation = self._generation
+            if not generation:
+                raise SubprocessCrashError("Subprocess not running")
+            with generation.state_lock:
+                poison = generation.poisoned_reason
+            if poison:
+                raise IBKRTransportPoisonedError(f"IBKR worker generation poisoned: {poison}")
+            if (
+                not self.process
+                or generation.process is not self.process
+                or self.process.poll() is not None
+            ):
                 raise SubprocessCrashError("Subprocess not running")
 
+            command_name = command.get("command")
+            if not isinstance(command_name, str) or not command_name:
+                self._poison_generation(generation, "malformed command name")
+                raise IBKRTransportPoisonedError("Malformed command name")
+            request_id = uuid.uuid4().hex
+            loop = asyncio.get_running_loop()
+            pending = _PendingResponse(command_name, loop, loop.create_future())
+            envelope = {
+                "protocol_version": _TRANSPORT_PROTOCOL_VERSION,
+                "generation_id": generation.generation_id,
+                "request_id": request_id,
+                "command": command_name,
+                "params": command.get("params", {}),
+            }
+            try:
+                command_json = json.dumps(envelope) + "\n"
+            except (TypeError, ValueError) as exc:
+                raise IBKRError(f"Command is not JSON serializable: {exc}") from exc
+            with generation.state_lock:
+                if generation.poisoned_reason:
+                    raise IBKRTransportPoisonedError(
+                        "IBKR worker generation poisoned: " f"{generation.poisoned_reason}"
+                    )
+                generation.pending[request_id] = pending
+
             # Send command - write directly to stdin (no executor to avoid event loop starvation)
-            command_json = json.dumps(command) + "\n"
-            logger.debug("Sending command to subprocess", command=command.get("command"))
+            logger.debug(
+                "Sending command to subprocess",
+                command=command_name,
+                request_id=request_id,
+                generation_id=generation.generation_id,
+            )
 
             try:
-                self.process.stdin.write(command_json)
-                self.process.stdin.flush()
+                generation.process.stdin.write(command_json)
+                generation.process.stdin.flush()
             except Exception as e:
-                raise SubprocessCrashError(f"Failed to send command: {e}")
+                self._poison_generation(generation, f"command write failure: {e}")
+                raise IBKRTransportPoisonedError(f"Failed to send command: {e}")
 
             # Log write confirmation
             logger.debug(
                 "Command sent to subprocess",
-                command=command.get("command"),
+                command=command_name,
+                request_id=request_id,
                 bytes_written=len(command_json),
             )
 
-            # Small yield to let reader thread process
-            await asyncio.sleep(0.001)
-
-            # Read response from queue with timeout
+            # Await the request-correlated Future. No executor-backed queue read is
+            # used, so cancellation cannot leave an orphan response consumer.
             try:
-                # Use run_in_executor to wait on queue without blocking event loop
-                def read_response():
-                    return self._response_queue.get(timeout=timeout)
+                response = await asyncio.wait_for(pending.future, timeout=timeout)
 
-                line = await asyncio.wait_for(
-                    asyncio.get_event_loop().run_in_executor(None, read_response),
-                    timeout=timeout + 1.0,  # Add buffer to asyncio timeout
+            except asyncio.TimeoutError:
+                self._poison_generation(
+                    generation, f"command timeout: {command_name} ({request_id})"
                 )
-
-                if not line:
-                    raise SubprocessCrashError("Subprocess closed stdout")
-
-                response = json.loads(line)
-
-            except (asyncio.TimeoutError, queue.Empty):
-                logger.error("Command timeout", command=command.get("command"), timeout=timeout)
+                logger.error("Command timeout", command=command_name, timeout=timeout)
                 raise IBKRTimeoutError(f"Command timeout after {timeout}s")
-            except json.JSONDecodeError as e:
-                logger.error("Invalid JSON response", error=str(e), line=line)
-                raise SubprocessCrashError(f"Invalid JSON response: {e}")
+            except asyncio.CancelledError:
+                self._poison_generation(
+                    generation, f"command cancelled: {command_name} ({request_id})"
+                )
+                raise
+
+            if isinstance(response, Exception):
+                raise response
+            if not isinstance(response, dict):
+                self._poison_generation(generation, "non-object routed response")
+                raise IBKRTransportPoisonedError("Invalid routed response")
 
             # Check response status
             if response.get("status") == "error":
@@ -524,7 +868,7 @@ class SubprocessIBKRClient:
 
                 logger.error(
                     "Command failed",
-                    command=command.get("command"),
+                    command=command_name,
                     error=error_msg,
                     error_type=error_type,
                     requires_restart=requires_restart,
@@ -534,11 +878,19 @@ class SubprocessIBKRClient:
                     message = detail or error_msg
                     self._gateway_api_down_detail = message or "Gateway API layer reported down"
                     raise GatewayRequiresRestartError(message)
+                if error_type in {"ConnectionError", "NotConnectedError"}:
+                    raise IBKRDisconnectedError(error_msg)
 
                 raise IBKRError(f"{error_type}: {error_msg}")
+            if response.get("status") != "success":
+                self._poison_generation(generation, "unknown response status")
+                raise IBKRTransportPoisonedError("Unknown worker response status")
+            if not isinstance(response.get("data"), dict):
+                self._poison_generation(generation, "malformed success response data")
+                raise IBKRTransportPoisonedError("Worker success response data must be an object")
 
-            logger.debug("Command succeeded", command=command.get("command"))
-            return response.get("data", {})
+            logger.debug("Command succeeded", command=command_name, request_id=request_id)
+            return response["data"]
 
     async def connect(
         self,
@@ -594,6 +946,7 @@ class SubprocessIBKRClient:
 
         # Record connection attempt timing for debugging
         connection_start = time.time()
+        requested_identity = (host, port, client_id, readonly)
 
         try:
             # Calculate timeout: base TCP timeout + worker's internal sequence + buffer
@@ -608,13 +961,56 @@ class SubprocessIBKRClient:
                 extended_timeout=extended_timeout,
             )
 
-            data = await self._execute_command(command, timeout=extended_timeout)
+            async with self._lifecycle_lock:
+                generation = self._generation
+                if self._connected:
+                    if not (
+                        generation
+                        and generation.poisoned_reason is None
+                        and generation.process.poll() is None
+                    ):
+                        raise SubprocessCrashError("Connected worker generation is not healthy")
+                    ping_data = await self._execute_command_unlocked(
+                        {"command": "ping"}, timeout=5.0
+                    )
+                    if self._accept_ping_response(ping_data):
+                        if self._connection_identity != requested_identity:
+                            raise IBKRConnectionConflictError(
+                                "Worker is already connected with different "
+                                "host/port/client_id/readonly parameters; call stop() "
+                                "and start() before connecting with a new identity"
+                            )
+                        logger.info(
+                            "Reusing matching IBKR subprocess connection",
+                            host=host,
+                            port=port,
+                            client_id=client_id,
+                            readonly=readonly,
+                        )
+                        return True
+                    logger.warning(
+                        "Cached broker connection was stale; reconnecting worker session",
+                        host=host,
+                        port=port,
+                        client_id=client_id,
+                    )
+                data = await self._execute_command_unlocked(command, timeout=extended_timeout)
+                self._connected = data.get("connected", False)
+                if self._connected:
+                    self._connection_identity = requested_identity
+                    self._connection_start_time = datetime.now()
+                    self._last_activity = datetime.now()
+                    self._gateway_api_down_detail = None
 
-            connection_duration = time.time() - connection_start
-            logger.info("Connect command completed", duration_seconds=f"{connection_duration:.2f}")
+                connection_duration = time.time() - connection_start
+                logger.info(
+                    "Connect command completed",
+                    duration_seconds=f"{connection_duration:.2f}",
+                )
 
         except GatewayRequiresRestartError:
             self._connected = False
+            self._connection_identity = None
             connection_duration = time.time() - connection_start
             logger.error(
                 "Connection failed - Gateway restart required",
@@ -622,15 +1018,8 @@ class SubprocessIBKRClient:
             )
             raise
 
-        self._connected = data.get("connected", False)
         accounts = data.get("accounts", [])
         server_version = data.get("server_version")
-
-        # Track connection timing for health monitoring
-        if self._connected:
-            self._connection_start_time = datetime.now()
-            self._last_activity = datetime.now()
-            self._gateway_api_down_detail = None
 
         logger.info(
             "Connected to IBKR via subprocess",
@@ -746,6 +1135,12 @@ class SubprocessIBKRClient:
         Returns:
             List of bar dictionaries with date, open, high, low, close, volume
         """
+        if bar_size not in _INTRADAY_BAR_SIZES:
+            raise ValueError(
+                "Subprocess transport supports only intraday datetime bars; "
+                f"unsupported bar_size={bar_size!r}"
+            )
+        generation = self._generation
         data = await self._execute_command(
             {
                 "command": "get_historical_bars",
@@ -759,26 +1154,69 @@ class SubprocessIBKRClient:
             },
             timeout=60.0,  # Historical data can take longer
         )
-        return data.get("bars", [])
+        requested = symbol.strip().upper()
+        echoed = data.get("requested_symbol")
+        contract = data.get("qualified_contract")
+
+        integrity_error: Optional[str] = None
+        if not isinstance(echoed, str) or echoed.strip().upper() != requested:
+            integrity_error = "historical response requested symbol mismatch"
+        elif not isinstance(contract, dict):
+            integrity_error = "historical response missing qualified contract identity"
+        elif str(contract.get("symbol", "")).strip().upper() != requested:
+            integrity_error = "historical response qualified contract symbol mismatch"
+        elif (
+            not isinstance(contract.get("con_id"), int)
+            or isinstance(contract["con_id"], bool)
+            or contract["con_id"] <= 0
+        ):
+            integrity_error = "historical response has invalid qualified contract ID"
+        elif str(contract.get("local_symbol", "")).strip().upper() != requested:
+            integrity_error = "historical response local symbol alias is not explicitly allowed"
+        elif contract.get("security_type") != "STK":
+            integrity_error = "historical response security type is not STK"
+        elif contract.get("currency") != "USD":
+            integrity_error = "historical response currency is not USD"
+        elif contract.get("exchange") != "SMART":
+            integrity_error = "historical response exchange is not SMART"
+        elif any(
+            not isinstance(contract.get(field), str) or not contract[field]
+            for field in ("primary_exchange", "trading_class")
+        ):
+            integrity_error = "historical response has incomplete contract identity"
+
+        for timestamp_field in ("broker_timestamp", "retrieval_timestamp"):
+            timestamp = data.get(timestamp_field)
+            try:
+                parsed = datetime.fromisoformat(timestamp) if isinstance(timestamp, str) else None
+            except ValueError:
+                parsed = None
+            if parsed is None or parsed.tzinfo is None or parsed.utcoffset() is None:
+                integrity_error = f"historical response {timestamp_field} is not timezone-aware"
+                break
+
+        bars = data.get("bars")
+        if not isinstance(bars, list) or any(not isinstance(bar, dict) for bar in bars):
+            integrity_error = "historical response bars are malformed"
+
+        if integrity_error:
+            if generation:
+                self._poison_generation(generation, integrity_error)
+            raise IBKRTransportPoisonedError(integrity_error)
+        return cast(list[dict], bars)
 
     async def disconnect(self) -> None:
         """Disconnect from IBKR"""
-        if not self._connected:
-            return
-
-        # Set _connected = False FIRST to prevent infinite loop with stop()
-        # (stop() calls disconnect() if _connected is True)
-        self._connected = False
-
-        logger.info("Disconnecting from IBKR via subprocess")
-        try:
-            # Use a short timeout - if it doesn't respond quickly, just terminate
-            await self._execute_command({"command": "disconnect"}, timeout=5.0)
-        except Exception as e:
-            logger.warning(f"Disconnect command failed, will terminate subprocess: {e}")
-
-        # Always stop the subprocess to ensure clean state
-        await self.stop()
+        async with self._lifecycle_lock:
+            if not self._connected:
+                return
+            self._connected = False
+            logger.info("Disconnecting from IBKR via subprocess")
+            try:
+                await self._execute_command_unlocked({"command": "disconnect"}, timeout=5.0)
+            except Exception as e:
+                logger.warning(f"Disconnect command failed, will terminate subprocess: {e}")
+            await self._stop_unlocked()
         logger.info("Disconnected from IBKR")
 
     async def ping(self) -> bool:
@@ -789,16 +1227,9 @@ class SubprocessIBKRClient:
             True if subprocess responds to ping
         """
         try:
-            data = await self._execute_command({"command": "ping"}, timeout=5.0)
-            pong = data.get("pong", False)
-            if data.get("gateway_api_down"):
-                detail = data.get("detail") or "Gateway API layer reported down by worker ping"
-                self._gateway_api_down_detail = detail
-                logger.error("Worker ping reports Gateway API down", detail=detail)
-                return False
-            if pong:
-                self._last_activity = datetime.now()
-            return pong
+            async with self._lifecycle_lock:
+                data = await self._execute_command_unlocked({"command": "ping"}, timeout=5.0)
+                return self._accept_ping_response(data)
         except Exception as e:
             logger.warning("Ping failed", error=str(e))
             return False
@@ -849,7 +1280,19 @@ class SubprocessIBKRClient:
             to place orders, the reconnect path MUST be revisited — repeating
             an order command after a transient disconnect could double-fill.
         """
+        generation = self._generation
+        if generation and generation.poisoned_reason:
+            raise IBKRTransportPoisonedError(
+                "Refusing automatic retry of poisoned worker generation: "
+                f"{generation.poisoned_reason}"
+            )
         if not await self.health_check():
+            generation = self._generation
+            if generation and generation.poisoned_reason:
+                raise IBKRTransportPoisonedError(
+                    "Refusing automatic retry of poisoned worker generation: "
+                    f"{generation.poisoned_reason}"
+                )
             if self._gateway_api_down_detail:
                 raise GatewayRequiresRestartError(self._gateway_api_down_detail)
             logger.warning("Connection unhealthy, attempting reconnection...")

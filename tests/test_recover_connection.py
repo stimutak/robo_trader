@@ -5,6 +5,7 @@ Gateway restart on attempt >=3, returns bool, mutex via _recovery_lock.
 """
 
 import asyncio
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -203,12 +204,19 @@ async def test_recovery_in_progress_flag_set_and_cleared():
 
 @pytest.mark.asyncio
 async def test_recovery_rewarms_stop_loss_monitor_with_cached_prices():
-    """C4: After a successful recovery, stop_loss_monitor.update_price must
-    be called for every active stop whose symbol exists in latest_prices.
-    This closes the 10-second freshness gate gap that otherwise blinds
-    stop-losses for the first 1-N cycles after reconnect."""
+    """Recovery offers each cached price together with its broker event time.
+
+    The real stop monitor remains authoritative about whether that event is
+    sufficiently fresh to accept.
+    """
     runner = make_runner_for_recovery(initialize_succeeds_on=1)
     runner.latest_prices = {"AAPL": 150.0, "NVDA": 500.0, "TSLA": 200.0}
+    event_time = datetime.now(timezone.utc)
+    runner.latest_price_times = {
+        "AAPL": event_time,
+        "NVDA": event_time,
+        "TSLA": event_time,
+    }
 
     # Build a stop-loss monitor mock with active stops keyed by
     # portfolio:symbol but stop objects carrying bare symbols
@@ -227,9 +235,12 @@ async def test_recovery_rewarms_stop_loss_monitor_with_cached_prices():
     assert result is True
     # Both active stops have symbols present in latest_prices → both rewarmed
     assert runner.stop_loss_monitor.update_price.await_count == 2
-    rewarmed_calls = {call.args for call in runner.stop_loss_monitor.update_price.await_args_list}
-    assert ("AAPL", 150.0) in rewarmed_calls
-    assert ("NVDA", 500.0) in rewarmed_calls
+    rewarmed_symbols = {
+        call.args[0] for call in runner.stop_loss_monitor.update_price.await_args_list
+    }
+    assert rewarmed_symbols == {"AAPL", "NVDA"}
+    for call in runner.stop_loss_monitor.update_price.await_args_list:
+        assert call.kwargs["source_timestamp"] is event_time
 
 
 @pytest.mark.asyncio
@@ -237,6 +248,8 @@ async def test_recovery_skips_stops_with_no_cached_price():
     """If a stop's symbol isn't in latest_prices, skip it gracefully."""
     runner = make_runner_for_recovery(initialize_succeeds_on=1)
     runner.latest_prices = {"AAPL": 150.0}  # only AAPL has a cached price
+    event_time = datetime.now(timezone.utc)
+    runner.latest_price_times = {"AAPL": event_time}
 
     stop_aapl = MagicMock(symbol="AAPL")
     stop_unknown = MagicMock(symbol="UNKNOWN")
@@ -251,7 +264,11 @@ async def test_recovery_skips_stops_with_no_cached_price():
         await runner.recover_connection("test")
 
     # Only AAPL was rewarmed
-    runner.stop_loss_monitor.update_price.assert_awaited_once_with("AAPL", 150.0)
+    runner.stop_loss_monitor.update_price.assert_awaited_once_with(
+        "AAPL",
+        150.0,
+        source_timestamp=event_time,
+    )
 
 
 @pytest.mark.asyncio
@@ -260,6 +277,8 @@ async def test_recovery_rewarm_handles_per_symbol_failures():
     A single broken stop cannot poison the entire rewarm pass."""
     runner = make_runner_for_recovery(initialize_succeeds_on=1)
     runner.latest_prices = {"AAPL": 150.0, "NVDA": 500.0}
+    event_time = datetime.now(timezone.utc)
+    runner.latest_price_times = {"AAPL": event_time, "NVDA": event_time}
 
     stop_aapl = MagicMock(symbol="AAPL")
     stop_nvda = MagicMock(symbol="NVDA")
@@ -269,7 +288,7 @@ async def test_recovery_rewarm_handles_per_symbol_failures():
         "default:NVDA": stop_nvda,
     }
 
-    async def update_price_fails_for_aapl(symbol, price):
+    async def update_price_fails_for_aapl(symbol, price, *, source_timestamp):
         if symbol == "AAPL":
             raise RuntimeError("intentional test failure")
 

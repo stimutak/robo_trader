@@ -12,7 +12,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import inspect
+import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -59,7 +62,15 @@ except ImportError:
     ws_client = None
     WEBSOCKET_ENABLED = False
 from .circuit_breaker import CircuitBreaker
-from .clients.subprocess_ibkr_client import SubprocessIBKRClient
+from .clients.subprocess_ibkr_client import (
+    GatewayRequiresRestartError,
+    IBKRConnectionConflictError,
+    IBKRDisconnectedError,
+    IBKRTimeoutError,
+    IBKRTransportPoisonedError,
+    SubprocessCrashError,
+    SubprocessIBKRClient,
+)
 from .connection_health import HealthStatus, get_gateway_recovery_lock
 from .exceptions import KillSwitchTriggeredError
 from .portfolio import Portfolio, PositionSnapshot  # Import Portfolio class from portfolio.py file
@@ -73,6 +84,22 @@ from .utils.connection_recovery import OrderRateLimiter
 
 # Initialize logger early for use in import error handling
 logger = get_logger(__name__)
+
+
+class MarketDataContractError(ValueError):
+    """Broker bars failed the runner's fail-closed event-time contract."""
+
+
+class MarketDataIdentityError(MarketDataContractError):
+    """Broker response identity is ambiguous or contradicts the request."""
+
+
+class SymbolCycleAbortError(RuntimeError):
+    """A transport-integrity failure requires cancellation of the symbol cycle."""
+
+
+_UNVERIFIED_PRICE_RATIO_LIMIT = 1.75
+
 
 # Import AI analyst for news-driven trading
 try:
@@ -418,6 +445,9 @@ class AsyncRunner:
         self.portfolio_manager: Optional[MultiStrategyPortfolioManager] = None
         self.positions: Dict[str, Position] = {}
         self.latest_prices: Dict[str, float] = {}
+        self.latest_price_times: Dict[str, datetime] = {}
+        self._trusted_bar_closes: Dict[str, float] = {}
+        self._protective_feed_status: Dict[str, dict] = {}
         self.daily_pnl = 0.0
         self.daily_executed_notional = 0.0
         # TC-M7: track today's starting unrealized P&L so the daily-loss check
@@ -448,6 +478,14 @@ class AsyncRunner:
         # This set is checked before any BUY order is placed
         self._pending_orders: set = set()
         self._pending_orders_lock = asyncio.Lock()
+        # A transport abort and final order admission serialize on this lock.
+        # A task that has started synchronous placement drains accounting; a
+        # task that has not crossed admission fails closed.
+        self._order_admission_lock = asyncio.Lock()
+        self._symbol_cycle_abort_event = asyncio.Event()
+        self._cycle_worker_tasks: set[asyncio.Task] = set()
+        self._order_admitted_tasks: set[asyncio.Task] = set()
+        self._run_parallel_lock = asyncio.Lock()
 
         # ADDITIONAL PROTECTION: Track symbols that have executed BUY orders this cycle
         # This is a more aggressive duplicate prevention mechanism
@@ -717,6 +755,33 @@ class AsyncRunner:
             logger.error(f"Error in _trading_blocked: {exc}")
         return False, ""
 
+    @staticmethod
+    def _rejected_order_result(message: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            ok=False,
+            message=message,
+            msg=message,
+            fill_price=None,
+        )
+
+    def _order_increases_exposure(self, order: Order) -> bool:
+        """Conservatively classify entry intents for temporary session gates."""
+        side = str(getattr(order, "side", "") or "").upper()
+        return side in {"BUY", "SELL_SHORT"}
+
+    async def _latch_symbol_cycle_abort(self) -> None:
+        """Serialize transport abort with the final placement admission gate."""
+        lock = getattr(self, "_order_admission_lock", None)
+        if lock is None:
+            self._order_admission_lock = asyncio.Lock()
+            lock = self._order_admission_lock
+        async with lock:
+            event = getattr(self, "_symbol_cycle_abort_event", None)
+            if event is None:
+                self._symbol_cycle_abort_event = asyncio.Event()
+                event = self._symbol_cycle_abort_event
+            event.set()
+
     async def _place_order_with_circuit_breaker(self, order: Order):
         """
         Execute order with circuit breaker protection.
@@ -738,9 +803,7 @@ class AsyncRunner:
                 f"Order rejected: non-finite price={_price!r} or qty={_qty!r} "
                 f"for {order.symbol}"
             )
-            return SimpleNamespace(
-                ok=False, message="Non-finite price or quantity", fill_price=None
-            )
+            return self._rejected_order_result("Non-finite price or quantity")
 
         # TC-M1 / TC-M6: centralized trading-blocked gate. This catches every
         # path that places an order, including SELL/closing flows, pairs trading,
@@ -759,21 +822,53 @@ class AsyncRunner:
             if _last is None or (_now - _last) >= self._kill_switch_log_throttle_seconds:
                 logger.error(f"Order blocked by trading_blocked gate for {order.symbol}: {reason}")
                 self._kill_switch_log_last[_key] = _now
-            return SimpleNamespace(ok=False, message=f"Trading blocked: {reason}", fill_price=None)
+            return self._rejected_order_result(f"Trading blocked: {reason}")
 
         # Check if circuit breaker allows the request
         if not await self.circuit_breaker.can_proceed():
             logger.error(f"Circuit breaker OPEN - order rejected for {order.symbol}")
-            return SimpleNamespace(ok=False, message="Circuit breaker open", fill_price=None)
+            return self._rejected_order_result("Circuit breaker open")
 
         # Apply rate limiting before order execution
         await self.rate_limiter.acquire()
         logger.debug(f"Rate limit acquired for {order.symbol} order")
 
         try:
-            # Execute the order
-            with Timer("order_execution", self.monitor):
-                result = self.executor.place_order(order)
+            lock = getattr(self, "_order_admission_lock", None)
+            if lock is None:
+                self._order_admission_lock = asyncio.Lock()
+                lock = self._order_admission_lock
+            async with lock:
+                abort_event = getattr(self, "_symbol_cycle_abort_event", None)
+                if abort_event is not None and abort_event.is_set():
+                    logger.error(
+                        "Order admission blocked after broker transport abort for %s",
+                        order.symbol,
+                    )
+                    return self._rejected_order_result(
+                        "Order admission blocked: broker transport unavailable"
+                    )
+                if is_extended_hours() and self._order_increases_exposure(order):
+                    logger.warning(
+                        "Extended-hours entry blocked for %s until session-aware "
+                        "market data lands in PR 3",
+                        order.symbol,
+                    )
+                    return self._rejected_order_result(
+                        "Entry blocked: extended-hours session data unavailable"
+                    )
+
+                # Synchronous paper placement is the point of no return. Hold
+                # admission through the call so an abort is ordered either
+                # before it (no fill) or after it (caller drains accounting).
+                current_task = asyncio.current_task()
+                cycle_workers: set[asyncio.Task] = getattr(self, "_cycle_worker_tasks", set())
+                if current_task is not None and current_task in cycle_workers:
+                    if not hasattr(self, "_order_admitted_tasks"):
+                        self._order_admitted_tasks = set()
+                    self._order_admitted_tasks.add(current_task)
+                with Timer("order_execution", self.monitor):
+                    result = self.executor.place_order(order)
 
             # Record success/failure with circuit breaker
             if result.ok:
@@ -1670,43 +1765,281 @@ class AsyncRunner:
             if not bars:
                 return pd.DataFrame()
 
-            # Convert list of dicts to DataFrame
+            # Convert list of dicts to DataFrame. Normalization below is
+            # intentionally shared with the legacy client so every consumer
+            # receives the same event-time contract.
             df = pd.DataFrame(bars)
-            if not df.empty:
-                # Ensure columns are lowercase
-                df.columns = [col.lower() for col in df.columns]
-                # Sort by date
-                if "date" in df.columns:
-                    df = df.sort_values("date")
         else:
             # Legacy IB client - use synchronous methods
             if not self.ib.isConnected():
                 raise ConnectionError("Not connected to IBKR")
 
             contract = Stock(symbol, "SMART", "USD")
-            qualified = self.ib.qualifyContracts(contract)
-            if not qualified:
-                return pd.DataFrame()
+            if hasattr(self.ib, "qualifyContractsAsync"):
+                qualified = self.ib.qualifyContractsAsync(contract)
+            elif hasattr(self.ib, "qualifyContracts"):
+                qualified = self.ib.qualifyContracts(contract)
+            else:
+                raise MarketDataContractError(
+                    "IBKR client exposes no contract qualification method"
+                )
+            if inspect.isawaitable(qualified):
+                qualified = await qualified
+            qualified_contract = self._validate_qualified_contract(symbol, qualified)
 
-            bars = self.ib.reqHistoricalData(
-                qualified[0],
-                endDateTime="",
-                durationStr=duration,
-                barSizeSetting=bar_size,
-                whatToShow=what_to_show,
-                useRTH=use_rth,
-                formatDate=1,
-            )
+            request_kwargs = {
+                "endDateTime": "",
+                "durationStr": duration,
+                "barSizeSetting": bar_size,
+                "whatToShow": what_to_show,
+                "useRTH": use_rth,
+                # UTC-aware datetime values; formatDate=1 is local/ambiguous.
+                "formatDate": 2,
+            }
+            if hasattr(self.ib, "reqHistoricalDataAsync"):
+                bars = self.ib.reqHistoricalDataAsync(
+                    qualified_contract,
+                    **request_kwargs,
+                )
+            elif hasattr(self.ib, "reqHistoricalData"):
+                bars = self.ib.reqHistoricalData(
+                    qualified_contract,
+                    **request_kwargs,
+                )
+            else:
+                raise MarketDataContractError("IBKR client exposes no historical-data method")
+            if inspect.isawaitable(bars):
+                bars = await bars
 
             if not bars:
                 return pd.DataFrame()
 
             df = pd.DataFrame(bars)
-            if not df.empty:
-                df.columns = [col.lower() for col in df.columns]
-                df = df.sort_values("date")
 
-        return df
+        return self._normalize_broker_bars(symbol, df, bar_size)
+
+    @staticmethod
+    def _bar_interval_seconds(bar_size: str) -> int:
+        """Return the requested bar interval in seconds, conservatively."""
+        value = str(bar_size).strip().lower().split()
+        if not value:
+            return 60
+        try:
+            amount = int(value[0])
+        except (TypeError, ValueError):
+            return 60
+        unit = value[1] if len(value) > 1 else "min"
+        if unit.startswith("sec"):
+            return amount
+        if unit.startswith("min"):
+            return amount * 60
+        if unit.startswith("hour"):
+            return amount * 3600
+        if unit.startswith("day"):
+            return amount * 86400
+        return 60
+
+    @classmethod
+    def _require_intraday_bar_size(cls, bar_size: str) -> None:
+        """Reject daily-or-coarser bars from the active trading runtime."""
+        normalized = str(bar_size).strip().lower()
+        interval_seconds = cls._bar_interval_seconds(normalized)
+        if (
+            interval_seconds >= 86400
+            or "day" in normalized
+            or "week" in normalized
+            or "month" in normalized
+            or re.fullmatch(r"\d+\s*(d|w|wk|wks|mo|mos)", normalized) is not None
+        ):
+            raise MarketDataContractError(
+                "active trading requires timezone-aware intraday datetime bars; "
+                "daily-or-coarser bars are unsupported"
+            )
+
+    @staticmethod
+    def _validate_qualified_contract(symbol: str, contracts: object) -> object:
+        """Validate the legacy client's qualified Stock identity fail closed."""
+        requested = symbol.strip().upper()
+        if not isinstance(contracts, (list, tuple)) or len(contracts) != 1:
+            raise MarketDataIdentityError(
+                f"IBKR contract qualification was not unique for {symbol}"
+            )
+        contract = contracts[0]
+        con_id = getattr(contract, "conId", None)
+        if (
+            contract is None
+            or isinstance(con_id, bool)
+            or not isinstance(con_id, int)
+            or con_id <= 0
+        ):
+            raise MarketDataIdentityError(
+                f"IBKR returned an invalid qualified contract for {symbol}"
+            )
+
+        contract_symbol = str(getattr(contract, "symbol", "") or "").strip().upper()
+        local_symbol = str(getattr(contract, "localSymbol", "") or "").strip().upper()
+        if contract_symbol != requested or local_symbol != requested:
+            raise MarketDataIdentityError(
+                f"IBKR qualified contract identity does not match {symbol}"
+            )
+        if str(getattr(contract, "secType", "") or "").strip().upper() != "STK":
+            raise MarketDataIdentityError("IBKR qualified contract is not a stock")
+        if str(getattr(contract, "currency", "") or "").strip().upper() != "USD":
+            raise MarketDataIdentityError("IBKR qualified contract currency is not USD")
+        if str(getattr(contract, "exchange", "") or "").strip().upper() != "SMART":
+            raise MarketDataIdentityError("IBKR qualified contract does not preserve SMART routing")
+        return contract
+
+    @classmethod
+    def _normalize_broker_bars(
+        cls,
+        symbol: str,
+        frame: pd.DataFrame,
+        bar_size: str,
+        *,
+        now: Optional[pd.Timestamp] = None,
+    ) -> pd.DataFrame:
+        """Validate broker bars and return a UTC-aware, time-indexed frame.
+
+        This is the last trust boundary before bars can reach persistence,
+        caches, strategies, risk, or protective-stop logic. It therefore
+        rejects ambiguity instead of sorting, localizing, or otherwise
+        guessing what the broker meant.
+        """
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            return pd.DataFrame()
+        cls._require_intraday_bar_size(bar_size)
+
+        normalized = frame.copy()
+        lowered = [str(column).lower() for column in normalized.columns]
+        if len(lowered) != len(set(lowered)):
+            raise MarketDataIdentityError("broker bar columns are identity-ambiguous")
+        normalized.columns = lowered
+
+        if "symbol" in normalized.columns:
+            raw_identities = normalized["symbol"].tolist()
+            if any(pd.isna(value) or not str(value).strip() for value in raw_identities):
+                raise MarketDataIdentityError("broker bars contain missing symbol identity")
+            identities = {str(value).strip().upper() for value in raw_identities}
+            if identities != {symbol.upper()}:
+                raise MarketDataIdentityError(
+                    f"broker bar identity does not uniquely match {symbol}"
+                )
+
+        if "date" not in normalized.columns:
+            # A RangeIndex here is the historic corruption path: its row
+            # numbers were persisted as market timestamps.
+            if isinstance(normalized.index, pd.RangeIndex):
+                raise MarketDataContractError("broker bars have RangeIndex and no date values")
+            raise MarketDataContractError("broker bars have no explicit date values")
+
+        timestamps = []
+        for value in normalized["date"].tolist():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                raise MarketDataContractError("numeric broker timestamps are ambiguous")
+            try:
+                timestamp = pd.Timestamp(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise MarketDataContractError(f"invalid broker timestamp: {value!r}") from exc
+            if pd.isna(timestamp):
+                raise MarketDataContractError("broker timestamp is missing")
+            if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+                raise MarketDataContractError("timezone-naive broker timestamp rejected")
+            timestamps.append(timestamp.tz_convert("UTC"))
+
+        index = pd.DatetimeIndex(timestamps, name="timestamp")
+        if not index.is_unique:
+            raise MarketDataContractError("duplicate broker timestamps rejected")
+        if not index.is_monotonic_increasing:
+            raise MarketDataContractError("reversed or out-of-order broker timestamps rejected")
+
+        if isinstance(normalized.index, pd.DatetimeIndex):
+            existing = normalized.index
+            if existing.tz is None:
+                raise MarketDataContractError("timezone-naive broker index rejected")
+            if not existing.tz_convert("UTC").equals(index):
+                raise MarketDataIdentityError("broker date column and index disagree")
+        elif not isinstance(normalized.index, pd.RangeIndex):
+            raise MarketDataIdentityError("broker row identity is ambiguous")
+
+        current = now if now is not None else pd.Timestamp.now(tz="UTC")
+        current = pd.Timestamp(current)
+        if current.tzinfo is None or current.utcoffset() is None:
+            raise ValueError("validation clock must be timezone-aware")
+        current = current.tz_convert("UTC")
+        latest = index[-1]
+        if latest > current:
+            raise MarketDataContractError("broker bars contain a future timestamp")
+        interval_seconds = cls._bar_interval_seconds(bar_size)
+        default_max_age = max(180, (interval_seconds * 2) + 30)
+        try:
+            max_age_seconds = float(os.getenv("MARKET_DATA_MAX_AGE_SECONDS", str(default_max_age)))
+        except (TypeError, ValueError):
+            max_age_seconds = float(default_max_age)
+        if not math.isfinite(max_age_seconds) or max_age_seconds <= 0:
+            raise MarketDataContractError("MARKET_DATA_MAX_AGE_SECONDS must be positive")
+        if (current - latest).total_seconds() > max_age_seconds:
+            raise MarketDataContractError(
+                f"stale broker bars rejected (age={(current - latest).total_seconds():.1f}s)"
+            )
+
+        required = ("open", "high", "low", "close", "volume")
+        missing = [column for column in required if column not in normalized.columns]
+        if missing:
+            raise MarketDataContractError(f"broker bars missing fields: {', '.join(missing)}")
+        for column in required:
+            numeric = pd.to_numeric(normalized[column], errors="coerce")
+            if numeric.isna().any() or not numeric.map(math.isfinite).all():
+                raise MarketDataContractError(f"broker bar {column} contains invalid values")
+            normalized[column] = numeric
+        if (normalized[["open", "high", "low", "close"]] <= 0).any().any():
+            raise MarketDataContractError("broker OHLC values must be positive")
+        if (normalized["volume"] < 0).any():
+            raise MarketDataContractError("broker volume cannot be negative")
+        if (normalized["high"] < normalized[["open", "low", "close"]].max(axis=1)).any() or (
+            normalized["low"] > normalized[["open", "high", "close"]].min(axis=1)
+        ).any():
+            raise MarketDataContractError("broker OHLC ordering is invalid")
+
+        normalized = normalized.drop(columns=["date"])
+        normalized.index = index
+        return normalized
+
+    def _validate_cross_bar_anomaly(self, symbol: str, frame: pd.DataFrame) -> None:
+        """Quarantine split-like discontinuities before any downstream side effect.
+
+        Corporate-action adjustment is not yet authoritative. Any OHLC move at
+        or beyond 1.75x (or its reciprocal) therefore fails closed. This catches
+        common 2:1, 3:1, and 4:1 splits while leaving authoritative corporate
+        action handling to PR 3.
+        """
+        limit = _UNVERIFIED_PRICE_RATIO_LIMIT
+        reciprocal = 1.0 / limit
+        ohlc = frame[["open", "high", "low", "close"]].astype(float)
+        closes = frame["close"].astype(float)
+
+        intrabar_spread = ohlc.max(axis=1) / ohlc.min(axis=1)
+        if ((intrabar_spread >= limit) | (intrabar_spread <= reciprocal)).any():
+            raise MarketDataContractError(
+                f"intrabar OHLC anomaly quarantined for {symbol}: "
+                "possible bad tick or corporate action"
+            )
+
+        previous_close = closes.shift(1)
+        adjacent = ohlc.div(previous_close, axis=0).iloc[1:]
+        if ((adjacent >= limit) | (adjacent <= reciprocal)).any().any():
+            raise MarketDataContractError(
+                f"cross-bar OHLC anomaly quarantined for {symbol}: " "possible corporate action"
+            )
+
+        trusted = getattr(self, "_trusted_bar_closes", {}).get(symbol)
+        if trusted is not None:
+            latest_ratios = ohlc.iloc[-1] / float(trusted)
+            if ((latest_ratios >= limit) | (latest_ratios <= reciprocal)).any():
+                raise MarketDataContractError(
+                    f"latest bar OHLC anomaly quarantined for {symbol}: "
+                    "possible corporate action"
+                )
 
     async def teardown(self, full_cleanup: bool = False):
         """Clean up resources after a run cycle.
@@ -1796,12 +2129,13 @@ class AsyncRunner:
         # background monitor (or next cycle) handle recovery — do NOT reconnect here.
         if hasattr(self.ib, "is_connected") and not self.ib.is_connected:
             logger.warning(f"Connection lost before fetching {symbol}; deferring to health monitor")
+            error = IBKRDisconnectedError("is_connected=False before fetch")
             if getattr(self, "health", None) is not None:
                 self.health.record_failure(
-                    RuntimeError("is_connected=False before fetch"),
+                    error,
                     "fetch_and_store_data",
                 )
-            return None
+            raise SymbolCycleAbortError(f"broker disconnected before fetching {symbol}") from error
 
         try:
             start_time = asyncio.get_event_loop().time()
@@ -1821,6 +2155,7 @@ class AsyncRunner:
             if df.empty:
                 logger.warning(f"No data returned for {symbol}")
                 return None
+            self._validate_cross_bar_anomaly(symbol, df)
 
             # Store market data in database
             logger.info(f"Fetched {len(df)} bars for {symbol}")
@@ -1847,19 +2182,44 @@ class AsyncRunner:
                 with Timer("database_write", self.monitor):
                     await self.db.batch_store_market_data(batch_data)
                 self.monitor.record_data_points(len(batch_data))
+            if not hasattr(self, "_trusted_bar_closes"):
+                self._trusted_bar_closes = {}
+            self._trusted_bar_closes[symbol] = float(df["close"].iloc[-1])
 
+            health = getattr(self, "health", None)
+            if health is not None:
+                health.record_success()
             return df
 
+        except MarketDataIdentityError as e:
+            logger.error(f"Rejected identity-ambiguous broker data for {symbol}: {e}")
+            health = getattr(self, "health", None)
+            if health is not None:
+                health.record_failure(e, "fetch_and_store_data:identity")
+            raise SymbolCycleAbortError(
+                f"broker response identity failed while fetching {symbol}"
+            ) from e
+        except MarketDataContractError as e:
+            logger.error(f"Rejected broker data for {symbol}: {e}")
+            return None
+        except (
+            IBKRTransportPoisonedError,
+            IBKRTimeoutError,
+            SubprocessCrashError,
+            GatewayRequiresRestartError,
+            IBKRDisconnectedError,
+            IBKRConnectionConflictError,
+            ConnectionError,
+        ) as e:
+            logger.error(f"Broker transport failed while fetching {symbol}: {e}")
+            health = getattr(self, "health", None)
+            if health is not None:
+                health.record_failure(e, "fetch_and_store_data")
+            raise SymbolCycleAbortError(
+                f"broker transport integrity failed while fetching {symbol}"
+            ) from e
         except Exception as e:
-            error_str = str(e)
             logger.error(f"Failed to fetch data for {symbol}: {e}")
-
-            # If connection error, mark as disconnected to trigger reconnect on next fetch
-            if "ConnectionError" in error_str or "Not connected" in error_str:
-                if hasattr(self.ib, "_connected"):
-                    self.ib._connected = False
-                logger.warning("Marked connection as disconnected for next retry")
-
             return None
 
     def _manage_cache_size(self):
@@ -1937,32 +2297,61 @@ class AsyncRunner:
                 message="No data available",
             )
 
-        # Cache market data for pairs/stat arb analysis with LRU eviction
+        latest_price = float(df["close"].iloc[-1])
+        latest_timestamp = df.index[-1].to_pydatetime()
+
+        # Protective freshness is a prerequisite for any strategy or order
+        # path. Historical bars remain an interim source until PR 3 adds an
+        # independent live-grade protective feed, so paper entries may pause.
+        if self.stop_loss_monitor and latest_price:
+            protective_available = await self.stop_loss_monitor.update_price(
+                symbol,
+                latest_price,
+                source_timestamp=latest_timestamp,
+            )
+            if not hasattr(self, "_protective_feed_status"):
+                self._protective_feed_status = {}
+            self._protective_feed_status[symbol] = {
+                "available": bool(protective_available),
+                "source_timestamp": latest_timestamp.isoformat(),
+            }
+            if not protective_available:
+                logger.error(
+                    "Protective feed unavailable for %s; strategy and order paths blocked",
+                    symbol,
+                )
+                return self._blocked_result(
+                    symbol,
+                    0,
+                    latest_price,
+                    "Protective feed unavailable: source event rejected",
+                    df,
+                )
+
+        # Cache and latest/risk consumers are downstream of both the data
+        # contract and protective-feed admission.
         if symbol in self.market_data_cache:
             self.market_data_cache.move_to_end(symbol)
         self.market_data_cache[symbol] = df
         self._manage_cache_size()
+        self.latest_prices[symbol] = latest_price
+        if not hasattr(self, "latest_price_times"):
+            self.latest_price_times = {}
+        self.latest_price_times[symbol] = latest_timestamp
 
-        # Send real-time price update via WebSocket
-        latest_price = None
-        if df is not None and not df.empty:
-            latest_price = float(df["close"].iloc[-1])
-            self.latest_prices[symbol] = latest_price
+        if WEBSOCKET_ENABLED and ws_client:
+            try:
+                ws_client.send_market_update(symbol, latest_price)
+                logger.info(f"Sent WebSocket update for {symbol}: ${latest_price:.2f}")
+            except Exception as e:
+                logger.error(f"Could not send WebSocket update: {e}")
 
-            if WEBSOCKET_ENABLED and ws_client:
-                try:
-                    ws_client.send_market_update(symbol, latest_price)
-                    logger.info(f"Sent WebSocket update for {symbol}: ${latest_price:.2f}")
-                except Exception as e:
-                    logger.error(f"Could not send WebSocket update: {e}")
+        # Update advanced risk manager with latest prices
+        if self.use_advanced_risk and self.advanced_risk and latest_price:
+            self.advanced_risk.update_market_prices({symbol: latest_price})
 
-            # Update advanced risk manager with latest prices
-            if self.use_advanced_risk and self.advanced_risk and latest_price:
-                self.advanced_risk.update_market_prices({symbol: latest_price})
-
-            # Update stop-loss monitor with latest price
-            if self.stop_loss_monitor and latest_price:
-                await self.stop_loss_monitor.update_price(symbol, latest_price)
+        if hasattr(self, "_protective_feed_status") and self.stop_loss_monitor:
+            self._protective_feed_status[symbol]["available"] = True
 
         # Generate trading signal
         with Timer("signal_generation", self.monitor):
@@ -2969,6 +3358,15 @@ class AsyncRunner:
         )
 
     async def run_parallel(self, symbols: List[str]) -> List[SymbolResult]:
+        """Serialize complete symbol cycles so abort state cannot be reset early."""
+        if not hasattr(self, "_run_parallel_lock"):
+            self._run_parallel_lock = asyncio.Lock()
+        if self._run_parallel_lock.locked():
+            raise RuntimeError("run_parallel cycle is already active")
+        async with self._run_parallel_lock:
+            return await self._run_parallel_locked(symbols)
+
+    async def _run_parallel_locked(self, symbols: List[str]) -> List[SymbolResult]:
         """Process multiple symbols in parallel with concurrency control."""
         # TC-L4: clear cycle-level executed-buys set at the start of each cycle
         # so the protection re-applies fresh per cycle (it accumulated across
@@ -2986,18 +3384,92 @@ class AsyncRunner:
             pass
 
         semaphore = asyncio.Semaphore(self.max_concurrent_symbols)
+        if not hasattr(self, "_order_admission_lock"):
+            self._order_admission_lock = asyncio.Lock()
+        async with self._order_admission_lock:
+            self._symbol_cycle_abort_event = asyncio.Event()
+            self._cycle_worker_tasks = set()
+            self._order_admitted_tasks = set()
 
         async def process_with_semaphore(symbol: str) -> SymbolResult:
             async with semaphore:
-                result = await self.process_symbol(symbol)
-                self.monitor.record_symbol_processed(
-                    symbol, success=result.executed or result.signal == 0
-                )
-                return result
+                current_task = asyncio.current_task()
+                if current_task is not None:
+                    self._cycle_worker_tasks.add(current_task)
+                try:
+                    if self._symbol_cycle_abort_event.is_set():
+                        raise SymbolCycleAbortError(
+                            "shared broker transport was already declared unusable"
+                        )
+                    result = await self.process_symbol(symbol)
+                except SymbolCycleAbortError:
+                    await self._latch_symbol_cycle_abort()
+                    raise
+                else:
+                    self.monitor.record_symbol_processed(
+                        symbol, success=result.executed or result.signal == 0
+                    )
+                    return result
+                finally:
+                    if current_task is not None:
+                        self._order_admitted_tasks.discard(current_task)
+                        self._cycle_worker_tasks.discard(current_task)
 
-        # Process all symbols concurrently with exception safety
-        tasks = [process_with_semaphore(symbol) for symbol in symbols]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Process concurrently, but fail the entire remaining cycle closed if
+        # one symbol proves the shared broker transport generation unusable.
+        tasks = [
+            asyncio.create_task(process_with_semaphore(symbol), name=f"symbol:{symbol}")
+            for symbol in symbols
+        ]
+        if not tasks:
+            await self.update_position_market_prices({})
+            return []
+        task_indexes = {task: index for index, task in enumerate(tasks)}
+        results: List[object] = [None] * len(tasks)
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+        except asyncio.CancelledError:
+            # asyncio.wait does not propagate cancellation into children. Latch
+            # admission first, cancel only tasks that never crossed the
+            # point-of-no-return, and drain admitted tasks through accounting.
+            await self._latch_symbol_cycle_abort()
+            admitted = set(getattr(self, "_order_admitted_tasks", set()))
+            unfinished = [task for task in tasks if not task.done()]
+            for task in unfinished:
+                if task not in admitted:
+                    task.cancel()
+            if unfinished:
+
+                async def drain_children() -> None:
+                    await asyncio.gather(*unfinished, return_exceptions=True)
+
+                drain_task = asyncio.create_task(
+                    drain_children(),
+                    name="symbol-cycle-accounting-drain",
+                )
+                while not drain_task.done():
+                    try:
+                        await asyncio.shield(drain_task)
+                    except asyncio.CancelledError:
+                        # Retain and continue joining the concrete drain task;
+                        # repeated parent cancellation must not split a fill
+                        # from its accounting.
+                        continue
+            raise
+        except BaseException:
+            unfinished = [task for task in tasks if not task.done()]
+            for task in unfinished:
+                task.cancel()
+            if unfinished:
+                await asyncio.gather(*unfinished, return_exceptions=True)
+            raise
+
+        for task in done:
+            index = task_indexes[task]
+            try:
+                results[index] = task.result()
+            except Exception as exc:
+                results[index] = exc
 
         # Handle exceptions and collect valid results
         valid_results = []
@@ -3011,7 +3483,8 @@ class AsyncRunner:
                     traceback.format_exception(type(result), result, result.__traceback__)
                 )
                 logger.error(f"Task failed for symbol {symbol}: {result}\nTraceback:\n{tb_str}")
-                # Continue processing other symbols, don't crash the entire run
+                # Ordinary per-symbol failures are isolated. A
+                # SymbolCycleAbortError has already cancelled pending work.
                 continue
             else:
                 valid_results.append(result)
@@ -4315,14 +4788,12 @@ class AsyncRunner:
             self._recovery_exhausted = True
 
     async def _rewarm_stop_loss_prices_after_recovery(self) -> None:
-        """Push cached prices from self.latest_prices into the stop-loss
-        monitor's active stops after a successful reconnect.
+        """Offer cached broker events to stops after a successful reconnect.
 
-        The stop-loss monitor's freshness gate is 10 seconds — if no price
-        tick arrives that fast after recovery, stops go blind until the
-        next cycle finishes processing each symbol. Rewarming from the
-        in-memory price cache (which survives recovery — _safe_disconnect
-        and initialize_connection do not touch it) closes that gap.
+        The stop monitor independently rejects any source event older than
+        its protective-feed threshold. Reconnect must not manufacture
+        freshness for historical closes, so rejected events are counted as
+        skipped and never reported as rewarmed protection.
 
         Defensive: skips when attributes don't exist (e.g., minimal test
         runners). Each update_price call is independently wrapped so a
@@ -4330,7 +4801,8 @@ class AsyncRunner:
         """
         stop_monitor = getattr(self, "stop_loss_monitor", None)
         prices = getattr(self, "latest_prices", None)
-        if stop_monitor is None or prices is None:
+        price_times = getattr(self, "latest_price_times", None)
+        if stop_monitor is None or prices is None or price_times is None:
             logger.debug("event=stop_loss_prices_rewarm_skipped reason=missing_attributes")
             return
 
@@ -4344,12 +4816,19 @@ class AsyncRunner:
         # objects carry the bare symbol on .symbol.
         for stop in list(active_stops.values()):
             symbol = getattr(stop, "symbol", None)
-            if symbol is None or symbol not in prices:
+            if symbol is None or symbol not in prices or symbol not in price_times:
                 skipped += 1
                 continue
             try:
-                await stop_monitor.update_price(symbol, prices[symbol])
-                rewarmed += 1
+                accepted = await stop_monitor.update_price(
+                    symbol,
+                    prices[symbol],
+                    source_timestamp=price_times[symbol],
+                )
+                if accepted:
+                    rewarmed += 1
+                else:
+                    skipped += 1
             except Exception as e:
                 logger.warning(
                     "event=stop_loss_price_rewarm_failed symbol=%s error=%r",

@@ -14,8 +14,9 @@ Features:
 """
 
 import asyncio
+import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
@@ -155,7 +156,8 @@ class StopLossMonitor:
 
         # Price tracking for triggers
         self.last_prices: Dict[str, float] = {}
-        self.price_update_times: Dict[str, datetime] = {}
+        self.price_event_times: Dict[str, datetime] = {}
+        self.price_receipt_monotonic: Dict[str, float] = {}
 
         # Metrics
         self.metrics = StopLossMetrics()
@@ -258,23 +260,70 @@ class StopLossMonitor:
 
         return stop_order
 
-    async def update_price(self, symbol: str, price: float) -> None:
+    @staticmethod
+    def _utcnow() -> datetime:
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _monotonic() -> float:
+        return time.monotonic()
+
+    async def update_price(
+        self,
+        symbol: str,
+        price: float,
+        *,
+        source_timestamp: Optional[datetime] = None,
+    ) -> bool:
         """
         Update current price for a symbol.
 
         Args:
             symbol: Trading symbol
             price: Current market price
+            source_timestamp: Timezone-aware broker event timestamp. Missing
+                event time is rejected rather than replaced by receipt time.
         """
         try:
             symbol = DatabaseValidator.validate_symbol(symbol)
             price = DatabaseValidator.validate_price(price)
         except ValidationError as e:
             logger.error(f"Invalid price update: {e}")
-            return
+            return False
+
+        if source_timestamp is None or not isinstance(source_timestamp, datetime):
+            logger.error("Rejected price update for %s: missing source timestamp", symbol)
+            return False
+        if source_timestamp.tzinfo is None or source_timestamp.utcoffset() is None:
+            logger.error("Rejected price update for %s: timezone-naive timestamp", symbol)
+            return False
+
+        event_time = source_timestamp.astimezone(timezone.utc)
+        event_age = (self._utcnow() - event_time).total_seconds()
+        if event_age < 0:
+            logger.error("Rejected price update for %s: future source timestamp", symbol)
+            return False
+        if event_age > self.max_price_age_seconds:
+            logger.warning(
+                "Rejected stale price update for %s (event age: %.1fs)",
+                symbol,
+                event_age,
+            )
+            return False
+
+        previous_event_time = self.price_event_times.get(symbol)
+        if previous_event_time is not None and event_time <= previous_event_time:
+            logger.warning(
+                "Rejected non-increasing price event for %s: %s <= %s",
+                symbol,
+                event_time.isoformat(),
+                previous_event_time.isoformat(),
+            )
+            return False
 
         self.last_prices[symbol] = price
-        self.price_update_times[symbol] = datetime.now()
+        self.price_event_times[symbol] = event_time
+        self.price_receipt_monotonic[symbol] = self._monotonic()
 
         # Update trailing stops if needed
         stop_key = self._stop_key(symbol)
@@ -282,6 +331,7 @@ class StopLossMonitor:
             stop = self.active_stops[stop_key]
             if stop.stop_type in [StopType.TRAILING, StopType.TRAILING_PERCENT]:
                 await self._update_trailing_stop(stop, price)
+        return True
 
     async def _update_trailing_stop(self, stop: StopLossOrder, current_price: float) -> None:
         """
@@ -350,11 +400,27 @@ class StopLossMonitor:
                 logger.warning(f"No price data for {stop.symbol}, cannot check stop-loss")
                 continue
 
-            # Check price freshness
-            price_age = datetime.now() - self.price_update_times.get(stop.symbol, datetime.min)
-            if price_age.total_seconds() > self.max_price_age_seconds:
+            event_time = self.price_event_times.get(stop.symbol)
+            receipt_time = self.price_receipt_monotonic.get(stop.symbol)
+            if event_time is None or receipt_time is None:
+                logger.warning(f"No timestamp data for {stop.symbol}, cannot check stop-loss")
+                continue
+
+            # Event age protects against stale broker data. Monotonic receipt
+            # age stays correct if the host wall clock moves backwards.
+            event_age_seconds = (self._utcnow() - event_time).total_seconds()
+            receipt_age_seconds = self._monotonic() - receipt_time
+            if (
+                event_age_seconds < 0
+                or receipt_age_seconds < 0
+                or event_age_seconds > self.max_price_age_seconds
+                or receipt_age_seconds > self.max_price_age_seconds
+            ):
                 logger.warning(
-                    f"Stale price data for {stop.symbol} (age: {price_age.total_seconds():.1f}s)"
+                    "Stale price data for %s (event_age=%.1fs receipt_age=%.1fs)",
+                    stop.symbol,
+                    event_age_seconds,
+                    receipt_age_seconds,
                 )
                 continue
 
