@@ -110,8 +110,9 @@ class EquityHistoryFreshnessCheck:
                     f"Could not read equity_history from {db_path}. The ledger may be "
                     "locked, corrupted, or schema-mismatched. Inspect that exact file "
                     "with read-only SQLite tooling. If this is a known-good transient "
-                    "(for example, another process is writing), wait and re-run; "
-                    "otherwise use `--force` only after investigating."
+                    "(for example, another process is writing), wait and re-run. "
+                    "Keep startup blocked until the configured ledger can be read; "
+                    "diagnostic evidence does not authorize startup."
                 ),
                 details={"db_path": str(db_path), "error": str(exc)},
             )
@@ -146,8 +147,9 @@ class EquityHistoryFreshnessCheck:
                     f"The most recent equity_history row in {db_path} has a timestamp "
                     "that doesn't match the expected SQLite CURRENT_TIMESTAMP format. "
                     "Inspect the configured ledger and any pending migrations without "
-                    "rewriting history, or use `--force` if you've confirmed positions "
-                    "match IBKR."
+                    "rewriting history. Keep startup blocked; any broker-ledger "
+                    "reconciliation output is evidence only and does not authorize "
+                    "startup."
                 ),
                 details={"db_path": str(db_path), "raw_timestamp": max_ts_raw},
             )
@@ -182,9 +184,11 @@ class EquityHistoryFreshnessCheck:
             remediation=(
                 f"The last equity row in {db_path} is {trading_days_elapsed} trading "
                 "days old. This usually means a prior session died without writing "
-                "a snapshot. Verify positions match IBKR "
-                "(`scripts/reconcile_positions.py`) before resuming, or `--force` "
-                "if you've already confirmed."
+                "a snapshot. Collect evidence with the read-only diagnostic "
+                "`python3 scripts/reconcile_broker_ledger.py --portfolio-id "
+                "<portfolio_id>`. Review the resulting broker-versus-ledger report; "
+                "it does not modify state, clear safety controls, bypass preflight, "
+                "or authorize startup."
             ),
             details=details,
         )

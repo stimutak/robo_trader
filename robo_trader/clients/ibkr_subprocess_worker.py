@@ -20,19 +20,21 @@ import sys
 import threading
 import time
 import traceback
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from typing import Any, Optional, cast
 
 # CRITICAL: Enable real disconnect BEFORE importing ib_async or ibkr_safe
 # This prevents zombie connections when the worker process exits
 os.environ["IBKR_FORCE_DISCONNECT"] = "1"
 
-from ib_async import IB  # noqa: E402
+from ib_async import IB, ExecutionFilter  # noqa: E402
 
 from robo_trader.utils.ibkr_safe import safe_disconnect  # noqa: E402
 
 # Global IB instance
 ib: Optional[IB] = None
+worker_connection_identity: Optional[tuple[str, int, int, bool]] = None
 
 # Global shutdown flag
 shutdown_requested = False
@@ -76,6 +78,24 @@ class ContractIdentityProtocolError(ValueError):
     """Qualified broker identity cannot be trusted for the requested symbol."""
 
 
+class BrokerSnapshotAccountMismatchError(ValueError):
+    """Expected and connected broker account identities do not match."""
+
+
+BROKER_SNAPSHOT_SCHEMA_VERSION = 1
+BROKER_SNAPSHOT_BALANCE_TAGS = frozenset(
+    {
+        "NetLiquidation",
+        "TotalCashValue",
+        "SettledCash",
+        "GrossPositionValue",
+        "RealizedPnL",
+        "UnrealizedPnL",
+    }
+)
+BROKER_SNAPSHOT_REQUIRED_BALANCE_TAGS = frozenset({"NetLiquidation", "TotalCashValue"})
+
+
 def _aware_iso(value: Any) -> str:
     """Serialize a broker timestamp without silently losing timezone identity."""
     if not isinstance(value, datetime):
@@ -83,6 +103,72 @@ def _aware_iso(value: Any) -> str:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("Broker timestamp is timezone-naive")
     return value.isoformat()
+
+
+def _canonical_decimal(value: Any) -> str:
+    """Return a finite, non-lossy decimal string for reconciliation evidence."""
+    if isinstance(value, bool):
+        raise ValueError("Boolean is not a broker numeric value")
+    try:
+        decimal_value = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("Broker numeric value is not decimal") from exc
+    if not decimal_value.is_finite():
+        raise ValueError("Broker numeric value is not finite")
+    if decimal_value == 0:
+        return "0"
+    return format(decimal_value.normalize(), "f")
+
+
+def _required_int(value: Any, field: str, *, allow_zero: bool = False) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} is not an integer")
+    if value < 0 or (value == 0 and not allow_zero):
+        raise ValueError(f"{field} is not a valid broker identifier")
+    return value
+
+
+def _optional_identifier(value: Any, reason: str) -> tuple[Optional[int], Optional[str]]:
+    try:
+        identifier = _required_int(value, "broker identifier")
+    except ValueError:
+        return None, reason
+    return identifier, None
+
+
+def _optional_decimal(value: Any, reason: str) -> tuple[Optional[str], Optional[str]]:
+    """Represent IBKR unset numeric sentinels explicitly instead of as evidence."""
+    try:
+        canonical = _canonical_decimal(value)
+        decimal_value = Decimal(canonical)
+    except ValueError:
+        return None, reason
+    if abs(decimal_value) >= Decimal("1e307"):
+        return None, reason
+    return canonical, None
+
+
+def _optional_aware_time(value: Any, reason: str) -> tuple[Optional[str], Optional[str]]:
+    try:
+        return _aware_iso(value), None
+    except (TypeError, ValueError):
+        return None, reason
+
+
+async def _qualified_stock_identity(contract: Any) -> dict:
+    qualified = await _qualify_one_contract(contract)
+    requested_symbol = str(getattr(contract, "symbol", "")).strip()
+    _validate_stock_identity(qualified, requested_symbol)
+    return {
+        "con_id": qualified.conId,
+        "symbol": str(qualified.symbol).strip().upper(),
+        "local_symbol": str(qualified.localSymbol).strip().upper(),
+        "security_type": qualified.secType,
+        "currency": qualified.currency,
+        "exchange": qualified.exchange,
+        "primary_exchange": qualified.primaryExchange,
+        "trading_class": qualified.tradingClass,
+    }
 
 
 async def _qualify_one_contract(contract: Any) -> Any:
@@ -201,10 +287,14 @@ def _cleanup_on_exit():
     if ib is not None:
         print("atexit: Disconnecting from IBKR...", file=sys.stderr, flush=True)
         try:
-            safe_disconnect(ib)
+            safe_disconnect(
+                ib,
+                context="diagnostic_worker:atexit",
+                log_exception_details=False,
+            )
             print("atexit: Disconnected successfully", file=sys.stderr, flush=True)
-        except Exception as e:
-            print(f"atexit: Disconnect error: {e}", file=sys.stderr, flush=True)
+        except Exception:
+            print("atexit: Disconnect error", file=sys.stderr, flush=True)
         ib = None
 
 
@@ -239,7 +329,40 @@ async def handle_connect(params: dict) -> dict:
     3. Async polling with asyncio.sleep() for account data
     4. Event-based waiting using ib_async's internal event loop
     """
-    global ib, gateway_api_down, gateway_failure_detail
+    global ib, gateway_api_down, gateway_failure_detail, worker_connection_identity
+
+    host = params.get("host", "127.0.0.1")
+    port = params.get("port", 4002)
+    client_id = params.get("client_id", 1)
+    readonly = params.get("readonly", True)
+    timeout = params.get("timeout", 30.0)
+    if isinstance(port, bool) or port != 4002:
+        return {
+            "status": "error",
+            "error": "Diagnostic worker requires IBKR paper port 4002",
+            "error_type": "ValueError",
+        }
+    if readonly is not True:
+        return {
+            "status": "error",
+            "error": "Diagnostic worker requires readonly exactly true",
+            "error_type": "ValueError",
+        }
+    if isinstance(client_id, bool) or not isinstance(client_id, int) or client_id < 0:
+        return {
+            "status": "error",
+            "error": "Diagnostic worker requires a non-negative client ID",
+            "error_type": "ValueError",
+        }
+    if ib is not None and ib.isConnected():
+        return {
+            "status": "error",
+            "error": (
+                "Worker already has an active IBKR connection; "
+                "client must stop/start before reconnecting"
+            ),
+            "error_type": "RuntimeError",
+        }
 
     try:
         if gateway_api_down:
@@ -252,26 +375,18 @@ async def handle_connect(params: dict) -> dict:
             }
 
         if ib is not None:
-            if ib.isConnected():
-                raise RuntimeError(
-                    "Worker already has an active IBKR connection; "
-                    "client must stop/start before reconnecting"
-                )
-            safe_disconnect(ib)
+            safe_disconnect(
+                ib,
+                context="diagnostic_worker:replace_connection",
+                log_exception_details=False,
+            )
             ib = None
 
         # Create new IB instance
         ib = IB()
 
-        # Extract parameters
-        host = params.get("host", "127.0.0.1")
-        port = params.get("port", 4002)
-        client_id = params.get("client_id", 1)
-        readonly = params.get("readonly", True)
-        timeout = params.get("timeout", 30.0)
-
         print(
-            f"DEBUG: Connecting to {host}:{port} client_id={client_id} timeout={timeout}",
+            f"DEBUG: Connecting diagnostic client to {host}:{port} timeout={timeout}",
             file=sys.stderr,
             flush=True,
         )
@@ -324,17 +439,17 @@ async def handle_connect(params: dict) -> dict:
             except AttributeError:
                 # client.serverVersion() not available yet - handshake incomplete
                 pass
-            except (ConnectionError, OSError) as e:
+            except (ConnectionError, OSError):
                 # Connection-related errors during handshake
                 print(
-                    f"DEBUG: serverVersion() connection error: {e}",
+                    "DEBUG: serverVersion() connection error",
                     file=sys.stderr,
                     flush=True,
                 )
             except Exception as e:
                 # Unexpected error - log but continue polling
                 print(
-                    f"DEBUG: serverVersion() unexpected error ({type(e).__name__}): {e}",
+                    "DEBUG: serverVersion() unexpected error " f"({type(e).__name__})",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -376,7 +491,9 @@ async def handle_connect(params: dict) -> dict:
             accounts = ib.managedAccounts()
             if accounts:
                 print(
-                    f"DEBUG: Received accounts after {time.time() - account_wait_start:.2f}s: {accounts}",
+                    "DEBUG: Received managed account set after "
+                    f"{time.time() - account_wait_start:.2f}s "
+                    f"(count={len(accounts)})",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -398,11 +515,12 @@ async def handle_connect(params: dict) -> dict:
         # Connection fully established
         gateway_api_down = False
         gateway_failure_detail = ""
+        worker_connection_identity = (host, port, client_id, readonly)
 
         total_time = time.time() - handshake_start
         print(
             f"DEBUG: Connection fully established in {total_time:.2f}s "
-            f"(serverVersion={server_version}, accounts={accounts})",
+            f"(serverVersion={server_version}, managed_account_count={len(accounts)})",
             file=sys.stderr,
             flush=True,
         )
@@ -423,20 +541,32 @@ async def handle_connect(params: dict) -> dict:
         # Gateway has a bug where disconnect() during/after a failed connection
         # causes the API client to go RED. Let Python's cleanup handle it naturally.
         ib = None
+        worker_connection_identity = None
 
-        error_text = str(e).lower()
-        if isinstance(e, TimeoutError) or "timeout" in error_text:
+        is_timeout = isinstance(e, TimeoutError) or "timeout" in str(e).lower()
+        if is_timeout:
             gateway_api_down = True
             gateway_failure_detail = (
                 "Handshake timed out at "
                 f"{datetime.utcnow().isoformat()}Z. Restart IB Gateway before retrying."
             )
 
+        # Broker/client exceptions can contain account identifiers or other
+        # connection secrets. The diagnostic transport needs only a stable
+        # classification; never serialize the exception text or traceback.
+        if is_timeout:
+            safe_error = "Diagnostic broker connection timed out"
+            safe_error_type = "TimeoutError"
+        elif isinstance(e, (ConnectionError, OSError)):
+            safe_error = "Diagnostic broker connection failed"
+            safe_error_type = "ConnectionError"
+        else:
+            safe_error = "Diagnostic broker connection failed"
+            safe_error_type = "BrokerConnectionError"
         return {
             "status": "error",
-            "error": str(e),
-            "error_type": type(e).__name__,
-            "traceback": traceback.format_exc(),
+            "error": safe_error,
+            "error_type": safe_error_type,
             "requires_restart": gateway_api_down,
             "detail": gateway_failure_detail if gateway_api_down else "",
         }
@@ -508,21 +638,451 @@ async def handle_get_account_summary() -> dict:
         return {"status": "error", "error": str(e), "error_type": type(e).__name__}
 
 
+async def _position_state_signature(positions: Any, account: str) -> tuple:
+    rows = []
+    for position in positions:
+        if str(getattr(position, "account", "")).strip() != account:
+            raise ValueError("Broker position account is inconsistent")
+        contract = await _qualified_stock_identity(position.contract)
+        rows.append(
+            (
+                contract["con_id"],
+                contract["symbol"],
+                _canonical_decimal(position.position),
+                _canonical_decimal(position.avgCost),
+            )
+        )
+    return tuple(sorted(rows))
+
+
+async def _open_order_evidence(trade: Any, account: str) -> dict:
+    """Build every emitted order term from one broker trade object."""
+    order = trade.order
+    order_status = trade.orderStatus
+    if str(getattr(order, "account", "")).strip() != account:
+        raise ValueError("Broker order account is inconsistent")
+
+    order_id = _required_int(order.orderId, "broker order ID")
+    client_id = _required_int(order.clientId, "order client ID", allow_zero=True)
+    side = str(getattr(order, "action", "")).upper()
+    if side not in {"BUY", "SELL"}:
+        raise ValueError("Broker order side is unsupported")
+    contract_identity = await _qualified_stock_identity(trade.contract)
+
+    unavailable = {}
+    permanent_id, reason = _optional_identifier(order.permId, "IBKR returned no permanent order ID")
+    if reason:
+        unavailable["permanent_id"] = reason
+    limit_price, reason = _optional_decimal(
+        getattr(order, "lmtPrice", None),
+        "not supplied for this order type",
+    )
+    if reason:
+        unavailable["limit_price"] = reason
+    elif limit_price is not None and Decimal(limit_price) <= 0:
+        limit_price = None
+        unavailable["limit_price"] = "order has no positive limit price"
+    stop_price, reason = _optional_decimal(
+        getattr(order, "auxPrice", None),
+        "not supplied for this order type",
+    )
+    if reason:
+        unavailable["stop_price"] = reason
+    elif stop_price is not None and Decimal(stop_price) <= 0:
+        stop_price = None
+        unavailable["stop_price"] = "order has no positive stop price"
+    last_status_at, reason = _optional_aware_time(
+        trade.log[-1].time if getattr(trade, "log", None) else None,
+        "IBKR returned no order status timestamp",
+    )
+    if reason:
+        unavailable["last_status_at"] = reason
+
+    filled_quantity = _canonical_decimal(order_status.filled)
+    total_quantity = _canonical_decimal(order.totalQuantity)
+    remaining_quantity = _canonical_decimal(order_status.remaining)
+    if Decimal(total_quantity) <= 0:
+        raise ValueError("Broker order total quantity is not positive")
+    if Decimal(filled_quantity) < 0 or Decimal(remaining_quantity) < 0:
+        raise ValueError("Broker order quantity evidence is negative")
+    if Decimal(filled_quantity) + Decimal(remaining_quantity) != Decimal(total_quantity):
+        raise ValueError("Broker order quantities are internally inconsistent")
+    avg_fill_price, reason = _optional_decimal(
+        order_status.avgFillPrice,
+        "order has no reported average fill price",
+    )
+    if Decimal(filled_quantity) == 0:
+        avg_fill_price = None
+        reason = "order has no fills"
+    if reason:
+        unavailable["avg_fill_price"] = reason
+
+    return {
+        "account": account,
+        "broker_order_id": order_id,
+        "permanent_id": permanent_id,
+        "client_id": client_id,
+        "contract": contract_identity,
+        "side": side,
+        "status": str(order_status.status),
+        "order_type": str(order.orderType),
+        "time_in_force": str(order.tif),
+        "total_quantity": total_quantity,
+        "filled_quantity": filled_quantity,
+        "remaining_quantity": remaining_quantity,
+        "limit_price": limit_price,
+        "stop_price": stop_price,
+        "avg_fill_price": avg_fill_price,
+        "last_status_at": last_status_at,
+        "unavailable": unavailable,
+    }
+
+
+def _order_evidence_signature(orders: list[dict]) -> tuple[str, ...]:
+    """Freeze every emitted term so any between-read change is detected."""
+    return tuple(
+        sorted(json.dumps(order, sort_keys=True, separators=(",", ":")) for order in orders)
+    )
+
+
+async def _order_state_signature(trades: Any, account: str) -> tuple[str, ...]:
+    return _order_evidence_signature(
+        [await _open_order_evidence(trade, account) for trade in trades]
+    )
+
+
+async def handle_get_broker_snapshot(params: dict) -> dict:
+    """Collect one bounded, read-only broker evidence snapshot.
+
+    The command deliberately uses fresh async request APIs and verifies the
+    connected account before and after collection. It never calls an order,
+    cancellation, or account-mutation API.
+    """
+    try:
+        if (
+            not ib
+            or not ib.isConnected()
+            or worker_connection_identity is None
+            or worker_connection_identity[1] != 4002
+            or worker_connection_identity[2] <= 0
+            or worker_connection_identity[3] is not True
+        ):
+            raise ConnectionError("Broker snapshot requires a connected session")
+        expected_account = str(params.get("expected_account", "")).strip()
+        if not expected_account:
+            raise ValueError("Broker snapshot expected account is missing")
+
+        accounts_before = [
+            str(account).strip() for account in ib.managedAccounts() if str(account).strip()
+        ]
+        if len(accounts_before) != 1:
+            raise BrokerSnapshotAccountMismatchError(
+                "Broker snapshot requires exactly one managed account"
+            )
+        account = accounts_before[0]
+        if account != expected_account:
+            raise BrokerSnapshotAccountMismatchError(
+                "Broker snapshot managed account does not match expectation"
+            )
+
+        broker_time_before = await _request_broker_time()
+        positions = await ib.reqPositionsAsync()
+        initial_position_signature = await _position_state_signature(positions, account)
+        if not ib.isConnected():
+            raise ConnectionError("Broker disconnected during snapshot collection")
+
+        positions_data = []
+        seen_contract_ids: set[int] = set()
+        seen_symbols: set[str] = set()
+        for position in positions:
+            if str(getattr(position, "account", "")).strip() != account:
+                raise ValueError("Broker position account is inconsistent")
+            contract_identity = await _qualified_stock_identity(position.contract)
+            con_id = contract_identity["con_id"]
+            symbol = contract_identity["symbol"]
+            if con_id in seen_contract_ids or symbol in seen_symbols:
+                raise ValueError("Broker snapshot contains duplicate position identity")
+            seen_contract_ids.add(con_id)
+            seen_symbols.add(symbol)
+
+            quantity = _canonical_decimal(position.position)
+            if Decimal(quantity) == 0:
+                raise ValueError("Broker snapshot contains a zero position")
+            avg_cost = _canonical_decimal(position.avgCost)
+            if Decimal(avg_cost) < 0:
+                raise ValueError("Broker snapshot contains a negative average cost")
+
+            positions_data.append(
+                {
+                    "account": account,
+                    "contract": contract_identity,
+                    "quantity": quantity,
+                    "avg_cost": avg_cost,
+                }
+            )
+
+        open_trades = await ib.reqAllOpenOrdersAsync()
+        if not ib.isConnected():
+            raise ConnectionError("Broker disconnected during snapshot collection")
+        open_orders_data = []
+        seen_order_ids: set[tuple[int, int]] = set()
+        for trade in open_trades:
+            order_evidence = await _open_order_evidence(trade, account)
+            order_id = order_evidence["broker_order_id"]
+            client_id = order_evidence["client_id"]
+            order_identity = (client_id, order_id)
+            if order_identity in seen_order_ids:
+                raise ValueError("Broker snapshot contains duplicate order identity")
+            seen_order_ids.add(order_identity)
+            open_orders_data.append(order_evidence)
+        initial_order_signature = _order_evidence_signature(open_orders_data)
+
+        # IBKR's ExecutionFilter carries a lower bound only, serialized to
+        # whole seconds. Derive that exact wire value from authoritative broker
+        # time and expose the identical instant in the snapshot.
+        execution_window_start = broker_time_before.replace(microsecond=0) - timedelta(hours=24)
+        execution_filter_time = execution_window_start.strftime("%Y%m%d %H:%M:%S UTC")
+        execution_filter = ExecutionFilter(
+            acctCode=account,
+            time=execution_filter_time,
+        )
+        # The wire filter has no upper-bound field. Capture a broker-clock
+        # upper bound before issuing the request. A fill can arrive while the
+        # lower-bound-only request is in flight; such a later fill must make
+        # the snapshot fail closed rather than be silently omitted or falsely
+        # claimed as covered by an after-the-fact cutoff.
+        execution_window_end = await _request_broker_time()
+        fills = await ib.reqExecutionsAsync(execution_filter)
+        if not ib.isConnected():
+            raise ConnectionError("Broker disconnected during snapshot collection")
+        executions_data = []
+        seen_execution_ids: set[str] = set()
+        for fill in fills:
+            execution = fill.execution
+            execution_id = str(getattr(execution, "execId", "")).strip()
+            if not execution_id or execution_id in seen_execution_ids:
+                raise ValueError("Broker snapshot contains invalid execution identity")
+            seen_execution_ids.add(execution_id)
+            if str(getattr(execution, "acctNumber", "")).strip() != account:
+                raise ValueError("Broker execution account is inconsistent")
+            raw_side = str(getattr(execution, "side", "")).upper()
+            side = {"BOT": "BUY", "SLD": "SELL", "BUY": "BUY", "SELL": "SELL"}.get(raw_side)
+            if side is None:
+                raise ValueError("Broker execution side is unsupported")
+
+            contract_identity = await _qualified_stock_identity(fill.contract)
+            execution_time = getattr(execution, "time", None) or getattr(fill, "time", None)
+            executed_at = _aware_iso(execution_time)
+            executed_at_value = datetime.fromisoformat(executed_at)
+            if not execution_window_start <= executed_at_value <= execution_window_end:
+                raise ValueError("Broker execution is outside the declared evidence window")
+            unavailable = {}
+            broker_order_id, reason = _optional_identifier(
+                execution.orderId, "IBKR returned no broker order ID"
+            )
+            if reason:
+                unavailable["broker_order_id"] = reason
+            permanent_id, reason = _optional_identifier(
+                execution.permId, "IBKR returned no permanent order ID"
+            )
+            if reason:
+                unavailable["permanent_id"] = reason
+            commission_report = getattr(fill, "commissionReport", None)
+            if commission_report is None:
+                commission = None
+                commission_currency = None
+                realized_pnl = None
+                unavailable.update(
+                    {
+                        "commission": "IBKR returned no commission report",
+                        "commission_currency": "IBKR returned no commission report",
+                        "realized_pnl": "IBKR returned no commission report",
+                    }
+                )
+            else:
+                commission, reason = _optional_decimal(
+                    getattr(commission_report, "commission", None),
+                    "IBKR returned no commission value",
+                )
+                if reason:
+                    unavailable["commission"] = reason
+                commission_currency = (
+                    str(getattr(commission_report, "currency", "")).strip() or None
+                )
+                if commission_currency is None:
+                    unavailable["commission_currency"] = "IBKR returned no commission currency"
+                realized_pnl, reason = _optional_decimal(
+                    getattr(commission_report, "realizedPNL", None),
+                    "IBKR returned no realized PnL",
+                )
+                if reason:
+                    unavailable["realized_pnl"] = reason
+
+            quantity = _canonical_decimal(execution.shares)
+            price = _canonical_decimal(execution.price)
+            average_price = _canonical_decimal(execution.avgPrice)
+            if Decimal(quantity) <= 0 or Decimal(price) <= 0 or Decimal(average_price) <= 0:
+                raise ValueError("Broker execution numeric evidence is not positive")
+
+            executions_data.append(
+                {
+                    "account": account,
+                    "execution_id": execution_id,
+                    "broker_order_id": broker_order_id,
+                    "permanent_id": permanent_id,
+                    "client_id": _required_int(
+                        execution.clientId,
+                        "execution client ID",
+                        allow_zero=True,
+                    ),
+                    "contract": contract_identity,
+                    "side": side,
+                    "quantity": quantity,
+                    "price": price,
+                    "average_price": average_price,
+                    "executed_at": executed_at,
+                    "execution_exchange": str(execution.exchange),
+                    "commission": commission,
+                    "commission_currency": commission_currency,
+                    "realized_pnl": realized_pnl,
+                    "unavailable": unavailable,
+                }
+            )
+
+        await ib.reqAccountSummaryAsync()
+        account_values = ib.accountValues(account)
+        if not ib.isConnected():
+            raise ConnectionError("Broker disconnected during snapshot collection")
+
+        balances = []
+        seen_balances: set[tuple[str, str]] = set()
+        present_tags: set[str] = set()
+        for account_value in account_values:
+            tag = str(getattr(account_value, "tag", ""))
+            if tag not in BROKER_SNAPSHOT_BALANCE_TAGS:
+                continue
+            if str(getattr(account_value, "account", "")).strip() != account:
+                raise ValueError("Broker balance account is inconsistent")
+            currency = str(getattr(account_value, "currency", "")).strip()
+            if not currency:
+                raise ValueError("Broker balance currency is missing")
+            identity = (tag, currency)
+            if identity in seen_balances:
+                raise ValueError("Broker snapshot contains duplicate balance identity")
+            seen_balances.add(identity)
+            present_tags.add(tag)
+            balances.append(
+                {
+                    "tag": tag,
+                    "currency": currency,
+                    "value": _canonical_decimal(account_value.value),
+                }
+            )
+        if not BROKER_SNAPSHOT_REQUIRED_BALANCE_TAGS.issubset(present_tags):
+            raise ValueError("Broker snapshot is missing required balance evidence")
+
+        final_positions = await ib.reqPositionsAsync()
+        final_position_signature = await _position_state_signature(final_positions, account)
+        final_open_trades = await ib.reqAllOpenOrdersAsync()
+        final_order_signature = await _order_state_signature(final_open_trades, account)
+        if (
+            final_position_signature != initial_position_signature
+            or final_order_signature != initial_order_signature
+        ):
+            raise ValueError("Broker critical state changed during snapshot collection")
+
+        broker_time_after = await _request_broker_time()
+        accounts_after = [str(item).strip() for item in ib.managedAccounts() if str(item).strip()]
+        if accounts_after != accounts_before:
+            raise ValueError("Managed account set changed during snapshot collection")
+        if not ib.isConnected():
+            raise ConnectionError("Broker disconnected during snapshot collection")
+
+        positions_data.sort(
+            key=lambda item: (
+                cast(dict[str, Any], item["contract"])["symbol"],
+                cast(dict[str, Any], item["contract"])["con_id"],
+            )
+        )
+        open_orders_data.sort(key=lambda item: (item["client_id"], item["broker_order_id"]))
+        executions_data.sort(key=lambda item: cast(str, item["execution_id"]))
+        balances.sort(key=lambda item: (item["tag"], item["currency"]))
+        retrieved_at = datetime.now(timezone.utc)
+        return {
+            "status": "success",
+            "data": {
+                "snapshot_schema_version": BROKER_SNAPSHOT_SCHEMA_VERSION,
+                "account": account,
+                "broker_time_before": _aware_iso(broker_time_before),
+                "broker_time_after": _aware_iso(broker_time_after),
+                "retrieved_at": retrieved_at.isoformat(),
+                "positions": positions_data,
+                "balances": balances,
+                "open_orders": open_orders_data,
+                "executions": executions_data,
+                "execution_scope": {
+                    "kind": "bounded_execution_filter",
+                    "start_at": execution_window_start.isoformat(),
+                    "end_at": execution_window_end.isoformat(),
+                },
+            },
+        }
+    except BrokerSnapshotAccountMismatchError:
+        return {
+            "status": "error",
+            "error": "Broker snapshot account mismatch",
+            "error_type": "BrokerSnapshotAccountMismatchError",
+        }
+    except TimeoutError:
+        # Preserve the timeout classification so the parent poisons this exact
+        # worker generation and never reuses an ambiguous broker request.
+        return {
+            "status": "error",
+            "error": "Broker snapshot collection timed out",
+            "error_type": "TimeoutError",
+        }
+    except ConnectionError:
+        return {
+            "status": "error",
+            "error": "Broker snapshot collection failed",
+            "error_type": "ConnectionError",
+        }
+    except Exception:
+        # Once collection has started, malformed or internally inconsistent
+        # broker evidence is a transport-integrity failure, not an ordinary
+        # per-request miss. The parent treats this status as ambiguous and
+        # poisons the exact responding generation.
+        return {
+            "status": PROTOCOL_ERROR_STATUS,
+            "error": "Broker snapshot collection failed",
+            "error_type": PROTOCOL_ERROR_TYPE,
+        }
+
+
 async def handle_disconnect() -> dict:
     """Handle disconnect command"""
-    global ib
+    global ib, worker_connection_identity
 
     try:
         if ib:
             # Properly disconnect to avoid zombie connections
             print("Disconnecting from IBKR...", file=sys.stderr, flush=True)
-            safe_disconnect(ib)
+            safe_disconnect(
+                ib,
+                context="diagnostic_worker:disconnect",
+                log_exception_details=False,
+            )
             ib = None
+        worker_connection_identity = None
 
         return {"status": "success", "data": {"disconnected": True}}
 
-    except Exception as e:
-        return {"status": "error", "error": str(e), "error_type": type(e).__name__}
+    except Exception:
+        return {
+            "status": "error",
+            "error": "Diagnostic broker disconnect failed",
+            "error_type": "BrokerDisconnectionError",
+        }
 
 
 async def handle_ping() -> dict:
@@ -690,6 +1250,8 @@ async def handle_command(command: dict) -> dict:
         return await handle_get_positions()
     elif cmd == "get_account_summary":
         return await handle_get_account_summary()
+    elif cmd == "get_broker_snapshot":
+        return await handle_get_broker_snapshot(command.get("params", {}))
     elif cmd == "get_historical_bars":
         return await handle_get_historical_bars(command.get("params", {}))
     elif cmd == "disconnect":
@@ -817,10 +1379,14 @@ async def main():
         if ib is not None:
             print("Disconnecting from IBKR to prevent zombie...", file=sys.stderr, flush=True)
             try:
-                safe_disconnect(ib)
+                safe_disconnect(
+                    ib,
+                    context="diagnostic_worker:shutdown",
+                    log_exception_details=False,
+                )
                 print("Disconnected successfully", file=sys.stderr, flush=True)
-            except Exception as e:
-                print(f"Disconnect error (non-fatal): {e}", file=sys.stderr, flush=True)
+            except Exception:
+                print("Disconnect error (non-fatal)", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

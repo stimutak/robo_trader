@@ -6,6 +6,8 @@ All runtime configuration is loaded via environment variables in `robo_trader/co
 - `IBKR_HOST` (default `127.0.0.1`)
 - `IBKR_PORT` (default `7497` for paper)
 - `IBKR_CLIENT_ID` (integer client ID)
+- `IBKR_RECONCILIATION_CLIENT_ID` (dedicated read-only diagnostic ID; must
+  differ from `IBKR_CLIENT_ID`)
 
 ### Trading Mode
 - `TRADING_MODE`:
@@ -26,5 +28,4 @@ All runtime configuration is loaded via environment variables in `robo_trader/co
 
 ### Validation
 On startup, ensure variables are present and parseable. Fail fast with clear messages.
-
 
