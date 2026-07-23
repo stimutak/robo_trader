@@ -1,6 +1,7 @@
 # RoboTrader Remediation and Launch Plan
 
 Document date: 2026-07-20
+Last updated: 2026-07-23
 Status: Active execution plan
 Source baseline: repository audit at commit `51f0e99` on branch `main`
 Target: safe supervised paper operation first, then remote read-only access, then an explicitly gated limited live canary
