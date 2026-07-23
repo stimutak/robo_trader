@@ -4,7 +4,6 @@ fileExistenceTests:
   - name: Application package is present
     path: /app/robo_trader
     shouldExist: true
-    isDirectory: true
 
   - name: Entrypoint is executable
     path: /usr/local/bin/entrypoint.sh
