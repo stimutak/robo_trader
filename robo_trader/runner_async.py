@@ -784,17 +784,78 @@ class AsyncRunner:
         return side in {"BUY", "SELL_SHORT"}
 
     def _has_live_protective_feed(self, symbol: str) -> bool:
-        """Return whether an exact symbol has an admitted live protection source."""
+        """Return whether monitor-accepted live protection is still fresh.
+
+        Provenance flags are necessary but never sufficient: order admission
+        trusts the stop monitor's accepted event and monotonic receipt state,
+        evaluated against its own validated clocks and maximum age. Missing,
+        malformed, stale, or future state fails closed.
+        """
         statuses = getattr(self, "_protective_feed_status", None)
         if not isinstance(statuses, dict):
             return False
         status = statuses.get(symbol)
-        return (
+        if not (
             isinstance(status, dict)
             and status.get("available") is True
             and status.get("live_grade") is True
             and status.get("source") == "live_protective"
-        )
+        ):
+            return False
+
+        monitor = getattr(self, "stop_loss_monitor", None)
+        prices = getattr(monitor, "last_prices", None)
+        event_times = getattr(monitor, "price_event_times", None)
+        receipt_times = getattr(monitor, "price_receipt_monotonic", None)
+        utcnow = getattr(monitor, "_utcnow", None)
+        monotonic = getattr(monitor, "_monotonic", None)
+        max_age = getattr(monitor, "max_price_age_seconds", None)
+        if (
+            not isinstance(prices, dict)
+            or not isinstance(event_times, dict)
+            or not isinstance(receipt_times, dict)
+            or not callable(utcnow)
+            or not callable(monotonic)
+            or not isinstance(max_age, (int, float))
+            or isinstance(max_age, bool)
+            or not math.isfinite(float(max_age))
+            or float(max_age) <= 0
+        ):
+            return False
+
+        try:
+            now_utc = utcnow()
+            now_monotonic = monotonic()
+        except Exception:
+            return False
+        price = prices.get(symbol)
+        event_time = event_times.get(symbol)
+        receipt_time = receipt_times.get(symbol)
+        if (
+            not isinstance(now_utc, datetime)
+            or now_utc.tzinfo is None
+            or now_utc.utcoffset() is None
+            or not isinstance(now_monotonic, (int, float))
+            or isinstance(now_monotonic, bool)
+            or not math.isfinite(float(now_monotonic))
+            or not isinstance(price, (int, float))
+            or isinstance(price, bool)
+            or not math.isfinite(float(price))
+            or float(price) <= 0
+            or not isinstance(event_time, datetime)
+            or event_time.tzinfo is None
+            or event_time.utcoffset() is None
+            or not isinstance(receipt_time, (int, float))
+            or isinstance(receipt_time, bool)
+            or not math.isfinite(float(receipt_time))
+        ):
+            return False
+
+        event_age = (
+            now_utc.astimezone(timezone.utc) - event_time.astimezone(timezone.utc)
+        ).total_seconds()
+        receipt_age = float(now_monotonic) - float(receipt_time)
+        return 0 <= event_age <= float(max_age) and 0 <= receipt_age <= float(max_age)
 
     def _pairs_execution_admitted(self, pair: object) -> bool:
         """Fail closed until pairs have an atomic two-leg execution lifecycle."""
@@ -832,18 +893,22 @@ class AsyncRunner:
         errors must not overwrite the diagnostic that caused the cycle to
         fail closed.
         """
+        event = getattr(self, "_symbol_cycle_abort_event", None)
+        if event is None:
+            self._symbol_cycle_abort_event = asyncio.Event()
+            event = self._symbol_cycle_abort_event
+        # Publish abort intent before queueing for admission. A previously
+        # queued order waiter may acquire the lock first, but it will observe
+        # this event and reject instead of crossing the placement boundary.
+        event.set()
+
         lock = getattr(self, "_order_admission_lock", None)
         if lock is None:
             self._order_admission_lock = asyncio.Lock()
             lock = self._order_admission_lock
         async with lock:
-            event = getattr(self, "_symbol_cycle_abort_event", None)
-            if event is None:
-                self._symbol_cycle_abort_event = asyncio.Event()
-                event = self._symbol_cycle_abort_event
             if cause is not None and getattr(self, "_symbol_cycle_abort_error", None) is None:
                 self._symbol_cycle_abort_error = cause
-            event.set()
 
     async def _place_order_with_circuit_breaker(self, order: Order):
         """
@@ -1762,9 +1827,6 @@ class AsyncRunner:
                 fail("active_stop_not_pending")
             if getattr(stop, "position_qty", None) != position.quantity:
                 fail("active_stop_quantity_mismatch")
-            if not self._has_live_protective_feed(symbol):
-                fail("live_protective_feed_unavailable")
-
             price = prices.get(symbol)
             event_time = event_times.get(symbol)
             receipt_time = receipt_times.get(symbol)
@@ -1786,6 +1848,8 @@ class AsyncRunner:
             receipt_age = now_monotonic - float(receipt_time)
             if event_age < 0 or receipt_age < 0 or event_age > max_age or receipt_age > max_age:
                 fail("protective_price_stale")
+            if not self._has_live_protective_feed(symbol):
+                fail("live_protective_feed_unavailable")
 
     async def load_existing_positions(self):
         """Load existing positions and account state from database on startup."""

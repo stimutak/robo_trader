@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -457,6 +457,12 @@ def _runner_for_parallel(process_symbol) -> AsyncRunner:
 
 
 def _configure_order_runtime(runner: AsyncRunner, executor_result=None) -> None:
+    accepted_at = datetime.now(timezone.utc)
+    accepted_monotonic = 1000.0
+    protective_clock = {
+        "utc": accepted_at,
+        "monotonic": accepted_monotonic,
+    }
     runner._order_admission_lock = asyncio.Lock()
     runner._symbol_cycle_abort_event = asyncio.Event()
     runner._cycle_worker_tasks = set()
@@ -471,6 +477,17 @@ def _configure_order_runtime(runner: AsyncRunner, executor_result=None) -> None:
         }
         for symbol in ("AAPL", "MSFT", "TSLA", "NVDA")
     }
+    runner._test_protective_clock = protective_clock
+    runner.stop_loss_monitor = SimpleNamespace(
+        last_prices={symbol: 100.0 for symbol in ("AAPL", "MSFT", "TSLA", "NVDA")},
+        price_event_times={symbol: accepted_at for symbol in ("AAPL", "MSFT", "TSLA", "NVDA")},
+        price_receipt_monotonic={
+            symbol: accepted_monotonic for symbol in ("AAPL", "MSFT", "TSLA", "NVDA")
+        },
+        max_price_age_seconds=10,
+        _utcnow=lambda: protective_clock["utc"],
+        _monotonic=lambda: protective_clock["monotonic"],
+    )
     runner.risk = MagicMock(emergency_shutdown_triggered=False)
     runner.advanced_risk = None
     runner.circuit_breaker = MagicMock()
@@ -529,6 +546,33 @@ async def test_central_order_admission_accepts_exact_live_protection(side: str) 
 
     assert result.ok is True
     runner.executor.place_order.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("aged_clock", ["event", "receipt"])
+@pytest.mark.parametrize("side", ["BUY", "SELL_SHORT", "SELL", "BUY_TO_COVER"])
+async def test_order_admission_rechecks_monitor_owned_protective_freshness(
+    aged_clock: str,
+    side: str,
+) -> None:
+    """The current central feed gate applies to exits as well as entries."""
+    runner = AsyncRunner.__new__(AsyncRunner)
+    _configure_order_runtime(runner)
+    assert runner._has_live_protective_feed("AAPL") is True
+
+    if aged_clock == "event":
+        runner._test_protective_clock["utc"] += timedelta(seconds=11)
+    else:
+        runner._test_protective_clock["monotonic"] += 11
+
+    result = await runner._place_order_with_circuit_breaker(
+        Order(symbol="AAPL", quantity=1, side=side, price=100.0)
+    )
+
+    assert runner._has_live_protective_feed("AAPL") is False
+    assert result.ok is False
+    assert "live protective feed unavailable" in result.message.lower()
+    runner.executor.place_order.assert_not_called()
 
 
 def test_pairs_historical_cache_cannot_mutate_strategy_state() -> None:
@@ -733,6 +777,37 @@ async def test_abort_before_order_admission_has_no_fill() -> None:
     await abort_task
     result = await order_task
     assert result.ok is False
+    runner.executor.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_queued_order_cannot_beat_abort_intent_to_admission_lock() -> None:
+    runner = AsyncRunner.__new__(AsyncRunner)
+    _configure_order_runtime(runner)
+    await runner._order_admission_lock.acquire()
+
+    # Queue the order first so it is the lock's oldest waiter.
+    order_task = asyncio.create_task(
+        runner._place_order_with_circuit_breaker(
+            Order(symbol="AAPL", quantity=1, side="BUY", price=100.0)
+        )
+    )
+    await asyncio.sleep(0)
+    abort_task = asyncio.create_task(
+        runner._latch_symbol_cycle_abort(
+            SymbolCycleAbortError("transport failed before latch admission")
+        )
+    )
+    await asyncio.sleep(0)
+
+    # Abort intent is visible without acquiring the held admission lock.
+    assert runner._symbol_cycle_abort_event.is_set()
+    runner._order_admission_lock.release()
+
+    result = await order_task
+    await abort_task
+    assert result.ok is False
+    assert "broker transport unavailable" in result.message.lower()
     runner.executor.place_order.assert_not_called()
 
 
