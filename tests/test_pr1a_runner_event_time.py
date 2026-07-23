@@ -13,6 +13,7 @@ import pandas as pd
 import pytest
 
 from robo_trader.clients.subprocess_ibkr_client import IBKRTimeoutError
+from robo_trader.connection_health import HealthStatus
 from robo_trader.execution import Order
 from robo_trader.monitoring.performance import PerformanceMonitor
 from robo_trader.runner_async import (
@@ -20,6 +21,7 @@ from robo_trader.runner_async import (
     MarketDataContractError,
     SymbolCycleAbortError,
     SymbolResult,
+    run_continuous,
 )
 
 
@@ -582,11 +584,11 @@ async def test_transport_abort_cancels_remaining_symbols() -> None:
         raise AssertionError("remaining symbol must not run")
 
     runner = _runner_for_parallel(process)
-    results = await runner.run_parallel(["AAPL", "MSFT"])
+    with pytest.raises(SymbolCycleAbortError, match="poisoned generation"):
+        await runner.run_parallel(["AAPL", "MSFT"])
 
-    assert results == []
     assert reached_second is False
-    runner.update_position_market_prices.assert_awaited_once_with({})
+    runner.update_position_market_prices.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -647,11 +649,71 @@ async def test_transport_abort_drains_running_sibling_and_blocks_its_order() -> 
     runner = _runner_for_parallel(process)
     runner.max_concurrent_symbols = 2
     _configure_order_runtime(runner)
-    results = await runner.run_parallel(["AAPL", "MSFT"])
+    with pytest.raises(SymbolCycleAbortError, match="poisoned generation"):
+        await runner.run_parallel(["AAPL", "MSFT"])
 
-    assert len(results) == 1
     assert sibling_settled.is_set()
     runner.executor.place_order.assert_not_called()
+    runner.update_position_market_prices.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transport_abort_cancels_hung_non_admitted_sibling() -> None:
+    sibling_started = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+
+    async def process(symbol: str):
+        if symbol == "AAPL":
+            await sibling_started.wait()
+            raise SymbolCycleAbortError("originating identity poison")
+        sibling_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            sibling_cancelled.set()
+            raise
+
+    runner = _runner_for_parallel(process)
+    runner.max_concurrent_symbols = 2
+
+    with pytest.raises(SymbolCycleAbortError, match="originating identity poison"):
+        await asyncio.wait_for(
+            runner.run_parallel(["AAPL", "MSFT"]),
+            timeout=1,
+        )
+
+    assert sibling_cancelled.is_set()
+    runner.update_position_market_prices.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transport_abort_preserves_first_causal_error() -> None:
+    secondary_latched = asyncio.Event()
+
+    async def process(symbol: str):
+        if symbol == "MSFT":
+            raise SymbolCycleAbortError("originating identity poison")
+        await runner._symbol_cycle_abort_event.wait()
+        raise SymbolCycleAbortError("secondary already-poisoned observation")
+
+    runner = _runner_for_parallel(process)
+    runner.max_concurrent_symbols = 2
+    original_latch = runner._latch_symbol_cycle_abort
+
+    async def latch_in_causal_order(cause=None):
+        await original_latch(cause)
+        if cause is not None and "originating" in str(cause):
+            await secondary_latched.wait()
+        elif cause is not None:
+            secondary_latched.set()
+
+    runner._latch_symbol_cycle_abort = latch_in_causal_order
+
+    with pytest.raises(SymbolCycleAbortError, match="originating identity poison"):
+        await runner.run_parallel(["AAPL", "MSFT"])
+
+    assert secondary_latched.is_set()
+    runner.update_position_market_prices.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -713,11 +775,12 @@ async def test_fill_then_sibling_abort_drains_accounting() -> None:
     await accounting_started.wait()
     assert not cycle.done()
     release_accounting.set()
-    results = await cycle
+    with pytest.raises(SymbolCycleAbortError, match="poisoned generation"):
+        await cycle
 
-    assert [result.symbol for result in results] == ["AAPL"]
     runner.executor.place_order.assert_called_once()
     accounting.assert_awaited_once_with("AAPL", 100.0)
+    runner.update_position_market_prices.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -752,6 +815,47 @@ async def test_parent_cancel_after_fill_waits_for_accounting() -> None:
 
 
 @pytest.mark.asyncio
+async def test_parent_cancel_during_abort_drain_preserves_cancellation() -> None:
+    fill_happened = asyncio.Event()
+    release_accounting = asyncio.Event()
+    accounting_done = asyncio.Event()
+
+    async def process(symbol: str):
+        if symbol == "MSFT":
+            await fill_happened.wait()
+            raise SymbolCycleAbortError("originating transport poison")
+        result = await runner._place_order_with_circuit_breaker(
+            Order(symbol="AAPL", quantity=1, side="BUY", price=100.0)
+        )
+        fill_happened.set()
+        await release_accounting.wait()
+        accounting_done.set()
+        return SymbolResult("AAPL", 1, 100.0, 1, result.ok, "accounted")
+
+    runner = _runner_for_parallel(process)
+    runner.max_concurrent_symbols = 2
+    _configure_order_runtime(runner)
+    parent = asyncio.create_task(runner.run_parallel(["AAPL", "MSFT"]))
+
+    await fill_happened.wait()
+    while not any(
+        task.get_name() == "symbol-cycle-accounting-drain" for task in asyncio.all_tasks()
+    ):
+        await asyncio.sleep(0)
+
+    parent.cancel()
+    await asyncio.sleep(0)
+    assert not parent.done()
+    release_accounting.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await parent
+    assert parent.cancelled() is True
+    assert accounting_done.is_set()
+    runner.update_position_market_prices.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_cancel_while_waiting_for_admission_does_not_leak_cycle_lock() -> None:
     runner = _runner_for_parallel(AsyncMock())
     _configure_order_runtime(runner)
@@ -777,10 +881,93 @@ async def test_next_cycle_resets_abort_only_after_prior_drain() -> None:
         return SymbolResult(symbol, 0, 100.0, 0, False, "healthy next cycle")
 
     runner = _runner_for_parallel(process)
-    assert await runner.run_parallel(["AAPL"]) == []
+    with pytest.raises(SymbolCycleAbortError, match="first cycle poisoned"):
+        await runner.run_parallel(["AAPL"])
     second = await runner.run_parallel(["AAPL"])
     assert len(second) == 1
     assert second[0].message == "healthy next cycle"
+
+
+@pytest.mark.asyncio
+async def test_symbol_cycle_abort_suppresses_all_run_level_downstream_work() -> None:
+    runner = AsyncRunner.__new__(AsyncRunner)
+    runner.setup = AsyncMock()
+    runner.teardown = AsyncMock()
+    runner.positions = {}
+    runner.cfg = SimpleNamespace(symbols=["AAPL"])
+    runner.max_concurrent_symbols = 1
+    runner.ai_analyst = None
+    runner.run_parallel = AsyncMock(side_effect=SymbolCycleAbortError("shared transport poisoned"))
+    runner.market_data_cache = OrderedDict(
+        {
+            "AAPL": pd.DataFrame({"close": [100.0]}),
+            "MSFT": pd.DataFrame({"close": [200.0]}),
+        }
+    )
+    runner.pairs_strategy = MagicMock()
+    runner.pairs_strategy.pair_stats = {("AAPL", "MSFT"): object()}
+    runner.pairs_strategy.analyze_pairs = AsyncMock()
+    runner.stat_arb_strategy = MagicMock()
+    runner.stat_arb_strategy.calculate_arbitrage_scores = AsyncMock()
+    runner.update_account_summary = AsyncMock()
+    runner.monitor = MagicMock()
+    runner.monitor.log_performance_summary = AsyncMock()
+    runner.use_correlation_sizing = False
+
+    with patch("robo_trader.runner_async.is_trading_allowed", return_value=True):
+        with pytest.raises(SymbolCycleAbortError, match="shared transport poisoned"):
+            await runner.run(["AAPL"])
+
+    runner.pairs_strategy.analyze_pairs.assert_not_awaited()
+    runner.stat_arb_strategy.calculate_arbitrage_scores.assert_not_awaited()
+    runner.update_account_summary.assert_not_awaited()
+    runner.monitor.log_performance_summary.assert_not_awaited()
+    runner.teardown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_continuous_transport_abort_disconnects_and_exits_without_next_cycle() -> None:
+    runner = MagicMock()
+    runner.recovery_in_progress = False
+    runner._recovery_exhausted = False
+    runner.health = MagicMock()
+    runner.health.status = HealthStatus.HEALTHY
+    runner.health._status = HealthStatus.HEALTHY
+    runner.run = AsyncMock(side_effect=SymbolCycleAbortError("shared transport poisoned"))
+    runner._safe_disconnect = AsyncMock()
+    runner.teardown = AsyncMock()
+    runner.cleanup = AsyncMock()
+    portfolio = SimpleNamespace(
+        id="default",
+        name="Default",
+        starting_cash=100000,
+        symbols=["AAPL"],
+        active=True,
+    )
+
+    with (
+        patch("signal.signal"),
+        patch("robo_trader.runner_async.AsyncRunner", return_value=runner),
+        patch("robo_trader.runner_async._setup_continuous_runner", new_callable=AsyncMock),
+        patch("robo_trader.runner_async.is_trading_allowed", return_value=True),
+        patch(
+            "robo_trader.multiuser.portfolio_config.load_portfolio_configs",
+            return_value=[portfolio],
+        ),
+        patch("robo_trader.runner_async.sleep_unless_shutdown", new_callable=AsyncMock) as sleep,
+        patch("robo_trader.runner_async._write_exit_audit"),
+        patch("robo_trader.runner_async._fire_runner_exit_alert"),
+    ):
+        await run_continuous(symbols=["AAPL"], interval_seconds=1)
+
+    runner.run.assert_awaited_once_with(["AAPL"])
+    runner._safe_disconnect.assert_awaited_once()
+    assert runner.health._status is HealthStatus.UNHEALTHY
+    runner.health.record_failure.assert_not_called()
+    assert runner._recovery_exhausted is True
+    runner.teardown.assert_not_awaited()
+    runner.cleanup.assert_awaited_once()
+    sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio

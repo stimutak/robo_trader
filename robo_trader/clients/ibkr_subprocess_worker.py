@@ -68,6 +68,12 @@ INTRADAY_BAR_SIZES = {
     "4 hours",
     "8 hours",
 }
+PROTOCOL_ERROR_STATUS = "protocol_error"
+PROTOCOL_ERROR_TYPE = "TransportProtocolError"
+
+
+class ContractIdentityProtocolError(ValueError):
+    """Qualified broker identity cannot be trusted for the requested symbol."""
 
 
 def _aware_iso(value: Any) -> str:
@@ -92,11 +98,11 @@ async def _qualify_one_contract(contract: Any) -> Any:
     if inspect.isawaitable(result):
         result = await result
     if not isinstance(result, (list, tuple)) or len(result) != 1 or result[0] is None:
-        raise ValueError("Expected exactly one qualified contract")
+        raise ContractIdentityProtocolError("Expected exactly one qualified contract")
     qualified = result[0]
     con_id = getattr(qualified, "conId", None)
     if not isinstance(con_id, int) or isinstance(con_id, bool) or con_id <= 0:
-        raise ValueError("Qualified contract is missing a valid conId")
+        raise ContractIdentityProtocolError("Qualified contract is missing a valid conId")
     return qualified
 
 
@@ -104,19 +110,19 @@ def _validate_stock_identity(qualified: Any, requested_symbol: str) -> None:
     """Require the exact stock identity requested; implicit aliases are denied."""
     requested = requested_symbol.strip().upper()
     if str(getattr(qualified, "symbol", "")).strip().upper() != requested:
-        raise ValueError("Qualified contract symbol does not match request")
+        raise ContractIdentityProtocolError("Qualified contract symbol does not match request")
     if str(getattr(qualified, "localSymbol", "")).strip().upper() != requested:
-        raise ValueError("Qualified localSymbol alias is not explicitly allowed")
+        raise ContractIdentityProtocolError("Qualified localSymbol alias is not explicitly allowed")
     if getattr(qualified, "secType", None) != "STK":
-        raise ValueError("Qualified contract is not STK")
+        raise ContractIdentityProtocolError("Qualified contract is not STK")
     if getattr(qualified, "currency", None) != "USD":
-        raise ValueError("Qualified contract currency is not USD")
+        raise ContractIdentityProtocolError("Qualified contract currency is not USD")
     if getattr(qualified, "exchange", None) != "SMART":
-        raise ValueError("Qualified contract exchange is not SMART")
+        raise ContractIdentityProtocolError("Qualified contract exchange is not SMART")
     if not getattr(qualified, "primaryExchange", None):
-        raise ValueError("Qualified contract is missing primary exchange")
+        raise ContractIdentityProtocolError("Qualified contract is missing primary exchange")
     if not getattr(qualified, "tradingClass", None):
-        raise ValueError("Qualified contract is missing trading class")
+        raise ContractIdentityProtocolError("Qualified contract is missing trading class")
 
 
 async def _request_broker_time() -> datetime:
@@ -647,6 +653,18 @@ async def handle_get_historical_bars(params: dict) -> dict:
             },
         }
 
+    except ContractIdentityProtocolError as e:
+        # A qualified-contract mismatch means the worker cannot prove that the
+        # returned market data belongs to the requested stock. Emit a distinct
+        # protocol status: the parent treats unsupported response statuses as
+        # transport ambiguity, poisons the exact worker generation, and aborts
+        # instead of degrading this to an ordinary per-symbol broker miss.
+        return {
+            "status": PROTOCOL_ERROR_STATUS,
+            "error": str(e),
+            "error_type": PROTOCOL_ERROR_TYPE,
+            "traceback": traceback.format_exc(),
+        }
     except Exception as e:
         return {
             "status": "error",

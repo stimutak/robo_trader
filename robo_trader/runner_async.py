@@ -820,8 +820,18 @@ class AsyncRunner:
         )
         return False
 
-    async def _latch_symbol_cycle_abort(self) -> None:
-        """Serialize transport abort with the final placement admission gate."""
+    async def _latch_symbol_cycle_abort(
+        self,
+        cause: Optional[SymbolCycleAbortError] = None,
+    ) -> None:
+        """Serialize transport abort with the final placement admission gate.
+
+        The first causal abort is retained under the same lock that closes
+        order admission. Later siblings may observe the already-poisoned
+        transport and raise their own, less-specific aborts; those secondary
+        errors must not overwrite the diagnostic that caused the cycle to
+        fail closed.
+        """
         lock = getattr(self, "_order_admission_lock", None)
         if lock is None:
             self._order_admission_lock = asyncio.Lock()
@@ -831,6 +841,8 @@ class AsyncRunner:
             if event is None:
                 self._symbol_cycle_abort_event = asyncio.Event()
                 event = self._symbol_cycle_abort_event
+            if cause is not None and getattr(self, "_symbol_cycle_abort_error", None) is None:
+                self._symbol_cycle_abort_error = cause
             event.set()
 
     async def _place_order_with_circuit_breaker(self, order: Order):
@@ -3571,6 +3583,7 @@ class AsyncRunner:
             self._order_admission_lock = asyncio.Lock()
         async with self._order_admission_lock:
             self._symbol_cycle_abort_event = asyncio.Event()
+            self._symbol_cycle_abort_error = None
             self._cycle_worker_tasks = set()
             self._order_admitted_tasks = set()
 
@@ -3585,8 +3598,8 @@ class AsyncRunner:
                             "shared broker transport was already declared unusable"
                         )
                     result = await self.process_symbol(symbol)
-                except SymbolCycleAbortError:
-                    await self._latch_symbol_cycle_abort()
+                except SymbolCycleAbortError as exc:
+                    await self._latch_symbol_cycle_abort(exc)
                     raise
                 else:
                     self.monitor.record_symbol_processed(
@@ -3609,50 +3622,95 @@ class AsyncRunner:
             return []
         task_indexes = {task: index for index, task in enumerate(tasks)}
         results: List[object] = [None] * len(tasks)
+
+        async def cancel_non_admitted_and_drain() -> bool:
+            """Stop pre-admission work and join all point-of-no-return tasks.
+
+            Taking the admission lock after the abort latch gives a stable
+            admitted-task snapshot: no new placement can cross the gate after
+            the event is set. Non-admitted siblings are cancellation-safe,
+            while admitted siblings are allowed to finish fill accounting.
+            The concrete drain task is shielded so repeated parent
+            cancellation cannot split a fill from its durable accounting.
+            Return whether cancellation arrived during the shielded drain so
+            the caller can preserve it after every child has settled.
+            """
+
+            async with self._order_admission_lock:
+                admitted = set(getattr(self, "_order_admitted_tasks", set()))
+            for task in tasks:
+                if not task.done() and task not in admitted:
+                    task.cancel()
+
+            async def drain_children() -> None:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            drain_task = asyncio.create_task(
+                drain_children(),
+                name="symbol-cycle-accounting-drain",
+            )
+            cancellation_received = False
+            while not drain_task.done():
+                try:
+                    await asyncio.shield(drain_task)
+                except asyncio.CancelledError:
+                    cancellation_received = True
+                    continue
+            return cancellation_received
+
+        children_drained = False
         try:
-            done, _ = await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+            pending = set(tasks)
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    index = task_indexes[task]
+                    try:
+                        results[index] = task.result()
+                    except Exception as exc:
+                        results[index] = exc
+
+                cycle_abort = getattr(self, "_symbol_cycle_abort_error", None)
+                if cycle_abort is None:
+                    cycle_abort = next(
+                        (
+                            results[task_indexes[task]]
+                            for task in done
+                            if isinstance(
+                                results[task_indexes[task]],
+                                SymbolCycleAbortError,
+                            )
+                        ),
+                        None,
+                    )
+                if cycle_abort is not None:
+                    cancellation_received = await cancel_non_admitted_and_drain()
+                    children_drained = True
+                    if cancellation_received:
+                        raise asyncio.CancelledError
+                    logger.critical(
+                        "event=symbol_cycle_aborted reason=%r "
+                        "note=downstream_cycle_work_suppressed",
+                        str(cycle_abort),
+                    )
+                    raise cycle_abort
+        except SymbolCycleAbortError:
+            # The abort path already latched admission and drained every child.
+            raise
         except asyncio.CancelledError:
             # asyncio.wait does not propagate cancellation into children. Latch
             # admission first, cancel only tasks that never crossed the
             # point-of-no-return, and drain admitted tasks through accounting.
             await self._latch_symbol_cycle_abort()
-            admitted = set(getattr(self, "_order_admitted_tasks", set()))
-            unfinished = [task for task in tasks if not task.done()]
-            for task in unfinished:
-                if task not in admitted:
-                    task.cancel()
-            if unfinished:
-
-                async def drain_children() -> None:
-                    await asyncio.gather(*unfinished, return_exceptions=True)
-
-                drain_task = asyncio.create_task(
-                    drain_children(),
-                    name="symbol-cycle-accounting-drain",
-                )
-                while not drain_task.done():
-                    try:
-                        await asyncio.shield(drain_task)
-                    except asyncio.CancelledError:
-                        # Retain and continue joining the concrete drain task;
-                        # repeated parent cancellation must not split a fill
-                        # from its accounting.
-                        continue
+            if not children_drained:
+                await cancel_non_admitted_and_drain()
             raise
         except BaseException:
-            unfinished = [task for task in tasks if not task.done()]
-            for task in unfinished:
-                task.cancel()
-            if unfinished:
-                await asyncio.gather(*unfinished, return_exceptions=True)
+            await cancel_non_admitted_and_drain()
             raise
-
-        for task in done:
-            index = task_indexes[task]
-            try:
-                results[index] = task.result()
-            except Exception as exc:
-                results[index] = exc
 
         # Handle exceptions and collect valid results
         valid_results = []
@@ -3666,8 +3724,8 @@ class AsyncRunner:
                     traceback.format_exception(type(result), result, result.__traceback__)
                 )
                 logger.error(f"Task failed for symbol {symbol}: {result}\nTraceback:\n{tb_str}")
-                # Ordinary per-symbol failures are isolated. A
-                # SymbolCycleAbortError has already cancelled pending work.
+                # Ordinary per-symbol failures are isolated. Transport-level
+                # SymbolCycleAbortError was propagated above after child drain.
                 continue
             else:
                 valid_results.append(result)
@@ -5009,7 +5067,7 @@ class AsyncRunner:
             )
             self._recovery_exhausted = True
 
-    async def _rewarm_stop_loss_prices_after_recovery(self) -> None:
+    async def _rewarm_stop_loss_prices_after_recovery(self) -> bool:
         """Offer cached live protective events after a successful reconnect.
 
         Reconnect must not manufacture freshness for historical closes.
@@ -5017,21 +5075,28 @@ class AsyncRunner:
         may be offered to the stop monitor. The monitor independently rejects
         any source event older than its ten-second threshold.
 
-        Defensive: skips when attributes don't exist (e.g., minimal test
-        runners). Each update_price call is independently wrapped so a
-        single symbol's failure cannot poison the others.
+        Flat/no-stop runtimes deliberately succeed without a rewarm. If active
+        stops exist, every stop must accept its live-protective event; partial,
+        stale, missing, or failed updates return False so recovery remains
+        fail-closed. Calls remain independent so one failure does not hide
+        evidence about the other active stops.
         """
         stop_monitor = getattr(self, "stop_loss_monitor", None)
+        active_stops = getattr(stop_monitor, "active_stops", None) if stop_monitor else None
+        if not active_stops:
+            logger.debug("event=stop_loss_prices_rewarm_skipped reason=no_active_stops")
+            return True
+
         prices = getattr(self, "latest_prices", None)
         price_times = getattr(self, "latest_price_times", None)
         price_sources = getattr(self, "latest_price_sources", None)
-        if stop_monitor is None or prices is None or price_times is None or price_sources is None:
-            logger.debug("event=stop_loss_prices_rewarm_skipped reason=missing_attributes")
-            return
-
-        active_stops = getattr(stop_monitor, "active_stops", None)
-        if not active_stops:
-            return
+        if not all(isinstance(value, dict) for value in (prices, price_times, price_sources)):
+            logger.error(
+                "event=stop_loss_prices_rewarm_incomplete "
+                "reason=missing_or_invalid_cache active_stop_count=%d",
+                len(active_stops),
+            )
+            return False
 
         rewarmed = 0
         skipped = 0
@@ -5073,6 +5138,7 @@ class AsyncRunner:
             rewarmed,
             skipped,
         )
+        return skipped == 0 and rewarmed == len(active_stops)
 
     def _maybe_auto_reset_kill_switch_after_recovery(self) -> None:
         """Auto-reset the AdvancedRiskManager kill switch iff it was
@@ -5126,9 +5192,11 @@ class AsyncRunner:
     async def recover_connection(self, reason: str) -> bool:
         """Re-establish IBKR connection after ConnectionHealth reports unhealthy.
 
-        Returns True if recovered, False if all 5 backoff attempts failed.
-        On False, the caller should exit run_continuous and let the watchdog
-        do process-level restart.
+        Returns True only when the connection and required active-stop
+        protection are both restored. Returns False when connection attempts
+        are exhausted or protective rewarming/validation fails. On False, the
+        caller should exit run_continuous and let the watchdog do process-level
+        restart.
 
         Per 2026-05-16 design spec:
         - Backoff: [15, 30, 60, 120, 300] seconds
@@ -5237,26 +5305,67 @@ class AsyncRunner:
 
             try:
                 await self.initialize_connection()
-                logger.info("event=recovery_succeeded attempt=%d", attempt)
+                health = getattr(self, "health", None)
+                if health is not None:
+                    # initialize_connection installs a new monitor whose
+                    # default state is HEALTHY. Recovery is not complete until
+                    # active stop protection has been re-established.
+                    health._status = HealthStatus.RECOVERING
                 # C4: rewarm stop_loss_monitor with cached prices from
                 # latest_prices so the freshness check
                 # (max_price_age_seconds=10) passes for the next
                 # check. Without this, stop-losses go blind for the
                 # first 1–N cycles after recovery because they require
                 # a recent price tick to evaluate.
-                await self._rewarm_stop_loss_prices_after_recovery()
+                rewarmed = await self._rewarm_stop_loss_prices_after_recovery()
+                if not rewarmed:
+                    active_stop_count = len(
+                        getattr(getattr(self, "stop_loss_monitor", None), "active_stops", {})
+                    )
+                    raise UnprotectedExistingPositionsError(
+                        getattr(self, "portfolio_id", "default"),
+                        active_stop_count,
+                        "recovery_stop_rewarm_incomplete",
+                    )
+                self._assert_existing_position_protection()
                 # H1: auto-clear kill switch if it was tripped by a
                 # connection-related transient (now resolved).
                 # Loss-based triggers are preserved — those are real
                 # safety stops and a recovery doesn't change them.
                 self._maybe_auto_reset_kill_switch_after_recovery()
+                if health is not None and callable(getattr(health, "record_success", None)):
+                    health.record_success()
+                logger.info("event=recovery_succeeded attempt=%d", attempt)
                 return True
+            except UnprotectedExistingPositionsError as e:
+                health = getattr(self, "health", None)
+                if health is not None:
+                    health._status = HealthStatus.UNHEALTHY
+                logger.critical(
+                    "event=recovery_protection_failed attempt=%d reason_code=%s "
+                    "position_count=%d note=connection_not_resumed",
+                    attempt,
+                    e.reason_code,
+                    e.position_count,
+                )
+                await self._safe_disconnect()
+                return False
             except Exception as e:
+                health = getattr(self, "health", None)
+                if health is not None:
+                    health._status = HealthStatus.UNHEALTHY
                 logger.warning(
                     "event=recovery_attempt_failed attempt=%d error=%r",
                     attempt,
                     e,
                 )
+                # initialize_connection may already have installed a new
+                # subprocess before a later recovery step fails (protection
+                # assertion, kill-switch reset, health transition, or health
+                # monitor attachment). Disconnect immediately on every generic
+                # failure so even the final attempt cannot return False while
+                # a post-failure broker session remains active.
+                await self._safe_disconnect()
 
         logger.error(
             "event=recovery_exhausted attempts=%d reason=%r",
@@ -5585,6 +5694,29 @@ async def run_continuous(
                         raise  # propagate to outer while-loop handler for graceful shutdown
                     except UnprotectedExistingPositionsError:
                         raise
+                    except SymbolCycleAbortError as cycle_err:
+                        # A symbol-cycle abort means the shared broker worker
+                        # generation is no longer trustworthy. Treat it as a
+                        # terminal recovery condition for this process instead
+                        # of feeding it through the ordinary cycle-error path:
+                        # direct record_failure() transitions can otherwise
+                        # leave ConnectionHealth UNHEALTHY without scheduling
+                        # recovery, and the loop would skip forever.
+                        if portfolio_runner.health is not None:
+                            portfolio_runner.health._status = HealthStatus.UNHEALTHY
+                        portfolio_runner._recovery_exhausted = True
+                        logger.critical(
+                            "event=cycle_transport_abort portfolio=%s error=%r "
+                            "note=disconnecting_and_exiting_for_watchdog",
+                            portfolio_id,
+                            cycle_err,
+                        )
+                        await portfolio_runner._safe_disconnect()
+                        raise RecoveryExhaustedError(
+                            f"portfolio={portfolio_id} broker transport generation "
+                            "was poisoned; exiting run_continuous so watchdog can "
+                            "restart the process"
+                        ) from cycle_err
                     except Exception as cycle_err:
                         logger.exception(
                             "event=cycle_error portfolio=%s error=%r",

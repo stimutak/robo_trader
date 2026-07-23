@@ -654,7 +654,8 @@ async def test_worker_rejects_none_qualification_and_naive_broker_time(monkeypat
 
     monkeypatch.setattr(worker, "ib", NoneQualificationIB())
     result = await worker.handle_get_historical_bars({"symbol": "AAPL"})
-    assert result["status"] == "error"
+    assert result["status"] == worker.PROTOCOL_ERROR_STATUS
+    assert result["error_type"] == worker.PROTOCOL_ERROR_TYPE
     assert "exactly one qualified contract" in result["error"]
 
     class BoolConIdIB:
@@ -676,6 +677,49 @@ async def test_worker_rejects_none_qualification_and_naive_broker_time(monkeypat
     )
     with pytest.raises(ValueError, match="timezone-naive"):
         worker._aware_iso(datetime(2026, 7, 23, 14, 30))
+
+
+@pytest.mark.asyncio
+async def test_worker_identity_protocol_error_poisons_parent_generation(monkeypatch):
+    class AliasIdentityIB:
+        def isConnected(self):
+            return True
+
+        async def qualifyContractsAsync(self, requested):
+            return [
+                SimpleNamespace(
+                    symbol="AAPL",
+                    localSymbol="AAPL ALIAS",
+                    conId=265598,
+                    secType="STK",
+                    exchange="SMART",
+                    primaryExchange="NASDAQ",
+                    currency="USD",
+                    tradingClass="NMS",
+                )
+            ]
+
+        async def reqHistoricalDataAsync(self, requested, **kwargs):
+            raise AssertionError("identity failure must precede historical data")
+
+    monkeypatch.setattr(worker, "ib", AliasIdentityIB())
+    worker_response = await worker.handle_get_historical_bars({"symbol": "AAPL"})
+
+    assert worker_response["status"] == worker.PROTOCOL_ERROR_STATUS
+    assert worker_response["error_type"] == worker.PROTOCOL_ERROR_TYPE
+
+    def handler(process, request):
+        envelope = _response(request)
+        envelope.pop("data")
+        envelope.update(worker_response)
+        _feed(process, envelope)
+
+    client, _, generation = _attach_client(handler)
+
+    with pytest.raises(IBKRTransportPoisonedError, match="Unknown worker response status"):
+        await client.get_historical_bars("AAPL")
+
+    assert generation.poisoned_reason == "unknown response status"
 
 
 @pytest.mark.asyncio
