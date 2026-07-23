@@ -8,15 +8,14 @@ Target: safe supervised paper operation first, then remote read-only access, the
 
 Current execution baseline (2026-07-23): `main` includes the truthful Phase 0
 CI gates from PR #83 (`7f5de0a`) and runtime-stability fixes from PR #81
-(`b7e5005`). PR #82 completed PR 1 and merged as `393f533`. PR #80 is
-superseded and must not be merged or cherry-picked; its independent findings
-are assigned to later scoped PRs in
-`docs/branch_analysis/PR80_DISPOSITION_2026-07-23.md`. PR 1A is now the next
-gate because a read-only incident reconstruction proved that an uncorrelated
-timed-out broker response can be relabeled as another symbol and reach stop
-logic. PR 1B then supplies the non-mutating broker-versus-ledger evidence
-required for the later Gate A decision. Neither PR 1A nor PR 1B authorizes a
-restart.
+(`b7e5005`). PR #82 completed PR 1 and merged as `393f533`. PR #87 completed
+PR 1A and merged as `4cafb782cbf43ff4397f1b89b42d5f657eceea8e`,
+closing the incident-driven broker-correlation and protected-runtime gate.
+PR #80 is superseded and must not be merged or cherry-picked; its independent
+findings are assigned to later scoped PRs in
+`docs/branch_analysis/PR80_DISPOSITION_2026-07-23.md`. PR 1B is next and must
+supply the non-mutating broker-versus-ledger evidence required for the later
+Gate A decision. Gate A remains closed and the trader remains stopped.
 
 ## 1. Purpose
 
@@ -1118,13 +1117,18 @@ Update after each merge.
   mapped one-to-one to PR 1 / PR #82, PR 6, or PR 11 in the branch disposition
   record. Separate branch requirements, rather than review threads, are
   retained for PRs 8 and 10.
-- PR 1A: Not started. Added as an incident-driven prerequisite after read-only
-  evidence showed that a timed-out IBKR historical-data response could shift
-  later FIFO responses across symbols and feed a mislabeled quote into loss and
-  stop logic. Historical persistence also uses integer RangeIndex values and
-  overwrites prior cycles. The current kill switch, lock, and database evidence
-  must remain intact. Restart is prohibited until correlation, contract
-  validation, and timestamp persistence are complete.
+- PR 1A: PR #87 merged on 2026-07-23 as
+  `4cafb782cbf43ff4397f1b89b42d5f657eceea8e` from exact reviewed head
+  `aa62b3e20dbd88096aa78a5875a8dc48e298f7ee`. Local focused validation
+  passed 371 tests with 2 skipped; the local full suite passed 1,396 tests with
+  5 skipped and 20 warnings. All repository-owned hosted checks were green,
+  Codex exact-head review was clean, and the independent challenger returned
+  PASS. The external Claude run `30047548445` provided no validation: its
+  revoked OAuth credential failed with HTTP 401 after using zero tokens and
+  incurring zero cost. PR 1A closes the incident-driven broker-correlation,
+  event-time, transport-poisoning, stop-protection, and fail-closed lifecycle
+  scope. It does not authorize a restart. Gate A remains closed, the trader
+  remains stopped, and PR 1B read-only reconciliation is next.
 - PR 1B: Not started. A strictly read-only, account-verified broker-versus-ledger
   diagnostic is required because the current preflight points to a nonexistent
   command and the legacy position-sync utility is deliberately quarantined.
