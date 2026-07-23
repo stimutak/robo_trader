@@ -1,0 +1,28 @@
+schemaVersion: "2.0.0"
+
+fileExistenceTests:
+  - name: Application package is present
+    path: /app/robo_trader
+    shouldExist: true
+
+  - name: Entrypoint is executable
+    path: /usr/local/bin/entrypoint.sh
+    shouldExist: true
+    permissions: "-rwxr-xr-x"
+
+  - name: Only the IBC configuration template is present
+    path: /app/config/ibc/config.ini.template
+    shouldExist: true
+
+  - name: Populated IBC credentials are absent
+    path: /app/config/ibc/config.ini
+    shouldExist: false
+
+metadataTest:
+  user: trader
+  workdir: /app
+  entrypoint:
+    - /usr/local/bin/entrypoint.sh
+  envVars:
+    - key: PYTHONUNBUFFERED
+      value: "1"
