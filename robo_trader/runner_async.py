@@ -4561,6 +4561,24 @@ async def sleep_unless_shutdown(
             return
 
 
+def _raise_if_recovery_exhausted(runners: Dict[str, AsyncRunner]) -> None:
+    """Raise when any long-lived portfolio runner exhausted recovery.
+
+    This check must run before market-hours waiting. Recovery can exhaust just
+    after the last trading cycle; delaying observation until the next open
+    would leave a known-dead runner alive and prevent launchd from restarting
+    it.
+    """
+
+    for portfolio_id, portfolio_runner in runners.items():
+        if portfolio_runner._recovery_exhausted:
+            raise RecoveryExhaustedError(
+                f"portfolio={portfolio_id} recovery exhausted after "
+                "all backoff attempts; exiting run_continuous so "
+                "watchdog can restart the process"
+            )
+
+
 async def run_continuous(
     symbols: Optional[List[str]] = None,
     duration: str = "1 D",
@@ -4621,41 +4639,47 @@ async def run_continuous(
             eastern = pytz.timezone("US/Eastern")
             current_time = datetime.now(eastern)
 
-            # Check market status and adjust polling frequency
-            if not is_trading_allowed() and not force_connect:
-                session = get_market_session()
-                seconds_to_open = seconds_until_market_open()
-
-                # Extended hours: slower polling (2 min) - but only if extended hours trading is DISABLED
-                # If ENABLE_EXTENDED_HOURS=true, is_trading_allowed() returns true and we won't reach here
-                if session in ["after-hours", "pre-market"]:
-                    wait_time = 120  # 2 minutes during extended hours
-                    logger.info(f"Extended hours ({session}). Polling every 2 minutes...")
-                    await sleep_unless_shutdown(wait_time, lambda: shutdown_flag)
-                    continue
-                # Within 1 hour of open: moderate polling (5 min)
-                elif seconds_to_open < 3600:
-                    wait_time = 300  # 5 minutes when close to open
-                    logger.info(
-                        f"Market opens in {seconds_to_open/60:.0f} min. Polling every 5 minutes..."
-                    )
-                    await sleep_unless_shutdown(wait_time, lambda: shutdown_flag)
-                    continue
-                else:
-                    # Market fully closed (overnight/weekend): long wait (30 min max)
-                    wait_time = min(1800, seconds_to_open // 2)  # Max 30 minutes
-                    logger.info(
-                        f"Market {session}. Next open in {seconds_to_open/3600:.1f} hours. "
-                        f"Sleeping {wait_time/60:.1f} minutes..."
-                    )
-                    await sleep_unless_shutdown(wait_time, lambda: shutdown_flag)
-                    continue
-            elif force_connect and not is_trading_allowed():
-                logger.warning(
-                    "⚠️ Force-connect enabled - connecting to IBKR despite market being closed"
-                )
-
             try:
+                # Observe recovery exhaustion before any market-closed sleep or
+                # continue. A failure latched after the prior cycle must exit
+                # promptly even when the next session is hours away.
+                _raise_if_recovery_exhausted(runners)
+
+                # Check market status and adjust polling frequency
+                if not is_trading_allowed() and not force_connect:
+                    session = get_market_session()
+                    seconds_to_open = seconds_until_market_open()
+
+                    # Extended hours: slower polling (2 min) - but only if
+                    # extended-hours trading is disabled.
+                    if session in ["after-hours", "pre-market"]:
+                        wait_time = 120  # 2 minutes during extended hours
+                        logger.info(f"Extended hours ({session}). Polling every 2 minutes...")
+                        await sleep_unless_shutdown(wait_time, lambda: shutdown_flag)
+                        continue
+                    # Within 1 hour of open: moderate polling (5 min)
+                    elif seconds_to_open < 3600:
+                        wait_time = 300  # 5 minutes when close to open
+                        logger.info(
+                            f"Market opens in {seconds_to_open/60:.0f} min. "
+                            "Polling every 5 minutes..."
+                        )
+                        await sleep_unless_shutdown(wait_time, lambda: shutdown_flag)
+                        continue
+                    else:
+                        # Market fully closed (overnight/weekend): long wait
+                        wait_time = min(1800, seconds_to_open // 2)  # Max 30 minutes
+                        logger.info(
+                            f"Market {session}. Next open in {seconds_to_open/3600:.1f} hours. "
+                            f"Sleeping {wait_time/60:.1f} minutes..."
+                        )
+                        await sleep_unless_shutdown(wait_time, lambda: shutdown_flag)
+                        continue
+                elif force_connect and not is_trading_allowed():
+                    logger.warning(
+                        "⚠️ Force-connect enabled - connecting to IBKR despite market being closed"
+                    )
+
                 logger.info(
                     f"Starting trading cycle at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
                 )
@@ -4720,12 +4744,7 @@ async def run_continuous(
                     # runner can't get stuck in a perpetual "cycle skipped"
                     # state that keeps the log mtime fresh (which would defeat
                     # the watchdog's "no log activity for 5 min" trigger).
-                    if portfolio_runner._recovery_exhausted:
-                        raise RecoveryExhaustedError(
-                            f"portfolio={portfolio_id} recovery exhausted after "
-                            f"all backoff attempts; exiting run_continuous so "
-                            f"watchdog can restart the process"
-                        )
+                    _raise_if_recovery_exhausted({portfolio_id: portfolio_runner})
 
                     # Skip cycle if recovery is mid-flight
                     if portfolio_runner.recovery_in_progress:

@@ -12,6 +12,8 @@
 # Environment overrides (testing):
 #   LAUNCH_AGENTS_DIR   Override target dir (default: ~/Library/LaunchAgents)
 #   SKIP_LAUNCHCTL=1    Skip launchctl load/list assertions (for CI/tests).
+#   ROBOTRADER_USER     Override launchd UserName (default: current user).
+#   PLUTIL_BIN          Override plutil executable (testing only).
 #
 # Exits non-zero on any error.
 
@@ -22,6 +24,9 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 PLIST_SRC="$SCRIPT_DIR/com.robotrader.watchdog.plist"
 WATCHDOG_SH="$SCRIPT_DIR/watchdog.sh"
 LABEL="com.robotrader.watchdog"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+PLUTIL_BIN="${PLUTIL_BIN:-plutil}"
+ROBOTRADER_USER="${ROBOTRADER_USER:-$(id -un)}"
 
 LAUNCH_AGENTS_DIR="${LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 PLIST_DEST="$LAUNCH_AGENTS_DIR/${LABEL}.plist"
@@ -48,25 +53,50 @@ echo ""
 # 1. Sanity checks ---------------------------------------------------------
 [[ -f "$PLIST_SRC" ]]    || die "plist source not found at $PLIST_SRC"
 [[ -f "$WATCHDOG_SH" ]]  || die "watchdog.sh not found at $WATCHDOG_SH"
+command -v "$PYTHON_BIN" >/dev/null 2>&1 || die "Python not found: $PYTHON_BIN"
 [[ -x "$WATCHDOG_SH" ]]  || {
     echo "    watchdog.sh not executable, fixing..."
     chmod +x "$WATCHDOG_SH" || die "could not chmod +x $WATCHDOG_SH"
 }
 
-# 2. Validate plist --------------------------------------------------------
-echo "==> Validating plist with plutil -lint"
-plutil -lint "$PLIST_SRC" || die "plist failed plutil -lint"
-
-# 3. Validate watchdog.sh shell syntax ------------------------------------
+# 2. Validate watchdog.sh shell syntax ------------------------------------
 echo "==> Validating watchdog.sh shell syntax"
 bash -n "$WATCHDOG_SH" || die "watchdog.sh failed bash -n syntax check"
 
-# 4. Ensure LaunchAgents dir exists ---------------------------------------
+# 3. Ensure LaunchAgents dir exists ---------------------------------------
 mkdir -p "$LAUNCH_AGENTS_DIR" || die "could not create $LAUNCH_AGENTS_DIR"
 
-# 5. Copy plist (idempotent) ----------------------------------------------
-echo "==> Copying plist to $PLIST_DEST"
-cp "$PLIST_SRC" "$PLIST_DEST" || die "failed to copy plist to $PLIST_DEST"
+# 4. Render the machine-specific plist (idempotent) ------------------------
+# The tracked template contains this checkout's defaults so it remains easy to
+# inspect, but the installed plist must always match the actual checkout and
+# current GUI user. In particular, StandardOutPath/StandardErrorPath must point
+# beside watchdog.sh's WATCHDOG_LAUNCHD_LOG or launchd output escapes its cap.
+echo "==> Rendering plist to $PLIST_DEST"
+"$PYTHON_BIN" - "$PLIST_SRC" "$PLIST_DEST" "$PROJECT_DIR" "$ROBOTRADER_USER" <<'PY'
+import plistlib
+import sys
+from pathlib import Path
+
+source, destination, project_dir, user_name = sys.argv[1:]
+project = Path(project_dir).resolve()
+
+with open(source, "rb") as handle:
+    plist = plistlib.load(handle)
+
+plist["UserName"] = user_name
+plist["ProgramArguments"][0] = str(project / "scripts" / "watchdog.sh")
+plist["WorkingDirectory"] = str(project)
+launchd_log = str(project / "watchdog_launchd.log")
+plist["StandardOutPath"] = launchd_log
+plist["StandardErrorPath"] = launchd_log
+
+with open(destination, "wb") as handle:
+    plistlib.dump(plist, handle, sort_keys=False)
+PY
+
+# 5. Validate the rendered plist ------------------------------------------
+echo "==> Validating rendered plist with plutil -lint"
+"$PLUTIL_BIN" -lint "$PLIST_DEST" || die "rendered plist failed plutil -lint"
 
 if [[ "${SKIP_LAUNCHCTL:-0}" = "1" ]]; then
     echo "==> SKIP_LAUNCHCTL=1 set; skipping launchctl load/list."

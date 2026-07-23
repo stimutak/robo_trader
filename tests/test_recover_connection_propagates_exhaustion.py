@@ -24,7 +24,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from robo_trader.runner_async import AsyncRunner, RecoveryExhaustedError
+from robo_trader.runner_async import (
+    AsyncRunner,
+    RecoveryExhaustedError,
+    _raise_if_recovery_exhausted,
+)
 
 
 def test_recovery_exhausted_error_is_subclass_of_exception():
@@ -125,6 +129,16 @@ async def test_run_continuous_raises_recovery_exhausted_via_flag():
     assert "recovery exhausted" in str(excinfo.value)
 
 
+def test_recovery_exhaustion_helper_checks_all_long_lived_runners():
+    healthy_runner = MagicMock()
+    healthy_runner._recovery_exhausted = False
+    failed_runner = MagicMock()
+    failed_runner._recovery_exhausted = True
+
+    with pytest.raises(RecoveryExhaustedError, match="portfolio=failed"):
+        _raise_if_recovery_exhausted({"healthy": healthy_runner, "failed": failed_runner})
+
+
 def test_cycle_loop_contains_recovery_exhausted_check():
     """Guard against future refactors silently dropping the cycle-loop
     check. The actual lines of code matter here — this is the only
@@ -142,6 +156,19 @@ def test_cycle_loop_contains_recovery_exhausted_check():
     assert (
         "RecoveryExhaustedError" in src
     ), "run_continuous no longer raises RecoveryExhaustedError — C2 regression."
+
+
+def test_recovery_exhaustion_is_checked_before_market_closed_wait():
+    """A closed market must not defer a latched recovery failure until open."""
+    import inspect
+
+    from robo_trader import runner_async
+
+    src = inspect.getsource(runner_async.run_continuous)
+    top_level_check = src.index("_raise_if_recovery_exhausted(runners)")
+    market_closed_branch = src.index("if not is_trading_allowed() and not force_connect")
+
+    assert top_level_check < market_closed_branch
 
 
 def test_run_continuous_catches_recovery_exhausted_at_outer_level():
