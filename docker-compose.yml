@@ -44,6 +44,7 @@ services:
       - DASH_PORT=5555
       - WEBSOCKET_URL=ws://websocket:8765
       - LOG_LEVEL=INFO
+      - LOG_CONSOLE=true
       - MONITORING_LOG_FORMAT=plain
     volumes:
       - ./data:/app/data

@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import plistlib
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -131,7 +132,13 @@ def test_install_watchdog_renders_checkout_and_user_paths(tmp_path):
     env["PLUTIL_BIN"] = shutil.which("true") or "true"
 
     result = subprocess.run(
-        ["bash", str(portable_scripts / INSTALL_SH.name)],
+        [
+            "bash",
+            "-c",
+            'umask 000; exec bash "$1"',
+            "watchdog-installer-test",
+            str(portable_scripts / INSTALL_SH.name),
+        ],
         capture_output=True,
         text=True,
         env=env,
@@ -149,6 +156,8 @@ def test_install_watchdog_renders_checkout_and_user_paths(tmp_path):
     assert installed["WorkingDirectory"] == str(expected_project)
     assert installed["StandardOutPath"] == expected_launchd_log
     assert installed["StandardErrorPath"] == expected_launchd_log
+    installed_mode = stat.S_IMODE((fake_la / "com.robotrader.watchdog.plist").stat().st_mode)
+    assert installed_mode == 0o600
 
 
 @macos_only

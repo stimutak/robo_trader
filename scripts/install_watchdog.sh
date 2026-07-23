@@ -93,6 +93,7 @@ plist["StandardErrorPath"] = launchd_log
 with open(destination, "wb") as handle:
     plistlib.dump(plist, handle, sort_keys=False)
 PY
+chmod 600 "$PLIST_DEST" || die "could not set safe permissions on $PLIST_DEST"
 
 # 5. Validate the rendered plist ------------------------------------------
 echo "==> Validating rendered plist with plutil -lint"

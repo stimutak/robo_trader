@@ -17,10 +17,14 @@ Policy under test:
 
 import logging
 import sys
+from pathlib import Path
 
 import pytest
+import yaml
 
 from robo_trader import logger as logger_mod
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture
@@ -120,6 +124,20 @@ def test_log_console_false_forces_mirror_off_on_tty(monkeypatch, restore_root_lo
 
     root = restore_root_logger
     assert _stdout_stream_handlers(root) == []
+
+
+@pytest.mark.parametrize(
+    "compose_path",
+    (
+        "docker-compose.yml",
+        "deployment/docker-compose.prod.yml",
+    ),
+)
+def test_container_dashboard_explicitly_keeps_console_logging(compose_path):
+    compose = yaml.safe_load((PROJECT_ROOT / compose_path).read_text())
+    environment = compose["services"]["dashboard"]["environment"]
+
+    assert "LOG_CONSOLE=true" in environment
 
 
 @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
