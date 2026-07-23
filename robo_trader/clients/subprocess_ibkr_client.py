@@ -13,6 +13,7 @@ to avoid event loop starvation in busy async environments.
 
 import asyncio
 import json
+import math
 import os
 import subprocess
 import sys
@@ -23,6 +24,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Optional, cast
 
@@ -117,6 +119,12 @@ class IBKRConnectionConflictError(IBKRError):
     pass
 
 
+class BrokerSnapshotAccountMismatchError(IBKRTransportPoisonedError):
+    """Raised without exposing raw IDs when snapshot account identity is wrong."""
+
+    pass
+
+
 class GatewayRequiresRestartError(IBKRError):
     """Raised when the worker detects the Gateway API layer has crashed"""
 
@@ -150,6 +158,20 @@ _INTRADAY_BAR_SIZES = {
     "4 hours",
     "8 hours",
 }
+_BROKER_SNAPSHOT_SCHEMA_VERSION = 1
+_BROKER_SNAPSHOT_BALANCE_TAGS = {
+    "NetLiquidation",
+    "TotalCashValue",
+    "SettledCash",
+    "GrossPositionValue",
+    "RealizedPnL",
+    "UnrealizedPnL",
+}
+_BROKER_SNAPSHOT_REQUIRED_BALANCE_TAGS = {"NetLiquidation", "TotalCashValue"}
+_BROKER_SNAPSHOT_MAX_AGE_SECONDS = 300.0
+_BROKER_SNAPSHOT_MAX_WINDOW_SECONDS = 60.0
+_BROKER_SNAPSHOT_MAX_CLOCK_SKEW_SECONDS = 120.0
+_BROKER_EXECUTION_LOOKBACK_SECONDS = 24 * 60 * 60
 
 
 @dataclass
@@ -201,6 +223,7 @@ class SubprocessIBKRClient:
         self.lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
         self._connection_state_lock = threading.Lock()
+        self._debug_log_cleanup_lock = threading.Lock()
         self._connected = False
         self._connection_identity: Optional[tuple[str, int, int, bool]] = None
         self._connection_generation_id: Optional[str] = None
@@ -270,6 +293,84 @@ class SubprocessIBKRClient:
                 self._last_activity,
                 self._gateway_api_down_detail,
             )
+
+    def _cleanup_worker_debug_log(
+        self,
+        generation: Optional[_WorkerGeneration],
+        *,
+        required: bool = False,
+    ) -> None:
+        """Close and unlink one generation's temporary stderr capture.
+
+        References are cleared only for the operation that actually succeeded.
+        A later stop or cleanup call can therefore retry a transient close or
+        unlink failure without losing the remaining handle or path.
+        """
+        failures: list[tuple[str, Exception]] = []
+        with self._debug_log_cleanup_lock:
+            debug_log_file = (
+                generation.debug_log_file if generation is not None else self._debug_log_file
+            )
+            debug_log_path = (
+                generation.debug_log_path if generation is not None else self._debug_log_path
+            )
+
+            close_succeeded = debug_log_file is None
+            if debug_log_file is not None:
+                try:
+                    debug_log_file.close()
+                    close_succeeded = True
+                except Exception as exc:
+                    failures.append(("close", exc))
+
+            unlink_succeeded = not debug_log_path
+            if debug_log_path:
+                try:
+                    os.unlink(debug_log_path)
+                    unlink_succeeded = True
+                except FileNotFoundError:
+                    unlink_succeeded = True
+                except OSError as exc:
+                    failures.append(("remove", exc))
+
+            if close_succeeded:
+                if generation is not None and generation.debug_log_file is debug_log_file:
+                    generation.debug_log_file = None
+                if self._debug_log_file is debug_log_file:
+                    self._debug_log_file = None
+            if unlink_succeeded:
+                if generation is not None and generation.debug_log_path == debug_log_path:
+                    generation.debug_log_path = None
+                if self._debug_log_path == debug_log_path:
+                    self._debug_log_path = None
+
+        for operation, failure_exc in failures:
+            logger.warning(
+                f"Could not {operation} worker debug log",
+                error=str(failure_exc),
+            )
+        if failures and required:
+            operations = " and ".join(operation for operation, _ in failures)
+            raise SubprocessCrashError(
+                f"Could not complete diagnostic worker debug log cleanup ({operations})"
+            ) from failures[0][1]
+
+    def _cleanup_worker_debug_log_with_retry(
+        self,
+        generation: Optional[_WorkerGeneration],
+        *,
+        attempts: int = 2,
+    ) -> None:
+        """Require verified cleanup, retrying transient close/unlink failures."""
+        last_error: Optional[SubprocessCrashError] = None
+        for _ in range(attempts):
+            try:
+                self._cleanup_worker_debug_log(generation, required=True)
+                return
+            except SubprocessCrashError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
 
     def _record_gateway_failure(
         self,
@@ -476,6 +577,8 @@ class SubprocessIBKRClient:
         try:
             fd, debug_log_path = tempfile.mkstemp(prefix="worker_debug_", suffix=".log")
             debug_log_file = os.fdopen(fd, "w")
+            self._debug_log_file = debug_log_file
+            self._debug_log_path = debug_log_path
             logger.info("Worker debug output will be captured", debug_log=debug_log_path)
         except Exception as e:
             logger.warning("Could not create debug log file", error=str(e))
@@ -502,6 +605,8 @@ class SubprocessIBKRClient:
                 env=worker_env,
             )
             generation = _WorkerGeneration(generation_id, self.process)
+            generation.debug_log_file = debug_log_file
+            generation.debug_log_path = debug_log_path
             with self._connection_state_lock:
                 # Installing a worker is an authoritative disconnected state.
                 # Synchronizing the pointer swap with cached state prevents a
@@ -517,12 +622,6 @@ class SubprocessIBKRClient:
                 pid=self.process.pid,
                 generation_id=generation_id,
             )
-
-            # Store debug log file only after successful subprocess start
-            generation.debug_log_file = debug_log_file
-            generation.debug_log_path = debug_log_path
-            self._debug_log_file = debug_log_file
-            self._debug_log_path = debug_log_path
 
             # Start reader threads to avoid blocking
             self._reader_thread = threading.Thread(
@@ -569,11 +668,6 @@ class SubprocessIBKRClient:
                             stream.close()
                     except Exception:
                         pass
-            if debug_log_file:
-                try:
-                    debug_log_file.close()
-                except Exception:
-                    pass
             if generation:
                 for thread in (generation.stdout_thread, generation.stderr_thread):
                     if thread and thread.is_alive():
@@ -590,7 +684,7 @@ class SubprocessIBKRClient:
                         self._gateway_failure_generation_id = None
             if self.process is process:
                 self.process = None
-            self._debug_log_file = None
+            self._cleanup_worker_debug_log_with_retry(generation)
             raise
 
     def _poison_generation(self, generation: _WorkerGeneration, reason: str) -> None:
@@ -774,11 +868,7 @@ class SubprocessIBKRClient:
                 self._poison_generation(generation, f"stderr reader failure: {e}")
         finally:
             logger.debug("Stderr reader thread exiting")
-            if generation.debug_log_file:
-                try:
-                    generation.debug_log_file.close()
-                except Exception:
-                    pass
+            self._cleanup_worker_debug_log(generation)
 
     async def stop(self) -> None:
         """Serialize shutdown against worker creation and commands."""
@@ -791,6 +881,7 @@ class SubprocessIBKRClient:
         process = generation.process if generation else self.process
         if not process:
             self._clear_cached_connection_state(generation=generation)
+            self._cleanup_worker_debug_log_with_retry(generation)
             return
 
         logger.info("Stopping IBKR subprocess worker", pid=process.pid)
@@ -863,6 +954,7 @@ class SubprocessIBKRClient:
         if (stdout_thread and stdout_thread.is_alive()) or (
             stderr_thread and stderr_thread.is_alive()
         ):
+            self._cleanup_worker_debug_log_with_retry(generation)
             raise SubprocessCrashError(
                 "Worker reader thread did not stop; refusing generation replacement"
             )
@@ -880,16 +972,8 @@ class SubprocessIBKRClient:
                     self._gateway_api_down_detail = None
                     self._gateway_failure_generation_id = None
 
-        # Ensure debug log file is closed (belt-and-suspenders cleanup)
-        debug_log_file = generation.debug_log_file if generation else self._debug_log_file
-        if debug_log_file:
-            try:
-                debug_log_file.close()
-            except Exception:
-                pass
-            if generation:
-                generation.debug_log_file = None
-            self._debug_log_file = None
+        # Ensure the temporary stderr capture never survives its worker.
+        self._cleanup_worker_debug_log_with_retry(generation)
 
         logger.info("IBKR subprocess worker stopped cleanly")
 
@@ -1042,6 +1126,13 @@ class SubprocessIBKRClient:
                         raise IBKRTimeoutRequiresGatewayRestartError(diagnostic)
                     raise IBKRTimeoutError(diagnostic)
 
+                if error_type == "BrokerSnapshotAccountMismatchError":
+                    self._poison_generation(
+                        generation,
+                        "worker-reported broker snapshot account mismatch",
+                    )
+                    raise BrokerSnapshotAccountMismatchError("Broker snapshot account mismatch")
+
                 if requires_restart or error_type == "GatewayRequiresRestartError":
                     message = detail or error_msg
                     gateway_detail = message or "Gateway API layer reported down"
@@ -1086,6 +1177,12 @@ class SubprocessIBKRClient:
             SubprocessCrashError: If subprocess crashes
             IBKRError: If connection fails
         """
+        if isinstance(port, bool) or port != 4002:
+            raise ValueError("Diagnostic client requires IBKR paper port 4002")
+        if readonly is not True:
+            raise ValueError("Diagnostic client requires readonly exactly true")
+        if isinstance(client_id, bool) or not isinstance(client_id, int) or client_id <= 0:
+            raise ValueError("Diagnostic client requires a positive client ID")
         command = {
             "command": "connect",
             "params": {
@@ -1097,7 +1194,12 @@ class SubprocessIBKRClient:
             },
         }
 
-        logger.info("Connecting to IBKR via subprocess", host=host, port=port, client_id=client_id)
+        logger.info(
+            "Connecting diagnostic IBKR subprocess",
+            host=host,
+            port=port,
+            client_id_alias="configured-positive-id",
+        )
 
         # ZOMBIE CONNECTION CHECK: Detect zombies before connection attempt
         # Gateway-owned zombies will block API handshakes
@@ -1155,7 +1257,7 @@ class SubprocessIBKRClient:
                             "Reusing matching IBKR subprocess connection",
                             host=host,
                             port=port,
-                            client_id=client_id,
+                            client_id_alias="configured-positive-id",
                             readonly=readonly,
                         )
                         return True
@@ -1163,7 +1265,7 @@ class SubprocessIBKRClient:
                         "Cached broker connection was stale; reconnecting worker session",
                         host=host,
                         port=port,
-                        client_id=client_id,
+                        client_id_alias="configured-positive-id",
                     )
                 data = await self._execute_command_unlocked(command, timeout=extended_timeout)
                 connected = data.get("connected", False)
@@ -1212,7 +1314,7 @@ class SubprocessIBKRClient:
         logger.info(
             "Connected to IBKR via subprocess",
             connected=connected_state,
-            accounts=accounts,
+            managed_account_count=len(accounts),
             server_version=server_version,
             duration_seconds=f"{time.time() - connection_start:.2f}",
         )
@@ -1301,6 +1403,502 @@ class SubprocessIBKRClient:
         """Get account summary"""
         data = await self._execute_command({"command": "get_account_summary"})
         return data.get("summary", {})
+
+    @staticmethod
+    def _masked_account(account: object) -> str:
+        normalized = str(account or "").strip()
+        return "****" if len(normalized) <= 4 else f"***{normalized[-4:]}"
+
+    @staticmethod
+    def _strict_decimal(value: Any, field: str) -> Decimal:
+        if not isinstance(value, str) or value != value.strip() or not value:
+            raise ValueError(f"{field} must be a canonical decimal string")
+        try:
+            parsed = Decimal(value)
+        except InvalidOperation as exc:
+            raise ValueError(f"{field} must be a canonical decimal string") from exc
+        if not parsed.is_finite():
+            raise ValueError(f"{field} must be finite")
+        canonical = "0" if parsed == 0 else format(parsed.normalize(), "f")
+        if value != canonical:
+            raise ValueError(f"{field} is not canonical")
+        return parsed
+
+    @staticmethod
+    def _strict_timestamp(value: Any, field: str) -> datetime:
+        if not isinstance(value, str):
+            raise ValueError(f"{field} must be an ISO timestamp")
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError(f"{field} must be an ISO timestamp") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError(f"{field} must be timezone-aware")
+        return parsed
+
+    @staticmethod
+    def _strict_identifier(
+        value: Any,
+        field: str,
+        *,
+        optional: bool = False,
+        allow_zero: bool = False,
+    ) -> Optional[int]:
+        if optional and value is None:
+            return None
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            or (value == 0 and not allow_zero)
+        ):
+            raise ValueError(f"{field} must be a positive integer")
+        return value
+
+    def _snapshot_fail(
+        self,
+        generation: Optional[_WorkerGeneration],
+        reason: str,
+    ) -> None:
+        if generation:
+            self._poison_generation(generation, reason)
+        raise IBKRTransportPoisonedError(reason)
+
+    def _require_snapshot_generation_binding(
+        self,
+        generation: _WorkerGeneration,
+        *,
+        expected_identity: Optional[tuple[str, int, int, bool]] = None,
+        poison_on_mismatch: bool,
+    ) -> tuple[str, int, int, bool]:
+        """Require one unpoisoned diagnostic session at a snapshot boundary.
+
+        The caller holds ``_lifecycle_lock``.  The nested locks match the
+        transport's global state order so a reader-thread poison and its
+        connection-state clear are observed atomically.
+        """
+        with generation.state_lock:
+            poisoned = generation.poisoned_reason is not None
+            with self._connection_state_lock:
+                identity = self._connection_identity
+                bound = (
+                    self._generation is generation
+                    and self._connected
+                    and identity is not None
+                    and identity[1] == 4002
+                    and identity[2] > 0
+                    and identity[3] is True
+                    and self._connection_generation_id == generation.generation_id
+                    and (expected_identity is None or identity == expected_identity)
+                )
+
+        if poisoned:
+            raise IBKRTransportPoisonedError("Broker snapshot worker generation is poisoned")
+        if not bound:
+            if poison_on_mismatch:
+                self._snapshot_fail(
+                    generation,
+                    "worker generation changed during broker snapshot",
+                )
+            raise IBKRDisconnectedError(
+                "Broker snapshot requires the validated diagnostic connection"
+            )
+        return cast(tuple[str, int, int, bool], identity)
+
+    def _validate_snapshot_contract(self, value: Any) -> tuple[int, str]:
+        expected_keys = {
+            "con_id",
+            "symbol",
+            "local_symbol",
+            "security_type",
+            "currency",
+            "exchange",
+            "primary_exchange",
+            "trading_class",
+        }
+        if not isinstance(value, dict) or set(value) != expected_keys:
+            raise ValueError("broker snapshot contract schema is invalid")
+        con_id = self._strict_identifier(value["con_id"], "contract con_id")
+        symbol = value["symbol"]
+        local_symbol = value["local_symbol"]
+        if (
+            not isinstance(symbol, str)
+            or not symbol
+            or symbol != symbol.strip().upper()
+            or local_symbol != symbol
+        ):
+            raise ValueError("broker snapshot contract alias is unsupported")
+        if value["security_type"] != "STK":
+            raise ValueError("broker snapshot contract is not STK")
+        if value["currency"] != "USD":
+            raise ValueError("broker snapshot contract is not USD")
+        if value["exchange"] != "SMART":
+            raise ValueError("broker snapshot contract exchange is not SMART")
+        for field_name in ("primary_exchange", "trading_class"):
+            if not isinstance(value[field_name], str) or not value[field_name].strip():
+                raise ValueError("broker snapshot contract identity is incomplete")
+        return cast(int, con_id), symbol
+
+    @staticmethod
+    def _validate_unavailable(
+        record: dict,
+        optional_fields: set[str],
+    ) -> dict[str, str]:
+        unavailable = record.get("unavailable")
+        if not isinstance(unavailable, dict) or not set(unavailable).issubset(optional_fields):
+            raise ValueError("broker snapshot unavailable-field schema is invalid")
+        if any(not isinstance(reason, str) or not reason for reason in unavailable.values()):
+            raise ValueError("broker snapshot unavailable reason is invalid")
+        for field_name in optional_fields:
+            if record[field_name] is None and field_name not in unavailable:
+                raise ValueError("broker snapshot silently omitted optional evidence")
+            if record[field_name] is not None and field_name in unavailable:
+                raise ValueError("broker snapshot optional evidence is contradictory")
+        return cast(dict[str, str], unavailable)
+
+    def _validate_broker_snapshot(
+        self,
+        expected_account: str,
+        data: dict,
+        generation: Optional[_WorkerGeneration],
+        max_age_seconds: float,
+    ) -> dict:
+        top_keys = {
+            "snapshot_schema_version",
+            "account",
+            "broker_time_before",
+            "broker_time_after",
+            "retrieved_at",
+            "positions",
+            "balances",
+            "open_orders",
+            "executions",
+            "execution_scope",
+        }
+        try:
+            if set(data) != top_keys:
+                raise ValueError("broker snapshot top-level schema is invalid")
+            if (
+                isinstance(data["snapshot_schema_version"], bool)
+                or data["snapshot_schema_version"] != _BROKER_SNAPSHOT_SCHEMA_VERSION
+            ):
+                raise ValueError("broker snapshot schema version is unsupported")
+
+            account = data["account"]
+            if not isinstance(account, str) or not account:
+                raise ValueError("broker snapshot account identity is malformed")
+            if account != expected_account:
+                reason = "broker snapshot account identity mismatch"
+                if generation:
+                    self._poison_generation(generation, reason)
+                raise BrokerSnapshotAccountMismatchError(
+                    "Broker snapshot account mismatch "
+                    f"(expected={self._masked_account(expected_account)}, "
+                    f"connected={self._masked_account(account)})"
+                )
+
+            broker_before = self._strict_timestamp(data["broker_time_before"], "broker_time_before")
+            broker_after = self._strict_timestamp(data["broker_time_after"], "broker_time_after")
+            retrieved_at = self._strict_timestamp(data["retrieved_at"], "retrieved_at")
+            if broker_after < broker_before:
+                raise ValueError("broker snapshot broker times are reversed")
+            broker_window = (broker_after - broker_before).total_seconds()
+            if (
+                not math.isfinite(broker_window)
+                or broker_window > _BROKER_SNAPSHOT_MAX_WINDOW_SECONDS
+            ):
+                raise ValueError("broker snapshot collection window is unbounded")
+            age = (
+                datetime.now(timezone.utc) - retrieved_at.astimezone(timezone.utc)
+            ).total_seconds()
+            if age < -5 or age > max_age_seconds:
+                raise ValueError("broker snapshot retrieval time is outside freshness bounds")
+            if any(
+                abs((broker_time - retrieved_at).total_seconds())
+                > _BROKER_SNAPSHOT_MAX_CLOCK_SKEW_SECONDS
+                for broker_time in (broker_before, broker_after)
+            ):
+                raise ValueError("broker snapshot clock skew exceeds safety bound")
+
+            positions = data["positions"]
+            if not isinstance(positions, list):
+                raise ValueError("broker snapshot positions are not a list")
+            seen_contract_ids: set[int] = set()
+            seen_symbols: set[str] = set()
+            position_keys = {"account", "contract", "quantity", "avg_cost"}
+            for position in positions:
+                if not isinstance(position, dict) or set(position) != position_keys:
+                    raise ValueError("broker snapshot position schema is invalid")
+                if position["account"] != expected_account:
+                    raise ValueError("broker snapshot position account is inconsistent")
+                con_id, symbol = self._validate_snapshot_contract(position["contract"])
+                if con_id in seen_contract_ids or symbol in seen_symbols:
+                    raise ValueError("broker snapshot position identity is duplicated")
+                seen_contract_ids.add(con_id)
+                seen_symbols.add(symbol)
+                if self._strict_decimal(position["quantity"], "position quantity") == 0:
+                    raise ValueError("broker snapshot position quantity is zero")
+                if self._strict_decimal(position["avg_cost"], "position avg_cost") < 0:
+                    raise ValueError("broker snapshot position average cost is negative")
+
+            balances = data["balances"]
+            if not isinstance(balances, list):
+                raise ValueError("broker snapshot balances are not a list")
+            seen_balances: set[tuple[str, str]] = set()
+            present_tags: set[str] = set()
+            for balance in balances:
+                if not isinstance(balance, dict) or set(balance) != {
+                    "tag",
+                    "currency",
+                    "value",
+                }:
+                    raise ValueError("broker snapshot balance schema is invalid")
+                tag = balance["tag"]
+                currency = balance["currency"]
+                if tag not in _BROKER_SNAPSHOT_BALANCE_TAGS:
+                    raise ValueError("broker snapshot balance tag is not allowed")
+                if not isinstance(currency, str) or not currency:
+                    raise ValueError("broker snapshot balance currency is invalid")
+                identity = (tag, currency)
+                if identity in seen_balances:
+                    raise ValueError("broker snapshot balance identity is duplicated")
+                seen_balances.add(identity)
+                present_tags.add(tag)
+                self._strict_decimal(balance["value"], "balance value")
+            if not _BROKER_SNAPSHOT_REQUIRED_BALANCE_TAGS.issubset(present_tags):
+                raise ValueError("broker snapshot required balances are missing")
+
+            self._validate_snapshot_orders(data["open_orders"], expected_account)
+            execution_scope = data["execution_scope"]
+            if not isinstance(execution_scope, dict) or set(execution_scope) != {
+                "kind",
+                "start_at",
+                "end_at",
+            }:
+                raise ValueError("broker snapshot execution scope schema is invalid")
+            if execution_scope["kind"] != "bounded_execution_filter":
+                raise ValueError("broker snapshot execution scope is unsupported")
+            execution_start = self._strict_timestamp(
+                execution_scope["start_at"], "execution scope start"
+            )
+            execution_end = self._strict_timestamp(execution_scope["end_at"], "execution scope end")
+            expected_execution_start = broker_before.replace(microsecond=0) - timedelta(
+                seconds=_BROKER_EXECUTION_LOOKBACK_SECONDS
+            )
+            if execution_start != expected_execution_start:
+                raise ValueError("broker snapshot execution scope does not match the wire filter")
+            if not broker_before <= execution_end <= broker_after:
+                raise ValueError(
+                    "broker snapshot execution scope end is outside broker collection bounds"
+                )
+            self._validate_snapshot_executions(
+                data["executions"],
+                expected_account,
+                execution_start,
+                execution_end,
+            )
+            return data
+        except BrokerSnapshotAccountMismatchError:
+            raise
+        except (KeyError, TypeError, ValueError) as exc:
+            self._snapshot_fail(generation, str(exc))
+        raise AssertionError("unreachable")
+
+    def _validate_snapshot_orders(self, orders: Any, account: str) -> None:
+        if not isinstance(orders, list):
+            raise ValueError("broker snapshot open orders are not a list")
+        keys = {
+            "account",
+            "broker_order_id",
+            "permanent_id",
+            "client_id",
+            "contract",
+            "side",
+            "status",
+            "order_type",
+            "time_in_force",
+            "total_quantity",
+            "filled_quantity",
+            "remaining_quantity",
+            "limit_price",
+            "stop_price",
+            "avg_fill_price",
+            "last_status_at",
+            "unavailable",
+        }
+        optional = {
+            "permanent_id",
+            "limit_price",
+            "stop_price",
+            "avg_fill_price",
+            "last_status_at",
+        }
+        seen: set[tuple[int, int]] = set()
+        for order in orders:
+            if not isinstance(order, dict) or set(order) != keys:
+                raise ValueError("broker snapshot open-order schema is invalid")
+            self._validate_unavailable(order, optional)
+            if order["account"] != account:
+                raise ValueError("broker snapshot order account is inconsistent")
+            order_id = self._strict_identifier(order["broker_order_id"], "broker order ID")
+            client_id = self._strict_identifier(order["client_id"], "client ID", allow_zero=True)
+            order_identity = (cast(int, client_id), cast(int, order_id))
+            if order_identity in seen:
+                raise ValueError("broker snapshot order identity is duplicated")
+            seen.add(order_identity)
+            self._strict_identifier(order["permanent_id"], "permanent ID", optional=True)
+            self._validate_snapshot_contract(order["contract"])
+            if order["side"] not in {"BUY", "SELL"}:
+                raise ValueError("broker snapshot order side is invalid")
+            for field_name in ("status", "order_type", "time_in_force"):
+                if not isinstance(order[field_name], str) or not order[field_name]:
+                    raise ValueError("broker snapshot order text evidence is missing")
+            total = self._strict_decimal(order["total_quantity"], "order total quantity")
+            filled = self._strict_decimal(order["filled_quantity"], "order filled quantity")
+            remaining = self._strict_decimal(
+                order["remaining_quantity"], "order remaining quantity"
+            )
+            if total <= 0 or filled < 0 or remaining < 0:
+                raise ValueError("broker snapshot order quantities are invalid")
+            if filled + remaining != total:
+                raise ValueError("broker snapshot order quantities are inconsistent")
+            for field_name in ("limit_price", "stop_price", "avg_fill_price"):
+                if order[field_name] is not None:
+                    if self._strict_decimal(order[field_name], field_name) <= 0:
+                        raise ValueError("broker snapshot order price evidence is not positive")
+            if order["last_status_at"] is not None:
+                self._strict_timestamp(order["last_status_at"], "last_status_at")
+
+    def _validate_snapshot_executions(
+        self,
+        executions: Any,
+        account: str,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> None:
+        if not isinstance(executions, list):
+            raise ValueError("broker snapshot executions are not a list")
+        keys = {
+            "account",
+            "execution_id",
+            "broker_order_id",
+            "permanent_id",
+            "client_id",
+            "contract",
+            "side",
+            "quantity",
+            "price",
+            "average_price",
+            "executed_at",
+            "execution_exchange",
+            "commission",
+            "commission_currency",
+            "realized_pnl",
+            "unavailable",
+        }
+        optional = {
+            "broker_order_id",
+            "permanent_id",
+            "commission",
+            "commission_currency",
+            "realized_pnl",
+        }
+        seen: set[str] = set()
+        for execution in executions:
+            if not isinstance(execution, dict) or set(execution) != keys:
+                raise ValueError("broker snapshot execution schema is invalid")
+            self._validate_unavailable(execution, optional)
+            if execution["account"] != account:
+                raise ValueError("broker snapshot execution account is inconsistent")
+            execution_id = execution["execution_id"]
+            if not isinstance(execution_id, str) or not execution_id or execution_id in seen:
+                raise ValueError("broker snapshot execution identity is invalid")
+            seen.add(execution_id)
+            self._strict_identifier(
+                execution["broker_order_id"], "execution order ID", optional=True
+            )
+            self._strict_identifier(
+                execution["permanent_id"], "execution permanent ID", optional=True
+            )
+            self._strict_identifier(execution["client_id"], "execution client ID", allow_zero=True)
+            self._validate_snapshot_contract(execution["contract"])
+            if execution["side"] not in {"BUY", "SELL"}:
+                raise ValueError("broker snapshot execution side is invalid")
+            for field_name in ("quantity", "price", "average_price"):
+                if self._strict_decimal(execution[field_name], field_name) <= 0:
+                    raise ValueError("broker snapshot execution numeric evidence is invalid")
+            executed_at = self._strict_timestamp(execution["executed_at"], "executed_at")
+            if executed_at < window_start or executed_at > window_end:
+                raise ValueError("broker snapshot execution timestamp is outside requested window")
+            if (
+                not isinstance(execution["execution_exchange"], str)
+                or not execution["execution_exchange"]
+            ):
+                raise ValueError("broker snapshot execution exchange is missing")
+            for field_name in ("commission", "realized_pnl"):
+                if execution[field_name] is not None:
+                    self._strict_decimal(execution[field_name], field_name)
+            if execution["commission_currency"] is not None and (
+                not isinstance(execution["commission_currency"], str)
+                or not execution["commission_currency"]
+            ):
+                raise ValueError("broker snapshot commission currency is invalid")
+
+    async def get_broker_snapshot(
+        self,
+        expected_account: str,
+        *,
+        max_age_seconds: float = 30.0,
+    ) -> dict:
+        """Return one strictly validated, read-only broker evidence snapshot."""
+        normalized_account = str(expected_account or "").strip()
+        if not normalized_account:
+            raise ValueError("Expected broker account is required")
+        if (
+            isinstance(max_age_seconds, bool)
+            or not isinstance(max_age_seconds, (int, float))
+            or not math.isfinite(float(max_age_seconds))
+            or max_age_seconds <= 0
+            or max_age_seconds > _BROKER_SNAPSHOT_MAX_AGE_SECONDS
+        ):
+            raise ValueError("Snapshot freshness bound must be finite and at most 300 seconds")
+        async with self._lifecycle_lock:
+            generation = self._generation
+            if generation is None:
+                raise SubprocessCrashError("Subprocess generation is unavailable")
+            try:
+                identity = self._require_snapshot_generation_binding(
+                    generation,
+                    poison_on_mismatch=False,
+                )
+                data = await self._execute_command_unlocked(
+                    {
+                        "command": "get_broker_snapshot",
+                        "params": {"expected_account": normalized_account},
+                    },
+                    timeout=30.0,
+                )
+                self._require_snapshot_generation_binding(
+                    generation,
+                    expected_identity=identity,
+                    poison_on_mismatch=True,
+                )
+                validated = self._validate_broker_snapshot(
+                    normalized_account,
+                    data,
+                    generation,
+                    float(max_age_seconds),
+                )
+                self._require_snapshot_generation_binding(
+                    generation,
+                    expected_identity=identity,
+                    poison_on_mismatch=True,
+                )
+                return validated
+            finally:
+                # Broker evidence must not leave diagnostic stderr artifacts on
+                # disk, whether validation succeeds or fails closed.
+                self._cleanup_worker_debug_log(generation, required=True)
 
     def _validate_historical_response(
         self,

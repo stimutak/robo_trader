@@ -274,7 +274,11 @@ class TestStaleRow:
         assert result.status is CheckStatus.BLOCK
         assert result.details["trading_days_elapsed"] == 5
         assert "trading days old" in result.message
-        assert "reconcile_positions.py" in result.remediation
+        assert "scripts/reconcile_broker_ledger.py" in result.remediation
+        assert "--portfolio-id <portfolio_id>" in result.remediation
+        assert "reconcile_positions.py" not in result.remediation
+        assert "--force" not in result.remediation
+        assert "authorize startup" in result.remediation
 
 
 class TestMultiPortfolio:
@@ -317,6 +321,8 @@ class TestSqliteError:
         assert result.status is CheckStatus.BLOCK
         assert "sqlite read error" in result.message
         assert "database is locked" in result.details["error"]
+        assert "--force" not in result.remediation
+        assert "does not authorize startup" in result.remediation
 
 
 class TestMalformedTimestamp:
@@ -331,6 +337,8 @@ class TestMalformedTimestamp:
         result = EquityHistoryFreshnessCheck().run(preflight_context)
         assert result.status is CheckStatus.BLOCK
         assert "could not parse" in result.message
+        assert "--force" not in result.remediation
+        assert "does not authorize startup" in result.remediation
 
 
 class TestCheckMetadata:
