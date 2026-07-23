@@ -10,6 +10,7 @@ import hmac
 import json
 import os
 import secrets
+import shutil
 import signal
 import subprocess
 import threading
@@ -5396,6 +5397,33 @@ def market_status():
     return jsonify(result)
 
 
+def _resolve_lsof_binary():
+    """Resolve lsof without relying on the reduced launchd/container PATH."""
+    discovered = shutil.which("lsof")
+    if discovered:
+        return str(Path(discovered).resolve())
+
+    macos_fallback = Path("/usr/sbin/lsof")
+    if macos_fallback.is_file() and os.access(macos_fallback, os.X_OK):
+        return str(macos_fallback)
+    return None
+
+
+def _lsof_has_state(lsof_binary, gateway_port, state):
+    """Return whether lsof found ``state`` or raise for an unusable diagnostic."""
+    result = subprocess.run(
+        [lsof_binary, "-nP", f"-iTCP:{gateway_port}", f"-sTCP:{state}"],
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+    if result.returncode == 0:
+        return state in result.stdout
+    if result.returncode == 1:
+        return False
+    raise RuntimeError(f"lsof exited with status {result.returncode}")
+
+
 def check_ibkr_connection():
     """
     Check the supervised paper Gateway connection using lsof (no zombies).
@@ -5413,42 +5441,39 @@ def check_ibkr_connection():
     IMPORTANT: Do NOT use socket.connect_ex() here - it creates zombie connections
     that block subsequent IBKR API handshakes!
     """
-    import subprocess
-
     gateway_healthy = False
     api_connected = False
-    status_msg = "Unknown"
+    diagnostic_available = True
+    diagnostic_error = None
     gateway_port = str(runtime_contract.ibkr_port)
+    lsof_binary = _resolve_lsof_binary()
 
-    # Check the contract Gateway port using lsof.
-    try:
-        result = subprocess.run(
-            ["lsof", "-nP", f"-iTCP:{gateway_port}", "-sTCP:LISTEN"],
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-        if result.returncode == 0 and "LISTEN" in result.stdout:
-            gateway_healthy = True
-    except Exception as e:
-        logger.debug(f"Gateway health check error: {e}")
+    if lsof_binary is None:
+        diagnostic_available = False
+        diagnostic_error = "lsof is unavailable"
+    else:
+        # Check the contract Gateway port using a non-connecting lsof probe.
+        try:
+            gateway_healthy = _lsof_has_state(lsof_binary, gateway_port, "LISTEN")
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            diagnostic_available = False
+            diagnostic_error = f"lsof listener probe failed: {exc}"
+            logger.warning(f"Gateway diagnostic unavailable: {exc}")
 
-    # Check for ESTABLISHED connections (actual API connections)
-    # This tells us if the runner currently has an active Gateway connection.
-    try:
-        result = subprocess.run(
-            ["lsof", "-nP", f"-iTCP:{gateway_port}", "-sTCP:ESTABLISHED"],
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-        if result.returncode == 0 and "ESTABLISHED" in result.stdout:
-            api_connected = True
-    except Exception as e:
-        logger.debug(f"API connection check error: {e}")
+        # An ESTABLISHED query is meaningful only when the listener diagnostic
+        # itself succeeded. This remains observational and opens no TCP socket.
+        if diagnostic_available:
+            try:
+                api_connected = _lsof_has_state(lsof_binary, gateway_port, "ESTABLISHED")
+            except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+                diagnostic_available = False
+                diagnostic_error = f"lsof API-session probe failed: {exc}"
+                logger.warning(f"Gateway API-session diagnostic unavailable: {exc}")
 
     # Determine status message - be clear about the distinction
-    if api_connected:
+    if not diagnostic_available:
+        status_msg = "Gateway diagnostic unavailable"
+    elif api_connected:
         status_msg = f"Gateway API connected (port {gateway_port})"
     elif gateway_healthy:
         status_msg = "Gateway available (no active API session)"
@@ -5463,6 +5488,8 @@ def check_ibkr_connection():
         "status": status_msg,
         "tws_running": False,  # Backwards-compatible field; TWS is unsupported.
         "gateway_running": gateway_healthy,  # Keep for backwards compat
+        "diagnostic_available": diagnostic_available,
+        "diagnostic_error": diagnostic_error,
     }
 
 
@@ -5530,6 +5557,7 @@ def status():
     ibkr_status_msg = ibkr_check.get("status", "Unknown")
     tws_running = ibkr_check.get("tws_running", False)
     gateway_running = ibkr_check.get("gateway_running", False)
+    gateway_diagnostic_available = ibkr_check.get("diagnostic_available", False)
 
     # Build clear status message based on actual connection state
     if not runner_running:
@@ -5556,10 +5584,16 @@ def status():
             "Gateway is available, but the dashboard cannot confirm "
             "an active runner API session"
         )
+    elif not gateway_diagnostic_available:
+        status_message = "⚠️ Market Open - Gateway status unavailable"
+        status_detail = (
+            "Runner is running, but the non-connecting lsof diagnostic is unavailable. "
+            "This does not establish that Gateway is down."
+        )
     else:
-        # Runner is running, market is open, but no Gateway/TWS
+        # Runner is running, market is open, but no supervised Gateway
         status_message = "⚠️ Market Open - No Gateway"
-        status_detail = "Runner is running but Gateway/TWS not detected. Check IBKR Gateway."
+        status_detail = "Runner is running but IB Gateway was not detected."
 
     # Get symbol count from user_settings.json
     symbols_count = 0

@@ -204,6 +204,12 @@ def load_runtime_contract_from_env(
             raise ConfigValidationError(
                 "Supervised paper runtime requires IBKR_ACCOUNT to identify the expected account."
             )
+        if not account.upper().startswith("DU"):
+            raise ConfigValidationError(
+                "Supervised paper runtime currently supports only IBKR paper account "
+                "identifiers with the DU prefix; live-format U accounts cannot "
+                "self-declare as paper."
+            )
         approved_accounts = {
             item.strip()
             for item in str(env.get("IBKR_APPROVED_ACCOUNTS", "")).split(",")

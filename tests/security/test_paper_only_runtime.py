@@ -116,6 +116,7 @@ def test_runtime_contract_fingerprint_excludes_full_account_number():
     ("overrides", "message"),
     [
         ({"IBKR_ACCOUNT": ""}, "requires IBKR_ACCOUNT"),
+        ({"IBKR_ACCOUNT": "U1234567", "IBKR_APPROVED_ACCOUNTS": "U1234567"}, "DU prefix"),
         ({"IBKR_APPROVED_ACCOUNTS": "DU7654321"}, "unapproved broker account"),
         ({"IBKR_ACCOUNT_TYPE": "live"}, "IBKR_ACCOUNT_TYPE=paper"),
         ({"RT_STATE_NAMESPACE": "live"}, "must match EXECUTION_MODE"),
@@ -184,18 +185,62 @@ def test_production_preset_remains_paper_and_readonly(monkeypatch):
     assert config.ibkr.port == 4002
 
 
-def test_authoritative_launcher_fails_if_ibc_config_is_missing_before_process_kill():
+def test_authoritative_launcher_validates_ibc_and_preflight_before_process_kill():
     source = (ROOT / "START_TRADER.sh").read_text()
     missing_guard = source.index('if [ ! -f "$IBC_INI" ]')
+    preflight_gate = source.index('case "$PREFLIGHT_RC" in')
     first_process_kill = source.index('pkill -9 -f "runner_async"')
 
     assert missing_guard < first_process_kill
+    assert preflight_gate < first_process_kill
     assert 'export EXECUTION_MODE="paper"' in source
     assert 'export IBKR_READONLY="true"' in source
     assert 'ENV_IBKR_PORT=$(grep "^IBKR_PORT="' in source
     assert "sed 's/[[:space:]]*#.*$//'" in source
     assert "supervised paper remediation requires IB Gateway port 4002" in source
     assert "4002|7497" not in source
+
+
+@pytest.mark.parametrize(
+    ("config_text", "accepted"),
+    [
+        ("ReadOnlyApi=yes\nTradingMode=paper\n", True),
+        (" readonlyapi = YES \n tradingmode = PAPER \n", True),
+        ("TradingMode=paper\n", False),
+        ("ReadOnlyApi=yes\n", False),
+        ("ReadOnlyApi=no\nTradingMode=paper\n", False),
+        ("ReadOnlyApi=yes\nTradingMode=live\n", False),
+        ("ReadOnlyApi=yes\nReadOnlyApi=yes\nTradingMode=paper\n", False),
+        ("ReadOnlyApi=yes\nReadOnlyApi=no\nTradingMode=paper\n", False),
+        ("ReadOnlyApi=yes\nTradingMode=paper\nTradingMode=paper\n", False),
+        ("ReadOnlyApi=yes\nTradingMode=paper\nTradingMode=live\n", False),
+    ],
+)
+def test_authoritative_launcher_requires_unambiguous_ibc_safety_settings(
+    tmp_path, config_text, accepted
+):
+    source = (ROOT / "START_TRADER.sh").read_text()
+    function_source = (
+        "validate_ibc_safety_config() {"
+        + source.split("validate_ibc_safety_config() {", 1)[1].split("\n}\n\n# SECURITY:", 1)[0]
+        + "\n}\n"
+    )
+    config_path = tmp_path / "config.ini"
+    config_path.write_text(config_text)
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'{function_source}\nvalidate_ibc_safety_config "$1"',
+            "bash",
+            str(config_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert (result.returncode == 0) is accepted, result.stdout + result.stderr
 
 
 def test_authoritative_launcher_normalizes_commented_port(tmp_path):
@@ -297,11 +342,14 @@ def test_other_legacy_process_launchers_are_inert(relative_path):
 def test_gateway_launchers_reject_live_mode_before_side_effects():
     shell_script = ROOT / "scripts" / "start_gateway.sh"
     result = subprocess.run(
-        [str(shell_script), "live"], capture_output=True, text=True, check=False
+        ["bash", str(shell_script), "live"],
+        capture_output=True,
+        text=True,
+        check=False,
     )
 
     assert result.returncode == 2
-    assert "disabled during remediation" in result.stderr
+    assert "DISABLED" in result.stderr
 
     import scripts.gateway_manager as gateway_manager
 

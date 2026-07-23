@@ -220,6 +220,47 @@ def test_security_headers_present_on_json_endpoint(monkeypatch):
     assert "frame-ancestors 'none'" in resp.headers.get("Content-Security-Policy", "")
 
 
+def test_gateway_diagnostic_uses_resolved_absolute_lsof(monkeypatch):
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    monkeypatch.setattr(app_mod, "_resolve_lsof_binary", lambda: "/usr/sbin/lsof")
+    probes = [
+        MagicMock(
+            returncode=0,
+            stdout="java 123 trader TCP *:4002 (LISTEN)\n",
+            stderr="",
+        ),
+        MagicMock(
+            returncode=0,
+            stdout="python3 456 trader TCP 127.0.0.1:4002 (ESTABLISHED)\n",
+            stderr="",
+        ),
+    ]
+
+    with patch.object(app_mod.subprocess, "run", side_effect=probes) as run:
+        status = app_mod.check_ibkr_connection()
+
+    assert status["diagnostic_available"] is True
+    assert status["gateway_available"] is True
+    assert status["api_connected"] is True
+    assert len(run.call_args_list) == 2
+    assert all(call.args[0][0] == "/usr/sbin/lsof" for call in run.call_args_list)
+
+
+def test_missing_lsof_is_reported_as_unavailable_not_gateway_down(monkeypatch):
+    app_mod = _reload_app(monkeypatch, DASH_AUTH_ENABLED="false")
+    monkeypatch.setattr(app_mod, "_resolve_lsof_binary", lambda: None)
+
+    with patch.object(app_mod.subprocess, "run") as run:
+        status = app_mod.check_ibkr_connection()
+
+    run.assert_not_called()
+    assert status["diagnostic_available"] is False
+    assert status["gateway_available"] is False
+    assert status["api_connected"] is False
+    assert status["status"] == "Gateway diagnostic unavailable"
+    assert status["diagnostic_error"] == "lsof is unavailable"
+
+
 # ---------------------------------------------------------------------------
 # W-R2-M2: Origin allowlist must NOT trust inbound Host header.
 # ---------------------------------------------------------------------------

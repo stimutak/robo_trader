@@ -76,11 +76,8 @@ def test_start_trader_checks_readonly():
     assert (
         "ReadOnlyApi=yes" in text
     ), "START_TRADER.sh must reference 'ReadOnlyApi=yes' for the safety check."
-    # NEW-IB-H1.1: The check must be the anchored, case-insensitive grep -E
-    # variant. The bare '^ReadOnlyApi=yes' grep is fragile (matches yesno,
-    # rejects 'Yes'). We require the new form.
-    assert "grep -Eqi" in text and "readonlyapi" in text.lower(), (
-        "START_TRADER.sh must use the anchored, case-insensitive ReadOnlyApi grep " "(NEW-IB-H1.1)."
+    assert "validate_ibc_safety_config" in text and "readonlyapi" in text.lower(), (
+        "START_TRADER.sh must normalize and cardinality-check ReadOnlyApi " "(NEW-IB-H1.1)."
     )
     assert "exit 4" in text, (
         "START_TRADER.sh must exit non-zero (audit prescribes 4) when the "
@@ -95,12 +92,14 @@ def test_start_gateway_script_checks_readonly():
     assert script_path.exists()
 
     text = script_path.read_text()
+    is_quarantined = "DISABLED:" in text and "exit 2" in text
     # NEW-IB-H1.1: anchored, case-insensitive grep.
-    assert "grep -Eqi" in text and "readonlyapi" in text.lower(), (
-        "scripts/start_gateway.sh must verify ReadOnlyApi=yes via anchored, "
-        "case-insensitive grep (NEW-IB-H1.1)."
+    has_readonly_guard = "grep -Eqi" in text and "readonlyapi" in text.lower()
+    assert is_quarantined or has_readonly_guard, (
+        "scripts/start_gateway.sh must be inert or verify ReadOnlyApi=yes via "
+        "anchored, case-insensitive grep (NEW-IB-H1.1)."
     )
-    assert "exit 3" in text, "scripts/start_gateway.sh must exit non-zero on failed safety check."
+    assert ("exit 2" in text) if is_quarantined else ("exit 3" in text)
 
 
 # ---------------------------------------------------------------------------
@@ -113,12 +112,13 @@ def test_start_gateway_chmod_and_umask():
     created config.ini and set a restrictive umask (audit IB-L2)."""
     script_path = PROJECT_ROOT / "scripts" / "start_gateway.sh"
     text = script_path.read_text()
+    is_quarantined = "DISABLED:" in text and "exit 2" in text
 
-    assert "umask 077" in text, (
+    assert is_quarantined or "umask 077" in text, (
         "scripts/start_gateway.sh must set 'umask 077' to keep credential "
         "files group/other-readable-proof."
     )
-    assert 'chmod 600 "$IBC_INI"' in text, (
+    assert is_quarantined or 'chmod 600 "$IBC_INI"' in text, (
         "scripts/start_gateway.sh must chmod 600 the freshly-created "
         "IBC config (it contains plaintext IBKR credentials)."
     )
@@ -526,11 +526,76 @@ def test_gateway_manager_start_refuses_without_readonly_ibn_h1():
 
     source = inspect.getsource(gm.start_gateway)
     assert (
-        "_READONLY_API_RE" in source
-    ), "start_gateway must reference _READONLY_API_RE before launching the Gateway"
+        "_ibc_safety_file_error" in source
+    ), "start_gateway must validate the complete IBC safety contract before launching Gateway"
     # It's the same regex used by show_status, so cross-check it works.
     assert gm._READONLY_API_RE.search("ReadOnlyApi=yes") is not None
     assert gm._READONLY_API_RE.search("ReadOnlyApi=no") is None
+
+
+@pytest.mark.parametrize(
+    ("config_text", "accepted"),
+    [
+        ("ReadOnlyApi=yes\nTradingMode=paper\n", True),
+        (" readonlyapi = YES \n tradingmode = PAPER \n", True),
+        ("TradingMode=paper\n", False),
+        ("ReadOnlyApi=yes\n", False),
+        ("ReadOnlyApi=no\nTradingMode=paper\n", False),
+        ("ReadOnlyApi=yes\nTradingMode=live\n", False),
+        ("ReadOnlyApi=yes\nReadOnlyApi=yes\nTradingMode=paper\n", False),
+        ("ReadOnlyApi=yes\nReadOnlyApi=no\nTradingMode=paper\n", False),
+        ("ReadOnlyApi=yes\nTradingMode=paper\nTradingMode=paper\n", False),
+        ("ReadOnlyApi=yes\nTradingMode=paper\nTradingMode=live\n", False),
+    ],
+)
+def test_gateway_manager_requires_unambiguous_ibc_safety_settings(config_text, accepted):
+    import scripts.gateway_manager as gm
+
+    assert (gm._ibc_safety_config_error(config_text) is None) is accepted
+
+
+def test_gateway_manager_restart_validates_before_stopping_gateway(monkeypatch, tmp_path):
+    import scripts.gateway_manager as gm
+
+    unsafe_config = tmp_path / "config.ini"
+    unsafe_config.write_text(
+        "ReadOnlyApi=yes\nReadOnlyApi=no\nTradingMode=paper\n",
+        encoding="utf-8",
+    )
+    stopped = False
+
+    def record_stop():
+        nonlocal stopped
+        stopped = True
+        return True
+
+    monkeypatch.setattr(gm, "IBC_CONFIG", unsafe_config)
+    monkeypatch.setattr(gm, "stop_gateway", record_stop)
+
+    assert gm.restart_gateway("paper") is False
+    assert stopped is False
+
+
+def test_gateway_manager_start_validates_before_running_gateway_shortcut(monkeypatch, tmp_path):
+    import scripts.gateway_manager as gm
+
+    unsafe_config = tmp_path / "config.ini"
+    unsafe_config.write_text(
+        "ReadOnlyApi=yes\nTradingMode=paper\nTradingMode=live\n",
+        encoding="utf-8",
+    )
+    process_checked = False
+
+    def record_process_check():
+        nonlocal process_checked
+        process_checked = True
+        return True
+
+    monkeypatch.setattr(gm, "IBC_CONFIG", unsafe_config)
+    monkeypatch.setattr(gm, "is_gateway_running", record_process_check)
+
+    assert gm.start_gateway("paper") is False
+    assert process_checked is False
 
 
 def test_gateway_manager_start_uses_env_allowlist_ibn_h2():

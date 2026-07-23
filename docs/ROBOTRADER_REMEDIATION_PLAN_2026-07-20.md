@@ -1,9 +1,13 @@
 # RoboTrader Remediation and Launch Plan
 
 Document date: 2026-07-20
-Status: Proposed execution plan
+Status: Active execution plan
 Source baseline: repository audit at commit `51f0e99` on branch `main`
 Target: safe supervised paper operation first, then remote read-only access, then an explicitly gated limited live canary
+
+Current execution baseline (2026-07-23): `main` includes the truthful Phase 0
+CI gates from PR #83 (`7f5de0a`) and runtime-stability fixes from PR #81
+(`b7e5005`). PR #82 is the active PR 1 containment change.
 
 ## 1. Purpose
 
@@ -879,7 +883,19 @@ Use these identifiers in issues and PR descriptions.
 
 Update after each merge.
 
-- PR 1: Implemented locally on 2026-07-20; 930 tests passed; pending review/commit
+- Phase 0 CI truth gate: PR #83 merged on 2026-07-23 (`7f5de0a`)
+- Phase 0 runtime-stability prerequisite: PR #81 merged on 2026-07-23 (`b7e5005`)
+- PR 1: PR #82 is implementation-complete locally and awaiting hosted merge
+  gates. Local evidence on 2026-07-23: 1,020 passed, 5 skipped, 42% total
+  coverage; Black, isort, Flake8, Bandit, pip integrity, shell syntax, YAML
+  parsing, and diff checks passed. Two Docker Compose render tests were skipped
+  because Docker is unavailable on the local Mac and must pass in hosted CI.
+  A two-phase review examined 11 findings: nine were confirmed and remediated,
+  one dashboard `lsof` diagnostic was downgraded and remediated, and
+  `RT_STATE_NAMESPACE` file-path isolation was safely deferred because changing
+  the legacy paper kill-switch path could bypass the currently triggered state.
+  The active runner already rejects backtest mode; separate non-paper safety
+  state remains required before that mode may use shared risk components.
 - PR 2: Not started
 - PR 3: Not started
 - PR 4: Not started

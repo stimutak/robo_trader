@@ -34,15 +34,14 @@ import time
 from pathlib import Path
 from typing import Optional, Tuple
 
-# NEW-IB-H1.1: Anchored, case-insensitive ReadOnlyApi=yes detector.
-# Mirrors the bash regex used in START_TRADER.sh and scripts/start_gateway.sh.
-# MULTILINE so `^`/`$` anchor each line; IGNORECASE so 'ReadOnlyApi=Yes' and
-# 'readonlyapi=YES' both match (IBC honors them); end-anchor prevents
-# 'ReadOnlyApi=yesno' from masquerading as the safety setting.
+# NEW-IB-H1.1 compatibility detector retained for focused regex regression
+# tests. Gateway lifecycle decisions use _ibc_safety_config_error below so
+# duplicate or conflicting assignments cannot pass merely because one is good.
 _READONLY_API_RE = re.compile(
     r"^[ \t]*readonlyapi[ \t]*=[ \t]*yes[ \t]*$",
     re.IGNORECASE | re.MULTILINE,
 )
+_IBC_ASSIGNMENT_RE = re.compile(r"^([^=]+)=(.*)$")
 
 # Determine paths based on platform
 PLATFORM = platform.system()  # 'Darwin' for macOS, 'Windows' for Windows
@@ -76,6 +75,51 @@ else:
 # API ports
 PAPER_PORT = 4002
 LIVE_PORT = 4001
+
+
+def _ibc_safety_config_error(config_text: str) -> Optional[str]:
+    """Return a fail-closed error for an ambiguous IBC safety configuration."""
+    assignments: dict[str, list[str]] = {}
+    for raw_line in config_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        match = _IBC_ASSIGNMENT_RE.fullmatch(line)
+        if match is None:
+            continue
+        key = match.group(1).strip().casefold()
+        value = match.group(2).strip().casefold()
+        assignments.setdefault(key, []).append(value)
+
+    requirements = (
+        ("readonlyapi", "ReadOnlyApi", "yes"),
+        ("tradingmode", "TradingMode", "paper"),
+    )
+    errors = []
+    for normalized_key, display_key, expected_value in requirements:
+        values = assignments.get(normalized_key, [])
+        if len(values) != 1 or values[0] != expected_value:
+            errors.append(
+                f"exactly one active {display_key}={expected_value} assignment is "
+                f"required; found {len(values)} {display_key} assignment(s)"
+            )
+    return "; ".join(errors) if errors else None
+
+
+def _ibc_safety_file_error(config_path: Optional[Path] = None) -> Optional[str]:
+    """Read and validate the active IBC configuration without leaking it."""
+    if config_path is None:
+        config_path = IBC_CONFIG
+    if not config_path.exists():
+        return f"IBC config not found at {config_path}"
+    try:
+        config_text = config_path.read_text()
+    except OSError as exc:
+        return f"cannot read IBC config {config_path}: {exc}"
+    config_error = _ibc_safety_config_error(config_text)
+    if config_error:
+        return f"invalid IBC paper/read-only configuration: {config_error}"
+    return None
 
 
 def find_gateway_version() -> Optional[str]:
@@ -213,6 +257,11 @@ def start_gateway(trading_mode: str = "paper", version: Optional[str] = None) ->
     print(f"Starting IB Gateway ({trading_mode} mode)")
     print(f"{'='*60}\n")
 
+    config_error = _ibc_safety_file_error()
+    if config_error:
+        print(f"ERROR: {config_error}. Refusing to start Gateway.")
+        return False
+
     # Check if already running
     if is_gateway_running():
         print("Gateway is already running.")
@@ -237,29 +286,6 @@ def start_gateway(trading_mode: str = "paper", version: Optional[str] = None) ->
 
     # Ensure IBC directories exist
     IBC_LOGS.mkdir(parents=True, exist_ok=True)
-
-    # Check IBC config
-    if not IBC_CONFIG.exists():
-        print(f"ERROR: IBC config not found at {IBC_CONFIG}")
-        print("Run: python3 scripts/gateway_manager.py setup")
-        return False
-
-    # IBN-H1 (followup audit): refuse to start the Gateway unless the IBC config
-    # has ReadOnlyApi=yes. Without this check, a misconfigured config silently
-    # opens an order-placing API. Use the same anchored case-insensitive regex
-    # as the rest of the codebase (NEW-IB-H1.1).
-    try:
-        config_text = IBC_CONFIG.read_text()
-    except OSError as exc:
-        print(f"ERROR: cannot read IBC config {IBC_CONFIG}: {exc}")
-        return False
-    if not _READONLY_API_RE.search(config_text):
-        print(
-            "ERROR: IBC config does not enforce ReadOnlyApi=yes. Refusing to "
-            "start Gateway. Set 'ReadOnlyApi=yes' in "
-            f"{IBC_CONFIG} before retrying."
-        )
-        return False
 
     # Build environment
     # IBN-H2 (followup audit): full os.environ.copy() propagates ALL parent-process
@@ -406,6 +432,10 @@ def restart_gateway(trading_mode: str = "paper") -> bool:
     if trading_mode != "paper":
         print("ERROR: live Gateway restart is disabled during remediation.")
         return False
+    config_error = _ibc_safety_file_error()
+    if config_error:
+        print(f"ERROR: {config_error}. Refusing to restart Gateway.")
+        return False
     print("\n" + "=" * 60)
     print("Restarting IB Gateway")
     print("=" * 60 + "\n")
@@ -462,26 +492,17 @@ def show_status():
     print(f"\nIBC Config: {IBC_CONFIG}")
     print(f"IBC Config Exists: {IBC_CONFIG.exists()}")
 
-    # SECURITY: Verify Gateway-side read-only enforcement.
-    # RoboTrader relies on IBC's ReadOnlyApi=yes to prevent any client
-    # (including buggy code) from placing orders against the Gateway.
+    # Report the same cardinality-aware safety contract used by start/restart.
     if IBC_CONFIG.exists():
         try:
             config_text = IBC_CONFIG.read_text(errors="replace")
-            # NEW-IB-H1.1: Use the anchored, case-insensitive regex (same as
-            # the bash grep) so 'ReadOnlyApi=Yes' is accepted and
-            # 'ReadOnlyApi=yesno' is rejected.
-            has_readonly = bool(_READONLY_API_RE.search(config_text))
-            if has_readonly:
-                print("ReadOnlyApi: yes (Gateway will reject order placement)")
+            config_error = _ibc_safety_config_error(config_text)
+            if config_error is None:
+                print("IBC Safety: ReadOnlyApi=yes, TradingMode=paper (unambiguous)")
             else:
-                print(
-                    "ReadOnlyApi: WARNING - not set to 'yes'. "
-                    "Gateway may accept order placement from any API client. "
-                    "Set 'ReadOnlyApi=yes' in the config to enforce read-only safety."
-                )
+                print(f"IBC Safety: INVALID - {config_error}")
         except Exception as e:
-            print(f"ReadOnlyApi: WARNING - could not read config: {e}")
+            print(f"IBC Safety: WARNING - could not read config: {e}")
 
     # Gateway version
     version = find_gateway_version()

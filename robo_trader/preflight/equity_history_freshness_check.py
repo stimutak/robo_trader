@@ -1,6 +1,6 @@
 """G2 — EquityHistoryFreshnessCheck.
 
-Verifies that ``trading_data.db`` has a recent ``equity_history`` row.
+Verifies that the configured trading ledger has a recent ``equity_history`` row.
 Equity snapshots are written at end-of-day for every active portfolio.
 A row that is more than 1 *trading day* old means the system did not
 complete its last expected EOD cycle — usually a sign of an unclean
@@ -18,7 +18,7 @@ Decision matrix (spec §7.3)
 ======================================  ======  =================================
 condition                               result  rationale
 ======================================  ======  =================================
-``trading_data.db`` missing             BLOCK   system unconfigured
+configured trading ledger missing      BLOCK   system unconfigured
 empty ``equity_history`` table          WARN    first-run; not a livelock
                                                 (per Q11.1 design decision)
 MAX(timestamp) within 1 trading day     PASS    normal startup
@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from robo_trader.market_hours import count_trading_days
@@ -77,17 +78,23 @@ class EquityHistoryFreshnessCheck:
     timeout_seconds = 3.0
 
     def run(self, context: PreflightContext) -> CheckResult:
-        db_path = context.project_root / "trading_data.db"
+        configured_path = Path(context.env.get("RT_DB_PATH", "trading_data.db"))
+        db_path = (
+            configured_path
+            if configured_path.is_absolute()
+            else context.project_root / configured_path
+        )
 
         if not db_path.exists():
             return CheckResult(
                 name=self.name,
                 status=CheckStatus.BLOCK,
-                message=f"trading_data.db not found at {db_path}",
+                message=f"configured trading database not found at {db_path}",
                 remediation=(
-                    "The trading database is missing. This usually means the system "
-                    "has never been started or the data directory was wiped. Run "
-                    "./START_TRADER.sh to initialize, then re-run preflight."
+                    f"Verify RT_DB_PATH and restore the expected ledger at {db_path} "
+                    "from a verified backup if it is missing. Do not create or replace "
+                    "the ledger merely to pass preflight; re-run the check after the "
+                    "configured ledger is available."
                 ),
                 details={"db_path": str(db_path)},
             )
@@ -98,13 +105,13 @@ class EquityHistoryFreshnessCheck:
             return CheckResult(
                 name=self.name,
                 status=CheckStatus.BLOCK,
-                message=f"sqlite read error: {exc}",
+                message=f"sqlite read error for {db_path}: {exc}",
                 remediation=(
-                    "Could not read equity_history from trading_data.db. The DB may "
-                    "be locked, corrupted, or schema-mismatched. Try "
-                    "`sqlite3 trading_data.db 'PRAGMA integrity_check;'`. If this "
-                    "is a known-good transient (e.g. another process is writing), "
-                    "wait and re-run; otherwise `--force` after investigating."
+                    f"Could not read equity_history from {db_path}. The ledger may be "
+                    "locked, corrupted, or schema-mismatched. Inspect that exact file "
+                    "with read-only SQLite tooling. If this is a known-good transient "
+                    "(for example, another process is writing), wait and re-run; "
+                    "otherwise use `--force` only after investigating."
                 ),
                 details={"db_path": str(db_path), "error": str(exc)},
             )
@@ -114,28 +121,33 @@ class EquityHistoryFreshnessCheck:
             return CheckResult(
                 name=self.name,
                 status=CheckStatus.WARN,
-                message="equity_history is empty (first-run portfolio)",
+                message=f"equity_history is empty in {db_path} (first-run portfolio)",
                 remediation=(
-                    "No equity snapshots have been written yet. This is normal for "
-                    "a brand-new install or a newly-created portfolio. The first "
-                    "successful EOD cycle will populate this table. Not blocking; "
-                    "verify positions manually if you weren't expecting an empty "
-                    "history."
+                    f"No equity snapshots have been written to {db_path}. This is "
+                    "normal for a brand-new install or a newly-created portfolio. "
+                    "The first successful EOD cycle will populate this table. Not "
+                    "blocking; verify positions manually if you weren't expecting "
+                    "an empty history."
                 ),
                 details={"db_path": str(db_path), "row_count": 0},
             )
 
         max_ts = _parse_sqlite_timestamp(max_ts_raw)
         if max_ts is None:
+            timestamp_repr = repr(max_ts_raw)
             return CheckResult(
                 name=self.name,
                 status=CheckStatus.BLOCK,
-                message=f"could not parse equity_history MAX(timestamp)={max_ts_raw!r}",
+                message=(
+                    f"could not parse equity_history MAX(timestamp)="
+                    f"{timestamp_repr} in {db_path}"
+                ),
                 remediation=(
-                    "The most recent equity_history row has a timestamp that "
-                    "doesn't match the expected SQLite CURRENT_TIMESTAMP format. "
-                    "The DB schema may be out of date. Run any pending migrations, "
-                    "or `--force` if you've confirmed positions match IBKR."
+                    f"The most recent equity_history row in {db_path} has a timestamp "
+                    "that doesn't match the expected SQLite CURRENT_TIMESTAMP format. "
+                    "Inspect the configured ledger and any pending migrations without "
+                    "rewriting history, or use `--force` if you've confirmed positions "
+                    "match IBKR."
                 ),
                 details={"db_path": str(db_path), "raw_timestamp": max_ts_raw},
             )
@@ -154,7 +166,7 @@ class EquityHistoryFreshnessCheck:
                 name=self.name,
                 status=CheckStatus.PASS,
                 message=(
-                    f"latest equity row at {max_ts_raw} "
+                    f"latest equity row in {db_path} at {max_ts_raw} "
                     f"({trading_days_elapsed} trading day(s) ago)"
                 ),
                 details=details,
@@ -164,12 +176,13 @@ class EquityHistoryFreshnessCheck:
             name=self.name,
             status=CheckStatus.BLOCK,
             message=(
-                f"latest equity row at {max_ts_raw} is " f"{trading_days_elapsed} trading days old"
+                f"latest equity row in {db_path} at {max_ts_raw} is "
+                f"{trading_days_elapsed} trading days old"
             ),
             remediation=(
-                f"Last equity row is {trading_days_elapsed} trading days old. "
-                "This usually means a prior session died without writing a "
-                "snapshot. Verify positions match IBKR "
+                f"The last equity row in {db_path} is {trading_days_elapsed} trading "
+                "days old. This usually means a prior session died without writing "
+                "a snapshot. Verify positions match IBKR "
                 "(`scripts/reconcile_positions.py`) before resuming, or `--force` "
                 "if you've already confirmed."
             ),
@@ -177,7 +190,7 @@ class EquityHistoryFreshnessCheck:
         )
 
     @staticmethod
-    def _query_max_timestamp(db_path) -> Optional[str]:
+    def _query_max_timestamp(db_path: Path) -> Optional[str]:
         """Return the freshest ``timestamp`` across all portfolios, or None if empty.
 
         Opens the DB read-only via the ``file:...?mode=ro`` URI so the check

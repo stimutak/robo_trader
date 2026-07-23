@@ -1,7 +1,13 @@
 """Static regression tests for CI and unsupported container containment."""
 
+import json
+import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -13,6 +19,50 @@ def _workflow(path: str) -> dict:
 
 def _job_environment(workflow: dict, job_name: str) -> dict:
     return workflow["jobs"][job_name]["env"]
+
+
+def _render_compose(relative_path: str) -> dict:
+    if shutil.which("docker") is None:
+        pytest.skip("Docker Compose is unavailable on this test host")
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "ENVIRONMENT": "test",
+            "IBKR_HOST": "127.0.0.1",
+            "IBKR_CLIENT_ID": "321",
+            "IBKR_ACCOUNT": "DU_RENDER_PAPER",
+            "IBKR_APPROVED_ACCOUNTS": "DU_RENDER_PAPER",
+            "RT_STATE_NAMESPACE": "paper",
+            "RT_DB_PATH": "/app/data/render-paper.db",
+            "MODEL_ARTIFACT_SET": "render-paper-models",
+            "BUILD_ID": "compose-render-test",
+            "GRAFANA_PASSWORD": "render-only",
+        }
+    )
+    result = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "--env-file",
+            "/dev/null",
+            "--profile",
+            "unsupported-trader",
+            "-f",
+            relative_path,
+            "config",
+            "--format",
+            "json",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
 
 
 def test_ci_test_job_uses_supervised_paper_gateway_contract():
@@ -74,6 +124,83 @@ def test_compose_traders_are_opt_in_inert_services():
         assert env["TRADING_MODE"] == "paper"
         assert env["IBKR_READONLY"] == "true"
         assert "4002" in env["IBKR_PORT"]
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    ["docker-compose.yml", "deployment/docker-compose.prod.yml"],
+)
+def test_compose_dashboard_requires_operator_paper_runtime_identity(relative_path):
+    source = (ROOT / relative_path).read_text()
+    for name in (
+        "ENVIRONMENT",
+        "IBKR_HOST",
+        "IBKR_CLIENT_ID",
+        "IBKR_ACCOUNT",
+        "IBKR_APPROVED_ACCOUNTS",
+        "RT_STATE_NAMESPACE",
+        "RT_DB_PATH",
+        "MODEL_ARTIFACT_SET",
+        "BUILD_ID",
+    ):
+        assert f"${{{name}:?" in source
+
+    assert "${IBKR_ACCOUNT:-" not in source
+    assert "${IBKR_APPROVED_ACCOUNTS:-" not in source
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    ["docker-compose.yml", "deployment/docker-compose.prod.yml"],
+)
+def test_rendered_compose_dashboard_has_paper_runtime_identity(relative_path):
+    dashboard = _render_compose(relative_path)["services"]["dashboard"]
+    env = dashboard["environment"]
+    assert env["EXECUTION_MODE"] == "paper"
+    assert env["TRADING_MODE"] == "paper"
+    assert env["IBKR_PORT"] == "4002"
+    assert env["IBKR_READONLY"] == "true"
+    assert env["IBKR_ACCOUNT"] == "DU_RENDER_PAPER"
+    assert env["IBKR_APPROVED_ACCOUNTS"] == "DU_RENDER_PAPER"
+    assert env["IBKR_ACCOUNT_TYPE"] == "paper"
+    assert env["RT_STATE_NAMESPACE"] == "paper"
+    assert env["RT_DB_PATH"] == "/app/data/render-paper.db"
+    assert env["MODEL_ARTIFACT_SET"] == "render-paper-models"
+    assert env["BUILD_ID"] == "compose-render-test"
+
+
+def test_alternate_gateway_and_monitor_launchers_are_inert():
+    gateway_script = ROOT / "scripts" / "start_gateway.sh"
+    gateway_result = subprocess.run(
+        [str(gateway_script)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert gateway_result.returncode == 2
+    assert "DISABLED" in gateway_result.stderr
+    assert "./START_TRADER.sh" in gateway_result.stderr
+    gateway_source = gateway_script.read_text()
+    assert "gatewaystartmacos" not in gateway_source
+    assert "nc -z" not in gateway_source
+    assert "pkill" not in gateway_source
+
+    monitor_script = ROOT / "scripts" / "utilities" / "ibkr_connection_monitor.py"
+    monitor_result = subprocess.run(
+        [sys.executable, str(monitor_script)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert monitor_result.returncode == 2
+    assert "DISABLED" in monitor_result.stderr
+    assert "./START_TRADER.sh" in monitor_result.stderr
+    monitor_source = monitor_script.read_text()
+    assert "runner_async" not in monitor_source
+    assert "connectAsync" not in monitor_source
+    assert "pkill" not in monitor_source
 
 
 def test_kubernetes_trader_is_scaled_to_zero_and_inert():

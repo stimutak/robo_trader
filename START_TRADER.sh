@@ -80,26 +80,89 @@ echo "RoboTrader Startup Script"
 echo "=========================================="
 echo ""
 
+validate_ibc_safety_config() {
+    local config_path="$1"
+    local counts
+    local readonly_count
+    local readonly_valid
+    local trading_mode_count
+    local trading_mode_valid
+
+    # Count every active assignment for each safety-critical key, not merely
+    # the expected value. This rejects duplicate-good and good-plus-conflicting
+    # entries instead of relying on whichever duplicate IBC happens to honor.
+    counts=$(awk '
+        function trim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            return value
+        }
+        BEGIN {
+            readonly_count = 0
+            readonly_valid = 0
+            trading_mode_count = 0
+            trading_mode_valid = 0
+        }
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            if (line ~ /^[[:space:]]*([#;]|$)/) {
+                next
+            }
+            separator = index(line, "=")
+            if (separator == 0) {
+                next
+            }
+            key = tolower(trim(substr(line, 1, separator - 1)))
+            value = tolower(trim(substr(line, separator + 1)))
+            if (key == "readonlyapi") {
+                readonly_count++
+                if (value == "yes") {
+                    readonly_valid++
+                }
+            } else if (key == "tradingmode") {
+                trading_mode_count++
+                if (value == "paper") {
+                    trading_mode_valid++
+                }
+            }
+        }
+        END {
+            print readonly_count, readonly_valid, trading_mode_count, trading_mode_valid
+        }
+    ' "$config_path") || return 1
+
+    read -r readonly_count readonly_valid trading_mode_count trading_mode_valid <<< "$counts"
+    if [ "$readonly_count" -ne 1 ] || [ "$readonly_valid" -ne 1 ]; then
+        echo "IBC config must contain exactly one active ReadOnlyApi=yes assignment; found ${readonly_count:-0} ReadOnlyApi assignment(s)."
+        return 1
+    fi
+    if [ "$trading_mode_count" -ne 1 ] || [ "$trading_mode_valid" -ne 1 ]; then
+        echo "IBC config must contain exactly one active TradingMode=paper assignment; found ${trading_mode_count:-0} TradingMode assignment(s)."
+        return 1
+    fi
+}
+
 # SECURITY: Verify Gateway-side read-only enforcement is configured.
 # RoboTrader relies on IBC's ReadOnlyApi=yes as a primary safety net against
 # any code path (intentional or accidental) that might attempt to submit
 # live orders. If the active config has been modified to permit writes, abort.
 IBC_INI="${SCRIPT_DIR}/config/ibc/config.ini"
-# NEW-IB-H1.1: Use anchored, case-insensitive regex with end-anchor.
-# - Old grep ('^ReadOnlyApi=yes') matched 'ReadOnlyApi=yesno' (no end anchor)
-#   and rejected 'ReadOnlyApi=Yes' (case-sensitive) even though IBC honors it.
-# - The -E + -i flags + start/end anchors + tolerated whitespace fix all three.
+# Normalize key/value case and whitespace, then require exactly one active
+# assignment for each safety setting. A duplicate expected value is ambiguous
+# just like an explicitly conflicting value, so both fail closed.
 if [ ! -f "$IBC_INI" ]; then
     echo "FATAL: IBC config not found." >&2
     echo "       File: $IBC_INI" >&2
     echo "       Copy config/ibc/config.ini.template and configure the paper account first." >&2
     exit 4
 fi
-if ! grep -Eqi '^[[:space:]]*readonlyapi[[:space:]]*=[[:space:]]*yes[[:space:]]*$' "$IBC_INI"; then
-    echo "FATAL: IBC config has ReadOnlyApi != yes." >&2
-    echo "       RoboTrader requires Gateway-side read-only enforcement." >&2
+IBC_VALIDATION_ERROR=""
+if ! IBC_VALIDATION_ERROR="$(validate_ibc_safety_config "$IBC_INI")"; then
+    echo "FATAL: invalid IBC paper/read-only safety configuration." >&2
+    echo "       $IBC_VALIDATION_ERROR" >&2
     echo "       File: $IBC_INI" >&2
-    echo "       To fix: set 'ReadOnlyApi=yes' and re-run." >&2
+    echo "       Require one ReadOnlyApi=yes and one TradingMode=paper assignment." >&2
     exit 4
 fi
 
@@ -111,14 +174,6 @@ export TRADING_MODE="paper"
 export IBKR_PORT="$PORT"
 export IBKR_READONLY="true"
 
-
-# Step 1: Kill existing Python processes first
-echo "1. Killing existing trader processes..."
-pkill -9 -f "runner_async" 2>/dev/null && echo "   ✓ Killed runner_async" || echo "   ✓ No runner_async running"
-pkill -9 -f "app.py" 2>/dev/null && echo "   ✓ Killed dashboard" || echo "   ✓ No dashboard running"
-pkill -9 -f "websocket_server" 2>/dev/null && echo "   ✓ Killed websocket_server" || echo "   ✓ No websocket_server running"
-sleep 2
-echo ""
 
 # Function to start Gateway via IBC
 start_gateway() {
@@ -451,6 +506,16 @@ case "$PREFLIGHT_RC" in
         exit 1
         ;;
 esac
+echo ""
+
+# Stop the prior application processes only after the preflight gate has
+# authorized this launch. A kill-switch or stale-equity BLOCK must leave the
+# existing supervised runtime available for inspection and recovery.
+echo "4.6. Stopping existing trader processes..."
+pkill -9 -f "runner_async" 2>/dev/null && echo "   ✓ Killed runner_async" || echo "   ✓ No runner_async running"
+pkill -9 -f "app.py" 2>/dev/null && echo "   ✓ Killed dashboard" || echo "   ✓ No dashboard running"
+pkill -9 -f "websocket_server" 2>/dev/null && echo "   ✓ Killed websocket_server" || echo "   ✓ No websocket_server running"
+sleep 2
 echo ""
 
 # Step 5: Start dashboard (includes WebSocket server)

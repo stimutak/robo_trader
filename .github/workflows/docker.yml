@@ -40,6 +40,7 @@ jobs:
       contents: read
       security-events: write
     env:
+      ENVIRONMENT: test
       EXECUTION_MODE: paper
       TRADING_MODE: paper
       IBKR_HOST: 127.0.0.1
@@ -50,6 +51,7 @@ jobs:
       IBKR_APPROVED_ACCOUNTS: DU_CI_PAPER
       IBKR_ACCOUNT_TYPE: paper
       RT_STATE_NAMESPACE: paper
+      RT_DB_PATH: /app/data/ci-paper.db
       MODEL_ARTIFACT_SET: ci-fixtures
       BUILD_ID: github-actions
 
@@ -108,6 +110,7 @@ jobs:
             -e IBKR_APPROVED_ACCOUNTS=DU_CI_PAPER \
             -e IBKR_ACCOUNT_TYPE=paper \
             -e RT_STATE_NAMESPACE=paper \
+            -e RT_DB_PATH=/app/data/ci-paper.db \
             -e MODEL_ARTIFACT_SET=ci-fixtures \
             -e BUILD_ID=github-actions \
             -e ENVIRONMENT=test \
@@ -130,6 +133,7 @@ jobs:
             -e IBKR_APPROVED_ACCOUNTS=DU_CI_PAPER \
             -e IBKR_ACCOUNT_TYPE=paper \
             -e RT_STATE_NAMESPACE=paper \
+            -e RT_DB_PATH=/app/data/ci-paper.db \
             -e MODEL_ARTIFACT_SET=ci-fixtures \
             -e BUILD_ID=github-actions \
             -e ENVIRONMENT=test \
@@ -143,6 +147,7 @@ jobs:
 
       - name: Validate docker compose containment
         env:
+          ENVIRONMENT: test
           EXECUTION_MODE: paper
           TRADING_MODE: paper
           IBKR_HOST: 127.0.0.1
@@ -153,6 +158,7 @@ jobs:
           IBKR_APPROVED_ACCOUNTS: DU_CI_PAPER
           IBKR_ACCOUNT_TYPE: paper
           RT_STATE_NAMESPACE: paper
+          RT_DB_PATH: /app/data/ci-paper.db
           MODEL_ARTIFACT_SET: ci-fixtures
           BUILD_ID: github-actions
           TRADING_SYMBOLS: AAPL
@@ -225,11 +231,20 @@ jobs:
 
       - name: Render compose topologies without starting services
         env:
+          ENVIRONMENT: test
           EXECUTION_MODE: paper
           TRADING_MODE: paper
           IBKR_HOST: 127.0.0.1
           IBKR_PORT: "4002"
           IBKR_READONLY: "true"
+          IBKR_CLIENT_ID: "123"
+          IBKR_ACCOUNT: DU_CI_PAPER
+          IBKR_APPROVED_ACCOUNTS: DU_CI_PAPER
+          IBKR_ACCOUNT_TYPE: paper
+          RT_STATE_NAMESPACE: paper
+          RT_DB_PATH: /app/data/ci-paper.db
+          MODEL_ARTIFACT_SET: ci-fixtures
+          BUILD_ID: github-actions
           TRADING_SYMBOLS: AAPL
           STRATEGY_ENABLED_STRATEGIES: momentum
           RISK_MAX_POSITION_SIZE: "1000"
