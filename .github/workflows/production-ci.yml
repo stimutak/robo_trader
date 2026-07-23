@@ -170,7 +170,11 @@ jobs:
       run: |
         base_sha="${PR_BASE_SHA:-${PUSH_BASE_SHA:-}}"
         if ! git cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
-          base_sha="$(git rev-parse HEAD^)"
+          if git show-ref --verify --quiet refs/remotes/origin/main; then
+            base_sha="$(git merge-base "$GITHUB_SHA" origin/main)"
+          else
+            base_sha="$(git hash-object -t tree /dev/null)"
+          fi
         fi
         git diff --name-only --diff-filter=ACMR "$base_sha" "$GITHUB_SHA" \
           | awk '/\.py$/' \

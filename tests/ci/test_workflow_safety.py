@@ -64,6 +64,7 @@ def test_docker_workflow_watches_every_image_input() -> None:
     for image_input in (
         "Dockerfile",
         ".dockerignore",
+        "docker-compose*.yml",
         "deployment/**",
         "requirements*.txt",
         "robo_trader/**",
@@ -72,8 +73,19 @@ def test_docker_workflow_watches_every_image_input() -> None:
         "START_TRADER.sh",
         "robotrader_favicon.ico",
         "config/ibc/config.ini.template",
+        ".github/container-structure-test.yml",
+        ".github/workflows/docker.yml",
     ):
         assert f"- '{image_input}'" in workflow
+
+
+def test_changed_file_gates_fail_closed_when_push_base_is_unavailable() -> None:
+    for workflow_name in ("ci.yml", "deploy.yml", "production-ci.yml"):
+        workflow = _workflow(workflow_name)
+
+        assert 'git merge-base "$GITHUB_SHA" origin/main' in workflow
+        assert "git hash-object -t tree /dev/null" in workflow
+        assert 'base_sha="$(git rev-parse HEAD^)"' not in workflow
 
 
 def test_container_structure_policy_exists() -> None:
