@@ -249,8 +249,9 @@ and verified.
 
 ### Objective
 
-Produce the broker evidence required to explain the incident and authorize any
-later state correction without placing orders or mutating local data.
+Produce the broker evidence required to explain the incident and determine
+whether a separate user-approved, backed-up state-correction action should be
+designed, without placing orders or mutating local data.
 
 ### Problems addressed
 
@@ -913,7 +914,9 @@ Enable the smallest reasonable real-money exposure only after all prior gates pa
 
 ### Preconditions
 
-- PRs 1 through 14 are complete as applicable.
+- PR 1, PR 1A, PR 1B, and PRs 2 through 14 are complete as applicable.
+- PR 1B reconciliation evidence was reviewed and did not itself mutate or
+  authorize mutation of the ledger or safety state.
 - All P0 and P1 audit findings are closed.
 - Independent security and trading-safety review approves the evidence package.
 - Reconciliation is clean.
@@ -945,13 +948,22 @@ Enable the smallest reasonable real-money exposure only after all prior gates pa
 
 # 6. Launch gates
 
+Launch gates are cumulative. Gate B and every later gate require Gate A,
+including explicit PR 1A correlation evidence and PR 1B read-only
+reconciliation evidence. A numeric PR range never implicitly omits PR 1A or PR
+1B.
+
 ## Gate A - Supervised local paper readiness
 
-Required PRs: 1 through 5, plus relevant parts of 7.
+Required PRs: 1, 1A, 1B, 2 through 5, plus relevant parts of 7.
 
 Evidence required:
 
 - Broker confirms paper account and read-only API.
+- PR 1A failure injection proves delayed, mismatched, stale, or uncorrelated
+  broker data cannot reach valuation, risk, strategy, persistence, or stops.
+- PR 1B broker-versus-ledger reconciliation is current, reviewed, and proves it
+  did not modify the database or safety state.
 - Paper state cannot collide with any future live state.
 - Reduce-only exits pass all blocking-state tests.
 - Data timestamps, freshness, and session semantics are correct.
@@ -998,7 +1010,7 @@ Evidence required:
 
 ## Gate E - Live canary readiness
 
-Required PRs: 13 through 15.
+Required PRs: Gate A through Gate D, then PRs 13 through 15.
 
 Evidence required:
 
@@ -1075,8 +1087,10 @@ Update after each merge.
   code because its configured credential returned HTTP 401 with zero tokens;
   this infrastructure failure is recorded on PR #82 and was not treated as
   repository validation. PR #80 (`dd26ad5`, `edd0288`) is explicitly
-  superseded: no commit from that branch was merged. Its 11 review findings are
-  mapped to PRs 6, 8, 10, and 11 in the branch disposition record.
+  superseded: no commit from that branch was merged. Its 11 review threads are
+  mapped one-to-one to PR 1 / PR #82, PR 6, or PR 11 in the branch disposition
+  record. Separate branch requirements, rather than review threads, are
+  retained for PRs 8 and 10.
 - PR 1A: Not started. Added as an incident-driven prerequisite after read-only
   evidence showed that a timed-out IBKR historical-data response could shift
   later FIFO responses across symbols and feed a mislabeled quote into loss and
