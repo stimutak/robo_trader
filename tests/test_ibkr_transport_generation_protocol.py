@@ -263,6 +263,17 @@ async def test_new_generation_cannot_consume_old_generation_response():
 async def test_concurrent_start_creates_only_one_worker(monkeypatch):
     created = []
 
+    # The production allowlist intentionally rejects GitHub Actions'
+    # /opt/hostedtoolcache interpreter. This test replaces Popen and never
+    # executes it, so allow only this process's resolved interpreter prefix in
+    # the test rather than weakening the runtime policy.
+    interpreter_prefix = client_module.Path(client_module.sys.executable).resolve().parent
+    monkeypatch.setattr(
+        client_module,
+        "_INTERPRETER_PREFIX_ALLOWLIST",
+        client_module._INTERPRETER_PREFIX_ALLOWLIST + (interpreter_prefix,),
+    )
+
     def popen(*args, **kwargs):
         process = _FakeProcess(lambda process, request: None)
         created.append(process)
