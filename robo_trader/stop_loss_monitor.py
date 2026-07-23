@@ -812,6 +812,41 @@ class StopLossMonitor:
             return triggered
 
     async def execute_stop_loss(self, stop: StopLossOrder) -> bool:
+        """Execute a stop and always retire only this object's phase records.
+
+        The implementation keeps BROKER_WAIT visible during each broker await
+        and POST_FILL_SETTLEMENT visible through the runner callback. This
+        outer boundary then handles direct callers and the monitor wrapper
+        identically, without deleting a same-symbol replacement's records.
+        """
+        stop_key = self._stop_key(stop.symbol)
+        queued_record = self._queued_stop_orders.get(stop_key)
+        if queued_record is not None and queued_record.stop is stop:
+            del self._queued_stop_orders[stop_key]
+        try:
+            return await self._execute_stop_loss_impl(stop, stop_key)
+        finally:
+            self._cleanup_stop_execution_tracking(stop, stop_key)
+
+    def _cleanup_stop_execution_tracking(
+        self,
+        stop: StopLossOrder,
+        stop_key: str,
+    ) -> None:
+        """Remove exact-object execution state while preserving replacements."""
+        inflight_record = self._inflight_stop_orders.get(stop_key)
+        if inflight_record is not None and inflight_record.stop is stop:
+            del self._inflight_stop_orders[stop_key]
+        queued_record = self._queued_stop_orders.get(stop_key)
+        if queued_record is not None and queued_record.stop is stop:
+            del self._queued_stop_orders[stop_key]
+        self._latched_stop_crossings.pop(id(stop), None)
+
+    async def _execute_stop_loss_impl(
+        self,
+        stop: StopLossOrder,
+        stop_key: str,
+    ) -> bool:
         """
         Execute stop-loss order immediately.
 
@@ -821,7 +856,6 @@ class StopLossMonitor:
         Returns:
             bool: True if execution successful
         """
-        stop_key = self._stop_key(stop.symbol)
         if self.active_stops.get(stop_key) is not stop or stop.status in {
             StopStatus.CANCELLED,
             StopStatus.EXECUTED,
@@ -1008,20 +1042,7 @@ class StopLossMonitor:
 
     async def _execute_tracked_stop(self, stop: StopLossOrder) -> bool:
         """Execute one stop while publishing exact in-flight ownership."""
-        stop_key = self._stop_key(stop.symbol)
-        queued_record = self._queued_stop_orders.get(stop_key)
-        if queued_record is not None and queued_record.stop is stop:
-            del self._queued_stop_orders[stop_key]
-        try:
-            return await self.execute_stop_loss(stop)
-        finally:
-            inflight_record = self._inflight_stop_orders.get(stop_key)
-            if inflight_record is not None and inflight_record.stop is stop:
-                del self._inflight_stop_orders[stop_key]
-            queued_record = self._queued_stop_orders.get(stop_key)
-            if queued_record is not None and queued_record.stop is stop:
-                del self._queued_stop_orders[stop_key]
-            self._latched_stop_crossings.pop(id(stop), None)
+        return await self.execute_stop_loss(stop)
 
     async def monitor_stops(self) -> None:
         """

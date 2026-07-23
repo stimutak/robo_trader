@@ -330,6 +330,160 @@ async def test_cancel_stop_cleans_latched_evidence() -> None:
     assert id(stop) not in monitor._latched_stop_crossings
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        ("success", True),
+        ("failure", False),
+        ("exception", False),
+    ],
+)
+async def test_direct_stop_execution_always_cleans_exact_phase_state(
+    outcome,
+    expected,
+) -> None:
+    class _Executor:
+        async def place_order_async(self, order):
+            if outcome == "success":
+                return ExecutionResult(True, "filled", fill_price=order.price)
+            if outcome == "failure":
+                return ExecutionResult(False, "rejected")
+            raise RuntimeError("transport failure")
+
+    now = datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc)
+    monitor = StopLossMonitor(
+        executor=_Executor(),
+        risk_manager=SimpleNamespace(),
+        portfolio_id="default",
+    )
+    monitor._utcnow = lambda: now
+    monitor._monotonic = lambda: 100.0
+    stop = await monitor.add_stop_loss("AAPL", Position("AAPL", 10, 100.0))
+    stop.status = StopStatus.TRIGGERED
+    stop.triggered_at = now
+    stop.trigger_price = 97.0
+
+    with patch(
+        "robo_trader.stop_loss_monitor.asyncio.sleep",
+        AsyncMock(),
+    ):
+        assert await monitor.execute_stop_loss(stop) is expected
+
+    assert "default:AAPL" not in monitor._inflight_stop_orders
+    assert "default:AAPL" not in monitor._queued_stop_orders
+    assert id(stop) not in monitor._latched_stop_crossings
+    if outcome != "success":
+        assert stop.status is StopStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_direct_obsolete_execution_preserves_replacement_phase_records() -> None:
+    monitor = StopLossMonitor(
+        executor=SimpleNamespace(),
+        risk_manager=SimpleNamespace(),
+        portfolio_id="default",
+    )
+    position = Position("AAPL", 10, 100.0)
+    old_stop = await monitor.add_stop_loss("AAPL", position)
+    replacement = await monitor.add_stop_loss("AAPL", position)
+    stop_key = "default:AAPL"
+    replacement_queued = _phase_record(
+        replacement,
+        StopExecutionPhase.QUEUED,
+    )
+    replacement_inflight = _phase_record(
+        replacement,
+        StopExecutionPhase.BROKER_WAIT,
+    )
+    monitor._queued_stop_orders[stop_key] = replacement_queued
+    monitor._inflight_stop_orders[stop_key] = replacement_inflight
+
+    assert await monitor.execute_stop_loss(old_stop) is False
+
+    assert monitor._queued_stop_orders[stop_key] is replacement_queued
+    assert monitor._inflight_stop_orders[stop_key] is replacement_inflight
+
+
+@pytest.mark.asyncio
+async def test_direct_exact_queued_stop_has_single_broker_owner_during_await() -> None:
+    broker_started = asyncio.Event()
+    release_broker = asyncio.Event()
+
+    class _GatedExecutor:
+        async def place_order_async(self, order):
+            broker_started.set()
+            await release_broker.wait()
+            return ExecutionResult(True, "filled", fill_price=order.price)
+
+    now = datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc)
+    monitor = StopLossMonitor(
+        executor=_GatedExecutor(),
+        risk_manager=SimpleNamespace(),
+        portfolio_id="default",
+    )
+    monitor._utcnow = lambda: now
+    stop = await monitor.add_stop_loss("AAPL", Position("AAPL", 10, 100.0))
+    stop.status = StopStatus.TRIGGERED
+    stop.triggered_at = now
+    stop.trigger_price = 97.0
+    stop_key = "default:AAPL"
+    monitor._queued_stop_orders[stop_key] = _phase_record(
+        stop,
+        StopExecutionPhase.QUEUED,
+    )
+
+    execution = asyncio.create_task(monitor.execute_stop_loss(stop))
+    await broker_started.wait()
+
+    assert stop_key not in monitor._queued_stop_orders
+    broker_record = monitor._inflight_stop_orders[stop_key]
+    assert broker_record.stop is stop
+    assert broker_record.phase is StopExecutionPhase.BROKER_WAIT
+
+    release_broker.set()
+    assert await execution is True
+    assert stop_key not in monitor._queued_stop_orders
+    assert stop_key not in monitor._inflight_stop_orders
+
+
+@pytest.mark.asyncio
+async def test_direct_success_keeps_post_fill_visible_through_callback() -> None:
+    callback_started = asyncio.Event()
+    release_callback = asyncio.Event()
+
+    class _Executor:
+        async def place_order_async(self, order):
+            return ExecutionResult(True, "filled", fill_price=order.price)
+
+    async def gated_callback(_stop, _result) -> None:
+        callback_started.set()
+        await release_callback.wait()
+
+    now = datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc)
+    monitor = StopLossMonitor(
+        executor=_Executor(),
+        risk_manager=SimpleNamespace(),
+        portfolio_id="default",
+        position_closed_callback=gated_callback,
+    )
+    monitor._utcnow = lambda: now
+    stop = await monitor.add_stop_loss("AAPL", Position("AAPL", 10, 100.0))
+    stop.status = StopStatus.TRIGGERED
+    stop.triggered_at = now
+    stop.trigger_price = 97.0
+
+    execution = asyncio.create_task(monitor.execute_stop_loss(stop))
+    await callback_started.wait()
+    record = monitor._inflight_stop_orders["default:AAPL"]
+    assert record.stop is stop
+    assert record.phase is StopExecutionPhase.POST_FILL_SETTLEMENT
+
+    release_callback.set()
+    assert await execution is True
+    assert "default:AAPL" not in monitor._inflight_stop_orders
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
