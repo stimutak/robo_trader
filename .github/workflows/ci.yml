@@ -56,31 +56,21 @@ jobs:
     - name: Collect changed Python files
       env:
         PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
         PUSH_BASE_SHA: ${{ github.event.before }}
-      run: |
-        base_sha="${PR_BASE_SHA:-${PUSH_BASE_SHA:-}}"
-        if ! git cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
-          if git show-ref --verify --quiet refs/remotes/origin/main; then
-            base_sha="$(git merge-base "$GITHUB_SHA" origin/main)"
-          else
-            base_sha="$(git hash-object -t tree /dev/null)"
-          fi
-        fi
-        git diff --name-only --diff-filter=ACMR "$base_sha" "$GITHUB_SHA" \
-          | awk '/\.py$/' \
-          > changed-python.txt
-        echo "Changed Python files:"
-        cat changed-python.txt
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: bash scripts/ci/collect_changed_python.sh
 
     - name: Gate changed Python files
       run: |
-        if [[ ! -s changed-python.txt ]]; then
+        mapfile -d '' -t changed_python < changed-python.zlist
+        if (( ${#changed_python[@]} == 0 )); then
           echo "No changed Python files."
           exit 0
         fi
-        xargs black --check < changed-python.txt
-        xargs isort --check-only --diff < changed-python.txt
-        xargs flake8 < changed-python.txt
+        black --check -- "${changed_python[@]}"
+        isort --check-only --diff -- "${changed_python[@]}"
+        flake8 -- "${changed_python[@]}"
 
     - name: Run bandit security scan
       run: bandit -r robo_trader/ -ll --skip B101,B104,B201

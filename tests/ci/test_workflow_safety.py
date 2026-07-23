@@ -30,10 +30,12 @@ def test_primary_ci_reports_baseline_isort_debt_and_gates_changed_files() -> Non
     workflow = _workflow("ci.yml")
 
     assert "Report legacy test import-order debt" in workflow
-    assert "continue-on-error: true" in workflow
+    legacy_isort_step = workflow.split("- name: Report legacy test import-order debt", maxsplit=1)[
+        1
+    ].split("- name: Collect changed Python files", maxsplit=1)[0]
+    assert "continue-on-error: true" in legacy_isort_step
     assert "Gate changed Python files" in workflow
-    assert "awk '/\\.py$/'" in workflow
-    assert "xargs isort --check-only --diff" in workflow
+    assert "isort --check-only --diff --" in workflow
 
 
 def test_deploy_ci_gates_all_changed_python_entrypoints() -> None:
@@ -41,11 +43,11 @@ def test_deploy_ci_gates_all_changed_python_entrypoints() -> None:
 
     assert "fetch-depth: 0" in workflow
     assert "Collect changed Python files" in workflow
-    assert "awk '/\\.py$/'" in workflow
+    assert "bash scripts/ci/collect_changed_python.sh" in workflow
     assert "Gate changed Python files" in workflow
-    assert "xargs black --check" in workflow
-    assert "xargs isort --check-only --diff" in workflow
-    assert "xargs flake8" in workflow
+    assert 'black --check -- "${changed_python[@]}"' in workflow
+    assert 'isort --check-only --diff -- "${changed_python[@]}"' in workflow
+    assert 'flake8 -- "${changed_python[@]}"' in workflow
 
 
 def test_mypy_and_supply_chain_debt_are_explicitly_advisory() -> None:
@@ -80,12 +82,37 @@ def test_docker_workflow_watches_every_image_input() -> None:
 
 
 def test_changed_file_gates_fail_closed_when_push_base_is_unavailable() -> None:
+    collector = (ROOT / "scripts" / "ci" / "collect_changed_python.sh").read_text(encoding="utf-8")
+
+    assert '[[ "$merge_base" != "$HEAD_SHA" ]]' in collector
+    assert 'BASE_SHA="$EMPTY_TREE"' in collector
+    assert "git diff --name-only -z" in collector
+    assert 'base_sha="$(git rev-parse HEAD^)"' not in collector
+
     for workflow_name in ("ci.yml", "deploy.yml", "production-ci.yml"):
         workflow = _workflow(workflow_name)
 
-        assert 'git merge-base "$GITHUB_SHA" origin/main' in workflow
-        assert "git hash-object -t tree /dev/null" in workflow
-        assert 'base_sha="$(git rev-parse HEAD^)"' not in workflow
+        assert "bash scripts/ci/collect_changed_python.sh" in workflow
+        assert "PR_BASE_REF:" in workflow
+        assert "DEFAULT_BRANCH:" in workflow
+
+
+def test_changed_file_gates_are_nul_safe_and_stop_option_parsing() -> None:
+    collector = (ROOT / "scripts" / "ci" / "collect_changed_python.sh").read_text(encoding="utf-8")
+    assert "git diff --name-only -z" in collector
+    assert '>"$output_tmp"' in collector
+
+    for workflow_name in ("ci.yml", "deploy.yml", "production-ci.yml"):
+        workflow = _workflow(workflow_name)
+
+        assert "bash scripts/ci/collect_changed_python.sh" in workflow
+        assert "mapfile -d '' -t changed_python" in workflow
+        assert 'black --check -- "${changed_python[@]}"' in workflow
+        assert 'isort --check-only --diff -- "${changed_python[@]}"' in workflow
+        assert 'flake8 -- "${changed_python[@]}"' in workflow
+        assert "xargs black" not in workflow
+        assert "xargs isort" not in workflow
+        assert "xargs flake8" not in workflow
 
 
 def test_container_structure_policy_exists() -> None:
