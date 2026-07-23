@@ -1901,10 +1901,12 @@ class AsyncRunner:
     ) -> pd.DataFrame:
         """Validate broker bars and return a UTC-aware, time-indexed frame.
 
-        This is the last trust boundary before bars can reach persistence,
-        caches, strategies, risk, or protective-stop logic. It therefore
-        rejects ambiguity instead of sorting, localizing, or otherwise
-        guessing what the broker meant.
+        This is the sanctioned AsyncRunner's last trust boundary before bars
+        can reach persistence, caches, strategies, risk, or protective-stop
+        logic. Alternate engines are outside the supported runtime topology
+        and remain scheduled for quarantine in PR 7. This boundary rejects
+        ambiguity instead of sorting, localizing, or otherwise guessing what
+        the broker meant.
         """
         if not isinstance(frame, pd.DataFrame) or frame.empty:
             return pd.DataFrame()

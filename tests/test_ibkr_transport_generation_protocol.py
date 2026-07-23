@@ -181,6 +181,24 @@ async def test_queued_command_fails_without_write_after_first_command_poisons():
 
 
 @pytest.mark.asyncio
+async def test_write_failure_cancels_unawaited_current_response_future():
+    held = {}
+    generation = None
+
+    def handler(process, request):
+        held["future"] = generation.pending[request["request_id"]].future
+        raise OSError("simulated stdin failure")
+
+    client, _, generation = _attach_client(handler)
+    with pytest.raises(IBKRTransportPoisonedError, match="Failed to send command"):
+        await client._execute_command({"command": "ping"})
+
+    assert held["future"].cancelled()
+    assert generation.pending == {}
+    assert "command write failure" in generation.poisoned_reason
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("mutate", "reason"),
     [

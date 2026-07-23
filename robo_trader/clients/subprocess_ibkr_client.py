@@ -838,6 +838,14 @@ class SubprocessIBKRClient:
                 generation.process.stdin.write(command_json)
                 generation.process.stdin.flush()
             except Exception as e:
+                # This caller raises synchronously below, so it will never
+                # await its response Future. Remove and cancel that Future
+                # before poisoning the remaining generation requests to avoid
+                # an unobserved "Future exception was never retrieved".
+                with generation.state_lock:
+                    generation.pending.pop(request_id, None)
+                if not pending.future.done():
+                    pending.future.cancel()
                 self._poison_generation(generation, f"command write failure: {e}")
                 raise IBKRTransportPoisonedError(f"Failed to send command: {e}")
 
