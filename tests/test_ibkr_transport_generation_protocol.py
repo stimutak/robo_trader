@@ -10,11 +10,11 @@ import pytest
 from robo_trader.clients import ibkr_subprocess_worker as worker
 from robo_trader.clients import subprocess_ibkr_client as client_module
 from robo_trader.clients.subprocess_ibkr_client import (
+    GatewayRequiresRestartError,
     IBKRConnectionConflictError,
     IBKRTimeoutError,
     IBKRTimeoutRequiresGatewayRestartError,
     IBKRTransportPoisonedError,
-    GatewayRequiresRestartError,
     SubprocessCrashError,
     SubprocessIBKRClient,
     _WorkerGeneration,
