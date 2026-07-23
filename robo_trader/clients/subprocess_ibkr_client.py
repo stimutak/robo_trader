@@ -223,6 +223,9 @@ class SubprocessIBKRClient:
             logger.error("Worker ping reports Gateway API down", detail=detail)
             return False
 
+        # This response proves the previous Gateway-down diagnosis is no
+        # longer current, even if the broker session itself remains down.
+        self._gateway_api_down_detail = None
         if data.get("pong") is not True or data.get("connected") is not True:
             self._clear_cached_connection_state()
             logger.warning(
@@ -232,7 +235,17 @@ class SubprocessIBKRClient:
             )
             return False
 
-        self._gateway_api_down_detail = None
+        # A ping proves liveness, not which validated account/host/port owns
+        # the session. Never reconstruct authorization from pong alone.
+        if not self._connected or self._connection_identity is None:
+            self._clear_cached_connection_state()
+            logger.warning(
+                "Worker reports a broker session without validated connection identity; "
+                "explicit reconnect required"
+            )
+            return False
+
+        self._connected = True
         self._last_activity = datetime.now()
         return True
 

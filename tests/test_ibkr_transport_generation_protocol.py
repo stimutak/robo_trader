@@ -659,6 +659,45 @@ async def test_connect_probes_and_replaces_stale_cached_session():
     assert commands == ["ping", "connect"]
 
 
+def test_ping_clears_stale_gateway_failure_on_plain_disconnect():
+    client = SubprocessIBKRClient()
+    client._connected = True
+    client._connection_identity = ("127.0.0.1", 4002, 7, True)
+    client._gateway_api_down_detail = "old gateway failure"
+
+    assert (
+        client._accept_ping_response(
+            {
+                "pong": True,
+                "connected": False,
+                "gateway_api_down": False,
+                "detail": "",
+            }
+        )
+        is False
+    )
+    assert client._gateway_api_down_detail is None
+    assert client.is_connected is False
+
+
+def test_ping_cannot_reauthorize_session_without_validated_identity():
+    client = SubprocessIBKRClient()
+
+    assert (
+        client._accept_ping_response(
+            {
+                "pong": True,
+                "connected": True,
+                "gateway_api_down": False,
+                "detail": "",
+            }
+        )
+        is False
+    )
+    assert client.is_connected is False
+    assert client._connection_identity is None
+
+
 @pytest.mark.asyncio
 async def test_worker_refuses_active_connect_and_cleans_stale_instance(monkeypatch):
     class Existing:
