@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import plistlib
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -114,6 +115,51 @@ def test_install_watchdog_script_bash_syntax():
     assert result.returncode == 0, f"bash -n failed: {result.stderr}"
 
 
+def test_install_watchdog_renders_checkout_and_user_paths(tmp_path):
+    """Installed plist paths must follow the checkout, not tracked defaults."""
+    portable_project = tmp_path / "different checkout"
+    portable_scripts = portable_project / "scripts"
+    portable_scripts.mkdir(parents=True)
+    for source in (INSTALL_SH, PLIST_PATH, WATCHDOG_SH):
+        shutil.copy2(source, portable_scripts / source.name)
+
+    fake_la = tmp_path / "LaunchAgents"
+    env = os.environ.copy()
+    env["LAUNCH_AGENTS_DIR"] = str(fake_la)
+    env["SKIP_LAUNCHCTL"] = "1"
+    env["ROBOTRADER_USER"] = "portable-user"
+    env["PYTHON_BIN"] = sys.executable
+    env["PLUTIL_BIN"] = shutil.which("true") or "true"
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'umask 000; exec bash "$1"',
+            "watchdog-installer-test",
+            str(portable_scripts / INSTALL_SH.name),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    with (fake_la / "com.robotrader.watchdog.plist").open("rb") as fh:
+        installed = plistlib.load(fh)
+
+    expected_project = portable_project.resolve()
+    expected_launchd_log = str(expected_project / "watchdog_launchd.log")
+    assert installed["UserName"] == "portable-user"
+    assert installed["ProgramArguments"][0] == str(expected_project / "scripts" / "watchdog.sh")
+    assert installed["WorkingDirectory"] == str(expected_project)
+    assert installed["StandardOutPath"] == expected_launchd_log
+    assert installed["StandardErrorPath"] == expected_launchd_log
+    installed_mode = stat.S_IMODE((fake_la / "com.robotrader.watchdog.plist").stat().st_mode)
+    assert installed_mode == 0o600
+
+
 @macos_only
 def test_install_watchdog_script_is_idempotent(tmp_path):
     """Run the installer twice into a fake LaunchAgents dir; both runs must
@@ -165,6 +211,15 @@ def test_claude_md_mentions_watchdog_install():
     assert CLAUDE_MD.exists(), "CLAUDE.md missing"
     content = CLAUDE_MD.read_text()
     assert "install_watchdog.sh" in content, "CLAUDE.md must reference scripts/install_watchdog.sh"
+
+
+def test_start_runner_failure_points_to_both_log_sinks():
+    """Pre-logger startup failures are visible in runner_stdout.log first."""
+    content = (SCRIPTS_DIR / "start_runner.sh").read_text()
+    failure_block = content.split('echo "   ERROR: Runner failed to start"', maxsplit=1)[1]
+
+    assert "$RUNNER_STDOUT_LOG" in failure_block
+    assert "$LOG_FILE" in failure_block
 
 
 # ---------------------------------------------------------------------------

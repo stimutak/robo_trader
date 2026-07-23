@@ -335,13 +335,34 @@ def configure_stdlib_logging():
     # Remove existing handlers
     root.handlers.clear()
 
-    # Console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
-    root.addHandler(console_handler)
+    log_file = os.getenv("LOG_FILE")
+
+    # Console handler — mirror logs to stdout only when it makes sense.
+    #
+    # A backgrounded/redirected process (e.g. the runner under START_TRADER.sh,
+    # whose stdout goes to the un-rotated runner_stdout.log) would otherwise
+    # duplicate every line to that sink, growing it unbounded over long uptimes
+    # while the RotatingFileHandler below is already capturing everything.
+    #
+    # Policy:
+    #   LOG_CONSOLE truthy  -> always attach
+    #   LOG_CONSOLE falsy   -> never attach
+    #   unset               -> attach when stdout is a TTY, or when there is no
+    #                          file handler to fall back on; skip only when
+    #                          stdout is redirected AND a file handler is active.
+    console_env = os.getenv("LOG_CONSOLE")
+    if console_env is not None:
+        want_console = console_env.strip().lower() in ("1", "true", "yes", "on")
+    else:
+        is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        want_console = is_tty or not log_file
+
+    if want_console:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        root.addHandler(console_handler)
 
     # File handler with rotation (if enabled)
-    log_file = os.getenv("LOG_FILE")
     if log_file:
         from logging.handlers import RotatingFileHandler
 

@@ -566,6 +566,9 @@ STOP_LOSS_PERCENT=2.0           # Fixed 2% stop
 | Stop-loss has no price data on restart → ML sells first | Stop-loss needs `update_price()` calls; ML sell blocked by profit check | 2026-02-04 |
 | Forgetting to load launchd watchdog on fresh install | Run ./scripts/install_watchdog.sh ONCE per machine | 2026-05-12 |
 | Adding per-cycle IBKR disconnect/reconnect in run_continuous | Connection is long-lived under run_continuous; cycles must reuse via teardown(full_cleanup=False). Re-introducing per-cycle disconnect causes 2026-05-13-style IBKR-throttle cascade | 2026-05-16 |
+| Gating the run_continuous inter-cycle sleep on `is_trading_allowed()` | With `--force-connect` + market closed, NO wait branch ran → zero-backoff spin at thousands of iterations/sec, 69 GB log flood (2026-07-10). Sleep must run on EVERY loop path — use `intercycle_wait_seconds()`; regression tests in `tests/test_run_continuous_persistent.py::TestIntercycleWait` | 2026-07-10 |
+| Passing testing flags (`--force-connect`) in production startup (START_TRADER.sh) | The flag's help says "for testing" but it shipped in the only sanctioned startup path for 7 months. Testing-only flags stay OUT of START_TRADER.sh | 2026-07-10 |
+| launchd `StandardOutPath`/`StandardErrorPath` pointing at a script-rotated log (watchdog.log) | launchd holds a persistent write fd, so `rotate_log()`'s mv can't cap it, and every backgrounded child (`&` in START_TRADER.sh) inherits the fd and floods it. launchd streams go to a separate `watchdog_launchd.log`; children redirect their own stdout (`runner_stdout.log`, `dashboard_stdout.log`, truncated per start) | 2026-07-10 |
 
 ---
 

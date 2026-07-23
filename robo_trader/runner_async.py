@@ -25,7 +25,7 @@ from dataclasses import dataclass  # isort:skip  # noqa: E402
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 from ib_async import Stock
@@ -4515,6 +4515,78 @@ async def run_once(
     await runner.run(symbols)
 
 
+# 2026-07-10 disk-fill incident: with --force-connect and the market closed,
+# run_continuous skipped both wait branches and spun at loop speed, flooding
+# watchdog.log at ~20 GB/hour. Inter-cycle wait must be positive on every path.
+FORCE_CONNECT_CLOSED_WAIT_SECONDS = 120
+
+
+def intercycle_wait_seconds(interval_seconds: int, trading_allowed: bool) -> float:
+    """Seconds to sleep between run_continuous iterations. Never returns < 1.
+
+    When trading is not allowed, back off to at least
+    FORCE_CONNECT_CLOSED_WAIT_SECONDS. Reachable with --force-connect (the
+    top-of-loop closed-market branch is skipped entirely) or, without the
+    flag, on the single iteration where the market closes mid-cycle before
+    this bottom-of-loop re-check.
+    """
+    if trading_allowed:
+        return max(1.0, float(interval_seconds))
+    return max(1.0, float(interval_seconds), float(FORCE_CONNECT_CLOSED_WAIT_SECONDS))
+
+
+async def sleep_unless_shutdown(
+    total_seconds: float,
+    should_stop: Callable[[], bool],
+    poll_seconds: float = 1.0,
+) -> None:
+    """Sleep up to total_seconds, returning early once should_stop() is True.
+
+    run_continuous's SIGINT/SIGTERM handler only flips a local shutdown_flag;
+    it does not cancel the running coroutine. A single long asyncio.sleep()
+    (up to 1800s for the overnight closed-market branch, or intercycle_wait for
+    the inter-cycle wait) therefore delays a graceful shutdown by up to its full
+    duration. Sleeping in poll_seconds chunks and re-checking should_stop() caps
+    that delay at ~poll_seconds.
+    """
+    if should_stop():
+        return
+    remaining = float(total_seconds)
+    poll = float(poll_seconds)
+    while remaining > 0:
+        chunk = min(poll, remaining) if poll > 0 else remaining
+        await asyncio.sleep(chunk)
+        remaining -= chunk
+        if should_stop():
+            return
+
+
+def _continuous_wait_should_stop(
+    shutdown_requested: bool,
+    runners: Dict[str, AsyncRunner],
+) -> bool:
+    """Return whether a continuous-loop wait must end promptly."""
+    return shutdown_requested or any(runner._recovery_exhausted for runner in runners.values())
+
+
+def _raise_if_recovery_exhausted(runners: Dict[str, AsyncRunner]) -> None:
+    """Raise when any long-lived portfolio runner exhausted recovery.
+
+    This check must run before market-hours waiting. Recovery can exhaust just
+    after the last trading cycle; delaying observation until the next open
+    would leave a known-dead runner alive and prevent launchd from restarting
+    it.
+    """
+
+    for portfolio_id, portfolio_runner in runners.items():
+        if portfolio_runner._recovery_exhausted:
+            raise RecoveryExhaustedError(
+                f"portfolio={portfolio_id} recovery exhausted after "
+                "all backoff attempts; exiting run_continuous so "
+                "watchdog can restart the process"
+            )
+
+
 async def run_continuous(
     symbols: Optional[List[str]] = None,
     duration: str = "1 D",
@@ -4575,41 +4647,56 @@ async def run_continuous(
             eastern = pytz.timezone("US/Eastern")
             current_time = datetime.now(eastern)
 
-            # Check market status and adjust polling frequency
-            if not is_trading_allowed() and not force_connect:
-                session = get_market_session()
-                seconds_to_open = seconds_until_market_open()
-
-                # Extended hours: slower polling (2 min) - but only if extended hours trading is DISABLED
-                # If ENABLE_EXTENDED_HOURS=true, is_trading_allowed() returns true and we won't reach here
-                if session in ["after-hours", "pre-market"]:
-                    wait_time = 120  # 2 minutes during extended hours
-                    logger.info(f"Extended hours ({session}). Polling every 2 minutes...")
-                    await asyncio.sleep(wait_time)
-                    continue
-                # Within 1 hour of open: moderate polling (5 min)
-                elif seconds_to_open < 3600:
-                    wait_time = 300  # 5 minutes when close to open
-                    logger.info(
-                        f"Market opens in {seconds_to_open/60:.0f} min. Polling every 5 minutes..."
-                    )
-                    await asyncio.sleep(wait_time)
-                    continue
-                else:
-                    # Market fully closed (overnight/weekend): long wait (30 min max)
-                    wait_time = min(1800, seconds_to_open // 2)  # Max 30 minutes
-                    logger.info(
-                        f"Market {session}. Next open in {seconds_to_open/3600:.1f} hours. "
-                        f"Sleeping {wait_time/60:.1f} minutes..."
-                    )
-                    await asyncio.sleep(wait_time)
-                    continue
-            elif force_connect and not is_trading_allowed():
-                logger.warning(
-                    "⚠️ Force-connect enabled - connecting to IBKR despite market being closed"
-                )
-
             try:
+                # Observe recovery exhaustion before any market-closed sleep or
+                # continue. A failure latched after the prior cycle must exit
+                # promptly even when the next session is hours away.
+                _raise_if_recovery_exhausted(runners)
+
+                # Check market status and adjust polling frequency
+                if not is_trading_allowed() and not force_connect:
+                    session = get_market_session()
+                    seconds_to_open = seconds_until_market_open()
+
+                    # Extended hours: slower polling (2 min) - but only if
+                    # extended-hours trading is disabled.
+                    if session in ["after-hours", "pre-market"]:
+                        wait_time = 120  # 2 minutes during extended hours
+                        logger.info(f"Extended hours ({session}). Polling every 2 minutes...")
+                        await sleep_unless_shutdown(
+                            wait_time,
+                            lambda: _continuous_wait_should_stop(shutdown_flag, runners),
+                        )
+                        continue
+                    # Within 1 hour of open: moderate polling (5 min)
+                    elif seconds_to_open < 3600:
+                        wait_time = 300  # 5 minutes when close to open
+                        logger.info(
+                            f"Market opens in {seconds_to_open/60:.0f} min. "
+                            "Polling every 5 minutes..."
+                        )
+                        await sleep_unless_shutdown(
+                            wait_time,
+                            lambda: _continuous_wait_should_stop(shutdown_flag, runners),
+                        )
+                        continue
+                    else:
+                        # Market fully closed (overnight/weekend): long wait
+                        wait_time = min(1800, seconds_to_open // 2)  # Max 30 minutes
+                        logger.info(
+                            f"Market {session}. Next open in {seconds_to_open/3600:.1f} hours. "
+                            f"Sleeping {wait_time/60:.1f} minutes..."
+                        )
+                        await sleep_unless_shutdown(
+                            wait_time,
+                            lambda: _continuous_wait_should_stop(shutdown_flag, runners),
+                        )
+                        continue
+                elif force_connect and not is_trading_allowed():
+                    logger.warning(
+                        "⚠️ Force-connect enabled - connecting to IBKR despite market being closed"
+                    )
+
                 logger.info(
                     f"Starting trading cycle at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
                 )
@@ -4674,12 +4761,7 @@ async def run_continuous(
                     # runner can't get stuck in a perpetual "cycle skipped"
                     # state that keeps the log mtime fresh (which would defeat
                     # the watchdog's "no log activity for 5 min" trigger).
-                    if portfolio_runner._recovery_exhausted:
-                        raise RecoveryExhaustedError(
-                            f"portfolio={portfolio_id} recovery exhausted after "
-                            f"all backoff attempts; exiting run_continuous so "
-                            f"watchdog can restart the process"
-                        )
+                    _raise_if_recovery_exhausted({portfolio_id: portfolio_runner})
 
                     # Skip cycle if recovery is mid-flight
                     if portfolio_runner.recovery_in_progress:
@@ -4718,12 +4800,22 @@ async def run_continuous(
 
                     await portfolio_runner.teardown(full_cleanup=False)
 
-                # Wait before next iteration
-                if not shutdown_flag and is_trading_allowed():
-                    logger.info(
-                        f"Waiting {interval_seconds/60:.1f} minutes before next iteration..."
+                # Wait before next iteration. This sleep must run on EVERY
+                # path: with --force-connect and the market closed, neither
+                # top-of-loop wait branch runs, so gating this sleep on
+                # is_trading_allowed() spins the loop with zero delay
+                # (2026-07-10 disk-fill incident, ~20 GB/hour of logs).
+                if not shutdown_flag:
+                    intercycle_wait = intercycle_wait_seconds(
+                        interval_seconds, is_trading_allowed()
                     )
-                    await asyncio.sleep(interval_seconds)
+                    logger.info(
+                        f"Waiting {intercycle_wait/60:.1f} minutes before next iteration..."
+                    )
+                    await sleep_unless_shutdown(
+                        intercycle_wait,
+                        lambda: _continuous_wait_should_stop(shutdown_flag, runners),
+                    )
 
             except asyncio.CancelledError:
                 logger.info("Trading loop cancelled")
@@ -4752,7 +4844,10 @@ async def run_continuous(
                 # owns its connection lifecycle.
                 if not shutdown_flag:
                     logger.info("Waiting 1 minute before retry...")
-                    await asyncio.sleep(60)
+                    await sleep_unless_shutdown(
+                        60,
+                        lambda: _continuous_wait_should_stop(shutdown_flag, runners),
+                    )
 
     finally:
         # Final cleanup: all portfolios get full disconnect on process exit

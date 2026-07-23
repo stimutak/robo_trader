@@ -40,8 +40,8 @@ class TestMeanReversionStrategy(unittest.IsolatedAsyncioTestCase):
 
     def tearDown(self):
         """Clean up test fixtures."""
-        import shutil
         import os
+        import shutil
 
         if os.path.exists("model_registry"):
             try:

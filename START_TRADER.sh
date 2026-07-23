@@ -212,6 +212,19 @@ check_zombies() {
     echo "${count:-0}"
 }
 
+# Function to rotate a child's stdout log before (re)launching it.
+# In a restart storm (472 restarts on 2026-05-29) each start would otherwise
+# truncate the previous attempt's crash output, leaving only the last try.
+# Keep ONE prior generation as <name>.log.1 (gitignored via *.log.*), then let
+# the caller's `> file` redirect truncate a fresh file. Guarded so a non-zero
+# test/mv can't trip `set -e`. Uses only /bin,/usr/bin coreutils (test, mv).
+rotate_log() {
+    local f="$1"
+    if [ -s "$f" ]; then
+        mv -f "$f" "$f.1" || true
+    fi
+}
+
 # Step 2: Check/Start Gateway with retry logic
 echo "2. Checking Gateway status..."
 GATEWAY_RETRY=0
@@ -419,7 +432,13 @@ echo ""
 # Step 5: Start dashboard (includes WebSocket server)
 echo "5. Starting dashboard with WebSocket server..."
 export DASH_PORT=5555
-$PYTHON app.py &
+# Redirect stdout/stderr: backgrounded children otherwise inherit the
+# caller's fds — under the watchdog/launchd that was watchdog.log, which
+# bypassed all rotation and filled the disk on 2026-07-10. Rotate one
+# generation, then truncate on each start so these can't grow unbounded
+# across restarts while still preserving the prior attempt's crash output.
+rotate_log "$SCRIPT_DIR/dashboard_stdout.log"
+$PYTHON app.py > "$SCRIPT_DIR/dashboard_stdout.log" 2>&1 &
 DASH_PID=$!
 sleep 2
 
@@ -428,6 +447,7 @@ if ps -p $DASH_PID > /dev/null; then
     echo "   ✓ WebSocket server running on ws://localhost:8765"
 else
     echo "   ⚠️  Dashboard may have failed to start"
+    echo "      Check logs: tail -50 $SCRIPT_DIR/dashboard_stdout.log"
 fi
 echo ""
 
@@ -439,7 +459,13 @@ echo ""
 
 export LOG_FILE="$SCRIPT_DIR/robo_trader.log"
 
-$PYTHON -m robo_trader.runner_async --symbols "$SYMBOLS" --force-connect &
+# --force-connect removed 2026-07-10: it is a testing flag ("Force IBKR
+# connection even when market is closed") that, combined with a health-gate
+# skip, drove the zero-backoff spin loop in the disk-fill incident. Outside
+# market hours the runner now sleeps until open (extended hours still
+# covered by ENABLE_EXTENDED_HOURS via is_trading_allowed).
+rotate_log "$SCRIPT_DIR/runner_stdout.log"
+$PYTHON -m robo_trader.runner_async --symbols "$SYMBOLS" > "$SCRIPT_DIR/runner_stdout.log" 2>&1 &
 TRADER_PID=$!
 
 echo "   ✓ Trading system started (PID: $TRADER_PID)"
@@ -460,6 +486,7 @@ if ps -p $TRADER_PID > /dev/null; then
     echo "Dashboard PID: $DASH_PID (includes WebSocket server)"
     echo ""
     echo "Monitor logs: tail -f robo_trader.log"
+    echo "  Pre-logger crash output (import/.env errors): runner_stdout.log, dashboard_stdout.log"
     echo "View dashboard: http://localhost:5555"
     echo "WebSocket: ws://localhost:8765"
     echo ""
@@ -492,7 +519,9 @@ if ps -p $TRADER_PID > /dev/null; then
 else
     echo "   ❌ Trading system stopped unexpectedly"
     echo ""
-    echo "Check logs: tail -50 robo_trader.log"
+    echo "Check logs: tail -50 $SCRIPT_DIR/runner_stdout.log"
+    echo "  (a pre-logger crash — import error, bad .env — lands ONLY there, not robo_trader.log)"
+    echo "  Then also: tail -50 robo_trader.log"
     echo ""
     exit 1
 fi
