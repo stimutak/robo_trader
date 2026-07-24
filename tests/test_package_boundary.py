@@ -298,6 +298,12 @@ def test_wheel_contains_supported_subpackages_and_excludes_runtime_artifacts(
         "SHOULD_NOT_SHIP = True\n",
         encoding="utf-8",
     )
+    similarly_named_package = project_copy / "robo_trader_backup"
+    similarly_named_package.mkdir()
+    (similarly_named_package / "__init__.py").write_text(
+        "SHOULD_NOT_SHIP = True\n",
+        encoding="utf-8",
+    )
     (project_copy / "config" / "ibc").mkdir(parents=True)
     (project_copy / "config" / "ibc" / "config.ini").write_text(
         "IbLoginId=do-not-package\n",
@@ -345,8 +351,10 @@ def test_wheel_contains_supported_subpackages_and_excludes_runtime_artifacts(
     assert "robo_trader/preflight/__init__.py" in members
     assert "robo_trader/preflight/result.py" in members
     assert "robo_trader/utils/pricing.py" in members
+    assert "robo_trader/bug_detection/templates/bug_dashboard.html" in members
 
     assert not any(member.startswith("robo_trader/archived/") for member in members)
+    assert not any(member.startswith("robo_trader_backup/") for member in members)
     assert not any(member.startswith("tests/") for member in members)
     assert not any(member.startswith("config/") for member in members)
     assert not any(Path(member).name == ".env" for member in members)
@@ -361,9 +369,21 @@ def test_wheel_contains_supported_subpackages_and_excludes_runtime_artifacts(
         sys.path.insert(0, str(wheel_root))
 
         import robo_trader
+        from robo_trader.bug_detection.dashboard import BugDashboard
         import robo_trader.preflight.result as regular_module
         import robo_trader.utils.pricing as namespace_module
 
+        class FakeBugAgent:
+            bugs = []
+
+            @staticmethod
+            def generate_report():
+                return {}
+
+        response = BugDashboard(FakeBugAgent()).app.test_client().get("/")
+
+        assert response.status_code == 200
+        assert b"RoboTrader Bug Dashboard" in response.data
         assert "ib_async" not in sys.modules
         assert "robo_trader.utils.ibkr_safe" not in sys.modules
         assert str(wheel_root) in regular_module.__file__, regular_module.__file__
