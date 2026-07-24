@@ -7,5 +7,5 @@ isort>=5.12.0
 flake8>=6.0.0
 mypy>=1.0.0
 bandit>=1.7.0
-setuptools==80.9.0
-wheel==0.45.1
+# Offline wheel-boundary tests use setuptools' bundled bdist_wheel command.
+setuptools==83.0.0
