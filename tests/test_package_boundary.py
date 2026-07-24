@@ -315,7 +315,7 @@ def test_wheel_contains_supported_subpackages_and_excludes_runtime_artifacts(
 
     wheelhouse = tmp_path / "wheelhouse"
     wheelhouse.mkdir()
-    subprocess.run(
+    build_result = subprocess.run(
         [
             sys.executable,
             "-m",
@@ -329,10 +329,15 @@ def test_wheel_contains_supported_subpackages_and_excludes_runtime_artifacts(
             str(project_copy),
         ],
         cwd=tmp_path,
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
         timeout=120,
+    )
+    assert build_result.returncode == 0, (
+        f"wheel build failed with exit {build_result.returncode}\n"
+        f"stdout:\n{build_result.stdout}\n"
+        f"stderr:\n{build_result.stderr}"
     )
 
     wheels = list(wheelhouse.glob("robo_trader-*.whl"))
