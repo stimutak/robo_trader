@@ -135,6 +135,15 @@ initial gateway-only path repair as incomplete. The path was then fixed at
 contract creation, exercised across each consumer, and independently reviewed
 GO before push.
 
+The exact-head hosted run then exposed an existing CI fail-open condition:
+seven duplicated Linux full-suite jobs remained in their pytest steps without
+a workflow or command timeout, and the superseded-head jobs showed the same
+behavior. The three full-suite workflows now have a 20-minute job ceiling, a
+10-minute pytest-step ceiling, and 120-second faulthandler thread dumps. A
+tracked workflow-policy regression requires all three controls. This does not
+classify a timeout as a pass; it ensures the next hosted run fails with
+actionable evidence instead of remaining pending indefinitely.
+
 ## Operational status
 
 The trader, dashboard, WebSocket server, and Gateway were not started by this

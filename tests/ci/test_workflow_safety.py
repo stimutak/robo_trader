@@ -78,6 +78,15 @@ def test_mypy_and_supply_chain_debt_are_explicitly_advisory() -> None:
     assert 'safety check -r "$requirements_file" --json' in workflow
 
 
+def test_full_suite_jobs_fail_closed_on_hangs_with_thread_diagnostics() -> None:
+    for workflow_name in ("ci.yml", "deploy.yml", "production-ci.yml"):
+        workflow = _workflow(workflow_name)
+
+        assert "timeout-minutes: 20" in workflow
+        assert "timeout --signal=TERM --kill-after=30s 10m" in workflow
+        assert "-o faulthandler_timeout=120" in workflow
+
+
 def test_docker_workflow_watches_every_image_input() -> None:
     workflow = _workflow("docker.yml")
 

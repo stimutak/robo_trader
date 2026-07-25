@@ -1434,6 +1434,10 @@ Update after each merge.
   GitHub Codex subsequently found relative-ledger-path and persistent-reconnect
   executor-identity defects; both were reproduced and fixed end to end with
   regressions before the final 2,001-test run.
+  Exact-head hosted testing also revealed that three duplicated full-suite
+  workflows could remain pending indefinitely on a Linux pytest hang. Those
+  jobs now fail closed with bounded job and command timeouts plus periodic
+  Python thread dumps; a workflow-policy regression preserves the controls.
 
   PR 2B.1 schema v2 intentionally fails closed on a schema-v1 PR 2A journal.
   No operational v1 journal is known and none exists in the inspected runtime,
