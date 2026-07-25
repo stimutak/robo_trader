@@ -26,9 +26,9 @@ active subpackages and the required dashboard template are included in built
 wheels, broker safeguards remain explicit at direct `IB` users, and runtime
 artifacts and secrets remain excluded. Runtime dependency metadata and a true
 clean-install wheel gate remain assigned to PR 9. Gate A remains closed, the
-trader remains stopped. Dormant safety-core PR 2A is implemented on PR #97 and
-under review; it has no production imports or runtime wiring. PR 2B has not
-started.
+trader remains stopped. Dormant safety-core PR 2A merged through PR #97 as
+`d17b0d5b4f31ab15e2a9b138cca006c0103b7276`; it has no production imports or
+runtime wiring. PR 2B has not started.
 
 ## 1. Purpose
 
@@ -442,8 +442,8 @@ PR 2 is deliberately split into two separately reviewed changes:
 
 - **PR 2A / issue #91:** implement the immutable exact-value models, pure
   reduce-only policy, durable append-only journal, idempotency and reservation
-  rules, and package-boundary dormancy tests. PR #97 implements this stage but
-  is not yet merged.
+  rules, and package-boundary dormancy tests. PR #97 merged this stage as
+  `d17b0d5b4f31ab15e2a9b138cca006c0103b7276`.
 - **PR 2B:** integrate the reviewed safety core into active paper execution,
   stop-loss, kill-switch, circuit-breaker, and reconciliation paths. This stage
   has not started and must not be combined with PR 2A review.
@@ -1297,11 +1297,13 @@ Update after each merge.
   those unavailable reviews were recorded rather than counted as passes.
   Issue #94 closed and the source branch was deleted. PR 1C changes no runtime
   wiring or order authority. Gate A remains closed, the trader remains stopped,
-  and PR 2A / issue #91 is implemented in open PR #97 and under review. It is
-  not merged and grants no startup or order authority.
+  and PR 2A / issue #91 merged through PR #97 as
+  `d17b0d5b4f31ab15e2a9b138cca006c0103b7276`. The dormant merge grants no
+  startup or order authority.
 - PR 2: Staged as dormant PR 2A (issue #91) followed by separately reviewed
-  runtime-integration PR 2B. PR #97 implements PR 2A and remains under review;
-  PR 2B has not started.
+  runtime-integration PR 2B. PR #97 merged PR 2A on 2026-07-25 from exact
+  reviewed head `5cf0e4ec48178fdecde6794e920d6af7c67b58f8` as
+  `d17b0d5b4f31ab15e2a9b138cca006c0103b7276`; PR 2B has not started.
 
   PR 2A contains strict exact-`Decimal` models, account/portfolio-aware
   reduce-only validation, zero-crossing and over-close rejection, deterministic
@@ -1333,8 +1335,18 @@ Update after each merge.
   repeated concurrency coverage. A final independent review also found and
   verified the repair of a post-bind exception cleanup leak; the regression
   proves the binding map, SQLite connection, and guardian descriptor are all
-  released. Exact-head hosted-CI and final GitHub review evidence are still
-  required before merge and will be recorded after completion.
+  released.
+
+  Exact-head hosted CI passed every repository-owned build, Docker,
+  container-structure, Compose, lint, security, Trivy, code-quality,
+  bug-detection, and Python 3.10 through 3.12 unit/integration/performance job.
+  Exact-head Cursor security review found no medium, high, or critical finding,
+  and all three earlier GitHub Codex threads were fixed, replied to, and
+  resolved. A requested exact-head Codex rerun was unavailable because the
+  account reached its code-review usage limit. The external Claude action did
+  not review code because its revoked OAuth token returned HTTP 401 before
+  inference with zero input tokens, zero output tokens, and zero cost. Those
+  unavailable external reviews were recorded rather than counted as passes.
 
   This stage remains dormant and cannot authorize startup or order placement.
   Gate A remains closed, the trader remains stopped, and PR 2B plus PRs 3
