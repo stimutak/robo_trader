@@ -676,3 +676,45 @@ When Claude makes an error:
 - **NEVER add "Co-Authored-By" or any AI attribution to commit messages**
 - **NEVER mention Claude, AI, or any assistant in commit messages**
 - Write commit messages as if a human wrote them — concise, descriptive, no AI fingerprints
+
+---
+
+## Cursor Cloud specific instructions
+
+The Cursor Cloud VM is **Linux, Python 3.12**, not the macOS dev box the rest of this
+doc assumes. Dependencies are installed by the startup update script into a `.venv`
+(commands: `python3 -m venv .venv` + `pip install -r requirements.txt -r requirements-dev.txt`
++ `pip install -e .` + `pip install feedparser`). Full fresh-machine steps live in
+`DEV_SETUP.md`; only the cloud-specific caveats are captured here.
+
+### What can and cannot run in cloud
+- **`./START_TRADER.sh` and the trading runner (`runner_async`) do NOT work in cloud.**
+  They require a live IBKR Gateway (phone 2FA) plus macOS launchd/IBC. There is no mock
+  market-data feed, so the live trading loop cannot run end-to-end here. Do not launch
+  `START_TRADER.sh` in cloud — it is macOS/IBC/launchd-specific and will block on Gateway.
+- **The dashboard (`app.py`) + WebSocket server ARE the runnable/testable surface.** They
+  read the SQLite DB and open no IBKR connection. Start with `.venv/bin/python app.py`
+  (dashboard on `127.0.0.1:5555`, WebSocket on `127.0.0.1:8765`; the WS server is started
+  by `app.py`'s `__main__`). A red "Runner offline — no updates received" banner is
+  expected in cloud (no runner running); it is not a bug.
+
+### Non-obvious gotchas
+- **`feedparser` is a real runtime dependency missing from `requirements.txt`**
+  (`robo_trader/news_fetcher.py` imports it at module top level). The update script installs
+  it explicitly; keep that line if you touch the update script.
+- **`app.py` calls `load_config()` at import time** and the paper runtime contract is
+  fail-closed. `.env` (created from `.env.example`) must set `IBKR_ACCOUNT` to a `DU`-prefixed
+  paper id that is also listed in `IBKR_APPROVED_ACCOUNTS`, and `DASH_AUTH_ENABLED=false` for
+  headless dev. If `.env` is missing, recreate: `cp .env.example .env` then set
+  `IBKR_ACCOUNT=DU1234567` and `IBKR_APPROVED_ACCOUNTS=DU1234567`.
+- **`tensorflow` is intentionally not installed** on Python 3.12 (no wheel; guarded by
+  `python_version < "3.12"` in `requirements.txt`). ML code degrades gracefully via
+  `NEURAL_NETWORK_AVAILABLE`; this is expected, not a broken install.
+
+### Lint / test / run (from repo root, using the venv)
+- Lint: `.venv/bin/flake8 robo_trader/` and `.venv/bin/black --check robo_trader/`.
+- Tests: `.venv/bin/python -m pytest tests/ --ignore=tests/security -q` then
+  `.venv/bin/python -m pytest tests/security/ -q`. All pass; the ~7 skips are Docker-compose
+  and macOS launchd/`plutil` tests that are correctly skipped on Linux. `conftest.py` isolates
+  the DB via `RT_DB_PATH`, so tests never touch a live `trading_data.db`.
+- Run dashboard: `.venv/bin/python app.py` (see above).
