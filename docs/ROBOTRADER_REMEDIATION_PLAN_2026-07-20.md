@@ -443,20 +443,30 @@ A remains closed and the trader remains stopped.
 
 ### Staging and current status
 
-PR 2 is deliberately split into two separately reviewed changes:
+PR 2 is deliberately staged as a dormant core followed by separately reviewed
+runtime-integration changes:
 
 - **PR 2A / issue #91:** implement the immutable exact-value models, pure
   reduce-only policy, durable append-only journal, idempotency and reservation
   rules, and package-boundary dormancy tests. PR #97 merged this stage as
   `d17b0d5b4f31ab15e2a9b138cca006c0103b7276`.
-- **PR 2B:** integrate the reviewed safety core into active paper execution,
-  stop-loss, kill-switch, circuit-breaker, and reconciliation paths. This stage
-  has not started and must not be combined with PR 2A review.
+- **PR 2B.1 / issue #100:** establish paper runtime identity, trusted evidence
+  boundaries, and fail-closed startup journal replay without granting order
+  authority. PR #104 merged this stage as
+  `3ecdaa05b3352ddcd4519662b0fe957751f3fdb1`.
+- **PR 2B.2 / issue #101:** route paper exits through broker-bound reduce-only
+  authorization and separate hard safety blocks from entry-only soft blocks.
+  This stage is next and remains pending.
+- **PR 2B.3 / issue #102:** add exact settlement, ambiguity handling, and
+  crash/restart quarantine release. This stage remains pending.
 
-PR 2A grants no broker connection or submission authority by itself. The
-production runner, executor, stop monitor, launcher, and dashboard do not
-import it. Gate A remains closed, the trader remains stopped, and PR 2B plus
-the remaining Gate A work are required before any supervised paper start.
+PR 2A grants no broker connection or submission authority by itself. PR 2B.1
+now imports the safety runtime in the production runner and launcher only to
+bind identity and replay the journal before supervised process or Gateway
+mutation. It still does not call authorization, consume a production
+submission permit, or wire the executor/stop monitor to the safety coordinator.
+Gate A remains closed, the trader remains stopped, and PRs 2B.2, 2B.3, and the
+remaining Gate A work are required before any supervised paper start.
 
 ### Objective
 
