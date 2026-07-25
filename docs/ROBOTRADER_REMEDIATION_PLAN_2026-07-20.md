@@ -1,7 +1,7 @@
 # RoboTrader Remediation and Launch Plan
 
 Document date: 2026-07-20
-Last updated: 2026-07-24
+Last updated: 2026-07-25
 Status: Active execution plan
 Source baseline: repository audit at commit `51f0e99` on branch `main`
 Target: safe supervised paper operation first, then remote read-only access, then an explicitly gated limited live canary
@@ -411,7 +411,8 @@ other active subpackages.
 
 ### Done means
 
-- `robo_trader.safety` can be imported without activating broker behavior.
+- The package root is safe for PR 2A to add and import
+  `robo_trader.safety` without activating broker behavior.
 - A built wheel contains the dormant safety core and all other active
   subpackages once they are added.
 - Direct broker users retain the documented disconnect safeguard.
@@ -791,7 +792,7 @@ Make a green build mean the installable artifact, critical tests, security check
 - Safety tests are ignored by default.
 - Critical modules have zero coverage; `app.py` is excluded.
 - Performance jobs are no-ops.
-- Package metadata omits subpackages and runtime dependencies.
+- Package metadata omits runtime dependencies.
 - Security scans do not always scan installed application dependencies.
 - CI actions and container images use mutable references.
 - Model/runtime dependency versions drift.
@@ -799,7 +800,7 @@ Make a green build mean the installable artifact, critical tests, security check
 ### Step-by-step work
 
 1. Choose one authoritative CI workflow and remove contradictory duplicates.
-2. Package all `robo_trader` subpackages using package discovery.
+2. Preserve PR 1C's precise subpackage discovery and package-data allow-list.
 3. Declare runtime dependencies and split dev, test, ML, and operations extras.
 4. Create a reproducible lock with hashes for supported Python versions.
 5. Build a wheel and test it in a clean environment rather than relying on checkout imports.
