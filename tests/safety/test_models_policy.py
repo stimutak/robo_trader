@@ -10,6 +10,7 @@ from robo_trader.safety import (
     OrderIntent,
     OrderSide,
     RiskEffect,
+    SafetyDecision,
     TransportState,
     ValidationError,
     decimal_to_fixed,
@@ -67,6 +68,41 @@ def test_property_allowed_implies_both_authoritative_exposures_strictly_reduce(n
                     if decision.allowed:
                         assert quantity <= portfolio_abs
                         assert abs(decision.computed_target_quantity) < account_abs
+
+
+@pytest.mark.parametrize(
+    ("current_quantity", "target_quantity"),
+    [
+        (Decimal("10"), Decimal("-1")),
+        (Decimal("-10"), Decimal("1")),
+    ],
+)
+def test_direct_allow_decision_rejects_sign_crossing_reversal(
+    current_quantity,
+    target_quantity,
+):
+    with pytest.raises(ValidationError, match="must not cross through zero"):
+        SafetyDecision(
+            outcome=DecisionOutcome.ALLOW,
+            risk_effect=RiskEffect.REDUCING,
+            reason_codes=("REDUCE_ONLY_ALLOWED",),
+            current_quantity=current_quantity,
+            computed_target_quantity=target_quantity,
+            intent_fingerprint="a" * 64,
+        )
+
+
+@pytest.mark.parametrize("current_quantity", [Decimal("10"), Decimal("-10")])
+def test_direct_allow_decision_accepts_exact_close_to_zero(current_quantity):
+    decision = SafetyDecision(
+        outcome=DecisionOutcome.ALLOW,
+        risk_effect=RiskEffect.REDUCING,
+        reason_codes=("REDUCE_ONLY_ALLOWED",),
+        current_quantity=current_quantity,
+        computed_target_quantity=Decimal("0"),
+        intent_fingerprint="a" * 64,
+    )
+    assert decision.allowed
 
 
 @pytest.mark.parametrize(

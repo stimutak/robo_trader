@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 import pickle
 import sqlite3
 import stat
@@ -864,6 +865,219 @@ def test_initialize_refuses_to_reuse_an_unrelated_database(tmp_path):
     assert not type(path)(f"{path}-shm").exists()
 
 
+def test_initialize_rejects_existing_symlink_without_mutating_target(tmp_path, now):
+    target = tmp_path / "target.db"
+    SafetyJournal(target, clock=lambda: now).initialize()
+    target.chmod(0o644)
+    original_bytes = target.read_bytes()
+    original_stat = target.stat()
+    link = tmp_path / "safety.db"
+    link.symlink_to(target)
+
+    with pytest.raises(JournalIntegrityError, match="non-symlink regular file"):
+        SafetyJournal(link).initialize()
+
+    assert link.is_symlink()
+    assert target.read_bytes() == original_bytes
+    assert target.stat().st_mtime_ns == original_stat.st_mtime_ns
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644
+    assert not type(target)(f"{target}-wal").exists()
+    assert not type(target)(f"{target}-shm").exists()
+
+
+def test_replay_rejects_existing_symlink(tmp_path, now):
+    target = tmp_path / "target.db"
+    SafetyJournal(target, clock=lambda: now).initialize()
+    link = tmp_path / "safety.db"
+    link.symlink_to(target)
+
+    with pytest.raises(JournalIntegrityError, match="non-symlink regular file"):
+        SafetyJournal(link).replay()
+
+
+def _swap_open_and_restore(monkeypatch, path, replacement, parked):
+    import robo_trader.safety.journal as journal_module
+
+    real_connect = journal_module.sqlite3.connect
+
+    def connect_to_replacement(database, *args, **kwargs):
+        database_text = str(database)
+        if database_text != str(path) and not database_text.startswith(path.as_uri()):
+            return real_connect(database, *args, **kwargs)
+        path.replace(parked)
+        replacement.replace(path)
+        try:
+            connection = real_connect(database, *args, **kwargs)
+            connection.execute("SELECT COUNT(*) FROM safety_journal_events").fetchone()
+        finally:
+            path.replace(replacement)
+            parked.replace(path)
+        return connection
+
+    monkeypatch.setattr(journal_module.sqlite3, "connect", connect_to_replacement)
+    return real_connect
+
+
+def test_replay_rejects_swap_open_and_restore_of_same_schema(
+    tmp_path,
+    now,
+    monkeypatch,
+):
+    path = tmp_path / "safety.db"
+    replacement = tmp_path / "replacement.db"
+    SafetyJournal(path, clock=lambda: now).initialize()
+    replacement_journal = SafetyJournal(replacement, clock=lambda: now)
+    replacement_journal.initialize()
+    authorize(replacement_journal, now)
+    parked = tmp_path / "parked.db"
+    real_connect = _swap_open_and_restore(monkeypatch, path, replacement, parked)
+
+    with pytest.raises(JournalIntegrityError, match="identity changed"):
+        SafetyJournal(path).replay()
+
+    original = real_connect(f"{path.as_uri()}?mode=ro", uri=True)
+    substituted = real_connect(f"{replacement.as_uri()}?mode=ro", uri=True)
+    try:
+        assert original.execute("SELECT COUNT(*) FROM safety_journal_events").fetchone() == (0,)
+        assert substituted.execute("SELECT COUNT(*) FROM safety_journal_events").fetchone() == (3,)
+    finally:
+        original.close()
+        substituted.close()
+
+
+def test_replay_rejects_substitution_even_with_expected_inode_decoy(
+    tmp_path,
+    now,
+    monkeypatch,
+):
+    import robo_trader.safety.journal as journal_module
+
+    path = tmp_path / "safety.db"
+    replacement = tmp_path / "replacement.db"
+    parked = tmp_path / "parked.db"
+    SafetyJournal(path, clock=lambda: now).initialize()
+    replacement_journal = SafetyJournal(replacement, clock=lambda: now)
+    replacement_journal.initialize()
+    authorize(replacement_journal, now)
+    real_connect = journal_module.sqlite3.connect
+    held_descriptors = []
+
+    def connect_to_replacement_with_decoy(database, *args, **kwargs):
+        if not str(database).startswith(path.as_uri()):
+            return real_connect(database, *args, **kwargs)
+        path.replace(parked)
+        replacement.replace(path)
+        try:
+            connection = real_connect(database, *args, **kwargs)
+            connection.execute("SELECT COUNT(*) FROM safety_journal_events").fetchone()
+            held_descriptors.append(os.open(parked, os.O_RDONLY))
+        finally:
+            path.replace(replacement)
+            parked.replace(path)
+        return connection
+
+    monkeypatch.setattr(
+        journal_module.sqlite3,
+        "connect",
+        connect_to_replacement_with_decoy,
+    )
+    try:
+        with pytest.raises(JournalIntegrityError, match="identity changed"):
+            SafetyJournal(path).replay()
+    finally:
+        for file_descriptor in held_descriptors:
+            os.close(file_descriptor)
+
+
+def test_write_rejects_swap_open_and_restore_of_same_schema(
+    tmp_path,
+    now,
+    monkeypatch,
+):
+    path = tmp_path / "safety.db"
+    replacement = tmp_path / "replacement.db"
+    journal = SafetyJournal(path, clock=lambda: now)
+    journal.initialize()
+    replacement_journal = SafetyJournal(replacement, clock=lambda: now)
+    replacement_journal.initialize()
+    authorize(replacement_journal, now)
+    parked = tmp_path / "parked.db"
+    real_connect = _swap_open_and_restore(monkeypatch, path, replacement, parked)
+
+    with pytest.raises(JournalIntegrityError, match="identity changed"):
+        authorize(journal, now, key="must-not-write")
+
+    original = real_connect(f"{path.as_uri()}?mode=ro", uri=True)
+    substituted = real_connect(f"{replacement.as_uri()}?mode=ro", uri=True)
+    try:
+        assert original.execute("SELECT COUNT(*) FROM safety_journal_events").fetchone() == (0,)
+        assert substituted.execute("SELECT COUNT(*) FROM safety_journal_events").fetchone() == (3,)
+    finally:
+        original.close()
+        substituted.close()
+
+
+def test_fault_hook_can_replay_without_self_deadlock(tmp_path, now):
+    observations = []
+    journal = None
+
+    def inspect_uncommitted_state(stage, _event):
+        observations.append((stage, journal.replay().last_sequence))
+
+    journal = SafetyJournal(
+        tmp_path / "safety.db",
+        clock=lambda: now,
+        fault_hook=inspect_uncommitted_state,
+    )
+    journal.initialize()
+    authorize(journal, now)
+    assert observations == [
+        ("AFTER_APPEND", 0),
+        ("AFTER_APPEND", 0),
+        ("AFTER_APPEND", 0),
+        ("BEFORE_COMMIT", 0),
+    ]
+
+
+@pytest.mark.parametrize("guard_name", ["Py_GIL_DISABLED", "Py_TRACE_REFS"])
+def test_incompatible_cpython_abi_fails_before_pointer_access(
+    tmp_path,
+    monkeypatch,
+    guard_name,
+):
+    import robo_trader.safety.journal as journal_module
+
+    path = tmp_path / "plain.db"
+    connection = sqlite3.connect(path)
+    real_get_config_var = journal_module.sysconfig.get_config_var
+
+    def guarded_config(name):
+        if name == guard_name:
+            return 1
+        return real_get_config_var(name)
+
+    monkeypatch.setattr(journal_module.sysconfig, "get_config_var", guarded_config)
+    with pytest.raises(JournalIntegrityError, match="free-threaded or trace-reference"):
+        journal_module._sqlite_connection_file_identity(connection)
+    connection.close()
+
+
+def test_non_cpython_runtime_fails_before_pointer_access(tmp_path, monkeypatch):
+    import robo_trader.safety.journal as journal_module
+
+    path = tmp_path / "plain.db"
+    connection = sqlite3.connect(path)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            journal_module.sys,
+            "implementation",
+            SimpleNamespace(name="not-cpython"),
+        )
+        with pytest.raises(JournalIntegrityError, match="supported CPython"):
+            journal_module._sqlite_connection_file_identity(connection)
+    connection.close()
+
+
 def test_initialize_revalidates_same_connection_after_path_swap(
     tmp_path,
     now,
@@ -921,16 +1135,27 @@ def test_new_initialize_detects_swap_before_connection_binding(
     journal = SafetyJournal(path, clock=lambda: now)
     original_bind = journal._bind_connection_to_path
 
-    def swap_then_bind(connection, pre_connect_identity):
+    def swap_then_bind(
+        connection,
+        pre_connect_identity,
+        guardian_file_descriptor,
+    ):
         replacement.replace(path)
-        original_bind(connection, pre_connect_identity)
+        original_bind(
+            connection,
+            pre_connect_identity,
+            guardian_file_descriptor,
+        )
 
     monkeypatch.setattr(
         journal,
         "_bind_connection_to_path",
         swap_then_bind,
     )
-    with pytest.raises(JournalIntegrityError, match="identity changed"):
+    with pytest.raises(
+        JournalIntegrityError,
+        match="identity changed|moved or replaced",
+    ):
         journal.initialize()
 
     assert path.read_bytes() == original_bytes
@@ -946,6 +1171,48 @@ def test_new_initialize_detects_swap_before_connection_binding(
         } == {"trades"}
     finally:
         connection.close()
+
+
+def test_open_cleanup_releases_binding_after_post_bind_exception(
+    tmp_path,
+    now,
+    monkeypatch,
+):
+    path = tmp_path / "safety.db"
+    SafetyJournal(path, clock=lambda: now).initialize()
+    journal = SafetyJournal(path, clock=lambda: now)
+    original_bind = journal._bind_connection_to_path
+    captured = {}
+
+    def bind_then_interrupt(
+        connection,
+        expected_identity,
+        guardian_file_descriptor,
+    ):
+        original_bind(
+            connection,
+            expected_identity,
+            guardian_file_descriptor,
+        )
+        binding = journal._path_bindings[connection]
+        captured["connection"] = connection
+        captured["guardian_file_descriptor"] = binding.file_descriptor
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        journal,
+        "_bind_connection_to_path",
+        bind_then_interrupt,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        journal.replay()
+
+    assert journal._path_bindings == {}
+    with pytest.raises(OSError):
+        os.fstat(captured["guardian_file_descriptor"])
+    with pytest.raises(sqlite3.ProgrammingError):
+        captured["connection"].execute("SELECT 1")
+    assert SafetyJournal(path, clock=lambda: now).replay().last_sequence == 0
 
 
 def test_write_revalidates_replaced_path_before_mutating_it(tmp_path, now):

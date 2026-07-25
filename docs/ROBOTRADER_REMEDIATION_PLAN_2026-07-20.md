@@ -6,7 +6,7 @@ Status: Active execution plan
 Source baseline: repository audit at commit `51f0e99` on branch `main`
 Target: safe supervised paper operation first, then remote read-only access, then an explicitly gated limited live canary
 
-Current execution baseline (2026-07-24): `main` includes the truthful Phase 0
+Current execution baseline (2026-07-25): `main` includes the truthful Phase 0
 CI gates from PR #83 (`7f5de0a`) and runtime-stability fixes from PR #81
 (`b7e5005`). PR #82 completed PR 1 and merged as `393f533`. PR #87 completed
 PR 1A and merged as `4cafb782cbf43ff4397f1b89b42d5f657eceea8e`,
@@ -26,7 +26,9 @@ active subpackages and the required dashboard template are included in built
 wheels, broker safeguards remain explicit at direct `IB` users, and runtime
 artifacts and secrets remain excluded. Runtime dependency metadata and a true
 clean-install wheel gate remain assigned to PR 9. Gate A remains closed, the
-trader remains stopped, and dormant safety-core PR 2A is the next code change.
+trader remains stopped. Dormant safety-core PR 2A is implemented on PR #97 and
+under review; it has no production imports or runtime wiring. PR 2B has not
+started.
 
 ## 1. Purpose
 
@@ -433,6 +435,23 @@ database, safety state, or order authority. It cannot authorize startup. Gate
 A remains closed and the trader remains stopped.
 
 ## PR 2 - Implement a reduce-only safety plane
+
+### Staging and current status
+
+PR 2 is deliberately split into two separately reviewed changes:
+
+- **PR 2A / issue #91:** implement the immutable exact-value models, pure
+  reduce-only policy, durable append-only journal, idempotency and reservation
+  rules, and package-boundary dormancy tests. PR #97 implements this stage but
+  is not yet merged.
+- **PR 2B:** integrate the reviewed safety core into active paper execution,
+  stop-loss, kill-switch, circuit-breaker, and reconciliation paths. This stage
+  has not started and must not be combined with PR 2A review.
+
+PR 2A grants no broker connection or submission authority by itself. The
+production runner, executor, stop monitor, launcher, and dashboard do not
+import it. Gate A remains closed, the trader remains stopped, and PR 2B plus
+the remaining Gate A work are required before any supervised paper start.
 
 ### Objective
 
@@ -1278,10 +1297,48 @@ Update after each merge.
   those unavailable reviews were recorded rather than counted as passes.
   Issue #94 closed and the source branch was deleted. PR 1C changes no runtime
   wiring or order authority. Gate A remains closed, the trader remains stopped,
-  and PR 2A / issue #91 is next.
+  and PR 2A / issue #91 is implemented in open PR #97 and under review. It is
+  not merged and grants no startup or order authority.
 - PR 2: Staged as dormant PR 2A (issue #91) followed by separately reviewed
-  runtime-integration PR 2B. PR 2A is next; neither stage is started or wired
-  into production runtime yet.
+  runtime-integration PR 2B. PR #97 implements PR 2A and remains under review;
+  PR 2B has not started.
+
+  PR 2A contains strict exact-`Decimal` models, account/portfolio-aware
+  reduce-only validation, zero-crossing and over-close rejection, deterministic
+  idempotency, one-shot submission permits, dual-scope active reservations,
+  crash/unknown-outcome quarantine, exact terminal reconciliation, and a
+  dedicated append-only SQLite hash-chain journal. Journal initialization is
+  explicit, owner-only, rejects unrelated databases and symlinked final paths,
+  and binds the actual SQLite-owned native descriptor to the independently
+  opened journal device/inode around reads and mutations. The descriptor proof
+  fails closed outside supported GIL-enabled CPython 3.10 through 3.14 with a
+  default Unix SQLite VFS. Tests also prove that importing
+  `robo_trader.safety` does not import or wire any production runtime.
+
+  Current PR evidence: the focused safety and package-boundary suite passes 103
+  tests. The full repository suite passes 1,667 tests with 5 skipped and 20
+  known warnings. Black, isort, Flake8, and Bandit pass for the new package and
+  tests.
+  Independent code, bug, trading-safety, style, and challenger reviews passed
+  before GitHub review. GitHub Codex then identified three valid gaps: stale
+  plan status, direct-model zero-crossing acceptance, and existing-symlink
+  journal redirection. All three are remediated on the branch with regression
+  coverage. Post-fix adversarial review then exposed same-schema
+  swap-open-restore races in both read and write paths, a false-attribution
+  weakness in process-wide descriptor enumeration, a callback self-deadlock,
+  and unsafe CPython ABI assumptions. The final design compares the native
+  descriptor owned by SQLite itself with an independent `O_NOFOLLOW` guardian,
+  rejects unsupported interpreter/VFS builds before pointer access, and has
+  focused substitution, decoy-descriptor, ABI-guard, reentrant-callback, and
+  repeated concurrency coverage. A final independent review also found and
+  verified the repair of a post-bind exception cleanup leak; the regression
+  proves the binding map, SQLite connection, and guardian descriptor are all
+  released. Exact-head hosted-CI and final GitHub review evidence are still
+  required before merge and will be recorded after completion.
+
+  This stage remains dormant and cannot authorize startup or order placement.
+  Gate A remains closed, the trader remains stopped, and PR 2B plus PRs 3
+  through 5 and relevant PR 7 work remain outstanding.
 - PR 3: Not started
 - PR 4: Not started
 - PR 5: Not started

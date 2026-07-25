@@ -581,6 +581,11 @@ class SafetyDecision:
                 or self.computed_target_quantity.copy_abs() >= self.current_quantity.copy_abs()
             ):
                 raise ValidationError("ALLOW decision must strictly reduce absolute exposure")
+            if (
+                self.computed_target_quantity != 0
+                and self.computed_target_quantity.is_signed() != self.current_quantity.is_signed()
+            ):
+                raise ValidationError("ALLOW decision must not cross through zero")
 
     @property
     def allowed(self) -> bool:

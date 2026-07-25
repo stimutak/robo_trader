@@ -10,17 +10,22 @@ uses a fresh SQLite connection plus ``BEGIN IMMEDIATE``.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
 import sqlite3
 import stat
+import sys
+import sysconfig
 import threading
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional, Tuple
+
+import _sqlite3
 
 from .models import (
     MODEL_VERSION,
@@ -64,6 +69,54 @@ from .policy import evaluate_reduce_only
 JOURNAL_SCHEMA_VERSION = 1
 _ZERO_HASH = "0" * 64
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_SQLITE_FCNTL_FILE_POINTER = 7
+_SQLITE_FCNTL_VFS_POINTER = 27
+_SQLITE_OK = 0
+_SQLITE_C_API = None
+_SQLITE_UNIX_VFS_NAMES = frozenset(
+    {
+        b"unix",
+        b"unix-afp",
+        b"unix-dotfile",
+        b"unix-excl",
+        b"unix-flock",
+        b"unix-nfs",
+        b"unix-none",
+        b"unix-posix",
+        b"unix-proxy",
+    }
+)
+
+
+class _CPythonSQLiteConnectionHead(ctypes.Structure):
+    """Stable leading fields of CPython's pysqlite Connection on supported versions."""
+
+    _fields_ = (
+        ("ob_refcnt", ctypes.c_ssize_t),
+        ("ob_type", ctypes.c_void_p),
+        ("db", ctypes.c_void_p),
+    )
+
+
+class _SQLiteVFSHead(ctypes.Structure):
+    _fields_ = (
+        ("i_version", ctypes.c_int),
+        ("os_file_size", ctypes.c_int),
+        ("max_pathname", ctypes.c_int),
+        ("next_vfs", ctypes.c_void_p),
+        ("name", ctypes.c_char_p),
+    )
+
+
+class _UnixSQLiteFileHead(ctypes.Structure):
+    """Leading fields of SQLite's default unix VFS ``unixFile``."""
+
+    _fields_ = (
+        ("methods", ctypes.c_void_p),
+        ("vfs", ctypes.c_void_p),
+        ("inode", ctypes.c_void_p),
+        ("file_descriptor", ctypes.c_int),
+    )
 
 
 class JournalError(RuntimeError):
@@ -90,6 +143,99 @@ class StateTransitionError(JournalError):
     pass
 
 
+def _sqlite_c_api():
+    """Load the SQLite C API used by CPython's active ``_sqlite3`` extension."""
+
+    global _SQLITE_C_API
+    if sys.implementation.name != "cpython" or not ((3, 10) <= sys.version_info[:2] <= (3, 14)):
+        raise JournalIntegrityError(
+            "SQLite inode binding requires supported CPython 3.10 through 3.14"
+        )
+    if (
+        sysconfig.get_config_var("Py_GIL_DISABLED")
+        or sysconfig.get_config_var("Py_TRACE_REFS")
+        or "t" in getattr(sys, "abiflags", "")
+        or hasattr(sys, "getobjects")
+    ):
+        raise JournalIntegrityError(
+            "SQLite inode binding rejects free-threaded or trace-reference CPython"
+        )
+    if _SQLITE_C_API is not None:
+        return _SQLITE_C_API
+    try:
+        api = ctypes.PyDLL(_sqlite3.__file__)
+        api.sqlite3_db_filename.argtypes = (ctypes.c_void_p, ctypes.c_char_p)
+        api.sqlite3_db_filename.restype = ctypes.c_char_p
+        api.sqlite3_file_control.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        )
+        api.sqlite3_file_control.restype = ctypes.c_int
+    except (AttributeError, OSError) as exc:
+        raise JournalIntegrityError(
+            "active SQLite library cannot prove database-file identity"
+        ) from exc
+    _SQLITE_C_API = api
+    return api
+
+
+def _sqlite_connection_file_identity(
+    connection: sqlite3.Connection,
+) -> Tuple[int, Tuple[int, int]]:
+    """Return the descriptor and inode owned by SQLite's default unix VFS."""
+
+    if type(connection) is not sqlite3.Connection:
+        raise JournalIntegrityError("journal connection must be an exact sqlite3.Connection")
+    api = _sqlite_c_api()
+    pointer = _CPythonSQLiteConnectionHead.from_address(id(connection)).db
+    if not pointer:
+        raise JournalIntegrityError("journal connection has no active SQLite handle")
+    filename = api.sqlite3_db_filename(pointer, b"main")
+    if not filename:
+        raise JournalIntegrityError("journal connection has no main database filename")
+    vfs_pointer = ctypes.c_void_p()
+    result = api.sqlite3_file_control(
+        pointer,
+        b"main",
+        _SQLITE_FCNTL_VFS_POINTER,
+        ctypes.byref(vfs_pointer),
+    )
+    if result != _SQLITE_OK or not vfs_pointer.value:
+        raise JournalIntegrityError("SQLite cannot identify the journal VFS")
+    vfs = _SQLiteVFSHead.from_address(vfs_pointer.value)
+    if (
+        not vfs.name
+        or vfs.name not in _SQLITE_UNIX_VFS_NAMES
+        or vfs.os_file_size < ctypes.sizeof(_UnixSQLiteFileHead)
+    ):
+        raise JournalIntegrityError("safety journal requires SQLite's default unix VFS")
+    file_pointer = ctypes.c_void_p()
+    result = api.sqlite3_file_control(
+        pointer,
+        b"main",
+        _SQLITE_FCNTL_FILE_POINTER,
+        ctypes.byref(file_pointer),
+    )
+    if result != _SQLITE_OK or not file_pointer.value:
+        raise JournalIntegrityError("SQLite cannot expose its opened journal file")
+    sqlite_file = _UnixSQLiteFileHead.from_address(file_pointer.value)
+    if (
+        not sqlite_file.methods
+        or sqlite_file.vfs != vfs_pointer.value
+        or sqlite_file.file_descriptor < 0
+    ):
+        raise JournalIntegrityError("SQLite returned an invalid unix journal file")
+    try:
+        file_stat = os.fstat(sqlite_file.file_descriptor)
+    except OSError as exc:
+        raise JournalIntegrityError("SQLite journal descriptor is not open") from exc
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise JournalIntegrityError("SQLite journal descriptor is not a regular file")
+    return sqlite_file.file_descriptor, (file_stat.st_dev, file_stat.st_ino)
+
+
 class _RejectedAuthorization:
     """A denial that must commit before its public exception is raised."""
 
@@ -106,6 +252,7 @@ Clock = Callable[[], datetime]
 @dataclass(frozen=True)
 class _PathBinding:
     file_descriptor: int
+    sqlite_file_descriptor: int
     device: int
     inode: int
 
@@ -132,7 +279,11 @@ class SafetyJournal:
             raise TypeError("clock must be callable")
         if fault_hook is not None and not callable(fault_hook):
             raise TypeError("fault_hook must be callable")
-        self._path = Path(database_path).expanduser().resolve(strict=False)
+        # Keep the final component lexical so every open can reject symlinks.
+        # ``Path.resolve`` would follow an existing link before our lstat and
+        # O_NOFOLLOW checks had a chance to validate it.
+        expanded_path = Path(database_path).expanduser()
+        self._path = expanded_path.parent.resolve(strict=False) / expanded_path.name
         self._busy_timeout_ms = busy_timeout_ms
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._fault_hook = fault_hook
@@ -253,7 +404,9 @@ class SafetyJournal:
     def _assert_existing_path_is_dedicated(self) -> None:
         """Inspect an existing path read-only before WAL or chmod can mutate it."""
 
-        if not self._path.exists():
+        try:
+            self._path_identity()
+        except FileNotFoundError:
             return
         connection = sqlite3.connect(
             f"{self._path.as_uri()}?mode=ro",
@@ -930,24 +1083,29 @@ class SafetyJournal:
     def replay(self) -> ReplayState:
         """Replay through a read-only connection; never returns a permit."""
 
-        if not self._path.is_file():
+        try:
+            expected_identity = self._path_identity()
+        except FileNotFoundError:
             raise JournalNotInitialized("safety journal has not been initialized")
-        connection = sqlite3.connect(
+        connection = self._open_bound_connection(
             f"{self._path.as_uri()}?mode=ro",
             uri=True,
-            timeout=self._busy_timeout_ms / 1000,
-            isolation_level=None,
+            expected_identity=expected_identity,
+            writable=False,
         )
         try:
+            self._assert_connection_path_identity(connection)
             connection.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
             connection.execute("PRAGMA query_only = ON")
             connection.set_authorizer(self._read_only_authorizer)
             result = connection.execute("PRAGMA integrity_check").fetchone()
             if result != ("ok",):
                 raise JournalIntegrityError(f"SQLite integrity check failed: {result!r}")
-            return self._replay_connection(connection)
+            state = self._replay_connection(connection)
+            self._assert_connection_path_identity(connection)
+            return state
         finally:
-            connection.close()
+            self._close_connection(connection)
 
     verify_integrity = replay
 
@@ -988,18 +1146,17 @@ class SafetyJournal:
             database = f"{self._path.as_uri()}?mode=rw"
             uri = True
         try:
-            connection = sqlite3.connect(
+            connection = self._open_bound_connection(
                 database,
                 uri=uri,
-                timeout=self._busy_timeout_ms / 1000,
-                isolation_level=None,
+                expected_identity=pre_connect_identity,
+                writable=True,
             )
         except (OSError, sqlite3.DatabaseError) as exc:
             raise JournalIntegrityError(
                 "safety journal path is not a writable SQLite database"
             ) from exc
         try:
-            self._bind_connection_to_path(connection, pre_connect_identity)
             connection.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
             connection.execute("PRAGMA foreign_keys = ON")
             self._validate_connection_before_mutation(
@@ -1032,29 +1189,70 @@ class SafetyJournal:
     def _bind_connection_to_path(
         self,
         connection: sqlite3.Connection,
-        pre_connect_identity: Tuple[int, int],
+        expected_identity: Tuple[int, int],
+        guardian_file_descriptor: int,
     ) -> None:
-        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        guardian_stat = os.fstat(guardian_file_descriptor)
+        guardian_identity = (guardian_stat.st_dev, guardian_stat.st_ino)
+        sqlite_file_descriptor, sqlite_identity = _sqlite_connection_file_identity(connection)
+        path_identity = self._path_identity()
+        if (
+            not stat.S_ISREG(guardian_stat.st_mode)
+            or guardian_identity != expected_identity
+            or sqlite_identity != expected_identity
+            or path_identity != expected_identity
+        ):
+            raise JournalIntegrityError("safety journal path identity changed while opening")
+        self._path_bindings[connection] = _PathBinding(
+            file_descriptor=guardian_file_descriptor,
+            sqlite_file_descriptor=sqlite_file_descriptor,
+            device=expected_identity[0],
+            inode=expected_identity[1],
+        )
+
+    def _open_bound_connection(
+        self,
+        database: str,
+        *,
+        uri: bool,
+        expected_identity: Tuple[int, int],
+        writable: bool,
+    ) -> sqlite3.Connection:
+        flags = (
+            (os.O_RDWR if writable else os.O_RDONLY)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
         try:
-            file_descriptor = os.open(self._path, flags)
+            guardian_file_descriptor = os.open(self._path, flags)
         except OSError as exc:
             raise JournalIntegrityError(
                 "cannot bind the opened journal to its filesystem path"
             ) from exc
-        file_stat = os.fstat(file_descriptor)
-        identity = (file_stat.st_dev, file_stat.st_ino)
+        connection: Optional[sqlite3.Connection] = None
         try:
-            path_identity = self._path_identity()
-            if identity != path_identity or identity != pre_connect_identity:
-                raise JournalIntegrityError("safety journal path identity changed while opening")
+            connection = sqlite3.connect(
+                database,
+                uri=uri,
+                timeout=self._busy_timeout_ms / 1000,
+                isolation_level=None,
+            )
+            self._bind_connection_to_path(
+                connection,
+                expected_identity,
+                guardian_file_descriptor,
+            )
         except BaseException:
-            os.close(file_descriptor)
+            binding = self._path_bindings.pop(connection, None) if connection is not None else None
+            try:
+                if connection is not None:
+                    connection.close()
+            finally:
+                os.close(
+                    binding.file_descriptor if binding is not None else guardian_file_descriptor
+                )
             raise
-        self._path_bindings[connection] = _PathBinding(
-            file_descriptor=file_descriptor,
-            device=identity[0],
-            inode=identity[1],
-        )
+        return connection
 
     def _assert_connection_path_identity(
         self,
@@ -1062,9 +1260,10 @@ class SafetyJournal:
     ) -> None:
         binding = self._path_bindings.get(connection)
         if binding is None:
-            raise JournalIntegrityError("writable journal connection lacks a path binding")
+            raise JournalIntegrityError("journal connection lacks a path binding")
         try:
-            file_stat = os.fstat(binding.file_descriptor)
+            guardian_stat = os.fstat(binding.file_descriptor)
+            sqlite_file_descriptor, sqlite_identity = _sqlite_connection_file_identity(connection)
             path_identity = self._path_identity()
         except (OSError, JournalIntegrityError) as exc:
             raise JournalIntegrityError(
@@ -1072,8 +1271,10 @@ class SafetyJournal:
             ) from exc
         identity = (binding.device, binding.inode)
         if (
-            not stat.S_ISREG(file_stat.st_mode)
-            or (file_stat.st_dev, file_stat.st_ino) != identity
+            not stat.S_ISREG(guardian_stat.st_mode)
+            or (guardian_stat.st_dev, guardian_stat.st_ino) != identity
+            or sqlite_file_descriptor != binding.sqlite_file_descriptor
+            or sqlite_identity != identity
             or path_identity != identity
         ):
             raise JournalIntegrityError(
