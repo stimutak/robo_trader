@@ -1392,21 +1392,22 @@ Update after each merge.
   journal verification without importing side-effectful RoboTrader runtime
   modules. Dedicated tests prove same-identity symlink rejection, fresh and
   incomplete virtual-environment bootstrap, and fail-closed handling of a
-  partially successful dependency installation. Two independent reviews
-  returned PASS on the repaired exact tree. The focused late-fix suite passed
-  77 tests; the final full local suite passed 1,801 tests with 5 expected skips
-  and 20 known warnings. Black, isort, Flake8, Bash syntax, and diff checks
-  passed.
+  partially successful dependency installation. Two independent local agent
+  reviews returned PASS on the repaired exact tree; their durable summaries are
+  recorded in `docs/reviews/PR2B1_LOCAL_REVIEW_EVIDENCE_2026-07-25.md`. A
+  separate trading-safety review also passed for the symlink boundary. The
+  focused late-fix suite passed 77 tests; the final full local suite passed
+  1,801 tests with 5 expected skips and 20 known warnings. Black, isort,
+  Flake8, Bash syntax, and diff checks passed.
 
-  All 26 repository-owned exact-head hosted checks passed: Python 3.10 through
-  3.12, production unit/integration/performance jobs, lint, security, Docker,
-  container structure, Compose, build, Trivy, BugBot, and the Cursor
-  vulnerability scan. Both late Codex review threads were replied to and
-  resolved. The external Claude action provided no validation because its
-  revoked OAuth token returned HTTP 401 before inference with zero input or
-  output tokens. That unavailable review was recorded rather than counted as a
-  pass. The merge grants no order authority or startup approval. Gate A remains
-  closed and the trader remains stopped.
+  Twenty-six exact-head checks succeeded: 24 GitHub Actions jobs, GitHub
+  Advanced Security Trivy, and the external Cursor vulnerability scan. Eleven
+  non-applicable jobs were skipped and Cursor Bugbot was neutral. Both late
+  Codex review threads were replied to and resolved. The Claude-backed review
+  workflow failed only because its revoked OAuth token returned HTTP 401 before
+  inference with zero input or output tokens; it produced no code verdict and
+  was not counted as a pass. The merge grants no order authority or startup
+  approval. Gate A remains closed and the trader remains stopped.
 - PR 3: Not started
 - PR 4: Not started
 - PR 5: Not started
