@@ -10,8 +10,11 @@ This implements Phase 1 F3: Async Database Operations
 
 import asyncio
 import os
+import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -26,6 +29,38 @@ DB_PATH = Path(os.getenv("RT_DB_PATH", "trading_data.db"))
 
 # Default portfolio ID for backward compatibility
 DEFAULT_PORTFOLIO_ID = "default"
+
+
+class SafetyAllocationSnapshotError(ValidationError):
+    """Stored allocation state cannot form authoritative safety evidence."""
+
+
+@dataclass(frozen=True)
+class SafetyPortfolioAllocation:
+    """One validated portfolio allocation from a coherent database snapshot."""
+
+    portfolio_id: str
+    symbol: str
+    quantity: Decimal
+    updated_at: Optional[datetime]
+
+
+@dataclass(frozen=True)
+class SafetyAllocationSnapshot:
+    """Immutable cross-portfolio allocation truth for one symbol.
+
+    The current ledger schema has no authoritative broker contract identifier.
+    This object therefore must be bound to a separately qualified broker
+    contract before it can contribute to order authorization.
+    """
+
+    snapshot_id: str
+    observed_at: datetime
+    symbol: str
+    allocations: Tuple[SafetyPortfolioAllocation, ...]
+    aggregate_allocated_quantity: Decimal
+    has_offsetting_allocations: bool
+    complete: bool
 
 
 class AsyncTradingDatabase:
@@ -782,6 +817,236 @@ class AsyncTradingDatabase:
                 }
                 for row in rows
             ]
+
+    async def get_safety_allocation_snapshot(
+        self,
+        symbol: str,
+    ) -> SafetyAllocationSnapshot:
+        """Read authoritative allocation truth for ``symbol`` without mutation.
+
+        This boundary intentionally does not use ``PortfolioScopedDB``.  It
+        derives the portfolio universe from the underlying ``portfolios`` table
+        and reads all matching ``positions`` rows in one SELECT inside one
+        read-only SQLite transaction.  Missing position rows are represented as
+        exact zero allocations; orphaned, duplicate, future-dated, or malformed
+        rows fail closed instead of being silently omitted.
+
+        The returned identity and observation time are created by this method,
+        not accepted from a caller.  This prevents a caller from relabelling
+        stale or partial evidence as a new coherent snapshot.  The returned
+        ``observed_at`` is the freshness clock for runtime consumption.
+
+        ``positions.timestamp`` is validated as UTC, non-future provenance but
+        is not required to be recent: the existing schema records mutation
+        time, not a heartbeat.  The current schema also has no broker conId, so
+        this symbol-only allocation snapshot cannot establish broker identity.
+        Runtime must bind it to independently qualified contract/conId evidence.
+        """
+        try:
+            symbol = DatabaseValidator.validate_symbol(symbol)
+        except ValidationError as exc:
+            raise SafetyAllocationSnapshotError("snapshot symbol is invalid") from exc
+
+        database_uri = self.db_path.expanduser().resolve().as_uri() + "?mode=ro"
+        query = """
+            SELECT
+                definitions.id AS registry_portfolio_id,
+                positions.id AS position_id,
+                positions.portfolio_id AS stored_portfolio_id,
+                positions.symbol AS stored_symbol,
+                positions.quantity AS stored_quantity,
+                typeof(positions.quantity) AS quantity_storage_type,
+                positions.timestamp AS stored_timestamp,
+                typeof(positions.timestamp) AS timestamp_storage_type
+            FROM portfolios AS definitions
+            LEFT JOIN positions
+              ON lower(trim(positions.portfolio_id)) = lower(trim(definitions.id))
+             AND upper(trim(positions.symbol)) = ?
+
+            UNION ALL
+
+            SELECT
+                NULL AS registry_portfolio_id,
+                positions.id AS position_id,
+                positions.portfolio_id AS stored_portfolio_id,
+                positions.symbol AS stored_symbol,
+                positions.quantity AS stored_quantity,
+                typeof(positions.quantity) AS quantity_storage_type,
+                positions.timestamp AS stored_timestamp,
+                typeof(positions.timestamp) AS timestamp_storage_type
+            FROM positions
+            WHERE upper(trim(positions.symbol)) = ?
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM portfolios AS definitions
+                    WHERE lower(trim(definitions.id)) =
+                          lower(trim(positions.portfolio_id))
+              )
+
+            ORDER BY registry_portfolio_id, stored_portfolio_id, position_id
+        """
+
+        async with aiosqlite.connect(database_uri, uri=True) as conn:
+            await conn.execute("BEGIN")
+            try:
+                # Bind freshness conservatively before the SELECT establishes
+                # its SQLite snapshot. If the query waits, the evidence can
+                # only appear older, never newer than the rows it observed.
+                observed_at = datetime.now(timezone.utc)
+                cursor = await conn.execute(query, (symbol, symbol))
+                rows = await cursor.fetchall()
+                row_timestamp_upper_bound = datetime.now(timezone.utc)
+            finally:
+                # Explicitly end the read transaction.  The URI is mode=ro, so
+                # this method cannot mutate the ledger even if later refactored.
+                await conn.rollback()
+
+        if not rows:
+            raise SafetyAllocationSnapshotError(
+                "allocation snapshot is incomplete: no portfolio definitions"
+            )
+
+        allocations: List[SafetyPortfolioAllocation] = []
+        seen_portfolio_ids = set()
+        integer_quantities: List[int] = []
+
+        for row in rows:
+            (
+                registry_portfolio_id,
+                position_id,
+                stored_portfolio_id,
+                stored_symbol,
+                stored_quantity,
+                quantity_storage_type,
+                stored_timestamp,
+                timestamp_storage_type,
+            ) = row
+
+            raw_portfolio_id = (
+                stored_portfolio_id if position_id is not None else registry_portfolio_id
+            )
+            try:
+                portfolio_id = DatabaseValidator.validate_portfolio_id(raw_portfolio_id)
+            except ValidationError as exc:
+                raise SafetyAllocationSnapshotError(
+                    "allocation snapshot contains an invalid portfolio_id"
+                ) from exc
+
+            try:
+                registry_id = DatabaseValidator.validate_portfolio_id(registry_portfolio_id)
+            except ValidationError as exc:
+                raise SafetyAllocationSnapshotError(
+                    f"allocation for portfolio {portfolio_id!r} is orphaned"
+                ) from exc
+
+            if registry_id != portfolio_id:
+                raise SafetyAllocationSnapshotError(
+                    f"allocation for portfolio {portfolio_id!r} is orphaned"
+                )
+            if portfolio_id in seen_portfolio_ids:
+                raise SafetyAllocationSnapshotError(
+                    f"duplicate allocation for portfolio {portfolio_id!r}"
+                )
+            seen_portfolio_ids.add(portfolio_id)
+
+            if position_id is None:
+                quantity_int = 0
+                updated_at = None
+            else:
+                try:
+                    stored_symbol_normalized = DatabaseValidator.validate_symbol(stored_symbol)
+                except ValidationError as exc:
+                    raise SafetyAllocationSnapshotError(
+                        f"allocation for portfolio {portfolio_id!r} has an invalid symbol"
+                    ) from exc
+                if stored_symbol_normalized != symbol or stored_symbol != stored_symbol_normalized:
+                    raise SafetyAllocationSnapshotError(
+                        f"allocation for portfolio {portfolio_id!r} has a "
+                        "noncanonical or mismatched symbol"
+                    )
+
+                if quantity_storage_type != "integer" or type(stored_quantity) is not int:
+                    raise SafetyAllocationSnapshotError(
+                        f"allocation for portfolio {portfolio_id!r} is not stored " "as an integer"
+                    )
+                try:
+                    quantity_int = DatabaseValidator.validate_quantity(
+                        stored_quantity, allow_negative=True
+                    )
+                except ValidationError as exc:
+                    raise SafetyAllocationSnapshotError(
+                        f"allocation for portfolio {portfolio_id!r} has an " "invalid quantity"
+                    ) from exc
+
+                if (
+                    timestamp_storage_type != "text"
+                    or not isinstance(stored_timestamp, str)
+                    or len(stored_timestamp) < 19
+                ):
+                    raise SafetyAllocationSnapshotError(
+                        f"allocation for portfolio {portfolio_id!r} has an " "invalid timestamp"
+                    )
+                try:
+                    parsed_timestamp = datetime.fromisoformat(
+                        stored_timestamp.replace("Z", "+00:00")
+                    )
+                except ValueError as exc:
+                    raise SafetyAllocationSnapshotError(
+                        f"allocation for portfolio {portfolio_id!r} has an " "invalid timestamp"
+                    ) from exc
+                if parsed_timestamp.tzinfo is None:
+                    updated_at = parsed_timestamp.replace(tzinfo=timezone.utc)
+                elif parsed_timestamp.utcoffset() == timedelta(0):
+                    updated_at = parsed_timestamp.astimezone(timezone.utc)
+                else:
+                    raise SafetyAllocationSnapshotError(
+                        f"allocation for portfolio {portfolio_id!r} timestamp " "is not UTC"
+                    )
+
+                age = row_timestamp_upper_bound - updated_at
+                if age < timedelta(0):
+                    raise SafetyAllocationSnapshotError(
+                        f"allocation for portfolio {portfolio_id!r} has a " "future timestamp"
+                    )
+                if updated_at < datetime(2000, 1, 1, tzinfo=timezone.utc):
+                    raise SafetyAllocationSnapshotError(
+                        f"allocation for portfolio {portfolio_id!r} has an "
+                        "implausibly old timestamp"
+                    )
+
+            integer_quantities.append(quantity_int)
+            allocations.append(
+                SafetyPortfolioAllocation(
+                    portfolio_id=portfolio_id,
+                    symbol=symbol,
+                    quantity=Decimal(quantity_int),
+                    updated_at=updated_at,
+                )
+            )
+
+        # Sum integers first, then cross the exact-Decimal boundary.  Decimal
+        # addition is context-sensitive for very large values; this ordering
+        # cannot round a valid aggregate.
+        aggregate = Decimal(sum(integer_quantities))
+        has_positive = any(quantity > 0 for quantity in integer_quantities)
+        has_negative = any(quantity < 0 for quantity in integer_quantities)
+
+        # Safety boundary text rejects strings that merely resemble raw broker
+        # account numbers (for example a random ``f`` followed by digits).
+        # Encode UUID nibbles with a letters-only alphabet so a random snapshot
+        # identifier can never trip that fail-closed secret detector.
+        snapshot_nonce = uuid.uuid4().hex.translate(
+            str.maketrans("0123456789abcdef", "ghjkmnpqrstvwxyz")
+        )
+        return SafetyAllocationSnapshot(
+            snapshot_id=f"allocation-db-{snapshot_nonce}",
+            observed_at=observed_at,
+            symbol=symbol,
+            allocations=tuple(sorted(allocations, key=lambda allocation: allocation.portfolio_id)),
+            aggregate_allocated_quantity=aggregate,
+            has_offsetting_allocations=has_positive and has_negative,
+            complete=True,
+        )
 
     async def has_recent_buy_trade(
         self,

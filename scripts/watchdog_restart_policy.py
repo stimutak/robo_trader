@@ -23,6 +23,7 @@ MAX_AUDIT_BYTES: Final = 64 * 1024
 MAX_NONTERMINAL_AGE_SECONDS: Final = 5 * 60
 MAX_FUTURE_SKEW_SECONDS: Final = 5
 TERMINAL_EXITS: Final = {
+    ("paper_safety_journal_replay_blocked", 7),
     ("unprotected_existing_positions", 6),
 }
 RESTARTABLE_EXITS: Final = {

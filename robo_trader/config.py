@@ -8,6 +8,7 @@ with schema validation, environment-specific settings, and equity-specific const
 import hashlib
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from enum import Enum
@@ -18,6 +19,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .logger import get_logger
+from .runtime_contract_constants import PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
 from .utils.config_validator import ConfigValidator, EnhancedTradingConfig
 from .utils.secure_config import ConfigValidationError, SecureConfig
 
@@ -28,6 +30,30 @@ PAPER_PORTS = frozenset({4002})
 LIVE_PORTS = frozenset({7496, 4001})
 PAPER_ONLY_EXECUTION_SOURCE = "paper_simulator"
 BACKTEST_EXECUTION_SOURCE = "offline_backtest"
+_OPAQUE_SAFETY_ACCOUNT_SCOPE_RE = re.compile(r"^acct_v1_[0-9a-f]{64}$")
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _resolve_project_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = _PROJECT_ROOT / path
+    return path.resolve(strict=False)
+
+
+def _resolve_project_path_preserving_leaf(value: str) -> Path:
+    """Anchor a protected path without following its final component.
+
+    The safety journal validates the configured leaf with ``lstat`` and
+    ``O_NOFOLLOW`` on every open. Resolving the whole path here would replace a
+    configured symlink with its target before those checks can reject it.
+    Parent traversal and parent symlinks are still canonicalized.
+    """
+
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = _PROJECT_ROOT / path
+    return path.parent.resolve(strict=False) / path.name
 
 
 @dataclass(frozen=True)
@@ -51,6 +77,9 @@ class RuntimeContract:
     model_artifact_set: str
     build_id: str
     state_namespace: str
+    safety_account_scope: Optional[str] = None
+    safety_execution_domain_scope: Optional[str] = None
+    safety_journal_path: Optional[str] = None
 
     @property
     def database_identity(self) -> str:
@@ -58,6 +87,15 @@ class RuntimeContract:
         resolved = str(Path(self.database_path).expanduser().resolve(strict=False))
         digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
         return f"{self.state_namespace}:{digest}"
+
+    @property
+    def safety_journal_identity(self) -> Optional[str]:
+        """Return a non-sensitive identity for the dedicated safety journal."""
+        if self.safety_journal_path is None:
+            return None
+        protected = str(_resolve_project_path_preserving_leaf(self.safety_journal_path))
+        digest = hashlib.sha256(protected.encode("utf-8")).hexdigest()[:12]
+        return f"{self.state_namespace}:safety:{digest}"
 
     @property
     def fingerprint(self) -> str:
@@ -78,6 +116,9 @@ class RuntimeContract:
             "model_artifact_set": self.model_artifact_set,
             "build_id": self.build_id,
             "state_namespace": self.state_namespace,
+            "safety_account_scope": self.safety_account_scope,
+            "safety_execution_domain_scope": self.safety_execution_domain_scope,
+            "safety_journal_identity": self.safety_journal_identity,
             "live_capability": "disabled",
         }
         if include_fingerprint:
@@ -235,12 +276,56 @@ def load_runtime_contract_from_env(
         )
     live_database_path = str(env.get("LIVE_RT_DB_PATH", "")).strip()
     if live_database_path:
-        paper_resolved = Path(database_path).expanduser().resolve(strict=False)
-        live_resolved = Path(live_database_path).expanduser().resolve(strict=False)
+        paper_resolved = _resolve_project_path(database_path)
+        live_resolved = _resolve_project_path(live_database_path)
         if paper_resolved == live_resolved:
             raise ConfigValidationError(
                 "RT_DB_PATH and LIVE_RT_DB_PATH must identify different ledgers."
             )
+
+    safety_account_scope: Optional[str] = None
+    safety_execution_domain_scope: Optional[str] = None
+    safety_journal_path: Optional[str] = None
+    if execution_mode == TradingMode.PAPER.value:
+        safety_account_scope = str(env.get("SAFETY_ACCOUNT_SCOPE", "")).strip()
+        if not _OPAQUE_SAFETY_ACCOUNT_SCOPE_RE.fullmatch(safety_account_scope):
+            raise ConfigValidationError(
+                "Supervised paper runtime requires SAFETY_ACCOUNT_SCOPE as an "
+                "operator-generated opaque acct_v1_<64 lowercase hex> value."
+            )
+        scope_payload = safety_account_scope.removeprefix("acct_v1_")
+        if len(set(scope_payload)) == 1:
+            raise ConfigValidationError("SAFETY_ACCOUNT_SCOPE must not use a placeholder digest.")
+        unsalted_account_scopes = {
+            "acct_v1_" + hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+            for candidate in {account, account.lower(), account.upper()}
+        }
+        if safety_account_scope in unsalted_account_scopes:
+            raise ConfigValidationError(
+                "SAFETY_ACCOUNT_SCOPE must not be an unsalted hash of IBKR_ACCOUNT."
+            )
+
+        safety_journal_path = str(env.get("SAFETY_JOURNAL_PATH", "")).strip()
+        if not safety_journal_path:
+            raise ConfigValidationError(
+                "Supervised paper runtime requires a dedicated SAFETY_JOURNAL_PATH."
+            )
+        journal_path = _resolve_project_path_preserving_leaf(safety_journal_path)
+        # Resolve only a separate comparison value. The stored path must keep
+        # its lexical leaf so SafetyJournal can reject a symlink itself.
+        journal_resolved = journal_path.resolve(strict=False)
+        database_resolved = _resolve_project_path(database_path)
+        if journal_resolved == database_resolved:
+            raise ConfigValidationError("SAFETY_JOURNAL_PATH must be separate from RT_DB_PATH.")
+        safety_journal_path = str(journal_path)
+        live_safety_journal_path = str(env.get("LIVE_SAFETY_JOURNAL_PATH", "")).strip()
+        if live_safety_journal_path:
+            live_journal_resolved = _resolve_project_path(live_safety_journal_path)
+            if journal_resolved == live_journal_resolved:
+                raise ConfigValidationError(
+                    "SAFETY_JOURNAL_PATH and LIVE_SAFETY_JOURNAL_PATH must differ."
+                )
+        safety_execution_domain_scope = PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
 
     build_id = _build_identifier(env)
     model_artifact_set = _model_artifact_identity(env)
@@ -282,6 +367,9 @@ def load_runtime_contract_from_env(
         model_artifact_set=model_artifact_set,
         build_id=build_id,
         state_namespace=state_namespace,
+        safety_account_scope=safety_account_scope,
+        safety_execution_domain_scope=safety_execution_domain_scope,
+        safety_journal_path=safety_journal_path,
     )
 
 
@@ -656,6 +744,7 @@ class MonitoringConfig(BaseModel):
 class Config(BaseModel):
     """Main configuration class combining all sub-configurations."""
 
+    runtime_contract: Optional[RuntimeContract] = Field(default=None, exclude=True)
     environment: Environment = Field(default=Environment.DEVELOPMENT)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
@@ -740,6 +829,7 @@ def load_config_from_env() -> Config:
     validator = ConfigValidator()
 
     config_dict = {
+        "runtime_contract": runtime_contract,
         "environment": runtime_contract.environment,
         "execution": {
             "mode": runtime_contract.execution_mode,

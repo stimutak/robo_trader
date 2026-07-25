@@ -45,6 +45,8 @@ os.environ["IBKR_ACCOUNT"] = "DU_TEST_PAPER"
 os.environ["IBKR_APPROVED_ACCOUNTS"] = "DU_TEST_PAPER"
 os.environ["IBKR_ACCOUNT_TYPE"] = "paper"
 os.environ["RT_STATE_NAMESPACE"] = "paper"
+os.environ["SAFETY_ACCOUNT_SCOPE"] = "acct_v1_" + ("0123456789abcdef" * 4)
+os.environ["SAFETY_JOURNAL_PATH"] = str(_TEST_ARTIFACTS / f"safety_journal_{os.getpid()}.db")
 os.environ["MODEL_ARTIFACT_SET"] = "pytest-fixtures"
 os.environ["BUILD_ID"] = "pytest"
 # -------------------------------------------------------------------------

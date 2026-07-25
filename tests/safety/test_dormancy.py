@@ -55,9 +55,8 @@ sqlite3.connect = real_connect
     )
 
 
-def test_active_runtime_startup_and_preflight_do_not_import_safety_package():
+def test_only_runner_startup_replays_safety_package_without_order_wiring():
     targets = (
-        ROOT / "robo_trader" / "runner_async.py",
         ROOT / "robo_trader" / "execution.py",
         ROOT / "robo_trader" / "order_manager.py",
         ROOT / "robo_trader" / "stop_loss_monitor.py",
@@ -67,5 +66,15 @@ def test_active_runtime_startup_and_preflight_do_not_import_safety_package():
     for path in targets:
         text = path.read_text(encoding="utf-8")
         assert "robo_trader.safety" not in text
+        assert "safety_runtime_evidence" not in text
         assert "from .safety" not in text
         assert "from robo_trader import safety" not in text
+
+    runner_text = (ROOT / "robo_trader" / "runner_async.py").read_text(encoding="utf-8")
+    assert "from .safety import (" in runner_text
+    assert "SafetyRuntimeCoordinator" in runner_text
+    assert "_start_paper_safety_runtime(cfg)" in runner_text
+    assert ".authorize(" not in runner_text
+    assert ".submit_fake(" not in runner_text
+    assert "FakeOrderSubmitter" not in runner_text
+    assert "safety_runtime_evidence" not in runner_text

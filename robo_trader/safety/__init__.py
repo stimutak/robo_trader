@@ -1,7 +1,7 @@
-"""Dormant order-safety core.
+"""Order-safety core and dormant paper-only runtime coordinator.
 
 Importing this package performs no filesystem, database, broker, configuration,
-or runtime work.  Runtime integration is intentionally deferred to a later PR.
+or runtime work.  Production runtime wiring remains intentionally deferred.
 """
 
 from .journal import (
@@ -43,13 +43,39 @@ from .models import (
     decimal_to_fixed,
 )
 from .policy import ReduceOnlyPolicy, evaluate_reduce_only
+from .runtime import (
+    PAPER_EXECUTION_DOMAIN_SCOPE,
+    PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE,
+    AccountPosition,
+    AuthoritativeContract,
+    FakeOrderSubmitter,
+    FakeSubmissionOnlyError,
+    FakeSubmissionReceipt,
+    OpenOrderSnapshot,
+    PaperExecutionIdentity,
+    PortfolioAllocation,
+    RuntimeAuthorization,
+    RuntimeAuthorizationBlocked,
+    RuntimeNotStarted,
+    RuntimeOrderRequest,
+    RuntimeSafetyError,
+    RuntimeStartupBlocked,
+    SafetyRuntimeCoordinator,
+)
 
 __all__ = [
     "MODEL_VERSION",
+    "PAPER_EXECUTION_DOMAIN_SCOPE",
+    "PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE",
     "SAFETY_MAX_EVIDENCE_AGE_SECONDS",
     "DecisionOutcome",
     "EvidenceStatus",
     "ExposureEvidence",
+    "AccountPosition",
+    "AuthoritativeContract",
+    "FakeOrderSubmitter",
+    "FakeSubmissionOnlyError",
+    "FakeSubmissionReceipt",
     "GateContext",
     "IdempotencyConflict",
     "JournalError",
@@ -59,6 +85,9 @@ __all__ = [
     "OrderIntent",
     "OrderSide",
     "OrderType",
+    "OpenOrderSnapshot",
+    "PaperExecutionIdentity",
+    "PortfolioAllocation",
     "PortfolioAllocationEvidence",
     "ReconciliationEvidence",
     "ReconciliationStatus",
@@ -68,8 +97,15 @@ __all__ = [
     "Reservation",
     "ReservationConflict",
     "RiskEffect",
+    "RuntimeAuthorization",
+    "RuntimeAuthorizationBlocked",
+    "RuntimeNotStarted",
+    "RuntimeOrderRequest",
+    "RuntimeSafetyError",
+    "RuntimeStartupBlocked",
     "SafetyDecision",
     "SafetyJournal",
+    "SafetyRuntimeCoordinator",
     "StateTransitionError",
     "SubmissionClaim",
     "SubmissionDescriptor",

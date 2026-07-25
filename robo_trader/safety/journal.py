@@ -66,7 +66,7 @@ from .models import (
 )
 from .policy import evaluate_reduce_only
 
-JOURNAL_SCHEMA_VERSION = 1
+JOURNAL_SCHEMA_VERSION = 2
 _ZERO_HASH = "0" * 64
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _SQLITE_FCNTL_FILE_POINTER = 7
@@ -290,19 +290,49 @@ class SafetyJournal:
         self._permit_lock = threading.Lock()
         self._issued_permits: Dict[int, Tuple[SubmissionPermit, str, SubmissionDescriptor]] = {}
         self._path_bindings: Dict[sqlite3.Connection, _PathBinding] = {}
+        self._runtime_path_identity: Optional[Tuple[int, int]] = None
 
     @property
     def database_path(self) -> Path:
         return self._path
 
-    def initialize(self) -> None:
-        """Create the immutable schema; parent directories are never fabricated."""
+    def initialize(
+        self,
+        *,
+        execution_domain_scope: Optional[str] = None,
+        account_scope: Optional[str] = None,
+    ) -> None:
+        """Create the immutable schema; parent directories are never fabricated.
+
+        Supplying both identity fields permanently binds the journal to one
+        execution domain and opaque account scope.  Runtime startup requires a
+        bound identity; the optional form remains available for isolated
+        policy/journal tests that never grant production authority.
+        """
+
+        if (execution_domain_scope is None) != (account_scope is None):
+            raise ValueError("journal identity requires both domain and account scope")
+        if execution_domain_scope is not None:
+            execution_domain_scope = _strict_text(
+                execution_domain_scope,
+                "execution_domain_scope",
+                max_length=128,
+            )
+            account_scope = _strict_account_scope(account_scope)
 
         statements = (
             """
             CREATE TABLE IF NOT EXISTS safety_schema_version (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 version INTEGER NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS safety_journal_identity (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                execution_domain_scope TEXT NOT NULL,
+                account_scope TEXT NOT NULL,
+                bound_at TEXT NOT NULL
             )
             """,
             """
@@ -350,6 +380,16 @@ class SafetyJournal:
             BEGIN SELECT RAISE(ABORT, 'safety schema version is immutable'); END
             """,
             """
+            CREATE TRIGGER IF NOT EXISTS safety_journal_identity_no_update
+            BEFORE UPDATE ON safety_journal_identity
+            BEGIN SELECT RAISE(ABORT, 'safety journal identity is immutable'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS safety_journal_identity_no_delete
+            BEFORE DELETE ON safety_journal_identity
+            BEGIN SELECT RAISE(ABORT, 'safety journal identity is immutable'); END
+            """,
+            """
             CREATE TRIGGER IF NOT EXISTS safety_journal_no_update
             BEFORE UPDATE ON safety_journal_events
             BEGIN SELECT RAISE(ABORT, 'safety journal is append-only'); END
@@ -372,6 +412,7 @@ class SafetyJournal:
                     """).fetchall()}
             unexpected = existing_tables - {
                 "safety_schema_version",
+                "safety_journal_identity",
                 "safety_journal_events",
             }
             if unexpected:
@@ -391,6 +432,33 @@ class SafetyJournal:
                 )
             elif row != (JOURNAL_SCHEMA_VERSION,):
                 raise JournalIntegrityError(f"unsupported schema version {row!r}")
+            if execution_domain_scope is not None:
+                identity_row = connection.execute("""
+                    SELECT execution_domain_scope, account_scope
+                    FROM safety_journal_identity WHERE singleton = 1
+                    """).fetchone()
+                expected_identity = (execution_domain_scope, account_scope)
+                if identity_row is None:
+                    connection.execute(
+                        """
+                        INSERT INTO safety_journal_identity(
+                            singleton, execution_domain_scope, account_scope, bound_at
+                        ) VALUES (1, ?, ?, ?)
+                        """,
+                        (
+                            execution_domain_scope,
+                            account_scope,
+                            utc_to_text(self._event_time()),
+                        ),
+                    )
+                elif identity_row != expected_identity:
+                    raise JournalIntegrityError(
+                        "safety journal is bound to a different runtime identity"
+                    )
+                self._assert_persisted_event_identities(
+                    connection,
+                    expected_identity,
+                )
             self._validate_schema(connection)
             self._assert_connection_path_identity(connection)
             connection.commit()
@@ -427,6 +495,7 @@ class SafetyJournal:
             connection.close()
         unexpected = existing_tables - {
             "safety_schema_version",
+            "safety_journal_identity",
             "safety_journal_events",
         }
         if unexpected:
@@ -769,6 +838,22 @@ class SafetyJournal:
             permit._mark_consumed()
             return registered[2]
 
+    def invalidate_unsubmitted_permit(self, permit: SubmissionPermit) -> None:
+        """Destroy expired in-memory authority while keeping its claim blocked."""
+
+        if type(permit) is not SubmissionPermit:
+            raise TypeError("permit must be SubmissionPermit")
+        with self._permit_lock:
+            registered = self._issued_permits.get(id(permit))
+            if (
+                registered is None
+                or registered[0] is not permit
+                or registered[1] != permit.claim_id
+            ):
+                raise StateTransitionError("permit was not issued by this live journal instance")
+            self._issued_permits.pop(id(permit), None)
+            permit._mark_consumed()
+
     def _invalidate_claim_permits_locked(self, claim_id: Optional[str]) -> None:
         if claim_id is None:
             return
@@ -1080,13 +1165,55 @@ class SafetyJournal:
 
     release_reservation = release_after_reconciliation
 
-    def replay(self) -> ReplayState:
+    def replay(
+        self,
+        *,
+        expected_execution_domain_scope: Optional[str] = None,
+        expected_account_scope: Optional[str] = None,
+    ) -> ReplayState:
         """Replay through a read-only connection; never returns a permit."""
 
+        return self._replay(
+            expected_execution_domain_scope=expected_execution_domain_scope,
+            expected_account_scope=expected_account_scope,
+            bind_runtime_path=False,
+        )
+
+    def replay_and_bind_runtime_path(
+        self,
+        *,
+        expected_execution_domain_scope: str,
+        expected_account_scope: str,
+    ) -> ReplayState:
+        """Replay and permanently bind this instance to the verified inode."""
+
+        return self._replay(
+            expected_execution_domain_scope=expected_execution_domain_scope,
+            expected_account_scope=expected_account_scope,
+            bind_runtime_path=True,
+        )
+
+    def _replay(
+        self,
+        *,
+        expected_execution_domain_scope: Optional[str],
+        expected_account_scope: Optional[str],
+        bind_runtime_path: bool,
+    ) -> ReplayState:
+        if (expected_execution_domain_scope is None) != (expected_account_scope is None):
+            raise ValueError("journal identity check requires both domain and account scope")
+        if expected_execution_domain_scope is not None:
+            expected_execution_domain_scope = _strict_text(
+                expected_execution_domain_scope,
+                "expected_execution_domain_scope",
+                max_length=128,
+            )
+            expected_account_scope = _strict_account_scope(expected_account_scope)
         try:
             expected_identity = self._path_identity()
         except FileNotFoundError:
             raise JournalNotInitialized("safety journal has not been initialized")
+        self._assert_runtime_path_identity(expected_identity)
         connection = self._open_bound_connection(
             f"{self._path.as_uri()}?mode=ro",
             uri=True,
@@ -1102,7 +1229,24 @@ class SafetyJournal:
             if result != ("ok",):
                 raise JournalIntegrityError(f"SQLite integrity check failed: {result!r}")
             state = self._replay_connection(connection)
+            if expected_execution_domain_scope is not None:
+                identity_rows = connection.execute("""
+                    SELECT execution_domain_scope, account_scope
+                    FROM safety_journal_identity
+                    """).fetchall()
+                if identity_rows != [(expected_execution_domain_scope, expected_account_scope)]:
+                    raise JournalIntegrityError(
+                        "safety journal runtime identity does not match configuration"
+                    )
             self._assert_connection_path_identity(connection)
+            if bind_runtime_path:
+                with self._permit_lock:
+                    if (
+                        self._runtime_path_identity is not None
+                        and self._runtime_path_identity != expected_identity
+                    ):
+                        raise JournalIntegrityError("safety journal runtime path identity changed")
+                    self._runtime_path_identity = expected_identity
             return state
         finally:
             self._close_connection(connection)
@@ -1139,6 +1283,7 @@ class SafetyJournal:
                 pre_connect_identity = (file_stat.st_dev, file_stat.st_ino)
             finally:
                 os.close(file_descriptor)
+        self._assert_runtime_path_identity(pre_connect_identity)
         if create:
             database = str(self._path)
             uri = False
@@ -1185,6 +1330,12 @@ class SafetyJournal:
         if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode):
             raise JournalIntegrityError("safety journal path must be a non-symlink regular file")
         return path_stat.st_dev, path_stat.st_ino
+
+    def _assert_runtime_path_identity(self, identity: Tuple[int, int]) -> None:
+        if self._runtime_path_identity is not None and identity != self._runtime_path_identity:
+            raise JournalIntegrityError(
+                "safety journal path differs from the inode replayed at startup"
+            )
 
     def _bind_connection_to_path(
         self,
@@ -1320,6 +1471,7 @@ class SafetyJournal:
             ) from exc
         expected_tables = {
             "safety_schema_version",
+            "safety_journal_identity",
             "safety_journal_events",
         }
         if allow_empty and not existing_tables:
@@ -1369,6 +1521,80 @@ class SafetyJournal:
             finally:
                 os.close(file_descriptor)
 
+    def _bound_runtime_identity(
+        self,
+        connection: sqlite3.Connection,
+    ) -> Optional[Tuple[str, str]]:
+        """Return the immutable singleton identity, rejecting malformed rows."""
+
+        try:
+            rows = connection.execute("""
+                SELECT execution_domain_scope, account_scope
+                FROM safety_journal_identity
+                ORDER BY singleton
+                """).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise JournalIntegrityError("safety journal identity is missing or unreadable") from exc
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise JournalIntegrityError("safety journal must contain at most one runtime identity")
+        execution_domain_scope, account_scope = rows[0]
+        try:
+            execution_domain_scope = _strict_text(
+                execution_domain_scope,
+                "execution_domain_scope",
+                max_length=128,
+            )
+            account_scope = _strict_account_scope(account_scope)
+        except ValidationError as exc:
+            raise JournalIntegrityError(
+                "safety journal contains a malformed runtime identity"
+            ) from exc
+        return execution_domain_scope, account_scope
+
+    @staticmethod
+    def _assert_persisted_event_identities(
+        connection: sqlite3.Connection,
+        bound_identity: Optional[Tuple[str, str]],
+    ) -> None:
+        """Reject any persisted event outside the singleton identity."""
+
+        if bound_identity is None:
+            return
+        try:
+            mismatch = connection.execute(
+                """
+                SELECT sequence
+                FROM safety_journal_events
+                WHERE execution_domain_scope != ? OR account_scope != ?
+                ORDER BY sequence
+                LIMIT 1
+                """,
+                bound_identity,
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise JournalIntegrityError("safety journal event identities are unreadable") from exc
+        if mismatch is not None:
+            raise JournalIntegrityError(
+                "persisted event identity does not match bound journal identity"
+            )
+
+    def _assert_event_identity(
+        self,
+        connection: sqlite3.Connection,
+        execution_domain_scope: str,
+        account_scope: str,
+    ) -> None:
+        """Check one pending append against identity read in its transaction."""
+
+        bound_identity = self._bound_runtime_identity(connection)
+        if bound_identity is not None and bound_identity != (
+            execution_domain_scope,
+            account_scope,
+        ):
+            raise JournalIntegrityError("event identity does not match bound journal identity")
+
     def _write_transaction(self, operation, *, include_path_identity: bool = False):
         connection = self._connect()
         try:
@@ -1377,6 +1603,8 @@ class SafetyJournal:
             self._assert_connection_path_identity(connection)
             connection.execute("BEGIN IMMEDIATE")
             self._assert_connection_path_identity(connection)
+            bound_identity = self._bound_runtime_identity(connection)
+            self._assert_persisted_event_identities(connection, bound_identity)
             before = self._last_event(connection)
             result = operation(connection)
             after = self._last_event(connection)
@@ -1412,6 +1640,11 @@ class SafetyJournal:
         claim_id: Optional[str],
         payload: dict,
     ) -> JournalEvent:
+        self._assert_event_identity(
+            connection,
+            execution_domain_scope,
+            account_scope,
+        )
         previous = self._last_event(connection)
         if previous is not None and occurred_at < previous.occurred_at:
             raise StateTransitionError("journal event time cannot move backward")
@@ -1533,6 +1766,7 @@ class SafetyJournal:
         if schema != [(1, JOURNAL_SCHEMA_VERSION)]:
             raise JournalIntegrityError("invalid safety schema version")
 
+        bound_identity = self._bound_runtime_identity(connection)
         events = []
         reservations: Dict[str, ReplayReservation] = {}
         decisions: Dict[str, dict] = {}
@@ -1540,6 +1774,17 @@ class SafetyJournal:
         previous_hash = _ZERO_HASH
         for expected_sequence, row in enumerate(rows, start=1):
             event = self._event_from_row(row)
+            if (
+                bound_identity is not None
+                and (
+                    event.execution_domain_scope,
+                    event.account_scope,
+                )
+                != bound_identity
+            ):
+                raise JournalIntegrityError(
+                    "persisted event identity does not match bound journal identity"
+                )
             if event.sequence != expected_sequence:
                 raise JournalIntegrityError("journal sequence is not contiguous")
             if event.previous_chain_hash != previous_hash:
@@ -1629,6 +1874,7 @@ class SafetyJournal:
         actual = {(row[0], row[1], row[2]) for row in rows}
         expected = {
             ("table", "safety_schema_version", "safety_schema_version"),
+            ("table", "safety_journal_identity", "safety_journal_identity"),
             ("table", "safety_journal_events", "safety_journal_events"),
             (
                 "index",
@@ -1655,6 +1901,16 @@ class SafetyJournal:
                 "safety_schema_version_no_delete",
                 "safety_schema_version",
             ),
+            (
+                "trigger",
+                "safety_journal_identity_no_update",
+                "safety_journal_identity",
+            ),
+            (
+                "trigger",
+                "safety_journal_identity_no_delete",
+                "safety_journal_identity",
+            ),
             ("trigger", "safety_journal_no_update", "safety_journal_events"),
             ("trigger", "safety_journal_no_delete", "safety_journal_events"),
         }
@@ -1665,6 +1921,14 @@ class SafetyJournal:
                 CREATE TABLE safety_schema_version (
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     version INTEGER NOT NULL
+                )
+            """,
+            "safety_journal_identity": """
+                CREATE TABLE safety_journal_identity (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    execution_domain_scope TEXT NOT NULL,
+                    account_scope TEXT NOT NULL,
+                    bound_at TEXT NOT NULL
                 )
             """,
             "safety_journal_events": """
@@ -1710,6 +1974,16 @@ class SafetyJournal:
                 CREATE TRIGGER safety_schema_version_no_delete
                 BEFORE DELETE ON safety_schema_version
                 BEGIN SELECT RAISE(ABORT, 'safety schema version is immutable'); END
+            """,
+            "safety_journal_identity_no_update": """
+                CREATE TRIGGER safety_journal_identity_no_update
+                BEFORE UPDATE ON safety_journal_identity
+                BEGIN SELECT RAISE(ABORT, 'safety journal identity is immutable'); END
+            """,
+            "safety_journal_identity_no_delete": """
+                CREATE TRIGGER safety_journal_identity_no_delete
+                BEFORE DELETE ON safety_journal_identity
+                BEGIN SELECT RAISE(ABORT, 'safety journal identity is immutable'); END
             """,
             "safety_journal_no_update": """
                 CREATE TRIGGER safety_journal_no_update
@@ -1758,9 +2032,24 @@ class SafetyJournal:
             (row[1], row[2], row[3], row[5])
             for row in connection.execute("PRAGMA table_info(safety_schema_version)").fetchall()
         )
-        if event_columns != expected_event_columns or schema_columns != (
-            ("singleton", "INTEGER", 0, 1),
-            ("version", "INTEGER", 1, 0),
+        identity_columns = tuple(
+            (row[1], row[2], row[3], row[5])
+            for row in connection.execute("PRAGMA table_info(safety_journal_identity)").fetchall()
+        )
+        if (
+            event_columns != expected_event_columns
+            or schema_columns
+            != (
+                ("singleton", "INTEGER", 0, 1),
+                ("version", "INTEGER", 1, 0),
+            )
+            or identity_columns
+            != (
+                ("singleton", "INTEGER", 0, 1),
+                ("execution_domain_scope", "TEXT", 1, 0),
+                ("account_scope", "TEXT", 1, 0),
+                ("bound_at", "TEXT", 1, 0),
+            )
         ):
             raise JournalIntegrityError("journal table definitions do not match schema")
 
@@ -1796,6 +2085,14 @@ class SafetyJournal:
             "safety_schema_version_no_delete": (
                 "before delete on safety_schema_version",
                 "safety schema version is immutable",
+            ),
+            "safety_journal_identity_no_update": (
+                "before update on safety_journal_identity",
+                "safety journal identity is immutable",
+            ),
+            "safety_journal_identity_no_delete": (
+                "before delete on safety_journal_identity",
+                "safety journal identity is immutable",
             ),
             "safety_journal_no_update": (
                 "before update on safety_journal_events",

@@ -304,6 +304,9 @@ IBKR_ACCOUNT=DU_FILE_PAPER
 IBKR_APPROVED_ACCOUNTS=DU_FILE_PAPER
 IBKR_ACCOUNT_TYPE=paper
 RT_STATE_NAMESPACE=paper
+RT_DB_PATH=paper-ledger.db
+SAFETY_ACCOUNT_SCOPE=acct_v1_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+SAFETY_JOURNAL_PATH=paper-safety-journal.db
 """
 
 
@@ -319,6 +322,7 @@ class TestResolvedEnvironment:
         assert context.target_port == 4002
         assert context.env["IBKR_ACCOUNT"] == "DU_FILE_PAPER"
         assert context.env["IBKR_APPROVED_ACCOUNTS"] == "DU_FILE_PAPER"
+        assert context.env["SAFETY_JOURNAL_PATH"] == "paper-safety-journal.db"
 
     def test_process_environment_overrides_env_file(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cli_module

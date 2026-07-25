@@ -87,6 +87,8 @@ def _project(tmp_path: Path, *, valid_ibc: bool = True):
         "IBKR_ACCOUNT_TYPE": "paper",
         "RT_DB_PATH": "ledger.db",
         "RT_STATE_NAMESPACE": "paper",
+        "SAFETY_ACCOUNT_SCOPE": "acct_v1_" + ("0123456789abcdef" * 4),
+        "SAFETY_JOURNAL_PATH": "safety-journal.db",
         "BUILD_ID": "test-build",
         "MODEL_ARTIFACT_SET": "test-models",
         "LOG_FILE": "robo_trader.log",

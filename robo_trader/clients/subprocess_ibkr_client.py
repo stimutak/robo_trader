@@ -15,6 +15,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -213,6 +214,63 @@ _BROKER_SNAPSHOT_MAX_AGE_SECONDS = 300.0
 _BROKER_SNAPSHOT_MAX_WINDOW_SECONDS = 60.0
 _BROKER_SNAPSHOT_MAX_CLOCK_SKEW_SECONDS = 120.0
 _BROKER_EXECUTION_LOOKBACK_SECONDS = 24 * 60 * 60
+_CONTRACT_TEXT_RE = re.compile(r"^[A-Z0-9][A-Z0-9._:/-]{0,63}$")
+
+
+@dataclass(frozen=True, slots=True)
+class QualifiedStockContractLineage:
+    """Immutable IBKR identity and timing for one historical-data response."""
+
+    con_id: int
+    symbol: str
+    local_symbol: str
+    security_type: str
+    currency: str
+    exchange: str
+    primary_exchange: str
+    trading_class: str
+    broker_timestamp: datetime
+    retrieval_timestamp: datetime
+    transport_generation: str
+
+    def __post_init__(self) -> None:
+        if type(self.con_id) is not int or self.con_id <= 0:
+            raise ValueError("qualified contract con_id must be a positive integer")
+        for field_name in (
+            "symbol",
+            "local_symbol",
+            "primary_exchange",
+            "trading_class",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not _CONTRACT_TEXT_RE.fullmatch(value):
+                raise ValueError(f"qualified contract {field_name} is malformed")
+        if self.local_symbol != self.symbol:
+            raise ValueError("qualified contract local_symbol must match symbol")
+        if self.security_type != "STK":
+            raise ValueError("qualified contract security_type must be STK")
+        if self.currency != "USD":
+            raise ValueError("qualified contract currency must be USD")
+        if self.exchange != "SMART":
+            raise ValueError("qualified contract exchange must be SMART")
+        for field_name in ("broker_timestamp", "retrieval_timestamp"):
+            value = getattr(self, field_name)
+            if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError(f"qualified contract {field_name} must be timezone-aware")
+            object.__setattr__(self, field_name, value.astimezone(timezone.utc))
+        if abs((self.broker_timestamp - self.retrieval_timestamp).total_seconds()) > (
+            _BROKER_SNAPSHOT_MAX_CLOCK_SKEW_SECONDS
+        ):
+            raise ValueError(
+                "qualified contract broker/retrieval timestamps exceed clock-skew tolerance"
+            )
+        if (
+            not isinstance(self.transport_generation, str)
+            or not self.transport_generation
+            or self.transport_generation != self.transport_generation.strip()
+            or len(self.transport_generation) > 128
+        ):
+            raise ValueError("qualified contract transport_generation is malformed")
 
 
 @dataclass
@@ -280,6 +338,91 @@ class SubprocessIBKRClient:
         self._zombies_detected_before_connect = (
             False  # Track if zombies were present before connect
         )
+        self._historical_lineage_lock = threading.Lock()
+        self._historical_lineage_generation_id: Optional[str] = None
+        self._historical_lineage_by_symbol: dict[str, QualifiedStockContractLineage] = {}
+
+    def _invalidate_historical_lineage(self) -> None:
+        """Forget broker identity evidence whenever its transport is no longer current."""
+        with self._historical_lineage_lock:
+            self._historical_lineage_generation_id = None
+            self._historical_lineage_by_symbol.clear()
+
+    def _cache_historical_lineage(
+        self,
+        generation: _WorkerGeneration,
+        lineage: QualifiedStockContractLineage,
+    ) -> None:
+        """Publish lineage only while its exact worker generation is current."""
+        with generation.state_lock:
+            with self._connection_state_lock:
+                current = (
+                    self._generation is generation
+                    and generation.poisoned_reason is None
+                    and self._connected
+                    and self._connection_generation_id == generation.generation_id
+                )
+                if current:
+                    with self._historical_lineage_lock:
+                        if self._historical_lineage_generation_id != generation.generation_id:
+                            self._historical_lineage_by_symbol.clear()
+                            self._historical_lineage_generation_id = generation.generation_id
+                        self._historical_lineage_by_symbol[lineage.symbol] = lineage
+        if not current:
+            self._invalidate_historical_lineage()
+            raise IBKRTransportPoisonedError(
+                "Historical contract lineage belongs to a stale worker generation"
+            )
+
+    def get_cached_historical_lineage(self, symbol: str) -> QualifiedStockContractLineage:
+        """Return current-generation lineage or reject stale/missing evidence."""
+        requested = self._normalize_historical_symbol(symbol)
+        generation = self._generation
+        if generation is None:
+            self._invalidate_historical_lineage()
+            raise IBKRTransportPoisonedError(
+                "Historical contract lineage has no current worker generation"
+            )
+        with generation.state_lock:
+            with self._connection_state_lock:
+                generation_current = (
+                    self._generation is generation
+                    and generation.poisoned_reason is None
+                    and self._connected
+                    and self._connection_generation_id == generation.generation_id
+                )
+                if generation_current:
+                    with self._historical_lineage_lock:
+                        cache_current = self._historical_lineage_generation_id in (
+                            None,
+                            generation.generation_id,
+                        )
+                        lineage = (
+                            self._historical_lineage_by_symbol.get(requested)
+                            if cache_current
+                            else None
+                        )
+                        lineage_current = (
+                            lineage is not None
+                            and lineage.transport_generation == generation.generation_id
+                        )
+                else:
+                    cache_current = False
+                    lineage = None
+                    lineage_current = False
+        if not generation_current or not cache_current:
+            self._invalidate_historical_lineage()
+            raise IBKRTransportPoisonedError(
+                "Historical contract lineage belongs to a stale worker generation"
+            )
+        if lineage is None:
+            raise IBKRError(f"No current qualified-contract lineage for {requested}")
+        if not lineage_current:
+            self._invalidate_historical_lineage()
+            raise IBKRTransportPoisonedError(
+                "Historical contract lineage generation is inconsistent"
+            )
+        return lineage
 
     def _clear_connection_tuple_locked(self) -> None:
         """Clear connected-session fields while holding the state lock."""
@@ -288,6 +431,7 @@ class SubprocessIBKRClient:
         self._connection_generation_id = None
         self._connection_start_time = None
         self._last_activity = None
+        self._invalidate_historical_lineage()
 
     def _clear_cached_connection_state(
         self,
@@ -682,6 +826,7 @@ class SubprocessIBKRClient:
                 self._gateway_api_down_detail = None
                 self._gateway_failure_generation_id = None
                 self._generation = generation
+            self._invalidate_historical_lineage()
 
             logger.info(
                 "IBKR subprocess worker started",
@@ -767,6 +912,7 @@ class SubprocessIBKRClient:
             # generation.state_lock -> _connection_state_lock.
             self._clear_cached_connection_state(generation=generation)
 
+        self._invalidate_historical_lineage()
         error = IBKRTransportPoisonedError(f"IBKR worker generation poisoned: {reason}")
         for request in pending:
 
@@ -945,6 +1091,7 @@ class SubprocessIBKRClient:
         """Stop the subprocess worker with graceful shutdown."""
         generation = self._generation
         process = generation.process if generation else self.process
+        self._invalidate_historical_lineage()
         if not process:
             self._clear_cached_connection_state(generation=generation)
             self._cleanup_worker_debug_log_with_retry(generation)
@@ -2009,6 +2156,74 @@ class SubprocessIBKRClient:
                 # disk, whether validation succeeds or fails closed.
                 self._cleanup_worker_debug_log(generation, required=True)
 
+    @staticmethod
+    def _normalize_historical_symbol(symbol: Any) -> str:
+        if not isinstance(symbol, str):
+            raise ValueError("Historical symbol must be a string")
+        normalized = symbol.strip().upper()
+        if not _CONTRACT_TEXT_RE.fullmatch(normalized):
+            raise ValueError("Historical symbol is malformed")
+        return normalized
+
+    def _historical_lineage_from_response(
+        self,
+        requested: str,
+        data: dict,
+        generation: _WorkerGeneration,
+    ) -> QualifiedStockContractLineage:
+        expected_contract_keys = {
+            "con_id",
+            "symbol",
+            "local_symbol",
+            "security_type",
+            "currency",
+            "exchange",
+            "primary_exchange",
+            "trading_class",
+        }
+        echoed = data.get("requested_symbol")
+        contract = data.get("qualified_contract")
+        if not isinstance(echoed, str) or echoed.strip().upper() != requested:
+            raise ValueError("historical response requested symbol mismatch")
+        if not isinstance(contract, dict) or set(contract) != expected_contract_keys:
+            raise ValueError("historical response missing or malformed qualified contract identity")
+        if contract.get("symbol") != requested:
+            raise ValueError("historical response qualified contract symbol mismatch")
+        if contract.get("local_symbol") != requested:
+            raise ValueError("historical response local symbol alias is not explicitly allowed")
+        for field_name in ("primary_exchange", "trading_class"):
+            value = contract.get(field_name)
+            if not isinstance(value, str) or not _CONTRACT_TEXT_RE.fullmatch(value):
+                raise ValueError("historical response has incomplete contract identity")
+        try:
+            broker_timestamp = self._strict_timestamp(
+                data.get("broker_timestamp"),
+                "historical response broker_timestamp",
+            )
+            retrieval_timestamp = self._strict_timestamp(
+                data.get("retrieval_timestamp"),
+                "historical response retrieval_timestamp",
+            )
+            if retrieval_timestamp > datetime.now(timezone.utc) + timedelta(
+                seconds=_BROKER_SNAPSHOT_MAX_CLOCK_SKEW_SECONDS
+            ):
+                raise ValueError("retrieval_timestamp exceeds allowed clock skew")
+            return QualifiedStockContractLineage(
+                con_id=contract.get("con_id"),
+                symbol=contract.get("symbol"),
+                local_symbol=contract.get("local_symbol"),
+                security_type=contract.get("security_type"),
+                currency=contract.get("currency"),
+                exchange=contract.get("exchange"),
+                primary_exchange=contract.get("primary_exchange"),
+                trading_class=contract.get("trading_class"),
+                broker_timestamp=broker_timestamp,
+                retrieval_timestamp=retrieval_timestamp,
+                transport_generation=generation.generation_id,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"historical response contract lineage is invalid: {exc}") from exc
+
     def _validate_historical_response(
         self,
         symbol: str,
@@ -2016,60 +2231,44 @@ class SubprocessIBKRClient:
         generation: Optional[_WorkerGeneration],
     ) -> list[dict]:
         """Validate and, on ambiguity, poison the exact responding generation."""
-        requested = symbol.strip().upper()
-        echoed = data.get("requested_symbol")
-        contract = data.get("qualified_contract")
-
+        try:
+            requested = self._normalize_historical_symbol(symbol)
+        except ValueError as exc:
+            raise IBKRTransportPoisonedError(str(exc)) from exc
         integrity_error: Optional[str] = None
-        if not isinstance(echoed, str) or echoed.strip().upper() != requested:
-            integrity_error = "historical response requested symbol mismatch"
-        elif not isinstance(contract, dict):
-            integrity_error = "historical response missing qualified contract identity"
-        elif str(contract.get("symbol", "")).strip().upper() != requested:
-            integrity_error = "historical response qualified contract symbol mismatch"
-        elif (
-            not isinstance(contract.get("con_id"), int)
-            or isinstance(contract["con_id"], bool)
-            or contract["con_id"] <= 0
-        ):
-            integrity_error = "historical response has invalid qualified contract ID"
-        elif str(contract.get("local_symbol", "")).strip().upper() != requested:
-            integrity_error = "historical response local symbol alias is not explicitly allowed"
-        elif contract.get("security_type") != "STK":
-            integrity_error = "historical response security type is not STK"
-        elif contract.get("currency") != "USD":
-            integrity_error = "historical response currency is not USD"
-        elif contract.get("exchange") != "SMART":
-            integrity_error = "historical response exchange is not SMART"
-        elif any(
-            not isinstance(contract.get(field), str) or not contract[field]
-            for field in ("primary_exchange", "trading_class")
-        ):
-            integrity_error = "historical response has incomplete contract identity"
-
-        bars = data.get("bars")
-        if integrity_error is None:
-            for timestamp_field in ("broker_timestamp", "retrieval_timestamp"):
-                timestamp = data.get(timestamp_field)
+        lineage: Optional[QualifiedStockContractLineage] = None
+        if generation is None:
+            integrity_error = "historical response has no worker generation"
+        else:
+            with generation.state_lock:
+                generation_current = (
+                    self._generation is generation and generation.poisoned_reason is None
+                )
+            if not generation_current:
+                integrity_error = "historical response belongs to a stale worker generation"
+            else:
                 try:
-                    parsed = (
-                        datetime.fromisoformat(timestamp) if isinstance(timestamp, str) else None
+                    lineage = self._historical_lineage_from_response(
+                        requested,
+                        data,
+                        generation,
                     )
-                except ValueError:
-                    parsed = None
-                if parsed is None or parsed.tzinfo is None or parsed.utcoffset() is None:
-                    integrity_error = f"historical response {timestamp_field} is not timezone-aware"
-                    break
-
+                except ValueError as exc:
+                    integrity_error = str(exc)
+        bars = data.get("bars")
         if integrity_error is None and (
             not isinstance(bars, list) or any(not isinstance(bar, dict) for bar in bars)
         ):
             integrity_error = "historical response bars are malformed"
 
         if integrity_error:
+            self._invalidate_historical_lineage()
             if generation:
                 self._poison_generation(generation, integrity_error)
             raise IBKRTransportPoisonedError(integrity_error)
+        assert generation is not None
+        assert lineage is not None
+        self._cache_historical_lineage(generation, lineage)
         return cast(list[dict], bars)
 
     async def get_historical_bars(
@@ -2093,6 +2292,7 @@ class SubprocessIBKRClient:
         Returns:
             List of bar dictionaries with date, open, high, low, close, volume
         """
+        normalized_symbol = self._normalize_historical_symbol(symbol)
         if bar_size not in _INTRADAY_BAR_SIZES:
             raise ValueError(
                 "Subprocess transport supports only intraday datetime bars; "
@@ -2104,7 +2304,7 @@ class SubprocessIBKRClient:
                 {
                     "command": "get_historical_bars",
                     "params": {
-                        "symbol": symbol,
+                        "symbol": normalized_symbol,
                         "duration": duration,
                         "bar_size": bar_size,
                         "what_to_show": what_to_show,
@@ -2113,7 +2313,7 @@ class SubprocessIBKRClient:
                 },
                 timeout=60.0,  # Historical data can take longer
             )
-            return self._validate_historical_response(symbol, data, generation)
+            return self._validate_historical_response(normalized_symbol, data, generation)
 
     async def disconnect(self) -> None:
         """Disconnect from IBKR"""
