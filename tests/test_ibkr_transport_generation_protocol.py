@@ -21,6 +21,8 @@ from robo_trader.clients.subprocess_ibkr_client import (
 )
 from robo_trader.connection_health import ConnectionHealth, HealthStatus
 
+_TRACKED_FAKE_GENERATIONS = []
+
 
 class _LineStream:
     def __init__(self):
@@ -108,7 +110,32 @@ def _attach_client(handler, generation_id="generation-one"):
     thread = threading.Thread(target=client._read_loop, args=(generation,), daemon=True)
     generation.stdout_thread = thread
     thread.start()
+    _TRACKED_FAKE_GENERATIONS.append((process, generation))
     return client, process, generation
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_fake_worker_generations():
+    """Do not leak fake worker reader threads into later tests."""
+
+    start_index = len(_TRACKED_FAKE_GENERATIONS)
+    yield
+
+    tracked = _TRACKED_FAKE_GENERATIONS[start_index:]
+    del _TRACKED_FAKE_GENERATIONS[start_index:]
+    still_alive = []
+    for process, generation in reversed(tracked):
+        generation.intentional_stop = True
+        generation.stop_event.set()
+        process.stdout.close()
+        process.stderr.close()
+        for thread in (generation.stdout_thread, generation.stderr_thread):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=1.0)
+            if thread is not None and thread.is_alive():
+                still_alive.append(thread.name)
+
+    assert not still_alive, f"fake worker reader threads did not stop: {still_alive}"
 
 
 def _feed(process, response):
@@ -458,6 +485,7 @@ async def test_new_generation_cannot_consume_old_generation_response():
     new_thread = threading.Thread(target=client._read_loop, args=(new_generation,), daemon=True)
     new_generation.stdout_thread = new_thread
     new_thread.start()
+    _TRACKED_FAKE_GENERATIONS.append((new_process, new_generation))
 
     _feed(old_process, _response(old_held["request"], data={"generation": "old"}))
     assert await client._execute_command({"command": "new"}) == {"generation": "new"}
@@ -549,6 +577,7 @@ async def test_poison_reaper_escalates_to_kill_for_stubborn_worker():
     thread = threading.Thread(target=client._read_loop, args=(generation,), daemon=True)
     generation.stdout_thread = thread
     thread.start()
+    _TRACKED_FAKE_GENERATIONS.append((process, generation))
 
     with pytest.raises(IBKRTransportPoisonedError):
         await client._execute_command({"command": "ping"})

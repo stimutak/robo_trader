@@ -19,10 +19,11 @@ from robo_trader.database_async import (
     AsyncTradingDatabase,
     SafetyAllocationSnapshot,
     SafetyAllocationSnapshotError,
+    SafetyDatabasePoolError,
     SafetyPortfolioAllocation,
     assert_producer_owned_safety_allocation_snapshot,
 )
-from robo_trader.safety.sqlite_identity import SQLitePathBinding
+from robo_trader.safety.sqlite_identity import SQLiteIdentityError, SQLitePathBinding
 
 
 def _create_ledger(path: Path, *, quantity: int = 7) -> None:
@@ -568,6 +569,163 @@ async def test_database_initialization_cancellation_closes_partial_pool(
 
 
 @pytest.mark.asyncio
+async def test_initializer_connect_cancellation_is_never_swallowed(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "cancelled-initializer-connect.db"
+    database = AsyncTradingDatabase(path, pool_size=1)
+    monkeypatch.setattr(
+        database_module.aiosqlite,
+        "connect",
+        AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await database.initialize()
+
+    assert database._initialized is False
+    assert database._pool == []
+    assert database._available.qsize() == 0
+    assert database._quarantined_connections == []
+    assert _table_names(path) == []
+
+
+@pytest.mark.asyncio
+async def test_snapshot_connect_cancellation_is_never_swallowed(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "cancelled-snapshot-connect.db"
+    _create_ledger(path)
+    database = AsyncTradingDatabase(path)
+    monkeypatch.setattr(
+        database_module.aiosqlite,
+        "connect",
+        AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await _snapshot(database)
+
+    assert database._quarantined_connections == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancel_during_initializer_close_cannot_leak_raw_handle(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "cancelled-initializer-close.db"
+    database = AsyncTradingDatabase(path, pool_size=1)
+    exact_close = database_module._EXACT_AIOSQLITE_CLOSE
+    original_connect = database_module.aiosqlite.connect
+    close_entered = asyncio.Event()
+    release_close = asyncio.Event()
+    captured = {}
+
+    async def tracked_connect(*args, **kwargs):
+        connection = await original_connect(*args, **kwargs)
+        captured.setdefault("connection", connection)
+        return connection
+
+    async def blocked_close(connection):
+        if connection is captured.get("connection"):
+            close_entered.set()
+            await release_close.wait()
+        await exact_close(connection)
+
+    monkeypatch.setattr(database_module.aiosqlite, "connect", tracked_connect)
+    monkeypatch.setattr(database_module, "_EXACT_AIOSQLITE_CLOSE", blocked_close)
+    initializer = asyncio.create_task(database.initialize())
+    await close_entered.wait()
+    initializer.cancel()
+    await asyncio.sleep(0)
+    assert initializer.done() is False
+    initializer.cancel()
+    await asyncio.sleep(0)
+    assert initializer.done() is False
+    release_close.set()
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await initializer
+        connection = captured["connection"]
+        assert database._pool == []
+        assert database._quarantined_connections == []
+        with pytest.raises(ValueError, match="no active connection"):
+            await connection.execute("CREATE TABLE forbidden_initializer (id INTEGER)")
+        with sqlite3.connect(path) as reader:
+            assert (
+                reader.execute(
+                    "SELECT name FROM sqlite_master " "WHERE name = 'forbidden_initializer'"
+                ).fetchall()
+                == []
+            )
+    finally:
+        release_close.set()
+        await asyncio.gather(initializer, return_exceptions=True)
+        monkeypatch.setattr(database_module, "_EXACT_AIOSQLITE_CLOSE", exact_close)
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancel_during_snapshot_close_cannot_leak_read_handle(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "cancelled-snapshot-close.db"
+    _create_ledger(path)
+    database = AsyncTradingDatabase(path)
+    exact_close = database_module._EXACT_AIOSQLITE_CLOSE
+    original_connect = database_module.aiosqlite.connect
+    close_entered = asyncio.Event()
+    release_close = asyncio.Event()
+    captured = {}
+
+    async def tracked_connect(*args, **kwargs):
+        connection = await original_connect(*args, **kwargs)
+        captured["connection"] = connection
+        return connection
+
+    async def blocked_close(connection):
+        close_entered.set()
+        await release_close.wait()
+        await exact_close(connection)
+
+    monkeypatch.setattr(database_module.aiosqlite, "connect", tracked_connect)
+    monkeypatch.setattr(database_module, "_EXACT_AIOSQLITE_CLOSE", blocked_close)
+    snapshot_task = asyncio.create_task(_snapshot(database))
+    await close_entered.wait()
+    snapshot_task.cancel()
+    await asyncio.sleep(0)
+    assert snapshot_task.done() is False
+    snapshot_task.cancel()
+    await asyncio.sleep(0)
+    assert snapshot_task.done() is False
+    release_close.set()
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await snapshot_task
+        connection = captured["connection"]
+        assert database._quarantined_connections == []
+        with pytest.raises(ValueError, match="no active connection"):
+            await connection.execute("SELECT 1")
+        with sqlite3.connect(path) as reader:
+            assert (
+                reader.execute(
+                    "SELECT name FROM sqlite_master " "WHERE name = 'forbidden_snapshot'"
+                ).fetchall()
+                == []
+            )
+    finally:
+        release_close.set()
+        await asyncio.gather(snapshot_task, return_exceptions=True)
+        monkeypatch.setattr(database_module, "_EXACT_AIOSQLITE_CLOSE", exact_close)
+
+
+@pytest.mark.asyncio
 async def test_pool_error_replaces_one_connection_with_identity_bound_connection(
     tmp_path,
     monkeypatch,
@@ -590,6 +748,7 @@ async def test_pool_error_replaces_one_connection_with_identity_bound_connection
         assert len(database._pool) == 1
         replacement = database._pool[0]
         assert replacement is not original
+        assert database._quarantined_connections == []
         expected = database._expected_database_file_identity
         assert expected is not None
         identity = await database._sqlite_descriptor_identity(replacement)
@@ -599,4 +758,999 @@ async def test_pool_error_replaces_one_connection_with_identity_bound_connection
             async with database.get_connection() as connection:
                 assert await (await connection.execute("SELECT 1")).fetchone() == (1,)
     finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_pool_replacement_poison_is_prompt_and_ensure_recovers(
+    tmp_path,
+    monkeypatch,
+):
+    database = AsyncTradingDatabase(tmp_path / "failed-pool-recovery.db", pool_size=1)
+    await database.initialize()
+    original = database._pool[0]
+    expected_identity = database._expected_database_file_identity
+    monkeypatch.setattr(
+        original,
+        "execute",
+        AsyncMock(side_effect=sqlite3.OperationalError("forced pool failure")),
+    )
+    open_replacement = database._open_identity_bound_pool_connection
+    monkeypatch.setattr(
+        database,
+        "_open_identity_bound_pool_connection",
+        AsyncMock(side_effect=SafetyAllocationSnapshotError("replacement rejected")),
+    )
+
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="forced pool failure") as caught:
+            async with database.get_connection():
+                pass
+        assert isinstance(caught.value.__cause__, SafetyAllocationSnapshotError)
+        assert database._initialized is True
+        assert database._pool == []
+        assert database._available.qsize() == 0
+
+        async with asyncio.timeout(0.25):
+            with pytest.raises(SafetyDatabasePoolError, match="pool is poisoned"):
+                async with database.get_connection():
+                    pass
+
+        monkeypatch.setattr(
+            database,
+            "_open_identity_bound_pool_connection",
+            open_replacement,
+        )
+        await database.ensure_connection()
+
+        assert database._pool_recovery_failure is None
+        assert database._expected_database_file_identity == expected_identity
+        assert len(database._pool) == 1
+        assert database._available.qsize() == 1
+        async with asyncio.timeout(1):
+            async with database.get_connection() as connection:
+                assert await (await connection.execute("SELECT 1")).fetchone() == (1,)
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_poisoned_pool_ensure_rejects_replaced_ledger_inode(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "replaced-after-pool-failure.db"
+    replacement = tmp_path / "replacement.db"
+    database = AsyncTradingDatabase(path, pool_size=1)
+    await database.initialize()
+    original = database._pool[0]
+    expected_identity = database._expected_database_file_identity
+    monkeypatch.setattr(
+        original,
+        "execute",
+        AsyncMock(side_effect=sqlite3.OperationalError("forced pool failure")),
+    )
+    monkeypatch.setattr(
+        database,
+        "_open_identity_bound_pool_connection",
+        AsyncMock(side_effect=SafetyAllocationSnapshotError("replacement rejected")),
+    )
+
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="forced pool failure"):
+            async with database.get_connection():
+                pass
+
+        _create_ledger(replacement, quantity=700)
+        os.replace(replacement, path)
+        with pytest.raises(
+            SafetyAllocationSnapshotError,
+            match="replaced before initialization",
+        ):
+            await database.ensure_connection()
+
+        assert database._initialized is False
+        assert database._pool == []
+        assert database._expected_database_file_identity == expected_identity
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_pool_replacement_wakes_concurrent_waiter(
+    tmp_path,
+    monkeypatch,
+):
+    database = AsyncTradingDatabase(tmp_path / "waiting-pool-recovery.db", pool_size=1)
+    await database.initialize()
+    original = database._pool[0]
+    execute_entered = asyncio.Event()
+    release_failure = asyncio.Event()
+
+    async def fail_health_query(*_args, **_kwargs):
+        execute_entered.set()
+        await release_failure.wait()
+        raise sqlite3.OperationalError("forced pool failure")
+
+    monkeypatch.setattr(original, "execute", AsyncMock(side_effect=fail_health_query))
+    open_replacement = database._open_identity_bound_pool_connection
+    monkeypatch.setattr(
+        database,
+        "_open_identity_bound_pool_connection",
+        AsyncMock(side_effect=SafetyAllocationSnapshotError("replacement rejected")),
+    )
+
+    async def borrow():
+        async with database.get_connection():
+            pass
+
+    failing_borrower = asyncio.create_task(borrow())
+    await execute_entered.wait()
+    queued_borrowers = [asyncio.create_task(borrow()) for _ in range(2)]
+    await asyncio.sleep(0)
+    release_failure.set()
+
+    try:
+        async with asyncio.timeout(1):
+            first_result = (await asyncio.gather(failing_borrower, return_exceptions=True))[0]
+            monkeypatch.setattr(
+                database,
+                "_open_identity_bound_pool_connection",
+                open_replacement,
+            )
+            await database.ensure_connection()
+            queued_results = await asyncio.gather(
+                *queued_borrowers,
+                return_exceptions=True,
+            )
+        assert isinstance(first_result, sqlite3.OperationalError)
+        assert str(first_result) == "forced pool failure"
+        assert all(isinstance(result, SafetyDatabasePoolError) for result in queued_results)
+        assert all("pool is poisoned" in str(result) for result in queued_results)
+        assert database._available.qsize() == 1
+    finally:
+        for task in (failing_borrower, *queued_borrowers):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(
+            failing_borrower,
+            *queued_borrowers,
+            return_exceptions=True,
+        )
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancel_after_queue_dequeue_restores_pool_slot(
+    tmp_path,
+    monkeypatch,
+):
+    database = AsyncTradingDatabase(tmp_path / "cancelled-pool-wait.db", pool_size=1)
+    await database.initialize()
+    borrowed_queue = database._available
+    generation = database._pool_generation
+    pooled_connection = database._pool[0]
+    original_get = borrowed_queue.get
+    dequeued = asyncio.Event()
+
+    async def observed_get():
+        connection = await original_get()
+        dequeued.set()
+        return connection
+
+    monkeypatch.setattr(borrowed_queue, "get", observed_get)
+    borrower = asyncio.create_task(database._wait_for_pool_connection(borrowed_queue, generation))
+    await dequeued.wait()
+    borrower.cancel()
+    asyncio.get_running_loop().call_soon(borrower.cancel)
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await borrower
+        assert database._pool == [pooled_connection]
+        assert database._available.qsize() == 1
+        async with database.get_connection() as connection:
+            assert await (await connection.execute("SELECT 1")).fetchone() == (1,)
+        assert database._available.qsize() == 1
+    finally:
+        await asyncio.gather(borrower, return_exceptions=True)
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancel_during_success_handoff_restores_pool_slot(
+    tmp_path,
+    monkeypatch,
+):
+    database = AsyncTradingDatabase(tmp_path / "cancelled-pool-handoff.db", pool_size=1)
+    await database.initialize()
+    pooled_connection = database._pool[0]
+    cleanup_entered = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    original_cleanup = database._cleanup_pool_waiters
+    cleanup_calls = 0
+
+    async def blocked_first_cleanup(*args, **kwargs):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        if cleanup_calls == 1:
+            cleanup_entered.set()
+            await release_cleanup.wait()
+        await original_cleanup(*args, **kwargs)
+
+    monkeypatch.setattr(database, "_cleanup_pool_waiters", blocked_first_cleanup)
+    borrower = asyncio.create_task(
+        database._wait_for_pool_connection(
+            database._available,
+            database._pool_generation,
+        )
+    )
+    await cleanup_entered.wait()
+    borrower.cancel()
+    await asyncio.sleep(0)
+    assert borrower.done() is False
+    borrower.cancel()
+    await asyncio.sleep(0)
+    assert borrower.done() is False
+    release_cleanup.set()
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await borrower
+        assert cleanup_calls == 2
+        assert database._pool == [pooled_connection]
+        assert database._available.qsize() == 1
+        async with database.get_connection() as connection:
+            assert connection is pooled_connection
+            assert await (await connection.execute("SELECT 1")).fetchone() == (1,)
+        assert database._available.qsize() == 1
+    finally:
+        release_cleanup.set()
+        await asyncio.gather(borrower, return_exceptions=True)
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_close_wakes_waiter_on_retired_pool_generation(tmp_path):
+    database = AsyncTradingDatabase(tmp_path / "close-waiter.db", pool_size=1)
+    await database.initialize()
+    holder_entered = asyncio.Event()
+    release_holder = asyncio.Event()
+
+    async def hold_connection():
+        async with database.get_connection():
+            holder_entered.set()
+            await release_holder.wait()
+
+    async def borrow_connection():
+        async with database.get_connection():
+            pass
+
+    holder = asyncio.create_task(hold_connection())
+    await holder_entered.wait()
+    waiter = asyncio.create_task(borrow_connection())
+    await asyncio.sleep(0)
+
+    try:
+        async with asyncio.timeout(1):
+            await database.close()
+            waiter_result = (await asyncio.gather(waiter, return_exceptions=True))[0]
+        assert isinstance(waiter_result, SafetyDatabasePoolError)
+        assert "database was closed" in str(waiter_result)
+        assert database._closed is True
+        assert database._initialized is False
+        release_holder.set()
+        holder_result = (await asyncio.gather(holder, return_exceptions=True))[0]
+        assert holder_result is None
+    finally:
+        release_holder.set()
+        await asyncio.gather(holder, waiter, return_exceptions=True)
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_close_wins_over_ensure_reinitialization(
+    tmp_path,
+    monkeypatch,
+):
+    database = AsyncTradingDatabase(tmp_path / "close-ensure-race.db", pool_size=1)
+    await database.initialize()
+    health_entered = asyncio.Event()
+    release_health = asyncio.Event()
+
+    async def blocked_unhealthy_check():
+        health_entered.set()
+        await release_health.wait()
+        return False
+
+    monkeypatch.setattr(database, "health_check", blocked_unhealthy_check)
+    ensure_task = asyncio.create_task(database.ensure_connection())
+    await health_entered.wait()
+
+    async with asyncio.timeout(1):
+        await database.close()
+        release_health.set()
+        await ensure_task
+
+    assert database._closed is True
+    assert database._initialized is False
+    assert database._pool == []
+    with pytest.raises(RuntimeError, match="Database is closed"):
+        async with database.get_connection():
+            pass
+
+
+@pytest.mark.asyncio
+async def test_poison_recovery_force_closes_active_old_generation_lease(
+    tmp_path,
+    monkeypatch,
+):
+    database = AsyncTradingDatabase(tmp_path / "active-lease-recovery.db", pool_size=2)
+    await database.initialize()
+    holder_entered = asyncio.Event()
+    release_holder = asyncio.Event()
+    held = {}
+
+    async def hold_connection():
+        async with database.get_connection() as connection:
+            held["connection"] = connection
+            holder_entered.set()
+            await release_holder.wait()
+
+    holder = asyncio.create_task(hold_connection())
+    await holder_entered.wait()
+    leased_connection = held["connection"]
+    idle_connection = next(
+        connection for connection in database._pool if connection is not leased_connection
+    )
+    monkeypatch.setattr(
+        idle_connection,
+        "execute",
+        AsyncMock(side_effect=sqlite3.OperationalError("forced pool failure")),
+    )
+    open_replacement = database._open_identity_bound_pool_connection
+    monkeypatch.setattr(
+        database,
+        "_open_identity_bound_pool_connection",
+        AsyncMock(side_effect=SafetyAllocationSnapshotError("replacement rejected")),
+    )
+
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="forced pool failure"):
+            async with database.get_connection():
+                pass
+        assert leased_connection in database._leased_connections
+        with pytest.raises(ValueError, match="no active connection"):
+            await leased_connection.execute("SELECT 1")
+
+        monkeypatch.setattr(
+            database,
+            "_open_identity_bound_pool_connection",
+            open_replacement,
+        )
+        await database.ensure_connection()
+        assert database._initialized is True
+        assert database._closed is False
+        assert len(database._pool) == 2
+        assert database._available.qsize() == 2
+        release_holder.set()
+        holder_result = (await asyncio.gather(holder, return_exceptions=True))[0]
+        assert holder_result is None
+        assert leased_connection not in database._leased_connections
+        assert len(database._pool) == 2
+        assert database._available.qsize() == 2
+    finally:
+        release_holder.set()
+        await asyncio.gather(holder, return_exceptions=True)
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_poison_waits_until_active_lease_is_exactly_revoked(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "cancelled-poison-active-lease.db"
+    database = AsyncTradingDatabase(path, pool_size=2)
+    await database.initialize()
+    holder_entered = asyncio.Event()
+    release_holder = asyncio.Event()
+    close_entered = asyncio.Event()
+    release_close = asyncio.Event()
+    held = {}
+
+    async def hold_connection():
+        async with database.get_connection() as connection:
+            held["connection"] = connection
+            holder_entered.set()
+            await release_holder.wait()
+
+    holder = asyncio.create_task(hold_connection())
+    await holder_entered.wait()
+    leased_connection = held["connection"]
+    failing_connection = next(
+        connection for connection in database._pool if connection is not leased_connection
+    )
+    monkeypatch.setattr(
+        failing_connection,
+        "execute",
+        AsyncMock(side_effect=sqlite3.OperationalError("forced pool failure")),
+    )
+    monkeypatch.setattr(
+        database,
+        "_open_identity_bound_pool_connection",
+        AsyncMock(side_effect=SafetyAllocationSnapshotError("replacement rejected")),
+    )
+    exact_close = database_module._EXACT_AIOSQLITE_CLOSE
+
+    async def blocked_active_close(connection):
+        if connection is leased_connection:
+            close_entered.set()
+            await release_close.wait()
+        await exact_close(connection)
+
+    monkeypatch.setattr(
+        database_module,
+        "_EXACT_AIOSQLITE_CLOSE",
+        blocked_active_close,
+    )
+
+    async def trigger_poison():
+        async with database.get_connection():
+            pass
+
+    failing_borrower = asyncio.create_task(trigger_poison())
+    await close_entered.wait()
+    failing_borrower.cancel()
+    await asyncio.sleep(0)
+    assert failing_borrower.done() is False
+    release_close.set()
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await failing_borrower
+        with pytest.raises(ValueError, match="no active connection"):
+            await leased_connection.execute("CREATE TABLE forbidden_during_poison (id INTEGER)")
+        with sqlite3.connect(path) as reader:
+            assert (
+                reader.execute(
+                    "SELECT name FROM sqlite_master WHERE name = 'forbidden_during_poison'"
+                ).fetchall()
+                == []
+            )
+        async with asyncio.timeout(0.25):
+            with pytest.raises(SafetyDatabasePoolError, match="pool is poisoned"):
+                async with database.get_connection():
+                    pass
+    finally:
+        release_close.set()
+        release_holder.set()
+        await asyncio.gather(holder, failing_borrower, return_exceptions=True)
+        monkeypatch.setattr(database_module, "_EXACT_AIOSQLITE_CLOSE", exact_close)
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_close_rejects_post_return_mutation_from_old_lease(tmp_path):
+    path = tmp_path / "post-close-mutation.db"
+    database = AsyncTradingDatabase(path, pool_size=1)
+    await database.initialize()
+    holder_entered = asyncio.Event()
+    attempt_mutation = asyncio.Event()
+
+    async def mutate_after_close():
+        async with database.get_connection() as connection:
+            holder_entered.set()
+            await attempt_mutation.wait()
+            try:
+                await connection.execute("CREATE TABLE forbidden_after_close (id INTEGER)")
+                await connection.commit()
+            except BaseException as error:
+                return error
+            return None
+
+    holder = asyncio.create_task(mutate_after_close())
+    await holder_entered.wait()
+    await database.close()
+    attempt_mutation.set()
+    mutation_result = await holder
+
+    assert isinstance(mutation_result, ValueError)
+    assert "no active connection" in str(mutation_result)
+    with sqlite3.connect(path) as connection:
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'forbidden_after_close'"
+            ).fetchall()
+            == []
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stale_holder_does_not_block_fresh_generation(tmp_path):
+    database = AsyncTradingDatabase(tmp_path / "cancelled-stale-holder.db", pool_size=1)
+    await database.initialize()
+    holder_entered = asyncio.Event()
+    keep_holding = asyncio.Event()
+
+    async def hold_connection():
+        async with database.get_connection():
+            holder_entered.set()
+            await keep_holding.wait()
+
+    holder = asyncio.create_task(hold_connection())
+    await holder_entered.wait()
+    await database.close()
+    await database.initialize()
+    holder.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await holder
+    assert database._quarantined_connections == []
+    assert database._leased_connections == []
+    async with database.get_connection() as connection:
+        assert await (await connection.execute("SELECT 1")).fetchone() == (1,)
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_close_cancellation_is_preserved_after_fail_closed_cleanup(
+    tmp_path,
+    monkeypatch,
+):
+    database = AsyncTradingDatabase(tmp_path / "cancelled-close.db", pool_size=1)
+    await database.initialize()
+    holder_entered = asyncio.Event()
+    rollback_entered = asyncio.Event()
+    release_holder = asyncio.Event()
+    captured = {}
+
+    async def blocked_rollback():
+        rollback_entered.set()
+        await asyncio.Event().wait()
+
+    async def hold_transaction():
+        async with database.get_connection() as connection:
+            await connection.execute("BEGIN")
+            captured["connection"] = connection
+            captured["rollback"] = connection.rollback
+            monkeypatch.setattr(connection, "rollback", blocked_rollback)
+            holder_entered.set()
+            await release_holder.wait()
+
+    holder = asyncio.create_task(hold_transaction())
+    await holder_entered.wait()
+    close_task = asyncio.create_task(database.close())
+    await rollback_entered.wait()
+    close_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+    assert database._closed is True
+    assert database._initialized is False
+    assert database._quarantined_connections == []
+
+    release_holder.set()
+    holder_result = (await asyncio.gather(holder, return_exceptions=True))[0]
+    assert holder_result is None
+    assert database._leased_connections == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancel_during_leased_close_cannot_escape_revocation(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "cancelled-leased-close.db"
+    database = AsyncTradingDatabase(path, pool_size=1)
+    await database.initialize()
+    holder_entered = asyncio.Event()
+    close_entered = asyncio.Event()
+    release_close = asyncio.Event()
+    release_holder = asyncio.Event()
+    captured = {}
+    exact_close = database_module._EXACT_AIOSQLITE_CLOSE
+
+    async def blocked_close(connection):
+        close_entered.set()
+        await release_close.wait()
+        await exact_close(connection)
+
+    monkeypatch.setattr(database_module, "_EXACT_AIOSQLITE_CLOSE", blocked_close)
+
+    async def hold_connection():
+        async with database.get_connection() as connection:
+            captured["connection"] = connection
+            holder_entered.set()
+            await release_holder.wait()
+
+    holder = asyncio.create_task(hold_connection())
+    await holder_entered.wait()
+    close_task = asyncio.create_task(database.close())
+    await close_entered.wait()
+    close_task.cancel()
+    await asyncio.sleep(0)
+    assert close_task.done() is False
+    close_task.cancel()
+    await asyncio.sleep(0)
+    assert close_task.done() is False
+    release_close.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+    connection = captured["connection"]
+    assert database._closed is True
+    assert database._quarantined_connections == []
+    with pytest.raises(ValueError, match="no active connection"):
+        await connection.execute("CREATE TABLE forbidden_after_cancel (id INTEGER)")
+    with sqlite3.connect(path) as reader:
+        assert (
+            reader.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'forbidden_after_cancel'"
+            ).fetchall()
+            == []
+        )
+
+    release_holder.set()
+    holder_result = (await asyncio.gather(holder, return_exceptions=True))[0]
+    assert holder_result is None
+    assert database._leased_connections == []
+
+
+@pytest.mark.asyncio
+async def test_self_cancelling_instance_close_cannot_bypass_exact_revocation(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "self-cancelling-close.db"
+    database = AsyncTradingDatabase(path, pool_size=1)
+    await database.initialize()
+    connection = database._pool[0]
+
+    async def self_cancelling_close():
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(connection, "close", self_cancelling_close)
+    await database.close()
+
+    assert database._closed is True
+    assert database._quarantined_connections == []
+    with pytest.raises(ValueError, match="no active connection"):
+        await connection.execute("CREATE TABLE forbidden_self_cancel (id INTEGER)")
+    with sqlite3.connect(path) as reader:
+        assert (
+            reader.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'forbidden_self_cancel'"
+            ).fetchall()
+            == []
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_pool_replacement_still_latches_prompt_failure(
+    tmp_path,
+    monkeypatch,
+):
+    database = AsyncTradingDatabase(tmp_path / "cancelled-pool-recovery.db", pool_size=1)
+    await database.initialize()
+    original = database._pool[0]
+    monkeypatch.setattr(
+        original,
+        "execute",
+        AsyncMock(side_effect=sqlite3.OperationalError("forced pool failure")),
+    )
+    replacement_entered = asyncio.Event()
+
+    async def blocked_replacement():
+        replacement_entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(database, "_open_identity_bound_pool_connection", blocked_replacement)
+
+    async def borrow():
+        async with database.get_connection():
+            pass
+
+    try:
+        borrower = asyncio.create_task(borrow())
+        await replacement_entered.wait()
+        borrower.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await borrower
+
+        # Exercise the normal context-manager entry path too; the cancelled
+        # replacement must have poisoned it before propagating cancellation.
+        async with asyncio.timeout(0.25):
+            with pytest.raises(
+                SafetyDatabasePoolError,
+                match="replacement connection opening was cancelled",
+            ):
+                async with database.get_connection():
+                    pass
+
+        assert database._pool == []
+        assert database._available.qsize() == 0
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_task_cancel_during_bad_connection_close_poisons_before_propagating(
+    tmp_path,
+    monkeypatch,
+):
+    database = AsyncTradingDatabase(tmp_path / "cancelled-bad-close.db", pool_size=1)
+    await database.initialize()
+    original = database._pool[0]
+    exact_close = database_module._EXACT_AIOSQLITE_CLOSE
+    close_entered = asyncio.Event()
+    release_close = asyncio.Event()
+
+    async def blocked_close(connection):
+        close_entered.set()
+        await release_close.wait()
+        await exact_close(connection)
+
+    monkeypatch.setattr(
+        original,
+        "execute",
+        AsyncMock(side_effect=sqlite3.OperationalError("forced pool failure")),
+    )
+    monkeypatch.setattr(database_module, "_EXACT_AIOSQLITE_CLOSE", blocked_close)
+
+    async def borrow():
+        async with database.get_connection():
+            pass
+
+    borrower = asyncio.create_task(borrow())
+    await close_entered.wait()
+    borrower.cancel()
+    await asyncio.sleep(0)
+    assert borrower.done() is False
+    release_close.set()
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await borrower
+        assert database._pool == []
+        assert database._quarantined_connections == []
+        async with asyncio.timeout(0.25):
+            with pytest.raises(
+                SafetyDatabasePoolError,
+                match="bad connection cleanup was cancelled",
+            ):
+                async with database.get_connection():
+                    pass
+    finally:
+        monkeypatch.setattr(database_module, "_EXACT_AIOSQLITE_CLOSE", exact_close)
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_task_cancel_during_rollback_poisons_before_propagating(
+    tmp_path,
+    monkeypatch,
+):
+    database = AsyncTradingDatabase(tmp_path / "cancelled-rollback.db", pool_size=1)
+    await database.initialize()
+    rollback_entered = asyncio.Event()
+    captured = {}
+
+    async def blocked_rollback():
+        rollback_entered.set()
+        await asyncio.Event().wait()
+
+    async def borrow_with_transaction():
+        async with database.get_connection() as connection:
+            await connection.execute("BEGIN")
+            captured["connection"] = connection
+            captured["rollback"] = connection.rollback
+            monkeypatch.setattr(connection, "rollback", blocked_rollback)
+
+    borrower = asyncio.create_task(borrow_with_transaction())
+    await rollback_entered.wait()
+    borrower.cancel()
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await borrower
+        connection = captured["connection"]
+        assert database._pool == []
+        assert database._quarantined_connections == []
+        async with asyncio.timeout(0.25):
+            with pytest.raises(
+                SafetyDatabasePoolError,
+                match="pooled connection rollback was cancelled",
+            ):
+                async with database.get_connection():
+                    pass
+    finally:
+        connection = captured.get("connection")
+        if connection is not None:
+            monkeypatch.setattr(connection, "rollback", captured["rollback"])
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_unresolved_quarantine_blocks_reopen_until_cleanup_succeeds(
+    tmp_path,
+    monkeypatch,
+):
+    database = AsyncTradingDatabase(tmp_path / "quarantine-gate.db", pool_size=1)
+    await database.initialize()
+    original = database._pool[0]
+    original_close = original.close
+    monkeypatch.setattr(
+        original,
+        "execute",
+        AsyncMock(side_effect=sqlite3.OperationalError("forced pool failure")),
+    )
+    monkeypatch.setattr(
+        original,
+        "close",
+        AsyncMock(side_effect=OSError("forced cleanup failure")),
+    )
+    exact_close = database_module._EXACT_AIOSQLITE_CLOSE
+
+    async def failed_exact_close(_connection):
+        raise OSError("forced exact cleanup failure")
+
+    monkeypatch.setattr(database_module, "_EXACT_AIOSQLITE_CLOSE", failed_exact_close)
+    with pytest.raises(
+        SafetyDatabasePoolError,
+        match="poisoned pool cleanup could not close every connection",
+    ):
+        async with database.get_connection():
+            pass
+    assert original in database._quarantined_connections
+    with pytest.raises(
+        SafetyDatabasePoolError,
+        match="quarantined connections remain unresolved",
+    ):
+        await database.initialize()
+
+    with pytest.raises(
+        SafetyDatabasePoolError,
+        match="could not resolve every quarantined connection",
+    ) as ensure_failure:
+        await database.ensure_connection()
+    assert isinstance(ensure_failure.value.__cause__, OSError)
+    assert database._closed is True
+    assert database._initialized is False
+    assert original in database._quarantined_connections
+
+    with pytest.raises(
+        SafetyDatabasePoolError,
+        match="quarantined connections remain unresolved",
+    ):
+        await database.initialize()
+    assert database._pool == []
+
+    monkeypatch.setattr(original, "close", original_close)
+    monkeypatch.setattr(database_module, "_EXACT_AIOSQLITE_CLOSE", exact_close)
+    await database.ensure_connection()
+
+    try:
+        assert database._quarantined_connections == []
+        assert database._initialized is True
+        assert database._closed is False
+        assert len(database._pool) == 1
+        async with database.get_connection() as connection:
+            assert await (await connection.execute("SELECT 1")).fetchone() == (1,)
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_partial_initialization_connection_is_quarantined_on_close_failure(
+    tmp_path,
+    monkeypatch,
+):
+    database = AsyncTradingDatabase(tmp_path / "partial-init-quarantine.db", pool_size=1)
+    original_connect = database_module.aiosqlite.connect
+    exact_close = database_module._EXACT_AIOSQLITE_CLOSE
+    captured = {}
+
+    async def tracked_connect(path):
+        connection = await original_connect(path)
+        captured["connection"] = connection
+        captured["close"] = connection.close
+        monkeypatch.setattr(
+            connection,
+            "close",
+            AsyncMock(side_effect=OSError("forced partial cleanup failure")),
+        )
+        return connection
+
+    monkeypatch.setattr(database, "_init_database", AsyncMock())
+    monkeypatch.setattr(database_module.aiosqlite, "connect", tracked_connect)
+
+    async def failed_exact_close(_connection):
+        raise OSError("forced exact partial cleanup failure")
+
+    monkeypatch.setattr(database_module, "_EXACT_AIOSQLITE_CLOSE", failed_exact_close)
+    monkeypatch.setattr(
+        database,
+        "_sqlite_descriptor_identity",
+        AsyncMock(side_effect=SQLiteIdentityError("forced identity failure")),
+    )
+
+    with pytest.raises(
+        SafetyDatabasePoolError,
+        match="initialization cleanup could not close every connection",
+    ) as failure:
+        await database.initialize()
+    assert isinstance(failure.value.__cause__, OSError)
+    connection = captured["connection"]
+    assert connection in database._quarantined_connections
+    assert database._initialized is False
+    assert database._pool == []
+
+    monkeypatch.setattr(connection, "close", captured["close"])
+    monkeypatch.setattr(database_module, "_EXACT_AIOSQLITE_CLOSE", exact_close)
+    await database.close()
+    assert database._quarantined_connections == []
+
+
+@pytest.mark.asyncio
+async def test_stale_replacement_close_failure_poisons_reinitialized_pool(
+    tmp_path,
+    monkeypatch,
+):
+    database = AsyncTradingDatabase(tmp_path / "stale-replacement.db", pool_size=1)
+    await database.initialize()
+    original = database._pool[0]
+    monkeypatch.setattr(
+        original,
+        "execute",
+        AsyncMock(side_effect=sqlite3.OperationalError("forced pool failure")),
+    )
+    open_replacement = database._open_identity_bound_pool_connection
+    replacement_opened = asyncio.Event()
+    release_replacement = asyncio.Event()
+    captured = {}
+
+    async def blocked_replacement():
+        replacement = await open_replacement()
+        captured["replacement"] = replacement
+        replacement_opened.set()
+        await release_replacement.wait()
+        return replacement
+
+    monkeypatch.setattr(
+        database,
+        "_open_identity_bound_pool_connection",
+        blocked_replacement,
+    )
+
+    async def borrow():
+        async with database.get_connection():
+            pass
+
+    old_borrower = asyncio.create_task(borrow())
+    await replacement_opened.wait()
+
+    try:
+        await database.close()
+        await database.initialize()
+        assert len(database._pool) == 1
+        assert database._pool_recovery_failure is None
+
+        release_replacement.set()
+        old_result = (await asyncio.gather(old_borrower, return_exceptions=True))[0]
+        assert isinstance(old_result, sqlite3.OperationalError)
+        assert str(old_result) == "forced pool failure"
+        assert database._quarantined_connections == []
+        assert database._pool == []
+
+        async with asyncio.timeout(0.25):
+            with pytest.raises(
+                SafetyDatabasePoolError,
+                match="stale replacement close failed",
+            ):
+                async with database.get_connection():
+                    pass
+    finally:
+        release_replacement.set()
+        await asyncio.gather(old_borrower, return_exceptions=True)
         await database.close()

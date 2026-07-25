@@ -38,6 +38,7 @@ ACCOUNT = "DU1234567"
 SAFETY_SCOPE_KEY = "0123456789abcdef" * 4
 ACCOUNT_SCOPE = _derive_safety_account_scope(SAFETY_SCOPE_KEY, ACCOUNT)
 NOW = datetime.now(timezone.utc)
+ASYNC_TEST_TIMEOUT_SECONDS = 2.0
 
 
 def _contract(symbol="AAPL", con_id=265598):
@@ -59,6 +60,10 @@ class _FakeIB:
         self.connected = True
         self.account_reads = 0
         self.contract = _contract()
+        # Collection of the full suite can take minutes. Timestamp broker
+        # evidence when this per-test fake is created, not when this module is
+        # imported, or otherwise-valid evidence becomes stale before the test.
+        self.now = datetime.now(timezone.utc)
 
     def isConnected(self):
         self.calls.append("isConnected")
@@ -71,7 +76,7 @@ class _FakeIB:
 
     async def reqCurrentTimeAsync(self):
         self.calls.append("reqCurrentTimeAsync")
-        return NOW + timedelta(milliseconds=len(self.calls))
+        return self.now + timedelta(milliseconds=len(self.calls))
 
     async def reqPositionsAsync(self):
         self.calls.append("reqPositionsAsync")
@@ -109,7 +114,7 @@ class _FakeIB:
                 order=order,
                 orderStatus=status,
                 contract=self.contract,
-                log=[SimpleNamespace(time=NOW)],
+                log=[SimpleNamespace(time=self.now)],
             )
         ]
 
@@ -164,6 +169,38 @@ def _connected_client(monkeypatch, payload):
     execute = AsyncMock(return_value=payload)
     monkeypatch.setattr(client, "_execute_command_unlocked", execute)
     return client, generation, execute
+
+
+async def _wait_for_event_or_surface_task_failure(event, task, *, event_name):
+    """Wait boundedly for an event while preserving an early task exception."""
+
+    event_task = asyncio.create_task(event.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {event_task, task},
+            timeout=ASYNC_TEST_TIMEOUT_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if task in done and not event.is_set():
+            await task
+            raise AssertionError(f"task completed before {event_name}")
+        if event_task not in done:
+            raise asyncio.TimeoutError(f"timed out waiting for {event_name}")
+        await event_task
+    finally:
+        if not event_task.done():
+            event_task.cancel()
+        await asyncio.gather(event_task, return_exceptions=True)
+
+
+async def _cancel_and_drain_tasks(*tasks):
+    for task in tasks:
+        if task is not None and not task.done():
+            task.cancel()
+    await asyncio.gather(
+        *(task for task in tasks if task is not None),
+        return_exceptions=True,
+    )
 
 
 def _runtime_context(
@@ -655,15 +692,28 @@ async def test_lifecycle_callback_holds_lock_until_stop_can_run(fake_ib, monkeyp
     snapshot_task = asyncio.create_task(
         client.run_with_locked_broker_safety_snapshot(runtime_context, "AAPL", callback)
     )
-    await entered.wait()
-    stop_task = asyncio.create_task(client.stop())
-    await asyncio.sleep(0)
-    assert not stop_called.is_set()
+    stop_task = None
+    try:
+        await _wait_for_event_or_surface_task_failure(
+            entered,
+            snapshot_task,
+            event_name="snapshot callback entry",
+        )
+        stop_task = asyncio.create_task(client.stop())
+        await asyncio.sleep(0)
+        assert not stop_called.is_set()
 
-    release.set()
-    assert (await snapshot_task).startswith("broker-safety-v1-")
-    await stop_task
-    assert stop_called.is_set()
+        release.set()
+        result = await asyncio.wait_for(
+            snapshot_task,
+            timeout=ASYNC_TEST_TIMEOUT_SECONDS,
+        )
+        assert result.startswith("broker-safety-v1-")
+        await asyncio.wait_for(stop_task, timeout=ASYNC_TEST_TIMEOUT_SECONDS)
+        assert stop_called.is_set()
+    finally:
+        release.set()
+        await _cancel_and_drain_tasks(snapshot_task, stop_task)
 
 
 @pytest.mark.asyncio
@@ -687,18 +737,37 @@ async def test_lifecycle_callback_holds_lock_until_reconnect_can_run(
     snapshot_task = asyncio.create_task(
         client.run_with_locked_broker_safety_snapshot(runtime_context, "AAPL", callback)
     )
-    await entered.wait()
-    reconnect_task = asyncio.create_task(
-        client.connect(host="127.0.0.1", port=4002, client_id=7, readonly=True)
-    )
-    await asyncio.sleep(0)
-    assert not reconnect_task.done()
-    assert execute.await_count == 1
+    reconnect_task = None
+    try:
+        await _wait_for_event_or_surface_task_failure(
+            entered,
+            snapshot_task,
+            event_name="snapshot callback entry",
+        )
+        reconnect_task = asyncio.create_task(
+            client.connect(host="127.0.0.1", port=4002, client_id=7, readonly=True)
+        )
+        await asyncio.sleep(0)
+        assert not reconnect_task.done()
+        assert execute.await_count == 1
 
-    release.set()
-    assert (await snapshot_task).startswith("broker-safety-v1-")
-    assert await reconnect_task is True
-    assert execute.await_count == 2
+        release.set()
+        result = await asyncio.wait_for(
+            snapshot_task,
+            timeout=ASYNC_TEST_TIMEOUT_SECONDS,
+        )
+        assert result.startswith("broker-safety-v1-")
+        assert (
+            await asyncio.wait_for(
+                reconnect_task,
+                timeout=ASYNC_TEST_TIMEOUT_SECONDS,
+            )
+            is True
+        )
+        assert execute.await_count == 2
+    finally:
+        release.set()
+        await _cancel_and_drain_tasks(snapshot_task, reconnect_task)
 
 
 @pytest.mark.asyncio
@@ -1109,15 +1178,30 @@ async def test_contract_snapshot_lifecycle_callback_holds_lock_against_stop(
             final_dispatch,
         )
     )
-    await entered.wait()
-    stop_task = asyncio.create_task(client.stop())
-    await asyncio.sleep(0)
-    assert not stop_called.is_set()
+    stop_task = None
+    try:
+        await _wait_for_event_or_surface_task_failure(
+            entered,
+            dispatch_task,
+            event_name="contract snapshot callback entry",
+        )
+        stop_task = asyncio.create_task(client.stop())
+        await asyncio.sleep(0)
+        assert not stop_called.is_set()
 
-    release.set()
-    assert await dispatch_task == 272093
-    await stop_task
-    assert stop_called.is_set()
+        release.set()
+        assert (
+            await asyncio.wait_for(
+                dispatch_task,
+                timeout=ASYNC_TEST_TIMEOUT_SECONDS,
+            )
+            == 272093
+        )
+        await asyncio.wait_for(stop_task, timeout=ASYNC_TEST_TIMEOUT_SECONDS)
+        assert stop_called.is_set()
+    finally:
+        release.set()
+        await _cancel_and_drain_tasks(dispatch_task, stop_task)
 
 
 @pytest.mark.asyncio

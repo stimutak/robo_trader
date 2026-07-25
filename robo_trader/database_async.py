@@ -38,6 +38,8 @@ from robo_trader.safety.sqlite_identity import (
 
 logger = get_logger(__name__)
 
+_EXACT_AIOSQLITE_CLOSE = aiosqlite.Connection.close
+
 DB_PATH = lexical_path_preserving_leaf(Path(os.getenv("RT_DB_PATH", "trading_data.db")))
 
 # Default portfolio ID for backward compatibility
@@ -46,6 +48,25 @@ DEFAULT_PORTFOLIO_ID = "default"
 
 class SafetyAllocationSnapshotError(ValidationError):
     """Stored allocation state cannot form authoritative safety evidence."""
+
+
+class SafetyDatabasePoolError(SafetyAllocationSnapshotError):
+    """The allocation-ledger connection pool cannot be used safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class _PoolRecoveryFailure:
+    """Latched reason shared with callers already waiting on the pool."""
+
+    reason: str
+
+
+@dataclass(slots=True)
+class _PoolGenerationState:
+    """Broadcast failure state for exactly one connection-pool generation."""
+
+    failure_event: asyncio.Event = field(default_factory=asyncio.Event)
+    failure: Optional[_PoolRecoveryFailure] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,10 +220,16 @@ class AsyncTradingDatabase:
         self.db_path = lexical_path_preserving_leaf(db_path)
         self.pool_size = pool_size
         self._pool: List[aiosqlite.Connection] = []
+        self._leased_connections: List[aiosqlite.Connection] = []
+        self._quarantined_connections: List[aiosqlite.Connection] = []
         self._available: asyncio.Queue = asyncio.Queue(maxsize=pool_size)
+        self._pool_generation = _PoolGenerationState()
         self._initialized = False
         self._lock = asyncio.Lock()
+        self._ensure_lock = asyncio.Lock()
         self._closed = False
+        self._lifecycle_revision = 0
+        self._pool_recovery_failure: Optional[_PoolRecoveryFailure] = None
         self._expected_database_file_identity = self._existing_database_file_identity()
 
     def _existing_database_file_identity(self) -> Optional[Tuple[int, int]]:
@@ -234,115 +261,234 @@ class AsyncTradingDatabase:
     async def initialize(self):
         """Initialize database and connection pool."""
         async with self._lock:
-            if self._initialized:
-                return
+            await self._initialize_locked()
 
-            binding: Optional[SQLitePathBinding] = None
-            try:
-                expected = self._expected_database_file_identity
-                binding = SQLitePathBinding.open_for_initialization(
-                    self.db_path,
-                    create=expected is None,
-                )
-                if expected is not None and (binding.device, binding.inode) != expected:
-                    raise SafetyAllocationSnapshotError(
-                        "configured allocation ledger was replaced before initialization"
-                    )
-                self._expected_database_file_identity = (binding.device, binding.inode)
-                binding.assert_path_identity()
+    async def _initialize_locked(self) -> None:
+        """Initialize while the lifecycle lock is held by the caller."""
 
-                # Schema and pool PRAGMAs are permitted only after SQLite's own
-                # descriptor is tied to the pre-mutation guardian.
-                await self._init_database(binding)
-                binding.assert_path_identity()
+        if self._quarantined_connections:
+            raise SafetyDatabasePoolError(
+                "allocation ledger pool cannot initialize while quarantined "
+                "connections remain unresolved"
+            )
+        if self._initialized:
+            return
 
-                for _ in range(self.pool_size):
-                    conn = await aiosqlite.connect(self.db_path)
-                    try:
-                        pool_binding = binding.bind_sqlite_connection(
-                            await self._sqlite_descriptor_identity(conn)
-                        )
-                        pool_binding.assert_connection_identity(
-                            await self._sqlite_descriptor_identity(conn)
-                        )
-                        await conn.execute("PRAGMA journal_mode=WAL")
-                        await conn.execute("PRAGMA busy_timeout=5000")
-                        pool_binding.assert_connection_identity(
-                            await self._sqlite_descriptor_identity(conn)
-                        )
-                    except BaseException:
-                        await conn.close()
-                        raise
-                    self._pool.append(conn)
-                    await self._available.put(conn)
-
-                binding.assert_path_identity()
-                self._initialized = True
-                logger.info(
-                    f"Async database initialized at {self.db_path} "
-                    f"with {self.pool_size} connections"
-                )
-            except SafetyAllocationSnapshotError:
-                await self._close_partial_pool()
-                raise
-            except (SQLiteIdentityError, OSError, aiosqlite.Error) as exc:
-                await self._close_partial_pool()
+        self._closed = False
+        binding: Optional[SQLitePathBinding] = None
+        try:
+            expected = self._expected_database_file_identity
+            binding = SQLitePathBinding.open_for_initialization(
+                self.db_path,
+                create=expected is None,
+            )
+            if expected is not None and (binding.device, binding.inode) != expected:
                 raise SafetyAllocationSnapshotError(
-                    "allocation ledger identity cannot be proven during initialization"
-                ) from exc
-            except BaseException:
-                # Cancellation and interpreter-level aborts must not strand
-                # partially opened SQLite connections or descriptors.
-                await self._close_partial_pool()
-                raise
-            finally:
-                if binding is not None:
-                    binding.close()
+                    "configured allocation ledger was replaced before initialization"
+                )
+            self._expected_database_file_identity = (binding.device, binding.inode)
+            binding.assert_path_identity()
 
-    async def _close_partial_pool(self) -> None:
-        """Close connections opened by an initialization attempt."""
+            # Schema and pool PRAGMAs are permitted only after SQLite's own
+            # descriptor is tied to the pre-mutation guardian.
+            await self._init_database(binding)
+            binding.assert_path_identity()
 
+            for _ in range(self.pool_size):
+                conn = await aiosqlite.connect(self.db_path)
+                self._quarantine_pool_connection(conn)
+                try:
+                    pool_binding = binding.bind_sqlite_connection(
+                        await self._sqlite_descriptor_identity(conn)
+                    )
+                    pool_binding.assert_connection_identity(
+                        await self._sqlite_descriptor_identity(conn)
+                    )
+                    await conn.execute("PRAGMA journal_mode=WAL")
+                    await conn.execute("PRAGMA busy_timeout=5000")
+                    pool_binding.assert_connection_identity(
+                        await self._sqlite_descriptor_identity(conn)
+                    )
+                except BaseException:
+                    # The outer initialization cleanup closes every tracked
+                    # partial connection through the exact close primitive.
+                    raise
+                self._pool.append(conn)
+                self._forget_quarantined_connection(conn)
+                # The queue is sized to the pool and this initializer is its
+                # sole producer.  Avoid introducing a cancellation point
+                # after the connection has joined the authoritative pool.
+                self._available.put_nowait(conn)
+
+            binding.assert_path_identity()
+            self._pool_recovery_failure = None
+            self._initialized = True
+            self._lifecycle_revision += 1
+            logger.info(
+                f"Async database initialized at {self.db_path} "
+                f"with {self.pool_size} connections"
+            )
+        except SafetyAllocationSnapshotError:
+            await self._close_partial_pool()
+            raise
+        except (SQLiteIdentityError, OSError, aiosqlite.Error) as exc:
+            await self._close_partial_pool()
+            raise SafetyAllocationSnapshotError(
+                "allocation ledger identity cannot be proven during initialization"
+            ) from exc
+        except BaseException:
+            # Cancellation and interpreter-level aborts must not strand
+            # partially opened SQLite connections or descriptors.
+            await self._close_partial_pool()
+            raise
+        finally:
+            if binding is not None:
+                binding.close()
+
+    def _retire_pool_generation(self, reason: str) -> List[aiosqlite.Connection]:
+        """Synchronously fail one generation before any cleanup can suspend."""
+
+        generation = self._pool_generation
+        failure = generation.failure or _PoolRecoveryFailure(reason)
+        generation.failure = failure
+        generation.failure_event.set()
+        # Retirement is terminal for the entire generation. Checked-out
+        # handles are force-closed too; their stale context finalizers only
+        # release ownership and never touch a later generation.
         for connection in self._pool:
-            try:
-                await connection.close()
-            except Exception:
-                pass
+            self._quarantine_pool_connection(connection)
+        connections = list(self._quarantined_connections)
         self._pool.clear()
         while not self._available.empty():
             try:
                 self._available.get_nowait()
             except asyncio.QueueEmpty:
                 break
+        self._available = asyncio.Queue(maxsize=self.pool_size)
+        self._pool_generation = _PoolGenerationState()
+        self._pool_recovery_failure = None
+        return connections
+
+    async def _close_partial_pool(self) -> None:
+        """Close connections opened by an initialization attempt."""
+
+        self._retire_pool_generation("database initialization failed")
+        await self._close_quarantined_connections(
+            "initialization cleanup could not close every connection"
+        )
 
     async def close(self):
         """Close all connections in the pool."""
         async with self._lock:
-            if not self._initialized:
-                return
+            await self._close_locked()
 
-            # Close all connections in the pool
-            for conn in self._pool:
-                try:
-                    # Ensure no transactions are left open
-                    if getattr(conn, "in_transaction", False):
-                        await conn.rollback()
-                    await conn.close()
-                except Exception as e:
-                    logger.debug(f"Error closing connection: {e}")
+    async def _close_locked(self) -> None:
+        """Close every pool state while the lifecycle lock is held."""
 
-            # Clear the pool and queue
-            self._pool.clear()
+        self._retire_pool_generation("database was closed")
+        self._initialized = False
+        self._closed = True
+        self._lifecycle_revision += 1
+        await self._close_quarantined_connections(
+            "database close could not resolve every quarantined connection",
+            rollback=True,
+        )
+        logger.info("Closed all database connections")
 
-            # Clear the available queue
-            while not self._available.empty():
-                try:
-                    self._available.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+    async def _close_quarantined_connections(
+        self,
+        message: str,
+        *,
+        rollback: bool = False,
+    ) -> None:
+        """Attempt every quarantine close and fail if any remain unresolved."""
 
-            self._initialized = False
-            self._closed = True
-            logger.info("Closed all database connections")
+        first_error: Optional[BaseException] = None
+        cancellation: Optional[asyncio.CancelledError] = None
+        for connection in list(self._quarantined_connections):
+            try:
+                if rollback:
+                    try:
+                        in_transaction = getattr(connection, "in_transaction", False)
+                    except BaseException:
+                        # A connection already closed by an old borrower has no
+                        # active transaction property; close remains the proof.
+                        in_transaction = False
+                    if in_transaction:
+                        try:
+                            await connection.rollback()
+                        except BaseException as rollback_error:
+                            if (
+                                isinstance(rollback_error, asyncio.CancelledError)
+                                and cancellation is None
+                            ):
+                                cancellation = rollback_error
+                            logger.debug(
+                                "Quarantined connection rollback failed; "
+                                f"attempting close: {rollback_error}"
+                            )
+                close_task = asyncio.create_task(_EXACT_AIOSQLITE_CLOSE(connection))
+                cancellation = await self._await_owned_cleanup_task(
+                    close_task,
+                    cancellation,
+                )
+                self._forget_quarantined_connection(connection)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+                if isinstance(error, asyncio.CancelledError) and cancellation is None:
+                    cancellation = error
+                logger.debug(f"Quarantined connection cleanup failed: {error}")
+        if self._quarantined_connections:
+            cleanup_error = SafetyDatabasePoolError(message)
+            if first_error is not None:
+                raise cleanup_error from first_error
+            raise cleanup_error
+        if cancellation is not None:
+            raise cancellation
+
+    async def _close_owned_connection(
+        self,
+        connection: aiosqlite.Connection,
+        message: str,
+        cancellation: Optional[asyncio.CancelledError] = None,
+    ) -> None:
+        """Prove one temporary connection closed before releasing ownership."""
+
+        self._quarantine_pool_connection(connection)
+        close_task = asyncio.create_task(_EXACT_AIOSQLITE_CLOSE(connection))
+        try:
+            cancellation = await self._await_owned_cleanup_task(
+                close_task,
+                cancellation,
+            )
+        except BaseException as error:
+            raise SafetyDatabasePoolError(message) from error
+        self._forget_quarantined_connection(connection)
+        if cancellation is not None:
+            raise cancellation
+
+    @staticmethod
+    async def _await_owned_cleanup_task(
+        task: asyncio.Task,
+        cancellation: Optional[asyncio.CancelledError],
+    ) -> Optional[asyncio.CancelledError]:
+        """Await one cleanup task through any number of outer cancellations."""
+
+        while True:
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                if task.cancelled():
+                    raise SafetyDatabasePoolError(
+                        "owned allocation-ledger close task was cancelled"
+                    ) from error
+                if cancellation is None:
+                    cancellation = error
+                if not task.done():
+                    continue
+                task.result()
+            return cancellation
 
     async def health_check(self) -> bool:
         """Check if database connections are healthy."""
@@ -359,11 +505,249 @@ class AsyncTradingDatabase:
 
     async def ensure_connection(self):
         """Ensure database is connected and healthy."""
-        if not await self.health_check():
-            logger.info("Database unhealthy, reinitializing...")
-            await self.close()
-            self._closed = False
-            await self.initialize()
+        async with self._ensure_lock:
+            observed_revision = self._lifecycle_revision
+            if not await self.health_check():
+                logger.info("Database unhealthy, reinitializing...")
+                async with self._lock:
+                    # A concurrent explicit lifecycle operation wins. This
+                    # prevents ensure_connection from resurrecting a database
+                    # after close() advanced the revision.
+                    if self._lifecycle_revision != observed_revision:
+                        return
+                    await self._close_locked()
+                    await self._initialize_locked()
+
+    def _latch_pool_recovery_failure(
+        self,
+        error: BaseException,
+        expected_generation: _PoolGenerationState,
+        operation: str,
+    ) -> Tuple[Optional[_PoolRecoveryFailure], List[aiosqlite.Connection]]:
+        """Poison one pool generation and wake every queued borrower.
+
+        This method intentionally performs the state transition without an
+        ``await``. Even cancellation while opening the replacement therefore
+        cannot leave the pool initialized-but-empty or strand queue waiters.
+        """
+
+        # A close/reinitialize transition owns the newer generation. A stale
+        # borrower must never poison or drain that replacement pool.
+        if self._closed or expected_generation is not self._pool_generation:
+            return None, []
+
+        existing = self._pool_recovery_failure
+        if existing is not None:
+            return existing, []
+
+        if isinstance(error, asyncio.CancelledError):
+            reason = f"{operation} was cancelled"
+        else:
+            reason = f"{operation} failed ({type(error).__name__})"
+        failure = _PoolRecoveryFailure(reason=reason)
+        self._pool_recovery_failure = failure
+        generation = expected_generation
+        generation.failure = failure
+
+        connections = list(self._pool)
+        for connection in connections:
+            self._quarantine_pool_connection(connection)
+        self._pool.clear()
+        while not self._available.empty():
+            try:
+                self._available.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        # Event.set() broadcasts to every current waiter. Unlike a queue
+        # sentinel, no waiter can consume the only wakeup while recovery swaps
+        # in a new pool generation.
+        generation.failure_event.set()
+        return failure, connections
+
+    async def _poison_connection_pool(
+        self,
+        error: BaseException,
+        expected_generation: _PoolGenerationState,
+        operation: str = "replacement connection opening",
+    ) -> None:
+        """Latch an unusable pool and best-effort close its connections."""
+
+        self._latch_pool_recovery_failure(
+            error,
+            expected_generation,
+            operation,
+        )
+        if self._quarantined_connections:
+            await self._close_quarantined_connections(
+                "poisoned pool cleanup could not close every connection"
+            )
+
+    def _detach_pool_connection(self, connection: aiosqlite.Connection) -> None:
+        """Synchronously remove a connection before fallible finalization."""
+
+        try:
+            self._pool.remove(connection)
+        except ValueError:
+            pass
+        self._release_connection_lease(connection)
+        self._quarantine_pool_connection(connection)
+
+    def _lease_pool_connection(self, connection: aiosqlite.Connection) -> None:
+        if self._is_connection_leased(connection):
+            raise SafetyDatabasePoolError("pooled connection is already leased")
+        self._leased_connections.append(connection)
+
+    def _release_connection_lease(self, connection: aiosqlite.Connection) -> None:
+        self._leased_connections = [
+            item for item in self._leased_connections if item is not connection
+        ]
+
+    def _is_connection_leased(self, connection: aiosqlite.Connection) -> bool:
+        return any(item is connection for item in self._leased_connections)
+
+    def _quarantine_pool_connection(self, connection: aiosqlite.Connection) -> None:
+        if not any(item is connection for item in self._quarantined_connections):
+            self._quarantined_connections.append(connection)
+
+    def _forget_quarantined_connection(self, connection: aiosqlite.Connection) -> None:
+        self._quarantined_connections = [
+            item for item in self._quarantined_connections if item is not connection
+        ]
+
+    @staticmethod
+    def _pool_failure_error(failure: _PoolRecoveryFailure) -> SafetyDatabasePoolError:
+        return SafetyDatabasePoolError(
+            "allocation ledger connection pool is poisoned: "
+            f"{failure.reason}; call ensure_connection() before retrying"
+        )
+
+    async def _wait_for_pool_connection(
+        self,
+        borrowed_queue: asyncio.Queue,
+        generation: _PoolGenerationState,
+    ) -> aiosqlite.Connection:
+        """Wait for a connection or broadcast poison without losing a slot."""
+
+        connection_wait = asyncio.create_task(borrowed_queue.get())
+        failure_wait = asyncio.create_task(generation.failure_event.wait())
+        queue_result_handled = False
+        connection_to_return: Optional[aiosqlite.Connection] = None
+        cancellation: Optional[asyncio.CancelledError] = None
+        try:
+            done, _ = await asyncio.wait(
+                (connection_wait, failure_wait),
+                timeout=10.0,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                raise asyncio.TimeoutError()
+            if failure_wait in done:
+                failure = generation.failure or _PoolRecoveryFailure(
+                    "pool generation failed without a recovery reason"
+                )
+                if connection_wait in done and not connection_wait.cancelled():
+                    connection = connection_wait.result()
+                    queue_result_handled = True
+                    self._quarantine_pool_connection(connection)
+                    await self._poison_connection_pool(
+                        self._pool_failure_error(failure),
+                        self._pool_generation,
+                        "orphaned checkout close",
+                    )
+                raise self._pool_failure_error(failure)
+
+            connection = connection_wait.result()
+            queue_result_handled = True
+            connection_to_return = connection
+            return connection
+        except asyncio.CancelledError as error:
+            # Preserve the first cancellation, but do not let it or any later
+            # cancellation interrupt ownership recovery for a queue result.
+            cancellation = error
+        finally:
+            cleanup_task = asyncio.create_task(
+                self._cleanup_pool_waiters(
+                    connection_wait,
+                    failure_wait,
+                    borrowed_queue,
+                    generation,
+                    queue_result_handled,
+                )
+            )
+            cancellation = await self._await_owned_cleanup_task(
+                cleanup_task,
+                cancellation,
+            )
+            if cancellation is not None and connection_to_return is not None:
+                # A successful dequeue is not transferred to the caller until
+                # this finally block completes.  If cancellation wins during
+                # waiter cleanup, restore/retire that pending result first.
+                salvage_task = asyncio.create_task(
+                    self._cleanup_pool_waiters(
+                        connection_wait,
+                        failure_wait,
+                        borrowed_queue,
+                        generation,
+                        False,
+                    )
+                )
+                cancellation = await self._await_owned_cleanup_task(
+                    salvage_task,
+                    cancellation,
+                )
+            if cancellation is not None:
+                raise cancellation
+
+    async def _cleanup_pool_waiters(
+        self,
+        connection_wait: asyncio.Task,
+        failure_wait: asyncio.Task,
+        borrowed_queue: asyncio.Queue,
+        generation: _PoolGenerationState,
+        queue_result_handled: bool,
+    ) -> None:
+        """Drain waiter tasks and recover any connection they already claimed."""
+
+        try:
+            for waiter in (connection_wait, failure_wait):
+                if not waiter.done():
+                    waiter.cancel()
+            await asyncio.gather(connection_wait, failure_wait, return_exceptions=True)
+
+            # Cancellation or timeout can race with queue delivery. Return the
+            # claimed slot only to its exact healthy generation; otherwise
+            # close it so a rebuilt pool cannot inherit a stale connection.
+            if (
+                not queue_result_handled
+                and connection_wait.done()
+                and not connection_wait.cancelled()
+            ):
+                try:
+                    orphaned_connection = connection_wait.result()
+                except BaseException:
+                    pass
+                else:
+                    if (
+                        generation is self._pool_generation
+                        and generation.failure is None
+                        and borrowed_queue is self._available
+                        and not self._closed
+                    ):
+                        borrowed_queue.put_nowait(orphaned_connection)
+                    else:
+                        self._quarantine_pool_connection(orphaned_connection)
+                        await self._poison_connection_pool(
+                            SafetyDatabasePoolError("orphaned pool wait connection"),
+                            self._pool_generation,
+                            "orphaned pool wait close",
+                        )
+        except asyncio.CancelledError as error:
+            # This task is owned by _wait_for_pool_connection and is shielded
+            # from borrower cancellation.  Internal cancellation would make
+            # queue ownership unknowable, so surface it as a safety failure.
+            raise SafetyDatabasePoolError(
+                "allocation ledger waiter cleanup task was cancelled"
+            ) from error
 
     async def _open_identity_bound_pool_connection(self) -> aiosqlite.Connection:
         """Open one replacement connection bound to the configured ledger inode."""
@@ -382,6 +766,7 @@ class AsyncTradingDatabase:
                 )
             binding.assert_path_identity()
             connection = await aiosqlite.connect(self.db_path)
+            self._quarantine_pool_connection(connection)
             pool_binding = binding.bind_sqlite_connection(
                 await self._sqlite_descriptor_identity(connection)
             )
@@ -396,8 +781,7 @@ class AsyncTradingDatabase:
             binding.assert_path_identity()
             return connection
         except BaseException:
-            if connection is not None:
-                await connection.close()
+            # The replacement caller owns exact cleanup through pool poison.
             raise
         finally:
             if binding is not None:
@@ -412,34 +796,139 @@ class AsyncTradingDatabase:
         if not self._initialized:
             await self.initialize()
 
-        conn = await asyncio.wait_for(self._available.get(), timeout=10.0)
+        # Keep the exact queue generation. Recovery replaces ``self._available``
+        # so a late return can never enter the rebuilt pool.
+        borrowed_queue = self._available
+        generation = self._pool_generation
+        lifecycle_revision = self._lifecycle_revision
+        if self._closed or not self._initialized:
+            raise RuntimeError("Database is closed")
+        failure = self._pool_recovery_failure
+        if failure is not None:
+            raise self._pool_failure_error(failure)
+
+        conn = await self._wait_for_pool_connection(borrowed_queue, generation)
+        self._lease_pool_connection(conn)
         return_connection: Optional[aiosqlite.Connection] = conn
         try:
+            failure = self._pool_recovery_failure
+            if (
+                failure is not None
+                or self._closed
+                or lifecycle_revision != self._lifecycle_revision
+                or borrowed_queue is not self._available
+                or generation is not self._pool_generation
+            ):
+                return_connection = None
+                self._release_connection_lease(conn)
+                if failure is None:
+                    failure = _PoolRecoveryFailure("pool generation changed during checkout")
+                raise self._pool_failure_error(failure)
             # Test connection before use
             await conn.execute("SELECT 1")
             yield conn
+        except SafetyDatabasePoolError:
+            raise
         except Exception as e:
+            if (
+                self._closed
+                or self._pool_recovery_failure is not None
+                or lifecycle_revision != self._lifecycle_revision
+                or borrowed_queue is not self._available
+                or generation is not self._pool_generation
+            ):
+                return_connection = None
+                self._release_connection_lease(conn)
+                raise
             logger.warning(f"Connection error: {e}")
             return_connection = None
+            # Detach before close: cancellation at the close await must not
+            # leave this connection counted in an empty pool generation.
+            self._detach_pool_connection(conn)
             try:
-                await conn.close()
-            except Exception as close_error:
-                logger.debug(f"Failed to close bad pooled connection: {close_error}")
-            try:
-                self._pool.remove(conn)
-            except ValueError:
-                pass
+                await self._close_quarantined_connections(
+                    "bad connection cleanup could not close every connection"
+                )
+            except BaseException as cleanup_error:
+                await self._poison_connection_pool(
+                    cleanup_error,
+                    generation,
+                    "bad connection cleanup",
+                )
+                raise
+            failure = self._pool_recovery_failure
+            if (
+                failure is not None
+                or self._closed
+                or lifecycle_revision != self._lifecycle_revision
+                or borrowed_queue is not self._available
+                or generation is not self._pool_generation
+            ):
+                raise
             try:
                 new_conn = await self._open_identity_bound_pool_connection()
-                self._pool.append(new_conn)
-                return_connection = new_conn
             except BaseException as replace_error:
                 logger.error(f"Failed to replace bad connection: {replace_error}")
+                poison_generation = generation
+                if generation is not self._pool_generation and self._quarantined_connections:
+                    poison_generation = self._pool_generation
+                await self._poison_connection_pool(replace_error, poison_generation)
                 if not isinstance(replace_error, Exception):
                     raise
                 raise e from replace_error
+            if (
+                self._closed
+                or lifecycle_revision != self._lifecycle_revision
+                or borrowed_queue is not self._available
+                or generation is not self._pool_generation
+            ):
+                # An intervening close may already have proved and forgotten a
+                # close while this old task still owned the replacement. Track
+                # it again before the stale owner performs its final close.
+                self._quarantine_pool_connection(new_conn)
+                await self._poison_connection_pool(
+                    SafetyDatabasePoolError("stale replacement generation"),
+                    self._pool_generation,
+                    "stale replacement close",
+                )
+                raise
+            self._pool.append(new_conn)
+            self._forget_quarantined_connection(new_conn)
+            return_connection = new_conn
+            raise
+        except BaseException as fatal_error:
+            # Cancellation or interpreter-level abort while validating/using
+            # a checked-out connection makes its state ambiguous. Fail the
+            # exact generation before the exception can propagate.
+            return_connection = None
+            if (
+                self._closed
+                or self._pool_recovery_failure is not None
+                or lifecycle_revision != self._lifecycle_revision
+                or borrowed_queue is not self._available
+                or generation is not self._pool_generation
+            ):
+                self._release_connection_lease(conn)
+                raise
+            self._detach_pool_connection(conn)
+            await self._poison_connection_pool(
+                fatal_error,
+                self._pool_generation,
+                "checked-out connection use",
+            )
             raise
         finally:
+            checkout_retired = (
+                self._closed
+                or self._pool_recovery_failure is not None
+                or lifecycle_revision != self._lifecycle_revision
+                or borrowed_queue is not self._available
+                or generation is not self._pool_generation
+            )
+            if checkout_retired and return_connection is not None:
+                self._release_connection_lease(return_connection)
+                return_connection = None
+
             # Ensure no transaction remains open on pooled connections
             try:
                 if return_connection is not None and getattr(
@@ -448,13 +937,54 @@ class AsyncTradingDatabase:
                     False,
                 ):
                     await return_connection.rollback()
-            except Exception as e:
-                logger.debug(f"Rollback on pooled connection failed: {e}")
+            except BaseException as rollback_error:
+                failed_connection = return_connection
+                return_connection = None
+                if failed_connection is not None:
+                    if (
+                        self._closed
+                        or lifecycle_revision != self._lifecycle_revision
+                        or borrowed_queue is not self._available
+                        or generation is not self._pool_generation
+                    ):
+                        self._release_connection_lease(failed_connection)
+                    else:
+                        self._detach_pool_connection(failed_connection)
+                        await self._poison_connection_pool(
+                            rollback_error,
+                            self._pool_generation,
+                            "pooled connection rollback",
+                        )
+                        raise
 
             # Return exactly one usable connection. Never enqueue a closed
             # original alongside its replacement.
-            if not self._closed and return_connection is not None:
-                await self._available.put(return_connection)
+            if return_connection is not None:
+                if (
+                    not self._closed
+                    and self._pool_recovery_failure is None
+                    and borrowed_queue is self._available
+                    and generation is self._pool_generation
+                    and lifecycle_revision == self._lifecycle_revision
+                ):
+                    try:
+                        self._release_connection_lease(return_connection)
+                        borrowed_queue.put_nowait(return_connection)
+                    except BaseException as return_error:
+                        self._detach_pool_connection(return_connection)
+                        await self._poison_connection_pool(
+                            return_error,
+                            generation,
+                            "pooled connection return",
+                        )
+                        raise
+                else:
+                    self._detach_pool_connection(return_connection)
+                    await self._poison_connection_pool(
+                        SafetyDatabasePoolError("stale returned connection"),
+                        self._pool_generation,
+                        "stale connection close",
+                    )
 
     async def _init_database(self, guardian: SQLitePathBinding) -> None:
         """Create tables if they don't exist.
@@ -464,7 +994,11 @@ class AsyncTradingDatabase:
         Tables without portfolio_id (global/shared):
             ticks, features, market_data
         """
-        async with aiosqlite.connect(self.db_path) as conn:
+        conn: Optional[aiosqlite.Connection] = None
+        cancellation: Optional[asyncio.CancelledError] = None
+        try:
+            conn = await aiosqlite.connect(self.db_path)
+            self._quarantine_pool_connection(conn)
             connection_binding = guardian.bind_sqlite_connection(
                 await self._sqlite_descriptor_identity(conn)
             )
@@ -703,6 +1237,17 @@ class AsyncTradingDatabase:
             connection_binding.assert_connection_identity(
                 await self._sqlite_descriptor_identity(conn)
             )
+        except asyncio.CancelledError as error:
+            cancellation = error
+        finally:
+            if conn is not None:
+                await self._close_owned_connection(
+                    conn,
+                    "initializer connection could not be closed",
+                    cancellation,
+                )
+        if cancellation is not None:
+            raise cancellation
 
     async def update_position(
         self,
@@ -1239,7 +1784,11 @@ class AsyncTradingDatabase:
                     "configured allocation ledger was replaced before snapshot collection"
                 )
             database_uri = binding.path.as_uri() + "?mode=ro"
-            async with aiosqlite.connect(database_uri, uri=True) as conn:
+            conn: Optional[aiosqlite.Connection] = None
+            connection_cancellation: Optional[asyncio.CancelledError] = None
+            try:
+                conn = await aiosqlite.connect(database_uri, uri=True)
+                self._quarantine_pool_connection(conn)
                 connection_identity = await self._sqlite_descriptor_identity(conn)
                 binding = binding.bind_sqlite_connection(connection_identity)
 
@@ -1280,6 +1829,17 @@ class AsyncTradingDatabase:
                 # replacement after the read cannot escape the final proof.
                 binding.assert_connection_identity(await self._sqlite_descriptor_identity(conn))
                 return snapshot
+            except asyncio.CancelledError as error:
+                connection_cancellation = error
+            finally:
+                if conn is not None:
+                    await self._close_owned_connection(
+                        conn,
+                        "allocation snapshot connection could not be closed",
+                        connection_cancellation,
+                    )
+            if connection_cancellation is not None:
+                raise connection_cancellation
         except SafetyAllocationSnapshotError:
             raise
         except (SQLiteIdentityError, OSError, aiosqlite.Error) as exc:
