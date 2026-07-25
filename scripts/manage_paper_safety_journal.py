@@ -20,7 +20,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from robo_trader.config import RuntimeContract, load_runtime_contract_from_env  # noqa: E402
+from robo_trader.config import (  # noqa: E402
+    RuntimeContract,
+    _derive_safety_account_scope,
+    load_runtime_contract_from_env,
+)
 from robo_trader.safety import (  # noqa: E402
     PaperExecutionIdentity,
     SafetyJournal,
@@ -30,10 +34,14 @@ from robo_trader.safety import (  # noqa: E402
 CREATE_CONFIRMATION = "CREATE-EMPTY-PAPER-SAFETY-JOURNAL"
 
 
-def generate_account_scope() -> str:
-    """Return a new opaque identifier with no broker-account derivation."""
+def generate_account_scope(account: str) -> tuple[str, str]:
+    """Return one fresh secret key and its exact account-bound scope."""
 
-    return f"acct_v1_{secrets.token_hex(32)}"
+    normalized_account = str(account).strip()
+    if not normalized_account:
+        raise ValueError("IBKR_ACCOUNT is required to generate a bound scope")
+    key = secrets.token_hex(32)
+    return key, _derive_safety_account_scope(key, normalized_account)
 
 
 def _resolved_environment() -> dict[str, str]:
@@ -109,7 +117,10 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser(
         "generate-scope",
-        help="Print a new opaque SAFETY_ACCOUNT_SCOPE; never edits .env.",
+        help=(
+            "Print a new SAFETY_ACCOUNT_SCOPE_KEY and matching account-bound "
+            "SAFETY_ACCOUNT_SCOPE; never edits .env."
+        ),
     )
     subparsers.add_parser("verify", help="Read-only replay of the configured journal.")
     initialize = subparsers.add_parser(
@@ -124,7 +135,10 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "generate-scope":
-            print(generate_account_scope())
+            environ = _resolved_environment()
+            key, scope = generate_account_scope(environ.get("IBKR_ACCOUNT", ""))
+            print(f"SAFETY_ACCOUNT_SCOPE_KEY={key}")
+            print(f"SAFETY_ACCOUNT_SCOPE={scope}")
             return 0
         environ = _resolved_environment()
         if args.command == "verify":

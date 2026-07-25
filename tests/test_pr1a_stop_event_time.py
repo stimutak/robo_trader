@@ -17,15 +17,15 @@ from robo_trader.stop_loss_monitor import StopLossMonitor, StopStatus, StopType
 
 def _monitor() -> StopLossMonitor:
     return StopLossMonitor(
-        executor=AsyncMock(),
+        execute_reduction=AsyncMock(),
         risk_manager=MagicMock(),
         portfolio_id="default",
     )
 
 
-def test_progress_deadline_defaults_cover_retries_and_monitor_cadence() -> None:
+def test_progress_deadline_defaults_cover_one_attempt_and_monitor_cadence() -> None:
     monitor = StopLossMonitor(
-        executor=AsyncMock(),
+        execute_reduction=AsyncMock(),
         risk_manager=MagicMock(),
         portfolio_id="default",
         order_timeout_seconds=5,
@@ -33,10 +33,8 @@ def test_progress_deadline_defaults_cover_retries_and_monitor_cadence() -> None:
 
     assert monitor.broker_attempt_timeout_seconds == 5
     assert monitor.pending_drain_timeout_seconds == 3
-    assert monitor.queue_timeout_seconds >= (
-        monitor.max_execution_retries * monitor.broker_attempt_timeout_seconds
-        + (monitor.max_execution_retries - 1) * 0.5
-    )
+    assert monitor.max_execution_retries == 1
+    assert monitor.queue_timeout_seconds >= monitor.broker_attempt_timeout_seconds
     assert monitor.settlement_timeout_seconds == 10
 
 
@@ -124,7 +122,7 @@ async def test_latched_crossing_survives_wall_clock_rollback() -> None:
     assert await monitor.check_stops() == [stop]
     assert stop.triggered_at == event_time
     assert stop.trigger_price == 90.0
-    monitor.executor.place_order_async.assert_not_awaited()
+    monitor._execute_reduction.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -169,7 +167,7 @@ async def test_same_timestamp_later_quote_uses_receipt_order_and_triggers_stop()
     assert monitor.price_receipt_orders["AAPL"] > first_order
     assert stop.status == StopStatus.TRIGGERED
     assert stop.trigger_price == 97.0
-    monitor.executor.place_order_async.assert_not_awaited()
+    monitor._execute_reduction.assert_not_awaited()
     assert await monitor.check_stops() == [stop]
     assert await monitor.check_stops() == []
 
@@ -214,7 +212,7 @@ async def test_burst_crossing_is_latched_for_fixed_and_trailing_long_and_short(
     newer_recovery,
 ) -> None:
     monitor = _monitor()
-    monitor.executor.place_order_async.return_value = ExecutionResult(
+    monitor._execute_reduction.return_value = ExecutionResult(
         True,
         "filled",
         fill_price=trigger_price,
@@ -248,12 +246,12 @@ async def test_burst_crossing_is_latched_for_fixed_and_trailing_long_and_short(
     assert stop.triggered_at == event_time
     assert stop.trigger_price == trigger_price
     assert monitor.metrics.triggered_today == 1
-    monitor.executor.place_order_async.assert_not_awaited()
+    monitor._execute_reduction.assert_not_awaited()
 
     assert await monitor.check_stops() == [stop]
     assert await monitor.check_stops() == []
     assert await monitor.execute_stop_loss(stop)
-    monitor.executor.place_order_async.assert_awaited_once()
+    monitor._execute_reduction.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -281,7 +279,7 @@ async def test_concurrent_quote_callbacks_preserve_crossing_order() -> None:
     assert stop.trigger_price == 104.0
     assert await monitor.check_stops() == [stop]
     assert await monitor.check_stops() == []
-    monitor.executor.place_order_async.assert_not_awaited()
+    monitor._execute_reduction.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -307,7 +305,7 @@ async def test_replacing_or_cancelling_stop_discards_latched_object() -> None:
     assert new_stop.status == StopStatus.CANCELLED
     assert monitor._pending_stop_triggers == {}
     assert await monitor.check_stops() == []
-    monitor.executor.place_order_async.assert_not_awaited()
+    monitor._execute_reduction.assert_not_awaited()
 
 
 @pytest.mark.asyncio

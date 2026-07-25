@@ -117,23 +117,27 @@ grep -E '^(ReadOnlyApi|AllowBlindTrading|TradingMode)=' config/ibc/config.ini
 
 ### 2.6 Provision the paper safety identity and journal
 
-The safety account scope is an opaque local identifier. It is not a password,
-but it must be random and must never be derived from or replaced by the IBKR
-account number.
+The safety account scope is an opaque, deterministic binding to the exact paper
+account. Its key is a local secret. Generate both values together, and do not
+reuse the key outside this installation:
 
 ```bash
 .venv/bin/python3 scripts/manage_paper_safety_journal.py generate-scope
 ```
 
-Copy the printed value into the untracked `.env` file:
+The command reads the existing untracked `IBKR_ACCOUNT` value and prints a new
+matching pair. Copy both printed values into the untracked `.env` file:
 
 ```dotenv
+SAFETY_ACCOUNT_SCOPE_KEY=<64 lowercase hex characters printed above>
 SAFETY_ACCOUNT_SCOPE=acct_v1_<64 lowercase hex characters printed above>
 SAFETY_JOURNAL_PATH=data/paper/safety_journal.db
 ```
 
-Never commit `.env`. Create and permission the parent directory explicitly,
-then perform the one-time, typed-confirmation initialization:
+Changing either the account or key requires deriving a new matching scope; an
+arbitrary replacement scope is rejected. The key is not included in runtime
+contract output or logs. Never commit `.env`. Create and permission the parent
+directory explicitly, then perform the one-time, typed-confirmation initialization:
 
 ```bash
 mkdir -p data/paper

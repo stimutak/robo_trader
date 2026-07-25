@@ -8,6 +8,8 @@ import pytest
 
 from robo_trader.config import RuntimeContract
 from robo_trader.runner_async import (
+    _setup_continuous_runner,
+    _start_paper_order_runtime,
     _start_paper_safety_runtime,
     main,
     run_continuous,
@@ -80,6 +82,26 @@ def test_startup_requires_exact_validated_runtime_contract(tmp_path):
         _start_paper_safety_runtime(cfg)
 
 
+@pytest.mark.asyncio
+async def test_paper_order_runtime_remains_blocked_until_pr2b3():
+    with pytest.raises(RuntimeError, match="PR 2B.3 terminal settlement"):
+        await _start_paper_order_runtime(object(), object())
+
+
+@pytest.mark.asyncio
+async def test_partial_continuous_setup_always_cleans_generic_failure():
+    runner = MagicMock()
+    runner.setup = AsyncMock(side_effect=RuntimeError("setup failed"))
+    runner._attach_health_monitor = AsyncMock()
+    runner.cleanup = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="setup failed"):
+        await _setup_continuous_runner(runner)
+
+    runner.cleanup.assert_awaited_once()
+    runner._attach_health_monitor.assert_not_awaited()
+
+
 def test_main_replays_safety_journal_before_gateway_or_runner_work(tmp_path):
     cfg = SimpleNamespace(
         execution=SimpleNamespace(mode=SimpleNamespace(value="paper")),
@@ -112,22 +134,97 @@ def test_main_replays_safety_journal_before_gateway_or_runner_work(tmp_path):
     exit_alert.assert_called_once()
 
 
+def test_main_refuses_runtime_until_terminal_settlement_is_ready(tmp_path):
+    cfg = SimpleNamespace(
+        execution=SimpleNamespace(mode=SimpleNamespace(value="paper")),
+        ibkr=SimpleNamespace(readonly=True, port=4002),
+        runtime_contract=_runtime_contract(tmp_path),
+    )
+    context = SimpleNamespace(runtime_contract=cfg.runtime_contract)
+
+    with (
+        patch.object(sys, "argv", ["robo-trader"]),
+        patch("robo_trader.runner_async._enforce_preflight_or_exit"),
+        patch("robo_trader.runner_async.load_config", return_value=cfg),
+        patch(
+            "robo_trader.runner_async._start_paper_safety_runtime",
+            return_value=object(),
+        ),
+        patch(
+            "robo_trader.runner_async.validate_runtime_safety",
+            return_value=context,
+        ),
+        patch("robo_trader.runner_async.resolve_environment", return_value={}),
+        patch("robo_trader.runner_async.check_gateway_zombies") as gateway_check,
+        patch("robo_trader.runner_async.asyncio.run") as run_async,
+        patch("robo_trader.runner_async._write_exit_audit") as exit_audit,
+        patch("robo_trader.runner_async._fire_runner_exit_alert") as exit_alert,
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+
+    assert exc_info.value.code == 9
+    gateway_check.assert_not_called()
+    run_async.assert_not_called()
+    exit_audit.assert_called_once_with(
+        "paper_terminal_settlement_not_ready",
+        exit_code=9,
+    )
+    exit_alert.assert_called_once_with(
+        "paper_terminal_settlement_not_ready",
+        {"required_pr": "2B.3"},
+    )
+
+
 @pytest.mark.asyncio
-async def test_run_once_retains_started_coordinator_for_runner():
-    coordinator = object()
+async def test_run_once_retains_started_coordinator_for_runner(tmp_path):
+    cfg = _cfg(tmp_path)
+    SafetyJournal(Path(cfg.runtime_contract.safety_journal_path)).initialize(
+        execution_domain_scope=cfg.runtime_contract.safety_execution_domain_scope,
+        account_scope=cfg.runtime_contract.safety_account_scope,
+    )
+    coordinator = _start_paper_safety_runtime(cfg)
+    runtime_context = object()
+    resources = SimpleNamespace(database=object(), gateway=object())
     runner = MagicMock()
     runner.run = AsyncMock()
+    runner.cleanup = AsyncMock()
 
-    with patch("robo_trader.runner_async.AsyncRunner", return_value=runner) as runner_class:
-        await run_once(symbols=["AAPL"], safety_runtime=coordinator)
+    with (
+        patch("robo_trader.runner_async.RuntimeSafetyContext", object),
+        patch(
+            "robo_trader.runner_async._start_paper_order_runtime",
+            new_callable=AsyncMock,
+            return_value=resources,
+        ),
+        patch(
+            "robo_trader.runner_async._close_paper_order_runtime",
+            new_callable=AsyncMock,
+        ),
+        patch("robo_trader.runner_async.AsyncRunner", return_value=runner) as runner_class,
+    ):
+        await run_once(
+            symbols=["AAPL"],
+            safety_runtime=coordinator,
+            runtime_context=runtime_context,
+        )
 
     assert runner_class.call_args.kwargs["safety_runtime"] is coordinator
+    assert runner_class.call_args.kwargs["shared_database"] is resources.database
+    assert runner_class.call_args.kwargs["paper_reduction_gateway"] is resources.gateway
     runner.run.assert_awaited_once_with(["AAPL"])
 
 
 @pytest.mark.asyncio
-async def test_continuous_reuses_one_account_coordinator_for_portfolio_runners():
-    coordinator = object()
+async def test_continuous_reuses_one_account_coordinator_for_portfolio_runners(tmp_path):
+    cfg = _cfg(tmp_path)
+    SafetyJournal(Path(cfg.runtime_contract.safety_journal_path)).initialize(
+        execution_domain_scope=cfg.runtime_contract.safety_execution_domain_scope,
+        account_scope=cfg.runtime_contract.safety_account_scope,
+    )
+    coordinator = _start_paper_safety_runtime(cfg)
+    runtime_context = object()
+    resources = SimpleNamespace(database=object(), gateway=object())
     runner = MagicMock()
     runner.recovery_in_progress = False
     runner._recovery_exhausted = False
@@ -145,6 +242,16 @@ async def test_continuous_reuses_one_account_coordinator_for_portfolio_runners()
 
     with (
         patch("signal.signal"),
+        patch("robo_trader.runner_async.RuntimeSafetyContext", object),
+        patch(
+            "robo_trader.runner_async._start_paper_order_runtime",
+            new_callable=AsyncMock,
+            return_value=resources,
+        ),
+        patch(
+            "robo_trader.runner_async._close_paper_order_runtime",
+            new_callable=AsyncMock,
+        ),
         patch("robo_trader.runner_async.AsyncRunner", return_value=runner) as runner_class,
         patch(
             "robo_trader.runner_async._setup_continuous_runner",
@@ -167,7 +274,10 @@ async def test_continuous_reuses_one_account_coordinator_for_portfolio_runners()
             symbols=["AAPL"],
             interval_seconds=1,
             safety_runtime=coordinator,
+            runtime_context=runtime_context,
         )
 
     assert runner_class.call_args.kwargs["safety_runtime"] is coordinator
+    assert runner_class.call_args.kwargs["shared_database"] is resources.database
+    assert runner_class.call_args.kwargs["paper_reduction_gateway"] is resources.gateway
     runner.cleanup.assert_awaited_once()

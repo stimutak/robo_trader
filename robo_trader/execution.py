@@ -5,6 +5,7 @@ import datetime as dt
 import math
 import os
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 if TYPE_CHECKING:
@@ -26,7 +27,8 @@ class Order:
     symbol: str
     quantity: int
     side: str  # "BUY" or "SELL"
-    price: Optional[float] = None  # None implies market
+    price: Optional[float | Decimal] = None  # None implies market
+    order_ref: Optional[str] = None
 
 
 class ExecutionResult:
@@ -211,17 +213,28 @@ class PaperExecutor(BaseExecutor):
     def _place_simple_order(self, order: Order) -> ExecutionResult:
         """Place order with simple paper execution."""
         base: Optional[float]
+        exact_base: Optional[Decimal] = None
 
         if order.price is not None:
-            try:
-                base = float(order.price)
-            except (TypeError, ValueError):
-                logger.error(
-                    "Invalid price provided for paper order", symbol=order.symbol, price=order.price
-                )
-                return ExecutionResult(False, "Invalid price for paper execution")
-            # Reject NaN / Infinity early (TC-M4); without this slippage math
-            # silently produces NaN fills.
+            if type(order.price) is Decimal:
+                if not order.price.is_finite() or order.price <= 0:
+                    logger.error(
+                        "Invalid exact price provided for paper order",
+                        symbol=order.symbol,
+                    )
+                    return ExecutionResult(False, "Invalid price for paper execution")
+                exact_base = order.price
+                base = float(exact_base)
+            else:
+                try:
+                    base = float(order.price)
+                except (TypeError, ValueError):
+                    logger.error(
+                        "Invalid price provided for paper order",
+                        symbol=order.symbol,
+                        price=order.price,
+                    )
+                    return ExecutionResult(False, "Invalid price for paper execution")
             if not math.isfinite(base):
                 logger.error(
                     "Non-finite price provided for paper order",
@@ -260,14 +273,36 @@ class PaperExecutor(BaseExecutor):
                 )
                 return ExecutionResult(False, "Stale reference price for market order")
 
-        # Apply symmetric slippage in basis points
-        slip = base * (self.slippage_bps / 10_000.0) if self.slippage_bps else 0.0
+        if exact_base is not None:
+            # The safety adapter passes a bounded, tick-quantized Decimal.
+            # Preserve it through all slippage arithmetic; only the legacy
+            # ExecutionResult boundary converts the final paper fill to float.
+            slip_decimal = (
+                exact_base * Decimal(str(self.slippage_bps)) / Decimal("10000")
+                if self.slippage_bps
+                else Decimal("0")
+            )
+            fill_decimal = (
+                exact_base + slip_decimal
+                if order.side.upper() in {"BUY", "BUY_TO_COVER"}
+                else exact_base - slip_decimal
+            )
+            fill = float(fill_decimal)
+        else:
+            # Apply symmetric slippage in basis points
+            slip = base * (self.slippage_bps / 10_000.0) if self.slippage_bps else 0.0
 
-        # Handle all order sides including short selling
-        if order.side.upper() in {"BUY", "BUY_TO_COVER"}:
-            fill = base + slip
-        else:  # SELL or SELL_SHORT
-            fill = base - slip
+            # Handle all order sides including short selling
+            if order.side.upper() in {"BUY", "BUY_TO_COVER"}:
+                fill = base + slip
+            else:  # SELL or SELL_SHORT
+                fill = base - slip
+        if not math.isfinite(fill) or fill <= 0:
+            logger.error(
+                "Paper slippage produced an invalid fill",
+                symbol=order.symbol,
+            )
+            return ExecutionResult(False, "Invalid paper execution fill")
 
         self.fills[f"{order.symbol}-{len(self.fills)+1}"] = (
             dt.datetime.utcnow(),

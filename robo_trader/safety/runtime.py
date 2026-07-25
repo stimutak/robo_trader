@@ -17,6 +17,7 @@ import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Callable, Optional, Tuple
 
 from ..runtime_contract_constants import PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
@@ -272,6 +273,12 @@ class CoherentSafetySnapshot:
     allocation_observed_at: datetime
     allocation_snapshot_id: str
     allocation_source: str
+    allocation_database_path: str
+    allocation_database_identity: str
+    allocation_database_device: int
+    allocation_database_inode: int
+    runtime_fingerprint: str
+    ibc_proof_id: str
     reconciliation_observed_at: datetime
     reconciliation_snapshot_id: str
     transport_generation: str
@@ -310,6 +317,30 @@ class CoherentSafetySnapshot:
         _scope(self.source, "source")
         _scope(self.allocation_snapshot_id, "allocation_snapshot_id")
         _scope(self.allocation_source, "allocation_source")
+        if (
+            not isinstance(self.allocation_database_path, str)
+            or not self.allocation_database_path.startswith("/")
+            or self.allocation_database_path != self.allocation_database_path.strip()
+        ):
+            raise ValidationError("allocation_database_path must be an absolute path")
+        _scope(self.allocation_database_identity, "allocation_database_identity")
+        for field_name in (
+            "allocation_database_device",
+            "allocation_database_inode",
+        ):
+            value = getattr(self, field_name)
+            if type(value) is not int or value < 0:
+                raise ValidationError(f"{field_name} must be a nonnegative integer")
+        if not isinstance(self.runtime_fingerprint, str) or not re.fullmatch(
+            r"[0-9a-f]{16}",
+            self.runtime_fingerprint,
+        ):
+            raise ValidationError("runtime_fingerprint must be a runtime contract digest")
+        if not isinstance(self.ibc_proof_id, str) or not re.fullmatch(
+            r"ibc-proof-v1-[0-9a-f]{64}",
+            self.ibc_proof_id,
+        ):
+            raise ValidationError("ibc_proof_id must be an opaque IBC proof")
         _scope(self.reconciliation_snapshot_id, "reconciliation_snapshot_id")
         _scope(self.transport_generation, "transport_generation")
         if not isinstance(self.account_positions, tuple) or any(
@@ -352,6 +383,12 @@ def _trusted_snapshot_digest(snapshot: CoherentSafetySnapshot) -> str:
             "allocation_observed_at": snapshot.allocation_observed_at,
             "allocation_snapshot_id": snapshot.allocation_snapshot_id,
             "allocation_source": snapshot.allocation_source,
+            "allocation_database_path": snapshot.allocation_database_path,
+            "allocation_database_identity": snapshot.allocation_database_identity,
+            "allocation_database_device": snapshot.allocation_database_device,
+            "allocation_database_inode": snapshot.allocation_database_inode,
+            "runtime_fingerprint": snapshot.runtime_fingerprint,
+            "ibc_proof_id": snapshot.ibc_proof_id,
             "reconciliation_observed_at": snapshot.reconciliation_observed_at,
             "reconciliation_snapshot_id": snapshot.reconciliation_snapshot_id,
             "transport_generation": snapshot.transport_generation,
@@ -406,13 +443,11 @@ def _register_trusted_snapshot(snapshot: CoherentSafetySnapshot) -> None:
     """Register the exact assembled object, not merely a copyable marker."""
 
     object_id = id(snapshot)
-    reference = weakref.ref(
-        snapshot,
-        lambda current, object_id=object_id: _discard_trusted_snapshot(
-            object_id,
-            current,
-        ),
-    )
+
+    def discard(reference: weakref.ReferenceType[CoherentSafetySnapshot]) -> None:
+        _discard_trusted_snapshot(object_id, reference)
+
+    reference = weakref.ref(snapshot, discard)
     with _TRUSTED_SNAPSHOT_REGISTRY_LOCK:
         _TRUSTED_SNAPSHOT_REGISTRY[object_id] = (
             reference,
@@ -440,7 +475,7 @@ def _assemble_coherent_safety_snapshot(**values: object) -> CoherentSafetySnapsh
     """Internal constructor used only by the typed integration boundary."""
 
     snapshot = CoherentSafetySnapshot(
-        **values,
+        **values,  # type: ignore[arg-type]
         _assembly_marker=_TRUSTED_ASSEMBLY_MARKER,
     )
     _register_trusted_snapshot(snapshot)
@@ -487,6 +522,56 @@ class RuntimeOrderRequest:
             raise ValidationError("reason and strategy must be strings")
 
 
+def _request_digest(request: RuntimeOrderRequest) -> str:
+    payload = canonical_json(
+        {
+            "contract": _contract_digest(request.contract),
+            "limit_price": request.limit_price,
+            "order_ref": request.order_ref,
+            "order_type": request.order_type,
+            "outside_regular_hours": request.outside_regular_hours,
+            "portfolio_id": request.portfolio_id,
+            "quantity": request.quantity,
+            "reason": request.reason,
+            "side": request.side,
+            "stop_price": request.stop_price,
+            "strategy": request.strategy,
+            "time_in_force": request.time_in_force,
+        }
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _snapshot_runtime_request(request: RuntimeOrderRequest) -> RuntimeOrderRequest:
+    """Take an exact request snapshot and detect concurrent mutation."""
+
+    if type(request) is not RuntimeOrderRequest:
+        raise TypeError("request must be RuntimeOrderRequest")
+    digest_before = _request_digest(request)
+    snapshot = RuntimeOrderRequest(
+        portfolio_id=request.portfolio_id,
+        contract=request.contract,
+        side=request.side,
+        quantity=request.quantity,
+        order_type=request.order_type,
+        time_in_force=request.time_in_force,
+        order_ref=request.order_ref,
+        limit_price=request.limit_price,
+        stop_price=request.stop_price,
+        outside_regular_hours=request.outside_regular_hours,
+        reason=request.reason,
+        strategy=request.strategy,
+    )
+    if not hmac.compare_digest(digest_before, _request_digest(request)) or not hmac.compare_digest(
+        digest_before, _request_digest(snapshot)
+    ):
+        raise ValidationError("RuntimeOrderRequest changed while being validated")
+    return snapshot
+
+
+_RUNTIME_AUTHORIZATION_MARKER = object()
+
+
 @dataclass(frozen=True)
 class RuntimeAuthorization:
     reservation: Reservation
@@ -497,13 +582,350 @@ class RuntimeAuthorization:
     allocation_snapshot_id: str
     contract_snapshot_id: str
     reconciliation_snapshot_id: str
+    allocation_database_path: str
+    allocation_database_identity: str
+    allocation_database_device: int
+    allocation_database_inode: int
+    runtime_fingerprint: str
+    ibc_proof_id: str
     descriptor_fingerprint: str
     expires_at: datetime
+    _request: RuntimeOrderRequest = field(repr=False, compare=False)
+    _request_digest: str = field(repr=False, compare=False)
     _permit: SubmissionPermit = field(repr=False)
     _coordinator_token: object = field(repr=False, compare=False)
+    _producer_marker: object = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self._producer_marker is not _RUNTIME_AUTHORIZATION_MARKER:
+            raise RuntimeSafetyError("RuntimeAuthorization requires coordinator production")
         object.__setattr__(self, "expires_at", _utc(self.expires_at, "expires_at"))
+
+    def __copy__(self):
+        raise TypeError("RuntimeAuthorization cannot be copied")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("RuntimeAuthorization cannot be copied")
+
+    def __reduce__(self):
+        raise TypeError("RuntimeAuthorization cannot be serialized")
+
+
+_FINAL_EVIDENCE_PROOF_MARKER = object()
+_CONSUMED_ENVELOPE_MARKER = object()
+_RUNTIME_AUTHORIZATION_REGISTRY_LOCK = threading.RLock()
+_RUNTIME_AUTHORIZATION_REGISTRY: dict[
+    int, tuple[weakref.ReferenceType[RuntimeAuthorization], str]
+] = {}
+_FINAL_EVIDENCE_REGISTRY_LOCK = threading.RLock()
+_FINAL_EVIDENCE_REGISTRY: dict[
+    int, tuple[weakref.ReferenceType["FinalSubmissionEvidenceProof"], str]
+] = {}
+_CONSUMED_ENVELOPE_REGISTRY_LOCK = threading.RLock()
+_CONSUMED_ENVELOPE_REGISTRY: dict[
+    int, tuple[weakref.ReferenceType["ConsumedPaperSubmissionEnvelope"], str]
+] = {}
+
+
+def _contract_digest(contract: AuthoritativeContract) -> str:
+    payload = canonical_json(
+        {
+            "broker_timestamp": contract.broker_timestamp,
+            "con_id": contract.con_id,
+            "currency": contract.currency,
+            "exchange": contract.exchange,
+            "local_symbol": contract.local_symbol,
+            "observed_at": contract.observed_at,
+            "primary_exchange": contract.primary_exchange,
+            "retrieval_timestamp": contract.retrieval_timestamp,
+            "security_type": contract.security_type,
+            "snapshot_id": contract.snapshot_id,
+            "source": contract.source,
+            "status": contract.status,
+            "symbol": contract.symbol,
+            "trading_class": contract.trading_class,
+            "transport_generation": contract.transport_generation,
+        }
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _runtime_authorization_digest(authorization: RuntimeAuthorization) -> str:
+    payload = canonical_json(
+        {
+            "account_scope": authorization.claim.account_scope,
+            "claim_id": authorization.claim.claim_id,
+            "con_id": authorization.claim.con_id,
+            "contract": _contract_digest(authorization.contract),
+            "descriptor_fingerprint": authorization.descriptor_fingerprint,
+            "execution_domain_scope": authorization.claim.execution_domain_scope,
+            "expires_at": authorization.expires_at,
+            "allocation_database_path": authorization.allocation_database_path,
+            "allocation_database_identity": authorization.allocation_database_identity,
+            "allocation_database_device": authorization.allocation_database_device,
+            "allocation_database_inode": authorization.allocation_database_inode,
+            "runtime_fingerprint": authorization.runtime_fingerprint,
+            "ibc_proof_id": authorization.ibc_proof_id,
+            "permit_claim_id": authorization._permit.claim_id,
+            "request_digest": authorization._request_digest,
+            "reservation_id": authorization.reservation.reservation_id,
+        }
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _register_runtime_authorization(authorization: RuntimeAuthorization) -> None:
+    object_id = id(authorization)
+
+    def discard(reference: weakref.ReferenceType[RuntimeAuthorization]) -> None:
+        with _RUNTIME_AUTHORIZATION_REGISTRY_LOCK:
+            registered = _RUNTIME_AUTHORIZATION_REGISTRY.get(object_id)
+            if registered is not None and registered[0] is reference:
+                _RUNTIME_AUTHORIZATION_REGISTRY.pop(object_id, None)
+
+    reference = weakref.ref(authorization, discard)
+    with _RUNTIME_AUTHORIZATION_REGISTRY_LOCK:
+        _RUNTIME_AUTHORIZATION_REGISTRY[object_id] = (
+            reference,
+            _runtime_authorization_digest(authorization),
+        )
+
+
+def _assert_runtime_authorization(
+    authorization: RuntimeAuthorization,
+    *,
+    coordinator_token: object,
+) -> None:
+    if type(authorization) is not RuntimeAuthorization:
+        raise RuntimeSafetyError("exact RuntimeAuthorization is required")
+    with _RUNTIME_AUTHORIZATION_REGISTRY_LOCK:
+        registered = _RUNTIME_AUTHORIZATION_REGISTRY.get(id(authorization))
+        if (
+            registered is None
+            or registered[0]() is not authorization
+            or authorization._coordinator_token is not coordinator_token
+            or not hmac.compare_digest(
+                registered[1],
+                _runtime_authorization_digest(authorization),
+            )
+        ):
+            raise RuntimeSafetyError(
+                "runtime authorization is forged, changed, invalidated, or foreign"
+            )
+
+
+def _retire_changed_runtime_authorization(
+    authorization: RuntimeAuthorization,
+    *,
+    coordinator_token: object,
+) -> bool:
+    """Retire a mutated exact registered object without accepting a copy."""
+
+    with _RUNTIME_AUTHORIZATION_REGISTRY_LOCK:
+        registered = _RUNTIME_AUTHORIZATION_REGISTRY.get(id(authorization))
+        if (
+            registered is None
+            or registered[0]() is not authorization
+            or authorization._coordinator_token is not coordinator_token
+        ):
+            return False
+        _RUNTIME_AUTHORIZATION_REGISTRY.pop(id(authorization), None)
+        return True
+
+
+def _retire_runtime_authorization(
+    authorization: RuntimeAuthorization,
+    *,
+    coordinator_token: object,
+) -> None:
+    _assert_runtime_authorization(
+        authorization,
+        coordinator_token=coordinator_token,
+    )
+    with _RUNTIME_AUTHORIZATION_REGISTRY_LOCK:
+        _RUNTIME_AUTHORIZATION_REGISTRY.pop(id(authorization), None)
+
+
+@dataclass(frozen=True)
+class FinalSubmissionEvidenceProof:
+    """Opaque, coordinator-bound proof of one fresh final evidence set.
+
+    The integration boundary must create this exact registered object only
+    after collecting and revalidating final broker and ledger evidence.  A
+    boolean or caller-supplied label can never substitute for it.
+    """
+
+    execution_domain_scope: str
+    account_scope: str
+    con_id: int
+    symbol: str
+    descriptor_fingerprint: str
+    contract_snapshot_id: str
+    contract_transport_generation: str
+    final_evidence_fingerprint: str
+    expires_at: datetime
+    _contract: AuthoritativeContract = field(repr=False, compare=False)
+    _coordinator_token: object = field(repr=False, compare=False)
+    _producer_marker: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._producer_marker is not _FINAL_EVIDENCE_PROOF_MARKER:
+            raise RuntimeSafetyError(
+                "FinalSubmissionEvidenceProof requires trusted final evidence production"
+            )
+        object.__setattr__(self, "expires_at", _utc(self.expires_at, "expires_at"))
+
+    def __copy__(self):
+        raise TypeError("FinalSubmissionEvidenceProof cannot be copied")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("FinalSubmissionEvidenceProof cannot be copied")
+
+    def __reduce__(self):
+        raise TypeError("FinalSubmissionEvidenceProof cannot be serialized")
+
+
+@dataclass(frozen=True)
+class ConsumedPaperSubmissionEnvelope:
+    """Producer-registered one-shot authority after durable permit consumption."""
+
+    execution_domain_scope: str
+    account_scope: str
+    con_id: int
+    symbol: str
+    descriptor_fingerprint: str
+    contract_snapshot_id: str
+    contract_transport_generation: str
+    final_evidence_fingerprint: str
+    _descriptor: SubmissionDescriptor = field(repr=False, compare=False)
+    _contract: AuthoritativeContract = field(repr=False, compare=False)
+    _coordinator_token: object = field(repr=False, compare=False)
+    _producer_marker: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._producer_marker is not _CONSUMED_ENVELOPE_MARKER:
+            raise RuntimeSafetyError(
+                "ConsumedPaperSubmissionEnvelope requires coordinator permit consumption"
+            )
+
+    def __copy__(self):
+        raise TypeError("ConsumedPaperSubmissionEnvelope cannot be copied")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("ConsumedPaperSubmissionEnvelope cannot be copied")
+
+    def __reduce__(self):
+        raise TypeError("ConsumedPaperSubmissionEnvelope cannot be serialized")
+
+
+def _final_evidence_digest(proof: FinalSubmissionEvidenceProof) -> str:
+    payload = canonical_json(
+        {
+            "account_scope": proof.account_scope,
+            "con_id": proof.con_id,
+            "contract_digest": _contract_digest(proof._contract),
+            "contract_snapshot_id": proof.contract_snapshot_id,
+            "contract_transport_generation": proof.contract_transport_generation,
+            "descriptor_fingerprint": proof.descriptor_fingerprint,
+            "execution_domain_scope": proof.execution_domain_scope,
+            "expires_at": proof.expires_at,
+            "final_evidence_fingerprint": proof.final_evidence_fingerprint,
+            "symbol": proof.symbol,
+        }
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _envelope_digest(envelope: ConsumedPaperSubmissionEnvelope) -> str:
+    payload = canonical_json(
+        {
+            "account_scope": envelope.account_scope,
+            "con_id": envelope.con_id,
+            "contract_digest": _contract_digest(envelope._contract),
+            "contract_snapshot_id": envelope.contract_snapshot_id,
+            "contract_transport_generation": envelope.contract_transport_generation,
+            "descriptor": envelope._descriptor.canonical_payload(),
+            "descriptor_fingerprint": envelope.descriptor_fingerprint,
+            "execution_domain_scope": envelope.execution_domain_scope,
+            "final_evidence_fingerprint": envelope.final_evidence_fingerprint,
+            "symbol": envelope.symbol,
+        }
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _register_final_evidence_proof(proof: FinalSubmissionEvidenceProof) -> None:
+    object_id = id(proof)
+
+    def discard(reference: weakref.ReferenceType[FinalSubmissionEvidenceProof]) -> None:
+        with _FINAL_EVIDENCE_REGISTRY_LOCK:
+            registered = _FINAL_EVIDENCE_REGISTRY.get(object_id)
+            if registered is not None and registered[0] is reference:
+                _FINAL_EVIDENCE_REGISTRY.pop(object_id, None)
+
+    reference = weakref.ref(proof, discard)
+    with _FINAL_EVIDENCE_REGISTRY_LOCK:
+        _FINAL_EVIDENCE_REGISTRY[object_id] = (reference, _final_evidence_digest(proof))
+
+
+def _register_consumed_envelope(envelope: ConsumedPaperSubmissionEnvelope) -> None:
+    object_id = id(envelope)
+
+    def discard(reference: weakref.ReferenceType[ConsumedPaperSubmissionEnvelope]) -> None:
+        with _CONSUMED_ENVELOPE_REGISTRY_LOCK:
+            registered = _CONSUMED_ENVELOPE_REGISTRY.get(object_id)
+            if registered is not None and registered[0] is reference:
+                _CONSUMED_ENVELOPE_REGISTRY.pop(object_id, None)
+
+    reference = weakref.ref(envelope, discard)
+    with _CONSUMED_ENVELOPE_REGISTRY_LOCK:
+        _CONSUMED_ENVELOPE_REGISTRY[object_id] = (
+            reference,
+            _envelope_digest(envelope),
+        )
+
+
+def _claim_final_evidence_proof(
+    proof: FinalSubmissionEvidenceProof,
+    *,
+    coordinator_token: object,
+) -> None:
+    if type(proof) is not FinalSubmissionEvidenceProof:
+        raise RuntimeSafetyError("exact FinalSubmissionEvidenceProof is required")
+    with _FINAL_EVIDENCE_REGISTRY_LOCK:
+        registered = _FINAL_EVIDENCE_REGISTRY.get(id(proof))
+        if (
+            registered is None
+            or registered[0]() is not proof
+            or proof._coordinator_token is not coordinator_token
+            or not hmac.compare_digest(registered[1], _final_evidence_digest(proof))
+        ):
+            raise RuntimeSafetyError(
+                "final submission evidence proof is forged, changed, replayed, or foreign"
+            )
+        _FINAL_EVIDENCE_REGISTRY.pop(id(proof), None)
+
+
+def _claim_consumed_envelope(
+    envelope: ConsumedPaperSubmissionEnvelope,
+    *,
+    coordinator_token: object,
+) -> tuple[SubmissionDescriptor, AuthoritativeContract]:
+    if type(envelope) is not ConsumedPaperSubmissionEnvelope:
+        raise RuntimeSafetyError("exact ConsumedPaperSubmissionEnvelope is required")
+    with _CONSUMED_ENVELOPE_REGISTRY_LOCK:
+        registered = _CONSUMED_ENVELOPE_REGISTRY.get(id(envelope))
+        if (
+            registered is None
+            or registered[0]() is not envelope
+            or envelope._coordinator_token is not coordinator_token
+            or not hmac.compare_digest(registered[1], _envelope_digest(envelope))
+        ):
+            raise RuntimeSafetyError(
+                "paper submission envelope is forged, changed, replayed, or foreign"
+            )
+        _CONSUMED_ENVELOPE_REGISTRY.pop(id(envelope), None)
+        return envelope._descriptor, envelope._contract
 
 
 @dataclass(frozen=True)
@@ -571,6 +993,26 @@ class SafetyRuntimeCoordinator:
         with self._startup_lock:
             return self._started
 
+    @property
+    def paper_execution_identity(self) -> PaperExecutionIdentity:
+        return self._identity
+
+    @property
+    def identity_execution_domain_scope(self) -> str:
+        return self._identity.execution_domain_scope
+
+    @property
+    def identity_account_scope(self) -> str:
+        return self._identity.account_scope
+
+    @property
+    def safety_journal_database_path(self) -> Path:
+        return self._journal.database_path
+
+    @property
+    def safety_journal_runtime_path_identity(self) -> Optional[Tuple[int, int]]:
+        return self._journal.runtime_path_identity
+
     def start(self) -> None:
         """Replay the supplied journal and refuse unresolved prior authority."""
 
@@ -608,6 +1050,7 @@ class SafetyRuntimeCoordinator:
                 raise TypeError("snapshot must be CoherentSafetySnapshot")
             _assert_trusted_snapshot(snapshot)
 
+            request = _snapshot_runtime_request(request)
             evaluated_at = _utc(self._clock(), "clock result")
             intent, exposure, allocation, gates, descriptor = self._build_boundary_models(
                 request, snapshot, evaluated_at
@@ -650,7 +1093,7 @@ class SafetyRuntimeCoordinator:
                 snapshot.open_orders.observed_at,
                 snapshot.reconciliation_observed_at,
             ) + timedelta(seconds=self._max_evidence_age_seconds)
-            return RuntimeAuthorization(
+            authorization = RuntimeAuthorization(
                 reservation=reservation,
                 claim=claim,
                 decision=decision,
@@ -659,11 +1102,340 @@ class SafetyRuntimeCoordinator:
                 allocation_snapshot_id=snapshot.allocation_snapshot_id,
                 contract_snapshot_id=request.contract.snapshot_id,
                 reconciliation_snapshot_id=snapshot.reconciliation_snapshot_id,
+                allocation_database_path=snapshot.allocation_database_path,
+                allocation_database_identity=snapshot.allocation_database_identity,
+                allocation_database_device=snapshot.allocation_database_device,
+                allocation_database_inode=snapshot.allocation_database_inode,
+                runtime_fingerprint=snapshot.runtime_fingerprint,
+                ibc_proof_id=snapshot.ibc_proof_id,
                 descriptor_fingerprint=descriptor.fingerprint(),
                 expires_at=evidence_deadline,
+                _request=request,
+                _request_digest=_request_digest(request),
                 _permit=permit,
                 _coordinator_token=self._coordinator_token,
+                _producer_marker=_RUNTIME_AUTHORIZATION_MARKER,
             )
+            _register_runtime_authorization(authorization)
+            return authorization
+
+    def _invalidate_unsubmitted_authorization(
+        self,
+        authorization: RuntimeAuthorization,
+    ) -> None:
+        """Irrevocably retire one exact, coordinator-owned unsubmitted permit."""
+
+        with self._startup_lock:
+            if not self._started:
+                raise RuntimeNotStarted("successful journal replay is required")
+            if type(authorization) is not RuntimeAuthorization:
+                raise TypeError("authorization must be RuntimeAuthorization")
+            _retire_runtime_authorization(
+                authorization,
+                coordinator_token=self._coordinator_token,
+            )
+            self._journal.invalidate_unsubmitted_permit(authorization._permit)
+
+    def _bind_fresh_final_evidence_proof(
+        self,
+        authorization: RuntimeAuthorization,
+        contract: AuthoritativeContract,
+        snapshot: CoherentSafetySnapshot,
+    ) -> FinalSubmissionEvidenceProof:
+        """Bind exact fresh final evidence collected by the integration layer.
+
+        This method does not collect broker or ledger data. It independently
+        re-evaluates the exact authorized request against the newly collected
+        final evidence before producing a non-labelable one-shot capability.
+        """
+
+        with self._startup_lock:
+            if not self._started:
+                raise RuntimeNotStarted("successful journal replay is required")
+            if type(authorization) is not RuntimeAuthorization:
+                raise TypeError("authorization must be RuntimeAuthorization")
+            try:
+                _assert_runtime_authorization(
+                    authorization,
+                    coordinator_token=self._coordinator_token,
+                )
+            except RuntimeSafetyError:
+                if _retire_changed_runtime_authorization(
+                    authorization,
+                    coordinator_token=self._coordinator_token,
+                ):
+                    self._journal.invalidate_unsubmitted_permit(authorization._permit)
+                raise
+            if type(contract) is not AuthoritativeContract:
+                self._invalidate_unsubmitted_authorization(authorization)
+                raise TypeError("contract must be AuthoritativeContract")
+            if type(snapshot) is not CoherentSafetySnapshot:
+                self._invalidate_unsubmitted_authorization(authorization)
+                raise TypeError("snapshot must be CoherentSafetySnapshot")
+
+            def reject(message: str) -> None:
+                self._invalidate_unsubmitted_authorization(authorization)
+                raise RuntimeSafetyError(message)
+
+            try:
+                _assert_trusted_snapshot(snapshot)
+            except ValidationError as exc:
+                reject("final evidence is not the exact trusted snapshot")
+                raise AssertionError("unreachable") from exc
+
+            evaluated_at = _utc(self._clock(), "clock result")
+            if evaluated_at > authorization.expires_at:
+                reject("authorization expired before final evidence binding")
+            if not hmac.compare_digest(
+                authorization._request_digest,
+                _request_digest(authorization._request),
+            ):
+                reject("authorized request lineage changed")
+            if (
+                snapshot.execution_domain_scope != self._identity.execution_domain_scope
+                or snapshot.account_scope != self._identity.account_scope
+                or authorization.claim.execution_domain_scope
+                != self._identity.execution_domain_scope
+                or authorization.claim.account_scope != self._identity.account_scope
+            ):
+                reject("final evidence scope does not match coordinator identity")
+            if (
+                contract.status is not EvidenceStatus.AUTHORITATIVE
+                or contract.con_id != authorization.contract.con_id
+                or contract.symbol != authorization.contract.symbol
+                or contract.local_symbol != authorization.contract.local_symbol
+                or contract.security_type != authorization.contract.security_type
+                or contract.currency != authorization.contract.currency
+                or contract.exchange != authorization.contract.exchange
+                or contract.primary_exchange != authorization.contract.primary_exchange
+                or contract.trading_class != authorization.contract.trading_class
+                or authorization.claim.con_id != contract.con_id
+            ):
+                reject("final contract does not match authorized contract identity")
+            if (
+                contract.transport_generation != snapshot.transport_generation
+                or snapshot.open_orders.transport_generation != snapshot.transport_generation
+                or contract.transport_generation != authorization.contract.transport_generation
+            ):
+                reject("final contract transport lineage is inconsistent")
+            if (
+                snapshot.allocation_database_path != authorization.allocation_database_path
+                or snapshot.allocation_database_identity
+                != authorization.allocation_database_identity
+                or snapshot.allocation_database_device != authorization.allocation_database_device
+                or snapshot.allocation_database_inode != authorization.allocation_database_inode
+                or snapshot.runtime_fingerprint != authorization.runtime_fingerprint
+                or snapshot.ibc_proof_id != authorization.ibc_proof_id
+            ):
+                reject("final ledger or runtime provenance changed")
+            if (
+                snapshot.transport_state is not TransportState.CONNECTED
+                or snapshot.reconciliation_status is not ReconciliationStatus.PASSED
+                or not snapshot.positions_complete
+                or not snapshot.allocations_complete
+                or not snapshot.contracts_complete
+                or not snapshot.open_orders.complete
+                or not snapshot.open_orders.all_clients
+                or not snapshot.open_orders.stable
+                or snapshot.open_orders.unknown_order_count != 0
+            ):
+                reject("final evidence is incomplete or hard-blocked")
+
+            evidence_times = (
+                contract.broker_timestamp,
+                contract.retrieval_timestamp,
+                snapshot.observed_at,
+                snapshot.allocation_observed_at,
+                snapshot.open_orders.observed_at,
+                snapshot.reconciliation_observed_at,
+            )
+            if any(value > evaluated_at for value in evidence_times):
+                reject("final evidence contains a future timestamp")
+            expires_at = min(evidence_times) + timedelta(seconds=self._max_evidence_age_seconds)
+            if evaluated_at > expires_at:
+                reject("final evidence is stale")
+
+            original_request = authorization._request
+            final_request = RuntimeOrderRequest(
+                portfolio_id=original_request.portfolio_id,
+                contract=contract,
+                side=original_request.side,
+                quantity=original_request.quantity,
+                order_type=original_request.order_type,
+                time_in_force=original_request.time_in_force,
+                order_ref=original_request.order_ref,
+                limit_price=original_request.limit_price,
+                stop_price=original_request.stop_price,
+                outside_regular_hours=original_request.outside_regular_hours,
+                reason=original_request.reason,
+                strategy=original_request.strategy,
+            )
+            try:
+                intent, exposure, allocation, gates, descriptor = self._build_boundary_models(
+                    final_request, snapshot, evaluated_at
+                )
+                _assert_trusted_snapshot(snapshot)
+                final_decision = evaluate_reduce_only(
+                    intent,
+                    exposure,
+                    allocation,
+                    gates,
+                )
+            except (ArithmeticError, AttributeError, TypeError, ValidationError) as exc:
+                reject("final evidence could not be re-evaluated exactly")
+                raise AssertionError("unreachable") from exc
+            if (
+                descriptor.fingerprint() != authorization.descriptor_fingerprint
+                or descriptor.fingerprint() != authorization.claim.submission_descriptor_fingerprint
+                or final_decision.outcome is not DecisionOutcome.ALLOW
+            ):
+                reject("final evidence no longer authorizes the exact submission")
+
+            try:
+                _assert_trusted_snapshot(snapshot)
+            except ValidationError as exc:
+                reject("final evidence changed after re-evaluation")
+                raise AssertionError("unreachable") from exc
+            final_evidence_fingerprint = hashlib.sha256(
+                canonical_json(
+                    {
+                        "authorization_descriptor_fingerprint": (
+                            authorization.descriptor_fingerprint
+                        ),
+                        "contract_digest": _contract_digest(contract),
+                        "snapshot_digest": _trusted_snapshot_digest(snapshot),
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            proof = FinalSubmissionEvidenceProof(
+                execution_domain_scope=self._identity.execution_domain_scope,
+                account_scope=self._identity.account_scope,
+                con_id=contract.con_id,
+                symbol=contract.symbol,
+                descriptor_fingerprint=authorization.descriptor_fingerprint,
+                contract_snapshot_id=contract.snapshot_id,
+                contract_transport_generation=contract.transport_generation,
+                final_evidence_fingerprint=final_evidence_fingerprint,
+                expires_at=expires_at,
+                _contract=contract,
+                _coordinator_token=self._coordinator_token,
+                _producer_marker=_FINAL_EVIDENCE_PROOF_MARKER,
+            )
+            _register_final_evidence_proof(proof)
+            return proof
+
+    def _consume_authorization_for_paper_submission(
+        self,
+        authorization: RuntimeAuthorization,
+        final_evidence: FinalSubmissionEvidenceProof,
+    ) -> ConsumedPaperSubmissionEnvelope:
+        """Consume one permit and issue one coordinator-bound paper envelope."""
+
+        with self._startup_lock:
+            if not self._started:
+                raise RuntimeNotStarted("successful journal replay is required")
+            if type(authorization) is not RuntimeAuthorization:
+                raise TypeError("authorization must be RuntimeAuthorization")
+            _assert_runtime_authorization(
+                authorization,
+                coordinator_token=self._coordinator_token,
+            )
+            if type(final_evidence) is not FinalSubmissionEvidenceProof:
+                raise TypeError("final_evidence must be FinalSubmissionEvidenceProof")
+
+            evaluated_at = _utc(self._clock(), "clock result")
+            if (
+                final_evidence.execution_domain_scope != self._identity.execution_domain_scope
+                or final_evidence.account_scope != self._identity.account_scope
+                or final_evidence.con_id != authorization.claim.con_id
+                or final_evidence.con_id != authorization.contract.con_id
+                or final_evidence.symbol != authorization.contract.symbol
+                or final_evidence.descriptor_fingerprint != authorization.descriptor_fingerprint
+                or final_evidence.descriptor_fingerprint
+                != authorization.claim.submission_descriptor_fingerprint
+                or final_evidence.contract_snapshot_id != final_evidence._contract.snapshot_id
+                or final_evidence.contract_transport_generation
+                != final_evidence._contract.transport_generation
+                or final_evidence.contract_transport_generation
+                != authorization.contract.transport_generation
+            ):
+                raise RuntimeSafetyError(
+                    "final evidence proof does not match authorized submission"
+                )
+            if evaluated_at > authorization.expires_at or evaluated_at > final_evidence.expires_at:
+                self._invalidate_unsubmitted_authorization(authorization)
+                raise RuntimeSafetyError(
+                    "authorization or final evidence expired before permit consumption"
+                )
+
+            # Claim the exact proof before consuming the journal permit. A
+            # forged, copied, replayed, or concurrently used proof cannot move
+            # the durable claim into OUTCOME_UNKNOWN.
+            _claim_final_evidence_proof(
+                final_evidence,
+                coordinator_token=self._coordinator_token,
+            )
+            _retire_runtime_authorization(
+                authorization,
+                coordinator_token=self._coordinator_token,
+            )
+            descriptor = self._journal.consume_submission_permit(authorization._permit)
+
+            # From this point forward every failure is intentionally fail
+            # closed: the permit is durably consumed and cannot be retried.
+            if (
+                descriptor.execution_domain_scope != self._identity.execution_domain_scope
+                or descriptor.account_scope != self._identity.account_scope
+                or descriptor.con_id != final_evidence.con_id
+                or descriptor.fingerprint() != final_evidence.descriptor_fingerprint
+            ):
+                raise RuntimeSafetyError(
+                    "consumed descriptor does not match final submission proof"
+                )
+            envelope = ConsumedPaperSubmissionEnvelope(
+                execution_domain_scope=descriptor.execution_domain_scope,
+                account_scope=descriptor.account_scope,
+                con_id=descriptor.con_id,
+                symbol=final_evidence.symbol,
+                descriptor_fingerprint=descriptor.fingerprint(),
+                contract_snapshot_id=final_evidence.contract_snapshot_id,
+                contract_transport_generation=(final_evidence.contract_transport_generation),
+                final_evidence_fingerprint=(final_evidence.final_evidence_fingerprint),
+                _descriptor=descriptor,
+                _contract=final_evidence._contract,
+                _coordinator_token=self._coordinator_token,
+                _producer_marker=_CONSUMED_ENVELOPE_MARKER,
+            )
+            _register_consumed_envelope(envelope)
+            return envelope
+
+    def _claim_consumed_paper_submission(
+        self,
+        envelope: ConsumedPaperSubmissionEnvelope,
+    ) -> tuple[SubmissionDescriptor, AuthoritativeContract]:
+        """Atomically claim the exact envelope for the bound paper adapter."""
+
+        with self._startup_lock:
+            if not self._started:
+                raise RuntimeNotStarted("successful journal replay is required")
+            descriptor, contract = _claim_consumed_envelope(
+                envelope,
+                coordinator_token=self._coordinator_token,
+            )
+            if (
+                envelope.execution_domain_scope != self._identity.execution_domain_scope
+                or envelope.account_scope != self._identity.account_scope
+                or descriptor.execution_domain_scope != envelope.execution_domain_scope
+                or descriptor.account_scope != envelope.account_scope
+                or descriptor.con_id != envelope.con_id
+                or descriptor.fingerprint() != envelope.descriptor_fingerprint
+                or contract.con_id != envelope.con_id
+                or contract.symbol != envelope.symbol
+                or contract.snapshot_id != envelope.contract_snapshot_id
+                or contract.transport_generation != envelope.contract_transport_generation
+            ):
+                raise RuntimeSafetyError("claimed paper envelope lineage is inconsistent")
+            return descriptor, contract
 
     def submit_fake(
         self,

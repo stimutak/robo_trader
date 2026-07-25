@@ -6,6 +6,7 @@ with schema validation, environment-specific settings, and equity-specific const
 """
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -31,6 +32,8 @@ LIVE_PORTS = frozenset({7496, 4001})
 PAPER_ONLY_EXECUTION_SOURCE = "paper_simulator"
 BACKTEST_EXECUTION_SOURCE = "offline_backtest"
 _OPAQUE_SAFETY_ACCOUNT_SCOPE_RE = re.compile(r"^acct_v1_[0-9a-f]{64}$")
+_SAFETY_ACCOUNT_SCOPE_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
+_SAFETY_ACCOUNT_SCOPE_DOMAIN = b"robotrader-safety-account-scope-v1\0"
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -39,6 +42,28 @@ def _resolve_project_path(value: str) -> Path:
     if not path.is_absolute():
         path = _PROJECT_ROOT / path
     return path.resolve(strict=False)
+
+
+def _validated_safety_account_scope_key(raw_key: object) -> bytes:
+    key_text = str(raw_key or "")
+    if not _SAFETY_ACCOUNT_SCOPE_KEY_RE.fullmatch(key_text):
+        raise ConfigValidationError(
+            "SAFETY_ACCOUNT_SCOPE_KEY must be exactly 32 random bytes encoded as "
+            "64 lowercase hexadecimal characters"
+        )
+    if len(set(key_text)) < 8:
+        raise ConfigValidationError("SAFETY_ACCOUNT_SCOPE_KEY does not meet entropy checks")
+    return bytes.fromhex(key_text)
+
+
+def _derive_safety_account_scope(raw_key: object, account: str) -> str:
+    key = _validated_safety_account_scope_key(raw_key)
+    digest = hmac.new(
+        key,
+        _SAFETY_ACCOUNT_SCOPE_DOMAIN + account.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return "acct_v1_" + digest
 
 
 def _resolve_project_path_preserving_leaf(value: str) -> Path:
@@ -303,6 +328,14 @@ def load_runtime_contract_from_env(
         if safety_account_scope in unsalted_account_scopes:
             raise ConfigValidationError(
                 "SAFETY_ACCOUNT_SCOPE must not be an unsalted hash of IBKR_ACCOUNT."
+            )
+        expected_safety_scope = _derive_safety_account_scope(
+            env.get("SAFETY_ACCOUNT_SCOPE_KEY"),
+            account,
+        )
+        if not hmac.compare_digest(safety_account_scope, expected_safety_scope):
+            raise ConfigValidationError(
+                "SAFETY_ACCOUNT_SCOPE does not match the keyed paper-account binding"
             )
 
         safety_journal_path = str(env.get("SAFETY_JOURNAL_PATH", "")).strip()

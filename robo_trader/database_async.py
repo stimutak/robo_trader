@@ -9,10 +9,16 @@ This implements Phase 1 F3: Async Database Operations
 """
 
 import asyncio
+import hashlib
+import hmac
+import json
 import os
+import stat
+import threading
 import uuid
+import weakref
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -22,10 +28,17 @@ import aiosqlite
 
 from robo_trader.database_validator import DatabaseValidator, ValidationError
 from robo_trader.logger import get_logger
+from robo_trader.safety.sqlite_identity import (
+    SQLiteDescriptorIdentity,
+    SQLiteIdentityError,
+    SQLitePathBinding,
+    lexical_path_preserving_leaf,
+    sqlite_connection_file_identity,
+)
 
 logger = get_logger(__name__)
 
-DB_PATH = Path(os.getenv("RT_DB_PATH", "trading_data.db"))
+DB_PATH = lexical_path_preserving_leaf(Path(os.getenv("RT_DB_PATH", "trading_data.db")))
 
 # Default portfolio ID for backward compatibility
 DEFAULT_PORTFOLIO_ID = "default"
@@ -35,7 +48,7 @@ class SafetyAllocationSnapshotError(ValidationError):
     """Stored allocation state cannot form authoritative safety evidence."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SafetyPortfolioAllocation:
     """One validated portfolio allocation from a coherent database snapshot."""
 
@@ -61,6 +74,121 @@ class SafetyAllocationSnapshot:
     aggregate_allocated_quantity: Decimal
     has_offsetting_allocations: bool
     complete: bool
+    database_path: str
+    database_identity: str
+    database_device: int
+    database_inode: int
+    _producer_marker: object = field(repr=False, compare=False, default=None)
+
+    def __post_init__(self) -> None:
+        if self._producer_marker is not _ALLOCATION_SNAPSHOT_PRODUCER_MARKER:
+            raise SafetyAllocationSnapshotError(
+                "allocation snapshot was not created by the trusted ledger producer"
+            )
+        path = Path(self.database_path)
+        if (
+            not path.is_absolute()
+            or str(path) != self.database_path
+            or lexical_path_preserving_leaf(path) != path
+        ):
+            raise SafetyAllocationSnapshotError(
+                "allocation snapshot database path must be absolute and canonical"
+            )
+        if (
+            not isinstance(self.database_identity, str)
+            or not self.database_identity
+            or self.database_identity != self.database_identity.strip()
+            or len(self.database_identity) > 256
+            or any(ord(character) < 32 for character in self.database_identity)
+        ):
+            raise SafetyAllocationSnapshotError(
+                "allocation snapshot database identity is malformed"
+            )
+        for field_name in ("database_device", "database_inode"):
+            value = getattr(self, field_name)
+            if type(value) is not int or value < 0:
+                raise SafetyAllocationSnapshotError(
+                    f"allocation snapshot {field_name} is malformed"
+                )
+
+
+_ALLOCATION_SNAPSHOT_PRODUCER_MARKER = object()
+_ALLOCATION_SNAPSHOT_REGISTRY_LOCK = threading.Lock()
+_ALLOCATION_SNAPSHOT_REGISTRY: Dict[
+    int, Tuple["weakref.ReferenceType[SafetyAllocationSnapshot]", str]
+] = {}
+
+
+def _allocation_snapshot_digest(snapshot: SafetyAllocationSnapshot) -> str:
+    payload = {
+        "snapshot_id": snapshot.snapshot_id,
+        "observed_at": snapshot.observed_at.isoformat(),
+        "symbol": snapshot.symbol,
+        "allocations": [
+            {
+                "portfolio_id": allocation.portfolio_id,
+                "symbol": allocation.symbol,
+                "quantity": str(allocation.quantity),
+                "updated_at": (
+                    allocation.updated_at.isoformat() if allocation.updated_at is not None else None
+                ),
+            }
+            for allocation in snapshot.allocations
+        ],
+        "aggregate_allocated_quantity": str(snapshot.aggregate_allocated_quantity),
+        "has_offsetting_allocations": snapshot.has_offsetting_allocations,
+        "complete": snapshot.complete,
+        "database_path": snapshot.database_path,
+        "database_identity": snapshot.database_identity,
+        "database_device": snapshot.database_device,
+        "database_inode": snapshot.database_inode,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _produce_safety_allocation_snapshot(**fields: object) -> SafetyAllocationSnapshot:
+    snapshot = SafetyAllocationSnapshot(
+        **fields,
+        _producer_marker=_ALLOCATION_SNAPSHOT_PRODUCER_MARKER,
+    )
+    snapshot_id = id(snapshot)
+
+    def discard(reference: "weakref.ReferenceType[SafetyAllocationSnapshot]") -> None:
+        with _ALLOCATION_SNAPSHOT_REGISTRY_LOCK:
+            registered = _ALLOCATION_SNAPSHOT_REGISTRY.get(snapshot_id)
+            if registered is not None and registered[0] is reference:
+                _ALLOCATION_SNAPSHOT_REGISTRY.pop(snapshot_id, None)
+
+    reference = weakref.ref(snapshot, discard)
+    with _ALLOCATION_SNAPSHOT_REGISTRY_LOCK:
+        _ALLOCATION_SNAPSHOT_REGISTRY[snapshot_id] = (
+            reference,
+            _allocation_snapshot_digest(snapshot),
+        )
+    return snapshot
+
+
+def assert_producer_owned_safety_allocation_snapshot(
+    snapshot: SafetyAllocationSnapshot,
+) -> None:
+    """Reject copied, reconstructed, or altered allocation evidence."""
+
+    if type(snapshot) is not SafetyAllocationSnapshot:
+        raise SafetyAllocationSnapshotError(
+            "allocation snapshot must be the exact trusted producer type"
+        )
+    with _ALLOCATION_SNAPSHOT_REGISTRY_LOCK:
+        registered = _ALLOCATION_SNAPSHOT_REGISTRY.get(id(snapshot))
+    if (
+        registered is None
+        or registered[0]() is not snapshot
+        or not hmac.compare_digest(registered[1], _allocation_snapshot_digest(snapshot))
+    ):
+        raise SafetyAllocationSnapshotError(
+            "allocation snapshot is not registered producer-owned evidence"
+        )
 
 
 class AsyncTradingDatabase:
@@ -68,13 +196,31 @@ class AsyncTradingDatabase:
 
     def __init__(self, db_path: Path = DB_PATH, pool_size: int = 5):
         """Initialize async database with connection pooling."""
-        self.db_path = db_path
+        self.db_path = lexical_path_preserving_leaf(db_path)
         self.pool_size = pool_size
         self._pool: List[aiosqlite.Connection] = []
         self._available: asyncio.Queue = asyncio.Queue(maxsize=pool_size)
         self._initialized = False
         self._lock = asyncio.Lock()
         self._closed = False
+        self._expected_database_file_identity = self._existing_database_file_identity()
+
+    def _existing_database_file_identity(self) -> Optional[Tuple[int, int]]:
+        """Capture a pre-existing regular ledger without following its leaf."""
+
+        try:
+            metadata = os.lstat(self.db_path)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise SafetyAllocationSnapshotError(
+                "configured allocation ledger identity cannot be inspected"
+            ) from exc
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise SafetyAllocationSnapshotError(
+                "configured allocation ledger must be a non-symlink regular file"
+            )
+        return metadata.st_dev, metadata.st_ino
 
     async def __aenter__(self):
         """Async context manager entry."""
@@ -91,21 +237,82 @@ class AsyncTradingDatabase:
             if self._initialized:
                 return
 
-            # Create database and tables
-            await self._init_database()
+            binding: Optional[SQLitePathBinding] = None
+            try:
+                expected = self._expected_database_file_identity
+                binding = SQLitePathBinding.open_for_initialization(
+                    self.db_path,
+                    create=expected is None,
+                )
+                if expected is not None and (binding.device, binding.inode) != expected:
+                    raise SafetyAllocationSnapshotError(
+                        "configured allocation ledger was replaced before initialization"
+                    )
+                self._expected_database_file_identity = (binding.device, binding.inode)
+                binding.assert_path_identity()
 
-            # Create connection pool
-            for _ in range(self.pool_size):
-                conn = await aiosqlite.connect(self.db_path)
-                await conn.execute("PRAGMA journal_mode=WAL")  # Better concurrent access
-                await conn.execute("PRAGMA busy_timeout=5000")  # Wait up to 5s on contention
-                self._pool.append(conn)
-                await self._available.put(conn)
+                # Schema and pool PRAGMAs are permitted only after SQLite's own
+                # descriptor is tied to the pre-mutation guardian.
+                await self._init_database(binding)
+                binding.assert_path_identity()
 
-            self._initialized = True
-            logger.info(
-                f"Async database initialized at {self.db_path} with {self.pool_size} connections"
-            )
+                for _ in range(self.pool_size):
+                    conn = await aiosqlite.connect(self.db_path)
+                    try:
+                        pool_binding = binding.bind_sqlite_connection(
+                            await self._sqlite_descriptor_identity(conn)
+                        )
+                        pool_binding.assert_connection_identity(
+                            await self._sqlite_descriptor_identity(conn)
+                        )
+                        await conn.execute("PRAGMA journal_mode=WAL")
+                        await conn.execute("PRAGMA busy_timeout=5000")
+                        pool_binding.assert_connection_identity(
+                            await self._sqlite_descriptor_identity(conn)
+                        )
+                    except BaseException:
+                        await conn.close()
+                        raise
+                    self._pool.append(conn)
+                    await self._available.put(conn)
+
+                binding.assert_path_identity()
+                self._initialized = True
+                logger.info(
+                    f"Async database initialized at {self.db_path} "
+                    f"with {self.pool_size} connections"
+                )
+            except SafetyAllocationSnapshotError:
+                await self._close_partial_pool()
+                raise
+            except (SQLiteIdentityError, OSError, aiosqlite.Error) as exc:
+                await self._close_partial_pool()
+                raise SafetyAllocationSnapshotError(
+                    "allocation ledger identity cannot be proven during initialization"
+                ) from exc
+            except BaseException:
+                # Cancellation and interpreter-level aborts must not strand
+                # partially opened SQLite connections or descriptors.
+                await self._close_partial_pool()
+                raise
+            finally:
+                if binding is not None:
+                    binding.close()
+
+    async def _close_partial_pool(self) -> None:
+        """Close connections opened by an initialization attempt."""
+
+        for connection in self._pool:
+            try:
+                await connection.close()
+            except Exception:
+                pass
+        self._pool.clear()
+        while not self._available.empty():
+            try:
+                self._available.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
     async def close(self):
         """Close all connections in the pool."""
@@ -158,6 +365,44 @@ class AsyncTradingDatabase:
             self._closed = False
             await self.initialize()
 
+    async def _open_identity_bound_pool_connection(self) -> aiosqlite.Connection:
+        """Open one replacement connection bound to the configured ledger inode."""
+
+        binding: Optional[SQLitePathBinding] = None
+        connection: Optional[aiosqlite.Connection] = None
+        try:
+            binding = SQLitePathBinding.open_for_initialization(
+                self.db_path,
+                create=False,
+            )
+            expected = self._expected_database_file_identity
+            if expected is None or (binding.device, binding.inode) != expected:
+                raise SafetyAllocationSnapshotError(
+                    "configured allocation ledger was replaced before pool recovery"
+                )
+            binding.assert_path_identity()
+            connection = await aiosqlite.connect(self.db_path)
+            pool_binding = binding.bind_sqlite_connection(
+                await self._sqlite_descriptor_identity(connection)
+            )
+            pool_binding.assert_connection_identity(
+                await self._sqlite_descriptor_identity(connection)
+            )
+            await connection.execute("PRAGMA journal_mode=WAL")
+            await connection.execute("PRAGMA busy_timeout=5000")
+            pool_binding.assert_connection_identity(
+                await self._sqlite_descriptor_identity(connection)
+            )
+            binding.assert_path_identity()
+            return connection
+        except BaseException:
+            if connection is not None:
+                await connection.close()
+            raise
+        finally:
+            if binding is not None:
+                binding.close()
+
     @asynccontextmanager
     async def get_connection(self):
         """Get a connection from the pool."""
@@ -168,36 +413,50 @@ class AsyncTradingDatabase:
             await self.initialize()
 
         conn = await asyncio.wait_for(self._available.get(), timeout=10.0)
+        return_connection: Optional[aiosqlite.Connection] = conn
         try:
             # Test connection before use
             await conn.execute("SELECT 1")
             yield conn
         except Exception as e:
             logger.warning(f"Connection error: {e}")
-            # Try to create a new connection to replace the bad one
+            return_connection = None
             try:
                 await conn.close()
-                new_conn = await aiosqlite.connect(self.db_path)
-                await new_conn.execute("PRAGMA journal_mode=WAL")
-                await new_conn.execute("PRAGMA busy_timeout=5000")
-                await self._available.put(new_conn)
-            except Exception as replace_error:
+            except Exception as close_error:
+                logger.debug(f"Failed to close bad pooled connection: {close_error}")
+            try:
+                self._pool.remove(conn)
+            except ValueError:
+                pass
+            try:
+                new_conn = await self._open_identity_bound_pool_connection()
+                self._pool.append(new_conn)
+                return_connection = new_conn
+            except BaseException as replace_error:
                 logger.error(f"Failed to replace bad connection: {replace_error}")
-                await self._available.put(conn)  # Put back the original connection
+                if not isinstance(replace_error, Exception):
+                    raise
+                raise e from replace_error
             raise
         finally:
             # Ensure no transaction remains open on pooled connections
             try:
-                if getattr(conn, "in_transaction", False):
-                    await conn.rollback()
+                if return_connection is not None and getattr(
+                    return_connection,
+                    "in_transaction",
+                    False,
+                ):
+                    await return_connection.rollback()
             except Exception as e:
                 logger.debug(f"Rollback on pooled connection failed: {e}")
 
-            # Only put back if not closed
-            if not self._closed:
-                await self._available.put(conn)
+            # Return exactly one usable connection. Never enqueue a closed
+            # original alongside its replacement.
+            if not self._closed and return_connection is not None:
+                await self._available.put(return_connection)
 
-    async def _init_database(self) -> None:
+    async def _init_database(self, guardian: SQLitePathBinding) -> None:
         """Create tables if they don't exist.
 
         Tables with portfolio_id (user-scoped):
@@ -206,6 +465,12 @@ class AsyncTradingDatabase:
             ticks, features, market_data
         """
         async with aiosqlite.connect(self.db_path) as conn:
+            connection_binding = guardian.bind_sqlite_connection(
+                await self._sqlite_descriptor_identity(conn)
+            )
+            connection_binding.assert_connection_identity(
+                await self._sqlite_descriptor_identity(conn)
+            )
             # Set WAL and busy timeout on the initializer connection too, to avoid rollback journal usage
             await conn.execute("PRAGMA journal_mode=WAL")
             await conn.execute("PRAGMA busy_timeout=5000")
@@ -435,6 +700,9 @@ class AsyncTradingDatabase:
             """)
 
             await conn.commit()
+            connection_binding.assert_connection_identity(
+                await self._sqlite_descriptor_identity(conn)
+            )
 
     async def update_position(
         self,
@@ -818,9 +1086,73 @@ class AsyncTradingDatabase:
                 for row in rows
             ]
 
+    def _expected_safety_database(
+        self,
+        *,
+        runtime_contract: Optional[object],
+    ) -> Tuple[Path, str]:
+        """Resolve the ledger only from the exact validated runtime contract."""
+
+        # Import lazily so the shared SQLite identity helper remains a
+        # stdlib-only primitive and database module import stays inert.
+        from robo_trader.config import RuntimeContract
+
+        if type(runtime_contract) is not RuntimeContract:
+            raise SafetyAllocationSnapshotError(
+                "allocation snapshot requires an exact RuntimeContract"
+            )
+        expected_path = lexical_path_preserving_leaf(runtime_contract.database_path)
+        identity = runtime_contract.database_identity
+        namespace = runtime_contract.state_namespace
+        if namespace not in {"paper", "backtest"} or namespace != runtime_contract.execution_mode:
+            raise SafetyAllocationSnapshotError(
+                "runtime contract database namespace is not a validated execution mode"
+            )
+        digest = hashlib.sha256(
+            str(expected_path.resolve(strict=False)).encode("utf-8")
+        ).hexdigest()[:12]
+        if identity != f"{namespace}:{digest}":
+            raise SafetyAllocationSnapshotError(
+                "runtime contract database identity is inconsistent with its path"
+            )
+
+        if expected_path != self.db_path:
+            raise SafetyAllocationSnapshotError(
+                "configured allocation ledger path differs from the expected database path"
+            )
+        if (
+            not isinstance(identity, str)
+            or not identity
+            or identity != identity.strip()
+            or len(identity) > 256
+            or any(ord(character) < 32 for character in identity)
+        ):
+            raise SafetyAllocationSnapshotError("expected database identity is malformed")
+        return expected_path, identity
+
+    @staticmethod
+    async def _sqlite_descriptor_identity(
+        connection: aiosqlite.Connection,
+    ) -> SQLiteDescriptorIdentity:
+        """Inspect the raw connection on its owning aiosqlite worker thread."""
+
+        try:
+            return await connection._execute(  # type: ignore[attr-defined]
+                sqlite_connection_file_identity,
+                connection._conn,  # type: ignore[attr-defined]
+            )
+        except SQLiteIdentityError:
+            raise
+        except Exception as exc:
+            raise SQLiteIdentityError(
+                "SQLite connection descriptor identity cannot be inspected"
+            ) from exc
+
     async def get_safety_allocation_snapshot(
         self,
         symbol: str,
+        *,
+        runtime_contract: Optional[object] = None,
     ) -> SafetyAllocationSnapshot:
         """Read authoritative allocation truth for ``symbol`` without mutation.
 
@@ -831,10 +1163,15 @@ class AsyncTradingDatabase:
         exact zero allocations; orphaned, duplicate, future-dated, or malformed
         rows fail closed instead of being silently omitted.
 
-        The returned identity and observation time are created by this method,
-        not accepted from a caller.  This prevents a caller from relabelling
-        stale or partial evidence as a new coherent snapshot.  The returned
-        ``observed_at`` is the freshness clock for runtime consumption.
+        The returned snapshot binds the caller's validated runtime identity to
+        the exact configured lexical path and the common device/inode proven by
+        an ``O_NOFOLLOW`` guardian plus SQLite's own unix-VFS descriptor. The
+        binding is checked before and after the one read-only transaction.
+
+        SQLite read transactions do not mutate user rows, the main database,
+        or WAL contents. SQLite may update shared-memory lock bytes in ``-shm``
+        while coordinating a WAL reader; callers must not interpret literal
+        filesystem immutability as part of this evidence contract.
 
         ``positions.timestamp`` is validated as UTC, non-future provenance but
         is not required to be recent: the existing schema records mutation
@@ -847,7 +1184,10 @@ class AsyncTradingDatabase:
         except ValidationError as exc:
             raise SafetyAllocationSnapshotError("snapshot symbol is invalid") from exc
 
-        database_uri = self.db_path.expanduser().resolve().as_uri() + "?mode=ro"
+        _, database_identity = self._expected_safety_database(
+            runtime_contract=runtime_contract,
+        )
+
         query = """
             SELECT
                 definitions.id AS registry_portfolio_id,
@@ -886,20 +1226,87 @@ class AsyncTradingDatabase:
             ORDER BY registry_portfolio_id, stored_portfolio_id, position_id
         """
 
-        async with aiosqlite.connect(database_uri, uri=True) as conn:
-            await conn.execute("BEGIN")
-            try:
-                # Bind freshness conservatively before the SELECT establishes
-                # its SQLite snapshot. If the query waits, the evidence can
-                # only appear older, never newer than the rows it observed.
-                observed_at = datetime.now(timezone.utc)
-                cursor = await conn.execute(query, (symbol, symbol))
-                rows = await cursor.fetchall()
-                row_timestamp_upper_bound = datetime.now(timezone.utc)
-            finally:
-                # Explicitly end the read transaction.  The URI is mode=ro, so
-                # this method cannot mutate the ledger even if later refactored.
-                await conn.rollback()
+        binding: Optional[SQLitePathBinding] = None
+        try:
+            binding = SQLitePathBinding.open_readonly(self.db_path)
+            expected_file_identity = self._expected_database_file_identity
+            if expected_file_identity is None:
+                raise SafetyAllocationSnapshotError(
+                    "allocation ledger has no previously bound file identity"
+                )
+            if (binding.device, binding.inode) != expected_file_identity:
+                raise SafetyAllocationSnapshotError(
+                    "configured allocation ledger was replaced before snapshot collection"
+                )
+            database_uri = binding.path.as_uri() + "?mode=ro"
+            async with aiosqlite.connect(database_uri, uri=True) as conn:
+                connection_identity = await self._sqlite_descriptor_identity(conn)
+                binding = binding.bind_sqlite_connection(connection_identity)
+
+                await conn.execute("PRAGMA query_only = ON")
+                query_only = await conn.execute("PRAGMA query_only")
+                if await query_only.fetchone() != (1,):
+                    raise SafetyAllocationSnapshotError(
+                        "allocation ledger query-only mode could not be proven"
+                    )
+                binding.assert_connection_identity(await self._sqlite_descriptor_identity(conn))
+
+                await conn.execute("BEGIN")
+                try:
+                    # Bind freshness conservatively before the SELECT establishes
+                    # its SQLite snapshot. If the query waits, the evidence can
+                    # only appear older, never newer than the rows it observed.
+                    observed_at = datetime.now(timezone.utc)
+                    cursor = await conn.execute(query, (symbol, symbol))
+                    rows = await cursor.fetchall()
+                    row_timestamp_upper_bound = datetime.now(timezone.utc)
+                    binding.assert_connection_identity(await self._sqlite_descriptor_identity(conn))
+                finally:
+                    # Explicitly end the only read transaction. The URI and
+                    # query_only proof prevent mutation even after refactoring.
+                    await conn.rollback()
+
+                binding.assert_connection_identity(await self._sqlite_descriptor_identity(conn))
+                snapshot = self._build_safety_allocation_snapshot(
+                    symbol=symbol,
+                    rows=rows,
+                    observed_at=observed_at,
+                    row_timestamp_upper_bound=row_timestamp_upper_bound,
+                    database_identity=database_identity,
+                    database_device=binding.device,
+                    database_inode=binding.inode,
+                )
+                # Keep the connection and guardian alive through validation so
+                # replacement after the read cannot escape the final proof.
+                binding.assert_connection_identity(await self._sqlite_descriptor_identity(conn))
+                return snapshot
+        except SafetyAllocationSnapshotError:
+            raise
+        except (SQLiteIdentityError, OSError, aiosqlite.Error) as exc:
+            raise SafetyAllocationSnapshotError(
+                "allocation snapshot database identity cannot be proven"
+            ) from exc
+        finally:
+            if binding is not None:
+                try:
+                    binding.close()
+                except SQLiteIdentityError as exc:
+                    raise SafetyAllocationSnapshotError(
+                        "allocation snapshot guardian descriptor could not be closed"
+                    ) from exc
+
+    def _build_safety_allocation_snapshot(
+        self,
+        *,
+        symbol: str,
+        rows: List[Tuple],
+        observed_at: datetime,
+        row_timestamp_upper_bound: datetime,
+        database_identity: str,
+        database_device: int,
+        database_inode: int,
+    ) -> SafetyAllocationSnapshot:
+        """Validate rows and construct immutable evidence while binding is held."""
 
         if not rows:
             raise SafetyAllocationSnapshotError(
@@ -1038,7 +1445,7 @@ class AsyncTradingDatabase:
         snapshot_nonce = uuid.uuid4().hex.translate(
             str.maketrans("0123456789abcdef", "ghjkmnpqrstvwxyz")
         )
-        return SafetyAllocationSnapshot(
+        return _produce_safety_allocation_snapshot(
             snapshot_id=f"allocation-db-{snapshot_nonce}",
             observed_at=observed_at,
             symbol=symbol,
@@ -1046,6 +1453,10 @@ class AsyncTradingDatabase:
             aggregate_allocated_quantity=aggregate,
             has_offsetting_allocations=has_positive and has_negative,
             complete=True,
+            database_path=str(self.db_path),
+            database_identity=database_identity,
+            database_device=database_device,
+            database_inode=database_inode,
         )
 
     async def has_recent_buy_trade(

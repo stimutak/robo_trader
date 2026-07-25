@@ -14,6 +14,7 @@ from typing import Any, Callable, List
 
 import pytest
 
+from robo_trader.config import _derive_safety_account_scope
 from robo_trader.preflight.protocol import PreflightContext
 from robo_trader.preflight.result import CheckResult, CheckStatus
 
@@ -305,7 +306,8 @@ IBKR_APPROVED_ACCOUNTS=DU_FILE_PAPER
 IBKR_ACCOUNT_TYPE=paper
 RT_STATE_NAMESPACE=paper
 RT_DB_PATH=paper-ledger.db
-SAFETY_ACCOUNT_SCOPE=acct_v1_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+SAFETY_ACCOUNT_SCOPE_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+SAFETY_ACCOUNT_SCOPE=acct_v1_c9971d17f4e9d9f5afe31403abe7820d1c12c8fc3ec05e19f3cf9c90312a7256
 SAFETY_JOURNAL_PATH=paper-safety-journal.db
 """
 
@@ -337,6 +339,10 @@ class TestResolvedEnvironment:
             "IBKR_PORT": "4002",
             "IBKR_ACCOUNT": "DU_PROCESS_PAPER",
             "IBKR_APPROVED_ACCOUNTS": "DU_PROCESS_PAPER",
+            "SAFETY_ACCOUNT_SCOPE": _derive_safety_account_scope(
+                "0123456789abcdef" * 4,
+                "DU_PROCESS_PAPER",
+            ),
         }
         monkeypatch.setattr(cli_module.os, "environ", process_env)
 

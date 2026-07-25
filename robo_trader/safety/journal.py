@@ -296,6 +296,12 @@ class SafetyJournal:
     def database_path(self) -> Path:
         return self._path
 
+    @property
+    def runtime_path_identity(self) -> Optional[Tuple[int, int]]:
+        """Return the exact journal inode replayed and bound at startup."""
+
+        return self._runtime_path_identity
+
     def initialize(
         self,
         *,

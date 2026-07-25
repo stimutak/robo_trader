@@ -19,6 +19,7 @@ from robo_trader.config import (
     IBKRConfig,
     RuntimeContract,
     TradingMode,
+    _derive_safety_account_scope,
     get_config_for_environment,
     load_config_from_env,
     load_runtime_contract_from_env,
@@ -27,6 +28,7 @@ from robo_trader.execution import LiveExecutor
 from robo_trader.utils.secure_config import ConfigValidationError
 
 ROOT = Path(__file__).resolve().parents[2]
+SAFETY_SCOPE_KEY = "0123456789abcdef" * 4
 
 
 def _paper_env(**overrides: str) -> dict[str, str]:
@@ -43,7 +45,8 @@ def _paper_env(**overrides: str) -> dict[str, str]:
         "IBKR_ACCOUNT_TYPE": "paper",
         "RT_DB_PATH": "data/paper.db",
         "RT_STATE_NAMESPACE": "paper",
-        "SAFETY_ACCOUNT_SCOPE": "acct_v1_" + ("0123456789abcdef" * 4),
+        "SAFETY_ACCOUNT_SCOPE_KEY": SAFETY_SCOPE_KEY,
+        "SAFETY_ACCOUNT_SCOPE": _derive_safety_account_scope(SAFETY_SCOPE_KEY, "DU1234567"),
         "SAFETY_JOURNAL_PATH": "data/paper/safety_journal.db",
         "MODEL_ARTIFACT_SET": "paper-models-v1",
         "BUILD_ID": "abc123",
@@ -64,13 +67,25 @@ def test_runtime_contract_accepts_only_consistent_paper_readonly():
     assert contract.model_artifact_set == "paper-models-v1"
     assert contract.build_id == "abc123"
     assert contract.database_identity.startswith("paper:")
-    assert contract.safety_account_scope == "acct_v1_" + ("0123456789abcdef" * 4)
+    assert contract.safety_account_scope == _derive_safety_account_scope(
+        SAFETY_SCOPE_KEY, "DU1234567"
+    )
     assert contract.safety_execution_domain_scope == PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
     assert contract.safety_journal_identity.startswith("paper:safety:")
     assert contract.public_dict()["live_capability"] == "disabled"
     assert "database_path" not in contract.public_dict()
     assert "safety_journal_path" not in contract.public_dict()
     assert len(contract.fingerprint) == 16
+
+
+def test_account_scope_binding_is_stable_account_specific_and_key_not_public():
+    contract = load_runtime_contract_from_env(_paper_env())
+    expected = _derive_safety_account_scope(SAFETY_SCOPE_KEY, "DU1234567")
+
+    assert expected == _derive_safety_account_scope(SAFETY_SCOPE_KEY, "DU1234567")
+    assert expected != _derive_safety_account_scope(SAFETY_SCOPE_KEY, "DU7654321")
+    assert SAFETY_SCOPE_KEY not in repr(contract)
+    assert SAFETY_SCOPE_KEY not in str(contract.public_dict())
 
 
 def test_config_retains_validated_runtime_contract_without_serializing_paths(monkeypatch):
@@ -188,6 +203,12 @@ def test_runtime_contract_fingerprint_excludes_full_account_number():
         ({"RT_STATE_NAMESPACE": "live"}, "must match EXECUTION_MODE"),
         ({"LIVE_RT_DB_PATH": "data/paper.db"}, "different ledgers"),
         ({"SAFETY_ACCOUNT_SCOPE": ""}, "requires SAFETY_ACCOUNT_SCOPE"),
+        ({"SAFETY_ACCOUNT_SCOPE_KEY": ""}, "exactly 32 random bytes"),
+        ({"SAFETY_ACCOUNT_SCOPE_KEY": "0" * 64}, "entropy checks"),
+        (
+            {"SAFETY_ACCOUNT_SCOPE": "acct_v1_" + ("0123456789abcdef" * 4)},
+            "keyed paper-account binding",
+        ),
         ({"SAFETY_ACCOUNT_SCOPE": "acct_v1_" + ("0" * 64)}, "placeholder digest"),
         ({"SAFETY_JOURNAL_PATH": ""}, "requires a dedicated SAFETY_JOURNAL_PATH"),
         ({"SAFETY_JOURNAL_PATH": "data/paper.db"}, "separate from RT_DB_PATH"),

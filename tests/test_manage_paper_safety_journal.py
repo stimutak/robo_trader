@@ -7,6 +7,7 @@ import pytest
 
 import robo_trader.config as config_module
 import scripts.manage_paper_safety_journal as journal_script
+from robo_trader.config import _derive_safety_account_scope
 from robo_trader.safety import (
     EvidenceStatus,
     ExposureEvidence,
@@ -32,6 +33,7 @@ from scripts.manage_paper_safety_journal import (
 
 
 def _env(tmp_path: Path) -> dict[str, str]:
+    scope_key = "0123456789abcdef" * 4
     return {
         "EXECUTION_MODE": "paper",
         "TRADING_MODE": "paper",
@@ -45,7 +47,8 @@ def _env(tmp_path: Path) -> dict[str, str]:
         "IBKR_ACCOUNT_TYPE": "paper",
         "RT_STATE_NAMESPACE": "paper",
         "RT_DB_PATH": str(tmp_path / "paper-ledger.db"),
-        "SAFETY_ACCOUNT_SCOPE": generate_account_scope(),
+        "SAFETY_ACCOUNT_SCOPE_KEY": scope_key,
+        "SAFETY_ACCOUNT_SCOPE": _derive_safety_account_scope(scope_key, "DU_TEST_PAPER"),
         "SAFETY_JOURNAL_PATH": str(tmp_path / "paper-safety.db"),
         "MODEL_ARTIFACT_SET": "test-models",
         "BUILD_ID": "test-build",
@@ -53,11 +56,15 @@ def _env(tmp_path: Path) -> dict[str, str]:
 
 
 def test_generated_scope_is_opaque_shape_and_unique():
-    first = generate_account_scope()
-    second = generate_account_scope()
+    first_key, first = generate_account_scope("DU_TEST_PAPER")
+    second_key, second = generate_account_scope("DU_TEST_PAPER")
 
+    assert len(first_key) == 64
+    assert len(second_key) == 64
     assert first.startswith("acct_v1_")
     assert len(first) == len("acct_v1_") + 64
+    assert first == _derive_safety_account_scope(first_key, "DU_TEST_PAPER")
+    assert second == _derive_safety_account_scope(second_key, "DU_TEST_PAPER")
     assert first != second
     int(first.removeprefix("acct_v1_"), 16)
 

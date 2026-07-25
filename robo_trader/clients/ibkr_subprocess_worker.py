@@ -12,9 +12,11 @@ where API handshakes timeout despite successful TCP connections.
 import asyncio
 import atexit
 import inspect
+import ipaddress
 import json
 import os
 import queue
+import re
 import signal
 import sys
 import threading
@@ -83,6 +85,41 @@ class BrokerSnapshotAccountMismatchError(ValueError):
 
 
 BROKER_SNAPSHOT_SCHEMA_VERSION = 1
+BROKER_SAFETY_SNAPSHOT_SCHEMA_VERSION = 1
+BROKER_CONTRACT_SAFETY_SNAPSHOT_SCHEMA_VERSION = 1
+BROKER_SAFETY_SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
+BROKER_SAFETY_ORDER_STATUSES = frozenset(
+    {
+        "ApiPending",
+        "PendingSubmit",
+        "PendingCancel",
+        "PreSubmitted",
+        "Submitted",
+        "ApiCancelled",
+        "Cancelled",
+        "Filled",
+        "Inactive",
+    }
+)
+BROKER_SAFETY_ORDER_TYPES = frozenset(
+    {
+        "MKT",
+        "LMT",
+        "STP",
+        "STP LMT",
+        "TRAIL",
+        "TRAIL LIMIT",
+        "MOC",
+        "LOC",
+        "MIT",
+        "LIT",
+        "REL",
+        "PEG MID",
+        "MIDPRICE",
+        "MTL",
+    }
+)
+BROKER_SAFETY_TIME_IN_FORCE = frozenset({"DAY", "GTC", "IOC", "GTD", "OPG", "FOK", "DTC"})
 BROKER_SNAPSHOT_BALANCE_TAGS = frozenset(
     {
         "NetLiquidation",
@@ -745,6 +782,15 @@ def _order_evidence_signature(orders: list[dict]) -> tuple[str, ...]:
     )
 
 
+def _validate_safety_order_terms(order: dict) -> None:
+    if order["status"] not in BROKER_SAFETY_ORDER_STATUSES:
+        raise ValueError("Broker safety snapshot order status is unsupported")
+    if order["order_type"] not in BROKER_SAFETY_ORDER_TYPES:
+        raise ValueError("Broker safety snapshot order type is unsupported")
+    if order["time_in_force"] not in BROKER_SAFETY_TIME_IN_FORCE:
+        raise ValueError("Broker safety snapshot order time in force is unsupported")
+
+
 async def _order_state_signature(trades: Any, account: str) -> tuple[str, ...]:
     return _order_evidence_signature(
         [await _open_order_evidence(trade, account) for trade in trades]
@@ -1059,6 +1105,290 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
         }
 
 
+async def handle_get_broker_safety_snapshot(params: dict) -> dict:
+    """Collect stable account positions and all-client orders without mutation."""
+    try:
+        connection_host = (
+            str(worker_connection_identity[0]).strip().casefold()
+            if worker_connection_identity is not None
+            else ""
+        )
+        try:
+            connection_address = ipaddress.ip_address(connection_host)
+        except ValueError:
+            connection_address = None
+        loopback_connection = connection_host in {"localhost", "localhost."} or (
+            connection_address is not None and connection_address.is_loopback
+        )
+        if (
+            not ib
+            or not ib.isConnected()
+            or worker_connection_identity is None
+            or not loopback_connection
+            or worker_connection_identity[1] != 4002
+            or worker_connection_identity[2] <= 0
+            or worker_connection_identity[3] is not True
+        ):
+            raise ConnectionError("Broker safety snapshot requires a connected session")
+
+        expected_account = str(params.get("expected_account", "")).strip()
+        if not re.fullmatch(r"DU[0-9]{4,20}", expected_account):
+            raise BrokerSnapshotAccountMismatchError(
+                "Broker safety snapshot requires a paper account identity"
+            )
+        requested_symbol = str(params.get("requested_symbol", "")).strip().upper()
+        if not BROKER_SAFETY_SYMBOL_RE.fullmatch(requested_symbol):
+            raise ValueError("Broker safety snapshot requested symbol is malformed")
+
+        accounts_before = [
+            str(account).strip() for account in ib.managedAccounts() if str(account).strip()
+        ]
+        if len(accounts_before) != 1 or accounts_before[0] != expected_account:
+            raise BrokerSnapshotAccountMismatchError(
+                "Broker safety snapshot managed account does not match expectation"
+            )
+        account = accounts_before[0]
+
+        broker_time_before = await _request_broker_time()
+        positions = await ib.reqPositionsAsync()
+        initial_position_signature = await _position_state_signature(positions, account)
+        if not ib.isConnected():
+            raise ConnectionError("Broker disconnected during safety snapshot collection")
+
+        positions_data = []
+        seen_contract_ids: set[int] = set()
+        seen_symbols: set[str] = set()
+        for position in positions:
+            if str(getattr(position, "account", "")).strip() != account:
+                raise ValueError("Broker position account is inconsistent")
+            contract_identity = await _qualified_stock_identity(position.contract)
+            con_id = contract_identity["con_id"]
+            symbol = contract_identity["symbol"]
+            if con_id in seen_contract_ids or symbol in seen_symbols:
+                raise ValueError("Broker safety snapshot contains duplicate position identity")
+            seen_contract_ids.add(con_id)
+            seen_symbols.add(symbol)
+            quantity = _canonical_decimal(position.position)
+            if Decimal(quantity) == 0:
+                raise ValueError("Broker safety snapshot contains a zero position")
+            positions_data.append(
+                {
+                    "account": account,
+                    "contract": contract_identity,
+                    "quantity": quantity,
+                }
+            )
+
+        matching_positions = [
+            position
+            for position in positions_data
+            if cast(dict[str, Any], position["contract"])["symbol"] == requested_symbol
+        ]
+        if len(matching_positions) != 1:
+            raise ValueError(
+                "Broker safety snapshot requested symbol is not one exact held position"
+            )
+
+        open_trades = await ib.reqAllOpenOrdersAsync()
+        if not ib.isConnected():
+            raise ConnectionError("Broker disconnected during safety snapshot collection")
+        open_orders_data = []
+        seen_order_ids: set[tuple[int, int]] = set()
+        for trade in open_trades:
+            order_evidence = await _open_order_evidence(trade, account)
+            _validate_safety_order_terms(order_evidence)
+            order_identity = (
+                order_evidence["client_id"],
+                order_evidence["broker_order_id"],
+            )
+            if order_identity in seen_order_ids:
+                raise ValueError("Broker safety snapshot contains duplicate order identity")
+            seen_order_ids.add(order_identity)
+            open_orders_data.append(order_evidence)
+        initial_order_signature = _order_evidence_signature(open_orders_data)
+
+        final_positions = await ib.reqPositionsAsync()
+        final_position_signature = await _position_state_signature(final_positions, account)
+        final_open_trades = await ib.reqAllOpenOrdersAsync()
+        final_orders_data = [
+            await _open_order_evidence(trade, account) for trade in final_open_trades
+        ]
+        for order_evidence in final_orders_data:
+            _validate_safety_order_terms(order_evidence)
+        final_order_signature = _order_evidence_signature(final_orders_data)
+        if (
+            final_position_signature != initial_position_signature
+            or final_order_signature != initial_order_signature
+        ):
+            raise ValueError("Broker critical state changed during safety snapshot collection")
+
+        broker_time_after = await _request_broker_time()
+        accounts_after = [str(item).strip() for item in ib.managedAccounts() if str(item).strip()]
+        if accounts_after != accounts_before:
+            raise BrokerSnapshotAccountMismatchError(
+                "Managed account set changed during safety snapshot collection"
+            )
+        if not ib.isConnected():
+            raise ConnectionError("Broker disconnected during safety snapshot collection")
+
+        positions_data.sort(
+            key=lambda item: (
+                cast(dict[str, Any], item["contract"])["symbol"],
+                cast(dict[str, Any], item["contract"])["con_id"],
+            )
+        )
+        open_orders_data.sort(key=lambda item: (item["client_id"], item["broker_order_id"]))
+        return {
+            "status": "success",
+            "data": {
+                "safety_snapshot_schema_version": BROKER_SAFETY_SNAPSHOT_SCHEMA_VERSION,
+                "account": account,
+                "requested_symbol": requested_symbol,
+                "broker_time_before": _aware_iso(broker_time_before),
+                "broker_time_after": _aware_iso(broker_time_after),
+                "retrieved_at": datetime.now(timezone.utc).isoformat(),
+                "positions": positions_data,
+                "open_orders": open_orders_data,
+                "positions_complete": True,
+                "open_orders_complete": True,
+                "open_orders_all_clients": True,
+                "open_orders_stable": True,
+                "unknown_order_count": 0,
+            },
+        }
+    except BrokerSnapshotAccountMismatchError:
+        return {
+            "status": "error",
+            "error": "Broker safety snapshot account mismatch",
+            "error_type": "BrokerSnapshotAccountMismatchError",
+        }
+    except TimeoutError:
+        return {
+            "status": "error",
+            "error": "Broker safety snapshot collection timed out",
+            "error_type": "TimeoutError",
+        }
+    except ConnectionError:
+        return {
+            "status": "error",
+            "error": "Broker safety snapshot collection failed",
+            "error_type": "ConnectionError",
+        }
+    except Exception:
+        return {
+            "status": PROTOCOL_ERROR_STATUS,
+            "error": "Broker safety snapshot collection failed",
+            "error_type": PROTOCOL_ERROR_TYPE,
+        }
+
+
+async def handle_get_broker_contract_safety_snapshot(params: dict) -> dict:
+    """Prove one stable qualified contract without reading broker account state."""
+
+    try:
+        connection_host = (
+            str(worker_connection_identity[0]).strip().casefold()
+            if worker_connection_identity is not None
+            else ""
+        )
+        try:
+            connection_address = ipaddress.ip_address(connection_host)
+        except ValueError:
+            connection_address = None
+        loopback_connection = connection_host in {"localhost", "localhost."} or (
+            connection_address is not None and connection_address.is_loopback
+        )
+        if (
+            worker_connection_identity is None
+            or not loopback_connection
+            or worker_connection_identity[1] != 4002
+            or worker_connection_identity[2] <= 0
+            or worker_connection_identity[3] is not True
+        ):
+            raise ConnectionError(
+                "Broker contract safety snapshot requires a local read-only paper session"
+            )
+        if not ib or not ib.isConnected():
+            raise ConnectionError("Broker contract safety snapshot requires a connected session")
+
+        expected_account = str(params.get("expected_account", "")).strip()
+        if not re.fullmatch(r"DU[0-9]{4,20}", expected_account):
+            raise BrokerSnapshotAccountMismatchError(
+                "Broker contract safety snapshot requires a paper account identity"
+            )
+        requested_symbol = str(params.get("requested_symbol", "")).strip().upper()
+        if not BROKER_SAFETY_SYMBOL_RE.fullmatch(requested_symbol):
+            raise ValueError("Broker contract safety snapshot requested symbol is malformed")
+
+        accounts_before = [
+            str(account).strip() for account in ib.managedAccounts() if str(account).strip()
+        ]
+        if len(accounts_before) != 1 or accounts_before[0] != expected_account:
+            raise BrokerSnapshotAccountMismatchError(
+                "Broker contract safety snapshot managed account does not match expectation"
+            )
+
+        from ib_async import Stock
+
+        broker_time_before = await _request_broker_time()
+        first_contract = await _qualified_stock_identity(Stock(requested_symbol, "SMART", "USD"))
+        if not ib.isConnected():
+            raise ConnectionError("Broker disconnected during contract safety snapshot collection")
+        second_contract = await _qualified_stock_identity(Stock(requested_symbol, "SMART", "USD"))
+        if first_contract != second_contract:
+            raise ContractIdentityProtocolError(
+                "Qualified contract identity changed during safety snapshot collection"
+            )
+        broker_time_after = await _request_broker_time()
+        accounts_after = [
+            str(account).strip() for account in ib.managedAccounts() if str(account).strip()
+        ]
+        if accounts_after != accounts_before:
+            raise BrokerSnapshotAccountMismatchError(
+                "Managed account set changed during contract safety snapshot collection"
+            )
+        if not ib.isConnected():
+            raise ConnectionError("Broker disconnected during contract safety snapshot collection")
+        return {
+            "status": "success",
+            "data": {
+                "contract_safety_snapshot_schema_version": (
+                    BROKER_CONTRACT_SAFETY_SNAPSHOT_SCHEMA_VERSION
+                ),
+                "account": accounts_before[0],
+                "requested_symbol": requested_symbol,
+                "broker_time_before": _aware_iso(broker_time_before),
+                "broker_time_after": _aware_iso(broker_time_after),
+                "retrieved_at": datetime.now(timezone.utc).isoformat(),
+                "qualified_contract": first_contract,
+            },
+        }
+    except BrokerSnapshotAccountMismatchError:
+        return {
+            "status": "error",
+            "error": "Broker contract safety snapshot account mismatch",
+            "error_type": "BrokerSnapshotAccountMismatchError",
+        }
+    except TimeoutError:
+        return {
+            "status": "error",
+            "error": "Broker contract safety snapshot collection timed out",
+            "error_type": "TimeoutError",
+        }
+    except ConnectionError:
+        return {
+            "status": "error",
+            "error": "Broker contract safety snapshot collection failed",
+            "error_type": "ConnectionError",
+        }
+    except Exception:
+        return {
+            "status": PROTOCOL_ERROR_STATUS,
+            "error": "Broker contract safety snapshot collection failed",
+            "error_type": PROTOCOL_ERROR_TYPE,
+        }
+
+
 async def handle_disconnect() -> dict:
     """Handle disconnect command"""
     global ib, worker_connection_identity
@@ -1252,6 +1582,10 @@ async def handle_command(command: dict) -> dict:
         return await handle_get_account_summary()
     elif cmd == "get_broker_snapshot":
         return await handle_get_broker_snapshot(command.get("params", {}))
+    elif cmd == "get_broker_safety_snapshot":
+        return await handle_get_broker_safety_snapshot(command.get("params", {}))
+    elif cmd == "get_broker_contract_safety_snapshot":
+        return await handle_get_broker_contract_safety_snapshot(command.get("params", {}))
     elif cmd == "get_historical_bars":
         return await handle_get_historical_bars(command.get("params", {}))
     elif cmd == "disconnect":

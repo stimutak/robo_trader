@@ -55,6 +55,20 @@ sqlite3.connect = real_connect
     )
 
 
+def test_broker_evidence_is_directly_importable_without_reconciliation_cycle(tmp_path):
+    script = f"""
+import sys
+sys.path.insert(0, {str(ROOT)!r})
+import robo_trader.broker_safety_evidence as evidence
+assert evidence.BrokerContractSafetySnapshot.__name__ == "BrokerContractSafetySnapshot"
+"""
+    subprocess.run(
+        [sys.executable, "-I", "-B", "-c", script],
+        cwd=tmp_path,
+        check=True,
+    )
+
+
 def test_only_runner_startup_replays_safety_package_without_order_wiring():
     targets = (
         ROOT / "robo_trader" / "execution.py",

@@ -37,7 +37,7 @@ from .analysis.correlation_integration import AsyncCorrelationManager, Correlati
 from .config import RuntimeContract, load_config
 from .correlation import CorrelationTracker
 from .database_async import AsyncTradingDatabase
-from .execution import Order, PaperExecutor
+from .execution import ExecutionResult, Order, PaperExecutor
 from .logger import get_logger
 from .market_hours import (
     get_market_session,
@@ -47,6 +47,13 @@ from .market_hours import (
 )
 from .monitoring.performance import PerformanceMonitor, Timer
 from .monitoring.production_monitor import ProductionMonitor
+from .paper_reduction_gateway import PaperReductionGateway
+from .reconciliation.identity import (
+    RuntimeSafetyContext,
+    assert_validated_runtime_safety_context,
+    resolve_environment,
+    validate_runtime_safety,
+)
 from .utils.robust_connection import (
     CircuitBreakerConfig,
     connect_ibkr_robust,
@@ -83,6 +90,7 @@ from .safety import (
     SafetyJournal,
     SafetyRuntimeCoordinator,
 )
+from .safety.readiness import require_paper_terminal_settlement_ready
 from .stop_loss_monitor import (
     StopExecutionPhase,
     StopExecutionPhaseRecord,
@@ -460,12 +468,26 @@ class AsyncRunner:
         use_advanced_risk: bool = None,  # Auto-detect if None
         portfolio_id: str = "default",  # Multi-portfolio support
         safety_runtime: Optional[SafetyRuntimeCoordinator] = None,
+        shared_database: Optional[AsyncTradingDatabase] = None,
+        paper_reduction_gateway: Optional[PaperReductionGateway] = None,
     ):
         if safety_runtime is not None and (
             type(safety_runtime) is not SafetyRuntimeCoordinator or not safety_runtime.started
         ):
             raise RuntimeError("safety_runtime must be a started SafetyRuntimeCoordinator")
         self.safety_runtime = safety_runtime
+        if shared_database is not None and type(shared_database) is not AsyncTradingDatabase:
+            raise RuntimeError("shared_database must be an exact AsyncTradingDatabase")
+        if paper_reduction_gateway is not None and (
+            type(paper_reduction_gateway) is not PaperReductionGateway
+            or not paper_reduction_gateway.started
+        ):
+            raise RuntimeError(
+                "paper_reduction_gateway must be an exact started PaperReductionGateway"
+            )
+        self._shared_database = shared_database
+        self._owns_database = shared_database is None
+        self.paper_reduction_gateway = paper_reduction_gateway
         self.portfolio_id = portfolio_id
         self.duration = duration
         self.bar_size = bar_size
@@ -836,7 +858,6 @@ class AsyncRunner:
         return SimpleNamespace(
             ok=False,
             message=message,
-            msg=message,
             fill_price=None,
         )
 
@@ -1123,6 +1144,35 @@ class AsyncRunner:
         if isinstance(active_requests, set):
             active_requests.discard(owner)
 
+    def _reduction_order_ref(
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+    ) -> str:
+        """Derive a stable idempotency key from admitted market-data lineage."""
+
+        event_time = self.latest_price_times.get(symbol)
+        if (
+            not isinstance(event_time, datetime)
+            or event_time.tzinfo is None
+            or event_time.utcoffset() is None
+        ):
+            raise RuntimeError(
+                f"Cannot derive reduction order_ref without trusted event time for {symbol}"
+            )
+        payload = "|".join(
+            (
+                "paper-reduction-v1",
+                self.portfolio_id,
+                symbol,
+                side,
+                str(quantity),
+                event_time.astimezone(timezone.utc).isoformat(),
+            )
+        )
+        return "paper-reduction-v1-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
     async def _place_order_with_circuit_breaker(self, order: Order):
         """
         Execute order with circuit breaker protection.
@@ -1146,11 +1196,53 @@ class AsyncRunner:
             )
             return self._rejected_order_result("Non-finite price or quantity")
 
+        side = str(getattr(order, "side", "") or "").upper()
+        is_reduction = side in {"SELL", "BUY_TO_COVER"}
+        if not is_reduction and side not in {"BUY", "SELL_SHORT"}:
+            return self._rejected_order_result("Unsupported order side")
+
+        # Semantic reductions bypass entry-only soft stops, but only after the
+        # account-wide gateway proves the exact broker contract/read-only
+        # transport and the complete local simulator allocation. The gateway
+        # then re-proves both immediately before its one-shot PaperExecutor
+        # dispatch. No other exit path may call the executor directly.
+        if is_reduction:
+            if not self._has_live_protective_feed(order.symbol):
+                return self._rejected_order_result(
+                    "Reduction blocked: live protective feed unavailable"
+                )
+            gateway = self.paper_reduction_gateway
+            if type(gateway) is not PaperReductionGateway or not gateway.started:
+                return self._rejected_order_result("Reduction blocked: safety gateway unavailable")
+            lock = getattr(self, "_order_admission_lock", None)
+            if lock is None:
+                self._order_admission_lock = asyncio.Lock()
+                lock = self._order_admission_lock
+            async with lock:
+                abort_event = getattr(self, "_symbol_cycle_abort_event", None)
+                if abort_event is not None and abort_event.is_set():
+                    return self._rejected_order_result(
+                        "Reduction blocked: broker transport unavailable"
+                    )
+                current_task = asyncio.current_task()
+                cycle_workers: set[asyncio.Task] = getattr(
+                    self,
+                    "_cycle_worker_tasks",
+                    set(),
+                )
+                if current_task is not None and current_task in cycle_workers:
+                    if not hasattr(self, "_order_admitted_tasks"):
+                        self._order_admitted_tasks = set()
+                    self._order_admitted_tasks.add(current_task)
+                with Timer("paper_reduction_execution", self.monitor):
+                    return await gateway.submit_reduction(
+                        order=order,
+                        portfolio_id=self.portfolio_id,
+                    )
+
         # TC-M1 / TC-M6: centralized trading-blocked gate. This catches every
-        # path that places an order, including SELL/closing flows, pairs trading,
-        # and stop-loss execution. Without this, kill_switch / emergency_shutdown
-        # were only enforced inside `validate_order` — the SELL closing path
-        # and the pairs path bypassed the check entirely.
+        # risk-increasing path. Semantic reductions use the hard-evidence
+        # boundary above so a kill switch cannot trap exposure in the account.
         blocked, reason = self._trading_blocked()
         if blocked:
             # Throttle log per (symbol, action) to avoid 1000s of identical lines
@@ -1216,8 +1308,15 @@ class AsyncRunner:
                     if not hasattr(self, "_order_admitted_tasks"):
                         self._order_admitted_tasks = set()
                     self._order_admitted_tasks.add(current_task)
-                with Timer("order_execution", self.monitor):
-                    result = self.executor.place_order(order)
+                gateway = self.paper_reduction_gateway
+                if type(gateway) is not PaperReductionGateway or not gateway.started:
+                    return self._rejected_order_result("Entry blocked: safety gateway unavailable")
+                # Hold the same account-wide lock used by reductions. This
+                # prevents an entry from changing the simulator allocation
+                # between a reduction's initial and final evidence snapshots.
+                async with gateway.serialize_entry():
+                    with Timer("order_execution", self.monitor):
+                        result = self.executor.place_order(order)
 
             # Record success/failure with circuit breaker
             if result.ok:
@@ -1855,8 +1954,17 @@ class AsyncRunner:
             logger.error("Cannot proceed without IBKR connection")
             sys.exit(1)
 
-        # Initialize async database with context manager
-        self._raw_db = AsyncTradingDatabase()
+        # Every portfolio runner in the active paper process must use the same
+        # exact database object as the account-wide reduction gateway. This is
+        # what makes the cross-portfolio allocation snapshot authoritative.
+        self._raw_db = (
+            self._shared_database if self._shared_database is not None else AsyncTradingDatabase()
+        )
+        if (
+            self.cfg.runtime_contract is None
+            or str(self._raw_db.db_path) != self.cfg.runtime_contract.database_path
+        ):
+            raise RuntimeError("runner database does not match the validated runtime ledger")
         await self._raw_db.initialize()
 
         # Wrap DB with portfolio-scoped proxy if using non-default portfolio
@@ -1932,6 +2040,8 @@ class AsyncRunner:
             smart_executor=smart_executor,
             use_smart_execution=self.use_smart_execution,
         )
+        if self.paper_reduction_gateway is None:
+            raise RuntimeError("active paper runtime requires the account-wide reduction gateway")
 
         # Initialize stop-loss monitor (CRITICAL SAFETY COMPONENT)
         if self.enable_stop_loss:
@@ -1945,8 +2055,16 @@ class AsyncRunner:
                 # Cancel all active orders
                 await self.cancel_all_orders()
 
+            async def execute_stop_reduction(
+                _stop: StopLossOrder,
+                order: Order,
+            ) -> ExecutionResult:
+                """Route the one stop attempt through the central order choke."""
+
+                return await self._place_order_with_circuit_breaker(order)
+
             self.stop_loss_monitor = StopLossMonitor(
-                executor=self.executor,
+                execute_reduction=execute_stop_reduction,
                 risk_manager=self.risk,
                 emergency_shutdown_callback=emergency_shutdown_callback,
                 portfolio_id=self.portfolio_id,
@@ -2180,6 +2298,14 @@ class AsyncRunner:
         # Load existing positions from database to prevent duplicate buying
         await self.load_existing_positions()
         self._assert_existing_position_protection()
+
+        # Seal the portfolio's executor only after every fallible setup and
+        # existing-position protection gate has passed. A partial setup must
+        # never leave a stale registration that blocks a clean retry.
+        self.paper_reduction_gateway.register_paper_executor(
+            self.portfolio_id,
+            self.executor,
+        )
 
         # Mark setup as complete for persistent connections
         self._setup_complete = True
@@ -4095,7 +4221,17 @@ class AsyncRunner:
                 # Kill-switch / emergency-shutdown is enforced centrally inside
                 # _place_order_with_circuit_breaker via _trading_blocked().
                 res = await self._place_order_with_circuit_breaker(
-                    Order(symbol=symbol, quantity=qty_to_cover, side="BUY_TO_COVER", price=price)
+                    Order(
+                        symbol=symbol,
+                        quantity=qty_to_cover,
+                        side="BUY_TO_COVER",
+                        price=price,
+                        order_ref=self._reduction_order_ref(
+                            symbol,
+                            "BUY_TO_COVER",
+                            qty_to_cover,
+                        ),
+                    )
                 )
                 if res.ok:
                     if self.stop_loss_monitor:
@@ -4139,7 +4275,7 @@ class AsyncRunner:
                         logger.error(f"Failed to update position for {symbol} BUY_TO_COVER order")
                         message = f"Cover order failed: atomic update error"
                 else:
-                    message = f"Cover order failed: {res.msg}"
+                    message = f"Cover order failed: {res.message}"
 
             elif symbol not in self.positions:
                 # CRITICAL: Check for pending orders to prevent duplicate buys
@@ -4408,7 +4544,7 @@ class AsyncRunner:
                                 logger.error(f"Failed to update position for {symbol} BUY order")
                                 message = f"Buy order failed: atomic update error"
                         else:
-                            message = f"Buy order failed: {res.msg}"
+                            message = f"Buy order failed: {res.message}"
                     else:
                         message = f"Buy signal rejected: {msg}"
                 finally:
@@ -4465,7 +4601,17 @@ class AsyncRunner:
                     # Kill-switch / emergency-shutdown is enforced centrally inside
                     # _place_order_with_circuit_breaker via _trading_blocked().
                     res = await self._place_order_with_circuit_breaker(
-                        Order(symbol=symbol, quantity=pos.quantity, side="SELL", price=price)
+                        Order(
+                            symbol=symbol,
+                            quantity=pos.quantity,
+                            side="SELL",
+                            price=price,
+                            order_ref=self._reduction_order_ref(
+                                symbol,
+                                "SELL",
+                                pos.quantity,
+                            ),
+                        )
                     )
                     if res.ok:
                         # Cancel stop-loss when closing position
@@ -4516,7 +4662,7 @@ class AsyncRunner:
                             logger.error(f"Failed to update position for {symbol} SELL order")
                             message = f"Sell order failed: atomic update error"
                     else:
-                        message = f"Sell order failed: {res.msg}"
+                        message = f"Sell order failed: {res.message}"
 
             elif enable_short_selling and symbol not in self.positions:
                 # Open short position
@@ -4632,7 +4778,7 @@ class AsyncRunner:
                             logger.error(f"Failed to update position for {symbol} SELL_SHORT order")
                             message = f"Short sell order failed: atomic update error"
                     else:
-                        message = f"Short sell order failed: {res.msg}"
+                        message = f"Short sell order failed: {res.message}"
                 else:
                     message = f"Short signal rejected: {msg}"
             else:
@@ -5957,7 +6103,7 @@ class AsyncRunner:
                     record_failure("ibkr_subprocess")
 
         database = getattr(self, "db", None)
-        if database is not None:
+        if database is not None and getattr(self, "_owns_database", True):
             try:
                 await database.close()
             except Exception:
@@ -6496,6 +6642,52 @@ class AsyncRunner:
         return False
 
 
+@dataclass(frozen=True)
+class _PaperOrderRuntimeResources:
+    database: AsyncTradingDatabase
+    gateway: PaperReductionGateway
+
+
+async def _start_paper_order_runtime(
+    runtime_context: RuntimeSafetyContext,
+    safety_runtime: SafetyRuntimeCoordinator,
+) -> _PaperOrderRuntimeResources:
+    """Start one shared ledger and one account-wide reduction gateway."""
+
+    require_paper_terminal_settlement_ready()
+    context = assert_validated_runtime_safety_context(runtime_context)
+    if type(safety_runtime) is not SafetyRuntimeCoordinator or not safety_runtime.started:
+        raise RuntimeError("started paper safety coordinator is required")
+    database = AsyncTradingDatabase(Path(context.runtime_contract.database_path))
+    gateway: Optional[PaperReductionGateway] = None
+    try:
+        await database.initialize()
+        gateway = PaperReductionGateway(
+            context,
+            safety_runtime,
+            database,
+        )
+        await gateway.start()
+    except BaseException:
+        await database.close()
+        raise
+    if gateway is None:
+        await database.close()
+        raise RuntimeError("paper reduction gateway startup returned no gateway")
+    return _PaperOrderRuntimeResources(database=database, gateway=gateway)
+
+
+async def _close_paper_order_runtime(
+    resources: _PaperOrderRuntimeResources,
+) -> None:
+    """Close the account gateway before releasing its authoritative ledger."""
+
+    try:
+        await resources.gateway.close()
+    finally:
+        await resources.database.close()
+
+
 async def run_once(
     symbols: Optional[List[str]] = None,
     duration: str = "1 D",
@@ -6511,25 +6703,44 @@ async def run_once(
     use_ml_enhanced: bool = False,
     use_smart_execution: bool = False,
     safety_runtime: Optional[SafetyRuntimeCoordinator] = None,
+    runtime_context: Optional[RuntimeSafetyContext] = None,
 ) -> None:
     """Run the trading system once with parallel processing."""
-    runner = AsyncRunner(
-        duration=duration,
-        bar_size=bar_size,
-        sma_fast=sma_fast,
-        sma_slow=sma_slow,
-        slippage_bps=slippage_bps,
-        max_order_notional=max_order_notional,
-        max_daily_notional=max_daily_notional,
-        default_cash=default_cash,
-        max_concurrent_symbols=max_concurrent,
-        use_correlation_sizing=True,  # FIXED: Enabled M5 correlation integration
-        use_ml_strategy=use_ml_strategy,
-        use_ml_enhanced=use_ml_enhanced,
-        use_smart_execution=use_smart_execution,
-        safety_runtime=safety_runtime,
+    if (
+        type(safety_runtime) is not SafetyRuntimeCoordinator
+        or not safety_runtime.started
+        or type(runtime_context) is not RuntimeSafetyContext
+    ):
+        raise RuntimeError("one-shot paper runtime requires validated safety resources")
+    resources = await _start_paper_order_runtime(
+        runtime_context,
+        safety_runtime,
     )
-    await runner.run(symbols)
+    runner: Optional[AsyncRunner] = None
+    try:
+        runner = AsyncRunner(
+            duration=duration,
+            bar_size=bar_size,
+            sma_fast=sma_fast,
+            sma_slow=sma_slow,
+            slippage_bps=slippage_bps,
+            max_order_notional=max_order_notional,
+            max_daily_notional=max_daily_notional,
+            default_cash=default_cash,
+            max_concurrent_symbols=max_concurrent,
+            use_correlation_sizing=True,  # FIXED: Enabled M5 correlation integration
+            use_ml_strategy=use_ml_strategy,
+            use_ml_enhanced=use_ml_enhanced,
+            use_smart_execution=use_smart_execution,
+            safety_runtime=safety_runtime,
+            shared_database=resources.database,
+            paper_reduction_gateway=resources.gateway,
+        )
+        await runner.run(symbols)
+    finally:
+        if runner is not None:
+            await runner.cleanup()
+        await _close_paper_order_runtime(resources)
 
 
 # 2026-07-10 disk-fill incident: with --force-connect and the market closed,
@@ -6610,8 +6821,11 @@ async def _setup_continuous_runner(runner: AsyncRunner) -> None:
     try:
         await runner.setup()
         await runner._attach_health_monitor()
-    except UnprotectedExistingPositionsError:
-        await runner.cleanup()
+    except BaseException:
+        try:
+            await runner.cleanup()
+        except BaseException:
+            logger.exception("event=partial_runner_setup_cleanup_failed")
         raise
 
 
@@ -6632,12 +6846,24 @@ async def run_continuous(
     use_smart_execution: bool = False,
     force_connect: bool = False,
     safety_runtime: Optional[SafetyRuntimeCoordinator] = None,
+    runtime_context: Optional[RuntimeSafetyContext] = None,
 ) -> None:
     """Run the trading system continuously with market hours checking."""
     import signal
     from datetime import datetime
 
     import pytz
+
+    if (
+        type(safety_runtime) is not SafetyRuntimeCoordinator
+        or not safety_runtime.started
+        or type(runtime_context) is not RuntimeSafetyContext
+    ):
+        raise RuntimeError("continuous paper runtime requires validated safety resources")
+    resources = await _start_paper_order_runtime(
+        runtime_context,
+        safety_runtime,
+    )
 
     # Setup signal handling for graceful shutdown
     shutdown_flag = False
@@ -6779,6 +7005,8 @@ async def run_continuous(
                             use_smart_execution=use_smart_execution,
                             portfolio_id=portfolio_id,
                             safety_runtime=safety_runtime,
+                            shared_database=resources.database,
+                            paper_reduction_gateway=resources.gateway,
                         )
                         await _setup_continuous_runner(new_runner)
                         runners[portfolio_id] = new_runner
@@ -6979,6 +7207,10 @@ async def run_continuous(
                 await r.cleanup()
             except Exception:
                 logger.exception("event=final_cleanup_failed portfolio=%s", pid)
+        try:
+            await _close_paper_order_runtime(resources)
+        except Exception:
+            logger.exception("event=paper_order_runtime_cleanup_failed")
         logger.info("Trading system shutdown complete")
         # B2 (2026-05-12): Record a clean exit so dashboard/watchdog know
         # the runner ended normally (vs crashing). Best-effort — don't
@@ -7143,6 +7375,49 @@ def main() -> None:
         )
         raise SystemExit(7) from exc
 
+    try:
+        project_root = Path(__file__).resolve().parents[1]
+        runtime_context = validate_runtime_safety(
+            project_root,
+            resolve_environment(project_root),
+        )
+        if (
+            cfg.runtime_contract is None
+            or runtime_context.runtime_contract.fingerprint != cfg.runtime_contract.fingerprint
+        ):
+            raise RuntimeError("runner configuration differs from validated broker safety context")
+    except Exception as exc:
+        logger.critical(
+            "event=paper_broker_safety_context_blocked exception_type=%s",
+            type(exc).__name__,
+        )
+        _write_exit_audit(
+            "paper_broker_safety_context_blocked",
+            exit_code=8,
+            extra={"exception_type": type(exc).__name__},
+        )
+        _fire_runner_exit_alert(
+            "paper_broker_safety_context_blocked",
+            {"exception_type": type(exc).__name__},
+        )
+        raise SystemExit(8) from exc
+
+    try:
+        require_paper_terminal_settlement_ready()
+    except RuntimeError:
+        logger.critical(
+            "event=paper_terminal_settlement_not_ready " "action=refuse_runner_start pr=2B.3"
+        )
+        _write_exit_audit(
+            "paper_terminal_settlement_not_ready",
+            exit_code=9,
+        )
+        _fire_runner_exit_alert(
+            "paper_terminal_settlement_not_ready",
+            {"required_pr": "2B.3"},
+        )
+        raise SystemExit(9)
+
     # Check for zombie connections before starting
     # Gateway-owned zombies will be handled in setup() by triggering Gateway restart
     port = cfg.ibkr.port  # Get port from config (4002 for paper, 4001 for live)
@@ -7172,6 +7447,7 @@ def main() -> None:
                     use_ml_enhanced=args.use_ml_enhanced,
                     use_smart_execution=args.use_smart_execution,
                     safety_runtime=safety_runtime,
+                    runtime_context=runtime_context,
                 )
             )
         else:
@@ -7194,6 +7470,7 @@ def main() -> None:
                     use_smart_execution=args.use_smart_execution,
                     force_connect=args.force_connect,
                     safety_runtime=safety_runtime,
+                    runtime_context=runtime_context,
                 )
             )
     except UnprotectedExistingPositionsError as e:
