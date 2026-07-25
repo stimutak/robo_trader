@@ -2,7 +2,7 @@
 
 Document date: 2026-07-20
 Last updated: 2026-07-25
-Status: Active execution plan
+Status: Active execution plan; Gate A remains closed
 Source baseline: repository audit at commit `51f0e99` on branch `main`
 Target: safe supervised paper operation first, then remote read-only access, then an explicitly gated limited live canary
 
@@ -28,7 +28,8 @@ artifacts and secrets remain excluded. Runtime dependency metadata and a true
 clean-install wheel gate remain assigned to PR 9. Gate A remains closed, the
 trader remains stopped. Dormant safety-core PR 2A merged through PR #97 as
 `d17b0d5b4f31ab15e2a9b138cca006c0103b7276`; it has no production imports or
-runtime wiring. PR 2B has not started.
+runtime wiring. PR 2B.1 is in local implementation and review; it is not yet
+committed, published, merged, or a launch authorization.
 
 ## 1. Purpose
 
@@ -1349,8 +1350,45 @@ Update after each merge.
   unavailable external reviews were recorded rather than counted as passes.
 
   This stage remains dormant and cannot authorize startup or order placement.
-  Gate A remains closed, the trader remains stopped, and PR 2B plus PRs 3
-  through 5 and relevant PR 7 work remain outstanding.
+  Gate A remains closed and the trader remains stopped.
+
+  PR 2B is split into PR 2B.1 (issue #100: paper runtime identity, trusted
+  evidence, and startup replay), PR 2B.2 (issue #101: route paper exits and
+  separate hard/soft gates), and PR 2B.3 (issue #102: exact settlement and
+  crash/restart quarantine). PR 2B.1 is implemented on
+  `codex/pr2b1-runtime-coordinator` and remains pending complete validation,
+  independent review, hosted CI, and merge. It adds an identity-bound journal,
+  read-only startup replay before any supervised process/Gateway mutation,
+  one-transaction cross-portfolio allocation evidence, connected-generation
+  qualified-contract lineage, and a typed producer-evidence assembly boundary.
+  The coordinator has only a sealed in-memory fake submitter: no production
+  order path is wired in PR 2B.1. Its broker snapshot wrappers are explicitly
+  dormant integration-test scaffolding, not an operational trust source.
+  PR 2B.2 must replace them with account-bound snapshots emitted by the broker
+  client, bind allocation evidence to the validated runtime ledger identity
+  and opened database device/inode, and revalidate live transport, account
+  positions, and all-client open orders immediately before broker dispatch.
+  These are high-severity prerequisites before the runner may call
+  authorization or any real submitter may consume a permit. The dormancy
+  regression fails if the runner or any active order path imports that
+  assembly module or calls the coordinator's authorization/submission methods.
+
+  PR 2B.1 schema v2 intentionally fails closed on a schema-v1 PR 2A journal.
+  No operational v1 journal is known and none exists in the inspected runtime,
+  so this is not a dormant-PR blocker. Any discovered v1 file must be preserved;
+  a later migration must use an explicit backup/copy-and-verify procedure and
+  must never rebind or rewrite the only copy. PRs 2B.2, 2B.3, 3 through 5, and
+  relevant PR 7 work remain outstanding.
+
+  Local PR 2B.1 evidence on the final pre-publish tree: the full repository
+  suite passes 1,795 tests with 5 skips and 20 known warnings. The focused
+  safety/startup/watchdog campaign passes 441 tests. Black, isort, Flake8,
+  medium/high Bandit, Bash syntax, YAML parsing, and diff checks pass for the
+  changed files. Independent design review passed. Two-phase review produced
+  10 concrete findings; eight were repaired and independently reproduced as
+  closed. The challenger retained only the schema-v1 preservation note as low
+  dormant compatibility debt and ledger path/inode binding as a high PR 2B.2
+  prerequisite. Hosted CI, GitHub review, and merge evidence remain pending.
 - PR 3: Not started
 - PR 4: Not started
 - PR 5: Not started

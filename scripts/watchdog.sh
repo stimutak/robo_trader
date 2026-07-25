@@ -271,7 +271,9 @@ notify_user() {
 }
 
 restart_trader() {
-    # Returns 0 if the restart appears successful (runner alive after wait), 1 otherwise.
+    # Returns 0 only if the launcher succeeded and a runner is alive after the
+    # verification wait, 1 for an ordinary failed restart, or 2 for a terminal
+    # safety/policy block.
     # A deliberate terminal safety exit must survive the supervisor boundary.
     # Manual START_TRADER.sh remains available after the missing protection is
     # deployed, but the watchdog must not loop through Gateway/2FA meanwhile.
@@ -324,28 +326,59 @@ restart_trader() {
     # Delegate the complete restart to the authoritative launcher. It validates
     # the paper/read-only contract and IBC configuration before terminating any
     # process, so the watchdog must not pre-kill a healthy runner itself.
-    "$PROJECT_DIR/START_TRADER.sh" >> "$WATCHDOG_LOG" 2>&1
+    local launcher_rc=0
+    "$PROJECT_DIR/START_TRADER.sh" >> "$WATCHDOG_LOG" 2>&1 || launcher_rc=$?
 
-    log "Restart script finished; verifying runner came up..."
-    sleep "$RESTART_VERIFY_WAIT"
-
-    if is_runner_alive; then
-        log "Restart verified: runner_async is alive"
+    if [ "$launcher_rc" -eq 7 ]; then
+        local terminal_reason="paper_safety_journal_replay_blocked"
+        log "TERMINAL SAFETY BLOCK: launcher exited 7 (reason=$terminal_reason)"
+        if [ "$terminal_reason" != "$LAST_TERMINAL_SAFETY_REASON" ]; then
+            notify_user "RoboTrader safety block" \
+                "Automatic restart suppressed: $terminal_reason. Keep trader stopped until protection is restored, then run START_TRADER.sh manually."
+            LAST_TERMINAL_SAFETY_REASON="$terminal_reason"
+        fi
         reset_failures
-        return 0
+        return 2
     fi
 
-    # Restart failed — likely a 2FA timeout on Gateway. Track and escalate.
+    if [ "$launcher_rc" -eq 0 ]; then
+        log "Restart script finished successfully; verifying runner came up..."
+        sleep "$RESTART_VERIFY_WAIT"
+
+        local verified_runner_pids
+        local verified_runner_count
+        verified_runner_pids=$(pgrep -f "python.*runner_async" 2>/dev/null || true)
+        verified_runner_count=$(
+            printf '%s\n' "$verified_runner_pids" |
+                awk 'NF {count++} END {print count+0}'
+        )
+        if (
+            [ "$verified_runner_count" -eq 1 ] &&
+            [[ "$verified_runner_pids" =~ ^[0-9]+$ ]] &&
+            [ "$verified_runner_pids" != "${LAST_OBSERVED_RUNNER_PID:-}" ]
+        ); then
+            LAST_OBSERVED_RUNNER_PID="$verified_runner_pids"
+            log "Restart verified: new runner_async PID $verified_runner_pids is alive"
+            reset_failures
+            return 0
+        fi
+        log "Restart launcher did not produce one new runner PID; old or ambiguous runner state is not success"
+    else
+        log "Restart launcher failed (launcher_rc=$launcher_rc); runner presence cannot mark this restart successful"
+    fi
+
+    # Restart failed. Track and escalate without converting a non-zero launcher
+    # result into success merely because an old runner PID remains visible.
     local prev_failures
     prev_failures=$(get_failure_count)
     local failures=$((prev_failures + 1))
     set_failure_count "$failures"
-    log "Restart FAILED: runner_async not alive after ${RESTART_VERIFY_WAIT}s (consecutive failures: $failures)"
+    log "Restart FAILED: launcher_rc=$launcher_rc runner not verified (consecutive failures: $failures)"
 
     # First-time escalation
     if [ "$failures" -eq "$ESCALATION_THRESHOLD" ]; then
         notify_user "RoboTrader watchdog: trader is DOWN" \
-            "Restart failed ${failures}x — likely IBKR 2FA wall. Check IBKR Mobile app or run ./START_TRADER.sh manually."
+            "Restart failed ${failures}x. Check the watchdog log or run ./START_TRADER.sh manually."
     elif [ "$failures" -gt "$ESCALATION_THRESHOLD" ]; then
         # Periodic reminder
         local extra=$((failures - ESCALATION_THRESHOLD))

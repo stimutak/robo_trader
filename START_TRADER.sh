@@ -3,12 +3,13 @@
 # RoboTrader Startup Script
 #
 # This script ensures clean startup by:
-# 1. Gracefully stopping the existing trading runner
-# 2. Starting Gateway via IBC if not running
-# 3. Cleaning up zombie CLOSE_WAIT connections
-# 4. Automatically restarting Gateway if zombies block API
-# 5. Running the preflight safety gate
-# 6. Replacing monitoring processes and starting the trading system
+# 1. Verifying the identity-bound paper safety journal without mutation
+# 2. Gracefully stopping the existing trading runner
+# 3. Starting Gateway via IBC if not running
+# 4. Cleaning up zombie CLOSE_WAIT connections
+# 5. Automatically restarting Gateway if zombies block API
+# 6. Running the preflight safety gate
+# 7. Replacing monitoring processes and starting the trading system
 #
 # Usage:
 #   ./START_TRADER.sh                    # Start with default symbols
@@ -382,6 +383,38 @@ rotate_log() {
         mv -f "$f" "$f.1" || true
     fi
 }
+
+# Step 0.5: Verify the safety journal before changing any running process or
+# Gateway state. Normal startup may replay this journal but must never create,
+# repair, rebind, or bypass it.
+if [ -x "$SCRIPT_DIR/.venv/bin/python3" ]; then
+    SAFETY_VERIFY_PYTHON="$SCRIPT_DIR/.venv/bin/python3"
+elif [ -x "$SCRIPT_DIR/venv/bin/python3" ]; then
+    SAFETY_VERIFY_PYTHON="$SCRIPT_DIR/venv/bin/python3"
+else
+    SAFETY_VERIFY_PYTHON="$LOCK_PYTHON"
+fi
+echo "0.5. Verifying identity-bound paper safety journal..."
+if ! "$SAFETY_VERIFY_PYTHON" \
+    "$SCRIPT_DIR/scripts/manage_paper_safety_journal.py" verify; then
+    echo "FATAL: paper safety journal verification blocked startup." >&2
+    echo "Fail-closed: stopping the existing trading runner only..." >&2
+    if ! stop_processes_gracefully \
+        "runner_async" "robo_trader[./]runner_async"; then
+        echo "FATAL: existing trading runner could not be quiesced." >&2
+    fi
+    # Write this only after the stop attempt: the old runner's SIGTERM/finally
+    # handlers write their own exit audit and must not overwrite this sticky
+    # terminal startup block.
+    if ! "$SAFETY_VERIFY_PYTHON" \
+        "$SCRIPT_DIR/scripts/write_paper_safety_terminal_audit.py"; then
+        echo "FATAL: could not persist the terminal safety audit." >&2
+    fi
+    echo "Gateway, dashboard, and WebSocket processes were left untouched." >&2
+    exit 7
+fi
+echo "   ✓ Paper safety journal replay passed"
+echo ""
 
 # Step 1: Quiesce the only process allowed to hold the trading connection.
 # This MUST precede Gateway status, LISTEN, CLOSE_WAIT, and preflight checks:

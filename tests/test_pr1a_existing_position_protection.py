@@ -2409,6 +2409,7 @@ is_runner_alive() {{
     runner_checks=$((runner_checks + 1))
     [ "$runner_checks" -ge 2 ]
 }}
+pgrep() {{ printf '5555\\n'; }}
 watchdog_restart_allowed_for_policy_rc() {{ [ "$1" -eq 0 ]; }}
 log() {{ printf '%s\\n' "$1" >> "$CAPTURE"; }}
 notify_user() {{ :; }}
@@ -2430,7 +2431,7 @@ printf 'RETURN_CODE=%s\\n' "$rc" >> "$CAPTURE"
     assert result.returncode == 0, result.stderr
     log_output = capture.read_text()
     assert "LAUNCHER_RAN" in log_output
-    assert "Restart verified: runner_async is alive" in log_output
+    assert "Restart verified: new runner_async PID 5555 is alive" in log_output
     assert "RETURN_CODE=0" in log_output
 
 

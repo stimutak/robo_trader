@@ -35,6 +35,10 @@ def _render_compose(relative_path: str) -> dict:
             "IBKR_APPROVED_ACCOUNTS": "DU_RENDER_PAPER",
             "RT_STATE_NAMESPACE": "paper",
             "RT_DB_PATH": "/app/data/render-paper.db",
+            "SAFETY_ACCOUNT_SCOPE": (
+                "acct_v1_0123456789abcdef0123456789abcdef" "fedcba9876543210fedcba9876543210"
+            ),
+            "SAFETY_JOURNAL_PATH": "/app/data/render-safety-journal.db",
             "MODEL_ARTIFACT_SET": "render-paper-models",
             "BUILD_ID": "compose-render-test",
             "GRAFANA_PASSWORD": "render-only",
@@ -83,6 +87,8 @@ def test_docker_job_uses_supervised_paper_gateway_contract():
     assert env["IBKR_HOST"] == "127.0.0.1"
     assert str(env["IBKR_PORT"]) == "4002"
     assert str(env["IBKR_READONLY"]).lower() == "true"
+    assert str(env["SAFETY_ACCOUNT_SCOPE"]).startswith("acct_v1_")
+    assert env["SAFETY_JOURNAL_PATH"] == "/app/data/ci-safety-journal.db"
 
 
 def test_docker_workflow_does_not_start_trading_stack():
@@ -140,6 +146,8 @@ def test_compose_dashboard_requires_operator_paper_runtime_identity(relative_pat
         "IBKR_APPROVED_ACCOUNTS",
         "RT_STATE_NAMESPACE",
         "RT_DB_PATH",
+        "SAFETY_ACCOUNT_SCOPE",
+        "SAFETY_JOURNAL_PATH",
         "MODEL_ARTIFACT_SET",
         "BUILD_ID",
     ):
@@ -165,6 +173,8 @@ def test_rendered_compose_dashboard_has_paper_runtime_identity(relative_path):
     assert env["IBKR_ACCOUNT_TYPE"] == "paper"
     assert env["RT_STATE_NAMESPACE"] == "paper"
     assert env["RT_DB_PATH"] == "/app/data/render-paper.db"
+    assert env["SAFETY_ACCOUNT_SCOPE"].startswith("acct_v1_")
+    assert env["SAFETY_JOURNAL_PATH"] == "/app/data/render-safety-journal.db"
     assert env["MODEL_ARTIFACT_SET"] == "render-paper-models"
     assert env["BUILD_ID"] == "compose-render-test"
 

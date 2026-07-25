@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import sys
 import time
@@ -12,12 +13,14 @@ import pytest
 from pydantic import ValidationError
 
 from robo_trader.config import (
+    PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE,
     Config,
     Environment,
     IBKRConfig,
     RuntimeContract,
     TradingMode,
     get_config_for_environment,
+    load_config_from_env,
     load_runtime_contract_from_env,
 )
 from robo_trader.execution import LiveExecutor
@@ -34,11 +37,14 @@ def _paper_env(**overrides: str) -> dict[str, str]:
         "IBKR_HOST": "127.0.0.1",
         "IBKR_PORT": "4002",
         "IBKR_READONLY": "true",
+        "IBKR_CLIENT_ID": "123",
         "IBKR_ACCOUNT": "DU1234567",
         "IBKR_APPROVED_ACCOUNTS": "DU1234567",
         "IBKR_ACCOUNT_TYPE": "paper",
         "RT_DB_PATH": "data/paper.db",
         "RT_STATE_NAMESPACE": "paper",
+        "SAFETY_ACCOUNT_SCOPE": "acct_v1_" + ("0123456789abcdef" * 4),
+        "SAFETY_JOURNAL_PATH": "data/paper/safety_journal.db",
         "MODEL_ARTIFACT_SET": "paper-models-v1",
         "BUILD_ID": "abc123",
     }
@@ -58,9 +64,26 @@ def test_runtime_contract_accepts_only_consistent_paper_readonly():
     assert contract.model_artifact_set == "paper-models-v1"
     assert contract.build_id == "abc123"
     assert contract.database_identity.startswith("paper:")
+    assert contract.safety_account_scope == "acct_v1_" + ("0123456789abcdef" * 4)
+    assert contract.safety_execution_domain_scope == PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
+    assert contract.safety_journal_identity.startswith("paper:safety:")
     assert contract.public_dict()["live_capability"] == "disabled"
     assert "database_path" not in contract.public_dict()
+    assert "safety_journal_path" not in contract.public_dict()
     assert len(contract.fingerprint) == 16
+
+
+def test_config_retains_validated_runtime_contract_without_serializing_paths(monkeypatch):
+    for name, value in _paper_env().items():
+        monkeypatch.setenv(name, value)
+
+    config = load_config_from_env()
+
+    assert config.runtime_contract is not None
+    assert config.runtime_contract.safety_journal_path == str(
+        (ROOT / "data/paper/safety_journal.db").resolve()
+    )
+    assert "runtime_contract" not in config.model_dump()
 
 
 def test_runtime_contract_accepts_offline_backtest_without_live_capability():
@@ -75,6 +98,9 @@ def test_runtime_contract_accepts_offline_backtest_without_live_capability():
 
     assert contract.execution_mode == "backtest"
     assert contract.execution_source == "offline_backtest"
+    assert contract.safety_account_scope is None
+    assert contract.safety_execution_domain_scope is None
+    assert contract.safety_journal_path is None
     assert contract.public_dict()["live_capability"] == "disabled"
 
 
@@ -107,10 +133,14 @@ def test_runtime_contract_fingerprint_excludes_full_account_number():
         model_artifact_set="paper-models-v1",
         build_id="abc123",
         state_namespace="paper",
+        safety_account_scope="acct_v1_" + ("0123456789abcdef" * 4),
+        safety_execution_domain_scope=PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE,
+        safety_journal_path="data/paper/safety_journal.db",
     )
 
     public = contract.public_dict()
     assert "DU1234567" not in str(public)
+    assert "data/paper/safety_journal.db" not in str(public)
     assert public["fingerprint"] == contract.fingerprint
 
 
@@ -123,11 +153,36 @@ def test_runtime_contract_fingerprint_excludes_full_account_number():
         ({"IBKR_ACCOUNT_TYPE": "live"}, "IBKR_ACCOUNT_TYPE=paper"),
         ({"RT_STATE_NAMESPACE": "live"}, "must match EXECUTION_MODE"),
         ({"LIVE_RT_DB_PATH": "data/paper.db"}, "different ledgers"),
+        ({"SAFETY_ACCOUNT_SCOPE": ""}, "requires SAFETY_ACCOUNT_SCOPE"),
+        ({"SAFETY_ACCOUNT_SCOPE": "acct_v1_" + ("0" * 64)}, "placeholder digest"),
+        ({"SAFETY_JOURNAL_PATH": ""}, "requires a dedicated SAFETY_JOURNAL_PATH"),
+        ({"SAFETY_JOURNAL_PATH": "data/paper.db"}, "separate from RT_DB_PATH"),
+        (
+            {
+                "SAFETY_JOURNAL_PATH": "data/paper/safety_journal.db",
+                "LIVE_SAFETY_JOURNAL_PATH": "data/paper/safety_journal.db",
+            },
+            "must differ",
+        ),
     ],
 )
 def test_runtime_contract_rejects_account_and_state_identity_drift(overrides, message):
     with pytest.raises(ConfigValidationError, match=message):
         load_runtime_contract_from_env(_paper_env(**overrides))
+
+
+def test_runtime_contract_rejects_unsalted_broker_account_scope():
+    raw_account = "DU1234567"
+    unsalted_scope = "acct_v1_" + hashlib.sha256(raw_account.encode("utf-8")).hexdigest()
+
+    with pytest.raises(ConfigValidationError, match="unsalted hash"):
+        load_runtime_contract_from_env(
+            _paper_env(
+                IBKR_ACCOUNT=raw_account,
+                IBKR_APPROVED_ACCOUNTS=raw_account,
+                SAFETY_ACCOUNT_SCOPE=unsalted_scope,
+            )
+        )
 
 
 def test_production_like_runtime_requires_all_readiness_gates():
@@ -201,6 +256,7 @@ def test_authoritative_launcher_quiesces_runner_before_gateway_and_preflight():
     source = (ROOT / "START_TRADER.sh").read_text()
     missing_guard = source.index('if [ ! -f "$IBC_INI" ]')
     lifecycle_lock = source.index('--validate-fd "$ROBOTRADER_RUNTIME_LIFECYCLE_FD"')
+    safety_replay = source.index('"$SCRIPT_DIR/scripts/manage_paper_safety_journal.py" verify')
     runner_stop = source.index(
         'stop_processes_gracefully "runner_async" "robo_trader[./]runner_async"'
     )
@@ -212,7 +268,7 @@ def test_authoritative_launcher_quiesces_runner_before_gateway_and_preflight():
     dashboard_start = source.index("$PYTHON app.py >")
     runner_start = source.index("$PYTHON -m robo_trader.runner_async")
 
-    assert lifecycle_lock < missing_guard < runner_stop
+    assert lifecycle_lock < missing_guard < safety_replay < runner_stop
     assert runner_stop < gateway_checks < port_check
     assert runner_stop < zombie_check < preflight_gate
     assert preflight_gate < monitoring_stop < dashboard_start < runner_start

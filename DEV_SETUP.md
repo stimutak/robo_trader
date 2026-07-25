@@ -115,18 +115,61 @@ grep -E '^(ReadOnlyApi|AllowBlindTrading|TradingMode)=' config/ibc/config.ini
 #   TradingMode=paper   (until you intentionally switch to live)
 ```
 
-### 2.6 First run
+### 2.6 Provision the paper safety identity and journal
+
+The safety account scope is an opaque local identifier. It is not a password,
+but it must be random and must never be derived from or replaced by the IBKR
+account number.
+
+```bash
+.venv/bin/python3 scripts/manage_paper_safety_journal.py generate-scope
+```
+
+Copy the printed value into the untracked `.env` file:
+
+```dotenv
+SAFETY_ACCOUNT_SCOPE=acct_v1_<64 lowercase hex characters printed above>
+SAFETY_JOURNAL_PATH=data/paper/safety_journal.db
+```
+
+Never commit `.env`. Create and permission the parent directory explicitly,
+then perform the one-time, typed-confirmation initialization:
+
+```bash
+mkdir -p data/paper
+chmod 700 data/paper
+.venv/bin/python3 scripts/manage_paper_safety_journal.py initialize \
+  --confirm CREATE-EMPTY-PAPER-SAFETY-JOURNAL
+.venv/bin/python3 scripts/manage_paper_safety_journal.py verify
+```
+
+Initialization refuses an existing path and never edits `.env`. Verification
+is read-only and rejects a missing, replaced, corrupt, identity-mismatched,
+active, or quarantined journal. If it blocks, do not delete, replace, or
+reinitialize the journal: preserve it and investigate the unresolved
+reservation/reconciliation state.
+
+Schema-v1 journals created while PR 2A was dormant are also preserved and fail
+closed; they are not rebound or migrated automatically. If one is discovered,
+stop and retain the original. A migration must first create and verify an
+independent backup/copy and must never rewrite or delete the only copy.
+
+### 2.7 First run
 ```bash
 ./START_TRADER.sh
 ```
 The script:
+- Replays the identity-bound safety journal before normal lifecycle changes.
+  If replay blocks, it stops only the existing runner, writes a sticky terminal
+  audit after shutdown handlers finish, and leaves Gateway/dashboard/WebSocket
+  untouched.
 - Starts IBKR Gateway via IBC (you'll get a 2FA prompt on your phone the first time)
 - Verifies `ReadOnlyApi=yes` and refuses to start otherwise (`exit 4`)
 - Starts the trading runner and the dashboard at `http://127.0.0.1:5555`
 
 If auth is enabled, log in with the password you set in step 2.4. Username defaults to `admin` (override with `DASH_USER` env var).
 
-### 2.6.1 🚨 REQUIRED: load the launchd watchdog (one-time per machine)
+### 2.7.1 🚨 REQUIRED: load the launchd watchdog (one-time per machine)
 
 **This step is NOT optional. Skipping it caused the trader to stay dead overnight on 2026-05-11 after a transient `lsof` timeout killed the runner.**
 

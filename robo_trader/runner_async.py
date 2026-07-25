@@ -34,7 +34,7 @@ import pandas as pd
 from ib_async import Stock
 
 from .analysis.correlation_integration import AsyncCorrelationManager, CorrelationBasedPositionSizer
-from .config import load_config
+from .config import RuntimeContract, load_config
 from .correlation import CorrelationTracker
 from .database_async import AsyncTradingDatabase
 from .execution import Order, PaperExecutor
@@ -78,6 +78,11 @@ from .portfolio import Portfolio, PositionSnapshot  # Import Portfolio class fro
 from .portfolio_pkg.portfolio_manager import AllocationMethod, MultiStrategyPortfolioManager
 from .risk.advanced_risk import AdvancedRiskManager, risk_monitor_task
 from .risk_manager import Position, RiskManager, create_risk_manager_from_config
+from .safety import (
+    PaperExecutionIdentity,
+    SafetyJournal,
+    SafetyRuntimeCoordinator,
+)
 from .stop_loss_monitor import (
     StopExecutionPhase,
     StopExecutionPhaseRecord,
@@ -126,6 +131,43 @@ class UnprotectedExistingPositionsError(RuntimeError):
 
 
 _UNVERIFIED_PRICE_RATIO_LIMIT = 1.75
+
+
+def _start_paper_safety_runtime(cfg: object) -> SafetyRuntimeCoordinator:
+    """Replay the dedicated paper safety journal before broker inspection.
+
+    This is intentionally startup-only in PR 2B.1.  It does not initialize a
+    journal, authorize an order, or expose a submission sink.  Missing,
+    replaced, corrupt, active, or quarantined journal state therefore blocks
+    startup before any Gateway or broker work begins.
+    """
+
+    runtime_contract = getattr(cfg, "runtime_contract", None)
+    if type(runtime_contract) is not RuntimeContract:
+        raise RuntimeError("validated runtime contract is required for safety startup")
+    if (
+        runtime_contract.safety_execution_domain_scope is None
+        or runtime_contract.safety_account_scope is None
+        or runtime_contract.safety_journal_path is None
+    ):
+        raise RuntimeError("paper safety identity and journal path are required")
+
+    identity = PaperExecutionIdentity(
+        runtime_contract.safety_execution_domain_scope,
+        runtime_contract.safety_account_scope,
+    )
+    coordinator = SafetyRuntimeCoordinator(
+        identity,
+        SafetyJournal(runtime_contract.safety_journal_path),
+    )
+    coordinator.start()
+    logger.info(
+        "Paper safety journal replay passed: domain=%s account_scope=%s journal=%s",
+        runtime_contract.safety_execution_domain_scope,
+        runtime_contract.safety_account_scope,
+        runtime_contract.safety_journal_identity,
+    )
+    return coordinator
 
 
 # Import AI analyst for news-driven trading
@@ -417,7 +459,13 @@ class AsyncRunner:
         use_smart_execution: bool = None,  # Auto-detect if None
         use_advanced_risk: bool = None,  # Auto-detect if None
         portfolio_id: str = "default",  # Multi-portfolio support
+        safety_runtime: Optional[SafetyRuntimeCoordinator] = None,
     ):
+        if safety_runtime is not None and (
+            type(safety_runtime) is not SafetyRuntimeCoordinator or not safety_runtime.started
+        ):
+            raise RuntimeError("safety_runtime must be a started SafetyRuntimeCoordinator")
+        self.safety_runtime = safety_runtime
         self.portfolio_id = portfolio_id
         self.duration = duration
         self.bar_size = bar_size
@@ -6462,6 +6510,7 @@ async def run_once(
     use_ml_strategy: bool = False,
     use_ml_enhanced: bool = False,
     use_smart_execution: bool = False,
+    safety_runtime: Optional[SafetyRuntimeCoordinator] = None,
 ) -> None:
     """Run the trading system once with parallel processing."""
     runner = AsyncRunner(
@@ -6478,6 +6527,7 @@ async def run_once(
         use_ml_strategy=use_ml_strategy,
         use_ml_enhanced=use_ml_enhanced,
         use_smart_execution=use_smart_execution,
+        safety_runtime=safety_runtime,
     )
     await runner.run(symbols)
 
@@ -6581,6 +6631,7 @@ async def run_continuous(
     use_ml_enhanced: bool = False,
     use_smart_execution: bool = False,
     force_connect: bool = False,
+    safety_runtime: Optional[SafetyRuntimeCoordinator] = None,
 ) -> None:
     """Run the trading system continuously with market hours checking."""
     import signal
@@ -6727,6 +6778,7 @@ async def run_continuous(
                             use_ml_strategy=use_ml_strategy,
                             use_smart_execution=use_smart_execution,
                             portfolio_id=portfolio_id,
+                            safety_runtime=safety_runtime,
                         )
                         await _setup_continuous_runner(new_runner)
                         runners[portfolio_id] = new_runner
@@ -7073,6 +7125,23 @@ def main() -> None:
         )
     if cfg.execution.mode.value != "paper" or not cfg.ibkr.readonly:
         raise SystemExit("Refusing to run outside the validated paper/read-only contract")
+    try:
+        safety_runtime = _start_paper_safety_runtime(cfg)
+    except Exception as exc:
+        logger.critical(
+            "event=paper_safety_journal_replay_blocked exception_type=%s",
+            type(exc).__name__,
+        )
+        _write_exit_audit(
+            "paper_safety_journal_replay_blocked",
+            exit_code=7,
+            extra={"exception_type": type(exc).__name__},
+        )
+        _fire_runner_exit_alert(
+            "paper_safety_journal_replay_blocked",
+            {"exception_type": type(exc).__name__},
+        )
+        raise SystemExit(7) from exc
 
     # Check for zombie connections before starting
     # Gateway-owned zombies will be handled in setup() by triggering Gateway restart
@@ -7102,6 +7171,7 @@ def main() -> None:
                     use_ml_strategy=args.use_ml,
                     use_ml_enhanced=args.use_ml_enhanced,
                     use_smart_execution=args.use_smart_execution,
+                    safety_runtime=safety_runtime,
                 )
             )
         else:
@@ -7123,6 +7193,7 @@ def main() -> None:
                     use_ml_enhanced=args.use_ml_enhanced,
                     use_smart_execution=args.use_smart_execution,
                     force_connect=args.force_connect,
+                    safety_runtime=safety_runtime,
                 )
             )
     except UnprotectedExistingPositionsError as e:
