@@ -28,8 +28,12 @@ artifacts and secrets remain excluded. Runtime dependency metadata and a true
 clean-install wheel gate remain assigned to PR 9. Gate A remains closed, the
 trader remains stopped. Dormant safety-core PR 2A merged through PR #97 as
 `d17b0d5b4f31ab15e2a9b138cca006c0103b7276`; it has no production imports or
-runtime wiring. PR 2B.1 is in local implementation and review; it is not yet
-committed, published, merged, or a launch authorization.
+runtime wiring. PR 2B.1 merged through PR #104 as
+`3ecdaa05b3352ddcd4519662b0fe957751f3fdb1` from exact reviewed head
+`0d5585b46f8f1b495d944e24b23df5a7c01cfc2d`. It binds the dormant paper
+safety coordinator to startup replay but deliberately leaves production order
+authorization and submission unwired. PR 2B.2 is next. Gate A remains closed
+and this merge is not a launch authorization.
 
 ## 1. Purpose
 
@@ -1302,9 +1306,13 @@ Update after each merge.
   `d17b0d5b4f31ab15e2a9b138cca006c0103b7276`. The dormant merge grants no
   startup or order authority.
 - PR 2: Staged as dormant PR 2A (issue #91) followed by separately reviewed
-  runtime-integration PR 2B. PR #97 merged PR 2A on 2026-07-25 from exact
-  reviewed head `5cf0e4ec48178fdecde6794e920d6af7c67b58f8` as
-  `d17b0d5b4f31ab15e2a9b138cca006c0103b7276`; PR 2B has not started.
+  runtime-integration PRs 2B.1 through 2B.3. PR #97 merged PR 2A on 2026-07-25
+  from exact reviewed head `5cf0e4ec48178fdecde6794e920d6af7c67b58f8`
+  as `d17b0d5b4f31ab15e2a9b138cca006c0103b7276`. PR #104 merged PR 2B.1
+  on 2026-07-25 from exact reviewed head
+  `0d5585b46f8f1b495d944e24b23df5a7c01cfc2d` as
+  `3ecdaa05b3352ddcd4519662b0fe957751f3fdb1`. PR 2B.2 is next; PR 2B.3
+  remains pending.
 
   PR 2A contains strict exact-`Decimal` models, account/portfolio-aware
   reduce-only validation, zero-crossing and over-close rejection, deterministic
@@ -1355,9 +1363,7 @@ Update after each merge.
   PR 2B is split into PR 2B.1 (issue #100: paper runtime identity, trusted
   evidence, and startup replay), PR 2B.2 (issue #101: route paper exits and
   separate hard/soft gates), and PR 2B.3 (issue #102: exact settlement and
-  crash/restart quarantine). PR 2B.1 is implemented on
-  `codex/pr2b1-runtime-coordinator` and remains pending complete validation,
-  independent review, hosted CI, and merge. It adds an identity-bound journal,
+  crash/restart quarantine). PR 2B.1 is merged. It adds an identity-bound journal,
   read-only startup replay before any supervised process/Gateway mutation,
   one-transaction cross-portfolio allocation evidence, connected-generation
   qualified-contract lineage, and a typed producer-evidence assembly boundary.
@@ -1380,15 +1386,27 @@ Update after each merge.
   must never rebind or rewrite the only copy. PRs 2B.2, 2B.3, 3 through 5, and
   relevant PR 7 work remain outstanding.
 
-  Local PR 2B.1 evidence on the final pre-publish tree: the full repository
-  suite passes 1,795 tests with 5 skips and 20 known warnings. The focused
-  safety/startup/watchdog campaign passes 441 tests. Black, isort, Flake8,
-  medium/high Bandit, Bash syntax, YAML parsing, and diff checks pass for the
-  changed files. Independent design review passed. Two-phase review produced
-  10 concrete findings; eight were repaired and independently reproduced as
-  closed. The challenger retained only the schema-v1 preservation note as low
-  dormant compatibility debt and ledger path/inode binding as a high PR 2B.2
-  prerequisite. Hosted CI, GitHub review, and merge evidence remain pending.
+  Final PR 2B.1 evidence: after two late GitHub Codex findings, the configured
+  journal path preserves its lexical final component so the journal can reject
+  symlink substitution itself, and Python dependencies are bootstrapped before
+  journal verification without importing side-effectful RoboTrader runtime
+  modules. Dedicated tests prove same-identity symlink rejection, fresh and
+  incomplete virtual-environment bootstrap, and fail-closed handling of a
+  partially successful dependency installation. Two independent reviews
+  returned PASS on the repaired exact tree. The focused late-fix suite passed
+  77 tests; the final full local suite passed 1,801 tests with 5 expected skips
+  and 20 known warnings. Black, isort, Flake8, Bash syntax, and diff checks
+  passed.
+
+  All 26 repository-owned exact-head hosted checks passed: Python 3.10 through
+  3.12, production unit/integration/performance jobs, lint, security, Docker,
+  container structure, Compose, build, Trivy, BugBot, and the Cursor
+  vulnerability scan. Both late Codex review threads were replied to and
+  resolved. The external Claude action provided no validation because its
+  revoked OAuth token returned HTTP 401 before inference with zero input or
+  output tokens. That unavailable review was recorded rather than counted as a
+  pass. The merge grants no order authority or startup approval. Gate A remains
+  closed and the trader remains stopped.
 - PR 3: Not started
 - PR 4: Not started
 - PR 5: Not started
