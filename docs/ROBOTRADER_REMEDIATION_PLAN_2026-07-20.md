@@ -1,12 +1,12 @@
 # RoboTrader Remediation and Launch Plan
 
 Document date: 2026-07-20
-Last updated: 2026-07-23
+Last updated: 2026-07-25
 Status: Active execution plan
 Source baseline: repository audit at commit `51f0e99` on branch `main`
 Target: safe supervised paper operation first, then remote read-only access, then an explicitly gated limited live canary
 
-Current execution baseline (2026-07-23): `main` includes the truthful Phase 0
+Current execution baseline (2026-07-24): `main` includes the truthful Phase 0
 CI gates from PR #83 (`7f5de0a`) and runtime-stability fixes from PR #81
 (`b7e5005`). PR #82 completed PR 1 and merged as `393f533`. PR #87 completed
 PR 1A and merged as `4cafb782cbf43ff4397f1b89b42d5f657eceea8e`,
@@ -19,8 +19,14 @@ PR 1B diagnostic implementation and merged as
 merged `main` failed closed before broker connection because the local runtime
 does not yet define an explicit paper-account identity and allow-list. Issue
 #92 tracks that local-only operator prerequisite. Protected evidence hashes
-were unchanged, no correction was attempted, Gate A remains closed, and the
-trader remains stopped. PR 2A is the next code change.
+were unchanged and no correction was attempted. PR #95 then completed the
+PR 1C package/import prerequisite and merged as
+`dff4c8b597a54c614d8925565f28aa865f8ae676`. The package root is now inert,
+active subpackages and the required dashboard template are included in built
+wheels, broker safeguards remain explicit at direct `IB` users, and runtime
+artifacts and secrets remain excluded. Runtime dependency metadata and a true
+clean-install wheel gate remain assigned to PR 9. Gate A remains closed, the
+trader remains stopped, and dormant safety-core PR 2A is the next code change.
 
 ## 1. Purpose
 
@@ -89,14 +95,16 @@ The required order is:
    any safety exit can be allowed through a kill switch.
 3. PR 1B adds non-mutating broker-versus-ledger reconciliation and resolves the
    incident evidence gate without clearing safety state.
-4. PRs 2 through 5 make active paper behavior safe and state authoritative.
-5. PR 6 repairs the evidence engine used to evaluate strategies.
-6. PR 7 unifies strategy and risk behavior on top of corrected data and state.
-7. PRs 8 through 10 establish remote security, reproducible delivery, and honest operations.
-8. PRs 11 and 12 add live order placement and broker-native protection behind a disabled gate.
-9. PR 13 proves failure behavior through soak and fault injection.
-10. PR 14 delivers an explicitly supported remote/cloud topology if still required.
-11. PR 15 permits only a tiny, manually armed live canary.
+4. PR 1C makes package-root imports side-effect-free and ensures the dormant
+   safety core and all active subpackages can ship in built wheels.
+5. PRs 2 through 5 make active paper behavior safe and state authoritative.
+6. PR 6 repairs the evidence engine used to evaluate strategies.
+7. PR 7 unifies strategy and risk behavior on top of corrected data and state.
+8. PRs 8 through 10 establish remote security, reproducible delivery, and honest operations.
+9. PRs 11 and 12 add live order placement and broker-native protection behind a disabled gate.
+10. PR 13 proves failure behavior through soak and fault injection.
+11. PR 14 delivers an explicitly supported remote/cloud topology if still required.
+12. PR 15 permits only a tiny, manually armed live canary.
 
 PRs may be prepared in parallel only when their files and safety contracts do not overlap. Merge order still follows the dependency chain.
 
@@ -347,6 +355,82 @@ before broker connection because the local runtime has no explicit paper
 account identity or allow-list. Issue #92 tracks the local-only configuration
 prerequisite. The blocked run changed none of the protected evidence files and
 does not satisfy the reviewed-reconciliation requirement above.
+
+## PR 1C - Isolate package imports and complete wheel discovery
+
+### Objective
+
+Remove two structural blockers discovered during the adversarial design review
+for dormant safety-core issue #91: importing `robo_trader.safety` must not load
+or mutate broker code, and a built wheel must not omit the safety package or
+other active subpackages.
+
+### Problems addressed
+
+- Python executes `robo_trader/__init__.py` before any nested package import,
+  and the previous initializer eagerly imported `ibkr_safe`, loaded
+  `ib_async`, and globally patched `IB.disconnect`.
+- `pyproject.toml` declared only the root `robo_trader` package, so source-tree
+  tests could pass while built wheels omitted every nested package.
+- Broad package discovery could accidentally include archived code, similarly
+  named sibling packages, tests, configuration, credentials, databases, or
+  logs.
+- Required non-Python assets could be omitted even when their Python package
+  was included.
+
+### Step-by-step work
+
+1. Make `robo_trader/__init__.py` metadata-only and side-effect-free.
+2. Require every production module that directly constructs `ib_async.IB` to
+   activate `ibkr_safe` explicitly.
+3. Replace the root-only package list with precise, namespace-aware discovery
+   for `robo_trader` and `robo_trader.*`.
+4. Exclude archived code and similarly named sibling packages.
+5. Disable implicit package-data inclusion and allow-list only the required
+   bug-dashboard template.
+6. Require a patched setuptools build backend and pin the supported
+   development backend.
+7. Add cold-import tests that reject broker imports, filesystem mutation,
+   sockets, subprocesses, threads, current-directory changes, and environment
+   changes.
+8. Build a wheel from a copied exact tree, inspect its contents, render the
+   packaged dashboard template, and import representative regular and
+   namespace subpackages from outside the checkout.
+
+### Required tests
+
+- A cold `python -I` root import is inert and does not load broker modules.
+- Explicit `ibkr_safe` activation remains idempotent and force-only.
+- Every direct production `IB` user activates the disconnect guard.
+- Built wheels include active regular and namespace packages plus the required
+  dashboard template.
+- Built wheels exclude archives, sibling packages, tests, config, `.env`, IBC
+  credentials, databases, and logs.
+- The full repository suite and supported Python 3.10 through 3.12 hosted
+  matrices pass.
+
+### Done means
+
+- The package root is safe for PR 2A to add and import
+  `robo_trader.safety` without activating broker behavior.
+- A built wheel contains the dormant safety core and all other active
+  subpackages once they are added.
+- Direct broker users retain the documented disconnect safeguard.
+- Package discovery does not expose secrets or runtime state.
+
+### Explicit deferral
+
+PR 1C proves import and distribution *structure*, not a standalone application
+installation. The pre-existing `dependencies = []` metadata, separation of
+runtime/dev/test/ML/operations extras, lockfiles with hashes, and a true clean
+wheel install remain PR 9 scope. The current supported setup continues to
+install tracked requirements before the project package.
+
+### Operational gate
+
+This prerequisite changes no runtime wiring, broker connection, launcher,
+database, safety state, or order authority. It cannot authorize startup. Gate
+A remains closed and the trader remains stopped.
 
 ## PR 2 - Implement a reduce-only safety plane
 
@@ -708,7 +792,7 @@ Make a green build mean the installable artifact, critical tests, security check
 - Safety tests are ignored by default.
 - Critical modules have zero coverage; `app.py` is excluded.
 - Performance jobs are no-ops.
-- Package metadata omits subpackages and runtime dependencies.
+- Package metadata omits runtime dependencies.
 - Security scans do not always scan installed application dependencies.
 - CI actions and container images use mutable references.
 - Model/runtime dependency versions drift.
@@ -716,7 +800,7 @@ Make a green build mean the installable artifact, critical tests, security check
 ### Step-by-step work
 
 1. Choose one authoritative CI workflow and remove contradictory duplicates.
-2. Package all `robo_trader` subpackages using package discovery.
+2. Preserve PR 1C's precise subpackage discovery and package-data allow-list.
 3. Declare runtime dependencies and split dev, test, ML, and operations extras.
 4. Create a reproducible lock with hashes for supported Python versions.
 5. Build a wheel and test it in a clean environment rather than relying on checkout imports.
@@ -1166,6 +1250,35 @@ Update after each merge.
   publishing the raw account number. Reconciliation remains incomplete, no
   data or safety state was corrected, and this merge does not authorize
   startup.
+- PR 1C: PR #95 merged on 2026-07-24 as
+  `dff4c8b597a54c614d8925565f28aa865f8ae676` from exact reviewed head
+  `431513b9c7034ac2712ffb54acb58429e04281ba`. The focused package,
+  import-isolation, and broker-boundary suite passed 76 tests. The full local
+  suite passed 1,568 tests with 5 skipped and 20 known warnings. All
+  repository-owned hosted checks passed, including Python 3.10 through 3.12,
+  production unit/integration/performance matrices, lint, security,
+  containers, build, BugBot, and Trivy. The prior missing-template review
+  finding was fixed, regression-tested, and its only review thread was
+  resolved.
+
+  Exact-head two-phase review ran code-quality, bug, trading-safety, and style
+  passes plus a verification challenger. Reviewers reproduced that the
+  pre-existing empty runtime dependency metadata prevents a standalone clean
+  wheel install; the challenger correctly retained it as medium PR 9 debt
+  rather than copying the current mixed requirements into this prerequisite.
+  The challenger also downgraded the offline no-build-isolation backend concern
+  to optional low-priority test hardening because normal PEP 517 builds honor
+  the `setuptools>=83.0.0` floor and supported CI/dev setup pins 83.0.0.
+  Test-only Bandit `assert` and shell-free subprocess notices were filtered as
+  false positives. Final two-phase verdict: PASS with no blocking finding.
+
+  The external Claude action did not review code: its credential returned HTTP
+  401 before inference with zero input tokens, zero output tokens, and zero
+  cost. Final-head Codex and Cursor review requests reported usage limits;
+  those unavailable reviews were recorded rather than counted as passes.
+  Issue #94 closed and the source branch was deleted. PR 1C changes no runtime
+  wiring or order authority. Gate A remains closed, the trader remains stopped,
+  and PR 2A / issue #91 is next.
 - PR 2: Staged as dormant PR 2A (issue #91) followed by separately reviewed
   runtime-integration PR 2B. PR 2A is next; neither stage is started or wired
   into production runtime yet.
