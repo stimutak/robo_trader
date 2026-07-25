@@ -32,8 +32,11 @@ runtime wiring. PR 2B.1 merged through PR #104 as
 `3ecdaa05b3352ddcd4519662b0fe957751f3fdb1` from exact reviewed head
 `0d5585b46f8f1b495d944e24b23df5a7c01cfc2d`. It binds the dormant paper
 safety coordinator to startup replay but deliberately leaves production order
-authorization and submission unwired. PR 2B.2 is next. Gate A remains closed
-and this merge is not a launch authorization.
+authorization and submission unwired. PR 2B.2 implementation and two-phase
+local review are complete on `codex/pr2b2-broker-bound-exits`; hosted review
+and merge remain pending. The implementation is deliberately dormant behind
+a shared terminal-settlement readiness gate. Gate A remains closed and this
+work is not a launch authorization.
 
 ## 1. Purpose
 
@@ -456,9 +459,15 @@ runtime-integration changes:
   `3ecdaa05b3352ddcd4519662b0fe957751f3fdb1`.
 - **PR 2B.2 / issue #101:** route paper exits through broker-bound reduce-only
   authorization and separate hard safety blocks from entry-only soft blocks.
-  This stage is next and remains pending.
+  Implementation and two-phase local review are complete on
+  `codex/pr2b2-broker-bound-exits` from implementation head
+  `5ba3bde2948bb3a1469245ea1f893d346cb90d4f`; hosted review and merge remain
+  pending. Every operational submission boundary remains hard-disabled.
 - **PR 2B.3 / issue #102:** add exact settlement, ambiguity handling, and
-  crash/restart quarantine release. This stage remains pending.
+  crash/restart quarantine release, and bind every reduction price to
+  producer-owned fresh protective-quote price, timestamp, and lineage. This
+  stage remains pending and must be complete before the shared readiness gate
+  can be enabled.
 
 PR 2A grants no broker connection or submission authority by itself. PR 2B.1
 now imports the safety runtime in the production runner and launcher only to
@@ -1321,8 +1330,9 @@ Update after each merge.
   as `d17b0d5b4f31ab15e2a9b138cca006c0103b7276`. PR #104 merged PR 2B.1
   on 2026-07-25 from exact reviewed head
   `0d5585b46f8f1b495d944e24b23df5a7c01cfc2d` as
-  `3ecdaa05b3352ddcd4519662b0fe957751f3fdb1`. PR 2B.2 is next; PR 2B.3
-  remains pending.
+  `3ecdaa05b3352ddcd4519662b0fe957751f3fdb1`. PR 2B.2 implementation and
+  local review are complete on `codex/pr2b2-broker-bound-exits`; hosted review
+  and merge remain pending. PR 2B.3 remains pending.
 
   PR 2A contains strict exact-`Decimal` models, account/portfolio-aware
   reduce-only validation, zero-crossing and over-close rejection, deterministic
@@ -1380,14 +1390,47 @@ Update after each merge.
   The coordinator has only a sealed in-memory fake submitter: no production
   order path is wired in PR 2B.1. Its broker snapshot wrappers are explicitly
   dormant integration-test scaffolding, not an operational trust source.
-  PR 2B.2 must replace them with account-bound snapshots emitted by the broker
-  client, bind allocation evidence to the validated runtime ledger identity
-  and opened database device/inode, and revalidate live transport, account
-  positions, and all-client open orders immediately before broker dispatch.
-  These are high-severity prerequisites before the runner may call
-  authorization or any real submitter may consume a permit. The dormancy
-  regression fails if the runner or any active order path imports that
-  assembly module or calls the coordinator's authorization/submission methods.
+  PR 2B.2 replaces those wrappers with producer-owned snapshots emitted by the
+  read-only broker client, binds them to an HMAC-derived exact paper-account
+  scope, proves loopback/4002/read-only transport and IBC configuration, and
+  binds local allocation evidence to the validated runtime ledger path,
+  identity, device, and inode. Every active paper reduction is serialized
+  account-wide, revalidates broker contract/transport and the complete
+  cross-portfolio local allocation immediately before one-shot
+  `PaperExecutor` submission, and cannot retry or fall back to another sink.
+  Entry-only kill-switch, circuit-breaker, rate, and session gates remain
+  separate from the hard evidence required for semantic reductions.
+
+  The sanctioned executor is still the local synchronous `PaperExecutor`;
+  IBKR remains diagnostic and read-only. Therefore the exact local
+  cross-portfolio SQLite ledger is the allocation/exposure authority for this
+  stage. IBKR paper-account positions and open orders describe a different
+  system and remain diagnostic inputs for PR 5 reconciliation; they do not
+  authorize or automatically correct a local simulator reduction. Broker state
+  becomes authoritative before any future broker-write capability can exist.
+
+  PR 2B.2 remains deliberately dormant. A shared readiness gate defaults false
+  and is enforced independently by the runner, paper-order runtime, gateway
+  startup, entry serialization, and reduction submission. The only strict
+  XFAIL demonstrates the reason: a successful local fill is not yet durably
+  applied to the allocation ledger and terminally settled in the safety
+  journal before the account-wide lock is released. PR 2B.3 must close that
+  gap and bind the authorized reference price to producer-owned fresh
+  protective-quote price, timestamp, and lineage before readiness may become
+  true.
+
+  Final local PR 2B.2 implementation evidence: the full repository suite passed
+  1,995 tests with 5 expected skips, 1 strict settlement XFAIL, and 20 known
+  warnings. Black, isort, Flake8, compilation, diff checks, targeted Bandit
+  scanning, and secret review passed. Phase-one code, trading, and bug reviews
+  identified an overlong stop reference, same-scope alternate-journal
+  acceptance, and unsafe SQLite pool replacement; all were reproduced, fixed,
+  and covered by regressions. The phase-two challenger confirmed those fixes,
+  found no new blocker, and classified terminal settlement and protective-price
+  lineage as high-severity PR 2B.3 pre-activation requirements. Durable detail
+  is recorded in
+  `docs/reviews/PR2B2_LOCAL_REVIEW_EVIDENCE_2026-07-25.md`. Hosted CI and hosted
+  review are still required before merge and are not represented as passed.
 
   PR 2B.1 schema v2 intentionally fails closed on a schema-v1 PR 2A journal.
   No operational v1 journal is known and none exists in the inspected runtime,
