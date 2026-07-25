@@ -384,16 +384,69 @@ rotate_log() {
     fi
 }
 
+python_environment_ready() {
+    "$PYTHON" -c \
+        "from dotenv import dotenv_values; from ib_async import Stock; from pydantic import BaseModel, field_validator; import pandas, structlog" \
+        >/dev/null 2>&1 &&
+        "$PYTHON" "$SCRIPT_DIR/scripts/manage_paper_safety_journal.py" --help \
+            >/dev/null 2>&1
+}
+
+prepare_python_environment() {
+    cd "$SCRIPT_DIR" || return 1
+
+    if [ -x "$SCRIPT_DIR/.venv/bin/python3" ]; then
+        PYTHON="$SCRIPT_DIR/.venv/bin/python3"
+        echo "   ✓ Using virtualenv Python: $PYTHON"
+    elif [ -x "$SCRIPT_DIR/venv/bin/python3" ]; then
+        PYTHON="$SCRIPT_DIR/venv/bin/python3"
+        echo "   ✓ Using virtualenv Python: $PYTHON"
+    elif [ -f "$SCRIPT_DIR/requirements.txt" ]; then
+        echo "   Creating virtual environment..."
+        "$LOCK_PYTHON" -m venv "$SCRIPT_DIR/.venv" || return 1
+        PYTHON="$SCRIPT_DIR/.venv/bin/python3"
+        if [ ! -x "$PYTHON" ]; then
+            echo "FATAL: virtualenv creation did not produce an executable python3." >&2
+            return 1
+        fi
+        echo "   Installing dependencies..."
+        "$PYTHON" -m pip install -r "$SCRIPT_DIR/requirements.txt" -q || return 1
+        echo "   ✓ Virtual environment created and dependencies installed"
+    else
+        PYTHON="$LOCK_PYTHON"
+        echo "   ⚠️  No virtualenv or requirements.txt found - checking system Python"
+    fi
+
+    if ! python_environment_ready; then
+        if [ ! -f "$SCRIPT_DIR/requirements.txt" ]; then
+            echo "FATAL: journal verification dependencies are unavailable and requirements.txt is missing." >&2
+            return 1
+        fi
+        echo "   ⚠️  Missing or incomplete dependencies - repairing from requirements.txt..."
+        "$PYTHON" -m pip install -r "$SCRIPT_DIR/requirements.txt" -q || return 1
+    fi
+
+    if ! python_environment_ready; then
+        echo "FATAL: Python environment cannot import the safety journal verifier." >&2
+        return 1
+    fi
+}
+
+# Step 0.25: Select and, if necessary, bootstrap the exact interpreter needed
+# for journal verification. This may repair only the project virtualenv; it
+# happens before any runner, Gateway, socket, or monitoring state is changed.
+echo "0.25. Preparing Python environment for safety verification..."
+if ! prepare_python_environment; then
+    echo "FATAL: Python dependency bootstrap failed before safety verification." >&2
+    exit 76
+fi
+SAFETY_VERIFY_PYTHON="$PYTHON"
+echo "   ✓ Safety verification interpreter is ready"
+echo ""
+
 # Step 0.5: Verify the safety journal before changing any running process or
 # Gateway state. Normal startup may replay this journal but must never create,
 # repair, rebind, or bypass it.
-if [ -x "$SCRIPT_DIR/.venv/bin/python3" ]; then
-    SAFETY_VERIFY_PYTHON="$SCRIPT_DIR/.venv/bin/python3"
-elif [ -x "$SCRIPT_DIR/venv/bin/python3" ]; then
-    SAFETY_VERIFY_PYTHON="$SCRIPT_DIR/venv/bin/python3"
-else
-    SAFETY_VERIFY_PYTHON="$LOCK_PYTHON"
-fi
 echo "0.5. Verifying identity-bound paper safety journal..."
 if ! "$SAFETY_VERIFY_PYTHON" \
     "$SCRIPT_DIR/scripts/manage_paper_safety_journal.py" verify; then
@@ -546,38 +599,9 @@ fi
 echo "   ✓ Zombie cleanup complete"
 echo ""
 
-# Step 4: Set up Python environment
-echo "4. Setting up Python environment..."
-cd "$SCRIPT_DIR"
-
-# Determine Python path - prefer .venv, fall back to system python3
-if [ -x ".venv/bin/python" ]; then
-    PYTHON="$SCRIPT_DIR/.venv/bin/python"
-    echo "   ✓ Using virtualenv Python: $PYTHON"
-elif [ -x "venv/bin/python" ]; then
-    PYTHON="$SCRIPT_DIR/venv/bin/python"
-    echo "   ✓ Using virtualenv Python: $PYTHON"
-else
-    # Check if we need to create virtualenv
-    if [ -f "requirements.txt" ]; then
-        echo "   Creating virtual environment..."
-        python3 -m venv .venv
-        PYTHON="$SCRIPT_DIR/.venv/bin/python"
-        echo "   Installing dependencies..."
-        $PYTHON -m pip install -r requirements.txt -q
-        echo "   ✓ Virtual environment created and dependencies installed"
-    else
-        PYTHON="python3"
-        echo "   ⚠️  No virtualenv found - using system Python"
-    fi
-fi
-
-# Verify Python works and has required packages
-if ! $PYTHON -c "import pandas" 2>/dev/null; then
-    echo "   ⚠️  Missing dependencies - installing from requirements.txt..."
-    $PYTHON -m pip install -r requirements.txt -q
-    echo "   ✓ Dependencies installed"
-fi
+# Step 4: The Python environment was prepared before the journal replay so a
+# dependency failure cannot be misclassified as a terminal journal failure.
+echo "4. Python environment already verified: $PYTHON"
 echo ""
 
 # Step 4.5: Preflight safety gate

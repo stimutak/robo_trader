@@ -39,6 +39,13 @@ def _shell_function(source: str, name: str, end_marker: str) -> str:
     return f"{name}() {{" + source.split(f"{name}() {{", 1)[1].split(end_marker, 1)[0]
 
 
+def _python_setup_and_verify_source(source: str) -> str:
+    return (
+        "python_environment_ready() {"
+        + source.split("python_environment_ready() {", 1)[1].split("# Step 1:", 1)[0]
+    )
+
+
 def test_terminal_audit_helper_writes_only_sanitized_exact_pair(tmp_path):
     helper = _load_audit_helper()
     policy = _load_watchdog_policy()
@@ -96,6 +103,7 @@ exit 99
     harness = f"""
 SCRIPT_DIR={tmp_path!s}
 LOCK_PYTHON={fake_python!s}
+SAFETY_VERIFY_PYTHON={fake_python!s}
 CAPTURE={capture!s}
 runner_alive=1
 pgrep() {{
@@ -125,6 +133,207 @@ sleep() {{ :; }}
     assert "RUNNER_SIGNAL=-TERM PID=4242" in actions
     assert actions.index("RUNNER_SIGNAL=-TERM PID=4242") < actions.index("AUDIT_WRITTEN")
     assert "Gateway, dashboard, and WebSocket processes were left untouched." in result.stderr
+
+
+def test_fresh_environment_bootstraps_before_journal_verification(tmp_path):
+    source = LAUNCHER_PATH.read_text(encoding="utf-8")
+    setup_source = _python_setup_and_verify_source(source)
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "manage_paper_safety_journal.py").touch()
+    (tmp_path / "requirements.txt").touch()
+    capture = tmp_path / "capture.log"
+    fake_system_python = tmp_path / "fake-system-python3"
+    fake_system_python.write_text(
+        f"""#!/bin/bash
+case "$1:$2" in
+  -m:venv)
+    printf 'VENV_CREATED\\n' >> "$CAPTURE"
+    mkdir -p "$3/bin"
+    cp "$0" "$3/bin/python3"
+    exit 0
+    ;;
+  -m:pip)
+    printf 'PIP_INSTALLED\\n' >> "$CAPTURE"
+    touch "$SCRIPT_DIR/.deps-ready"
+    exit 0
+    ;;
+  -c:*)
+    printf 'DEPENDENCIES_PROBED\\n' >> "$CAPTURE"
+    [ -f "$SCRIPT_DIR/.deps-ready" ]
+    exit
+    ;;
+  *manage_paper_safety_journal.py:--help)
+    printf 'VERIFIER_IMPORTED\\n' >> "$CAPTURE"
+    [ -f "$SCRIPT_DIR/.deps-ready" ]
+    exit
+    ;;
+  *manage_paper_safety_journal.py:verify)
+    printf 'JOURNAL_VERIFIED\\n' >> "$CAPTURE"
+    exit 0
+    ;;
+esac
+exit 99
+""",
+        encoding="utf-8",
+    )
+    fake_system_python.chmod(0o700)
+
+    harness = f"""
+set -e
+export SCRIPT_DIR={tmp_path!s}
+export LOCK_PYTHON={fake_system_python!s}
+export CAPTURE={capture!s}
+{setup_source}
+printf 'SAFETY_PYTHON=%s\\n' "$SAFETY_VERIFY_PYTHON" >> "$CAPTURE"
+"""
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    actions = capture.read_text(encoding="utf-8")
+    assert actions.index("VENV_CREATED") < actions.index("PIP_INSTALLED")
+    assert actions.index("PIP_INSTALLED") < actions.index("DEPENDENCIES_PROBED")
+    assert actions.index("DEPENDENCIES_PROBED") < actions.index("VERIFIER_IMPORTED")
+    assert actions.index("VERIFIER_IMPORTED") < actions.index("JOURNAL_VERIFIED")
+    assert f"SAFETY_PYTHON={tmp_path!s}/.venv/bin/python3" in actions
+
+
+def test_incomplete_existing_venv_repairs_runtime_dependencies_before_verification(
+    tmp_path,
+):
+    source = LAUNCHER_PATH.read_text(encoding="utf-8")
+    setup_source = _python_setup_and_verify_source(source)
+    fake_python = tmp_path / ".venv" / "bin" / "python3"
+    fake_python.parent.mkdir(parents=True)
+    fake_python.write_text(
+        """#!/bin/bash
+case "$1:$2" in
+  -m:pip)
+    printf 'PIP_REPAIRED_RUNTIME\\n' >> "$CAPTURE"
+    touch "$SCRIPT_DIR/.runtime-ready"
+    exit 0
+    ;;
+  -c:*pandas*)
+    if [ -f "$SCRIPT_DIR/.runtime-ready" ]; then
+        printf 'RUNTIME_DEPENDENCY_READY\\n' >> "$CAPTURE"
+        exit 0
+    fi
+    printf 'RUNTIME_DEPENDENCY_MISSING\\n' >> "$CAPTURE"
+    exit 1
+    ;;
+  -c:*)
+    printf 'VERIFIER_DEPENDENCIES_READY\\n' >> "$CAPTURE"
+    exit 0
+    ;;
+  *manage_paper_safety_journal.py:--help)
+    printf 'VERIFIER_IMPORTED\\n' >> "$CAPTURE"
+    exit 0
+    ;;
+  *manage_paper_safety_journal.py:verify)
+    printf 'JOURNAL_VERIFIED\\n' >> "$CAPTURE"
+    exit 0
+    ;;
+esac
+exit 99
+""",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o700)
+    (tmp_path / "requirements.txt").touch()
+    capture = tmp_path / "capture.log"
+
+    harness = f"""
+set -e
+export SCRIPT_DIR={tmp_path!s}
+export LOCK_PYTHON={fake_python!s}
+export CAPTURE={capture!s}
+{setup_source}
+"""
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    actions = capture.read_text(encoding="utf-8")
+    assert actions.index("RUNTIME_DEPENDENCY_MISSING") < actions.index("PIP_REPAIRED_RUNTIME")
+    assert actions.index("PIP_REPAIRED_RUNTIME") < actions.index("RUNTIME_DEPENDENCY_READY")
+    assert actions.index("RUNTIME_DEPENDENCY_READY") < actions.index("JOURNAL_VERIFIED")
+
+
+def test_failed_pip_cannot_be_hidden_by_later_successful_dependency_probe(tmp_path):
+    source = LAUNCHER_PATH.read_text(encoding="utf-8")
+    setup_source = _python_setup_and_verify_source(source)
+    fake_python = tmp_path / ".venv" / "bin" / "python3"
+    fake_python.parent.mkdir(parents=True)
+    fake_python.write_text(
+        """#!/bin/bash
+case "$1:$2" in
+  -m:pip)
+    printf 'PIP_FAILED_AFTER_PARTIAL_INSTALL\\n' >> "$CAPTURE"
+    touch "$SCRIPT_DIR/.deps-ready"
+    exit 1
+    ;;
+  -c:*)
+    printf 'DEPENDENCIES_PROBED\\n' >> "$CAPTURE"
+    [ -f "$SCRIPT_DIR/.deps-ready" ]
+    exit
+    ;;
+  *manage_paper_safety_journal.py:--help)
+    printf 'VERIFIER_IMPORTED\\n' >> "$CAPTURE"
+    [ -f "$SCRIPT_DIR/.deps-ready" ]
+    exit
+    ;;
+  *manage_paper_safety_journal.py:verify)
+    printf 'JOURNAL_VERIFIED\\n' >> "$CAPTURE"
+    exit 0
+    ;;
+  *write_paper_safety_terminal_audit.py:*)
+    printf 'AUDIT_WRITTEN\\n' >> "$CAPTURE"
+    exit 0
+    ;;
+esac
+exit 99
+""",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o700)
+    (tmp_path / "requirements.txt").touch()
+    capture = tmp_path / "capture.log"
+
+    harness = f"""
+set -e
+export SCRIPT_DIR={tmp_path!s}
+export LOCK_PYTHON={fake_python!s}
+export CAPTURE={capture!s}
+stop_processes_gracefully() {{
+    printf 'RUNNER_SIGNAL\\n' >> "$CAPTURE"
+}}
+{setup_source}
+printf 'UNREACHABLE\\n' >> "$CAPTURE"
+"""
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 76
+    assert "dependency bootstrap failed before safety verification" in result.stderr
+    actions = capture.read_text(encoding="utf-8")
+    assert "PIP_FAILED_AFTER_PARTIAL_INSTALL" in actions
+    assert "UNREACHABLE" not in actions
+    assert "JOURNAL_VERIFIED" not in actions
+    assert "AUDIT_WRITTEN" not in actions
+    assert "RUNNER_SIGNAL" not in actions
 
 
 @pytest.mark.parametrize(

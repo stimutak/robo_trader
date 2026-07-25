@@ -41,6 +41,21 @@ def _resolve_project_path(value: str) -> Path:
     return path.resolve(strict=False)
 
 
+def _resolve_project_path_preserving_leaf(value: str) -> Path:
+    """Anchor a protected path without following its final component.
+
+    The safety journal validates the configured leaf with ``lstat`` and
+    ``O_NOFOLLOW`` on every open. Resolving the whole path here would replace a
+    configured symlink with its target before those checks can reject it.
+    Parent traversal and parent symlinks are still canonicalized.
+    """
+
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = _PROJECT_ROOT / path
+    return path.parent.resolve(strict=False) / path.name
+
+
 @dataclass(frozen=True)
 class RuntimeContract:
     """Validated, non-secret runtime identity for the containment phase.
@@ -78,8 +93,8 @@ class RuntimeContract:
         """Return a non-sensitive identity for the dedicated safety journal."""
         if self.safety_journal_path is None:
             return None
-        resolved = str(Path(self.safety_journal_path).expanduser().resolve(strict=False))
-        digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
+        protected = str(_resolve_project_path_preserving_leaf(self.safety_journal_path))
+        digest = hashlib.sha256(protected.encode("utf-8")).hexdigest()[:12]
         return f"{self.state_namespace}:safety:{digest}"
 
     @property
@@ -295,11 +310,14 @@ def load_runtime_contract_from_env(
             raise ConfigValidationError(
                 "Supervised paper runtime requires a dedicated SAFETY_JOURNAL_PATH."
             )
-        journal_resolved = _resolve_project_path(safety_journal_path)
+        journal_path = _resolve_project_path_preserving_leaf(safety_journal_path)
+        # Resolve only a separate comparison value. The stored path must keep
+        # its lexical leaf so SafetyJournal can reject a symlink itself.
+        journal_resolved = journal_path.resolve(strict=False)
         database_resolved = _resolve_project_path(database_path)
         if journal_resolved == database_resolved:
             raise ConfigValidationError("SAFETY_JOURNAL_PATH must be separate from RT_DB_PATH.")
-        safety_journal_path = str(journal_resolved)
+        safety_journal_path = str(journal_path)
         live_safety_journal_path = str(env.get("LIVE_SAFETY_JOURNAL_PATH", "")).strip()
         if live_safety_journal_path:
             live_journal_resolved = _resolve_project_path(live_safety_journal_path)

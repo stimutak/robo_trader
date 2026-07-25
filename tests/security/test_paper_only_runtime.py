@@ -86,6 +86,40 @@ def test_config_retains_validated_runtime_contract_without_serializing_paths(mon
     assert "runtime_contract" not in config.model_dump()
 
 
+def test_runtime_contract_preserves_existing_safety_journal_symlink_leaf(tmp_path):
+    first_target = tmp_path / "first-journal.db"
+    second_target = tmp_path / "second-journal.db"
+    first_target.touch()
+    second_target.touch()
+    configured = tmp_path / "configured-journal.db"
+    configured.symlink_to(first_target)
+
+    contract = load_runtime_contract_from_env(_paper_env(SAFETY_JOURNAL_PATH=str(configured)))
+    first_identity = contract.safety_journal_identity
+
+    configured.unlink()
+    configured.symlink_to(second_target)
+
+    assert contract.safety_journal_path == str(configured)
+    assert Path(contract.safety_journal_path).is_symlink()
+    assert contract.safety_journal_identity == first_identity
+
+
+def test_runtime_contract_rejects_journal_symlink_targeting_runtime_ledger(tmp_path):
+    ledger = tmp_path / "paper-ledger.db"
+    ledger.touch()
+    configured = tmp_path / "configured-journal.db"
+    configured.symlink_to(ledger)
+
+    with pytest.raises(ConfigValidationError, match="separate from RT_DB_PATH"):
+        load_runtime_contract_from_env(
+            _paper_env(
+                RT_DB_PATH=str(ledger),
+                SAFETY_JOURNAL_PATH=str(configured),
+            )
+        )
+
+
 def test_runtime_contract_accepts_offline_backtest_without_live_capability():
     contract = load_runtime_contract_from_env(
         _paper_env(
@@ -256,6 +290,9 @@ def test_authoritative_launcher_quiesces_runner_before_gateway_and_preflight():
     source = (ROOT / "START_TRADER.sh").read_text()
     missing_guard = source.index('if [ ! -f "$IBC_INI" ]')
     lifecycle_lock = source.index('--validate-fd "$ROBOTRADER_RUNTIME_LIFECYCLE_FD"')
+    dependency_bootstrap = source.index(
+        'echo "0.25. Preparing Python environment for safety verification..."'
+    )
     safety_replay = source.index('"$SCRIPT_DIR/scripts/manage_paper_safety_journal.py" verify')
     runner_stop = source.index(
         'stop_processes_gracefully "runner_async" "robo_trader[./]runner_async"'
@@ -267,8 +304,15 @@ def test_authoritative_launcher_quiesces_runner_before_gateway_and_preflight():
     monitoring_stop = source.index('stop_processes_gracefully "dashboard"')
     dashboard_start = source.index("$PYTHON app.py >")
     runner_start = source.index("$PYTHON -m robo_trader.runner_async")
+    dependency_functions = source.index("python_environment_ready() {")
+    dependency_setup_source = source[dependency_functions:safety_replay]
 
-    assert lifecycle_lock < missing_guard < safety_replay < runner_stop
+    assert lifecycle_lock < missing_guard < dependency_bootstrap < safety_replay < runner_stop
+    assert "stop_processes_gracefully" not in dependency_setup_source
+    assert "start_gateway" not in dependency_setup_source
+    assert "import robo_trader" not in dependency_setup_source
+    assert "import pandas" in dependency_setup_source
+    assert "kill " not in dependency_setup_source
     assert runner_stop < gateway_checks < port_check
     assert runner_stop < zombie_check < preflight_gate
     assert preflight_gate < monitoring_stop < dashboard_start < runner_start

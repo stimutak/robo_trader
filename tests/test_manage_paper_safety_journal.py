@@ -11,6 +11,7 @@ from robo_trader.safety import (
     EvidenceStatus,
     ExposureEvidence,
     GateContext,
+    JournalIntegrityError,
     OrderIntent,
     OrderSide,
     OrderType,
@@ -128,6 +129,25 @@ def test_relative_journal_path_is_anchored_to_project_root(monkeypatch, tmp_path
     assert verified.safety_journal_path == contract.safety_journal_path
     assert journal_path.exists()
     assert not wrong_cwd_path.exists()
+
+
+def test_verify_rejects_configured_symlink_to_valid_same_identity_journal(tmp_path):
+    target_env = _env(tmp_path)
+    target_path = tmp_path / "target-safety.db"
+    target_env["SAFETY_JOURNAL_PATH"] = str(target_path)
+    initialize_journal(target_env, confirmation=CREATE_CONFIRMATION)
+    original = target_path.read_bytes()
+
+    configured_link = tmp_path / "configured-safety.db"
+    configured_link.symlink_to(target_path)
+    linked_env = dict(target_env)
+    linked_env["SAFETY_JOURNAL_PATH"] = str(configured_link)
+
+    with pytest.raises(JournalIntegrityError, match="non-symlink regular file"):
+        verify_journal(linked_env)
+
+    assert configured_link.is_symlink()
+    assert target_path.read_bytes() == original
 
 
 def test_verify_rejects_active_or_quarantined_submission_authority(tmp_path):
