@@ -26,7 +26,7 @@ simulator ledger is therefore the allocation authority for local paper fills.
 IBKR positions and open orders remain diagnostic inputs for PR 5 and cannot
 automatically authorize, block, or rewrite local simulator state.
 
-## Verification results
+## Initial verification results
 
 Final pre-documentation full suite:
 
@@ -103,6 +103,37 @@ The challenger retained two high-severity pre-activation requirements for PR
 The shared readiness gate must remain false until both requirements have
 passing success, failure, cancellation, crash-injection, and restart-replay
 coverage.
+
+## Hosted-review follow-up
+
+GitHub Codex reviewed exact PR head `b44fdf293251398e60853a24cf9dac21bc9db545`
+and found two valid P1 defects:
+
+1. A relative `RT_DB_PATH` was rejected because the database manager stores a
+   canonical lexical-leaf path while the runtime contract retained the
+   relative string. Runtime-contract creation now binds the path once to the
+   explicit project root while preserving the lexical leaf for symlink
+   rejection. Runner, gateway, reconciliation, and evidence-assembly
+   regressions cover exact binding and drift rejection.
+2. Persistent reconnect setup created a new `PaperExecutor`, but the
+   account-wide gateway correctly rejected a second executor registration for
+   the same portfolio. Reconnect setup now reuses the exact original executor
+   when its safety-relevant configuration is unchanged, fails closed on drift,
+   and treats re-registration as idempotent only for the same executor and
+   coordinator identity.
+
+Post-fix focused verification passed 150 tests with the one expected strict
+XFAIL. The full repository suite then passed:
+
+```text
+2001 passed, 5 skipped, 1 xfailed, 20 warnings in 65.26s
+```
+
+Changed-file Black, isort, Flake8, and diff checks passed. The independent
+phase-two challenger verified the persistent-executor repair and rejected the
+initial gateway-only path repair as incomplete. The path was then fixed at
+contract creation, exercised across each consumer, and independently reviewed
+GO before push.
 
 ## Operational status
 

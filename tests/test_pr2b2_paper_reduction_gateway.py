@@ -70,11 +70,15 @@ class GatewayHarness:
     gateway: PaperReductionGateway
 
 
-def _runtime_context(tmp_path: Path) -> RuntimeSafetyContext:
+def _runtime_context(
+    tmp_path: Path,
+    *,
+    database_path: str | None = None,
+) -> RuntimeSafetyContext:
     ibc = tmp_path / "config" / "ibc" / "config.ini"
     ibc.parent.mkdir(parents=True)
     ibc.write_text("ReadOnlyApi=yes\nTradingMode=paper\n")
-    database_path = tmp_path / "paper-ledger.db"
+    configured_database_path = database_path or str(tmp_path / "paper-ledger.db")
     journal_path = tmp_path / "paper-safety.db"
     environment = {
         "ENVIRONMENT": "dev",
@@ -89,7 +93,7 @@ def _runtime_context(tmp_path: Path) -> RuntimeSafetyContext:
         "IBKR_APPROVED_ACCOUNTS": ACCOUNT,
         "IBKR_ACCOUNT_TYPE": "paper",
         "RT_STATE_NAMESPACE": "paper",
-        "RT_DB_PATH": str(database_path),
+        "RT_DB_PATH": configured_database_path,
         "SAFETY_ACCOUNT_SCOPE_KEY": SCOPE_KEY,
         "SAFETY_ACCOUNT_SCOPE": ACCOUNT_SCOPE,
         "SAFETY_JOURNAL_PATH": str(journal_path),
@@ -383,6 +387,7 @@ def test_gateway_requires_exact_runtime_coordinator_database_and_executor_bindin
 
     executor = PaperExecutor()
     harness.gateway.register_paper_executor("portfolio-a", executor)
+    harness.gateway.register_paper_executor("portfolio-a", executor)
     with pytest.raises(PaperReductionGatewayError, match="already registered"):
         harness.gateway.register_paper_executor("portfolio-a", PaperExecutor())
     with pytest.raises(PaperReductionGatewayError, match="exactly PaperExecutor"):
@@ -393,6 +398,34 @@ def test_gateway_requires_exact_runtime_coordinator_database_and_executor_bindin
 
     with pytest.raises(PaperReductionGatewayError, match="exactly PaperExecutor"):
         harness.gateway.register_paper_executor("portfolio-b", ExecutorSubclass())
+
+
+def test_gateway_accepts_configured_relative_runtime_ledger_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("robo_trader.config._PROJECT_ROOT", tmp_path)
+    context = _runtime_context(tmp_path, database_path="paper-ledger.db")
+    database = AsyncTradingDatabase(Path(context.runtime_contract.database_path))
+    journal = SafetyJournal(Path(context.runtime_contract.safety_journal_path))
+    journal.initialize(
+        execution_domain_scope=context.runtime_contract.safety_execution_domain_scope,
+        account_scope=context.runtime_contract.safety_account_scope,
+    )
+    coordinator = SafetyRuntimeCoordinator(
+        PaperExecutionIdentity(
+            context.runtime_contract.safety_execution_domain_scope,
+            context.runtime_contract.safety_account_scope,
+        ),
+        journal,
+    )
+    coordinator.start()
+
+    gateway = PaperReductionGateway(context, coordinator, database)
+
+    assert Path(context.runtime_contract.database_path).is_absolute()
+    assert database.db_path == Path(context.runtime_contract.database_path)
+    assert gateway.started is False
 
 
 @pytest.mark.asyncio

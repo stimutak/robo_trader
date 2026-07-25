@@ -49,7 +49,7 @@ def runtime_contract(monkeypatch):
     )
     monkeypatch.setattr(
         "robo_trader.config.load_runtime_contract_from_env",
-        lambda environment: contract,
+        lambda environment, **_kwargs: contract,
     )
     return contract
 

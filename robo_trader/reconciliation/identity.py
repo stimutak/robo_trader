@@ -334,7 +334,10 @@ def validate_runtime_safety(
                 load_runtime_contract_from_env,
             )
 
-            contract = load_runtime_contract_from_env(resolved_env)
+            contract = load_runtime_contract_from_env(
+                resolved_env,
+                project_root=project_root,
+            )
         except Exception as exc:
             raise RuntimeSafetyError("paper runtime contract validation failed") from exc
 

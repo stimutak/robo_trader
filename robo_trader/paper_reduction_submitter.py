@@ -69,6 +69,15 @@ class PaperReductionSubmitter:
             raise AttributeError("PaperReductionSubmitter is sealed")
         object.__setattr__(self, name, value)
 
+    def _is_bound_to(
+        self,
+        executor: PaperExecutor,
+        coordinator: SafetyRuntimeCoordinator,
+    ) -> bool:
+        """Support idempotent reconnect registration without exposing authority."""
+
+        return self.__executor is executor and self.__coordinator is coordinator
+
     def _submit_once(
         self,
         envelope: ConsumedPaperSubmissionEnvelope,

@@ -1960,11 +1960,7 @@ class AsyncRunner:
         self._raw_db = (
             self._shared_database if self._shared_database is not None else AsyncTradingDatabase()
         )
-        if (
-            self.cfg.runtime_contract is None
-            or str(self._raw_db.db_path) != self.cfg.runtime_contract.database_path
-        ):
-            raise RuntimeError("runner database does not match the validated runtime ledger")
+        self._assert_runtime_ledger_database()
         await self._raw_db.initialize()
 
         # Wrap DB with portfolio-scoped proxy if using non-default portfolio
@@ -2024,22 +2020,7 @@ class AsyncRunner:
         if self.cleanup_task is None or self.cleanup_task.done():
             self.cleanup_task = asyncio.create_task(self._periodic_cleanup_loop())
 
-        # Initialize executor with smart execution support
-        smart_executor = None
-
-        # Auto-enable smart execution for large orders or if explicitly enabled
-        if self.use_smart_execution:
-            from .smart_execution.smart_executor import SmartExecutor
-
-            # Pass IBKR instance for real market data
-            smart_executor = SmartExecutor(self.cfg, ibkr_client=self.ib)
-            logger.info("Smart execution enabled with TWAP/VWAP/Iceberg algorithms")
-
-        self.executor = PaperExecutor(
-            slippage_bps=self.slippage_bps,
-            smart_executor=smart_executor,
-            use_smart_execution=self.use_smart_execution,
-        )
+        self._initialize_or_reuse_paper_executor()
         if self.paper_reduction_gateway is None:
             raise RuntimeError("active paper runtime requires the account-wide reduction gateway")
 
@@ -2315,6 +2296,42 @@ class AsyncRunner:
         # stale exit-audit file so the dashboard/watchdog reads "no exit"
         # while the runner is actually trading.
         _clear_exit_audit()
+
+    def _initialize_or_reuse_paper_executor(self) -> None:
+        """Keep one exact executor identity across persistent reconnect setup."""
+
+        existing = self.executor
+        if existing is not None:
+            if type(existing) is not PaperExecutor:
+                raise RuntimeError("existing executor is not exactly PaperExecutor")
+            if (
+                existing.slippage_bps != float(self.slippage_bps)
+                or existing.use_smart_execution is not self.use_smart_execution
+            ):
+                raise RuntimeError(
+                    "paper executor configuration changed during persistent reconnect"
+                )
+            return
+
+        smart_executor = None
+        if self.use_smart_execution:
+            from .smart_execution.smart_executor import SmartExecutor
+
+            smart_executor = SmartExecutor(self.cfg, ibkr_client=self.ib)
+            logger.info("Smart execution enabled with TWAP/VWAP/Iceberg algorithms")
+
+        self.executor = PaperExecutor(
+            slippage_bps=self.slippage_bps,
+            smart_executor=smart_executor,
+            use_smart_execution=self.use_smart_execution,
+        )
+
+    def _assert_runtime_ledger_database(self) -> None:
+        """Fail closed unless the runner owns the contract-bound ledger."""
+
+        runtime_contract = self.cfg.runtime_contract
+        if runtime_contract is None or str(self._raw_db.db_path) != runtime_contract.database_path:
+            raise RuntimeError("runner database does not match the validated runtime ledger")
 
     def _assert_existing_position_protection(
         self,

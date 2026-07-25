@@ -1420,7 +1420,7 @@ Update after each merge.
   true.
 
   Final local PR 2B.2 implementation evidence: the full repository suite passed
-  1,995 tests with 5 expected skips, 1 strict settlement XFAIL, and 20 known
+  2,001 tests with 5 expected skips, 1 strict settlement XFAIL, and 20 known
   warnings. Black, isort, Flake8, compilation, diff checks, targeted Bandit
   scanning, and secret review passed. Phase-one code, trading, and bug reviews
   identified an overlong stop reference, same-scope alternate-journal
@@ -1431,6 +1431,9 @@ Update after each merge.
   is recorded in
   `docs/reviews/PR2B2_LOCAL_REVIEW_EVIDENCE_2026-07-25.md`. Hosted CI and hosted
   review are still required before merge and are not represented as passed.
+  GitHub Codex subsequently found relative-ledger-path and persistent-reconnect
+  executor-identity defects; both were reproduced and fixed end to end with
+  regressions before the final 2,001-test run.
 
   PR 2B.1 schema v2 intentionally fails closed on a schema-v1 PR 2A journal.
   No operational v1 journal is known and none exists in the inspected runtime,

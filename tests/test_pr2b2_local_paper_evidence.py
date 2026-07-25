@@ -20,7 +20,11 @@ from robo_trader.broker_safety_evidence import (
 from robo_trader.clients.subprocess_ibkr_client import (  # noqa: F401
     SubprocessIBKRClient,
 )
-from robo_trader.config import RuntimeContract, _derive_safety_account_scope
+from robo_trader.config import (
+    RuntimeContract,
+    _derive_safety_account_scope,
+    load_runtime_contract_from_env,
+)
 from robo_trader.database_async import (
     AsyncTradingDatabase,
     SafetyAllocationSnapshotError,
@@ -74,13 +78,37 @@ def _runtime_contract(
     )
 
 
+def _loaded_relative_runtime_contract(tmp_path: Path, monkeypatch) -> RuntimeContract:
+    monkeypatch.setattr("robo_trader.config._PROJECT_ROOT", tmp_path)
+    return load_runtime_contract_from_env(
+        {
+            "ENVIRONMENT": "dev",
+            "EXECUTION_MODE": "paper",
+            "TRADING_MODE": "paper",
+            "IBKR_HOST": "127.0.0.1",
+            "IBKR_PORT": "4002",
+            "IBKR_READONLY": "true",
+            "IBKR_ACCOUNT": ACCOUNT,
+            "IBKR_APPROVED_ACCOUNTS": ACCOUNT,
+            "IBKR_ACCOUNT_TYPE": "paper",
+            "RT_STATE_NAMESPACE": "paper",
+            "RT_DB_PATH": "paper-ledger.db",
+            "SAFETY_ACCOUNT_SCOPE_KEY": SCOPE_KEY,
+            "SAFETY_ACCOUNT_SCOPE": ACCOUNT_SCOPE,
+            "SAFETY_JOURNAL_PATH": "paper-safety.db",
+            "BUILD_ID": "tests",
+            "MODEL_ARTIFACT_SET": "tests",
+        }
+    )
+
+
 def _runtime_context(tmp_path: Path, monkeypatch, contract: RuntimeContract):
     ibc_path = tmp_path / "config" / "ibc" / "config.ini"
     ibc_path.parent.mkdir(parents=True, exist_ok=True)
     ibc_path.write_text("ReadOnlyApi=yes\nTradingMode=paper\n", encoding="utf-8")
     monkeypatch.setattr(
         "robo_trader.config.load_runtime_contract_from_env",
-        lambda _environment: contract,
+        lambda _environment, **_kwargs: contract,
     )
     return validate_runtime_safety(
         tmp_path,
@@ -173,6 +201,36 @@ def _forge_exact_snapshot(snapshot):
     for model_field in fields(snapshot):
         object.__setattr__(forged, model_field.name, getattr(snapshot, model_field.name))
     return forged
+
+
+@pytest.mark.asyncio
+async def test_relative_runtime_ledger_path_survives_evidence_assembly(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    contract = _loaded_relative_runtime_contract(tmp_path, monkeypatch)
+    allocation = await _allocation_snapshot(
+        Path(contract.database_path),
+        {"default": 4},
+        symbol="AAPL",
+        contract=contract,
+    )
+    broker = _broker_contract_snapshot(
+        _runtime_context(tmp_path, monkeypatch, contract),
+        symbol="AAPL",
+        observed_at=allocation.observed_at,
+    )
+
+    _, snapshot = assemble_local_paper_safety_evidence(
+        _identity(),
+        contract,
+        broker,
+        allocation,
+    )
+
+    assert contract.database_path == str(tmp_path / "paper-ledger.db")
+    assert allocation.database_path == contract.database_path
+    assert snapshot.allocation_database_path == contract.database_path
 
 
 @pytest.mark.asyncio

@@ -198,7 +198,7 @@ def _runtime_context(
     )
     monkeypatch.setattr(
         "robo_trader.config.load_runtime_contract_from_env",
-        lambda _environment: contract,
+        lambda _environment, **_kwargs: contract,
     )
     context = validate_runtime_safety(
         tmp_path,

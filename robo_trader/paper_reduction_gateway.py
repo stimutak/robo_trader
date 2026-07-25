@@ -37,6 +37,7 @@ from .safety import (
     TimeInForce,
 )
 from .safety.readiness import require_paper_terminal_settlement_ready
+from .safety.sqlite_identity import lexical_path_preserving_leaf
 from .safety_runtime_evidence import assemble_local_paper_safety_evidence
 
 
@@ -91,7 +92,10 @@ class PaperReductionGateway:
         self._coordinator = coordinator
         if type(database) is not AsyncTradingDatabase:
             raise PaperReductionGatewayError("one exact shared AsyncTradingDatabase is required")
-        if str(database.db_path) != self._runtime_context.runtime_contract.database_path:
+        expected_database_path = lexical_path_preserving_leaf(
+            self._runtime_context.runtime_contract.database_path
+        )
+        if database.db_path != expected_database_path:
             raise PaperReductionGatewayError(
                 "shared safety database does not match the runtime ledger path"
             )
@@ -156,7 +160,10 @@ class PaperReductionGateway:
             raise PaperReductionGatewayError("portfolio_id is malformed")
         if type(executor) is not PaperExecutor:
             raise PaperReductionGatewayError("executor must be exactly PaperExecutor")
-        if portfolio_id in self._submitters:
+        existing = self._submitters.get(portfolio_id)
+        if existing is not None:
+            if existing._is_bound_to(executor, self._coordinator):
+                return
             raise PaperReductionGatewayError("portfolio paper executor is already registered")
         self._submitters[portfolio_id] = _bind_paper_reduction_submitter(
             executor,

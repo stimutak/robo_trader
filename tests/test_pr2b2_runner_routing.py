@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from robo_trader.execution import ExecutionResult, Order
+from robo_trader.database_async import AsyncTradingDatabase
+from robo_trader.execution import ExecutionResult, Order, PaperExecutor
 from robo_trader.paper_reduction_gateway import (
     PaperReductionGateway,
     PaperReductionGatewayError,
@@ -125,6 +127,41 @@ def _order(side: str) -> Order:
         price=100.0,
         order_ref=f"routing-{side.lower()}",
     )
+
+
+def test_persistent_reconnect_reuses_exact_registered_paper_executor() -> None:
+    runner = object.__new__(AsyncRunner)
+    runner.slippage_bps = 1.5
+    runner.use_smart_execution = False
+    runner.executor = PaperExecutor(
+        slippage_bps=runner.slippage_bps,
+        use_smart_execution=runner.use_smart_execution,
+    )
+    original = runner.executor
+
+    runner._initialize_or_reuse_paper_executor()
+
+    assert runner.executor is original
+
+
+def test_runner_accepts_exact_absolute_binding_for_relative_database_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = object.__new__(AsyncRunner)
+    runner._raw_db = AsyncTradingDatabase(Path("paper-ledger.db"))
+    runner.cfg = SimpleNamespace(
+        runtime_contract=SimpleNamespace(database_path=str(tmp_path / "paper-ledger.db"))
+    )
+
+    runner._assert_runtime_ledger_database()
+
+    runner.cfg = SimpleNamespace(
+        runtime_contract=SimpleNamespace(database_path=str(tmp_path / "other-ledger.db"))
+    )
+    with pytest.raises(RuntimeError, match="validated runtime ledger"):
+        runner._assert_runtime_ledger_database()
 
 
 @pytest.mark.asyncio

@@ -78,6 +78,32 @@ def test_runtime_contract_accepts_only_consistent_paper_readonly():
     assert len(contract.fingerprint) == 16
 
 
+def test_runtime_contract_anchors_relative_ledger_path_to_project_root(tmp_path, monkeypatch):
+    monkeypatch.setattr("robo_trader.config._PROJECT_ROOT", tmp_path)
+
+    contract = load_runtime_contract_from_env(_paper_env(RT_DB_PATH="paper-ledger.db"))
+    database_identity = contract.database_identity
+    monkeypatch.chdir(tmp_path.parent)
+
+    assert contract.database_path == str(tmp_path / "paper-ledger.db")
+    assert Path(contract.database_path).is_absolute()
+    assert contract.database_identity == database_identity
+
+
+def test_runtime_contract_preserves_database_symlink_leaf_for_database_rejection(
+    tmp_path,
+):
+    ledger_target = tmp_path / "ledger-target.db"
+    ledger_target.touch()
+    configured = tmp_path / "configured-ledger.db"
+    configured.symlink_to(ledger_target)
+
+    contract = load_runtime_contract_from_env(_paper_env(RT_DB_PATH=str(configured)))
+
+    assert contract.database_path == str(configured)
+    assert Path(contract.database_path).is_symlink()
+
+
 def test_account_scope_binding_is_stable_account_specific_and_key_not_public():
     contract = load_runtime_contract_from_env(_paper_env())
     expected = _derive_safety_account_scope(SAFETY_SCOPE_KEY, "DU1234567")
