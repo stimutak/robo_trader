@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+import robo_trader.config as config_module
+import scripts.manage_paper_safety_journal as journal_script
 from robo_trader.safety import (
     EvidenceStatus,
     ExposureEvidence,
@@ -22,7 +24,6 @@ from robo_trader.safety import (
 )
 from scripts.manage_paper_safety_journal import (
     CREATE_CONFIRMATION,
-    PROJECT_ROOT,
     generate_account_scope,
     initialize_journal,
     verify_journal,
@@ -107,8 +108,13 @@ def test_initialize_refuses_missing_parent_directory(tmp_path):
 
 def test_relative_journal_path_is_anchored_to_project_root(monkeypatch, tmp_path):
     environ = _env(tmp_path)
-    journal_path = tmp_path / "paper-safety.db"
-    environ["SAFETY_JOURNAL_PATH"] = os.path.relpath(journal_path, PROJECT_ROOT)
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    journal_path = project_root / "data" / "paper-safety.db"
+    journal_path.parent.mkdir()
+    monkeypatch.setattr(config_module, "_PROJECT_ROOT", project_root)
+    monkeypatch.setattr(journal_script, "PROJECT_ROOT", project_root)
+    environ["SAFETY_JOURNAL_PATH"] = os.path.relpath(journal_path, project_root)
     unrelated_cwd = tmp_path / "unrelated-cwd"
     unrelated_cwd.mkdir()
     wrong_cwd_path = (unrelated_cwd / environ["SAFETY_JOURNAL_PATH"]).resolve()
