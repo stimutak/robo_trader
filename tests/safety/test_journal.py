@@ -4,11 +4,11 @@ import pickle
 import sqlite3
 import stat
 import threading
-from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal, localcontext
+from types import SimpleNamespace
 
 import pytest
 

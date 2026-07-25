@@ -24,6 +24,7 @@ from typing import Callable, Dict, Iterable, Optional, Tuple
 
 from .models import (
     MODEL_VERSION,
+    SAFETY_MAX_EVIDENCE_AGE_SECONDS,
     DecisionOutcome,
     ExposureEvidence,
     GateContext,
@@ -40,7 +41,6 @@ from .models import (
     Reservation,
     RiskEffect,
     SafetyDecision,
-    SAFETY_MAX_EVIDENCE_AGE_SECONDS,
     SubmissionClaim,
     SubmissionDescriptor,
     SubmissionPermit,
