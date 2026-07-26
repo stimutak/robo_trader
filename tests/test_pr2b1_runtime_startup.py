@@ -11,6 +11,7 @@ import robo_trader.runner_async as runner_module
 from robo_trader.config import RuntimeContract
 from robo_trader.execution import PaperExecutor
 from robo_trader.paper_reduction_gateway import PaperReductionGateway
+from robo_trader.paper_runtime_settlement import PaperRuntimeSettlementParticipant
 from robo_trader.runner_async import (
     AsyncRunner,
     _close_paper_order_runtime_owned,
@@ -23,6 +24,7 @@ from robo_trader.runner_async import (
 )
 from robo_trader.safety import SafetyJournal
 from robo_trader.safety.journal import JournalNotInitialized
+from robo_trader.stop_loss_monitor import StopLossMonitor
 
 ACCOUNT_SCOPE = "acct_v1_0123456789abcdef0123456789abcdef" "fedcba9876543210fedcba9876543210"
 
@@ -263,6 +265,11 @@ async def test_one_shot_run_activates_recovery_pending_gateway_before_cycle() ->
     runner.cleanup = AsyncMock()
     runner.executor = PaperExecutor()
     runner.portfolio_id = "portfolio-a"
+    runner.stop_loss_monitor = StopLossMonitor(
+        execute_reduction=AsyncMock(),
+        risk_manager=SimpleNamespace(),
+        portfolio_id="portfolio-a",
+    )
 
     gateway = PaperReductionGateway.__new__(PaperReductionGateway)
     gateway._started = False
@@ -284,9 +291,12 @@ async def test_one_shot_run_activates_recovery_pending_gateway_before_cycle() ->
     ):
         await AsyncRunner.run(runner, [])
 
+    assert type(runner._paper_settlement_participant) is PaperRuntimeSettlementParticipant
     gateway.register_paper_executor.assert_called_once_with(
         "portfolio-a",
         runner.executor,
+        protective_quote_producer=runner.stop_loss_monitor,
+        settlement_participant=runner._paper_settlement_participant,
     )
     runner.cleanup.assert_awaited_once_with()
     assert runner._setup_complete is False

@@ -27,6 +27,17 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from robo_trader.database_validator import DatabaseValidator, ValidationError
 from robo_trader.execution import ExecutionResult, Order
 from robo_trader.logger import get_logger
+from robo_trader.paper_reduction_submitter import (
+    LocalPaperOrderStatus,
+    LocalPaperTerminalOutcome,
+)
+from robo_trader.protective_quote_evidence import (
+    ProtectiveQuoteEvidence,
+    ProtectiveQuoteSource,
+    ProtectiveQuoteValidationError,
+    _produce_protective_quote,
+    assert_producer_owned_protective_quote,
+)
 from robo_trader.risk_manager import Position
 
 logger = get_logger(__name__)
@@ -263,6 +274,11 @@ class _PendingStopTrigger:
     receipt_order: int
     drain_timeout_seconds: float
     drain_deadline_monotonic: float
+    quote_evidence: Optional[ProtectiveQuoteEvidence] = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
 
 class StopExecutionPhase(str, Enum):
@@ -358,6 +374,11 @@ class StopLossMonitor:
         # order independently of the monotonic clock, whose resolution is not
         # guaranteed to distinguish adjacent callbacks.
         self.price_receipt_orders: Dict[str, int] = {}
+        # The exact producer-owned object corresponding to each accepted quote.
+        # Legacy callbacks remain explicitly unbound to a broker contract and
+        # transport generation; later safety boundaries can therefore reject
+        # them without trusting the mutable display dictionaries above.
+        self._protective_quote_evidence: Dict[str, ProtectiveQuoteEvidence] = {}
         self._price_receipt_order = 0
         self._pending_stop_triggers: Dict[str, _PendingStopTrigger] = {}
         # Immutable crossing evidence is retained by exact stop identity until
@@ -570,6 +591,10 @@ class StopLossMonitor:
         price: float,
         *,
         source_timestamp: Optional[datetime] = None,
+        source: ProtectiveQuoteSource = ProtectiveQuoteSource.LEGACY_CALLBACK,
+        con_id: Optional[int] = None,
+        transport_generation: Optional[str] = None,
+        source_event_id: Optional[str] = None,
     ) -> bool:
         """
         Update current price for a symbol.
@@ -579,6 +604,11 @@ class StopLossMonitor:
             price: Current market price
             source_timestamp: Timezone-aware broker event timestamp. Missing
                 event time is rejected rather than replaced by receipt time.
+            source: Explicit quote origin. LIVE_BROKER additionally requires
+                contract and transport lineage.
+            con_id: Qualified broker contract identifier for LIVE_BROKER.
+            transport_generation: Current broker transport generation.
+            source_event_id: Optional upstream event identifier.
         """
         try:
             symbol = DatabaseValidator.validate_symbol(symbol)
@@ -628,10 +658,28 @@ class StopLossMonitor:
             receipt_monotonic = self._monotonic()
             self._price_receipt_order += 1
             receipt_order = self._price_receipt_order
+            try:
+                quote_evidence = _produce_protective_quote(
+                    self,
+                    portfolio_id=self.portfolio_id,
+                    symbol=symbol,
+                    price=Decimal(str(price)),
+                    source_timestamp=event_time,
+                    receipt_monotonic=receipt_monotonic,
+                    receipt_order=receipt_order,
+                    source=source,
+                    con_id=con_id,
+                    transport_generation=transport_generation,
+                    source_event_id=source_event_id,
+                )
+            except ProtectiveQuoteValidationError as exc:
+                logger.error("Rejected price update for %s: %s", symbol, exc)
+                return False
             self.last_prices[symbol] = price
             self.price_event_times[symbol] = event_time
             self.price_receipt_monotonic[symbol] = receipt_monotonic
             self.price_receipt_orders[symbol] = receipt_order
+            self._protective_quote_evidence[symbol] = quote_evidence
 
             stop_key = self._stop_key(symbol)
             stop = self.active_stops.get(stop_key)
@@ -657,6 +705,7 @@ class StopLossMonitor:
                         drain_deadline_monotonic=(
                             receipt_monotonic + self.pending_drain_timeout_seconds
                         ),
+                        quote_evidence=quote_evidence,
                     )
                     self._pending_stop_triggers[stop_key] = evidence
                     self._latched_stop_crossings[id(stop)] = evidence
@@ -671,6 +720,28 @@ class StopLossMonitor:
                         receipt_order,
                     )
         return True
+
+    def get_protective_quote_evidence(
+        self,
+        symbol: str,
+    ) -> Optional[ProtectiveQuoteEvidence]:
+        """Return the latest exact evidence only while this monitor owns it."""
+
+        try:
+            normalized_symbol = DatabaseValidator.validate_symbol(symbol)
+        except ValidationError:
+            return None
+        evidence = self._protective_quote_evidence.get(normalized_symbol)
+        if evidence is None:
+            return None
+        try:
+            return assert_producer_owned_protective_quote(evidence, producer=self)
+        except ProtectiveQuoteValidationError:
+            logger.error(
+                "Protective quote ownership check failed for %s",
+                normalized_symbol,
+            )
+            return None
 
     @staticmethod
     def _price_crosses_stop(stop: StopLossOrder, price: float) -> bool:
@@ -826,6 +897,7 @@ class StopLossMonitor:
                         drain_deadline_monotonic=(
                             receipt_time + self.pending_drain_timeout_seconds
                         ),
+                        quote_evidence=self._protective_quote_evidence.get(stop.symbol),
                     )
                     self._latched_stop_crossings[id(stop)] = evidence
                     triggered.append(stop)
@@ -896,20 +968,14 @@ class StopLossMonitor:
             f"{abs(stop.position_qty)} shares"
         )
 
-        # TCN-H5 (followup audit): pass stop.trigger_price as the order price
-        # rather than None. The paper executor's market-order path requires a
-        # cached reference price in _execution_cache; if the runner just restarted
-        # or the symbol has been "held" for >60s, the cache is empty/stale and
-        # the order fails with "No reference price for market order", causing the
-        # stop to never fire. trigger_price is the price that crossed the stop
-        # threshold this cycle, so it's the correct execution reference.
-        # IBKR live executor still treats this as the limit price guard around
-        # an immediate fill; paper executor uses it directly.
+        # The mutable stop price is never submission authority. The runner passes
+        # the exact producer-owned quote latched with this crossing, and the
+        # gateway alone derives the local-paper reference price from it.
         order = Order(
             symbol=stop.symbol,
             quantity=abs(stop.position_qty),
             side="SELL" if stop.position_qty > 0 else "BUY_TO_COVER",
-            price=stop.trigger_price if stop.trigger_price is not None else stop.stop_price,
+            price=None,
             order_ref=_stable_stop_order_ref(self.portfolio_id, stop),
         )
 
@@ -943,7 +1009,10 @@ class StopLossMonitor:
             )
             result = ExecutionResult(False, "Stop-loss submission failed")
 
-        if type(result) is not ExecutionResult or type(result.ok) is not bool:
+        if (
+            type(result) not in {ExecutionResult, LocalPaperTerminalOutcome}
+            or type(result.ok) is not bool
+        ):
             logger.error(
                 "Stop-loss callback returned malformed result for %s; refusing retry",
                 stop.symbol,
@@ -963,9 +1032,10 @@ class StopLossMonitor:
 
         if result.ok:
 
-            # Broker-fill commit point. Nothing after result.ok may re-enter
-            # the retry loop: bookkeeping failures cannot make an already
-            # filled closing order safe to submit again.
+            # Settled local-paper commit point. The gateway has already
+            # committed the ledger, verified runtime projection, and released
+            # the safety journal. Nothing after result.ok may re-enter the
+            # retry loop or submit a second simulated exit.
             self._inflight_stop_orders[stop_key] = self._new_phase_record(
                 stop,
                 StopExecutionPhase.POST_FILL_SETTLEMENT,
@@ -1027,9 +1097,9 @@ class StopLossMonitor:
                 prevented_loss,
             )
 
-            # TCN-H4 (followup audit): notify the runner so it can update
-            # self.positions, portfolio.update_fill, and persist to DB.
-            # This callback is attempted exactly once after the broker fill.
+            # Compatibility-only notification. Production PR 2B.3 wiring sets
+            # this to None because the gateway owns every authoritative DB and
+            # runtime mutation before it returns terminal success.
             if self.position_closed_callback is not None:
                 try:
                     await self.position_closed_callback(stop, result)
@@ -1042,7 +1112,34 @@ class StopLossMonitor:
 
             return True
 
-        # Execution failed after the only authorized attempt.
+        # A producer-owned terminal no-fill is definitive: the exact authority
+        # was consumed and released, so this object must never submit again.
+        # Preserve the authenticated TRIGGERED stop in active state for
+        # operator/restart recovery instead of converting it to inert FAILED;
+        # check_stops intentionally does not redispatch TRIGGERED objects.
+        definitive_no_fill = (
+            type(result) is LocalPaperTerminalOutcome
+            and result.terminal is True
+            and result.status
+            in {
+                LocalPaperOrderStatus.REJECTED,
+                LocalPaperOrderStatus.CANCELLED,
+                LocalPaperOrderStatus.EXPIRED,
+            }
+            and result.filled_quantity == 0
+        )
+        if definitive_no_fill:
+            self.metrics.failed_today += 1
+            logger.critical(
+                "CRITICAL: terminal no-fill retained triggered protection for %s; "
+                "operator restart/reconciliation required",
+                stop.symbol,
+            )
+            if self.emergency_shutdown_on_failure and self.emergency_shutdown:
+                await self.emergency_shutdown(f"Stop-loss terminal no-fill: {result.status.value}")
+            return False
+
+        # Ambiguous or malformed failure after the only authorized attempt.
         stop.status = StopStatus.FAILED
         self.metrics.failed_today += 1
 

@@ -28,11 +28,13 @@ from .models import (
     EvidenceStatus,
     ExposureEvidence,
     GateContext,
+    LocalPaperTerminalEvidence,
     OrderIntent,
     OrderSide,
     OrderType,
     PortfolioAllocationEvidence,
     ReconciliationStatus,
+    ReplayReservation,
     Reservation,
     SafetyDecision,
     SubmissionClaim,
@@ -1436,6 +1438,84 @@ class SafetyRuntimeCoordinator:
             ):
                 raise RuntimeSafetyError("claimed paper envelope lineage is inconsistent")
             return descriptor, contract
+
+    def release_after_local_paper_settlement(
+        self,
+        idempotency_key: str,
+        intent_fingerprint: str,
+        receipt: object,
+    ) -> ReplayReservation:
+        """Release consumed authority from one producer-owned local receipt.
+
+        The lazy import preserves the safety runtime's inert import boundary:
+        this method verifies a receipt model but never imports or opens the
+        application database and never presents local evidence as broker truth.
+        """
+
+        from ..paper_terminal_settlement import (
+            PaperTerminalSettlementReceipt,
+            assert_producer_owned_paper_terminal_settlement_receipt,
+        )
+
+        with self._startup_lock:
+            if not self._started:
+                raise RuntimeNotStarted("successful journal replay is required")
+            if type(receipt) is not PaperTerminalSettlementReceipt:
+                raise TypeError("receipt must be PaperTerminalSettlementReceipt")
+            try:
+                assert_producer_owned_paper_terminal_settlement_receipt(receipt)
+            except RuntimeError as exc:
+                raise RuntimeSafetyError(
+                    "local paper settlement receipt is not producer-owned evidence"
+                ) from exc
+            request = receipt.request
+            if (
+                request.execution_domain_scope != self._identity.execution_domain_scope
+                or request.account_scope != self._identity.account_scope
+            ):
+                raise RuntimeSafetyError(
+                    "local paper settlement scope does not match coordinator identity"
+                )
+            return self._journal.release_after_local_paper_settlement(
+                idempotency_key,
+                intent_fingerprint,
+                receipt.to_safety_evidence(),
+            )
+
+    def recover_after_verified_local_paper_settlement(
+        self,
+        idempotency_key: str,
+        intent_fingerprint: str,
+        evidence: LocalPaperTerminalEvidence,
+    ) -> ReplayReservation:
+        """Append one offline terminal release without starting the runtime.
+
+        Receipt reconstruction and allocation-ledger verification are owned by
+        the query-only management command. This boundary accepts only the exact
+        validated safety evidence model and refuses use by a started runtime.
+        """
+
+        with self._startup_lock:
+            if self._started:
+                raise RuntimeSafetyError(
+                    "offline paper settlement recovery requires a stopped runtime"
+                )
+            if type(evidence) is not LocalPaperTerminalEvidence:
+                raise TypeError("evidence must be LocalPaperTerminalEvidence")
+            if (
+                evidence.execution_domain_scope != self._identity.execution_domain_scope
+                or evidence.account_scope != self._identity.account_scope
+            ):
+                raise RuntimeSafetyError(
+                    "offline paper settlement scope does not match coordinator identity"
+                )
+            return self._journal.recover_after_verified_local_paper_settlement(
+                idempotency_key,
+                intent_fingerprint,
+                evidence,
+                expected_execution_domain_scope=self._identity.execution_domain_scope,
+                expected_account_scope=self._identity.account_scope,
+            )
 
     def submit_fake(
         self,

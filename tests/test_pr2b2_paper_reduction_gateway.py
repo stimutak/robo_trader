@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -30,6 +30,11 @@ from robo_trader.paper_reduction_gateway import (
     PaperReductionGatewayError,
 )
 from robo_trader.paper_reduction_submitter import PaperReductionSubmissionError
+from robo_trader.paper_runtime_settlement import (
+    PaperRuntimeProjection,
+    PaperRuntimeSettlementParticipant,
+)
+from robo_trader.protective_quote_evidence import ProtectiveQuoteSource
 from robo_trader.reconciliation.errors import RuntimeSafetyError as RuntimeIdentityError
 from robo_trader.reconciliation.identity import (
     RuntimeSafetyContext,
@@ -38,7 +43,6 @@ from robo_trader.reconciliation.identity import (
 from robo_trader.safety import (
     IdempotencyConflict,
     PaperExecutionIdentity,
-    ReservationConflict,
     RuntimeSafetyError,
     RuntimeStartupBlocked,
     SafetyJournal,
@@ -49,6 +53,7 @@ from robo_trader.safety import readiness as paper_readiness
 from robo_trader.safety_runtime_evidence import (
     assemble_local_paper_safety_evidence,
 )
+from robo_trader.stop_loss_monitor import StopLossMonitor
 
 ACCOUNT = "DU1234567"
 SCOPE_KEY = "0123456789abcdef" * 4
@@ -69,6 +74,9 @@ class GatewayHarness:
     journal: SafetyJournal
     coordinator: SafetyRuntimeCoordinator
     gateway: PaperReductionGateway
+    runtime_monitors: dict[str, StopLossMonitor] = field(default_factory=dict)
+    runtime_positions: dict[str, Decimal] = field(default_factory=dict)
+    quarantine_reasons: list[str] = field(default_factory=list)
 
 
 def _runtime_context(
@@ -119,17 +127,24 @@ async def _seed_allocations(
     await database.update_position(
         SYMBOL,
         portfolio_a_quantity,
-        100.0,
-        101.0,
+        Decimal("100"),
+        Decimal("101"),
         portfolio_id="portfolio-a",
     )
     await database.update_position(
         SYMBOL,
         portfolio_b_quantity,
-        100.0,
-        101.0,
+        Decimal("100"),
+        Decimal("101"),
         portfolio_id="portfolio-b",
     )
+    for portfolio_id in ("portfolio-a", "portfolio-b"):
+        await database.update_account(
+            Decimal("100000"),
+            Decimal("100000"),
+            realized_pnl=Decimal("0"),
+            portfolio_id=portfolio_id,
+        )
 
 
 async def _build_harness(
@@ -560,7 +575,7 @@ def _order(
     *,
     side: str = "SELL",
     quantity: int = 2,
-    price: Decimal = Decimal("123.4500"),
+    price: Decimal | None = None,
     order_ref: str = "gateway-reduction-1",
 ) -> Order:
     return Order(
@@ -570,6 +585,79 @@ def _order(
         price=price,
         order_ref=order_ref,
     )
+
+
+def _runtime_components(
+    harness: GatewayHarness,
+    portfolio_id: str,
+) -> tuple[StopLossMonitor, PaperRuntimeSettlementParticipant]:
+    async def unused_execute(*_args):
+        raise AssertionError("gateway unit monitor must not execute stops")
+
+    monitor = StopLossMonitor(
+        execute_reduction=unused_execute,
+        risk_manager=None,
+        portfolio_id=portfolio_id,
+    )
+
+    async def apply(receipt):
+        post_quantity = receipt.request.expected_post_position_quantity
+        harness.runtime_positions[portfolio_id] = post_quantity
+        return PaperRuntimeProjection(
+            settlement_id=receipt.settlement_id,
+            settlement_receipt_fingerprint=receipt.fingerprint(),
+            portfolio_id=portfolio_id,
+            symbol=receipt.request.symbol,
+            runner_position_quantity=post_quantity,
+            portfolio_position_quantity=post_quantity,
+            account_cash=receipt.request.expected_post_cash,
+            account_realized_pnl=receipt.request.expected_post_realized_pnl,
+            risk_visible_daily_pnl_before=receipt.request.expected_pre_daily_pnl,
+            risk_visible_daily_pnl=receipt.request.expected_post_daily_pnl,
+            protective_stop_quantity=(None if post_quantity == 0 else post_quantity),
+            advanced_risk_position_quantity=None,
+            advanced_risk_position_avg_price=None,
+            advanced_risk_total_pnl=None,
+            advanced_risk_daily_pnl=None,
+        )
+
+    def quarantine(reason: str) -> None:
+        harness.quarantine_reasons.append(reason)
+
+    participant = PaperRuntimeSettlementParticipant(
+        portfolio_id,
+        apply_callback=apply,
+        quarantine_callback=quarantine,
+    )
+    return monitor, participant
+
+
+async def _bind_runtime(
+    harness: GatewayHarness,
+    portfolio_id: str,
+    executor: PaperExecutor,
+    *,
+    price: Decimal = Decimal("123.4500"),
+    generation: str = "gateway-generation",
+) -> None:
+    monitor, participant = _runtime_components(harness, portfolio_id)
+    harness.gateway.register_paper_executor(
+        portfolio_id,
+        executor,
+        protective_quote_producer=monitor,
+        settlement_participant=participant,
+    )
+    accepted = await monitor.update_price(
+        SYMBOL,
+        float(price),
+        source_timestamp=datetime.now(timezone.utc),
+        source=ProtectiveQuoteSource.LIVE_BROKER,
+        con_id=CON_ID,
+        transport_generation=generation,
+        source_event_id=f"gateway-test-{portfolio_id}",
+    )
+    assert accepted is True
+    harness.runtime_monitors[portfolio_id] = monitor
 
 
 def test_gateway_requires_exact_runtime_coordinator_database_and_executor_binding(
@@ -630,18 +718,45 @@ def test_gateway_requires_exact_runtime_coordinator_database_and_executor_bindin
         PaperReductionGateway(harness.context, unstarted, harness.database)
 
     executor = PaperExecutor()
-    harness.gateway.register_paper_executor("portfolio-a", executor)
-    harness.gateway.register_paper_executor("portfolio-a", executor)
+    monitor_a, participant_a = _runtime_components(harness, "portfolio-a")
+    harness.gateway.register_paper_executor(
+        "portfolio-a",
+        executor,
+        protective_quote_producer=monitor_a,
+        settlement_participant=participant_a,
+    )
+    harness.gateway.register_paper_executor(
+        "portfolio-a",
+        executor,
+        protective_quote_producer=monitor_a,
+        settlement_participant=participant_a,
+    )
     with pytest.raises(PaperReductionGatewayError, match="already registered"):
-        harness.gateway.register_paper_executor("portfolio-a", PaperExecutor())
+        harness.gateway.register_paper_executor(
+            "portfolio-a",
+            PaperExecutor(),
+            protective_quote_producer=monitor_a,
+            settlement_participant=participant_a,
+        )
+    monitor_b, participant_b = _runtime_components(harness, "portfolio-b")
     with pytest.raises(PaperReductionGatewayError, match="exactly PaperExecutor"):
-        harness.gateway.register_paper_executor("portfolio-b", object())  # type: ignore[arg-type]
+        harness.gateway.register_paper_executor(
+            "portfolio-b",
+            object(),  # type: ignore[arg-type]
+            protective_quote_producer=monitor_b,
+            settlement_participant=participant_b,
+        )
 
     class ExecutorSubclass(PaperExecutor):
         pass
 
     with pytest.raises(PaperReductionGatewayError, match="exactly PaperExecutor"):
-        harness.gateway.register_paper_executor("portfolio-b", ExecutorSubclass())
+        harness.gateway.register_paper_executor(
+            "portfolio-b",
+            ExecutorSubclass(),
+            protective_quote_producer=monitor_b,
+            settlement_participant=participant_b,
+        )
 
 
 def test_gateway_accepts_configured_relative_runtime_ledger_path(
@@ -679,8 +794,8 @@ async def test_account_lock_serializes_entry_and_cross_portfolio_reductions(
 ):
     executor_a = PaperExecutor()
     executor_b = PaperExecutor()
-    harness.gateway.register_paper_executor("portfolio-a", executor_a)
-    harness.gateway.register_paper_executor("portfolio-b", executor_b)
+    await _bind_runtime(harness, "portfolio-a", executor_a)
+    await _bind_runtime(harness, "portfolio-b", executor_b)
     first_snapshot_entered = asyncio.Event()
     release_first_snapshot = asyncio.Event()
     snapshot_calls = 0
@@ -737,11 +852,10 @@ async def test_account_lock_serializes_entry_and_cross_portfolio_reductions(
     release_first_snapshot.set()
     assert (await first).ok is True
     await entry_task
-    with pytest.raises(ReservationConflict, match=r"active account\+conId reservation"):
-        await second
+    assert (await second).ok is True
     assert entry_entered.is_set()
     assert len(executor_a.fills) == 1
-    assert len(executor_b.fills) == 0
+    assert len(executor_b.fills) == 1
 
 
 @pytest.mark.asyncio
@@ -761,7 +875,7 @@ async def test_reduction_admission_retries_gateway_after_entry_recovery_failed(
 
     assert harness.gateway.started is False
     executor = PaperExecutor()
-    harness.gateway.register_paper_executor("portfolio-a", executor)
+    await _bind_runtime(harness, "portfolio-a", executor)
     _install_broker_boundary(harness, monkeypatch)
 
     result = await harness.gateway.submit_reduction(
@@ -782,7 +896,7 @@ async def test_initial_broker_snapshot_failure_drains_and_defers_recovery_to_nex
     harness: GatewayHarness,
 ) -> None:
     executor = PaperExecutor()
-    harness.gateway.register_paper_executor("portfolio-a", executor)
+    await _bind_runtime(harness, "portfolio-a", executor)
     client = harness.gateway._client
     client.start.reset_mock()
     client.connect.reset_mock()
@@ -821,7 +935,7 @@ async def test_final_broker_snapshot_failure_drains_without_retrying_ambiguous_r
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     executor = PaperExecutor()
-    harness.gateway.register_paper_executor("portfolio-a", executor)
+    await _bind_runtime(harness, "portfolio-a", executor)
     _install_broker_boundary(harness, monkeypatch)
     client = harness.gateway._client
     client.start.reset_mock()
@@ -864,7 +978,7 @@ async def test_broker_snapshot_cancellation_drains_and_requires_fresh_health(
     phase: str,
 ) -> None:
     executor = PaperExecutor()
-    harness.gateway.register_paper_executor("portfolio-a", executor)
+    await _bind_runtime(harness, "portfolio-a", executor)
     _install_broker_boundary(harness, monkeypatch)
     client = harness.gateway._client
     client.start.reset_mock()
@@ -920,11 +1034,10 @@ async def test_reduction_preserves_side_order_ref_and_decimal_limit_semantics(
     )
     try:
         executor = PaperExecutor(slippage_bps=1.0)
-        value.gateway.register_paper_executor("portfolio-a", executor)
+        await _bind_runtime(value, "portfolio-a", executor)
         _install_broker_boundary(value, monkeypatch)
         order = _order(
             side=side,
-            price=Decimal("123.4500"),
             order_ref=f"exact-{side.lower()}",
         )
 
@@ -963,7 +1076,7 @@ async def test_invalid_reduction_semantics_fail_before_broker_authority(
     harness: GatewayHarness,
     order: Order,
 ):
-    harness.gateway.register_paper_executor("portfolio-a", PaperExecutor())
+    await _bind_runtime(harness, "portfolio-a", PaperExecutor())
     get_snapshot = AsyncMock()
     harness.gateway._client.get_broker_contract_safety_snapshot = get_snapshot
 
@@ -981,7 +1094,7 @@ async def test_initial_or_final_drift_invalidates_without_submission(
     monkeypatch: pytest.MonkeyPatch,
 ):
     executor = PaperExecutor()
-    harness.gateway.register_paper_executor("portfolio-a", executor)
+    await _bind_runtime(harness, "portfolio-a", executor)
     _install_broker_boundary(
         harness,
         monkeypatch,
@@ -1006,7 +1119,7 @@ async def test_final_allocation_drift_invalidates_and_blocks_restart(
     monkeypatch: pytest.MonkeyPatch,
 ):
     executor = PaperExecutor()
-    harness.gateway.register_paper_executor("portfolio-a", executor)
+    await _bind_runtime(harness, "portfolio-a", executor)
 
     async def reduce_allocation_below_request():
         await harness.database.update_position(
@@ -1079,7 +1192,7 @@ async def test_lifecycle_callback_remains_held_through_exactly_one_submission(
     monkeypatch: pytest.MonkeyPatch,
 ):
     executor = PaperExecutor()
-    harness.gateway.register_paper_executor("portfolio-a", executor)
+    await _bind_runtime(harness, "portfolio-a", executor)
 
     async def get_snapshot(context, symbol, *, max_age_seconds=30.0):
         del context, symbol, max_age_seconds
@@ -1133,7 +1246,7 @@ async def test_executor_preflight_failure_consumes_authority_without_retry(
 ):
     executor = PaperExecutor()
     executor.slippage_bps = float("nan")
-    harness.gateway.register_paper_executor("portfolio-a", executor)
+    await _bind_runtime(harness, "portfolio-a", executor)
     _install_broker_boundary(harness, monkeypatch)
 
     with pytest.raises(PaperReductionSubmissionError, match="slippage"):
@@ -1145,7 +1258,7 @@ async def test_executor_preflight_failure_consumes_authority_without_retry(
     state = harness.journal.replay()
     assert len(state.quarantined_reservations) == 1
 
-    with pytest.raises(IdempotencyConflict, match="different authorization evidence"):
+    with pytest.raises(PaperReductionGatewayError, match="terminally quarantined"):
         await harness.gateway.submit_reduction(
             order=_order(order_ref="executor-failure"),
             portfolio_id="portfolio-a",
@@ -1153,20 +1266,13 @@ async def test_executor_preflight_failure_consumes_authority_without_retry(
     assert executor.fills == {}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known settlement gap: PaperReductionGateway does not apply the local fill to "
-        "the allocation ledger or release the journal reservation before unlocking."
-    ),
-)
 @pytest.mark.asyncio
 async def test_successful_fill_is_settled_and_journal_released_before_gateway_unlock(
     harness: GatewayHarness,
     monkeypatch: pytest.MonkeyPatch,
 ):
     executor = PaperExecutor()
-    harness.gateway.register_paper_executor("portfolio-a", executor)
+    await _bind_runtime(harness, "portfolio-a", executor)
     _install_broker_boundary(harness, monkeypatch)
 
     result = await harness.gateway.submit_reduction(

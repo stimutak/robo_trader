@@ -18,6 +18,11 @@ import pytest
 
 from robo_trader.database_validator import ValidationError
 from robo_trader.execution import ExecutionResult
+from robo_trader.paper_reduction_submitter import (
+    LocalPaperOrderStatus,
+    LocalPaperOutcomeProvenance,
+    LocalPaperTerminalOutcome,
+)
 from robo_trader.portfolio import Portfolio
 from robo_trader.risk_manager import Position
 from robo_trader.runner_async import (
@@ -59,6 +64,26 @@ def _reduction_callback(executor):
         return await executor.place_order_async(order)
 
     return execute
+
+
+def _filled_terminal_outcome(
+    order,
+    *,
+    fill_price: Decimal = Decimal("97.5"),
+) -> LocalPaperTerminalOutcome:
+    quantity = Decimal(order.quantity)
+    return LocalPaperTerminalOutcome(
+        order_ref=order.order_ref,
+        status=LocalPaperOrderStatus.FILLED,
+        requested_quantity=quantity,
+        filled_quantity=quantity,
+        remaining_quantity=Decimal("0"),
+        exact_fill_price=fill_price,
+        observed_at=datetime.now(timezone.utc),
+        provenance=LocalPaperOutcomeProvenance.LOCAL_PAPER_EXECUTOR,
+        terminal=True,
+        message="exact local paper fill",
+    )
 
 
 def _protected_runner(
@@ -359,7 +384,7 @@ async def test_direct_stop_execution_always_cleans_exact_phase_state(
     class _Executor:
         async def place_order_async(self, order):
             if outcome == "success":
-                return ExecutionResult(True, "filled", fill_price=order.price)
+                return _filled_terminal_outcome(order)
             if outcome == "failure":
                 return ExecutionResult(False, "rejected")
             raise RuntimeError("transport failure")
@@ -427,7 +452,7 @@ async def test_direct_exact_queued_stop_has_single_broker_owner_during_await() -
         async def place_order_async(self, order):
             broker_started.set()
             await release_broker.wait()
-            return ExecutionResult(True, "filled", fill_price=order.price)
+            return _filled_terminal_outcome(order)
 
     now = datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc)
     monitor = StopLossMonitor(
@@ -467,7 +492,7 @@ async def test_direct_success_keeps_post_fill_visible_through_callback() -> None
 
     class _Executor:
         async def place_order_async(self, order):
-            return ExecutionResult(True, "filled", fill_price=order.price)
+            return _filled_terminal_outcome(order)
 
     async def gated_callback(_stop, _result) -> None:
         callback_started.set()
@@ -796,7 +821,7 @@ async def test_persistent_fast_path_preserves_exact_broker_inflight_execution() 
         async def place_order_async(self, order):
             broker_started.set()
             await release_broker.wait()
-            return ExecutionResult(True, "filled", fill_price=order.price)
+            return _filled_terminal_outcome(order)
 
     async def filled_callback(_stop, _result) -> None:
         callback_complete.set()
@@ -863,7 +888,7 @@ async def test_pending_replacement_can_coexist_with_unresolved_old_broker_stop()
         async def place_order_async(self, order):
             broker_started.set()
             await release_broker.wait()
-            return ExecutionResult(True, "filled", fill_price=order.price)
+            return _filled_terminal_outcome(order)
 
     monitor = StopLossMonitor(
         execute_reduction=_reduction_callback(_GatedExecutor()),
@@ -928,7 +953,7 @@ async def test_cancelled_broker_stop_without_replacement_fails_closed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_persistent_fast_path_accepts_exact_post_fill_settlement() -> None:
+async def test_persistent_fast_path_accepts_exact_terminal_cleanup_in_progress() -> None:
     now = datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc)
     callback_started = asyncio.Event()
     release_callback = asyncio.Event()
@@ -936,12 +961,11 @@ async def test_persistent_fast_path_accepts_exact_post_fill_settlement() -> None
 
     class _ImmediateExecutor:
         async def place_order_async(self, order):
-            return ExecutionResult(True, "filled", fill_price=order.price)
+            return _filled_terminal_outcome(order)
 
     runner = object.__new__(AsyncRunner)
     runner.portfolio_id = "default"
     runner.positions = {"AAPL": Position("AAPL", 10, 100.0)}
-    runner._pending_orders_lock = asyncio.Lock()
     runner.portfolio = SimpleNamespace(update_fill=AsyncMock(return_value=None))
     runner.db = SimpleNamespace(
         record_trade=AsyncMock(return_value=None),
@@ -954,17 +978,16 @@ async def test_persistent_fast_path_accepts_exact_post_fill_settlement() -> None
     runner.cleanup = AsyncMock()
     runner.cancel_all_orders = AsyncMock()
 
-    async def gated_runner_callback(stop, result) -> None:
+    async def gated_terminal_cleanup(_stop, _result) -> None:
         callback_started.set()
         await release_callback.wait()
-        await runner._on_stop_loss_executed(stop, result)
         callback_complete.set()
 
     monitor = StopLossMonitor(
         execute_reduction=_reduction_callback(_ImmediateExecutor()),
         risk_manager=SimpleNamespace(),
         portfolio_id="default",
-        position_closed_callback=gated_runner_callback,
+        position_closed_callback=gated_terminal_cleanup,
     )
     monitor._utcnow = lambda: now
     monitor._monotonic = lambda: 1000.0
@@ -1010,162 +1033,14 @@ async def test_persistent_fast_path_accepts_exact_post_fill_settlement() -> None
         if "default:AAPL" not in monitor._inflight_stop_orders:
             break
         await asyncio.sleep(0)
-    assert "AAPL" not in runner.positions
+    # Runtime/DB mutation is owned by the gateway's producer receipt.  The
+    # monitor compatibility callback may not perform a second mutation.
+    assert runner.positions["AAPL"].quantity == 10
+    runner.portfolio.update_fill.assert_not_awaited()
+    runner.db.record_trade.assert_not_awaited()
+    runner.db.update_position.assert_not_awaited()
     assert "default:AAPL" not in monitor._inflight_stop_orders
     await monitor.stop_monitoring()
-
-
-@pytest.mark.asyncio
-async def test_expired_settlement_after_callback_deletes_position_fails_closed() -> None:
-    now = datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc)
-    monotonic_now = [1000.0]
-    persistence_started = asyncio.Event()
-    release_persistence = asyncio.Event()
-
-    class _ImmediateExecutor:
-        async def place_order_async(self, order):
-            return ExecutionResult(True, "filled", fill_price=order.price)
-
-    async def gated_update_fill(*_args) -> None:
-        persistence_started.set()
-        await release_persistence.wait()
-
-    runner = object.__new__(AsyncRunner)
-    runner.portfolio_id = "default"
-    runner.positions = {"AAPL": Position("AAPL", 10, 100.0)}
-    runner._pending_orders_lock = asyncio.Lock()
-    runner.portfolio = SimpleNamespace(update_fill=gated_update_fill)
-    runner.db = SimpleNamespace(
-        record_trade=AsyncMock(return_value=None),
-        update_position=AsyncMock(return_value=None),
-    )
-    runner.use_advanced_risk = False
-    runner.advanced_risk = None
-    runner._setup_complete = True
-    runner.ib = SimpleNamespace(ping=AsyncMock(return_value=True))
-    runner.cleanup = AsyncMock()
-    runner.cancel_all_orders = AsyncMock()
-
-    monitor = StopLossMonitor(
-        execute_reduction=_reduction_callback(_ImmediateExecutor()),
-        risk_manager=SimpleNamespace(),
-        portfolio_id="default",
-        position_closed_callback=runner._on_stop_loss_executed,
-        settlement_timeout_seconds=30.0,
-    )
-    monitor._utcnow = lambda: now
-    monitor._monotonic = lambda: monotonic_now[0]
-    runner.stop_loss_monitor = monitor
-    runner._protective_feed_status = {}
-    stop = await monitor.add_stop_loss(
-        "AAPL",
-        runner.positions["AAPL"],
-        stop_percent=0.02,
-    )
-    assert await monitor.update_price("AAPL", 97.0, source_timestamp=now)
-
-    await monitor.start_monitoring()
-    await persistence_started.wait()
-    assert "AAPL" not in runner.positions
-    assert stop.status is StopStatus.EXECUTED
-    assert "default:AAPL" not in monitor.active_stops
-    assert (
-        monitor._inflight_stop_orders["default:AAPL"].phase
-        is StopExecutionPhase.POST_FILL_SETTLEMENT
-    )
-
-    monotonic_now[0] = 1031.0
-    with pytest.raises(UnprotectedExistingPositionsError) as caught:
-        await runner.setup()
-
-    assert caught.value.reason_code == "post_fill_progress_expired"
-    release_persistence.set()
-    for _ in range(10):
-        if "default:AAPL" not in monitor._inflight_stop_orders:
-            break
-        await asyncio.sleep(0)
-    await monitor.stop_monitoring()
-
-
-@pytest.mark.asyncio
-async def test_partial_fill_waiting_to_resize_replacement_remains_consistent() -> None:
-    now = datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc)
-    runner = object.__new__(AsyncRunner)
-    runner.portfolio_id = "default"
-    runner.positions = {"AAPL": Position("AAPL", 20, 100.0)}
-    runner._pending_orders_lock = asyncio.Lock()
-    runner.portfolio = SimpleNamespace(update_fill=AsyncMock(return_value=None))
-    runner.db = SimpleNamespace(
-        record_trade=AsyncMock(return_value=None),
-        update_position=AsyncMock(return_value=None),
-    )
-    runner.use_advanced_risk = False
-    runner.advanced_risk = None
-    runner._setup_complete = True
-    runner.ib = SimpleNamespace(ping=AsyncMock(return_value=True))
-    runner.cleanup = AsyncMock()
-    runner.cancel_all_orders = AsyncMock()
-
-    monitor = StopLossMonitor(
-        execute_reduction=_unused_reduction,
-        risk_manager=SimpleNamespace(),
-        portfolio_id="default",
-    )
-    monitor.monitoring_active = True
-    monitor.monitor_task = _AliveTask()
-    monitor._utcnow = lambda: now
-    monitor._monotonic = lambda: 1000.0
-    replacement = await monitor.add_stop_loss(
-        "AAPL",
-        runner.positions["AAPL"],
-        stop_percent=0.05,
-    )
-    assert await monitor.update_price(
-        "AAPL",
-        101.0,
-        source_timestamp=now,
-    )
-    runner.stop_loss_monitor = monitor
-    runner._protective_feed_status = {
-        "AAPL": {
-            "available": True,
-            "live_grade": True,
-            "source": "live_protective",
-        }
-    }
-    old_stop = StopLossOrder(
-        symbol="AAPL",
-        position_qty=10,
-        stop_price=98.0,
-        entry_price=100.0,
-        stop_type=StopType.FIXED,
-        created_at=now,
-    )
-
-    await monitor._price_update_lock.acquire()
-    callback_task = asyncio.create_task(
-        runner._on_stop_loss_executed(
-            old_stop,
-            ExecutionResult(True, "filled", fill_price=97.5),
-        )
-    )
-    for _ in range(10):
-        if runner._pending_orders_lock.locked() and not callback_task.done():
-            break
-        await asyncio.sleep(0)
-
-    assert runner.positions["AAPL"].quantity == 20
-    assert replacement.position_qty == 20
-    with patch("robo_trader.runner_async.load_config") as cold_setup:
-        await runner.setup()
-    cold_setup.assert_not_called()
-    runner.cleanup.assert_not_awaited()
-    runner.cancel_all_orders.assert_not_awaited()
-
-    monitor._price_update_lock.release()
-    await callback_task
-    assert runner.positions["AAPL"].quantity == 10
-    assert replacement.position_qty == 10
 
 
 @pytest.mark.asyncio
@@ -1185,7 +1060,7 @@ async def test_persistent_fast_path_accepts_complete_two_stop_execution_batch() 
             if len(self.calls) == 1:
                 first_broker_call.set()
                 await release_first_call.wait()
-            return ExecutionResult(True, "filled", fill_price=order.price)
+            return _filled_terminal_outcome(order)
 
     executor = _BatchExecutor()
 
@@ -1937,10 +1812,19 @@ async def test_stop_registration_failure_is_fatal() -> None:
     runner.db = SimpleNamespace(
         get_account_info=AsyncMock(return_value=None),
         get_positions=AsyncMock(
-            return_value=[{"symbol": "AAPL", "quantity": 10, "avg_cost": 100.0}]
+            return_value=[
+                {
+                    "symbol": "AAPL",
+                    "quantity": 10,
+                    "avg_cost": 100.0,
+                    "market_price_exact": Decimal("100"),
+                }
+            ]
         ),
     )
     runner.portfolio = Portfolio(100_000)
+    runner.latest_prices = {}
+    runner.latest_price_sources = {}
     runner.stop_loss_monitor = SimpleNamespace(
         add_stop_loss=AsyncMock(side_effect=RuntimeError("registration failed"))
     )

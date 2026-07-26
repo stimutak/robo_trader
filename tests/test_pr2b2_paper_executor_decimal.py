@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -56,7 +56,12 @@ def test_public_place_order_preserves_exact_decimal_into_simple_sink(monkeypatch
 @pytest.mark.parametrize("slippage_bps", [0.0, 12.5])
 def test_common_decimal_price_has_deterministic_finite_fill(slippage_bps: float) -> None:
     exact_price = Decimal("123.45")
-    expected = float(exact_price + (exact_price * Decimal(str(slippage_bps)) / Decimal("10000")))
+    expected = float(
+        (exact_price + (exact_price * Decimal(str(slippage_bps)) / Decimal("10000"))).quantize(
+            Decimal("0.0001"),
+            rounding=ROUND_HALF_EVEN,
+        )
+    )
 
     first = PaperExecutor(slippage_bps=slippage_bps)._place_simple_order(_order(price=exact_price))
     second = PaperExecutor(slippage_bps=slippage_bps)._place_simple_order(_order(price=exact_price))
@@ -75,7 +80,12 @@ def test_decimal_slippage_direction_for_reducing_sides(side: str, direction: int
     price = Decimal("123.45")
     slippage_bps = Decimal("25")
     slip = price * slippage_bps / Decimal("10000")
-    expected = float(price + (slip * direction))
+    expected = float(
+        (price + (slip * direction)).quantize(
+            Decimal("0.0001"),
+            rounding=ROUND_HALF_EVEN,
+        )
+    )
 
     result = PaperExecutor(slippage_bps=float(slippage_bps))._place_simple_order(
         _order(side=side, price=price)
@@ -84,6 +94,16 @@ def test_decimal_slippage_direction_for_reducing_sides(side: str, direction: int
     assert result.ok is True
     assert result.fill_price == expected
     assert result.fill_price < float(price) if side == "SELL" else result.fill_price > float(price)
+
+
+def test_arbitrary_finite_slippage_is_normalized_before_float_compatibility_view() -> None:
+    result = PaperExecutor(slippage_bps=0.3333333333333333)._place_simple_order(
+        _order(side="SELL", price=Decimal("123.4567"))
+    )
+
+    assert result.ok is True
+    assert result.exact_fill_price == Decimal("123.4526")
+    assert Decimal(str(result.fill_price)) == result.exact_fill_price
 
 
 @pytest.mark.parametrize(

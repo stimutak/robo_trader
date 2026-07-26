@@ -26,6 +26,7 @@ from dotenv import load_dotenv  # isort:skip
 load_dotenv()  # noqa: E402 - must run before imports that use os.getenv()
 from dataclasses import dataclass  # isort:skip  # noqa: E402
 from datetime import date, datetime, timezone
+from decimal import Decimal, localcontext
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
 from typing import Any, Callable, Coroutine, Dict, List, NoReturn, Optional, Tuple
@@ -48,6 +49,22 @@ from .market_hours import (
 from .monitoring.performance import PerformanceMonitor, Timer
 from .monitoring.production_monitor import ProductionMonitor
 from .paper_reduction_gateway import PaperReductionGateway
+from .paper_reduction_submitter import LocalPaperTerminalOutcome
+from .paper_runtime_settlement import (
+    PaperRuntimeProjection,
+    PaperRuntimeSettlementParticipant,
+    bounded_float_projection_matches,
+)
+from .paper_terminal_settlement import (
+    PaperTerminalSettlementReceipt,
+    assert_producer_owned_paper_terminal_settlement_receipt,
+)
+from .protective_quote_evidence import (
+    ProtectiveQuoteEvidence,
+    ProtectiveQuoteSource,
+    ProtectiveQuoteValidationError,
+    assert_current_authoritative_protective_quote,
+)
 from .reconciliation.identity import (
     RuntimeSafetyContext,
     assert_validated_runtime_safety_context,
@@ -547,11 +564,14 @@ class AsyncRunner:
         self._trusted_bar_closes: Dict[str, float] = {}
         self._protective_feed_status: Dict[str, dict] = {}
         self.daily_pnl = 0.0
+        self._daily_pnl_exact = Decimal(0)
+        self._account_settlement_source_id: Optional[str] = None
         self.daily_executed_notional = 0.0
         # TC-M7: track today's starting unrealized P&L so the daily-loss check
         # uses mark-to-market (realized + unrealized - starting_unrealized) rather
         # than realized only.
         self._starting_unrealized_today: float = 0.0
+        self._starting_unrealized_today_exact = Decimal(0)
         self._daily_pnl_date: Optional[date] = None
         self.session_start_equity: Optional[float] = None  # Captured after loading positions
         # Per-(symbol, action) throttle for the centralized kill-switch/blocked-trading
@@ -576,6 +596,10 @@ class AsyncRunner:
         # This set is checked before any BUY order is placed
         self._pending_orders: set = set()
         self._pending_orders_lock = asyncio.Lock()
+        # Emergency settlement failures freeze only risk-increasing entries.
+        # Protective monitoring and semantic reductions must remain available
+        # so an incident cannot strand exposure in the account.
+        self._emergency_entry_freeze_reason: Optional[str] = None
         # A transport abort and final order admission serialize on this lock.
         # A task that has started synchronous placement drains accounting; a
         # task that has not crossed admission fails closed.
@@ -793,51 +817,84 @@ class AsyncRunner:
         """
         try:
             today = datetime.utcnow().date()
+            daily_boundary_reset = self._daily_pnl_date != today
+            unrealized = Decimal(0)
+            if self.portfolio is not None:
+                unrealized = await self.portfolio.compute_unrealized(self.latest_prices or {})
+                if type(unrealized) is not Decimal or not unrealized.is_finite():
+                    raise RuntimeError("portfolio unrealized P&L is not exact and finite")
             if self._daily_pnl_date != today:
-                # New day: capture starting unrealized.
-                try:
-                    if self.portfolio is not None:
-                        starting_unreal = float(
-                            await self.portfolio.compute_unrealized(self.latest_prices or {})
-                        )
-                    else:
-                        starting_unreal = 0.0
-                except Exception:
-                    starting_unreal = 0.0
-                self._starting_unrealized_today = starting_unreal
+                # New day: capture the exact starting unrealized baseline.
+                self._starting_unrealized_today_exact = unrealized
+                self._starting_unrealized_today = float(unrealized)
                 self._daily_pnl_date = today
 
-            realized = float(self.portfolio.realized_pnl) if self.portfolio else 0.0
-            unrealized = 0.0
-            try:
-                if self.portfolio is not None:
-                    unrealized = float(
-                        await self.portfolio.compute_unrealized(self.latest_prices or {})
+            realized = self.portfolio.realized_pnl if self.portfolio else Decimal(0)
+            with localcontext() as context:
+                context.prec = 64
+                exact_daily_pnl = realized + unrealized - self._starting_unrealized_today_exact
+            if not exact_daily_pnl.is_finite():
+                raise RuntimeError("daily P&L is not exact and finite")
+            self.daily_pnl = float(exact_daily_pnl)
+            self._daily_pnl_exact = exact_daily_pnl
+            if not bounded_float_projection_matches(
+                Decimal(str(self.daily_pnl)),
+                exact_daily_pnl,
+            ):
+                raise RuntimeError("exact daily P&L cannot be projected into runtime risk")
+            advanced = self.advanced_risk if self.use_advanced_risk else None
+            if advanced is not None:
+                advanced.seed_realized_pnl(
+                    total_pnl=float(realized),
+                    daily_pnl=self.daily_pnl,
+                )
+            if daily_boundary_reset:
+                persist_reset = getattr(self.db, "update_account", None)
+                if not callable(persist_reset):
+                    if self._account_settlement_source_id is not None:
+                        raise RuntimeError("settled daily P&L boundary reset cannot be persisted")
+                elif self.portfolio is not None:
+                    equity = await self.portfolio.equity(self.latest_prices or {})
+                    await persist_reset(
+                        cash=self.portfolio.cash,
+                        equity=equity,
+                        daily_pnl=exact_daily_pnl,
+                        realized_pnl=realized,
+                        unrealized_pnl=unrealized,
+                        portfolio_id=self.portfolio_id,
+                        daily_pnl_baseline=self._starting_unrealized_today_exact,
+                        daily_pnl_date=self._daily_pnl_date,
                     )
-            except Exception:
-                unrealized = 0.0
-
-            self.daily_pnl = realized + unrealized - self._starting_unrealized_today
             return self.daily_pnl
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(f"_refresh_daily_pnl failed: {exc}")
+            if self._account_settlement_source_id is not None:
+                raise RuntimeError("settled paper account daily P&L refresh failed closed") from exc
             # Fall back to realized only if anything goes wrong
             try:
-                self.daily_pnl = float(self.portfolio.realized_pnl) if self.portfolio else 0.0
+                fallback_daily = self.portfolio.realized_pnl if self.portfolio else Decimal(0)
+                self._daily_pnl_exact = fallback_daily
+                self.daily_pnl = float(fallback_daily)
             except Exception:
                 pass
             return self.daily_pnl
 
     def _trading_blocked(self) -> Tuple[bool, str]:
         """
-        Centralized check for any state that should block ALL outgoing orders
-        regardless of code path (BUY, SELL, BUY_TO_COVER, SELL_SHORT, pairs,
-        stop-loss execution).
+        Centralized check for state that should block risk-increasing entries.
+
+        Semantic reductions are intentionally admitted before this soft gate in
+        ``_place_order_with_circuit_breaker`` so emergency state cannot trap an
+        existing position. Hard reduction evidence is enforced by the paper
+        reduction gateway instead.
 
         Returns:
             (True, reason) if trading should be blocked, else (False, "").
         """
         try:
+            freeze_reason = getattr(self, "_emergency_entry_freeze_reason", None)
+            if freeze_reason:
+                return True, f"Emergency entry freeze active: {freeze_reason}"
             if getattr(self, "risk", None) and getattr(
                 self.risk, "emergency_shutdown_triggered", False
             ):
@@ -969,6 +1026,31 @@ class AsyncRunner:
             return False
 
         monitor = self.stop_loss_monitor
+        statuses = getattr(self, "_protective_feed_status", None)
+        status = statuses.get(symbol) if isinstance(statuses, dict) else None
+        if not isinstance(status, dict):
+            return False
+        expected_con_id = status.get("con_id")
+        expected_generation = status.get("transport_generation")
+        quote = monitor.get_protective_quote_evidence(symbol)
+        if (
+            type(quote) is not ProtectiveQuoteEvidence
+            or quote.source is not ProtectiveQuoteSource.LIVE_BROKER
+            or type(expected_con_id) is not int
+            or type(expected_generation) is not str
+        ):
+            return False
+        try:
+            assert_current_authoritative_protective_quote(
+                quote,
+                producer=monitor,
+                expected_portfolio_id=self.portfolio_id,
+                expected_symbol=symbol,
+                expected_con_id=expected_con_id,
+                expected_transport_generation=expected_generation,
+            )
+        except ProtectiveQuoteValidationError:
+            return False
         monitor_price = monitor.last_prices.get(symbol)
         monitor_event_time = monitor.price_event_times.get(symbol)
         if (
@@ -1173,7 +1255,12 @@ class AsyncRunner:
         )
         return "paper-reduction-v1-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    async def _place_order_with_circuit_breaker(self, order: Order):
+    async def _place_order_with_circuit_breaker(
+        self,
+        order: Order,
+        *,
+        protective_quote: Optional[ProtectiveQuoteEvidence] = None,
+    ):
         """
         Execute order with circuit breaker protection.
 
@@ -1217,6 +1304,23 @@ class AsyncRunner:
                 or not gateway.can_attempt_order_admission
             ):
                 return self._rejected_order_result("Reduction blocked: safety gateway unavailable")
+            monitor = getattr(self, "stop_loss_monitor", None)
+            if protective_quote is None and type(monitor) is StopLossMonitor:
+                protective_quote = monitor.get_protective_quote_evidence(order.symbol)
+            if type(protective_quote) is not ProtectiveQuoteEvidence:
+                return self._rejected_order_result(
+                    "Reduction blocked: exact protective quote evidence unavailable"
+                )
+            # Caller strategy/bar prices never enter the reduction authority.
+            # The gateway derives its exact reference solely from the registered
+            # stop monitor's producer-owned quote.
+            reduction_order = Order(
+                symbol=order.symbol,
+                quantity=order.quantity,
+                side=side,
+                price=None,
+                order_ref=order.order_ref,
+            )
             lock = getattr(self, "_order_admission_lock", None)
             if lock is None:
                 self._order_admission_lock = asyncio.Lock()
@@ -1239,8 +1343,9 @@ class AsyncRunner:
                     self._order_admitted_tasks.add(current_task)
                 with Timer("paper_reduction_execution", self.monitor):
                     return await gateway.submit_reduction(
-                        order=order,
+                        order=reduction_order,
                         portfolio_id=self.portfolio_id,
+                        protective_quote=protective_quote,
                     )
 
         # TC-M1 / TC-M6: centralized trading-blocked gate. This catches every
@@ -1275,6 +1380,18 @@ class AsyncRunner:
                 self._order_admission_lock = asyncio.Lock()
                 lock = self._order_admission_lock
             async with lock:
+                # Re-check after acquiring final admission. An emergency can be
+                # latched while this task is waiting behind an already-admitted
+                # order; without this second gate the stale pre-check above
+                # could still dispatch a new entry after the freeze.
+                blocked, reason = self._trading_blocked()
+                if blocked:
+                    logger.error(
+                        "Order admission blocked for %s after emergency gate: %s",
+                        order.symbol,
+                        reason,
+                    )
+                    return self._rejected_order_result(f"Trading blocked: {reason}")
                 abort_event = getattr(self, "_symbol_cycle_abort_event", None)
                 if abort_event is not None and abort_event.is_set():
                     logger.error(
@@ -1435,6 +1552,281 @@ class AsyncRunner:
                 )
                 return False
 
+    async def _apply_paper_terminal_settlement(
+        self,
+        receipt: PaperTerminalSettlementReceipt,
+    ) -> PaperRuntimeProjection:
+        """Project one committed local-paper receipt into every runtime view.
+
+        The gateway calls this only after the trade/position/outbox transaction
+        commits and before releasing the exact safety-journal reservation.  No
+        database write is permitted here.  Any mismatch propagates to the
+        gateway, which terminally quarantines later admissions.
+        """
+
+        if type(receipt) is not PaperTerminalSettlementReceipt:
+            raise RuntimeError("exact paper settlement receipt is required")
+        assert_producer_owned_paper_terminal_settlement_receipt(receipt)
+        request = receipt.request
+        if request.portfolio_id != self.portfolio_id:
+            raise RuntimeError("paper settlement belongs to another portfolio")
+        if self.portfolio is None or type(self.stop_loss_monitor) is not StopLossMonitor:
+            raise RuntimeError("paper settlement runtime projections are unavailable")
+
+        symbol = request.symbol
+        pre_quantity = int(request.expected_pre_position_quantity)
+        post_quantity = int(request.expected_post_position_quantity)
+        filled_quantity = int(request.filled_quantity)
+        fill_price = request.fill_price
+        position_lock = await self._get_position_lock(symbol)
+        monitor = self.stop_loss_monitor
+        stop_lock = monitor._price_update_lock
+
+        async with position_lock:
+            async with self.portfolio._lock:
+                async with stop_lock:
+                    runner_position = self.positions.get(symbol)
+                    runner_quantity = 0 if runner_position is None else runner_position.quantity
+                    portfolio_position = self.portfolio.positions.get(symbol)
+                    portfolio_quantity = (
+                        0 if portfolio_position is None else portfolio_position.quantity
+                    )
+                    if runner_quantity != pre_quantity:
+                        raise RuntimeError("runner pre-position differs from committed settlement")
+                    if portfolio_quantity != pre_quantity:
+                        raise RuntimeError(
+                            "Portfolio pre-position differs from committed settlement"
+                        )
+                    if self.portfolio.cash != request.expected_pre_cash:
+                        raise RuntimeError("Portfolio pre-cash differs from committed settlement")
+                    if self.portfolio.realized_pnl != request.expected_pre_realized_pnl:
+                        raise RuntimeError(
+                            "Portfolio pre-realized P&L differs from committed settlement"
+                        )
+                    try:
+                        risk_daily_before = self._daily_pnl_exact
+                        if not risk_daily_before.is_finite():
+                            raise ValueError("non-finite runner daily P&L")
+                    except Exception as exc:
+                        raise RuntimeError("runner daily P&L is not finitely projectable") from exc
+                    if not bounded_float_projection_matches(
+                        risk_daily_before,
+                        request.expected_pre_daily_pnl,
+                    ):
+                        raise RuntimeError("runner pre-daily P&L differs from committed settlement")
+                    baseline = getattr(
+                        self,
+                        "_starting_unrealized_today_exact",
+                        None,
+                    )
+                    if (
+                        type(baseline) is not Decimal
+                        or not baseline.is_finite()
+                        or baseline != request.expected_daily_pnl_baseline
+                    ):
+                        raise RuntimeError(
+                            "runner daily P&L baseline differs from committed settlement"
+                        )
+                    if (
+                        type(self._daily_pnl_date) is not date
+                        or self._daily_pnl_date.isoformat() != request.expected_daily_pnl_date
+                    ):
+                        raise RuntimeError(
+                            "runner daily P&L date differs from committed settlement"
+                        )
+
+                    stop_key = monitor._stop_key(symbol)
+                    active_stop = monitor.active_stops.get(stop_key)
+                    if pre_quantity != 0:
+                        if active_stop is None:
+                            raise RuntimeError(
+                                "committed reduction has no protective stop projection"
+                            )
+                        if active_stop.position_qty != pre_quantity:
+                            raise RuntimeError(
+                                "protective stop quantity differs from settlement pre-position"
+                            )
+
+                    advanced = self.advanced_risk if self.use_advanced_risk else None
+                    if advanced is not None:
+                        advanced_position = advanced.positions.get(symbol)
+                        advanced_quantity = (
+                            0 if advanced_position is None else advanced_position.get("quantity")
+                        )
+                        if advanced_quantity != pre_quantity:
+                            raise RuntimeError("advanced-risk pre-position differs from settlement")
+                        advanced_avg = (
+                            None
+                            if advanced_position is None
+                            else Decimal(str(advanced_position.get("avg_price")))
+                        )
+                        if (
+                            request.expected_position_cost_basis is None
+                            or advanced_avg is None
+                            or not bounded_float_projection_matches(
+                                advanced_avg,
+                                request.expected_position_cost_basis,
+                            )
+                        ):
+                            raise RuntimeError(
+                                "advanced-risk pre-position cost basis differs from settlement"
+                            )
+                        advanced_total_before = Decimal(str(advanced.total_pnl))
+                        advanced_daily_before = Decimal(str(advanced.daily_pnl))
+                        if not bounded_float_projection_matches(
+                            advanced_total_before,
+                            request.expected_pre_realized_pnl,
+                        ):
+                            raise RuntimeError(
+                                "advanced-risk pre-total P&L differs from settlement"
+                            )
+                        if not bounded_float_projection_matches(
+                            advanced_daily_before,
+                            risk_daily_before,
+                        ):
+                            raise RuntimeError(
+                                "advanced-risk daily P&L differs from runner daily P&L"
+                            )
+
+                    # The settlement daily-P&L delta was calculated from the
+                    # producer-owned protective mark. Project that same mark
+                    # into the runtime market view before changing exposure so
+                    # the next mark-to-market refresh cannot reinterpret the
+                    # committed fill against unrelated cached price state.
+                    protective_mark = request.protective_mark_price
+                    protective_mark_float = float(protective_mark)
+                    if not bounded_float_projection_matches(
+                        Decimal(str(protective_mark_float)),
+                        protective_mark,
+                    ):
+                        raise RuntimeError(
+                            "protective settlement mark cannot be projected into runtime"
+                        )
+                    self.latest_prices[symbol] = protective_mark_float
+                    self.latest_price_times[symbol] = request.protective_mark_timestamp
+                    self.latest_price_sources[symbol] = "paper-terminal-settlement-protective-quote"
+
+                    if filled_quantity:
+                        if fill_price is None or not fill_price.is_finite() or fill_price <= 0:
+                            raise RuntimeError("filled paper settlement has no exact usable price")
+                        side = request.side.value
+                        await self.portfolio._update_fill_unsafe(
+                            symbol,
+                            side,
+                            filled_quantity,
+                            fill_price,
+                        )
+                        if self.portfolio.cash != request.expected_post_cash:
+                            raise RuntimeError(
+                                "Portfolio post-cash differs from committed settlement"
+                            )
+                        if self.portfolio.realized_pnl != request.expected_post_realized_pnl:
+                            raise RuntimeError(
+                                "Portfolio post-realized P&L differs from committed settlement"
+                            )
+
+                        expected_risk_daily_after = request.expected_post_daily_pnl
+                        self._daily_pnl_exact = expected_risk_daily_after
+                        self.daily_pnl = float(expected_risk_daily_after)
+                        risk_daily_after = Decimal(str(self.daily_pnl))
+                        if not bounded_float_projection_matches(
+                            risk_daily_after,
+                            expected_risk_daily_after,
+                        ):
+                            raise RuntimeError(
+                                "runner daily P&L cannot represent the bounded settlement delta"
+                            )
+
+                        if post_quantity == 0:
+                            self.positions.pop(symbol, None)
+                        else:
+                            if runner_position is None:
+                                raise RuntimeError("paper settlement lost its runner cost basis")
+                            self.positions[symbol] = Position(
+                                symbol,
+                                post_quantity,
+                                runner_position.avg_price,
+                            )
+
+                        if post_quantity == 0:
+                            if active_stop is not None:
+                                monitor._pending_stop_triggers.pop(stop_key, None)
+                                monitor._latched_stop_crossings.pop(id(active_stop), None)
+                                active_stop.status = StopStatus.CANCELLED
+                                monitor.active_stops.pop(stop_key, None)
+                                if not any(
+                                    historical is active_stop for historical in monitor.stop_history
+                                ):
+                                    monitor.stop_history.append(active_stop)
+                        else:
+                            if active_stop is None:
+                                raise RuntimeError(
+                                    "remaining position lost protective stop coverage"
+                                )
+                            active_stop.position_qty = post_quantity
+                            active_stop.max_loss_amount = abs(
+                                post_quantity * (active_stop.entry_price - active_stop.stop_price)
+                            )
+                        monitor.metrics.active_stops = len(monitor.active_stops)
+
+                        if advanced is not None:
+                            advanced.update_position(
+                                symbol,
+                                filled_quantity,
+                                float(fill_price),
+                                side,
+                            )
+                            advanced.seed_realized_pnl(
+                                total_pnl=float(request.expected_post_realized_pnl),
+                                daily_pnl=float(request.expected_post_daily_pnl),
+                            )
+                            advanced.update_market_prices({symbol: protective_mark_float})
+                    else:
+                        risk_daily_after = risk_daily_before
+
+                    runner_after = self.positions.get(symbol)
+                    runner_after_quantity = 0 if runner_after is None else runner_after.quantity
+                    portfolio_after = self.portfolio.positions.get(symbol)
+                    portfolio_after_quantity = (
+                        0 if portfolio_after is None else portfolio_after.quantity
+                    )
+                    stop_after = monitor.active_stops.get(stop_key)
+                    stop_after_quantity = (
+                        None if stop_after is None else Decimal(stop_after.position_qty)
+                    )
+                    risk_after_quantity: Optional[Decimal] = None
+                    risk_after_avg: Optional[Decimal] = None
+                    risk_total_pnl: Optional[Decimal] = None
+                    risk_daily_pnl: Optional[Decimal] = None
+                    if advanced is not None:
+                        advanced_after = advanced.positions.get(symbol)
+                        risk_after_quantity = Decimal(
+                            0 if advanced_after is None else advanced_after.get("quantity")
+                        )
+                        if advanced_after is not None:
+                            risk_after_avg = Decimal(str(advanced_after.get("avg_price")))
+                        risk_total_pnl = Decimal(str(advanced.total_pnl))
+                        risk_daily_pnl = Decimal(str(advanced.daily_pnl))
+
+                    self._account_settlement_source_id = receipt.settlement_id
+                    return PaperRuntimeProjection(
+                        settlement_id=receipt.settlement_id,
+                        settlement_receipt_fingerprint=receipt.fingerprint(),
+                        portfolio_id=self.portfolio_id,
+                        symbol=symbol,
+                        runner_position_quantity=Decimal(runner_after_quantity),
+                        portfolio_position_quantity=Decimal(portfolio_after_quantity),
+                        account_cash=self.portfolio.cash,
+                        account_realized_pnl=self.portfolio.realized_pnl,
+                        risk_visible_daily_pnl_before=risk_daily_before,
+                        risk_visible_daily_pnl=risk_daily_after,
+                        protective_stop_quantity=stop_after_quantity,
+                        advanced_risk_position_quantity=risk_after_quantity,
+                        advanced_risk_position_avg_price=risk_after_avg,
+                        advanced_risk_total_pnl=risk_total_pnl,
+                        advanced_risk_daily_pnl=risk_daily_pnl,
+                    )
+
     async def _reconcile_replacement_stop_after_fill(
         self,
         filled_stop,
@@ -1540,203 +1932,23 @@ class AsyncRunner:
         return await reconcile()
 
     async def _on_stop_loss_executed(self, stop, result) -> None:
-        """Callback invoked by StopLossMonitor after a successful stop-loss fill.
+        """Reject any attempt to restore legacy post-fill mutation.
 
-        Synchronizes runtime state (self.positions, portfolio, DB) with the
-        broker so the rest of the session does not see a phantom position.
-
-        TCN-H4 (followup audit): the monitor used to update only its own
-        bookkeeping. The runner still believed the position existed, which
-        blocked subsequent BUY signals (`already have position` guard) and
-        broke SELL signals (no position to close). Now we mirror the same
-        atomic-then-persist pattern used by the main BUY/SELL paths.
-
-        Failures here are logged but never raised — the broker fill already
-        happened, and surfacing an exception would crash the monitor loop and
-        leave OTHER stops unwatched.
+        PR 2B.3 commits, projects, verifies, and releases a local-paper stop
+        reduction inside the account-wide gateway before success is returned.
+        The monitor is intentionally wired without this callback.  Keeping a
+        no-op compatibility boundary makes older callers fail closed without
+        duplicating trade, position, Portfolio, risk, or stop mutations.
         """
-        symbol = stop.symbol
-        # Side that closes the position: stop_qty>0 (long) -> SELL,
-        # stop_qty<0 (short) -> BUY_TO_COVER.
-        is_long = stop.position_qty > 0
-        side = "SELL" if is_long else "BUY_TO_COVER"
-        qty = abs(stop.position_qty)
-        try:
-            fill_price = (
-                float(result.fill_price)
-                if result is not None and result.fill_price is not None
-                else float(stop.trigger_price or stop.stop_price)
+        if type(result) is LocalPaperTerminalOutcome and result.terminal is True:
+            logger.info(
+                "Stop-loss settlement already committed by gateway for %s",
+                getattr(stop, "symbol", "unknown"),
             )
-        except Exception:
-            fill_price = float(stop.stop_price)
-
-        # Use the same pending-orders lock the BUY/SELL paths use so the
-        # position is compared with the quantity the stop actually closed
-        # before any state mutation. A newer/larger same-direction position is
-        # reduced only by the fill; absent, reversed, or too-small state is
-        # treated as divergence and preserved for broker reconciliation.
-        try:
-            emergency_reason = None
-            async with self._pending_orders_lock:
-                current = self.positions.get(symbol)
-                current_qty = getattr(current, "quantity", None)
-                state_matches_fill = False
-                remaining_qty = None
-                remaining_avg_cost = 0.0
-                divergence_reason = "absent_opposite_or_too_small_position"
-                try:
-                    same_direction = current is not None and (
-                        (stop.position_qty > 0 and current_qty > 0)
-                        or (stop.position_qty < 0 and current_qty < 0)
-                    )
-                    enough_quantity = same_direction and abs(current_qty) >= qty
-                    if enough_quantity:
-                        remaining_qty = current_qty - stop.position_qty
-                        if remaining_qty:
-                            remaining_avg_cost = float(current.avg_price)
-                            if not math.isfinite(remaining_avg_cost) or remaining_avg_cost <= 0:
-                                raise ValueError("invalid remaining average cost")
-                        state_matches_fill = True
-                except Exception as state_err:
-                    divergence_reason = repr(state_err)
-                    state_matches_fill = False
-
-                if not state_matches_fill:
-                    emergency_reason = (
-                        f"Broker stop fill state divergence for {symbol}: "
-                        f"filled signed_qty={stop.position_qty}, "
-                        f"runtime signed_qty={current_qty!r}"
-                    )
-                    logger.critical(
-                        "event=stop_fill_state_divergence symbol=%s "
-                        "stop_qty=%r current_qty=%r reason=%s "
-                        "action=preserve_runtime_position_and_reconcile",
-                        symbol,
-                        getattr(stop, "position_qty", None),
-                        current_qty,
-                        divergence_reason,
-                    )
-
-                # Record the irrevocable broker fill exactly once even when
-                # local position state has diverged. This audit row is safer
-                # than silently losing the fill; reconciliation can then repair
-                # position state without inventing another broker order.
-                try:
-                    if self.db is not None:
-                        await self.db.record_trade(symbol, side, qty, fill_price, 0)
-                except Exception as e:
-                    logger.error(
-                        f"_on_stop_loss_executed: db.record_trade failed " f"for {symbol}: {e}"
-                    )
-
-                if state_matches_fill:
-                    # Reconcile a newer replacement before publishing the
-                    # reduced runtime position. While this await is blocked on
-                    # the monitor lock, the old position and replacement
-                    # quantities remain mutually consistent for runtime health
-                    # checks. Once it returns, both mutations below are
-                    # synchronous with no interleaving await.
-                    replacement_safe = await self._reconcile_replacement_stop_after_fill(
-                        stop,
-                        remaining_qty or 0,
-                        remaining_avg_cost,
-                    )
-                    if remaining_qty:
-                        self.positions[symbol] = Position(
-                            symbol,
-                            remaining_qty,
-                            remaining_avg_cost,
-                        )
-                    else:
-                        del self.positions[symbol]
-
-                    if not replacement_safe:
-                        emergency_reason = (
-                            f"Unsafe replacement stop after broker fill for {symbol}: "
-                            f"remaining signed_qty={remaining_qty or 0}"
-                        )
-                        logger.critical(
-                            "event=stop_fill_replacement_reconcile_failed "
-                            "symbol=%s remaining_qty=%s "
-                            "action=emergency_shutdown_and_reconcile",
-                            symbol,
-                            remaining_qty or 0,
-                        )
-
-                    try:
-                        if self.portfolio is not None:
-                            await self.portfolio.update_fill(
-                                symbol,
-                                side,
-                                qty,
-                                fill_price,
-                            )
-                    except Exception as e:
-                        logger.error(
-                            f"_on_stop_loss_executed: portfolio.update_fill failed "
-                            f"for {symbol} {side} {qty}@{fill_price}: {e}"
-                        )
-
-                    try:
-                        if self.db is not None:
-                            await self.db.update_position(
-                                symbol,
-                                remaining_qty or 0,
-                                remaining_avg_cost if remaining_qty else 0.0,
-                                fill_price,
-                            )
-                    except Exception as e:
-                        logger.error(
-                            f"_on_stop_loss_executed: db.update_position failed "
-                            f"for {symbol}: {e}"
-                        )
-
-                    try:
-                        if self.use_advanced_risk and self.advanced_risk:
-                            self.advanced_risk.update_position(
-                                symbol,
-                                qty,
-                                fill_price,
-                                side,
-                            )
-                    except Exception as e:
-                        logger.error(
-                            f"_on_stop_loss_executed: advanced_risk update failed "
-                            f"for {symbol}: {e}"
-                        )
-
-            if emergency_reason:
-                emergency_callback = getattr(
-                    getattr(self, "stop_loss_monitor", None),
-                    "emergency_shutdown",
-                    None,
-                )
-                if callable(emergency_callback):
-                    try:
-                        await emergency_callback(emergency_reason)
-                    except Exception as emergency_err:
-                        logger.critical(
-                            "event=stop_fill_emergency_callback_failed " "symbol=%s error=%r",
-                            symbol,
-                            emergency_err,
-                        )
-                else:
-                    logger.critical(
-                        "event=stop_fill_emergency_callback_missing symbol=%s",
-                        symbol,
-                    )
-
-            if state_matches_fill:
-                logger.info(
-                    "Stop-loss state sync complete for %s: %s %s@%.2f " "remaining_qty=%s",
-                    symbol,
-                    side,
-                    qty,
-                    fill_price,
-                    remaining_qty or 0,
-                )
-        except Exception as outer:  # pragma: no cover - defensive
-            logger.error(f"_on_stop_loss_executed top-level failure for {symbol}: {outer}")
+        else:
+            self._latch_emergency_entry_freeze(
+                "Stop-loss callback received no exact settled local-paper outcome"
+            )
 
     async def setup(self):
         """Initialize all components."""
@@ -2015,12 +2227,9 @@ class AsyncRunner:
                 enable_correlation_limits=True,
                 enable_kill_switch=True,
             )
-            # Start background risk monitoring task
-            self.risk_monitor_task = asyncio.create_task(
-                risk_monitor_task(self.advanced_risk, interval=60)
-            )
             logger.info(
-                "Advanced risk management initialized with Kelly criterion and kill switches"
+                "Advanced risk management initialized; monitoring waits for authoritative "
+                "position seeding"
             )
 
         # DB-R2-L2: start periodic DB cleanup loop (idempotent — guard against
@@ -2036,32 +2245,33 @@ class AsyncRunner:
         if self.enable_stop_loss:
 
             async def emergency_shutdown_callback(reason: str):
-                """Emergency shutdown on stop-loss failure."""
-                logger.critical(f"EMERGENCY SHUTDOWN: {reason}")
-                self.running = False
-                if self.advanced_risk and hasattr(self.advanced_risk, "kill_switch"):
-                    self.advanced_risk.kill_switch.trigger(reason)
-                # Cancel all active orders
-                await self.cancel_all_orders()
+                """Freeze new entries after a stop-loss settlement failure."""
+                await self._enter_emergency_entry_freeze(reason)
 
             async def execute_stop_reduction(
                 _stop: StopLossOrder,
                 order: Order,
-            ) -> ExecutionResult:
+            ) -> ExecutionResult | LocalPaperTerminalOutcome:
                 """Route the one stop attempt through the central order choke."""
 
-                return await self._place_order_with_circuit_breaker(order)
+                monitor = self.stop_loss_monitor
+                latched = getattr(monitor, "_latched_stop_crossings", {}).get(id(_stop))
+                protective_quote = (
+                    latched.quote_evidence if isinstance(latched, _PendingStopTrigger) else None
+                )
+                return await self._place_order_with_circuit_breaker(
+                    order,
+                    protective_quote=protective_quote,
+                )
 
             self.stop_loss_monitor = StopLossMonitor(
                 execute_reduction=execute_stop_reduction,
                 risk_manager=self.risk,
                 emergency_shutdown_callback=emergency_shutdown_callback,
                 portfolio_id=self.portfolio_id,
-                # TCN-H4: wire up runner-state sync so successful stop-loss
-                # executions update self.positions, the Portfolio, and DB.
-                # Without this, the runner sees a phantom position post-stop
-                # and blocks/breaks subsequent BUY and SELL signals.
-                position_closed_callback=self._on_stop_loss_executed,
+                # The account-wide gateway settles DB + runtime projections and
+                # releases the journal before returning terminal success.
+                position_closed_callback=None,
                 order_timeout_seconds=self.cfg.execution.order_timeout_seconds,
             )
             await self.stop_loss_monitor.start_monitoring()
@@ -2302,9 +2512,23 @@ class AsyncRunner:
             raise RuntimeError("active paper runtime requires a started reduction gateway")
         if type(self.executor) is not PaperExecutor:
             raise RuntimeError("active paper runtime requires an exact PaperExecutor")
+        if type(self.stop_loss_monitor) is not StopLossMonitor:
+            raise RuntimeError("active paper runtime requires an exact protective quote producer")
+        participant = getattr(self, "_paper_settlement_participant", None)
+        if participant is None:
+            participant = PaperRuntimeSettlementParticipant(
+                self.portfolio_id,
+                apply_callback=self._apply_paper_terminal_settlement,
+                quarantine_callback=self._latch_emergency_entry_freeze,
+            )
+            self._paper_settlement_participant = participant
+        if type(participant) is not PaperRuntimeSettlementParticipant:
+            raise RuntimeError("active paper runtime settlement participant is malformed")
         gateway.register_paper_executor(
             self.portfolio_id,
             self.executor,
+            protective_quote_producer=self.stop_loss_monitor,
+            settlement_participant=participant,
         )
         self._setup_complete = True
         logger.info("AsyncRunner setup complete")
@@ -3089,11 +3313,40 @@ class AsyncRunner:
         from decimal import Decimal
 
         try:
+            account_daily_pnl = None
+            account_daily_pnl_date = None
             # Load account state (cash, realized_pnl) from database
             account_info = await self.db.get_account_info()
             if account_info:
-                db_cash = account_info.get("cash")
-                db_realized_pnl = account_info.get("realized_pnl", 0.0)
+                exact_cash = account_info.get("cash_exact")
+                exact_realized_pnl = account_info.get("realized_pnl_exact")
+                exact_daily_pnl = account_info.get("daily_pnl_exact")
+                exact_daily_pnl_baseline = account_info.get("daily_pnl_baseline_exact")
+                exact_daily_pnl_date = account_info.get("daily_pnl_date_exact")
+                source_settlement_id = account_info.get("source_settlement_id")
+                exact_values = (
+                    exact_cash,
+                    exact_realized_pnl,
+                    exact_daily_pnl,
+                    exact_daily_pnl_baseline,
+                    exact_daily_pnl_date,
+                )
+                if source_settlement_id is not None and any(
+                    value is None for value in exact_values
+                ):
+                    raise RuntimeError("settled paper account is missing exact restart state")
+                if all(value is not None for value in exact_values):
+                    db_cash = exact_cash
+                    db_realized_pnl = exact_realized_pnl
+                    account_daily_pnl = exact_daily_pnl
+                    self._starting_unrealized_today_exact = exact_daily_pnl_baseline
+                    self._starting_unrealized_today = float(exact_daily_pnl_baseline)
+                    account_daily_pnl_date = exact_daily_pnl_date
+                else:
+                    db_cash = account_info.get("cash")
+                    db_realized_pnl = account_info.get("realized_pnl", 0.0)
+                    account_daily_pnl = account_info.get("daily_pnl")
+                self._account_settlement_source_id = source_settlement_id
                 if db_cash is not None:
                     self.portfolio.cash = Decimal(str(db_cash))
                     self.portfolio.realized_pnl = Decimal(str(db_realized_pnl or 0.0))
@@ -3101,6 +3354,18 @@ class AsyncRunner:
                         f"Loaded account state: cash=${db_cash:,.2f}, "
                         f"realized_pnl=${db_realized_pnl or 0:,.2f}"
                     )
+
+            # The DB snapshot is authoritative across process restarts. Reset
+            # the derived advanced-risk position view before seeding it so
+            # stale in-memory state cannot survive a reconnect/setup retry.
+            advanced = (
+                self.advanced_risk
+                if getattr(self, "use_advanced_risk", False)
+                and getattr(self, "advanced_risk", None) is not None
+                else None
+            )
+            if advanced is not None:
+                advanced.reset_positions_for_authoritative_seed()
 
             # Load positions from database
             positions_data = await self.db.get_positions()
@@ -3121,6 +3386,24 @@ class AsyncRunner:
                 self.portfolio.positions[symbol] = PositionSnapshot(
                     symbol, quantity, avg_price_decimal
                 )
+                if advanced is not None:
+                    advanced.seed_position(symbol, quantity, float(avg_price_decimal))
+
+                exact_mark = pos.get("market_price_exact")
+                if type(exact_mark) is not Decimal or not exact_mark.is_finite() or exact_mark <= 0:
+                    raise RuntimeError(
+                        f"nonzero position {symbol} has no exact restart mark evidence"
+                    )
+                exact_mark_float = float(exact_mark)
+                if not bounded_float_projection_matches(
+                    Decimal(str(exact_mark_float)),
+                    exact_mark,
+                ):
+                    raise RuntimeError(
+                        f"exact restart mark for {symbol} cannot be projected into runtime"
+                    )
+                self.latest_prices[symbol] = exact_mark_float
+                self.latest_price_sources[symbol] = "paper-position-exact-mark"
 
                 logger.info(
                     f"Loaded existing position: {symbol} qty={quantity} avg_cost=${avg_cost:.2f}"
@@ -3188,11 +3471,55 @@ class AsyncRunner:
             else:
                 logger.info("No existing positions found in database")
 
+            today = datetime.utcnow().date()
+            if account_daily_pnl is None:
+                # No authoritative daily field is available in older account
+                # rows. Refresh the runner's current-day view after positions
+                # are loaded, then seed the advanced-risk daily float ledger.
+                account_daily_pnl = await self._refresh_daily_pnl()
+            else:
+                if type(account_daily_pnl_date) is not date:
+                    raise RuntimeError("exact restart daily P&L date is unavailable")
+                if account_daily_pnl_date > today:
+                    raise RuntimeError("exact restart daily P&L date is in the future")
+                if account_daily_pnl_date < today:
+                    # A new UTC day can be established only after every open
+                    # position has supplied its exact persisted mark above.
+                    self._daily_pnl_date = None
+                    account_daily_pnl = await self._refresh_daily_pnl()
+                else:
+                    self._daily_pnl_date = account_daily_pnl_date
+                exact_account_daily_pnl = Decimal(str(account_daily_pnl))
+                self.daily_pnl = float(exact_account_daily_pnl)
+                self._daily_pnl_exact = exact_account_daily_pnl
+                if not bounded_float_projection_matches(
+                    Decimal(str(self.daily_pnl)),
+                    exact_account_daily_pnl,
+                ):
+                    raise RuntimeError(
+                        "exact restart daily P&L cannot be projected into runtime risk"
+                    )
+            if advanced is not None:
+                advanced.seed_realized_pnl(
+                    total_pnl=float(self.portfolio.realized_pnl),
+                    daily_pnl=float(account_daily_pnl),
+                )
+
             # Capture session start equity for kill switch (after positions loaded)
             # Build market prices from loaded positions (use avg_price as proxy at startup)
             market_prices = {sym: float(pos.avg_price) for sym, pos in self.positions.items()}
             self.session_start_equity = float(await self.portfolio.equity(market_prices))
             logger.info(f"Session start equity: ${self.session_start_equity:,.2f}")
+
+            if advanced is not None:
+                # Background monitoring must never observe an unseeded empty
+                # book or partially initialized account when advanced risk is
+                # default-enabled.
+                risk_task = getattr(self, "risk_monitor_task", None)
+                if risk_task is None or risk_task.done():
+                    self.risk_monitor_task = asyncio.create_task(
+                        risk_monitor_task(advanced, interval=60)
+                    )
 
         except UnprotectedExistingPositionsError:
             raise
@@ -4295,46 +4622,27 @@ class AsyncRunner:
                     )
                 )
                 if res.ok:
-                    if self.stop_loss_monitor:
-                        self.stop_loss_monitor.cancel_stop(symbol)
-                    fill_price = res.fill_price if res.fill_price is not None else price_float
-                    success = await self._update_position_atomic(
-                        symbol, qty_to_cover, fill_price, "BUY_TO_COVER"
+                    # The gateway already committed the trade + position,
+                    # projected runner/Portfolio/risk/stop state, verified the
+                    # ledger, and released the journal reservation.
+                    fill_price = float(res.fill_price)
+                    await self._refresh_daily_pnl()
+                    self.monitor.record_order_placed(symbol, qty_to_cover)
+                    self.monitor.record_trade_executed(
+                        symbol,
+                        "BUY_TO_COVER",
+                        qty_to_cover,
                     )
-                    if success:
-                        # TC-M7: mark-to-market daily P&L
-                        await self._refresh_daily_pnl()
 
-                        await self.db.record_trade(
-                            symbol,
-                            "BUY_TO_COVER",
-                            qty_to_cover,
-                            fill_price,
-                            slippage=(
-                                (fill_price - price_float) * qty_to_cover
-                                if res.fill_price is not None
-                                else 0
-                            ),
-                        )
-                        await self.db.update_position(symbol, 0, 0, 0)  # Close position
+                    if self.production_monitor:
+                        latency_ms = 10  # Simulated latency for paper trading
+                        self.production_monitor.record_order(symbol, True, latency_ms)
+                        pnl = (float(pos.avg_price) - fill_price) * qty_to_cover
+                        self.production_monitor.record_trade(symbol, pnl, True)
 
-                        self.monitor.record_order_placed(symbol, qty_to_cover)
-                        self.monitor.record_trade_executed(symbol, "BUY_TO_COVER", qty_to_cover)
-
-                        if self.production_monitor:
-                            latency_ms = 10  # Simulated latency for paper trading
-                            self.production_monitor.record_order(symbol, True, latency_ms)
-                            pnl = (pos.avg_cost - fill_price) * qty_to_cover
-                            self.production_monitor.record_trade(symbol, pnl, True)
-
-                        executed = True
-                        quantity = qty_to_cover
-                        message = (
-                            f"Covered short: Bought {qty_to_cover} shares at ${fill_price:.2f}"
-                        )
-                    else:
-                        logger.error(f"Failed to update position for {symbol} BUY_TO_COVER order")
-                        message = f"Cover order failed: atomic update error"
+                    executed = True
+                    quantity = qty_to_cover
+                    message = f"Covered short: Bought {qty_to_cover} shares at ${fill_price:.2f}"
                 else:
                     message = f"Cover order failed: {res.message}"
 
@@ -4675,53 +4983,27 @@ class AsyncRunner:
                         )
                     )
                     if res.ok:
-                        # Cancel stop-loss when closing position
-                        if self.stop_loss_monitor:
-                            self.stop_loss_monitor.cancel_stop(symbol)
-                        # Use price_float for consistency (price is Decimal, fill_price is float)
-                        fill_price = res.fill_price or price_float
-                        # Use atomic position update to prevent race conditions
-                        success = await self._update_position_atomic(
-                            symbol, pos.quantity, fill_price, "SELL"
+                        # Authoritative settlement is complete before a success
+                        # result crosses the gateway boundary. Keep only derived
+                        # monitoring and operator messaging here.
+                        fill_price = float(res.fill_price)
+                        await self._refresh_daily_pnl()
+                        self.monitor.record_order_placed(symbol, pos.quantity)
+                        self.monitor.record_trade_executed(
+                            symbol,
+                            "SELL",
+                            pos.quantity,
                         )
-                        if success:
-                            # TC-M7: mark-to-market daily P&L
-                            await self._refresh_daily_pnl()
 
-                            # Record trade in database
-                            await self.db.record_trade(
-                                symbol,
-                                "SELL",
-                                pos.quantity,
-                                fill_price,
-                                slippage=(
-                                    (float(fill_price) - float(price)) * pos.quantity
-                                    if res.fill_price
-                                    else 0
-                                ),
-                            )
-                            await self.db.update_position(symbol, 0, 0, 0)  # Close position
+                        if self.production_monitor:
+                            latency_ms = 10  # Simulated latency for paper trading
+                            self.production_monitor.record_order(symbol, True, latency_ms)
+                            pnl = (fill_price - float(pos.avg_price)) * pos.quantity
+                            self.production_monitor.record_trade(symbol, pnl, pnl > 0)
 
-                            self.monitor.record_order_placed(symbol, pos.quantity)
-                            self.monitor.record_trade_executed(symbol, "SELL", pos.quantity)
-
-                            # Record metrics to ProductionMonitor (Phase 4 P2)
-                            if self.production_monitor:
-                                latency_ms = 10  # Simulated latency for paper trading
-                                self.production_monitor.record_order(symbol, True, latency_ms)
-                                pnl = (
-                                    float(fill_price) - float(pos.avg_price)
-                                ) * pos.quantity  # Long position PnL
-                                self.production_monitor.record_trade(symbol, pnl, pnl > 0)
-
-                            executed = True
-                            quantity = pos.quantity
-                            message = (
-                                f"Closed long: Sold {pos.quantity} shares at ${fill_price:.2f}"
-                            )
-                        else:
-                            logger.error(f"Failed to update position for {symbol} SELL order")
-                            message = f"Sell order failed: atomic update error"
+                        executed = True
+                        quantity = pos.quantity
+                        message = f"Closed long: Sold {pos.quantity} shares at ${fill_price:.2f}"
                     else:
                         message = f"Sell order failed: {res.message}"
 
@@ -5135,11 +5417,13 @@ class AsyncRunner:
                 logger.debug(f"Portfolio manager update failed: {e}")
 
         await self.db.update_account(
-            cash=cash_float,
+            cash=self.portfolio.cash,
             equity=equity_float,
-            daily_pnl=self.daily_pnl,
-            realized_pnl=realized_pnl_float,
-            unrealized_pnl=unrealized_float,
+            daily_pnl=self._daily_pnl_exact,
+            realized_pnl=self.portfolio.realized_pnl,
+            unrealized_pnl=unrealized,
+            daily_pnl_baseline=self._starting_unrealized_today_exact,
+            daily_pnl_date=self._daily_pnl_date,
         )
 
         # Save daily equity snapshot for portfolio value tracking (industry standard)
@@ -6050,32 +6334,77 @@ class AsyncRunner:
         finally:
             await self.teardown()
 
-    async def cancel_all_orders(self):
-        """Cancel all pending orders - used for emergency shutdown."""
-        try:
-            cancelled_count = 0
+    def _latch_emergency_entry_freeze(self, reason: str) -> None:
+        """Synchronously freeze entries without waiting on admission locks."""
 
-            # Cancel stop-loss orders
-            if self.stop_loss_monitor:
-                cancelled_count += self.stop_loss_monitor.cancel_all_stops()
+        reason_text = str(reason or "Emergency shutdown requested").strip()
+        if not reason_text:
+            reason_text = "Emergency shutdown requested"
+        logger.critical("EMERGENCY ENTRY FREEZE: %s", reason_text)
+        if not getattr(self, "_emergency_entry_freeze_reason", None):
+            self._emergency_entry_freeze_reason = reason_text
+        advanced_risk = getattr(self, "advanced_risk", None)
+        if advanced_risk and hasattr(advanced_risk, "kill_switch"):
+            advanced_risk.kill_switch.trigger(reason_text)
 
-            # In a real system, would also cancel any pending broker orders
-            # For paper trading, we just log the action
-            logger.warning(f"Emergency shutdown: Cancelled {cancelled_count} orders")
+    async def _enter_emergency_entry_freeze(self, reason: str) -> int:
+        """Latch an entry freeze while preserving protective execution."""
 
-            # TC-M3: do NOT clear self.positions here. Clearing the in-memory
-            # positions dict desynchronizes runner state from the database — on
-            # the very next cycle (or after a watchdog restart) the broker may
-            # still hold the position while the runner thinks it has none, so
-            # stop-losses cannot be recreated on startup and risk gates think
-            # the account is flat. Positions are reloaded from the DB on
-            # restart and stop-losses are recreated from those loaded
-            # positions; clearing here breaks that flow.
+        reason_text = str(reason or "Emergency shutdown requested").strip()
+        if not reason_text:
+            reason_text = "Emergency shutdown requested"
+        # Keep the runner and stop monitor alive. The kill switch is a soft
+        # entry gate; semantic SELL / BUY_TO_COVER reductions bypass it only
+        # through the hard-evidence reduction gateway.
+        self._latch_emergency_entry_freeze(reason_text)
+        return await self.cancel_all_orders(reason_text)
 
-            return cancelled_count
-        except Exception as e:
-            logger.error(f"Error cancelling orders: {e}")
-            return 0
+    async def cancel_all_orders(self, reason: str = "Emergency shutdown requested") -> int:
+        """Freeze entry work without deleting protective stop instructions.
+
+        The historical method name is retained for compatibility with callers,
+        but a generic emergency must never call ``cancel_all_stops``. There are
+        no resting broker orders in paper mode; pending symbols are local entry
+        bookkeeping. Already-admitted work is allowed to finish settlement,
+        then all later entry admission fails closed.
+        """
+
+        reason_text = str(reason or "Emergency shutdown requested").strip()
+        if not reason_text:
+            reason_text = "Emergency shutdown requested"
+
+        # Latch synchronously before the first await so even cancellation of
+        # this coroutine leaves the system fail-closed for new entries.
+        if not getattr(self, "_emergency_entry_freeze_reason", None):
+            self._emergency_entry_freeze_reason = reason_text
+
+        # Drain an order that already crossed final admission. Do not cancel
+        # the task: it must finish local accounting and journal settlement.
+        admission_lock = getattr(self, "_order_admission_lock", None)
+        if admission_lock is None:
+            self._order_admission_lock = asyncio.Lock()
+            admission_lock = self._order_admission_lock
+        async with admission_lock:
+            pass
+
+        pending_lock = getattr(self, "_pending_orders_lock", None)
+        if pending_lock is None:
+            self._pending_orders_lock = asyncio.Lock()
+            pending_lock = self._pending_orders_lock
+        async with pending_lock:
+            pending_entries = tuple(getattr(self, "_pending_orders", set()))
+            self._pending_orders.clear()
+
+        stop_count = len(
+            getattr(getattr(self, "stop_loss_monitor", None), "active_stops", {}) or {}
+        )
+        logger.warning(
+            "Emergency entry freeze active: cleared %d pending entry markers; "
+            "preserved %d protective stops and protective monitoring",
+            len(pending_entries),
+            stop_count,
+        )
+        return len(pending_entries)
 
     async def cleanup(self):
         """Clean up resources when runner is done."""
@@ -6501,24 +6830,22 @@ class AsyncRunner:
                 skipped += 1
                 continue
             try:
-                accepted = await stop_monitor.update_price(
-                    symbol,
-                    prices[symbol],
-                    source_timestamp=price_times[symbol],
-                )
-                if accepted:
-                    rewarmed += 1
-                elif self._monitor_owns_exact_fresh_protective_event(
+                if self._monitor_owns_exact_fresh_protective_event(
                     symbol,
                     prices[symbol],
                     price_times[symbol],
                 ):
                     logger.info(
-                        "event=stop_loss_price_rewarm_already_current symbol=%s",
+                        "event=stop_loss_price_rewarm_exact_live_evidence symbol=%s",
                         symbol,
                     )
                     rewarmed += 1
                 else:
+                    logger.warning(
+                        "event=stop_loss_price_rewarm_skipped symbol=%s "
+                        "reason=no_exact_current_transport_lineage",
+                        symbol,
+                    )
                     skipped += 1
             except Exception as e:
                 logger.warning(
@@ -6680,6 +7007,21 @@ class AsyncRunner:
             )
 
             await self._safe_disconnect()
+            # A quote from the prior socket generation can remain temporally
+            # fresh while being unusable as current transport evidence. Mark
+            # every cached feed unavailable before reconnect; only a new
+            # producer callback carrying the replacement generation may
+            # republish live-grade lineage during initialize/recovery.
+            statuses = getattr(self, "_protective_feed_status", None)
+            if isinstance(statuses, dict):
+                for symbol, status in list(statuses.items()):
+                    if isinstance(status, dict):
+                        statuses[symbol] = {
+                            **status,
+                            "available": False,
+                            "live_grade": False,
+                            "reason": "connection_generation_changed",
+                        }
             await asyncio.sleep(delay)
 
             if attempt >= gateway_restart_attempt_threshold:

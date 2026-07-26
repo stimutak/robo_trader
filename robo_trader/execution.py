@@ -5,7 +5,7 @@ import datetime as dt
 import math
 import os
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 if TYPE_CHECKING:
@@ -20,6 +20,7 @@ logger = get_logger(__name__)
 # cannot weaken it accidentally. PR 11 will replace this executor with a
 # reviewed broker lifecycle adapter rather than flipping this constant.
 LIVE_TRADING_CAPABILITY_ENABLED = False
+_PAPER_FILL_PRICE_TICK = Decimal("0.0001")
 
 
 @dataclass
@@ -32,10 +33,21 @@ class Order:
 
 
 class ExecutionResult:
-    def __init__(self, ok: bool, message: str, fill_price: Optional[float] = None) -> None:
+    def __init__(
+        self,
+        ok: bool,
+        message: str,
+        fill_price: Optional[float] = None,
+        *,
+        exact_fill_price: Optional[Decimal] = None,
+    ) -> None:
         self.ok = ok
         self.message = message
         self.fill_price = fill_price
+        # Only the simple local-paper sink sets this. Legacy/live callers keep
+        # their existing float-only contract and therefore cannot masquerade as
+        # exact terminal paper evidence.
+        self.exact_fill_price = exact_fill_price
 
 
 class AbstractExecutor:
@@ -273,6 +285,7 @@ class PaperExecutor(BaseExecutor):
                 )
                 return ExecutionResult(False, "Stale reference price for market order")
 
+        fill_decimal: Decimal
         if exact_base is not None:
             # The safety adapter passes a bounded, tick-quantized Decimal.
             # Preserve it through all slippage arithmetic; only the legacy
@@ -282,10 +295,25 @@ class PaperExecutor(BaseExecutor):
                 if self.slippage_bps
                 else Decimal("0")
             )
-            fill_decimal = (
+            unrounded_fill = (
                 exact_base + slip_decimal
                 if order.side.upper() in {"BUY", "BUY_TO_COVER"}
                 else exact_base - slip_decimal
+            )
+            if not unrounded_fill.is_finite() or unrounded_fill <= 0:
+                logger.error(
+                    "Paper slippage produced an invalid exact fill",
+                    symbol=order.symbol,
+                )
+                return ExecutionResult(False, "Invalid paper execution fill")
+            # Normalize the simulator's authoritative fill before either the
+            # durable exact-value path or its legacy float compatibility view
+            # observes it. Arbitrary finite float slippage otherwise produces
+            # a high-scale Decimal whose float round-trip no longer matches,
+            # after the fill has already been recorded.
+            fill_decimal = unrounded_fill.quantize(
+                _PAPER_FILL_PRICE_TICK,
+                rounding=ROUND_HALF_EVEN,
             )
             fill = float(fill_decimal)
         else:
@@ -297,6 +325,7 @@ class PaperExecutor(BaseExecutor):
                 fill = base + slip
             else:  # SELL or SELL_SHORT
                 fill = base - slip
+            fill_decimal = Decimal(str(fill))
         if not math.isfinite(fill) or fill <= 0:
             logger.error(
                 "Paper slippage produced an invalid fill",
@@ -309,7 +338,12 @@ class PaperExecutor(BaseExecutor):
             order,
             fill,
         )
-        return ExecutionResult(True, "Paper fill", fill)
+        return ExecutionResult(
+            True,
+            "Paper fill",
+            fill,
+            exact_fill_price=fill_decimal,
+        )
 
     def _place_smart_order(self, order: Order) -> ExecutionResult:
         """Place order using smart execution algorithms."""

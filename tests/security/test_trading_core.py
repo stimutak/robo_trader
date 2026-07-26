@@ -8,25 +8,32 @@ finding ID it pins.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from robo_trader.execution import ExecutionResult, Order, PaperExecutor
+from robo_trader.paper_reduction_submitter import (
+    LocalPaperOrderStatus,
+    LocalPaperOutcomeProvenance,
+    LocalPaperTerminalOutcome,
+)
 from robo_trader.portfolio import Portfolio
-from robo_trader.risk.advanced_risk import KillSwitch
+from robo_trader.protective_quote_evidence import ProtectiveQuoteSource
+from robo_trader.risk.advanced_risk import AdvancedRiskManager, KillSwitch
 from robo_trader.risk_manager import (
     Position,
     RiskManager,
     create_risk_manager_from_config,
 )
-from robo_trader.stop_loss_monitor import StopLossMonitor, StopType
+from robo_trader.stop_loss_monitor import StopLossMonitor, StopStatus, StopType
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -34,8 +41,8 @@ from robo_trader.stop_loss_monitor import StopLossMonitor, StopType
 
 
 class _StubExecutor:
-    async def place_order_async(self, order: Order) -> ExecutionResult:
-        return ExecutionResult(True, "stub", fill_price=order.price)
+    async def place_order_async(self, order: Order) -> LocalPaperTerminalOutcome:
+        return _filled_terminal_outcome(order)
 
 
 class _StubRiskManager:
@@ -43,11 +50,33 @@ class _StubRiskManager:
 
 
 def _reduction_callback(executor):
-    async def execute(stop, order: Order) -> ExecutionResult:
+    async def execute(stop, order: Order):
         del stop
         return await executor.place_order_async(order)
 
     return execute
+
+
+def _filled_terminal_outcome(
+    order: Order,
+    *,
+    fill_price: Decimal = Decimal("97.5"),
+) -> LocalPaperTerminalOutcome:
+    """Return exact local-paper terminal evidence for monitor-only tests."""
+
+    quantity = Decimal(order.quantity)
+    return LocalPaperTerminalOutcome(
+        order_ref=order.order_ref,
+        status=LocalPaperOrderStatus.FILLED,
+        requested_quantity=quantity,
+        filled_quantity=quantity,
+        remaining_quantity=Decimal("0"),
+        exact_fill_price=fill_price,
+        observed_at=datetime.now(timezone.utc),
+        provenance=LocalPaperOutcomeProvenance.LOCAL_PAPER_EXECUTOR,
+        terminal=True,
+        message="exact local paper fill",
+    )
 
 
 def _build_monitor() -> StopLossMonitor:
@@ -528,18 +557,20 @@ async def test_cancel_all_stops_actually_cancels_tcn_h1() -> None:
 
 
 @pytest.mark.asyncio
-async def test_execute_stop_loss_passes_trigger_price_tcn_h5() -> None:
-    """TCN-H5: stop-loss execution must not depend on PaperExecutor's
-    `_execution_cache` being populated. The Order is constructed with
-    `price=stop.trigger_price` so the executor has a usable reference even
-    after a runner restart.
+async def test_stop_reduction_uses_exact_producer_quote_not_order_price_tcn_h5() -> None:
+    """The monitor latches exact broker lineage and leaves Order.price unset.
+
+    PR 2B.3 makes the producer-owned ``ProtectiveQuoteEvidence`` the only
+    reference-price authority.  Copying the mutable trigger price onto the
+    order would recreate a second, caller-controlled authority.
     """
-    captured: Dict[str, Order] = {}
+    captured: Dict[str, Any] = {}
+    event_time = datetime(2026, 7, 25, 14, 30, tzinfo=timezone.utc)
 
     class _Capturing:
-        async def place_order_async(self, order: Order) -> ExecutionResult:
+        async def place_order_async(self, order: Order) -> LocalPaperTerminalOutcome:
             captured["order"] = order
-            return ExecutionResult(True, "captured", fill_price=order.price)
+            return _filled_terminal_outcome(order, fill_price=Decimal("97.5"))
 
     monitor = StopLossMonitor(
         execute_reduction=_reduction_callback(_Capturing()),
@@ -548,14 +579,27 @@ async def test_execute_stop_loss_passes_trigger_price_tcn_h5() -> None:
     pos = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
     await monitor.add_stop_loss("AAPL", pos, stop_percent=0.02, stop_type=StopType.FIXED)
     stop = monitor.active_stops["default:AAPL"]
-    stop.trigger_price = 97.5  # simulate the cycle that fires the stop
-    await monitor.execute_stop_loss(stop)
+    monitor._utcnow = MagicMock(return_value=event_time)
+    monitor._monotonic = MagicMock(return_value=100.0)
+    assert await monitor.update_price(
+        "AAPL",
+        97.5,
+        source_timestamp=event_time,
+        source=ProtectiveQuoteSource.LIVE_BROKER,
+        con_id=265598,
+        transport_generation="generation-1",
+        source_event_id="quote-event-1",
+    )
+    assert await monitor.check_stops() == [stop]
+    captured["quote"] = monitor._latched_stop_crossings[id(stop)].quote_evidence
+
+    assert await monitor.execute_stop_loss(stop) is True
 
     assert "order" in captured
-    assert captured["order"].price == 97.5, (
-        "Order must carry trigger_price; otherwise paper executor returns "
-        "'No reference price for market order' and the stop never fills."
-    )
+    assert captured["order"].price is None
+    assert captured["quote"].price == Decimal("97.5")
+    assert captured["quote"].source is ProtectiveQuoteSource.LIVE_BROKER
+    assert captured["quote"].con_id == 265598
 
 
 def test_stop_monitor_exposes_only_narrow_reduction_callback() -> None:
@@ -721,26 +765,17 @@ async def test_runner_wires_pairs_short_dedupe_state_tcn_h3() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stop_loss_execution_invokes_position_closed_callback_tcn_h4() -> None:
-    """TCN-H4: a successful stop-loss execution must invoke the
-    position_closed_callback, so the runner can sync self.positions, the
-    portfolio, and DB. Without this hook, the runner sees a phantom position
-    that blocks subsequent BUY/SELL signals.
-    """
-    captured: Dict[str, Any] = {}
-
-    async def cb(stop, result) -> None:
-        captured["stop"] = stop
-        captured["result"] = result
+async def test_exact_terminal_outcome_completes_without_legacy_callback_tcn_h4() -> None:
+    """Gateway success is already committed and projected before return."""
 
     class _OkExecutor:
-        async def place_order_async(self, order: Order) -> ExecutionResult:
-            return ExecutionResult(True, "ok", fill_price=order.price)
+        async def place_order_async(self, order: Order) -> LocalPaperTerminalOutcome:
+            return _filled_terminal_outcome(order)
 
     monitor = StopLossMonitor(
         execute_reduction=_reduction_callback(_OkExecutor()),
         risk_manager=_StubRiskManager(),
-        position_closed_callback=cb,
+        position_closed_callback=None,
     )
     pos = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
     await monitor.add_stop_loss("AAPL", pos, stop_percent=0.02, stop_type=StopType.FIXED)
@@ -749,29 +784,32 @@ async def test_stop_loss_execution_invokes_position_closed_callback_tcn_h4() -> 
 
     ok = await monitor.execute_stop_loss(stop)
     assert ok is True
-    assert "stop" in captured, "callback must be invoked after successful fill"
-    assert captured["stop"].symbol == "AAPL"
-    assert captured["result"].ok is True
-    # The monitor must also have removed the stop from active_stops.
     assert "default:AAPL" not in monitor.active_stops
 
 
 @pytest.mark.asyncio
-async def test_stop_loss_callback_failure_does_not_crash_monitor_tcn_h4() -> None:
-    """TCN-H4: if the callback raises, the monitor must log+continue. The
-    broker fill already happened; raising would crash the monitor loop and
-    leave OTHER stops unwatched.
-    """
+async def test_legacy_post_fill_callback_cannot_turn_fill_into_retry_tcn_h4() -> None:
+    """A compatibility callback failure occurs after the irrevocable fill."""
+
+    callback_calls = 0
 
     async def bad_cb(stop, result) -> None:
-        raise RuntimeError("simulated runner failure")
+        nonlocal callback_calls
+        callback_calls += 1
+        raise RuntimeError("simulated legacy callback failure")
 
     class _OkExecutor:
-        async def place_order_async(self, order: Order) -> ExecutionResult:
-            return ExecutionResult(True, "ok", fill_price=order.price)
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def place_order_async(self, order: Order) -> LocalPaperTerminalOutcome:
+            self.calls += 1
+            return _filled_terminal_outcome(order)
+
+    executor = _OkExecutor()
 
     monitor = StopLossMonitor(
-        execute_reduction=_reduction_callback(_OkExecutor()),
+        execute_reduction=_reduction_callback(executor),
         risk_manager=_StubRiskManager(),
         position_closed_callback=bad_cb,
     )
@@ -783,6 +821,8 @@ async def test_stop_loss_callback_failure_does_not_crash_monitor_tcn_h4() -> Non
     # Must NOT raise.
     ok = await monitor.execute_stop_loss(stop)
     assert ok is True
+    assert executor.calls == 1
+    assert callback_calls == 1
 
 
 class _GatedSuccessfulExecutor:
@@ -791,11 +831,11 @@ class _GatedSuccessfulExecutor:
         self.release = asyncio.Event()
         self.calls = 0
 
-    async def place_order_async(self, order: Order) -> ExecutionResult:
+    async def place_order_async(self, order: Order) -> LocalPaperTerminalOutcome:
         self.calls += 1
         self.started.set()
         await self.release.wait()
-        return ExecutionResult(True, "filled", fill_price=order.price)
+        return _filled_terminal_outcome(order)
 
 
 @pytest.mark.asyncio
@@ -887,6 +927,43 @@ async def test_rejected_stop_calls_reduction_callback_exactly_once() -> None:
 
 
 @pytest.mark.asyncio
+async def test_exact_terminal_no_fill_retains_triggered_stop_without_redispatch() -> None:
+    outcome = LocalPaperTerminalOutcome(
+        order_ref="placeholder",
+        status=LocalPaperOrderStatus.REJECTED,
+        requested_quantity=Decimal("10"),
+        filled_quantity=Decimal("0"),
+        remaining_quantity=Decimal("10"),
+        exact_fill_price=None,
+        observed_at=datetime.now(timezone.utc),
+        provenance=LocalPaperOutcomeProvenance.LOCAL_PAPER_EXECUTOR,
+        terminal=True,
+        message="definitive no fill",
+    )
+    execute_reduction = AsyncMock(return_value=outcome)
+    emergency = AsyncMock()
+    monitor = StopLossMonitor(
+        execute_reduction=execute_reduction,
+        risk_manager=_StubRiskManager(),
+        emergency_shutdown_callback=emergency,
+    )
+    position = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
+    stop = await monitor.add_stop_loss("AAPL", position, stop_percent=0.02)
+    stop.status = StopStatus.TRIGGERED
+    stop.trigger_price = 97.0
+    stop.triggered_at = datetime.now(timezone.utc)
+
+    assert await monitor.execute_stop_loss(stop) is False
+
+    execute_reduction.assert_awaited_once()
+    assert stop.status is StopStatus.TRIGGERED
+    assert monitor.active_stops["default:AAPL"] is stop
+    assert await monitor.check_stops() == []
+    execute_reduction.assert_awaited_once()
+    emergency.assert_awaited_once_with("Stop-loss terminal no-fill: REJECTED")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["exception", "wrong_type", "invalid_fill"])
 async def test_ambiguous_stop_callback_failure_is_never_retried(failure: str) -> None:
     if failure == "exception":
@@ -962,374 +1039,357 @@ async def test_post_fill_cleanup_exception_never_resubmits_order() -> None:
     assert callback_calls == 1
 
 
-@pytest.mark.asyncio
-async def test_runner_on_stop_loss_executed_updates_state_tcn_h4() -> None:
-    """TCN-H4: AsyncRunner._on_stop_loss_executed must clear self.positions,
-    call portfolio.update_fill, and persist via db.update_position +
-    db.record_trade.
-    """
-    from unittest.mock import AsyncMock, MagicMock
+def _paper_settlement_request(
+    *,
+    pre_quantity: int,
+    post_quantity: int,
+    fill_quantity: int,
+    mark_price: Decimal = Decimal("100"),
+    fill_price: Decimal = Decimal("97.5"),
+    pre_cash: Decimal | None = None,
+    pre_realized_pnl: Decimal = Decimal("0"),
+    pre_daily_pnl: Decimal = Decimal("0"),
+    daily_pnl_baseline: Decimal = Decimal("0"),
+    pre_mark_price: Decimal | None = None,
+):
+    from robo_trader.paper_terminal_settlement import PaperTerminalSettlementRequest
+    from robo_trader.safety import PAPER_EXECUTION_DOMAIN_SCOPE, OrderSide
+    from robo_trader.safety.models import TerminalOrderStatus
 
-    from robo_trader.runner_async import AsyncRunner
-    from robo_trader.stop_loss_monitor import StopLossOrder
-
-    runner = AsyncRunner.__new__(AsyncRunner)
-    AsyncRunner.__init__(runner)
-
-    # Pretend AAPL is a long position the stop closes.
-    runner.positions = {"AAPL": Position(symbol="AAPL", quantity=10, avg_price=100.0)}
-
-    runner.portfolio = MagicMock()
-    runner.portfolio.update_fill = AsyncMock(return_value=None)
-    runner.db = MagicMock()
-    runner.db.update_position = AsyncMock(return_value=None)
-    runner.db.record_trade = AsyncMock(return_value=None)
-    runner.use_advanced_risk = False
-    runner.advanced_risk = None
-
-    stop = StopLossOrder(
+    side = OrderSide.SELL if pre_quantity > 0 else OrderSide.BUY_TO_COVER
+    prior_mark = mark_price if pre_mark_price is None else pre_mark_price
+    quote_payload = json.dumps(
+        {
+            "con_id": 265598,
+            "portfolio_id": "default",
+            "price": str(mark_price),
+            "receipt_monotonic": float(10).hex(),
+            "receipt_order": 1,
+            "source": "live-broker",
+            "source_event_id": "ticker-42",
+            "source_timestamp": "2026-07-25T14:30:00.000000+00:00",
+            "symbol": "AAPL",
+            "transport_generation": "generation-1",
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if pre_quantity > 0:
+        if pre_cash is None:
+            pre_cash = Decimal("100000") - Decimal(pre_quantity * 100)
+        post_cash = pre_cash + Decimal(fill_quantity) * fill_price
+        realized_delta = Decimal(fill_quantity) * (fill_price - Decimal("100"))
+        removed_unrealized = Decimal(fill_quantity) * (mark_price - Decimal("100"))
+        mark_revaluation = Decimal(abs(pre_quantity)) * (mark_price - prior_mark)
+    else:
+        if pre_cash is None:
+            pre_cash = Decimal("100000") + Decimal(abs(pre_quantity) * 100)
+        post_cash = pre_cash - Decimal(fill_quantity) * fill_price
+        realized_delta = Decimal(fill_quantity) * (Decimal("100") - fill_price)
+        removed_unrealized = Decimal(fill_quantity) * (Decimal("100") - mark_price)
+        mark_revaluation = Decimal(abs(pre_quantity)) * (prior_mark - mark_price)
+    post_daily_pnl = pre_daily_pnl + mark_revaluation + realized_delta - removed_unrealized
+    return PaperTerminalSettlementRequest(
+        execution_domain_scope=PAPER_EXECUTION_DOMAIN_SCOPE,
+        account_scope=(
+            "acct_v1_0123456789abcdef0123456789abcdef" "fedcba9876543210fedcba9876543210"
+        ),
+        portfolio_id="default",
+        con_id=265598,
         symbol="AAPL",
-        position_qty=10,
-        stop_price=98.0,
-        entry_price=100.0,
-        stop_type=StopType.FIXED,
-        created_at=datetime.now(),
+        reservation_id="res-" + ("2" * 32),
+        claim_id="claim-" + ("3" * 32),
+        claim_sequence=1,
+        submission_descriptor_fingerprint="4" * 64,
+        protective_quote_fingerprint=hashlib.sha256(quote_payload.encode()).hexdigest(),
+        protective_quote_payload=quote_payload,
+        order_ref="stop:v1:" + ("6" * 64),
+        side=side,
+        requested_quantity=Decimal(fill_quantity),
+        filled_quantity=Decimal(fill_quantity),
+        remaining_quantity=Decimal("0"),
+        expected_pre_position_quantity=Decimal(pre_quantity),
+        expected_post_position_quantity=Decimal(post_quantity),
+        expected_pre_aggregate_quantity=Decimal(pre_quantity),
+        expected_post_aggregate_quantity=Decimal(post_quantity),
+        expected_pre_cash=pre_cash,
+        expected_post_cash=post_cash,
+        expected_pre_realized_pnl=pre_realized_pnl,
+        expected_post_realized_pnl=pre_realized_pnl + realized_delta,
+        expected_pre_daily_pnl=pre_daily_pnl,
+        expected_post_daily_pnl=post_daily_pnl,
+        expected_daily_pnl_baseline=daily_pnl_baseline,
+        expected_daily_pnl_date=datetime.utcnow().date().isoformat(),
+        expected_position_cost_basis=Decimal("100"),
+        expected_pre_position_mark_price=prior_mark,
+        expected_pre_position_source_settlement_id=None,
+        terminal_status=TerminalOrderStatus.FILLED,
+        fill_price=fill_price,
+        outcome_at=datetime(2026, 7, 25, 14, 30, tzinfo=timezone.utc),
     )
-    stop.trigger_price = 97.5
-    result = ExecutionResult(True, "ok", fill_price=97.4)
-
-    await runner._on_stop_loss_executed(stop, result)
-
-    # Position cleared.
-    assert "AAPL" not in runner.positions
-    # Portfolio updated with SELL side at the actual fill price.
-    runner.portfolio.update_fill.assert_awaited_once_with("AAPL", "SELL", 10, 97.4)
-    # DB updated.
-    runner.db.update_position.assert_awaited_once()
-    runner.db.record_trade.assert_awaited_once()
-    args, _ = runner.db.record_trade.call_args
-    assert args[0] == "AAPL"
-    assert args[1] == "SELL"
-    assert args[2] == 10
 
 
-@pytest.mark.asyncio
-async def test_runner_on_stop_loss_executed_short_uses_buy_to_cover_tcn_h4() -> None:
-    """TCN-H4: closing a SHORT via stop-loss must use BUY_TO_COVER, not SELL."""
-    from unittest.mock import AsyncMock, MagicMock
-
-    from robo_trader.runner_async import AsyncRunner
-    from robo_trader.stop_loss_monitor import StopLossOrder
-
-    runner = AsyncRunner.__new__(AsyncRunner)
-    AsyncRunner.__init__(runner)
-    runner.positions = {"TSLA": Position(symbol="TSLA", quantity=-5, avg_price=200.0)}
-    runner.portfolio = MagicMock()
-    runner.portfolio.update_fill = AsyncMock(return_value=None)
-    runner.db = MagicMock()
-    runner.db.update_position = AsyncMock(return_value=None)
-    runner.db.record_trade = AsyncMock(return_value=None)
-    runner.use_advanced_risk = False
-    runner.advanced_risk = None
-
-    stop = StopLossOrder(
-        symbol="TSLA",
-        position_qty=-5,
-        stop_price=210.0,
-        entry_price=200.0,
-        stop_type=StopType.FIXED,
-        created_at=datetime.now(),
+def _paper_settlement_receipt(request):
+    from robo_trader.paper_terminal_settlement import (
+        _produce_paper_terminal_settlement_receipt,
     )
-    stop.trigger_price = 210.5
-    result = ExecutionResult(True, "ok", fill_price=210.6)
 
-    await runner._on_stop_loss_executed(stop, result)
-    runner.portfolio.update_fill.assert_awaited_once_with("TSLA", "BUY_TO_COVER", 5, 210.6)
-    args, _ = runner.db.record_trade.call_args
-    assert args[1] == "BUY_TO_COVER"
+    return _produce_paper_terminal_settlement_receipt(
+        settlement_id="pset-" + ("7" * 32),
+        request=request,
+        trade_id=1,
+        database_path="/tmp/robo-trader-test-ledger.db",
+        database_identity="paper:123456abcdef",
+        database_device=1,
+        database_inode=2,
+        committed_at=datetime(2026, 7, 25, 14, 30, 1, tzinfo=timezone.utc),
+    )
 
 
-def _runner_for_stop_fill(position: Position | None):
-    from unittest.mock import AsyncMock, MagicMock
-
+async def _runner_for_receipt_projection(quantity: int, *, advanced: bool = False):
     from robo_trader.runner_async import AsyncRunner
 
     runner = AsyncRunner.__new__(AsyncRunner)
     AsyncRunner.__init__(runner)
-    runner.positions = {} if position is None else {position.symbol: position}
-    runner.portfolio = MagicMock()
-    runner.portfolio.update_fill = AsyncMock(return_value=None)
-    runner.db = MagicMock()
-    runner.db.update_position = AsyncMock(return_value=None)
-    runner.db.record_trade = AsyncMock(return_value=None)
-    runner.use_advanced_risk = False
+    runner.portfolio_id = "default"
+    runner.positions = {
+        "AAPL": Position(symbol="AAPL", quantity=quantity, avg_price=Decimal("100"))
+    }
+    runner.portfolio = Portfolio(100_000)
+    await runner.portfolio.update_fill(
+        "AAPL",
+        "BUY" if quantity > 0 else "SELL_SHORT",
+        abs(quantity),
+        100.0,
+    )
+    runner.stop_loss_monitor = _build_monitor()
+    await runner.stop_loss_monitor.add_stop_loss(
+        "AAPL",
+        runner.positions["AAPL"],
+        stop_percent=0.02,
+        stop_type=StopType.FIXED,
+    )
+    runner.use_advanced_risk = advanced
     runner.advanced_risk = None
+    if advanced:
+        runner.advanced_risk = AdvancedRiskManager(
+            {"starting_capital": 100_000},
+            enable_kelly=False,
+            enable_correlation_limits=False,
+            enable_kill_switch=True,
+        )
+        runner.advanced_risk.seed_position("AAPL", quantity, 100.0)
+        runner.advanced_risk.seed_realized_pnl(total_pnl=0.0, daily_pnl=0.0)
+    runner.db = MagicMock()
+    runner._daily_pnl_date = datetime.utcnow().date()
     return runner
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("current_qty", "stop_qty", "expected_qty", "expected_side"),
-    [
-        (15, 10, 5, "SELL"),
-        (-8, -5, -3, "BUY_TO_COVER"),
-    ],
+    ("pre_quantity", "post_quantity", "fill_quantity"),
+    [(10, 0, 10), (20, 10, 10), (-10, 0, 10), (-20, -10, 10)],
 )
-async def test_runner_stop_fill_reduces_only_filled_quantity(
-    current_qty,
-    stop_qty,
-    expected_qty,
-    expected_side,
+async def test_producer_receipt_projects_exact_fill_without_database_rewrite(
+    pre_quantity: int,
+    post_quantity: int,
+    fill_quantity: int,
 ) -> None:
-    from robo_trader.stop_loss_monitor import StopLossOrder
+    """The committed receipt, not the monitor callback, mutates runtime state."""
 
-    current = Position(symbol="AAPL", quantity=current_qty, avg_price=Decimal("123.45"))
-    runner = _runner_for_stop_fill(current)
-    monitor = _build_monitor()
-    replacement = await monitor.add_stop_loss(
-        "AAPL",
-        current,
-        stop_percent=0.05,
-        stop_type=StopType.FIXED,
+    runner = await _runner_for_receipt_projection(pre_quantity)
+    request = _paper_settlement_request(
+        pre_quantity=pre_quantity,
+        post_quantity=post_quantity,
+        fill_quantity=fill_quantity,
     )
-    runner.stop_loss_monitor = monitor
-    stop = StopLossOrder(
-        symbol="AAPL",
-        position_qty=stop_qty,
-        stop_price=100.0,
-        entry_price=123.45,
-        stop_type=StopType.FIXED,
-        created_at=datetime.now(),
-    )
-    result = ExecutionResult(True, "filled", fill_price=99.0)
+    projection = await runner._apply_paper_terminal_settlement(_paper_settlement_receipt(request))
 
-    await runner._on_stop_loss_executed(stop, result)
-
-    assert runner.positions["AAPL"].quantity == expected_qty
-    assert float(runner.positions["AAPL"].avg_price) == pytest.approx(123.45)
-    assert replacement.position_qty == expected_qty
-    runner.db.record_trade.assert_awaited_once_with(
-        "AAPL",
-        expected_side,
-        abs(stop_qty),
-        99.0,
-        0,
-    )
-    runner.db.update_position.assert_awaited_once_with(
-        "AAPL",
-        expected_qty,
-        123.45,
-        99.0,
-    )
-    runner.portfolio.update_fill.assert_awaited_once_with(
-        "AAPL",
-        expected_side,
-        abs(stop_qty),
-        99.0,
-    )
+    assert projection.runner_position_quantity == Decimal(post_quantity)
+    assert projection.portfolio_position_quantity == Decimal(post_quantity)
+    assert runner.db.method_calls == []
+    stop = runner.stop_loss_monitor.active_stops.get("default:AAPL")
+    if post_quantity == 0:
+        assert stop is None
+        assert projection.protective_stop_quantity is None
+    else:
+        assert stop is not None
+        assert stop.position_qty == post_quantity
+        assert projection.protective_stop_quantity == Decimal(post_quantity)
 
 
 @pytest.mark.asyncio
-async def test_runner_stop_fill_exact_quantity_closes_position() -> None:
-    from robo_trader.stop_loss_monitor import StopLossOrder
+async def test_stop_settlement_projects_realized_loss_before_next_entry_risk_check() -> None:
+    """Stop fills update the daily-loss input even without a refresh callback."""
 
-    current = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
-    runner = _runner_for_stop_fill(current)
-    stop = StopLossOrder(
-        symbol="AAPL",
-        position_qty=10,
-        stop_price=98.0,
-        entry_price=100.0,
-        stop_type=StopType.FIXED,
-        created_at=datetime.now(),
+    runner = await _runner_for_receipt_projection(10)
+    request = _paper_settlement_request(
+        pre_quantity=10,
+        post_quantity=0,
+        fill_quantity=10,
     )
-    result = ExecutionResult(True, "filled", fill_price=97.5)
+    projection = await runner._apply_paper_terminal_settlement(_paper_settlement_receipt(request))
 
-    await runner._on_stop_loss_executed(stop, result)
+    assert projection.account_cash == Decimal("99975.0")
+    assert projection.account_realized_pnl == Decimal("-25.0")
+    assert projection.risk_visible_daily_pnl == Decimal("-25.0")
+    assert runner.daily_pnl == -25.0
 
-    assert "AAPL" not in runner.positions
-    runner.db.record_trade.assert_awaited_once()
-    runner.db.update_position.assert_awaited_once_with("AAPL", 0, 0.0, 97.5)
-
-
-@pytest.mark.asyncio
-async def test_runner_partial_old_fill_resizes_newer_replacement_stop() -> None:
-    from robo_trader.stop_loss_monitor import StopLossOrder
-
-    current = Position(symbol="AAPL", quantity=20, avg_price=Decimal("100"))
-    runner = _runner_for_stop_fill(current)
-    monitor = _build_monitor()
-    replacement = await monitor.add_stop_loss(
-        "AAPL",
-        current,
-        stop_percent=0.05,
-        stop_type=StopType.FIXED,
+    entry_risk = RiskManager(
+        max_daily_loss=20.0,
+        max_position_risk_pct=0.02,
+        max_symbol_exposure_pct=0.10,
+        max_leverage=1.0,
     )
-    runner.stop_loss_monitor = monitor
-    old_stop = StopLossOrder(
-        symbol="AAPL",
-        position_qty=10,
-        stop_price=98.0,
-        entry_price=100.0,
-        stop_type=StopType.FIXED,
-        created_at=datetime.now(),
+    allowed, reason = entry_risk.validate_order(
+        "MSFT",
+        1,
+        100.0,
+        100_000.0,
+        runner.daily_pnl,
+        {},
     )
-
-    await runner._on_stop_loss_executed(
-        old_stop,
-        ExecutionResult(True, "filled", fill_price=97.5),
-    )
-
-    assert runner.positions["AAPL"].quantity == 10
-    assert monitor.active_stops["default:AAPL"] is replacement
-    assert replacement.position_qty == 10
-    assert replacement.entry_price == pytest.approx(100.0)
-    assert replacement.stop_price == pytest.approx(95.0)
-
-
-@pytest.mark.asyncio
-async def test_runner_exact_old_fill_cancels_newer_replacement_stop() -> None:
-    from robo_trader.stop_loss_monitor import StopLossOrder, StopStatus
-
-    current = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
-    runner = _runner_for_stop_fill(current)
-    monitor = _build_monitor()
-    replacement = await monitor.add_stop_loss(
-        "AAPL",
-        current,
-        stop_percent=0.05,
-        stop_type=StopType.FIXED,
-    )
-    runner.stop_loss_monitor = monitor
-    old_stop = StopLossOrder(
-        symbol="AAPL",
-        position_qty=10,
-        stop_price=98.0,
-        entry_price=100.0,
-        stop_type=StopType.FIXED,
-        created_at=datetime.now(),
-    )
-
-    await runner._on_stop_loss_executed(
-        old_stop,
-        ExecutionResult(True, "filled", fill_price=97.5),
-    )
-
-    assert "AAPL" not in runner.positions
-    assert "default:AAPL" not in monitor.active_stops
-    assert replacement.status is StopStatus.CANCELLED
-
-
-@pytest.mark.asyncio
-async def test_runner_partial_fill_without_replacement_triggers_emergency() -> None:
-    from robo_trader.stop_loss_monitor import StopLossOrder
-
-    current = Position(symbol="AAPL", quantity=20, avg_price=Decimal("100"))
-    runner = _runner_for_stop_fill(current)
-    monitor = _build_monitor()
-    monitor.emergency_shutdown = AsyncMock(return_value=None)
-    runner.stop_loss_monitor = monitor
-    old_stop = StopLossOrder(
-        symbol="AAPL",
-        position_qty=10,
-        stop_price=98.0,
-        entry_price=100.0,
-        stop_type=StopType.FIXED,
-        created_at=datetime.now(),
-    )
-
-    await runner._on_stop_loss_executed(
-        old_stop,
-        ExecutionResult(True, "filled", fill_price=97.5),
-    )
-
-    assert runner.positions["AAPL"].quantity == 10
-    monitor.emergency_shutdown.assert_awaited_once()
-    assert "remaining signed_qty=10" in monitor.emergency_shutdown.await_args.args[0]
-
-
-@pytest.mark.asyncio
-async def test_runner_unsafe_replacement_triggers_emergency_without_partial_mutation() -> None:
-    from robo_trader.stop_loss_monitor import StopLossOrder
-
-    current = Position(symbol="AAPL", quantity=20, avg_price=Decimal("100"))
-    runner = _runner_for_stop_fill(current)
-    monitor = _build_monitor()
-    monitor.emergency_shutdown = AsyncMock(return_value=None)
-    unsafe_replacement = await monitor.add_stop_loss(
-        "AAPL",
-        Position(symbol="AAPL", quantity=-20, avg_price=Decimal("100")),
-        stop_percent=0.05,
-        stop_type=StopType.FIXED,
-    )
-    original_replacement_state = (
-        unsafe_replacement.position_qty,
-        unsafe_replacement.entry_price,
-        unsafe_replacement.stop_price,
-    )
-    runner.stop_loss_monitor = monitor
-    old_stop = StopLossOrder(
-        symbol="AAPL",
-        position_qty=10,
-        stop_price=98.0,
-        entry_price=100.0,
-        stop_type=StopType.FIXED,
-        created_at=datetime.now(),
-    )
-
-    await runner._on_stop_loss_executed(
-        old_stop,
-        ExecutionResult(True, "filled", fill_price=97.5),
-    )
-
-    assert runner.positions["AAPL"].quantity == 10
-    assert (
-        unsafe_replacement.position_qty,
-        unsafe_replacement.entry_price,
-        unsafe_replacement.stop_price,
-    ) == original_replacement_state
-    monitor.emergency_shutdown.assert_awaited_once()
+    assert allowed is False
+    assert reason == "Daily loss limit reached"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "current",
+    ("starting_quantity", "first_mark", "first_fill", "second_mark", "second_fill"),
     [
-        None,
-        Position(symbol="AAPL", quantity=-10, avg_price=Decimal("100")),
-        Position(symbol="AAPL", quantity=5, avg_price=Decimal("100")),
+        (10, Decimal("110"), Decimal("109"), Decimal("112"), Decimal("111")),
+        (-10, Decimal("90"), Decimal("91"), Decimal("88"), Decimal("89")),
     ],
-    ids=["absent", "opposite", "too-small"],
 )
-async def test_runner_stop_fill_divergence_preserves_current_state_and_records_trade(
-    current,
-    caplog,
+async def test_sequential_reductions_preserve_exact_mark_to_market_daily_pnl(
+    starting_quantity: int,
+    first_mark: Decimal,
+    first_fill: Decimal,
+    second_mark: Decimal,
+    second_fill: Decimal,
 ) -> None:
+    """Partial then full exits converge before and after every refresh."""
+
+    runner = await _runner_for_receipt_projection(starting_quantity, advanced=True)
+    runner._daily_pnl_date = datetime.utcnow().date()
+    runner._starting_unrealized_today_exact = Decimal("25")
+    runner._starting_unrealized_today = 25.0
+    runner.daily_pnl = -25.0
+    runner._daily_pnl_exact = Decimal("-25")
+    # Cached runtime state deliberately disagrees; only producer-owned receipt
+    # evidence may replace it before the post-settlement refresh.
+    runner.latest_prices = {"AAPL": 123.0}
+    runner.advanced_risk.seed_realized_pnl(total_pnl=0.0, daily_pnl=-25.0)
+
+    first = _paper_settlement_request(
+        pre_quantity=starting_quantity,
+        post_quantity=5 if starting_quantity > 0 else -5,
+        fill_quantity=5,
+        mark_price=first_mark,
+        fill_price=first_fill,
+        pre_daily_pnl=Decimal("-25"),
+        daily_pnl_baseline=Decimal("25"),
+        pre_mark_price=Decimal("100"),
+    )
+    first_projection = await runner._apply_paper_terminal_settlement(
+        _paper_settlement_receipt(first)
+    )
+
+    assert first_projection.risk_visible_daily_pnl == Decimal("70")
+    assert runner.latest_prices["AAPL"] == float(first_mark)
+    assert runner.latest_price_sources["AAPL"] == ("paper-terminal-settlement-protective-quote")
+    assert runner.advanced_risk.daily_pnl == 70.0
+    assert await runner._refresh_daily_pnl() == 70.0
+    assert runner.advanced_risk.daily_pnl == 70.0
+
+    second = _paper_settlement_request(
+        pre_quantity=5 if starting_quantity > 0 else -5,
+        post_quantity=0,
+        fill_quantity=5,
+        mark_price=second_mark,
+        fill_price=second_fill,
+        pre_cash=Decimal("99545") if starting_quantity > 0 else Decimal("100545"),
+        pre_realized_pnl=Decimal("45"),
+        pre_daily_pnl=Decimal("70"),
+        daily_pnl_baseline=Decimal("25"),
+        pre_mark_price=first_mark,
+    )
+    second_projection = await runner._apply_paper_terminal_settlement(
+        _paper_settlement_receipt(second)
+    )
+
+    assert second_projection.account_realized_pnl == Decimal("100")
+    assert second_projection.risk_visible_daily_pnl == Decimal("75")
+    assert runner.advanced_risk.total_pnl == 100.0
+    assert runner.advanced_risk.daily_pnl == 75.0
+    assert await runner._refresh_daily_pnl() == 75.0
+    assert runner.advanced_risk.daily_pnl == 75.0
+
+
+@pytest.mark.asyncio
+async def test_exact_settled_callback_is_noop_and_cannot_duplicate_mutation() -> None:
+    from robo_trader.runner_async import AsyncRunner
     from robo_trader.stop_loss_monitor import StopLossOrder
 
-    runner = _runner_for_stop_fill(current)
-    runner.stop_loss_monitor = SimpleNamespace(
-        emergency_shutdown=AsyncMock(return_value=None),
-    )
-    before = runner.positions.get("AAPL")
+    runner = AsyncRunner.__new__(AsyncRunner)
+    AsyncRunner.__init__(runner)
+    position = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
+    runner.positions = {"AAPL": position}
+    runner.portfolio = MagicMock()
+    runner.db = MagicMock()
     stop = StopLossOrder(
         symbol="AAPL",
         position_qty=10,
         stop_price=98.0,
         entry_price=100.0,
         stop_type=StopType.FIXED,
-        created_at=datetime.now(),
+        created_at=datetime.now(timezone.utc),
     )
-    result = ExecutionResult(True, "filled", fill_price=97.5)
+    order = Order(
+        symbol="AAPL",
+        quantity=10,
+        side="SELL",
+        order_ref="stop:v1:" + ("6" * 64),
+    )
 
-    await runner._on_stop_loss_executed(stop, result)
+    await runner._on_stop_loss_executed(stop, _filled_terminal_outcome(order))
 
-    assert runner.positions.get("AAPL") is before
-    runner.db.record_trade.assert_awaited_once_with("AAPL", "SELL", 10, 97.5, 0)
-    runner.db.update_position.assert_not_awaited()
-    runner.portfolio.update_fill.assert_not_awaited()
-    runner.stop_loss_monitor.emergency_shutdown.assert_awaited_once()
-    assert "event=stop_fill_state_divergence" in caplog.text
+    assert runner.positions["AAPL"] is position
+    assert runner.portfolio.method_calls == []
+    assert runner.db.method_calls == []
+    assert runner._emergency_entry_freeze_reason is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_stop_fill_result_freezes_entries_without_mutation() -> None:
+    from robo_trader.runner_async import AsyncRunner
+    from robo_trader.stop_loss_monitor import StopLossOrder
+
+    runner = AsyncRunner.__new__(AsyncRunner)
+    AsyncRunner.__init__(runner)
+    position = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
+    runner.positions = {"AAPL": position}
+    runner.portfolio = MagicMock()
+    runner.db = MagicMock()
+    stop = StopLossOrder(
+        symbol="AAPL",
+        position_qty=10,
+        stop_price=98.0,
+        entry_price=100.0,
+        stop_type=StopType.FIXED,
+        created_at=datetime.now(timezone.utc),
+    )
+
+    await runner._on_stop_loss_executed(
+        stop,
+        ExecutionResult(True, "legacy fill", fill_price=97.5),
+    )
+
+    assert runner.positions["AAPL"] is position
+    assert runner.portfolio.method_calls == []
+    assert runner.db.method_calls == []
+    assert "no exact settled local-paper outcome" in (runner._emergency_entry_freeze_reason or "")
 
 
 # ---------------------------------------------------------------------------

@@ -6,13 +6,17 @@ Gateway restart on attempt >=3, returns bool, mutex via _recovery_lock.
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from robo_trader.connection_health import HealthStatus
 from robo_trader.paper_reduction_gateway import PaperReductionGateway
+from robo_trader.protective_quote_evidence import ProtectiveQuoteSource
+from robo_trader.risk_manager import Position
 from robo_trader.runner_async import AsyncRunner
+from robo_trader.stop_loss_monitor import StopLossMonitor
 
 
 def make_runner_for_recovery(initialize_succeeds_on=None):
@@ -240,12 +244,8 @@ async def test_recovery_in_progress_flag_set_and_cleared():
 
 
 @pytest.mark.asyncio
-async def test_recovery_rewarms_stop_loss_monitor_with_cached_prices():
-    """Recovery offers each cached price together with its broker event time.
-
-    The real stop monitor remains authoritative about whether that event is
-    sufficiently fresh to accept.
-    """
+async def test_recovery_cannot_rewarm_from_cached_prices_without_new_lineage():
+    """Cached labels cannot manufacture quote authority after reconnect."""
     runner = make_runner_for_recovery(initialize_succeeds_on=1)
     runner.latest_prices = {"AAPL": 150.0, "NVDA": 500.0, "TSLA": 200.0}
     event_time = datetime.now(timezone.utc)
@@ -274,15 +274,8 @@ async def test_recovery_rewarms_stop_loss_monitor_with_cached_prices():
     with patch("robo_trader.runner_async.asyncio.sleep", AsyncMock()):
         result = await runner.recover_connection("test")
 
-    assert result is True
-    # Both active stops have symbols present in latest_prices → both rewarmed
-    assert runner.stop_loss_monitor.update_price.await_count == 2
-    rewarmed_symbols = {
-        call.args[0] for call in runner.stop_loss_monitor.update_price.await_args_list
-    }
-    assert rewarmed_symbols == {"AAPL", "NVDA"}
-    for call in runner.stop_loss_monitor.update_price.await_args_list:
-        assert call.kwargs["source_timestamp"] is event_time
+    assert result is False
+    runner.stop_loss_monitor.update_price.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -307,11 +300,7 @@ async def test_recovery_skips_stops_with_no_cached_price():
         result = await runner.recover_connection("test")
 
     assert result is False
-    runner.stop_loss_monitor.update_price.assert_awaited_once_with(
-        "AAPL",
-        150.0,
-        source_timestamp=event_time,
-    )
+    runner.stop_loss_monitor.update_price.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -345,45 +334,58 @@ async def test_recovery_rewarm_handles_per_symbol_failures():
         result = await runner.recover_connection("test")
 
     assert result is False
-    # NVDA was still attempted so AAPL's failure did not hide other evidence.
-    assert runner.stop_loss_monitor.update_price.await_count == 2
+    runner.stop_loss_monitor.update_price.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_recovery_accepts_exact_fresh_event_already_owned_by_monitor():
-    """A duplicate-timestamp rejection is safe when exact evidence is fresh."""
+    """A new transport callback may republish exact authority during reconnect."""
     runner = make_runner_for_recovery(initialize_succeeds_on=1)
-    now = datetime(2026, 7, 23, 15, 0, 5, tzinfo=timezone.utc)
-    event_time = now - timedelta(seconds=2)
+    runner.portfolio_id = "default"
+    now = datetime.now(timezone.utc)
+    event_time = now
     runner.latest_prices = {"AAPL": 150.0}
     runner.latest_price_times = {"AAPL": event_time}
     runner.latest_price_sources = {"AAPL": "live_protective"}
-    runner._protective_feed_status = {
-        "AAPL": {
-            "available": True,
-            "live_grade": True,
-            "source": "live_protective",
+    monitor = StopLossMonitor(
+        execute_reduction=AsyncMock(),
+        risk_manager=MagicMock(),
+    )
+    await monitor.add_stop_loss(
+        "AAPL",
+        Position("AAPL", 10, Decimal("100")),
+    )
+    runner.stop_loss_monitor = monitor
+
+    async def initialize_with_new_transport_quote() -> None:
+        assert await monitor.update_price(
+            "AAPL",
+            150.0,
+            source_timestamp=event_time,
+            source=ProtectiveQuoteSource.LIVE_BROKER,
+            con_id=265598,
+            transport_generation="recovered-generation",
+            source_event_id="recovery-ticker-1",
+        )
+        runner._protective_feed_status = {
+            "AAPL": {
+                "available": True,
+                "live_grade": True,
+                "source": "live_protective",
+                "con_id": 265598,
+                "transport_generation": "recovered-generation",
+            }
         }
-    }
-    runner.stop_loss_monitor = MagicMock()
-    runner.stop_loss_monitor.active_stops = {"default:AAPL": MagicMock(symbol="AAPL")}
-    runner.stop_loss_monitor.update_price = AsyncMock(return_value=False)
-    runner.stop_loss_monitor.last_prices = {"AAPL": 150.0}
-    runner.stop_loss_monitor.price_event_times = {"AAPL": event_time}
-    runner.stop_loss_monitor.price_receipt_monotonic = {"AAPL": 998.0}
-    runner.stop_loss_monitor._utcnow = MagicMock(return_value=now)
-    runner.stop_loss_monitor._monotonic = MagicMock(return_value=1000.0)
-    runner.stop_loss_monitor.max_price_age_seconds = 10
+
+    runner.initialize_connection = initialize_with_new_transport_quote
 
     with patch("robo_trader.runner_async.asyncio.sleep", AsyncMock()):
         result = await runner.recover_connection("test")
 
     assert result is True
-    runner.stop_loss_monitor.update_price.assert_awaited_once_with(
-        "AAPL",
-        150.0,
-        source_timestamp=event_time,
-    )
+    quote = monitor.get_protective_quote_evidence("AAPL")
+    assert quote is not None
+    assert quote.transport_generation == "recovered-generation"
 
 
 @pytest.mark.asyncio
@@ -442,7 +444,7 @@ async def test_recovery_rejects_nonexact_or_unfresh_monitor_evidence(
         result = await runner.recover_connection("test")
 
     assert result is False
-    runner.stop_loss_monitor.update_price.assert_awaited_once()
+    runner.stop_loss_monitor.update_price.assert_not_awaited()
     assert runner._safe_disconnect.await_count == 2
 
 
@@ -484,7 +486,7 @@ async def test_stale_cached_event_after_backoff_keeps_recovery_unhealthy():
     runner.health.record_success.assert_not_called()
     runner.advanced_risk.kill_switch.reset.assert_not_called()
     runner.initialize_connection.assert_awaited_once()
-    runner.stop_loss_monitor.update_price.assert_awaited_once()
+    runner.stop_loss_monitor.update_price.assert_not_awaited()
     assert runner._safe_disconnect.await_count == 2
 
 
