@@ -42,8 +42,19 @@ class _StubRiskManager:
     pass
 
 
+def _reduction_callback(executor):
+    async def execute(stop, order: Order) -> ExecutionResult:
+        del stop
+        return await executor.place_order_async(order)
+
+    return execute
+
+
 def _build_monitor() -> StopLossMonitor:
-    return StopLossMonitor(executor=_StubExecutor(), risk_manager=_StubRiskManager())
+    return StopLossMonitor(
+        execute_reduction=_reduction_callback(_StubExecutor()),
+        risk_manager=_StubRiskManager(),
+    )
 
 
 def _build_config(default_cash: float = 100_000.0) -> SimpleNamespace:
@@ -530,7 +541,10 @@ async def test_execute_stop_loss_passes_trigger_price_tcn_h5() -> None:
             captured["order"] = order
             return ExecutionResult(True, "captured", fill_price=order.price)
 
-    monitor = StopLossMonitor(executor=_Capturing(), risk_manager=_StubRiskManager())
+    monitor = StopLossMonitor(
+        execute_reduction=_reduction_callback(_Capturing()),
+        risk_manager=_StubRiskManager(),
+    )
     pos = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
     await monitor.add_stop_loss("AAPL", pos, stop_percent=0.02, stop_type=StopType.FIXED)
     stop = monitor.active_stops["default:AAPL"]
@@ -542,6 +556,85 @@ async def test_execute_stop_loss_passes_trigger_price_tcn_h5() -> None:
         "Order must carry trigger_price; otherwise paper executor returns "
         "'No reference price for market order' and the stop never fills."
     )
+
+
+def test_stop_monitor_exposes_only_narrow_reduction_callback() -> None:
+    monitor = _build_monitor()
+
+    assert not hasattr(monitor, "executor")
+    assert callable(monitor._execute_reduction)
+    with pytest.raises(TypeError):
+        StopLossMonitor(executor=object(), risk_manager=_StubRiskManager())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("quantity", "expected_side"),
+    [(10, "SELL"), (-10, "BUY_TO_COVER")],
+)
+async def test_stop_order_side_and_order_ref_are_stable(
+    quantity: int,
+    expected_side: str,
+) -> None:
+    created_at = datetime(2026, 7, 25, 14, 30, tzinfo=timezone.utc)
+
+    async def capture_once() -> Order:
+        orders: list[Order] = []
+
+        async def execute_reduction(_stop, order: Order) -> ExecutionResult:
+            orders.append(order)
+            return ExecutionResult(False, "test rejection")
+
+        monitor = StopLossMonitor(
+            execute_reduction=execute_reduction,
+            risk_manager=_StubRiskManager(),
+            portfolio_id="stable-portfolio",
+        )
+        position = Position(symbol="AAPL", quantity=quantity, avg_price=Decimal("100"))
+        stop = await monitor.add_stop_loss("AAPL", position, stop_percent=0.02)
+        stop.created_at = created_at
+        stop.trigger_price = 97.0 if quantity > 0 else 103.0
+
+        assert await monitor.execute_stop_loss(stop) is False
+        assert len(orders) == 1
+        return orders[0]
+
+    first = await capture_once()
+    second = await capture_once()
+
+    assert first.side == expected_side
+    assert second.side == expected_side
+    assert first.order_ref == second.order_ref
+    assert first.order_ref.startswith("stop:v1:")
+    assert len(first.order_ref) == 72
+
+
+@pytest.mark.asyncio
+async def test_stop_order_ref_stays_fixed_width_at_valid_portfolio_boundary() -> None:
+    orders: list[Order] = []
+
+    async def execute_reduction(_stop, order: Order) -> ExecutionResult:
+        orders.append(order)
+        return ExecutionResult(False, "test rejection")
+
+    monitor = StopLossMonitor(
+        execute_reduction=execute_reduction,
+        risk_manager=_StubRiskManager(),
+        portfolio_id="p" * 64,
+    )
+    position = Position(
+        symbol="AAPL",
+        quantity=999_999_999,
+        avg_price=Decimal("999999.9999"),
+    )
+    stop = await monitor.add_stop_loss("AAPL", position, stop_percent=0.02)
+    stop.created_at = datetime(2026, 7, 25, 14, 30, tzinfo=timezone.utc)
+    stop.trigger_price = 999_999.9999
+
+    assert await monitor.execute_stop_loss(stop) is False
+    assert len(orders) == 1
+    assert orders[0].order_ref.startswith("stop:v1:")
+    assert len(orders[0].order_ref) == 72
 
 
 # ---------------------------------------------------------------------------
@@ -645,7 +738,7 @@ async def test_stop_loss_execution_invokes_position_closed_callback_tcn_h4() -> 
             return ExecutionResult(True, "ok", fill_price=order.price)
 
     monitor = StopLossMonitor(
-        executor=_OkExecutor(),
+        execute_reduction=_reduction_callback(_OkExecutor()),
         risk_manager=_StubRiskManager(),
         position_closed_callback=cb,
     )
@@ -678,7 +771,7 @@ async def test_stop_loss_callback_failure_does_not_crash_monitor_tcn_h4() -> Non
             return ExecutionResult(True, "ok", fill_price=order.price)
 
     monitor = StopLossMonitor(
-        executor=_OkExecutor(),
+        execute_reduction=_reduction_callback(_OkExecutor()),
         risk_manager=_StubRiskManager(),
         position_closed_callback=bad_cb,
     )
@@ -715,7 +808,7 @@ async def test_filled_old_stop_preserves_replacement_without_retry() -> None:
         callback_calls += 1
 
     monitor = StopLossMonitor(
-        executor=executor,
+        execute_reduction=_reduction_callback(executor),
         risk_manager=_StubRiskManager(),
         position_closed_callback=callback,
     )
@@ -740,7 +833,7 @@ async def test_filled_old_stop_preserves_replacement_without_retry() -> None:
 async def test_filled_cancelled_stop_is_not_resubmitted() -> None:
     executor = _GatedSuccessfulExecutor()
     monitor = StopLossMonitor(
-        executor=executor,
+        execute_reduction=_reduction_callback(executor),
         risk_manager=_StubRiskManager(),
     )
     position = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
@@ -763,7 +856,7 @@ async def test_filled_cancelled_stop_is_not_resubmitted() -> None:
 async def test_cancelled_replacement_from_trigger_batch_cannot_execute() -> None:
     executor = _GatedSuccessfulExecutor()
     monitor = StopLossMonitor(
-        executor=executor,
+        execute_reduction=_reduction_callback(executor),
         risk_manager=_StubRiskManager(),
     )
     position = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
@@ -775,79 +868,66 @@ async def test_cancelled_replacement_from_trigger_batch_cannot_execute() -> None
     assert executor.calls == 0
 
 
-class _DefinitiveRejectExecutor:
-    def __init__(self) -> None:
-        self.calls = 0
-
-    async def place_order_async(self, _order: Order) -> ExecutionResult:
-        self.calls += 1
-        return ExecutionResult(False, "definitive rejection")
-
-
 @pytest.mark.asyncio
-async def test_cancel_during_reject_backoff_prevents_obsolete_retry(monkeypatch) -> None:
-    executor = _DefinitiveRejectExecutor()
+async def test_rejected_stop_calls_reduction_callback_exactly_once() -> None:
+    execute_reduction = AsyncMock(return_value=ExecutionResult(False, "definitive rejection"))
     monitor = StopLossMonitor(
-        executor=executor,
+        execute_reduction=execute_reduction,
         risk_manager=_StubRiskManager(),
     )
     position = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
     stop = await monitor.add_stop_loss("AAPL", position, stop_percent=0.02)
     stop.trigger_price = 97.0
-    retry_sleep_started = asyncio.Event()
-    release_retry_sleep = asyncio.Event()
 
-    async def controlled_retry_sleep(_seconds) -> None:
-        retry_sleep_started.set()
-        await release_retry_sleep.wait()
+    assert await monitor.execute_stop_loss(stop) is False
 
-    monkeypatch.setattr(
-        "robo_trader.stop_loss_monitor.asyncio.sleep",
-        controlled_retry_sleep,
-    )
-    execution = asyncio.create_task(monitor.execute_stop_loss(stop))
-    await retry_sleep_started.wait()
-    assert monitor.cancel_stop("AAPL") is True
-    release_retry_sleep.set()
-
-    assert await execution is False
-    assert executor.calls == 1
-    assert stop.status.name == "CANCELLED"
-    assert monitor.metrics.failed_today == 0
+    execute_reduction.assert_awaited_once()
+    assert stop.status.name == "FAILED"
+    assert monitor.metrics.failed_today == 1
 
 
 @pytest.mark.asyncio
-async def test_replacement_during_reject_backoff_prevents_old_retry(monkeypatch) -> None:
-    executor = _DefinitiveRejectExecutor()
+@pytest.mark.parametrize("failure", ["exception", "wrong_type", "invalid_fill"])
+async def test_ambiguous_stop_callback_failure_is_never_retried(failure: str) -> None:
+    if failure == "exception":
+        execute_reduction = AsyncMock(side_effect=RuntimeError("transport failed"))
+    elif failure == "wrong_type":
+        execute_reduction = AsyncMock(return_value=SimpleNamespace(ok=True, fill_price=97.0))
+    else:
+        execute_reduction = AsyncMock(
+            return_value=ExecutionResult(True, "bad fill", fill_price=float("nan"))
+        )
     monitor = StopLossMonitor(
-        executor=executor,
+        execute_reduction=execute_reduction,
+        risk_manager=_StubRiskManager(),
+    )
+    position = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
+    stop = await monitor.add_stop_loss("AAPL", position, stop_percent=0.02)
+    stop.trigger_price = 97.0
+
+    assert await monitor.execute_stop_loss(stop) is False
+
+    execute_reduction.assert_awaited_once()
+    assert stop.status.name == "FAILED"
+    assert monitor.metrics.failed_today == 1
+
+
+@pytest.mark.asyncio
+async def test_replacement_before_stop_call_prevents_dispatch() -> None:
+    execute_reduction = AsyncMock()
+    monitor = StopLossMonitor(
+        execute_reduction=execute_reduction,
         risk_manager=_StubRiskManager(),
     )
     position = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
     old_stop = await monitor.add_stop_loss("AAPL", position, stop_percent=0.02)
-    old_stop.trigger_price = 97.0
-    retry_sleep_started = asyncio.Event()
-    release_retry_sleep = asyncio.Event()
-
-    async def controlled_retry_sleep(_seconds) -> None:
-        retry_sleep_started.set()
-        await release_retry_sleep.wait()
-
-    monkeypatch.setattr(
-        "robo_trader.stop_loss_monitor.asyncio.sleep",
-        controlled_retry_sleep,
-    )
-    execution = asyncio.create_task(monitor.execute_stop_loss(old_stop))
-    await retry_sleep_started.wait()
     replacement = await monitor.add_stop_loss("AAPL", position, stop_percent=0.05)
-    release_retry_sleep.set()
 
-    assert await execution is False
-    assert executor.calls == 1
+    assert await monitor.execute_stop_loss(old_stop) is False
+
+    execute_reduction.assert_not_awaited()
     assert old_stop.status.name == "CANCELLED"
     assert monitor.active_stops["default:AAPL"] is replacement
-    assert replacement.status.name == "PENDING"
-    assert monitor.metrics.failed_today == 0
 
 
 @pytest.mark.asyncio
@@ -864,7 +944,7 @@ async def test_post_fill_cleanup_exception_never_resubmits_order() -> None:
         callback_calls += 1
 
     monitor = StopLossMonitor(
-        executor=executor,
+        execute_reduction=_reduction_callback(executor),
         risk_manager=_StubRiskManager(),
         position_closed_callback=callback,
     )
@@ -1290,12 +1370,8 @@ def test_config_does_not_silently_flip_readonly_b_12(monkeypatch):
     """
     monkeypatch.setenv("ENVIRONMENT", "production")
     monkeypatch.delenv("IBKR_LIVE_ALLOW_ORDERS", raising=False)
-    # Force reload of the config module so the env vars take effect.
-    import importlib
-
     import robo_trader.config as cfg_mod
 
-    importlib.reload(cfg_mod)
     try:
         cfg = cfg_mod.load_config()
     except Exception:

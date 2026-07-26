@@ -9,6 +9,7 @@ from decimal import Decimal
 import aiosqlite
 import pytest
 
+from robo_trader.config import RuntimeContract
 from robo_trader.database_async import (
     AsyncTradingDatabase,
     SafetyAllocationSnapshotError,
@@ -63,6 +64,29 @@ async def _insert_position(
         await conn.commit()
 
 
+async def _snapshot(
+    database: AsyncTradingDatabase,
+    symbol: str = "AAPL",
+):
+    return await database.get_safety_allocation_snapshot(
+        symbol,
+        runtime_contract=RuntimeContract(
+            environment="dev",
+            execution_mode="paper",
+            execution_source="paper_simulator",
+            ibkr_host="127.0.0.1",
+            ibkr_port=4002,
+            ibkr_readonly=True,
+            database_path=str(database.db_path),
+            account_alias="***1234",
+            account_type="paper",
+            model_artifact_set="test-models",
+            build_id="test-build",
+            state_namespace="paper",
+        ),
+    )
+
+
 @pytest.mark.asyncio
 async def test_snapshot_computes_exact_aggregate_offsetting_and_zero_allocations(
     allocation_db,
@@ -74,7 +98,7 @@ async def test_snapshot_computes_exact_aggregate_offsetting_and_zero_allocations
     await _insert_position(allocation_db, "short_book", -3)
 
     before_snapshot = datetime.now(timezone.utc)
-    snapshot = await allocation_db.get_safety_allocation_snapshot("aapl")
+    snapshot = await _snapshot(allocation_db, "aapl")
     after_snapshot = datetime.now(timezone.utc)
 
     assert snapshot.symbol == "AAPL"
@@ -100,7 +124,7 @@ async def test_snapshot_computes_exact_aggregate_offsetting_and_zero_allocations
     with pytest.raises(FrozenInstanceError):
         snapshot.allocations[0].quantity = Decimal("999")
 
-    second = await allocation_db.get_safety_allocation_snapshot("AAPL")
+    second = await _snapshot(allocation_db)
     assert second.snapshot_id != snapshot.snapshot_id
     assert second.observed_at >= snapshot.observed_at
 
@@ -147,7 +171,7 @@ async def test_snapshot_is_one_coherent_read_during_concurrent_writer(
 
     writer_task = asyncio.create_task(writer())
     await writer_started.wait()
-    snapshots = [await allocation_db.get_safety_allocation_snapshot("AAPL") for _ in range(40)]
+    snapshots = [await _snapshot(allocation_db) for _ in range(40)]
     await writer_task
 
     for snapshot in snapshots:
@@ -167,7 +191,7 @@ async def test_snapshot_rejects_non_integer_quantity_storage(allocation_db, quan
     await _insert_position(allocation_db, "malformed", quantity)
 
     with pytest.raises(SafetyAllocationSnapshotError, match="not stored as an integer"):
-        await allocation_db.get_safety_allocation_snapshot("AAPL")
+        await _snapshot(allocation_db)
 
 
 @pytest.mark.asyncio
@@ -176,7 +200,7 @@ async def test_snapshot_rejects_noncanonical_stored_symbol(allocation_db):
     await _insert_position(allocation_db, "malformed", 10, symbol="aapl")
 
     with pytest.raises(SafetyAllocationSnapshotError, match="noncanonical or mismatched symbol"):
-        await allocation_db.get_safety_allocation_snapshot("AAPL")
+        await _snapshot(allocation_db)
 
 
 @pytest.mark.asyncio
@@ -185,7 +209,7 @@ async def test_snapshot_rejects_invalid_portfolio_id(allocation_db):
     await _insert_position(allocation_db, "bad id", 10)
 
     with pytest.raises(SafetyAllocationSnapshotError, match="invalid portfolio_id"):
-        await allocation_db.get_safety_allocation_snapshot("AAPL")
+        await _snapshot(allocation_db)
 
 
 @pytest.mark.asyncio
@@ -193,7 +217,7 @@ async def test_snapshot_rejects_orphaned_position(allocation_db):
     await _insert_position(allocation_db, "orphan", 10)
 
     with pytest.raises(SafetyAllocationSnapshotError, match="orphaned"):
-        await allocation_db.get_safety_allocation_snapshot("AAPL")
+        await _snapshot(allocation_db)
 
 
 @pytest.mark.asyncio
@@ -203,7 +227,7 @@ async def test_snapshot_distinguishes_historical_mutation_time_from_fresh_observ
     await _insert_portfolio(allocation_db, "stale")
     await _insert_position(allocation_db, "stale", 10, timestamp=_timestamp(age_seconds=86400))
 
-    snapshot = await allocation_db.get_safety_allocation_snapshot("AAPL")
+    snapshot = await _snapshot(allocation_db)
     allocation = next(row for row in snapshot.allocations if row.portfolio_id == "stale")
     assert snapshot.observed_at - allocation.updated_at > timedelta(hours=23)
     assert datetime.now(timezone.utc) - snapshot.observed_at < timedelta(seconds=1)
@@ -217,7 +241,7 @@ async def test_snapshot_distinguishes_historical_mutation_time_from_fresh_observ
         await conn.commit()
 
     with pytest.raises(SafetyAllocationSnapshotError, match="invalid timestamp"):
-        await allocation_db.get_safety_allocation_snapshot("AAPL")
+        await _snapshot(allocation_db)
 
     async with allocation_db.get_connection() as conn:
         await conn.execute(
@@ -231,7 +255,7 @@ async def test_snapshot_distinguishes_historical_mutation_time_from_fresh_observ
         await conn.commit()
 
     with pytest.raises(SafetyAllocationSnapshotError, match="future timestamp"):
-        await allocation_db.get_safety_allocation_snapshot("AAPL")
+        await _snapshot(allocation_db)
 
 
 @pytest.mark.asyncio
@@ -258,7 +282,7 @@ async def test_snapshot_rejects_duplicate_allocation_rows(tmp_path):
         await _insert_position(database, "duplicate", 20)
 
         with pytest.raises(SafetyAllocationSnapshotError, match="duplicate allocation"):
-            await database.get_safety_allocation_snapshot("AAPL")
+            await _snapshot(database)
     finally:
         await database.close()
 
@@ -279,7 +303,7 @@ async def test_snapshot_does_not_delete_or_modify_user_data(allocation_db):
                 """).fetchall()
 
     before = read_rows()
-    await allocation_db.get_safety_allocation_snapshot("AAPL")
+    await _snapshot(allocation_db)
     after = read_rows()
 
     assert after == before
@@ -306,7 +330,7 @@ async def test_snapshot_uses_one_select_on_a_read_only_connection(allocation_db,
     monkeypatch.setattr(aiosqlite.Connection, "execute", tracked_execute)
     monkeypatch.setattr(aiosqlite, "connect", tracked_connect)
 
-    await allocation_db.get_safety_allocation_snapshot("AAPL")
+    await _snapshot(allocation_db)
 
     select_calls = [statement for statement in statements if statement.upper().startswith("SELECT")]
     assert len(select_calls) == 1

@@ -54,6 +54,7 @@ jobs:
     # R2-CFG-H1.x: fork guard — uploads coverage with CODECOV_TOKEN secret.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     env:
@@ -102,12 +103,18 @@ jobs:
       # whole suite except the integration subdir, which the integration leg
       # covers separately.
       run: |
-        pytest tests/ --ignore=tests/integration -v --cov=robo_trader --cov-report=xml --cov-report=html
+        timeout --signal=TERM --kill-after=30s 10m \
+          pytest tests/ --ignore=tests/integration -v \
+          -o faulthandler_timeout=120 \
+          --cov=robo_trader --cov-report=xml --cov-report=html
 
     - name: Run integration tests
       if: matrix.test-type == 'integration'
       run: |
-        pytest tests/integration/ -v --cov=robo_trader --cov-append
+        timeout --signal=TERM --kill-after=30s 10m \
+          pytest tests/integration/ -v \
+          -o faulthandler_timeout=120 \
+          --cov=robo_trader --cov-append
 
     - name: Run performance tests
       if: matrix.test-type == 'performance'

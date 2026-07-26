@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from robo_trader.config import _derive_safety_account_scope
 from robo_trader.reconciliation import cli as cli_module
 from robo_trader.reconciliation.cli import (
     EXIT_BLOCKED,
@@ -33,6 +34,7 @@ from robo_trader.reconciliation.models import (
 
 NOW = datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc)
 RAW_ACCOUNT = "DU1234567"
+SAFETY_SCOPE_KEY = "0123456789abcdef" * 4
 
 
 def _project(tmp_path: Path, *, valid_ibc: bool = True):
@@ -87,7 +89,8 @@ def _project(tmp_path: Path, *, valid_ibc: bool = True):
         "IBKR_ACCOUNT_TYPE": "paper",
         "RT_DB_PATH": "ledger.db",
         "RT_STATE_NAMESPACE": "paper",
-        "SAFETY_ACCOUNT_SCOPE": "acct_v1_" + ("0123456789abcdef" * 4),
+        "SAFETY_ACCOUNT_SCOPE_KEY": SAFETY_SCOPE_KEY,
+        "SAFETY_ACCOUNT_SCOPE": _derive_safety_account_scope(SAFETY_SCOPE_KEY, RAW_ACCOUNT),
         "SAFETY_JOURNAL_PATH": "safety-journal.db",
         "BUILD_ID": "test-build",
         "MODEL_ARTIFACT_SET": "test-models",

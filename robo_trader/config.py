@@ -6,6 +6,7 @@ with schema validation, environment-specific settings, and equity-specific const
 """
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -31,17 +32,58 @@ LIVE_PORTS = frozenset({7496, 4001})
 PAPER_ONLY_EXECUTION_SOURCE = "paper_simulator"
 BACKTEST_EXECUTION_SOURCE = "offline_backtest"
 _OPAQUE_SAFETY_ACCOUNT_SCOPE_RE = re.compile(r"^acct_v1_[0-9a-f]{64}$")
+_SAFETY_ACCOUNT_SCOPE_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
+_SAFETY_ACCOUNT_SCOPE_DOMAIN = b"robotrader-safety-account-scope-v1\0"
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _resolve_project_path(value: str) -> Path:
+def _legacy_safety_scope_migration_guidance() -> str:
+    return (
+        " Existing PR2B1 random-scope journals must remain stopped and be migrated "
+        "with scripts/manage_paper_safety_journal.py migrate-empty-legacy "
+        "--target <distinct-new-path> --confirm "
+        "MIGRATE-EMPTY-LEGACY-PAPER-SAFETY-JOURNAL."
+    )
+
+
+def _resolve_project_path(
+    value: str,
+    *,
+    project_root: Optional[Path] = None,
+) -> Path:
     path = Path(value).expanduser()
     if not path.is_absolute():
-        path = _PROJECT_ROOT / path
+        path = (_PROJECT_ROOT if project_root is None else Path(project_root)) / path
     return path.resolve(strict=False)
 
 
-def _resolve_project_path_preserving_leaf(value: str) -> Path:
+def _validated_safety_account_scope_key(raw_key: object) -> bytes:
+    key_text = str(raw_key or "")
+    if not _SAFETY_ACCOUNT_SCOPE_KEY_RE.fullmatch(key_text):
+        raise ConfigValidationError(
+            "SAFETY_ACCOUNT_SCOPE_KEY must be exactly 32 random bytes encoded as "
+            "64 lowercase hexadecimal characters"
+        )
+    if len(set(key_text)) < 8:
+        raise ConfigValidationError("SAFETY_ACCOUNT_SCOPE_KEY does not meet entropy checks")
+    return bytes.fromhex(key_text)
+
+
+def _derive_safety_account_scope(raw_key: object, account: str) -> str:
+    key = _validated_safety_account_scope_key(raw_key)
+    digest = hmac.new(
+        key,
+        _SAFETY_ACCOUNT_SCOPE_DOMAIN + account.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return "acct_v1_" + digest
+
+
+def _resolve_project_path_preserving_leaf(
+    value: str,
+    *,
+    project_root: Optional[Path] = None,
+) -> Path:
     """Anchor a protected path without following its final component.
 
     The safety journal validates the configured leaf with ``lstat`` and
@@ -52,7 +94,7 @@ def _resolve_project_path_preserving_leaf(value: str) -> Path:
 
     path = Path(value).expanduser()
     if not path.is_absolute():
-        path = _PROJECT_ROOT / path
+        path = (_PROJECT_ROOT if project_root is None else Path(project_root)) / path
     return path.parent.resolve(strict=False) / path.name
 
 
@@ -179,6 +221,8 @@ def _enabled(env: Mapping[str, str], name: str) -> bool:
 
 def load_runtime_contract_from_env(
     environ: Optional[Mapping[str, str]] = None,
+    *,
+    project_root: Optional[Path] = None,
 ) -> RuntimeContract:
     """Load and fail-closed validate the current paper-only runtime contract.
 
@@ -269,6 +313,13 @@ def load_runtime_contract_from_env(
     database_path = str(env.get("RT_DB_PATH", "trading_data.db")).strip()
     if not database_path:
         raise ConfigValidationError("RT_DB_PATH cannot be empty.")
+    # Bind relative ledger configuration to the project that produced this
+    # contract. Downstream database and evidence objects carry absolute,
+    # lexical-leaf paths, so retaining the raw relative string here would make
+    # the same configured ledger fail exact-identity checks at runtime.
+    database_path = str(
+        _resolve_project_path_preserving_leaf(database_path, project_root=project_root)
+    )
     state_namespace = _normalized_value(env, "RT_STATE_NAMESPACE", execution_mode)
     if state_namespace != execution_mode:
         raise ConfigValidationError(
@@ -276,8 +327,8 @@ def load_runtime_contract_from_env(
         )
     live_database_path = str(env.get("LIVE_RT_DB_PATH", "")).strip()
     if live_database_path:
-        paper_resolved = _resolve_project_path(database_path)
-        live_resolved = _resolve_project_path(live_database_path)
+        paper_resolved = _resolve_project_path(database_path, project_root=project_root)
+        live_resolved = _resolve_project_path(live_database_path, project_root=project_root)
         if paper_resolved == live_resolved:
             raise ConfigValidationError(
                 "RT_DB_PATH and LIVE_RT_DB_PATH must identify different ledgers."
@@ -304,23 +355,43 @@ def load_runtime_contract_from_env(
             raise ConfigValidationError(
                 "SAFETY_ACCOUNT_SCOPE must not be an unsalted hash of IBKR_ACCOUNT."
             )
+        try:
+            expected_safety_scope = _derive_safety_account_scope(
+                env.get("SAFETY_ACCOUNT_SCOPE_KEY"),
+                account,
+            )
+        except ConfigValidationError as exc:
+            raise ConfigValidationError(
+                str(exc) + _legacy_safety_scope_migration_guidance()
+            ) from exc
+        if not hmac.compare_digest(safety_account_scope, expected_safety_scope):
+            raise ConfigValidationError(
+                "SAFETY_ACCOUNT_SCOPE does not match the keyed paper-account binding."
+                + _legacy_safety_scope_migration_guidance()
+            )
 
         safety_journal_path = str(env.get("SAFETY_JOURNAL_PATH", "")).strip()
         if not safety_journal_path:
             raise ConfigValidationError(
                 "Supervised paper runtime requires a dedicated SAFETY_JOURNAL_PATH."
             )
-        journal_path = _resolve_project_path_preserving_leaf(safety_journal_path)
+        journal_path = _resolve_project_path_preserving_leaf(
+            safety_journal_path,
+            project_root=project_root,
+        )
         # Resolve only a separate comparison value. The stored path must keep
         # its lexical leaf so SafetyJournal can reject a symlink itself.
         journal_resolved = journal_path.resolve(strict=False)
-        database_resolved = _resolve_project_path(database_path)
+        database_resolved = _resolve_project_path(database_path, project_root=project_root)
         if journal_resolved == database_resolved:
             raise ConfigValidationError("SAFETY_JOURNAL_PATH must be separate from RT_DB_PATH.")
         safety_journal_path = str(journal_path)
         live_safety_journal_path = str(env.get("LIVE_SAFETY_JOURNAL_PATH", "")).strip()
         if live_safety_journal_path:
-            live_journal_resolved = _resolve_project_path(live_safety_journal_path)
+            live_journal_resolved = _resolve_project_path(
+                live_safety_journal_path,
+                project_root=project_root,
+            )
             if journal_resolved == live_journal_resolved:
                 raise ConfigValidationError(
                     "SAFETY_JOURNAL_PATH and LIVE_SAFETY_JOURNAL_PATH must differ."

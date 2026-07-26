@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from robo_trader.connection_health import HealthStatus
+from robo_trader.paper_reduction_gateway import PaperReductionGateway
 from robo_trader.runner_async import AsyncRunner
 
 
@@ -51,6 +52,41 @@ async def test_returns_true_on_first_attempt_success():
         result = await runner.recover_connection("test-reason")
     assert result is True
     assert runner.recovery_in_progress is False
+
+
+@pytest.mark.asyncio
+async def test_recovery_refreshes_separate_paper_gateway_before_success():
+    runner = make_runner_for_recovery(initialize_succeeds_on=1)
+    gateway = object.__new__(PaperReductionGateway)
+    gateway._started = True
+    gateway.refresh_diagnostic_connection = AsyncMock()
+    runner.paper_reduction_gateway = gateway
+
+    with patch("robo_trader.runner_async.asyncio.sleep", AsyncMock()):
+        result = await runner.recover_connection("shared Gateway recovered")
+
+    assert result is True
+    gateway.refresh_diagnostic_connection.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_recovery_fails_and_disconnects_when_paper_gateway_refresh_fails():
+    runner = make_runner_for_recovery(initialize_succeeds_on=1)
+    gateway = object.__new__(PaperReductionGateway)
+    gateway._started = False
+    gateway.refresh_diagnostic_connection = AsyncMock(
+        side_effect=RuntimeError("diagnostic reconnect failed")
+    )
+    runner.paper_reduction_gateway = gateway
+
+    with patch("robo_trader.runner_async.asyncio.sleep", AsyncMock()):
+        result = await runner.recover_connection("shared Gateway recovered")
+
+    assert result is False
+    assert gateway.refresh_diagnostic_connection.await_count == 5
+    # Every failed post-connect gateway refresh must disconnect the newly
+    # installed runner client before the next attempt or final False result.
+    assert runner._safe_disconnect.await_count == 10
 
 
 @pytest.mark.asyncio

@@ -2,8 +2,7 @@
 
 Per M1 (2026-05-22): four per-path kill-switch checks each emitted ERROR-level
 logs per cycle per symbol per side. Production showed 5000+ "KILL SWITCH ACTIVE"
-lines/hour when the switch was triggered and SELL signals kept resolving every
-15s against held positions.
+lines/hour when the switch was triggered and entry signals kept resolving.
 
 The fix:
 - Per-path checks are removed; the central _place_order_with_circuit_breaker
@@ -54,7 +53,7 @@ def _make_runner_with_triggered_kill_switch():
 async def test_kill_switch_log_fires_once_then_throttles():
     """10 rapid blocked calls for the same (symbol, action) → log fires exactly once."""
     runner = _make_runner_with_triggered_kill_switch()
-    order = Order(symbol="AAPL", quantity=10, side="SELL", price=150.0)
+    order = Order(symbol="AAPL", quantity=10, side="BUY", price=150.0)
 
     # Freeze monotonic time so all 10 calls fall in the same throttle window.
     with patch("robo_trader.runner_async.time.monotonic", return_value=1000.0):
@@ -81,7 +80,7 @@ async def test_kill_switch_log_fires_once_then_throttles():
 async def test_kill_switch_log_fires_again_after_throttle_window():
     """After 61s elapses, the log should fire again for the same (symbol, action)."""
     runner = _make_runner_with_triggered_kill_switch()
-    order = Order(symbol="AAPL", quantity=10, side="SELL", price=150.0)
+    order = Order(symbol="AAPL", quantity=10, side="BUY", price=150.0)
 
     # First call at t=1000 fires the log
     with patch("robo_trader.runner_async.time.monotonic", return_value=1000.0):
@@ -125,9 +124,9 @@ async def test_kill_switch_log_fires_again_after_throttle_window():
 
 @pytest.mark.asyncio
 async def test_kill_switch_log_keyed_by_symbol_and_action():
-    """(AAPL, SELL) and (AAPL, BUY) are distinct keys — both should log."""
+    """(AAPL, SELL_SHORT) and (AAPL, BUY) are distinct keys — both log."""
     runner = _make_runner_with_triggered_kill_switch()
-    sell_order = Order(symbol="AAPL", quantity=10, side="SELL", price=150.0)
+    sell_order = Order(symbol="AAPL", quantity=10, side="SELL_SHORT", price=150.0)
     buy_order = Order(symbol="AAPL", quantity=10, side="BUY", price=150.0)
 
     with patch("robo_trader.runner_async.time.monotonic", return_value=1000.0):
@@ -146,15 +145,15 @@ async def test_kill_switch_log_keyed_by_symbol_and_action():
     ]
     assert (
         len(gate_log_calls) == 2
-    ), f"Expected one log for (AAPL,SELL) and one for (AAPL,BUY); got {len(gate_log_calls)}"
+    ), f"Expected one log for each entry side; got {len(gate_log_calls)}"
 
 
 @pytest.mark.asyncio
 async def test_kill_switch_log_keyed_by_symbol_distinct_symbols_both_log():
-    """(AAPL, SELL) and (TSLA, SELL) are distinct keys — both should log."""
+    """Distinct entry symbols receive independent throttled logs."""
     runner = _make_runner_with_triggered_kill_switch()
-    aapl_order = Order(symbol="AAPL", quantity=10, side="SELL", price=150.0)
-    tsla_order = Order(symbol="TSLA", quantity=10, side="SELL", price=200.0)
+    aapl_order = Order(symbol="AAPL", quantity=10, side="BUY", price=150.0)
+    tsla_order = Order(symbol="TSLA", quantity=10, side="BUY", price=200.0)
 
     with patch("robo_trader.runner_async.time.monotonic", return_value=1000.0):
         with patch("robo_trader.runner_async.logger") as mock_logger:
@@ -173,7 +172,7 @@ async def test_kill_switch_log_keyed_by_symbol_distinct_symbols_both_log():
 async def test_order_blocked_on_every_call_even_when_log_suppressed():
     """Functionality preserved: every call returns ok=False even if log suppressed."""
     runner = _make_runner_with_triggered_kill_switch()
-    order = Order(symbol="AAPL", quantity=10, side="SELL", price=150.0)
+    order = Order(symbol="AAPL", quantity=10, side="BUY", price=150.0)
 
     with patch("robo_trader.runner_async.time.monotonic", return_value=1000.0):
         for i in range(50):

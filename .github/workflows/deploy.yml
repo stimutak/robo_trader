@@ -34,6 +34,7 @@ jobs:
     # R2-CFG-H1.2: fork guard.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     env:
@@ -61,7 +62,9 @@ jobs:
           
       - name: Run full test suite
         run: |
-          python -m pytest tests/ -v --tb=short --junitxml=test-results.xml
+          timeout --signal=TERM --kill-after=30s 10m \
+            python -m pytest tests/ -v -o faulthandler_timeout=120 \
+            --tb=short --junitxml=test-results.xml
           
       - name: Upload test results
         if: always()

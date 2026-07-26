@@ -23,6 +23,7 @@ from robo_trader.risk_manager import Position
 from robo_trader.runner_async import (
     AsyncRunner,
     UnprotectedExistingPositionsError,
+    _cleanup_runner_owned,
     _clear_exit_audit,
     _setup_continuous_runner,
     _write_exit_audit,
@@ -46,6 +47,18 @@ WATCHDOG_GUARD = ROOT / "scripts" / "watchdog_restart_guard.sh"
 class _AliveTask:
     def done(self) -> bool:
         return False
+
+
+async def _unused_reduction(_stop, _order):
+    raise AssertionError("stop reduction callback was not expected")
+
+
+def _reduction_callback(executor):
+    async def execute(stop, order):
+        del stop
+        return await executor.place_order_async(order)
+
+    return execute
 
 
 def _protected_runner(
@@ -215,7 +228,7 @@ async def _cached_quote_trigger_runner():
     current_time = [event_time]
     monotonic_now = [100.0]
     monitor = StopLossMonitor(
-        executor=SimpleNamespace(),
+        execute_reduction=_unused_reduction,
         risk_manager=SimpleNamespace(),
         portfolio_id="default",
     )
@@ -302,7 +315,7 @@ async def test_cached_trigger_exception_rejects_tampered_or_orphan_lineage(
 async def test_replacement_cleans_untracked_old_latched_evidence() -> None:
     now = datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc)
     monitor = StopLossMonitor(
-        executor=SimpleNamespace(),
+        execute_reduction=_unused_reduction,
         risk_manager=SimpleNamespace(),
         portfolio_id="default",
     )
@@ -353,7 +366,7 @@ async def test_direct_stop_execution_always_cleans_exact_phase_state(
 
     now = datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc)
     monitor = StopLossMonitor(
-        executor=_Executor(),
+        execute_reduction=_reduction_callback(_Executor()),
         risk_manager=SimpleNamespace(),
         portfolio_id="default",
     )
@@ -380,7 +393,7 @@ async def test_direct_stop_execution_always_cleans_exact_phase_state(
 @pytest.mark.asyncio
 async def test_direct_obsolete_execution_preserves_replacement_phase_records() -> None:
     monitor = StopLossMonitor(
-        executor=SimpleNamespace(),
+        execute_reduction=_unused_reduction,
         risk_manager=SimpleNamespace(),
         portfolio_id="default",
     )
@@ -418,7 +431,7 @@ async def test_direct_exact_queued_stop_has_single_broker_owner_during_await() -
 
     now = datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc)
     monitor = StopLossMonitor(
-        executor=_GatedExecutor(),
+        execute_reduction=_reduction_callback(_GatedExecutor()),
         risk_manager=SimpleNamespace(),
         portfolio_id="default",
     )
@@ -462,7 +475,7 @@ async def test_direct_success_keeps_post_fill_visible_through_callback() -> None
 
     now = datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc)
     monitor = StopLossMonitor(
-        executor=_Executor(),
+        execute_reduction=_reduction_callback(_Executor()),
         risk_manager=SimpleNamespace(),
         portfolio_id="default",
         position_closed_callback=gated_callback,
@@ -599,7 +612,7 @@ def test_fresh_pending_stop_that_already_crosses_quote_fails_closed(
 @pytest.mark.asyncio
 async def test_add_stop_loss_rejects_invalid_replacement_before_publish() -> None:
     monitor = StopLossMonitor(
-        executor=SimpleNamespace(),
+        execute_reduction=_unused_reduction,
         risk_manager=SimpleNamespace(),
         portfolio_id="default",
     )
@@ -789,7 +802,7 @@ async def test_persistent_fast_path_preserves_exact_broker_inflight_execution() 
         callback_complete.set()
 
     monitor = StopLossMonitor(
-        executor=_GatedExecutor(),
+        execute_reduction=_reduction_callback(_GatedExecutor()),
         risk_manager=SimpleNamespace(),
         portfolio_id="default",
         position_closed_callback=filled_callback,
@@ -853,7 +866,7 @@ async def test_pending_replacement_can_coexist_with_unresolved_old_broker_stop()
             return ExecutionResult(True, "filled", fill_price=order.price)
 
     monitor = StopLossMonitor(
-        executor=_GatedExecutor(),
+        execute_reduction=_reduction_callback(_GatedExecutor()),
         risk_manager=SimpleNamespace(),
         portfolio_id="default",
     )
@@ -948,7 +961,7 @@ async def test_persistent_fast_path_accepts_exact_post_fill_settlement() -> None
         callback_complete.set()
 
     monitor = StopLossMonitor(
-        executor=_ImmediateExecutor(),
+        execute_reduction=_reduction_callback(_ImmediateExecutor()),
         risk_manager=SimpleNamespace(),
         portfolio_id="default",
         position_closed_callback=gated_runner_callback,
@@ -1034,7 +1047,7 @@ async def test_expired_settlement_after_callback_deletes_position_fails_closed()
     runner.cancel_all_orders = AsyncMock()
 
     monitor = StopLossMonitor(
-        executor=_ImmediateExecutor(),
+        execute_reduction=_reduction_callback(_ImmediateExecutor()),
         risk_manager=SimpleNamespace(),
         portfolio_id="default",
         position_closed_callback=runner._on_stop_loss_executed,
@@ -1094,7 +1107,7 @@ async def test_partial_fill_waiting_to_resize_replacement_remains_consistent() -
     runner.cancel_all_orders = AsyncMock()
 
     monitor = StopLossMonitor(
-        executor=SimpleNamespace(),
+        execute_reduction=_unused_reduction,
         risk_manager=SimpleNamespace(),
         portfolio_id="default",
     )
@@ -1183,7 +1196,7 @@ async def test_persistent_fast_path_accepts_complete_two_stop_execution_batch() 
             both_callbacks_complete.set()
 
     monitor = StopLossMonitor(
-        executor=executor,
+        execute_reduction=_reduction_callback(executor),
         risk_manager=SimpleNamespace(),
         portfolio_id="default",
         position_closed_callback=filled_callback,
@@ -1254,7 +1267,7 @@ async def test_persistent_fast_path_accepts_complete_two_stop_execution_batch() 
 @pytest.mark.asyncio
 async def test_inflight_tracking_clears_on_execution_exception() -> None:
     monitor = StopLossMonitor(
-        executor=SimpleNamespace(),
+        execute_reduction=_unused_reduction,
         risk_manager=SimpleNamespace(),
         portfolio_id="default",
     )
@@ -1991,12 +2004,39 @@ async def test_cleanup_reaches_ibkr_and_database_after_stop_monitor_failure() ->
     runner.db = SimpleNamespace(close=AsyncMock())
     runner.ws_client = None
 
-    await runner.cleanup()
+    with pytest.raises(RuntimeError, match="monitor failed"):
+        await runner.cleanup()
 
     runner.stop_loss_monitor.stop_monitoring.assert_awaited_once_with()
     runner.ib.disconnect.assert_awaited_once_with()
     runner.ib.stop.assert_awaited_once_with()
     runner.db.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_internal_cancellation_still_reaches_ibkr_and_database() -> None:
+    runner = object.__new__(AsyncRunner)
+    runner._setup_complete = True
+    runner.health = SimpleNamespace(stop_monitoring=AsyncMock(side_effect=asyncio.CancelledError()))
+    runner.subprocess_monitor_task = None
+    runner.risk_monitor_task = None
+    runner.cleanup_task = None
+    runner.stop_loss_monitor = None
+    runner.use_advanced_risk = False
+    runner.advanced_risk = None
+    runner.ib = SimpleNamespace(disconnect=AsyncMock(), stop=AsyncMock())
+    runner.db = SimpleNamespace(close=AsyncMock())
+    runner._owns_database = True
+    runner.ws_client = None
+
+    with pytest.raises(asyncio.CancelledError):
+        await _cleanup_runner_owned(runner)
+
+    runner.ib.disconnect.assert_awaited_once_with()
+    runner.ib.stop.assert_awaited_once_with()
+    runner.db.close.assert_awaited_once_with()
+    assert runner.health is None
+    assert runner._setup_complete is False
 
 
 def test_continuous_loop_treats_unprotected_positions_as_nonretryable() -> None:

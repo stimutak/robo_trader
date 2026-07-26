@@ -283,7 +283,7 @@ class TradeExecutor:
                 quantity=0,
                 fill_price=price,
                 side="BUY",
-                message=f"Buy order failed: {result.msg}",
+                message=f"Buy order failed: {result.message}",
             )
 
         fill_price = result.fill_price if result.fill_price is not None else price
@@ -389,7 +389,7 @@ class TradeExecutor:
                 quantity=0,
                 fill_price=price,
                 side="BUY_TO_COVER",
-                message=f"Cover order failed: {result.msg}",
+                message=f"Cover order failed: {result.message}",
             )
 
         fill_price = result.fill_price if result.fill_price is not None else price
@@ -496,7 +496,7 @@ class TradeExecutor:
                 quantity=0,
                 fill_price=price,
                 side="SELL",
-                message=f"Sell order failed: {result.msg}",
+                message=f"Sell order failed: {result.message}",
             )
 
         fill_price = result.fill_price if result.fill_price is not None else price
@@ -594,7 +594,7 @@ class TradeExecutor:
                 quantity=0,
                 fill_price=price,
                 side="SELL_SHORT",
-                message=f"Short order failed: {result.msg}",
+                message=f"Short order failed: {result.message}",
             )
 
         fill_price = result.fill_price if result.fill_price is not None else price
@@ -723,7 +723,7 @@ class TradeExecutor:
         @dataclass
         class SimpleResult:
             ok: bool = True
-            msg: str = ""
+            message: str = ""
             fill_price: Optional[float] = None
 
         return SimpleResult(ok=True, fill_price=float(order.price))

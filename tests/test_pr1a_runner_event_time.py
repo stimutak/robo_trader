@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12,10 +13,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pandas as pd
 import pytest
 
+import robo_trader.runner_async as runner_module
 from robo_trader.clients.subprocess_ibkr_client import IBKRTimeoutError
 from robo_trader.connection_health import HealthStatus
 from robo_trader.execution import Order
 from robo_trader.monitoring.performance import PerformanceMonitor
+from robo_trader.paper_reduction_gateway import PaperReductionGateway
 from robo_trader.runner_async import (
     AsyncRunner,
     MarketDataContractError,
@@ -35,6 +38,44 @@ def _regular_hours_default():
 
     with patch("robo_trader.runner_async.is_extended_hours", return_value=False):
         yield
+
+
+@pytest.fixture
+def continuous_safety_args(monkeypatch):
+    class TestCoordinator:
+        started = True
+
+    class TestRuntimeContext:
+        pass
+
+    resources = SimpleNamespace(
+        database=object(),
+        gateway=object(),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "SafetyRuntimeCoordinator",
+        TestCoordinator,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "RuntimeSafetyContext",
+        TestRuntimeContext,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_start_paper_order_runtime",
+        AsyncMock(return_value=resources),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_close_paper_order_runtime",
+        AsyncMock(),
+    )
+    return {
+        "safety_runtime": TestCoordinator(),
+        "runtime_context": TestRuntimeContext(),
+    }
 
 
 def _bars(dates: list[object], *, symbol: str | None = None) -> pd.DataFrame:
@@ -177,6 +218,7 @@ def test_active_runtime_rejects_daily_or_coarser_bars(bar_size: str) -> None:
 
 def _runner_for_fetch(fetch_side_effect: BaseException) -> AsyncRunner:
     runner = AsyncRunner.__new__(AsyncRunner)
+    runner.portfolio_id = "default"
     runner.ib = SimpleNamespace(is_connected=True)
     runner.health = MagicMock()
     runner.duration = "2 D"
@@ -511,6 +553,7 @@ def _runner_for_parallel(process_symbol) -> AsyncRunner:
 
 
 def _configure_order_runtime(runner: AsyncRunner, executor_result=None) -> None:
+    runner.portfolio_id = "default"
     accepted_at = datetime.now(timezone.utc)
     accepted_monotonic = 1000.0
     protective_clock = {
@@ -557,6 +600,18 @@ def _configure_order_runtime(runner: AsyncRunner, executor_result=None) -> None:
         msg="filled",
         message="filled",
     )
+    gateway = PaperReductionGateway.__new__(PaperReductionGateway)
+    gateway._started = True
+
+    @asynccontextmanager
+    async def serialize_entry():
+        yield
+
+    gateway.serialize_entry = serialize_entry
+    gateway.submit_reduction = AsyncMock(
+        return_value=runner.executor.place_order.return_value,
+    )
+    runner.paper_reduction_gateway = gateway
     runner.monitor = PerformanceMonitor()
 
 
@@ -599,7 +654,11 @@ async def test_central_order_admission_accepts_exact_live_protection(side: str) 
     )
 
     assert result.ok is True
-    runner.executor.place_order.assert_called_once()
+    if side in {"SELL", "BUY_TO_COVER"}:
+        runner.paper_reduction_gateway.submit_reduction.assert_awaited_once()
+        runner.executor.place_order.assert_not_called()
+    else:
+        runner.executor.place_order.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -1099,6 +1158,8 @@ async def test_next_cycle_resets_abort_only_after_prior_drain() -> None:
 async def test_symbol_cycle_abort_suppresses_all_run_level_downstream_work() -> None:
     runner = AsyncRunner.__new__(AsyncRunner)
     runner.setup = AsyncMock()
+    runner._ensure_health_monitor_for_activation = AsyncMock()
+    runner._activate_after_setup = MagicMock()
     runner.teardown = AsyncMock()
     runner.positions = {}
     runner.cfg = SimpleNamespace(symbols=["AAPL"])
@@ -1136,6 +1197,8 @@ async def test_symbol_cycle_abort_suppresses_all_run_level_downstream_work() -> 
 async def test_recoverable_disconnect_suppresses_all_run_level_downstream_work() -> None:
     runner = AsyncRunner.__new__(AsyncRunner)
     runner.setup = AsyncMock()
+    runner._ensure_health_monitor_for_activation = AsyncMock()
+    runner._activate_after_setup = MagicMock()
     runner.teardown = AsyncMock()
     runner.positions = {}
     runner.cfg = SimpleNamespace(symbols=["AAPL"])
@@ -1166,7 +1229,9 @@ async def test_recoverable_disconnect_suppresses_all_run_level_downstream_work()
 
 
 @pytest.mark.asyncio
-async def test_continuous_authoritative_disconnect_recovers_without_watchdog_exit() -> None:
+async def test_continuous_authoritative_disconnect_recovers_without_watchdog_exit(
+    continuous_safety_args,
+) -> None:
     runner = MagicMock()
     runner.recovery_in_progress = False
     runner._recovery_exhausted = False
@@ -1205,18 +1270,26 @@ async def test_continuous_authoritative_disconnect_recovers_without_watchdog_exi
         patch("robo_trader.runner_async._write_exit_audit"),
         patch("robo_trader.runner_async._fire_runner_exit_alert"),
     ):
-        await run_continuous(symbols=["AAPL"], interval_seconds=1)
+        await run_continuous(
+            symbols=["AAPL"],
+            interval_seconds=1,
+            **continuous_safety_args,
+        )
 
     runner.run.assert_awaited_once_with(["AAPL"])
     runner.recover_connection.assert_awaited_once()
     runner._safe_disconnect.assert_not_awaited()
     assert runner._recovery_exhausted is False
-    runner.teardown.assert_awaited_once_with(full_cleanup=False)
+    # AsyncRunner.run owns its cycle-finalization hook. The continuous loop
+    # must not invoke it a second time after a recovered cycle failure.
+    runner.teardown.assert_not_awaited()
     runner.cleanup.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_continuous_authoritative_disconnect_exits_when_recovery_exhausts() -> None:
+async def test_continuous_authoritative_disconnect_exits_when_recovery_exhausts(
+    continuous_safety_args,
+) -> None:
     runner = MagicMock()
     runner.recovery_in_progress = False
     runner._recovery_exhausted = False
@@ -1254,7 +1327,11 @@ async def test_continuous_authoritative_disconnect_exits_when_recovery_exhausts(
         patch("robo_trader.runner_async._write_exit_audit"),
         patch("robo_trader.runner_async._fire_runner_exit_alert"),
     ):
-        await run_continuous(symbols=["AAPL"], interval_seconds=1)
+        await run_continuous(
+            symbols=["AAPL"],
+            interval_seconds=1,
+            **continuous_safety_args,
+        )
 
     runner.run.assert_awaited_once_with(["AAPL"])
     runner.recover_connection.assert_awaited_once()
@@ -1266,7 +1343,9 @@ async def test_continuous_authoritative_disconnect_exits_when_recovery_exhausts(
 
 
 @pytest.mark.asyncio
-async def test_continuous_authoritative_disconnect_exits_when_recovery_raises() -> None:
+async def test_continuous_authoritative_disconnect_exits_when_recovery_raises(
+    continuous_safety_args,
+) -> None:
     runner = MagicMock()
     runner.recovery_in_progress = False
     runner._recovery_exhausted = False
@@ -1304,7 +1383,11 @@ async def test_continuous_authoritative_disconnect_exits_when_recovery_raises() 
         patch("robo_trader.runner_async._write_exit_audit"),
         patch("robo_trader.runner_async._fire_runner_exit_alert"),
     ):
-        await run_continuous(symbols=["AAPL"], interval_seconds=1)
+        await run_continuous(
+            symbols=["AAPL"],
+            interval_seconds=1,
+            **continuous_safety_args,
+        )
 
     runner.run.assert_awaited_once_with(["AAPL"])
     runner.recover_connection.assert_awaited_once()
@@ -1316,7 +1399,9 @@ async def test_continuous_authoritative_disconnect_exits_when_recovery_raises() 
 
 
 @pytest.mark.asyncio
-async def test_continuous_transport_abort_disconnects_and_exits_without_next_cycle() -> None:
+async def test_continuous_transport_abort_disconnects_and_exits_without_next_cycle(
+    continuous_safety_args,
+) -> None:
     runner = MagicMock()
     runner.recovery_in_progress = False
     runner._recovery_exhausted = False
@@ -1348,7 +1433,11 @@ async def test_continuous_transport_abort_disconnects_and_exits_without_next_cyc
         patch("robo_trader.runner_async._write_exit_audit"),
         patch("robo_trader.runner_async._fire_runner_exit_alert"),
     ):
-        await run_continuous(symbols=["AAPL"], interval_seconds=1)
+        await run_continuous(
+            symbols=["AAPL"],
+            interval_seconds=1,
+            **continuous_safety_args,
+        )
 
     runner.run.assert_awaited_once_with(["AAPL"])
     runner._safe_disconnect.assert_awaited_once()
@@ -1374,7 +1463,8 @@ async def test_extended_hours_blocks_entry_sides_but_not_exit() -> None:
             Order(symbol="AAPL", quantity=1, side="SELL", price=100.0)
         )
     assert exit_result.ok is True
-    runner.executor.place_order.assert_called_once()
+    runner.paper_reduction_gateway.submit_reduction.assert_awaited_once()
+    runner.executor.place_order.assert_not_called()
 
 
 @pytest.mark.asyncio

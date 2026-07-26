@@ -52,7 +52,8 @@ jobs:
       IBKR_ACCOUNT_TYPE: paper
       RT_STATE_NAMESPACE: paper
       RT_DB_PATH: /app/data/ci-paper.db
-      SAFETY_ACCOUNT_SCOPE: acct_v1_0123456789abcdef0123456789abcdeffedcba9876543210fedcba9876543210
+      SAFETY_ACCOUNT_SCOPE_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      SAFETY_ACCOUNT_SCOPE: acct_v1_2f8a092fef63a773832becc18080af747870b8b2c7b4814cfee555df781fdf5a
       SAFETY_JOURNAL_PATH: /app/data/ci-safety-journal.db
       MODEL_ARTIFACT_SET: ci-fixtures
       BUILD_ID: github-actions
@@ -113,7 +114,8 @@ jobs:
             -e IBKR_ACCOUNT_TYPE=paper \
             -e RT_STATE_NAMESPACE=paper \
             -e RT_DB_PATH=/app/data/ci-paper.db \
-            -e SAFETY_ACCOUNT_SCOPE=acct_v1_0123456789abcdef0123456789abcdeffedcba9876543210fedcba9876543210 \
+            -e SAFETY_ACCOUNT_SCOPE_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+            -e SAFETY_ACCOUNT_SCOPE=acct_v1_2f8a092fef63a773832becc18080af747870b8b2c7b4814cfee555df781fdf5a \
             -e SAFETY_JOURNAL_PATH=/app/data/ci-safety-journal.db \
             -e MODEL_ARTIFACT_SET=ci-fixtures \
             -e BUILD_ID=github-actions \
@@ -138,7 +140,8 @@ jobs:
             -e IBKR_ACCOUNT_TYPE=paper \
             -e RT_STATE_NAMESPACE=paper \
             -e RT_DB_PATH=/app/data/ci-paper.db \
-            -e SAFETY_ACCOUNT_SCOPE=acct_v1_0123456789abcdef0123456789abcdeffedcba9876543210fedcba9876543210 \
+            -e SAFETY_ACCOUNT_SCOPE_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+            -e SAFETY_ACCOUNT_SCOPE=acct_v1_2f8a092fef63a773832becc18080af747870b8b2c7b4814cfee555df781fdf5a \
             -e SAFETY_JOURNAL_PATH=/app/data/ci-safety-journal.db \
             -e MODEL_ARTIFACT_SET=ci-fixtures \
             -e BUILD_ID=github-actions \
@@ -165,7 +168,8 @@ jobs:
           IBKR_ACCOUNT_TYPE: paper
           RT_STATE_NAMESPACE: paper
           RT_DB_PATH: /app/data/ci-paper.db
-          SAFETY_ACCOUNT_SCOPE: acct_v1_0123456789abcdef0123456789abcdeffedcba9876543210fedcba9876543210
+          SAFETY_ACCOUNT_SCOPE_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          SAFETY_ACCOUNT_SCOPE: acct_v1_2f8a092fef63a773832becc18080af747870b8b2c7b4814cfee555df781fdf5a
           SAFETY_JOURNAL_PATH: /app/data/ci-safety-journal.db
           MODEL_ARTIFACT_SET: ci-fixtures
           BUILD_ID: github-actions
@@ -251,7 +255,8 @@ jobs:
           IBKR_ACCOUNT_TYPE: paper
           RT_STATE_NAMESPACE: paper
           RT_DB_PATH: /app/data/ci-paper.db
-          SAFETY_ACCOUNT_SCOPE: acct_v1_0123456789abcdef0123456789abcdeffedcba9876543210fedcba9876543210
+          SAFETY_ACCOUNT_SCOPE_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          SAFETY_ACCOUNT_SCOPE: acct_v1_2f8a092fef63a773832becc18080af747870b8b2c7b4814cfee555df781fdf5a
           SAFETY_JOURNAL_PATH: /app/data/ci-safety-journal.db
           MODEL_ARTIFACT_SET: ci-fixtures
           BUILD_ID: github-actions

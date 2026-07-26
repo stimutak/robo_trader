@@ -10,6 +10,8 @@ pytest's database teardown crashed the running trader.
 """
 
 import asyncio
+import hashlib
+import hmac
 import os
 import platform
 import sys
@@ -45,7 +47,16 @@ os.environ["IBKR_ACCOUNT"] = "DU_TEST_PAPER"
 os.environ["IBKR_APPROVED_ACCOUNTS"] = "DU_TEST_PAPER"
 os.environ["IBKR_ACCOUNT_TYPE"] = "paper"
 os.environ["RT_STATE_NAMESPACE"] = "paper"
-os.environ["SAFETY_ACCOUNT_SCOPE"] = "acct_v1_" + ("0123456789abcdef" * 4)
+_test_safety_scope_key = "0123456789abcdef" * 4
+os.environ["SAFETY_ACCOUNT_SCOPE_KEY"] = _test_safety_scope_key
+os.environ["SAFETY_ACCOUNT_SCOPE"] = (
+    "acct_v1_"
+    + hmac.new(
+        bytes.fromhex(_test_safety_scope_key),
+        b"robotrader-safety-account-scope-v1\0DU_TEST_PAPER",
+        hashlib.sha256,
+    ).hexdigest()
+)
 os.environ["SAFETY_JOURNAL_PATH"] = str(_TEST_ARTIFACTS / f"safety_journal_{os.getpid()}.db")
 os.environ["MODEL_ARTIFACT_SET"] = "pytest-fixtures"
 os.environ["BUILD_ID"] = "pytest"

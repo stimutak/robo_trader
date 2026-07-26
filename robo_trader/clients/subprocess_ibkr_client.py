@@ -12,6 +12,8 @@ to avoid event loop starvation in busy async environments.
 """
 
 import asyncio
+import hmac
+import inspect
 import json
 import math
 import os
@@ -27,11 +29,38 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Awaitable, Callable, Optional, TypeVar, cast
 
 import structlog
 
+from robo_trader.broker_account_identity import (
+    is_supported_paper_account_identifier,
+    normalize_synthetic_paper_account_environment,
+)
+from robo_trader.broker_safety_evidence import (
+    BrokerContractSafetySnapshot,
+    BrokerSafetyContract,
+    BrokerSafetyOpenOrder,
+    BrokerSafetyPosition,
+    BrokerSafetySnapshot,
+    _BrokerContractSnapshotCapability,
+    _BrokerSnapshotCapability,
+    _issue_broker_contract_snapshot_capability,
+    _issue_broker_snapshot_capability,
+    _produce_broker_contract_safety_snapshot,
+    _produce_broker_safety_snapshot,
+    assert_producer_owned_broker_contract_safety_snapshot,
+    assert_producer_owned_broker_safety_snapshot,
+)
+from robo_trader.reconciliation.identity import (
+    RuntimeSafetyContext,
+    assert_validated_runtime_safety_context,
+    mask_account_identifier,
+    validate_ibc_safety_config,
+)
+
 logger = structlog.get_logger(__name__)
+_BrokerCallbackResult = TypeVar("_BrokerCallbackResult")
 
 
 def _find_project_root(start: Path) -> Path:
@@ -82,6 +111,7 @@ _WORKER_ENV_ALLOWLIST = frozenset(
         "WINDIR",
     }
 )
+_WORKER_SYNTHETIC_ACCOUNT_ENVIRONMENT = "ROBOTRADER_WORKER_SYNTHETIC_ACCOUNT_ENVIRONMENT"
 _LSOF_EXECUTABLE_CANDIDATES: tuple[Path, ...] = (
     Path("/usr/sbin/lsof"),
     Path("/usr/bin/lsof"),
@@ -201,6 +231,8 @@ _INTRADAY_BAR_SIZES = {
     "8 hours",
 }
 _BROKER_SNAPSHOT_SCHEMA_VERSION = 1
+_BROKER_SAFETY_SNAPSHOT_SCHEMA_VERSION = 1
+_BROKER_CONTRACT_SAFETY_SNAPSHOT_SCHEMA_VERSION = 1
 _BROKER_SNAPSHOT_BALANCE_TAGS = {
     "NetLiquidation",
     "TotalCashValue",
@@ -215,6 +247,8 @@ _BROKER_SNAPSHOT_MAX_WINDOW_SECONDS = 60.0
 _BROKER_SNAPSHOT_MAX_CLOCK_SKEW_SECONDS = 120.0
 _BROKER_EXECUTION_LOOKBACK_SECONDS = 24 * 60 * 60
 _CONTRACT_TEXT_RE = re.compile(r"^[A-Z0-9][A-Z0-9._:/-]{0,63}$")
+_BROKER_SAFETY_SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
+_OPAQUE_ACCOUNT_SCOPE_RE = re.compile(r"^acct_v1_[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,7 +351,7 @@ class SubprocessIBKRClient:
         WORKER_HANDSHAKE_TIMEOUT + WORKER_STABILIZATION_DELAY + WORKER_ACCOUNT_TIMEOUT
     )  # 25.5s
 
-    def __init__(self):
+    def __init__(self, *, worker_runtime_environment: object = None):
         self.process: Optional[subprocess.Popen] = None
         self.lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
@@ -341,6 +375,13 @@ class SubprocessIBKRClient:
         self._historical_lineage_lock = threading.Lock()
         self._historical_lineage_generation_id: Optional[str] = None
         self._historical_lineage_by_symbol: dict[str, QualifiedStockContractLineage] = {}
+        # The worker receives a fresh, secret-free environment rather than the
+        # parent's ambient process environment. Preserve only the validated
+        # dev/test classification needed by deterministic synthetic accounts;
+        # every other value is production-like and therefore omitted.
+        self._worker_synthetic_account_environment = (
+            normalize_synthetic_paper_account_environment(worker_runtime_environment) or ""
+        )
 
     def _invalidate_historical_lineage(self) -> None:
         """Forget broker identity evidence whenever its transport is no longer current."""
@@ -789,6 +830,10 @@ class SubprocessIBKRClient:
                     "ROBOTRADER_WORKER_GENERATION_ID": generation_id,
                 }
             )
+            if self._worker_synthetic_account_environment:
+                worker_env[_WORKER_SYNTHETIC_ACCOUNT_ENVIRONMENT] = (
+                    self._worker_synthetic_account_environment
+                )
             # CRITICAL FIX: Use regular subprocess.Popen with threading instead of
             # asyncio.create_subprocess_exec to avoid event loop starvation in
             # busy async environments
@@ -2155,6 +2200,780 @@ class SubprocessIBKRClient:
                 # Broker evidence must not leave diagnostic stderr artifacts on
                 # disk, whether validation succeeds or fails closed.
                 self._cleanup_worker_debug_log(generation, required=True)
+
+    def _broker_safety_contract(self, value: Any) -> BrokerSafetyContract:
+        self._validate_snapshot_contract(value)
+        return BrokerSafetyContract(
+            con_id=value["con_id"],
+            symbol=value["symbol"],
+            local_symbol=value["local_symbol"],
+            security_type=value["security_type"],
+            currency=value["currency"],
+            exchange=value["exchange"],
+            primary_exchange=value["primary_exchange"],
+            trading_class=value["trading_class"],
+        )
+
+    def _broker_safety_open_orders(
+        self,
+        value: Any,
+        expected_account: str,
+    ) -> tuple[BrokerSafetyOpenOrder, ...]:
+        self._validate_snapshot_orders(value, expected_account)
+        return tuple(
+            BrokerSafetyOpenOrder(
+                broker_order_id=order["broker_order_id"],
+                permanent_id=order["permanent_id"],
+                client_id=order["client_id"],
+                contract=self._broker_safety_contract(order["contract"]),
+                side=order["side"],
+                status=order["status"],
+                order_type=order["order_type"],
+                time_in_force=order["time_in_force"],
+                total_quantity=self._strict_decimal(
+                    order["total_quantity"], "order total quantity"
+                ),
+                filled_quantity=self._strict_decimal(
+                    order["filled_quantity"], "order filled quantity"
+                ),
+                remaining_quantity=self._strict_decimal(
+                    order["remaining_quantity"], "order remaining quantity"
+                ),
+                limit_price=(
+                    self._strict_decimal(order["limit_price"], "limit_price")
+                    if order["limit_price"] is not None
+                    else None
+                ),
+                stop_price=(
+                    self._strict_decimal(order["stop_price"], "stop_price")
+                    if order["stop_price"] is not None
+                    else None
+                ),
+                average_fill_price=(
+                    self._strict_decimal(order["avg_fill_price"], "avg_fill_price")
+                    if order["avg_fill_price"] is not None
+                    else None
+                ),
+                last_status_at=(
+                    self._strict_timestamp(order["last_status_at"], "last_status_at")
+                    if order["last_status_at"] is not None
+                    else None
+                ),
+            )
+            for order in value
+        )
+
+    @staticmethod
+    def _validated_broker_runtime_context(
+        runtime_context: object,
+    ) -> tuple[RuntimeSafetyContext, str, str, str, str]:
+        """Revalidate the one registered runtime/IBC/account binding."""
+
+        context = assert_validated_runtime_safety_context(runtime_context)
+        expected_account = context.expected_account_for_provider
+        if (
+            not isinstance(expected_account, str)
+            or expected_account != expected_account.strip()
+            or not is_supported_paper_account_identifier(
+                expected_account,
+                environment=context.runtime_contract.environment,
+            )
+        ):
+            raise ValueError("validated runtime does not identify a paper account")
+        contract = context.runtime_contract
+        account_scope = getattr(contract, "safety_account_scope", None)
+        if not isinstance(account_scope, str) or not _OPAQUE_ACCOUNT_SCOPE_RE.fullmatch(
+            account_scope
+        ):
+            raise ValueError("validated runtime lacks an opaque safety account scope")
+        if len(set(account_scope.removeprefix("acct_v1_"))) == 1:
+            raise ValueError("validated runtime safety account scope is a placeholder")
+        connection = context.diagnostic_connection
+        if (
+            getattr(contract, "execution_mode", None) != "paper"
+            or getattr(contract, "ibkr_host", None) != connection.host
+            or getattr(contract, "ibkr_port", None) != connection.port
+            or getattr(contract, "ibkr_readonly", None) is not True
+            or connection.port != 4002
+            or connection.readonly is not True
+            or getattr(contract, "account_alias", None) != mask_account_identifier(expected_account)
+        ):
+            raise ValueError("validated runtime paper/read-only identity is inconsistent")
+        current_ibc_hash = validate_ibc_safety_config(
+            context.project_root / "config" / "ibc" / "config.ini"
+        )
+        if not hmac.compare_digest(current_ibc_hash, context.ibc_config_hash):
+            raise ValueError("validated IBC safety configuration changed")
+        runtime_fingerprint = contract.fingerprint
+        if not isinstance(runtime_fingerprint, str) or not runtime_fingerprint:
+            raise ValueError("validated runtime fingerprint is unavailable")
+        return (
+            context,
+            expected_account,
+            account_scope,
+            current_ibc_hash,
+            runtime_fingerprint,
+        )
+
+    def _validate_broker_safety_snapshot(
+        self,
+        *,
+        expected_account: str,
+        requested_symbol: str,
+        capability: _BrokerSnapshotCapability,
+        data: dict,
+        generation: _WorkerGeneration,
+        connection_identity: tuple[str, int, int, bool],
+        max_age_seconds: float,
+    ) -> BrokerSafetySnapshot:
+        top_keys = {
+            "safety_snapshot_schema_version",
+            "account",
+            "requested_symbol",
+            "broker_time_before",
+            "broker_time_after",
+            "retrieved_at",
+            "positions",
+            "open_orders",
+            "positions_complete",
+            "open_orders_complete",
+            "open_orders_all_clients",
+            "open_orders_stable",
+            "unknown_order_count",
+        }
+        try:
+            if not isinstance(data, dict) or set(data) != top_keys:
+                raise ValueError("broker safety snapshot top-level schema is invalid")
+            if (
+                type(data["safety_snapshot_schema_version"]) is not int
+                or data["safety_snapshot_schema_version"] != _BROKER_SAFETY_SNAPSHOT_SCHEMA_VERSION
+            ):
+                raise ValueError("broker safety snapshot schema version is unsupported")
+            account = data["account"]
+            if not isinstance(account, str) or not account:
+                raise ValueError("broker safety snapshot account identity is malformed")
+            if account != expected_account:
+                reason = "broker safety snapshot account identity mismatch"
+                self._poison_generation(generation, reason)
+                raise BrokerSnapshotAccountMismatchError(
+                    "Broker safety snapshot account mismatch "
+                    f"(expected={self._masked_account(expected_account)}, "
+                    f"connected={self._masked_account(account)})"
+                )
+            if data["requested_symbol"] != requested_symbol:
+                raise ValueError("broker safety snapshot requested symbol mismatch")
+            if any(
+                data[field_name] is not True
+                for field_name in (
+                    "positions_complete",
+                    "open_orders_complete",
+                    "open_orders_all_clients",
+                    "open_orders_stable",
+                )
+            ):
+                raise ValueError("broker safety snapshot completeness is unproven")
+            if type(data["unknown_order_count"]) is not int or data["unknown_order_count"] != 0:
+                raise ValueError("broker safety snapshot contains unknown orders")
+
+            broker_before = self._strict_timestamp(data["broker_time_before"], "broker_time_before")
+            broker_after = self._strict_timestamp(data["broker_time_after"], "broker_time_after")
+            retrieved_at = self._strict_timestamp(data["retrieved_at"], "retrieved_at")
+            if broker_after < broker_before:
+                raise ValueError("broker safety snapshot broker times are reversed")
+            broker_window = (broker_after - broker_before).total_seconds()
+            if (
+                not math.isfinite(broker_window)
+                or broker_window > _BROKER_SNAPSHOT_MAX_WINDOW_SECONDS
+            ):
+                raise ValueError("broker safety snapshot collection window is unbounded")
+            age = (
+                datetime.now(timezone.utc) - retrieved_at.astimezone(timezone.utc)
+            ).total_seconds()
+            if age < -5 or age > max_age_seconds:
+                raise ValueError("broker safety snapshot is outside freshness bounds")
+            if any(
+                abs((broker_time - retrieved_at).total_seconds())
+                > _BROKER_SNAPSHOT_MAX_CLOCK_SKEW_SECONDS
+                for broker_time in (broker_before, broker_after)
+            ):
+                raise ValueError("broker safety snapshot clock skew exceeds safety bound")
+
+            raw_positions = data["positions"]
+            if not isinstance(raw_positions, list):
+                raise ValueError("broker safety snapshot positions are not a list")
+            position_keys = {"account", "contract", "quantity"}
+            positions = []
+            seen_contract_ids: set[int] = set()
+            seen_symbols: set[str] = set()
+            for position in raw_positions:
+                if not isinstance(position, dict) or set(position) != position_keys:
+                    raise ValueError("broker safety snapshot position schema is invalid")
+                if position["account"] != expected_account:
+                    raise ValueError("broker safety snapshot position account is inconsistent")
+                contract = self._broker_safety_contract(position["contract"])
+                if contract.con_id in seen_contract_ids or contract.symbol in seen_symbols:
+                    raise ValueError("broker safety snapshot position identity is duplicated")
+                seen_contract_ids.add(contract.con_id)
+                seen_symbols.add(contract.symbol)
+                quantity = self._strict_decimal(position["quantity"], "position quantity")
+                if quantity == 0:
+                    raise ValueError("broker safety snapshot position quantity is zero")
+                positions.append(BrokerSafetyPosition(contract=contract, quantity=quantity))
+
+            matching = [
+                position for position in positions if position.contract.symbol == requested_symbol
+            ]
+            if len(matching) != 1:
+                raise ValueError(
+                    "broker safety snapshot requested symbol is not one exact held position"
+                )
+            open_orders = self._broker_safety_open_orders(data["open_orders"], expected_account)
+            snapshot = _produce_broker_safety_snapshot(
+                capability=capability,
+                observed_at=retrieved_at,
+                broker_time_before=broker_before,
+                broker_time_after=broker_after,
+                snapshot_id=f"broker-safety-v1-{uuid.uuid4().hex}",
+                source="ibkr-subprocess-safety-v1",
+                requested_contract=matching[0].contract,
+                positions=tuple(positions),
+                open_orders=open_orders,
+            )
+            assert_producer_owned_broker_safety_snapshot(snapshot)
+            return snapshot
+        except BrokerSnapshotAccountMismatchError:
+            raise
+        except Exception as exc:
+            self._snapshot_fail(generation, str(exc))
+        raise AssertionError("unreachable")
+
+    async def _get_broker_safety_snapshot_unlocked(
+        self,
+        runtime_context: RuntimeSafetyContext,
+        normalized_symbol: str,
+        *,
+        max_age_seconds: float,
+    ) -> tuple[
+        BrokerSafetySnapshot,
+        _WorkerGeneration,
+        tuple[str, int, int, bool],
+        tuple[RuntimeSafetyContext, str, str, str, str],
+    ]:
+        """Produce one snapshot while the caller holds ``_lifecycle_lock``."""
+
+        generation = self._generation
+        if generation is None:
+            raise SubprocessCrashError("Subprocess generation is unavailable")
+        try:
+            try:
+                validated_context = self._validated_broker_runtime_context(runtime_context)
+                (
+                    context,
+                    normalized_account,
+                    account_scope,
+                    ibc_config_hash,
+                    runtime_fingerprint,
+                ) = validated_context
+            except Exception as exc:
+                try:
+                    self._snapshot_fail(
+                        generation,
+                        "validated broker runtime context is unavailable",
+                    )
+                except IBKRTransportPoisonedError as poisoned:
+                    raise poisoned from exc
+            identity = self._require_snapshot_generation_binding(
+                generation,
+                poison_on_mismatch=False,
+            )
+            expected_identity = (
+                context.diagnostic_connection.host,
+                context.diagnostic_connection.port,
+                context.diagnostic_connection.client_id,
+                context.diagnostic_connection.readonly,
+            )
+            if identity != expected_identity:
+                self._snapshot_fail(
+                    generation,
+                    "broker transport differs from validated runtime context",
+                )
+            data = await self._execute_command_unlocked(
+                {
+                    "command": "get_broker_safety_snapshot",
+                    "params": {
+                        "expected_account": normalized_account,
+                        "requested_symbol": normalized_symbol,
+                    },
+                },
+                timeout=30.0,
+            )
+            self._require_snapshot_generation_binding(
+                generation,
+                expected_identity=expected_identity,
+                poison_on_mismatch=True,
+            )
+            try:
+                revalidated = self._validated_broker_runtime_context(runtime_context)
+            except Exception as exc:
+                try:
+                    self._snapshot_fail(
+                        generation,
+                        "validated broker runtime context changed during snapshot",
+                    )
+                except IBKRTransportPoisonedError as poisoned:
+                    raise poisoned from exc
+            if revalidated[1:] != validated_context[1:]:
+                self._snapshot_fail(
+                    generation,
+                    "validated broker runtime context changed during snapshot",
+                )
+            try:
+                capability = _issue_broker_snapshot_capability(
+                    context,
+                    connection_identity=identity,
+                    transport_generation=generation.generation_id,
+                    requested_symbol=normalized_symbol,
+                )
+            except Exception as exc:
+                try:
+                    self._snapshot_fail(
+                        generation,
+                        "broker snapshot capability issuance failed",
+                    )
+                except IBKRTransportPoisonedError as poisoned:
+                    raise poisoned from exc
+            snapshot = self._validate_broker_safety_snapshot(
+                expected_account=normalized_account,
+                requested_symbol=normalized_symbol,
+                capability=capability,
+                data=data,
+                generation=generation,
+                connection_identity=identity,
+                max_age_seconds=float(max_age_seconds),
+            )
+            self._require_snapshot_generation_binding(
+                generation,
+                expected_identity=expected_identity,
+                poison_on_mismatch=True,
+            )
+            try:
+                final_context = self._validated_broker_runtime_context(runtime_context)
+            except Exception as exc:
+                try:
+                    self._snapshot_fail(
+                        generation,
+                        "validated broker runtime context changed after snapshot",
+                    )
+                except IBKRTransportPoisonedError as poisoned:
+                    raise poisoned from exc
+            if final_context[1:] != revalidated[1:]:
+                self._snapshot_fail(
+                    generation,
+                    "validated broker runtime context changed after snapshot",
+                )
+            assert_producer_owned_broker_safety_snapshot(snapshot)
+            return snapshot, generation, expected_identity, final_context
+        except Exception:
+            raise
+
+    async def run_with_locked_broker_safety_snapshot(
+        self,
+        runtime_context: RuntimeSafetyContext,
+        requested_symbol: str,
+        async_callback: Callable[[BrokerSafetySnapshot], Awaitable[_BrokerCallbackResult]],
+        *,
+        max_age_seconds: float = 30.0,
+    ) -> _BrokerCallbackResult:
+        """Run one async finalization callback under the broker lifecycle lock."""
+
+        if not isinstance(requested_symbol, str):
+            raise ValueError("Broker safety symbol must be a string")
+        normalized_symbol = requested_symbol.strip().upper()
+        if not _BROKER_SAFETY_SYMBOL_RE.fullmatch(normalized_symbol):
+            raise ValueError("Broker safety symbol is malformed")
+        if not callable(async_callback):
+            raise TypeError("Broker safety callback must be callable")
+        if (
+            isinstance(max_age_seconds, bool)
+            or not isinstance(max_age_seconds, (int, float))
+            or not math.isfinite(float(max_age_seconds))
+            or max_age_seconds <= 0
+            or max_age_seconds > 30
+        ):
+            raise ValueError("Broker safety freshness bound must be finite and at most 30 seconds")
+
+        async with self._lifecycle_lock:
+            generation = self._generation
+            if generation is None:
+                raise SubprocessCrashError("Subprocess generation is unavailable")
+            snapshot: Optional[BrokerSafetySnapshot] = None
+            expected_identity: Optional[tuple[str, int, int, bool]] = None
+            final_context: Optional[tuple[RuntimeSafetyContext, str, str, str, str]] = None
+            try:
+                (
+                    snapshot,
+                    generation,
+                    expected_identity,
+                    final_context,
+                ) = await self._get_broker_safety_snapshot_unlocked(
+                    runtime_context,
+                    normalized_symbol,
+                    max_age_seconds=float(max_age_seconds),
+                )
+                callback_result = async_callback(snapshot)
+                if not inspect.isawaitable(callback_result):
+                    raise TypeError("Broker safety callback must return an awaitable")
+                return await callback_result
+            finally:
+                if snapshot is not None and expected_identity is not None:
+                    self._require_snapshot_generation_binding(
+                        generation,
+                        expected_identity=expected_identity,
+                        poison_on_mismatch=True,
+                    )
+                    assert_producer_owned_broker_safety_snapshot(snapshot)
+                    try:
+                        current_context = self._validated_broker_runtime_context(runtime_context)
+                    except Exception as exc:
+                        try:
+                            self._snapshot_fail(
+                                generation,
+                                "validated broker runtime context changed during finalization",
+                            )
+                        except IBKRTransportPoisonedError as poisoned:
+                            raise poisoned from exc
+                    if final_context is None or current_context[1:] != final_context[1:]:
+                        self._snapshot_fail(
+                            generation,
+                            "validated broker runtime context changed during finalization",
+                        )
+                self._cleanup_worker_debug_log(generation, required=True)
+
+    async def get_broker_safety_snapshot(
+        self,
+        runtime_context: RuntimeSafetyContext,
+        requested_symbol: str,
+        *,
+        max_age_seconds: float = 30.0,
+    ) -> BrokerSafetySnapshot:
+        """Return one snapshot through the lifecycle-held finalization boundary."""
+
+        async def return_snapshot(snapshot: BrokerSafetySnapshot) -> BrokerSafetySnapshot:
+            return snapshot
+
+        return await self.run_with_locked_broker_safety_snapshot(
+            runtime_context,
+            requested_symbol,
+            return_snapshot,
+            max_age_seconds=max_age_seconds,
+        )
+
+    def _validate_broker_contract_safety_snapshot(
+        self,
+        *,
+        expected_account: str,
+        requested_symbol: str,
+        capability: _BrokerContractSnapshotCapability,
+        data: dict,
+        generation: _WorkerGeneration,
+        max_age_seconds: float,
+    ) -> BrokerContractSafetySnapshot:
+        expected_keys = {
+            "contract_safety_snapshot_schema_version",
+            "account",
+            "requested_symbol",
+            "broker_time_before",
+            "broker_time_after",
+            "retrieved_at",
+            "qualified_contract",
+        }
+        try:
+            if not isinstance(data, dict) or set(data) != expected_keys:
+                raise ValueError("broker contract safety snapshot schema is invalid")
+            if (
+                type(data["contract_safety_snapshot_schema_version"]) is not int
+                or data["contract_safety_snapshot_schema_version"]
+                != _BROKER_CONTRACT_SAFETY_SNAPSHOT_SCHEMA_VERSION
+            ):
+                raise ValueError("broker contract safety snapshot version is unsupported")
+            account = data["account"]
+            if not isinstance(account, str) or not account:
+                raise ValueError("broker contract safety account identity is malformed")
+            if account != expected_account:
+                reason = "broker contract safety account identity mismatch"
+                self._poison_generation(generation, reason)
+                raise BrokerSnapshotAccountMismatchError(
+                    "Broker contract safety snapshot account mismatch "
+                    f"(expected={self._masked_account(expected_account)}, "
+                    f"connected={self._masked_account(account)})"
+                )
+            if data["requested_symbol"] != requested_symbol:
+                raise ValueError("broker contract safety requested symbol mismatch")
+            broker_before = self._strict_timestamp(
+                data["broker_time_before"],
+                "broker_time_before",
+            )
+            broker_after = self._strict_timestamp(
+                data["broker_time_after"],
+                "broker_time_after",
+            )
+            retrieved_at = self._strict_timestamp(data["retrieved_at"], "retrieved_at")
+            if broker_after < broker_before:
+                raise ValueError("broker contract safety times are reversed")
+            broker_window = (broker_after - broker_before).total_seconds()
+            if (
+                not math.isfinite(broker_window)
+                or broker_window > _BROKER_SNAPSHOT_MAX_WINDOW_SECONDS
+            ):
+                raise ValueError("broker contract safety collection window is unbounded")
+            age = (
+                datetime.now(timezone.utc) - retrieved_at.astimezone(timezone.utc)
+            ).total_seconds()
+            if age < -5 or age > max_age_seconds:
+                raise ValueError("broker contract safety snapshot is outside freshness bounds")
+            if any(
+                abs((broker_time - retrieved_at).total_seconds())
+                > _BROKER_SNAPSHOT_MAX_CLOCK_SKEW_SECONDS
+                for broker_time in (broker_before, broker_after)
+            ):
+                raise ValueError("broker contract safety clock skew exceeds safety bound")
+            qualified_contract = self._broker_safety_contract(data["qualified_contract"])
+            if qualified_contract.symbol != requested_symbol:
+                raise ValueError("qualified broker contract differs from requested symbol")
+            snapshot = _produce_broker_contract_safety_snapshot(
+                capability=capability,
+                broker_time_before=broker_before,
+                broker_time_after=broker_after,
+                retrieved_at=retrieved_at,
+                snapshot_id=f"broker-contract-safety-v1-{uuid.uuid4().hex}",
+                source="ibkr-subprocess-contract-safety-v1",
+                qualified_contract=qualified_contract,
+            )
+            assert_producer_owned_broker_contract_safety_snapshot(snapshot)
+            return snapshot
+        except BrokerSnapshotAccountMismatchError:
+            raise
+        except Exception as exc:
+            self._snapshot_fail(generation, str(exc))
+        raise AssertionError("unreachable")
+
+    async def _get_broker_contract_safety_snapshot_unlocked(
+        self,
+        runtime_context: RuntimeSafetyContext,
+        normalized_symbol: str,
+        *,
+        max_age_seconds: float,
+    ) -> tuple[
+        BrokerContractSafetySnapshot,
+        _WorkerGeneration,
+        tuple[str, int, int, bool],
+        tuple[RuntimeSafetyContext, str, str, str, str],
+    ]:
+        """Produce contract-only proof while the caller holds the lifecycle lock."""
+
+        generation = self._generation
+        if generation is None:
+            raise SubprocessCrashError("Subprocess generation is unavailable")
+        try:
+            validated_context = self._validated_broker_runtime_context(runtime_context)
+            context, normalized_account, _, _, _ = validated_context
+        except Exception as exc:
+            try:
+                self._snapshot_fail(
+                    generation,
+                    "validated broker runtime context is unavailable",
+                )
+            except IBKRTransportPoisonedError as poisoned:
+                raise poisoned from exc
+        identity = self._require_snapshot_generation_binding(
+            generation,
+            poison_on_mismatch=False,
+        )
+        expected_identity = (
+            context.diagnostic_connection.host,
+            context.diagnostic_connection.port,
+            context.diagnostic_connection.client_id,
+            context.diagnostic_connection.readonly,
+        )
+        if identity != expected_identity:
+            self._snapshot_fail(
+                generation,
+                "broker transport differs from validated runtime context",
+            )
+        data = await self._execute_command_unlocked(
+            {
+                "command": "get_broker_contract_safety_snapshot",
+                "params": {
+                    "expected_account": normalized_account,
+                    "requested_symbol": normalized_symbol,
+                },
+            },
+            timeout=30.0,
+        )
+        self._require_snapshot_generation_binding(
+            generation,
+            expected_identity=expected_identity,
+            poison_on_mismatch=True,
+        )
+        try:
+            revalidated = self._validated_broker_runtime_context(runtime_context)
+        except Exception as exc:
+            try:
+                self._snapshot_fail(
+                    generation,
+                    "validated broker runtime context changed during contract snapshot",
+                )
+            except IBKRTransportPoisonedError as poisoned:
+                raise poisoned from exc
+        if revalidated[1:] != validated_context[1:]:
+            self._snapshot_fail(
+                generation,
+                "validated broker runtime context changed during contract snapshot",
+            )
+        try:
+            capability = _issue_broker_contract_snapshot_capability(
+                context,
+                connection_identity=identity,
+                transport_generation=generation.generation_id,
+                requested_symbol=normalized_symbol,
+            )
+        except Exception as exc:
+            try:
+                self._snapshot_fail(
+                    generation,
+                    "broker contract snapshot capability issuance failed",
+                )
+            except IBKRTransportPoisonedError as poisoned:
+                raise poisoned from exc
+        snapshot = self._validate_broker_contract_safety_snapshot(
+            expected_account=normalized_account,
+            requested_symbol=normalized_symbol,
+            capability=capability,
+            data=data,
+            generation=generation,
+            max_age_seconds=max_age_seconds,
+        )
+        self._require_snapshot_generation_binding(
+            generation,
+            expected_identity=expected_identity,
+            poison_on_mismatch=True,
+        )
+        try:
+            final_context = self._validated_broker_runtime_context(runtime_context)
+        except Exception as exc:
+            try:
+                self._snapshot_fail(
+                    generation,
+                    "validated broker runtime context changed after contract snapshot",
+                )
+            except IBKRTransportPoisonedError as poisoned:
+                raise poisoned from exc
+        if final_context[1:] != revalidated[1:]:
+            self._snapshot_fail(
+                generation,
+                "validated broker runtime context changed after contract snapshot",
+            )
+        assert_producer_owned_broker_contract_safety_snapshot(snapshot)
+        return snapshot, generation, expected_identity, final_context
+
+    async def run_with_locked_broker_contract_safety_snapshot(
+        self,
+        runtime_context: RuntimeSafetyContext,
+        requested_symbol: str,
+        async_callback: Callable[
+            [BrokerContractSafetySnapshot],
+            Awaitable[_BrokerCallbackResult],
+        ],
+        *,
+        max_age_seconds: float = 30.0,
+    ) -> _BrokerCallbackResult:
+        """Run final local paper dispatch under current contract/transport proof."""
+
+        if not isinstance(requested_symbol, str):
+            raise ValueError("Broker contract safety symbol must be a string")
+        normalized_symbol = requested_symbol.strip().upper()
+        if not _BROKER_SAFETY_SYMBOL_RE.fullmatch(normalized_symbol):
+            raise ValueError("Broker contract safety symbol is malformed")
+        if not callable(async_callback):
+            raise TypeError("Broker contract safety callback must be callable")
+        if (
+            isinstance(max_age_seconds, bool)
+            or not isinstance(max_age_seconds, (int, float))
+            or not math.isfinite(float(max_age_seconds))
+            or max_age_seconds <= 0
+            or max_age_seconds > 30
+        ):
+            raise ValueError(
+                "Broker contract safety freshness bound must be finite and at most 30 seconds"
+            )
+
+        async with self._lifecycle_lock:
+            generation = self._generation
+            if generation is None:
+                raise SubprocessCrashError("Subprocess generation is unavailable")
+            snapshot: Optional[BrokerContractSafetySnapshot] = None
+            expected_identity: Optional[tuple[str, int, int, bool]] = None
+            final_context: Optional[tuple[RuntimeSafetyContext, str, str, str, str]] = None
+            try:
+                (
+                    snapshot,
+                    generation,
+                    expected_identity,
+                    final_context,
+                ) = await self._get_broker_contract_safety_snapshot_unlocked(
+                    runtime_context,
+                    normalized_symbol,
+                    max_age_seconds=float(max_age_seconds),
+                )
+                callback_result = async_callback(snapshot)
+                if not inspect.isawaitable(callback_result):
+                    raise TypeError("Broker contract safety callback must return an awaitable")
+                return await callback_result
+            finally:
+                if snapshot is not None and expected_identity is not None:
+                    self._require_snapshot_generation_binding(
+                        generation,
+                        expected_identity=expected_identity,
+                        poison_on_mismatch=True,
+                    )
+                    assert_producer_owned_broker_contract_safety_snapshot(snapshot)
+                    try:
+                        current_context = self._validated_broker_runtime_context(runtime_context)
+                    except Exception as exc:
+                        try:
+                            self._snapshot_fail(
+                                generation,
+                                "validated broker runtime context changed during finalization",
+                            )
+                        except IBKRTransportPoisonedError as poisoned:
+                            raise poisoned from exc
+                    if final_context is None or current_context[1:] != final_context[1:]:
+                        self._snapshot_fail(
+                            generation,
+                            "validated broker runtime context changed during finalization",
+                        )
+                self._cleanup_worker_debug_log(generation, required=True)
+
+    async def get_broker_contract_safety_snapshot(
+        self,
+        runtime_context: RuntimeSafetyContext,
+        requested_symbol: str,
+        *,
+        max_age_seconds: float = 30.0,
+    ) -> BrokerContractSafetySnapshot:
+        """Return contract-only proof through the lifecycle-held boundary."""
+
+        async def return_snapshot(
+            snapshot: BrokerContractSafetySnapshot,
+        ) -> BrokerContractSafetySnapshot:
+            return snapshot
+
+        return await self.run_with_locked_broker_contract_safety_snapshot(
+            runtime_context,
+            requested_symbol,
+            return_snapshot,
+            max_age_seconds=max_age_seconds,
+        )
 
     @staticmethod
     def _normalize_historical_symbol(symbol: Any) -> str:

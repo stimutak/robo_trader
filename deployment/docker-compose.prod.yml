@@ -53,6 +53,7 @@ services:
       - IBKR_ACCOUNT_TYPE=paper
       - RT_STATE_NAMESPACE=${RT_STATE_NAMESPACE:?Set RT_STATE_NAMESPACE to paper}
       - RT_DB_PATH=${RT_DB_PATH:?Set the container paper ledger path}
+      - SAFETY_ACCOUNT_SCOPE_KEY=${SAFETY_ACCOUNT_SCOPE_KEY:?Set the secret paper account-scope key}
       - SAFETY_ACCOUNT_SCOPE=${SAFETY_ACCOUNT_SCOPE:?Set an opaque paper safety account scope}
       - SAFETY_JOURNAL_PATH=${SAFETY_JOURNAL_PATH:?Set the dedicated paper safety journal path}
       - MODEL_ARTIFACT_SET=${MODEL_ARTIFACT_SET:?Identify the paper model artifact set}
@@ -99,6 +100,7 @@ services:
       - IBKR_PORT=${IBKR_PORT:-4002}
       - IBKR_READONLY=true
       - IBKR_CLIENT_ID=${IBKR_CLIENT_ID:-1}
+      - SAFETY_ACCOUNT_SCOPE_KEY=${SAFETY_ACCOUNT_SCOPE_KEY:?Set the secret paper account-scope key}
       - SAFETY_ACCOUNT_SCOPE=${SAFETY_ACCOUNT_SCOPE:?Set an opaque paper safety account scope}
       - SAFETY_JOURNAL_PATH=${SAFETY_JOURNAL_PATH:?Set the dedicated paper safety journal path}
       - LOG_LEVEL=WARNING

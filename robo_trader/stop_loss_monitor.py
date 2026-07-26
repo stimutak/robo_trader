@@ -14,6 +14,8 @@ Features:
 """
 
 import asyncio
+import hashlib
+import json
 import math
 import time
 from dataclasses import dataclass, field
@@ -28,6 +30,23 @@ from robo_trader.logger import get_logger
 from robo_trader.risk_manager import Position
 
 logger = get_logger(__name__)
+
+
+def _stable_stop_order_ref(portfolio_id: str, stop: "StopLossOrder") -> str:
+    """Return a fixed-width, deterministic reference for one protective stop."""
+
+    canonical_identity = json.dumps(
+        [
+            portfolio_id,
+            stop.symbol,
+            stop.created_at.astimezone(timezone.utc).isoformat(timespec="microseconds"),
+            str(stop.position_qty),
+            str(Decimal(str(stop.stop_price))),
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"stop:v1:{hashlib.sha256(canonical_identity).hexdigest()}"
 
 
 class StopType(str, Enum):
@@ -275,7 +294,10 @@ class StopLossMonitor:
 
     def __init__(
         self,
-        executor,
+        execute_reduction: Callable[
+            ["StopLossOrder", "Order"],
+            Awaitable["ExecutionResult"],
+        ],
         risk_manager,
         emergency_shutdown_callback=None,
         portfolio_id: str = "default",
@@ -291,7 +313,9 @@ class StopLossMonitor:
         Initialize stop-loss monitor.
 
         Args:
-            executor: Order executor for placing stop orders
+            execute_reduction: Narrow async callback for one authorized
+                reduce-only order attempt. The monitor never receives a raw
+                executor and never retries a submission.
             risk_manager: Risk manager for validation and limits
             emergency_shutdown_callback: Callback for emergency shutdown
             portfolio_id: Portfolio this monitor is scoped to
@@ -307,7 +331,9 @@ class StopLossMonitor:
             queue_timeout_seconds: Optional sequential queue progress bound.
             settlement_timeout_seconds: Optional post-fill callback bound.
         """
-        self.executor = executor
+        if not callable(execute_reduction):
+            raise ValueError("execute_reduction must be an async callback")
+        self._execute_reduction = execute_reduction
         self.risk_manager = risk_manager
         self.emergency_shutdown = emergency_shutdown_callback
         self.portfolio_id = portfolio_id
@@ -358,7 +384,7 @@ class StopLossMonitor:
         # Configuration
         self.check_interval_seconds = 1  # Check every second
         self.max_price_age_seconds = 10  # Require fresh prices
-        self.max_execution_retries = 3
+        self.max_execution_retries = 1
         self.emergency_shutdown_on_failure = True
         self.broker_attempt_timeout_seconds = self._validate_progress_timeout(
             order_timeout_seconds,
@@ -379,11 +405,7 @@ class StopLossMonitor:
             (
                 queue_timeout_seconds
                 if queue_timeout_seconds is not None
-                else (
-                    self.max_execution_retries * self.broker_attempt_timeout_seconds
-                    + (self.max_execution_retries - 1) * 0.5
-                    + self.check_interval_seconds
-                )
+                else (self.broker_attempt_timeout_seconds + self.check_interval_seconds)
             ),
             "queue_timeout_seconds",
         )
@@ -886,65 +908,60 @@ class StopLossMonitor:
         order = Order(
             symbol=stop.symbol,
             quantity=abs(stop.position_qty),
-            side="SELL" if stop.position_qty > 0 else "BUY",
+            side="SELL" if stop.position_qty > 0 else "BUY_TO_COVER",
             price=stop.trigger_price if stop.trigger_price is not None else stop.stop_price,
+            order_ref=_stable_stop_order_ref(self.portfolio_id, stop),
         )
 
-        # Attempt execution with retries.
-        #
-        # R2-L3 (intentional): stop-loss execution does NOT route through
-        # AsyncRunner._trading_blocked(). That's the gate for opening new
-        # positions; stop-losses are loss-mitigation exits on positions we
-        # already hold, and must execute even when normal trading is disabled
-        # (e.g. extended-hours window closed, AI suppressors active, daily
-        # notional cap hit). Refusing to close a losing position because new
-        # entries are blocked would be the worst possible behavior.
-        for attempt in range(self.max_execution_retries):
-            # A prior definitive rejection may be followed by cancellation or
-            # replacement during retry backoff. Revalidate immediately before
-            # every broker call so an obsolete close is never resubmitted.
-            if self.active_stops.get(stop_key) is not stop or stop.status in {
-                StopStatus.CANCELLED,
-                StopStatus.EXECUTED,
-                StopStatus.FAILED,
-            }:
-                logger.warning(
-                    "Abandoning obsolete stop retry for %s: status=%s " "attempt=%d",
-                    stop.symbol,
-                    stop.status.value,
-                    attempt + 1,
-                )
-                return False
-            self._inflight_stop_orders[stop_key] = self._new_phase_record(
-                stop,
-                StopExecutionPhase.BROKER_WAIT,
-                self.broker_attempt_timeout_seconds,
+        # One authenticated callback is the only execution path. A timeout,
+        # exception, malformed result, or definitive rejection is not retried:
+        # once an authorization might have crossed the submission boundary,
+        # another call could duplicate an exit.
+        if self.active_stops.get(stop_key) is not stop or stop.status in {
+            StopStatus.CANCELLED,
+            StopStatus.EXECUTED,
+            StopStatus.FAILED,
+        }:
+            logger.warning(
+                "Refusing obsolete stop submission for %s: status=%s",
+                stop.symbol,
+                stop.status.value,
             )
-            # PR1A deliberately does not wrap this await in a retrying timeout:
-            # cancellation after an ambiguous broker outcome could duplicate a
-            # filled exit. The runtime phase deadline makes health fail closed;
-            # broker idempotency/ambiguity resolution and concurrent exit
-            # scheduling are explicitly PR2-owned.
-            try:
-                result = await self.executor.place_order_async(order)
-            except Exception as e:
-                logger.error(
-                    f"Exception during stop-loss execution for {stop.symbol} "
-                    f"(attempt {attempt + 1}/{self.max_execution_retries}): {e}"
-                )
+            return False
+        self._inflight_stop_orders[stop_key] = self._new_phase_record(
+            stop,
+            StopExecutionPhase.BROKER_WAIT,
+            self.broker_attempt_timeout_seconds,
+        )
+        try:
+            result = await self._execute_reduction(stop, order)
+        except Exception as exc:
+            logger.error(
+                "Stop-loss execution raised for %s; refusing retry: %r",
+                stop.symbol,
+                exc,
+            )
+            result = ExecutionResult(False, "Stop-loss submission failed")
 
-                if attempt < self.max_execution_retries - 1:
-                    await asyncio.sleep(0.5)
-                continue
+        if type(result) is not ExecutionResult or type(result.ok) is not bool:
+            logger.error(
+                "Stop-loss callback returned malformed result for %s; refusing retry",
+                stop.symbol,
+            )
+            result = ExecutionResult(False, "Malformed stop-loss execution result")
+        elif result.ok and (
+            isinstance(result.fill_price, bool)
+            or not isinstance(result.fill_price, (int, float, Decimal))
+            or not math.isfinite(float(result.fill_price))
+            or float(result.fill_price) <= 0
+        ):
+            logger.error(
+                "Stop-loss callback returned an invalid fill for %s; refusing retry",
+                stop.symbol,
+            )
+            result = ExecutionResult(False, "Invalid stop-loss fill result")
 
-            if not result.ok:
-                logger.error(
-                    f"Stop-loss execution failed for {stop.symbol} "
-                    f"(attempt {attempt + 1}/{self.max_execution_retries}): {result.message}"
-                )
-                if attempt < self.max_execution_retries - 1:
-                    await asyncio.sleep(0.5)  # Brief delay before retry
-                continue
+        if result.ok:
 
             # Broker-fill commit point. Nothing after result.ok may re-enter
             # the retry loop: bookkeeping failures cannot make an already
@@ -1025,12 +1042,12 @@ class StopLossMonitor:
 
             return True
 
-        # Execution failed after all retries
+        # Execution failed after the only authorized attempt.
         stop.status = StopStatus.FAILED
         self.metrics.failed_today += 1
 
         logger.critical(
-            f"CRITICAL: Stop-loss execution FAILED for {stop.symbol} after {self.max_execution_retries} attempts!"
+            f"CRITICAL: Stop-loss execution FAILED for {stop.symbol}; no retry permitted"
         )
 
         # Trigger emergency shutdown if configured
