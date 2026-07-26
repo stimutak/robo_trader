@@ -5375,7 +5375,14 @@ class AsyncRunner:
                     await self.db.update_position(
                         symbol,
                         position.quantity,
-                        position.avg_price,  # Keep avg_cost same
+                        # This routine only maintains the legacy float market
+                        # projection.  Passing a Decimal cost basis alongside
+                        # a float quote would be interpreted as an exact-basis
+                        # update without an exact mark and would correctly
+                        # clear settlement mark authority.  Keep both values
+                        # float-only so the last producer-owned exact mark is
+                        # untouched until an exact settlement refreshes it.
+                        float(position.avg_price),
                         current_price,  # Update market price
                     )
                     logger.debug(f"Updated {symbol} market price to ${current_price:.2f}")

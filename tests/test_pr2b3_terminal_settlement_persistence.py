@@ -11,6 +11,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,6 +25,7 @@ from robo_trader.paper_terminal_settlement import (
     PaperTerminalSettlementRequest,
     assert_producer_owned_paper_terminal_settlement_receipt,
 )
+from robo_trader.runner_async import AsyncRunner
 from robo_trader.safety import (
     PAPER_EXECUTION_DOMAIN_SCOPE,
     OrderSide,
@@ -329,6 +331,37 @@ async def test_float_updates_cannot_mint_or_overwrite_exact_authority(tmp_path: 
                     WHERE portfolio_id = 'default' AND symbol = 'AAPL'
                     """)).fetchone()
         assert cleared_mark == ("200", None, None)
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_market_refresh_preserves_exact_settlement_mark(tmp_path: Path):
+    database = AsyncTradingDatabase(tmp_path / "paper-ledger.db", pool_size=1)
+    await database.initialize()
+    try:
+        await database.update_position(
+            "AAPL",
+            5,
+            Decimal("100"),
+            Decimal("101"),
+        )
+        runner = object.__new__(AsyncRunner)
+        runner.db = database
+        runner.positions = {"AAPL": SimpleNamespace(quantity=5, avg_price=Decimal("100"))}
+
+        await runner.update_position_market_prices({"AAPL": 102.5})
+
+        projection = await database.get_position("AAPL")
+        assert projection is not None
+        assert projection["market_price"] == 102.5
+        async with database.get_connection() as connection:
+            exact_position = await (await connection.execute("""
+                    SELECT cost_basis_text, mark_price_text
+                    FROM paper_position_settlement_state
+                    WHERE portfolio_id = 'default' AND symbol = 'AAPL'
+                    """)).fetchone()
+        assert exact_position == ("100", "101")
     finally:
         await database.close()
 
