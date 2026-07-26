@@ -20,7 +20,7 @@ import re
 import secrets
 import threading
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
@@ -59,9 +59,30 @@ def _text(value: object, field_name: str) -> str:
     return value
 
 
-@dataclass(frozen=True, slots=True, weakref_slot=True)
+@dataclass(frozen=True, repr=False)
 class ProtectiveQuoteEvidence:
     """One exact quote accepted and sequenced by a stop-loss monitor."""
+
+    # ``dataclasses.dataclass(..., weakref_slot=True)`` was added in Python
+    # 3.11, while this project supports Python 3.10.  Declaring the slots
+    # explicitly keeps the evidence immutable, without a ``__dict__``, and
+    # weak-referenceable on every supported interpreter.  The generated repr
+    # stays disabled so the internal producer marker is never rendered.
+    __slots__ = (
+        "portfolio_id",
+        "symbol",
+        "price",
+        "source_timestamp",
+        "receipt_monotonic",
+        "receipt_order",
+        "source",
+        "con_id",
+        "transport_generation",
+        "source_event_id",
+        "quote_id",
+        "_producer_marker",
+        "__weakref__",
+    )
 
     portfolio_id: str
     symbol: str
@@ -74,7 +95,7 @@ class ProtectiveQuoteEvidence:
     transport_generation: Optional[str]
     source_event_id: Optional[str]
     quote_id: str
-    _producer_marker: object = field(repr=False, compare=False)
+    _producer_marker: object
 
     def __post_init__(self) -> None:
         _text(self.portfolio_id, "portfolio_id")

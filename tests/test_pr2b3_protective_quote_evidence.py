@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import weakref
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -82,6 +83,9 @@ async def test_live_quote_is_exact_immutable_registered_and_current() -> None:
     )
     assert assert_producer_owned_protective_quote(quote, producer=monitor) is quote
     assert _strict(monitor, quote) is quote
+    assert not hasattr(quote, "__dict__")
+    assert weakref.ref(quote)() is quote
+    assert "_producer_marker" not in repr(quote)
     with pytest.raises(FrozenInstanceError):
         quote.price = Decimal("1")  # type: ignore[misc]
 
