@@ -62,6 +62,44 @@ async def test_snapshot_owned_cleanup_reuses_concurrent_close_identity_proof(
 
 
 @pytest.mark.asyncio
+async def test_stale_poison_closes_only_its_owned_connection(tmp_path):
+    """Stale recovery cannot consume a fresh snapshot quarantine entry."""
+
+    database = AsyncTradingDatabase(tmp_path / "stale-poison.db", pool_size=1)
+    await database.initialize()
+    old_generation = database._pool_generation
+    stale_orphan = await database_module.aiosqlite.connect(database.db_path)
+
+    await database.close()
+    await database.initialize()
+    fresh_generation = database._pool_generation
+    fresh_pool_connection = database._pool[0]
+    fresh_snapshot = await database_module.aiosqlite.connect(database.db_path)
+    database._quarantine_pool_connection(fresh_snapshot)
+
+    try:
+        await database._poison_connection_pool(
+            SafetyDatabasePoolError("stale borrower cleanup"),
+            old_generation,
+            "stale borrower cleanup",
+            (stale_orphan,),
+        )
+
+        assert stale_orphan in database._proven_closed_connections
+        assert fresh_snapshot not in database._proven_closed_connections
+        assert any(connection is fresh_snapshot for connection in database._quarantined_connections)
+        assert await (await fresh_snapshot.execute("SELECT 1")).fetchone() == (1,)
+        assert database._pool_generation is fresh_generation
+        assert database._pool_recovery_failure is None
+        assert database._pool == [fresh_pool_connection]
+        async with database.get_connection() as connection:
+            assert connection is fresh_pool_connection
+            assert await (await connection.execute("SELECT 1")).fetchone() == (1,)
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
 async def test_stale_waiter_cleanup_does_not_poison_reinitialized_pool(
     tmp_path,
 ):
@@ -79,6 +117,8 @@ async def test_stale_waiter_cleanup_does_not_poison_reinitialized_pool(
     await database.initialize()
     fresh_generation = database._pool_generation
     fresh_connection = database._pool[0]
+    fresh_snapshot = await database_module.aiosqlite.connect(database.db_path)
+    database._quarantine_pool_connection(fresh_snapshot)
 
     try:
         await database._cleanup_pool_waiters(
@@ -94,11 +134,91 @@ async def test_stale_waiter_cleanup_does_not_poison_reinitialized_pool(
         assert database._pool_recovery_failure is None
         assert database._pool == [fresh_connection]
         assert database._available.qsize() == 1
+        assert fresh_snapshot not in database._proven_closed_connections
+        assert any(connection is fresh_snapshot for connection in database._quarantined_connections)
+        assert await (await fresh_snapshot.execute("SELECT 1")).fetchone() == (1,)
         async with database.get_connection() as connection:
             assert connection is fresh_connection
             assert await (await connection.execute("SELECT 1")).fetchone() == (1,)
         assert database._available.qsize() == 1
     finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_return_closes_only_retired_generation_connection(
+    tmp_path,
+    monkeypatch,
+):
+    """A lifecycle race during rollback cannot poison the successor pool."""
+
+    database = AsyncTradingDatabase(tmp_path / "stale-return.db", pool_size=1)
+    await database.initialize()
+    old_generation = database._pool_generation
+    old_connection = database._pool[0]
+    original_rollback = old_connection.rollback
+    rollback_started = asyncio.Event()
+    release_borrower_rollback = asyncio.Event()
+    rollback_calls = 0
+    poison_calls = []
+    original_poison = database._poison_connection_pool
+
+    async def controlled_rollback():
+        nonlocal rollback_calls
+        rollback_calls += 1
+        if rollback_calls == 1:
+            rollback_started.set()
+            await release_borrower_rollback.wait()
+            return
+        await original_rollback()
+
+    async def tracked_poison(
+        error,
+        expected_generation,
+        operation="replacement connection opening",
+        owned_connections=(),
+    ):
+        poison_calls.append((expected_generation, operation, owned_connections))
+        await original_poison(
+            error,
+            expected_generation,
+            operation,
+            owned_connections,
+        )
+
+    monkeypatch.setattr(old_connection, "rollback", controlled_rollback)
+    monkeypatch.setattr(database, "_poison_connection_pool", tracked_poison)
+
+    async def borrow_with_transaction():
+        async with database.get_connection() as connection:
+            await connection.execute("BEGIN")
+            assert connection.in_transaction
+
+    borrower = asyncio.create_task(borrow_with_transaction())
+    await rollback_started.wait()
+
+    try:
+        await database.close()
+        await database.initialize()
+        fresh_generation = database._pool_generation
+        fresh_connection = database._pool[0]
+
+        release_borrower_rollback.set()
+        await borrower
+
+        stale_close_calls = [call for call in poison_calls if call[1] == "stale connection close"]
+        assert stale_close_calls == [(old_generation, "stale connection close", (old_connection,))]
+        assert old_connection in database._proven_closed_connections
+        assert database._pool_generation is fresh_generation
+        assert database._pool_recovery_failure is None
+        assert database._pool == [fresh_connection]
+        assert database._available.qsize() == 1
+        async with database.get_connection() as connection:
+            assert connection is fresh_connection
+            assert await (await connection.execute("SELECT 1")).fetchone() == (1,)
+    finally:
+        release_borrower_rollback.set()
+        await asyncio.gather(borrower, return_exceptions=True)
         await database.close()
 
 

@@ -26,6 +26,7 @@ from robo_trader.reconciliation.identity import (
     validate_ibc_safety_config,
 )
 
+from .broker_account_identity import is_supported_paper_account_identifier
 from .safety.models import ValidationError, canonical_json
 
 _ACCOUNT_SCOPE_RE = re.compile(r"^acct_v1_[0-9a-f]{64}$")
@@ -504,7 +505,10 @@ def _issue_broker_snapshot_capability(
     expected_account = context.expected_account_for_provider
     account_scope = getattr(context.runtime_contract, "safety_account_scope", None)
     runtime_fingerprint = context.runtime_contract.fingerprint
-    if not re.fullmatch(r"DU[0-9]{4,20}", expected_account):
+    if not is_supported_paper_account_identifier(
+        expected_account,
+        environment=context.runtime_contract.environment,
+    ):
         raise ValidationError("validated runtime lacks a paper account")
     if not isinstance(account_scope, str) or not _ACCOUNT_SCOPE_RE.fullmatch(account_scope):
         raise ValidationError("validated runtime lacks an opaque account scope")
@@ -616,7 +620,10 @@ def _issue_broker_contract_snapshot_capability(
     expected_account = context.expected_account_for_provider
     account_scope = getattr(context.runtime_contract, "safety_account_scope", None)
     runtime_fingerprint = context.runtime_contract.fingerprint
-    if not re.fullmatch(r"DU[0-9]{4,20}", expected_account):
+    if not is_supported_paper_account_identifier(
+        expected_account,
+        environment=context.runtime_contract.environment,
+    ):
         raise ValidationError("validated runtime lacks a paper account")
     if not isinstance(account_scope, str) or not _ACCOUNT_SCOPE_RE.fullmatch(account_scope):
         raise ValidationError("validated runtime lacks an opaque account scope")

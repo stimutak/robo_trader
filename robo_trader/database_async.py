@@ -408,9 +408,31 @@ class AsyncTradingDatabase:
     ) -> None:
         """Attempt every quarantine close and fail if any remain unresolved."""
 
+        await self._close_scoped_quarantined_connections(
+            list(self._quarantined_connections),
+            message,
+            rollback=rollback,
+        )
+        if self._quarantined_connections:
+            raise SafetyDatabasePoolError(message)
+
+    async def _close_scoped_quarantined_connections(
+        self,
+        connections: List[aiosqlite.Connection],
+        message: str,
+        *,
+        rollback: bool = False,
+    ) -> None:
+        """Close only the quarantined handles owned by one operation."""
+
+        owned_connections: List[aiosqlite.Connection] = []
+        for connection in connections:
+            if not any(item is connection for item in owned_connections):
+                owned_connections.append(connection)
+
         first_error: Optional[BaseException] = None
         cancellation: Optional[asyncio.CancelledError] = None
-        for connection in list(self._quarantined_connections):
+        for connection in owned_connections:
             try:
                 if connection in self._proven_closed_connections:
                     self._forget_quarantined_connection(connection)
@@ -448,7 +470,12 @@ class AsyncTradingDatabase:
                 if isinstance(error, asyncio.CancelledError) and cancellation is None:
                     cancellation = error
                 logger.debug(f"Quarantined connection cleanup failed: {error}")
-        if self._quarantined_connections:
+        unresolved = [
+            connection
+            for connection in owned_connections
+            if any(item is connection for item in self._quarantined_connections)
+        ]
+        if unresolved:
             cleanup_error = SafetyDatabasePoolError(message)
             if first_error is not None:
                 raise cleanup_error from first_error
@@ -589,17 +616,22 @@ class AsyncTradingDatabase:
         error: BaseException,
         expected_generation: _PoolGenerationState,
         operation: str = "replacement connection opening",
+        owned_connections: Tuple[aiosqlite.Connection, ...] = (),
     ) -> None:
         """Latch an unusable pool and best-effort close its connections."""
 
-        self._latch_pool_recovery_failure(
+        _, pool_connections = self._latch_pool_recovery_failure(
             error,
             expected_generation,
             operation,
         )
-        if self._quarantined_connections:
-            await self._close_quarantined_connections(
-                "poisoned pool cleanup could not close every connection"
+        cleanup_connections = list(owned_connections)
+        cleanup_connections.extend(pool_connections)
+        for connection in owned_connections:
+            self._quarantine_pool_connection(connection)
+        if cleanup_connections:
+            await self._close_scoped_quarantined_connections(
+                cleanup_connections, "poisoned pool cleanup could not close every connection"
             )
 
     def _detach_pool_connection(self, connection: aiosqlite.Connection) -> None:
@@ -675,6 +707,7 @@ class AsyncTradingDatabase:
                         self._pool_failure_error(failure),
                         generation,
                         "orphaned checkout close",
+                        (connection,),
                     )
                 raise self._pool_failure_error(failure)
 
@@ -762,6 +795,7 @@ class AsyncTradingDatabase:
                             SafetyDatabasePoolError("orphaned pool wait connection"),
                             generation,
                             "orphaned pool wait close",
+                            (orphaned_connection,),
                         )
         except asyncio.CancelledError as error:
             # This task is owned by _wait_for_pool_connection and is shielded
@@ -802,8 +836,20 @@ class AsyncTradingDatabase:
             )
             binding.assert_path_identity()
             return connection
+        except asyncio.CancelledError as error:
+            if connection is not None:
+                await self._close_owned_connection(
+                    connection,
+                    "cancelled replacement connection could not be closed",
+                    error,
+                )
+            raise
         except BaseException:
-            # The replacement caller owns exact cleanup through pool poison.
+            if connection is not None:
+                await self._close_owned_connection(
+                    connection,
+                    "failed replacement connection could not be closed",
+                )
             raise
         finally:
             if binding is not None:
@@ -868,14 +914,15 @@ class AsyncTradingDatabase:
             # leave this connection counted in an empty pool generation.
             self._detach_pool_connection(conn)
             try:
-                await self._close_quarantined_connections(
-                    "bad connection cleanup could not close every connection"
+                await self._close_scoped_quarantined_connections(
+                    [conn], "bad connection cleanup could not close every connection"
                 )
             except BaseException as cleanup_error:
                 await self._poison_connection_pool(
                     cleanup_error,
                     generation,
                     "bad connection cleanup",
+                    (conn,),
                 )
                 raise
             failure = self._pool_recovery_failure
@@ -891,10 +938,7 @@ class AsyncTradingDatabase:
                 new_conn = await self._open_identity_bound_pool_connection()
             except BaseException as replace_error:
                 logger.error(f"Failed to replace bad connection: {replace_error}")
-                poison_generation = generation
-                if generation is not self._pool_generation and self._quarantined_connections:
-                    poison_generation = self._pool_generation
-                await self._poison_connection_pool(replace_error, poison_generation)
+                await self._poison_connection_pool(replace_error, generation)
                 if not isinstance(replace_error, Exception):
                     raise
                 raise e from replace_error
@@ -910,8 +954,9 @@ class AsyncTradingDatabase:
                 self._quarantine_pool_connection(new_conn)
                 await self._poison_connection_pool(
                     SafetyDatabasePoolError("stale replacement generation"),
-                    self._pool_generation,
+                    generation,
                     "stale replacement close",
+                    (new_conn,),
                 )
                 raise
             self._pool.append(new_conn)
@@ -935,8 +980,9 @@ class AsyncTradingDatabase:
             self._detach_pool_connection(conn)
             await self._poison_connection_pool(
                 fatal_error,
-                self._pool_generation,
+                generation,
                 "checked-out connection use",
+                (conn,),
             )
             raise
         finally:
@@ -974,8 +1020,9 @@ class AsyncTradingDatabase:
                         self._detach_pool_connection(failed_connection)
                         await self._poison_connection_pool(
                             rollback_error,
-                            self._pool_generation,
+                            generation,
                             "pooled connection rollback",
+                            (failed_connection,),
                         )
                         raise
 
@@ -998,14 +1045,16 @@ class AsyncTradingDatabase:
                             return_error,
                             generation,
                             "pooled connection return",
+                            (return_connection,),
                         )
                         raise
                 else:
                     self._detach_pool_connection(return_connection)
                     await self._poison_connection_pool(
                         SafetyDatabasePoolError("stale returned connection"),
-                        self._pool_generation,
+                        generation,
                         "stale connection close",
+                        (return_connection,),
                     )
 
     async def _init_database(self, guardian: SQLitePathBinding) -> None:

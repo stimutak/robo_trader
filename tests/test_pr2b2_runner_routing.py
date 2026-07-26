@@ -42,12 +42,14 @@ class _EntrySerializationProbe(AbstractAsyncContextManager):
 def _exact_gateway(
     *,
     started: bool = True,
+    recovery_required: bool = False,
     reduction_result: ExecutionResult | None = None,
 ) -> tuple[PaperReductionGateway, _EntrySerializationProbe]:
     """Build only the exact gateway surface consumed by the runner seam."""
 
     gateway = object.__new__(PaperReductionGateway)
     gateway._started = started
+    gateway._diagnostic_recovery_required = recovery_required
     gateway.submit_reduction = AsyncMock(
         return_value=reduction_result or ExecutionResult(True, "gateway reduction filled", 100.0)
     )
@@ -265,6 +267,27 @@ async def test_reductions_require_exact_started_account_gateway(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("side", ["SELL", "BUY_TO_COVER"])
+async def test_reductions_reach_gateway_when_diagnostic_recovery_is_pending(side: str) -> None:
+    expected = ExecutionResult(True, "recovered reduction filled", 100.0)
+    gateway, _ = _exact_gateway(
+        started=False,
+        recovery_required=True,
+        reduction_result=expected,
+    )
+    runner = _runner(gateway)
+
+    result = await runner._place_order_with_circuit_breaker(_order(side))
+
+    assert result is expected
+    gateway.submit_reduction.assert_awaited_once_with(
+        order=_order(side),
+        portfolio_id="default",
+    )
+    runner.executor.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["SELL", "BUY_TO_COVER"])
 async def test_reductions_require_live_protective_feed(side: str) -> None:
     gateway, _ = _exact_gateway()
     runner = _runner(gateway, live_feed=False)
@@ -366,6 +389,25 @@ async def test_entries_require_exact_started_account_gateway(
     if serialize_entry is not None:
         serialize_entry.assert_not_called()
     runner.executor.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["BUY", "SELL_SHORT"])
+async def test_entries_reach_gateway_when_diagnostic_recovery_is_pending(
+    side: str,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("robo_trader.runner_async.is_extended_hours", lambda: False)
+    gateway, probe = _exact_gateway(started=False, recovery_required=True)
+    runner = _runner(gateway)
+
+    result = await runner._place_order_with_circuit_breaker(_order(side))
+
+    assert result.ok is True
+    gateway.serialize_entry.assert_called_once_with()
+    assert probe.enter_count == 1
+    assert probe.exit_count == 1
+    runner.executor.place_order.assert_called_once_with(_order(side))
 
 
 @pytest.mark.asyncio

@@ -32,6 +32,9 @@ os.environ["IBKR_FORCE_DISCONNECT"] = "1"
 
 from ib_async import IB, ExecutionFilter  # noqa: E402
 
+from robo_trader.broker_account_identity import (  # noqa: E402
+    is_supported_paper_account_identifier,
+)
 from robo_trader.utils.ibkr_safe import safe_disconnect  # noqa: E402
 
 # Global IB instance
@@ -74,6 +77,25 @@ INTRADAY_BAR_SIZES = {
 }
 PROTOCOL_ERROR_STATUS = "protocol_error"
 PROTOCOL_ERROR_TYPE = "TransportProtocolError"
+_SYNTHETIC_ACCOUNT_ENVIRONMENT_KEY = "ROBOTRADER_WORKER_SYNTHETIC_ACCOUNT_ENVIRONMENT"
+_FORBIDDEN_AMBIENT_POLICY_KEYS = frozenset(
+    {
+        "DASHBOARD_PASSWORD_HASH",
+        "DATABASE_URL",
+        "ENVIRONMENT",
+        "IBKR_PASSWORD",
+        "MODEL_SIGNING_KEY",
+        "PYTHONPATH",
+        "RT_TEST_MODE",
+        "VIRTUAL_ENV",
+    }
+)
+
+
+def _worker_environment() -> str:
+    """Read the parent's explicit, sanitized synthetic-account classification."""
+
+    return os.environ.get(_SYNTHETIC_ACCOUNT_ENVIRONMENT_KEY, "")
 
 
 class ContractIdentityProtocolError(ValueError):
@@ -1132,7 +1154,10 @@ async def handle_get_broker_safety_snapshot(params: dict) -> dict:
             raise ConnectionError("Broker safety snapshot requires a connected session")
 
         expected_account = str(params.get("expected_account", "")).strip()
-        if not re.fullmatch(r"DU[0-9]{4,20}", expected_account):
+        if not is_supported_paper_account_identifier(
+            expected_account,
+            environment=_worker_environment(),
+        ):
             raise BrokerSnapshotAccountMismatchError(
                 "Broker safety snapshot requires a paper account identity"
             )
@@ -1312,7 +1337,10 @@ async def handle_get_broker_contract_safety_snapshot(params: dict) -> dict:
             raise ConnectionError("Broker contract safety snapshot requires a connected session")
 
         expected_account = str(params.get("expected_account", "")).strip()
-        if not re.fullmatch(r"DU[0-9]{4,20}", expected_account):
+        if not is_supported_paper_account_identifier(
+            expected_account,
+            environment=_worker_environment(),
+        ):
             raise BrokerSnapshotAccountMismatchError(
                 "Broker contract safety snapshot requires a paper account identity"
             )
@@ -1460,6 +1488,17 @@ async def handle_health() -> dict:
             "connected": connected,
             "gateway_api_down": gateway_api_down,
             "detail": gateway_failure_detail if gateway_api_down else "",
+            "worker_policy": {
+                "reserved_synthetic_account_permitted": (
+                    is_supported_paper_account_identifier(
+                        "DU_CI_PAPER",
+                        environment=_worker_environment(),
+                    )
+                ),
+                "forbidden_ambient_keys_present": sorted(
+                    _FORBIDDEN_AMBIENT_POLICY_KEYS.intersection(os.environ)
+                ),
+            },
         },
     }
 

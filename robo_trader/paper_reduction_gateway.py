@@ -103,14 +103,23 @@ class PaperReductionGateway:
                 "shared safety database does not match the runtime ledger path"
             )
         self._database = database
-        self._client = SubprocessIBKRClient()
+        self._client = SubprocessIBKRClient(
+            worker_runtime_environment=self._runtime_context.runtime_contract.environment,
+        )
         self._account_order_gate = asyncio.Lock()
         self._submitters: dict[str, PaperReductionSubmitter] = {}
         self._started = False
+        self._diagnostic_recovery_required = False
 
     @property
     def started(self) -> bool:
         return self._started
+
+    @property
+    def can_attempt_order_admission(self) -> bool:
+        """Allow the locked boundary to retry health failures, not explicit closes."""
+
+        return self._started or self._diagnostic_recovery_required
 
     async def start(self) -> None:
         """Start one persistent diagnostic paper/read-only broker connection."""
@@ -119,6 +128,7 @@ class PaperReductionGateway:
         async with self._account_order_gate:
             if self._started:
                 return
+            self._diagnostic_recovery_required = False
             context = assert_validated_runtime_safety_context(self._runtime_context)
             connection = context.diagnostic_connection
             try:
@@ -188,10 +198,37 @@ class PaperReductionGateway:
 
         async with self._account_order_gate:
             self._started = False
+            self._diagnostic_recovery_required = False
             try:
                 await self._stop_client_owned()
             finally:
                 self._started = False
+                self._diagnostic_recovery_required = False
+
+    async def _refresh_diagnostic_connection_locked(self) -> None:
+        """Replace the diagnostic worker while the account gate is held."""
+
+        self._started = False
+        self._diagnostic_recovery_required = True
+        try:
+            context = assert_validated_runtime_safety_context(self._runtime_context)
+            connection = context.diagnostic_connection
+            await self._stop_client_owned()
+            await self._client.start()
+            connected = await self._client.connect(
+                host=connection.host,
+                port=connection.port,
+                client_id=connection.client_id,
+                readonly=connection.readonly,
+                timeout=30.0,
+            )
+            if connected is not True or await self._client.ping() is not True:
+                raise PaperReductionGatewayError("diagnostic broker connection did not recover")
+        except BaseException as error:
+            await self._stop_client_owned(error)
+            raise
+        self._started = True
+        self._diagnostic_recovery_required = False
 
     async def refresh_diagnostic_connection(self) -> None:
         """Replace stale broker state before order admission can resume.
@@ -205,25 +242,55 @@ class PaperReductionGateway:
 
         require_paper_terminal_settlement_ready()
         async with self._account_order_gate:
-            self._started = False
-            try:
-                context = assert_validated_runtime_safety_context(self._runtime_context)
-                connection = context.diagnostic_connection
-                await self._stop_client_owned()
-                await self._client.start()
-                connected = await self._client.connect(
-                    host=connection.host,
-                    port=connection.port,
-                    client_id=connection.client_id,
-                    readonly=connection.readonly,
-                    timeout=30.0,
-                )
-                if connected is not True or await self._client.ping() is not True:
-                    raise PaperReductionGatewayError("diagnostic broker connection did not recover")
-            except BaseException as error:
-                await self._stop_client_owned(error)
-                raise
-            self._started = True
+            await self._refresh_diagnostic_connection_locked()
+
+    async def _ensure_diagnostic_ready_locked(self) -> None:
+        """Retry only a gateway health failure, never an intentional close."""
+
+        if self._started:
+            return
+        if not self._diagnostic_recovery_required:
+            raise PaperReductionGatewayError("paper reduction gateway is not started")
+        try:
+            await self._refresh_diagnostic_connection_locked()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            raise PaperReductionGatewayError(
+                "diagnostic broker recovery failed before order admission"
+            ) from error
+
+    async def _recover_after_entry_health_failure_locked(self) -> None:
+        """Prepare the next admission without masking this failed health check."""
+
+        self._started = False
+        self._diagnostic_recovery_required = True
+        try:
+            await self._refresh_diagnostic_connection_locked()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.error(
+                "event=paper_reduction_gateway_entry_health_recovery_failed",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    async def _mark_broker_boundary_recovery_pending_locked(
+        self,
+        error: BaseException,
+    ) -> None:
+        """Drain a failed broker generation and preserve the current failure.
+
+        A broker snapshot failure happens before the paper submitter is entered,
+        so the current reduction must never be retried.  Stopping the exact
+        worker generation removes any pending response ambiguity; the next
+        order admission must establish a fresh connection through
+        ``_ensure_diagnostic_ready_locked``.
+        """
+
+        self._started = False
+        self._diagnostic_recovery_required = True
+        await self._stop_client_owned(error)
 
     def register_paper_executor(
         self,
@@ -255,25 +322,21 @@ class PaperReductionGateway:
         """Prevent an entry dispatch from interleaving with reduction evidence."""
 
         require_paper_terminal_settlement_ready()
-        if not self._started:
-            raise PaperReductionGatewayError("paper reduction gateway is not started")
         async with self._account_order_gate:
-            if not self._started:
-                raise PaperReductionGatewayError(
-                    "paper reduction gateway stopped before entry admission"
-                )
+            await self._ensure_diagnostic_ready_locked()
             try:
                 healthy = await self._client.ping()
             except asyncio.CancelledError:
                 self._started = False
+                self._diagnostic_recovery_required = True
                 raise
             except Exception as exc:
-                self._started = False
+                await self._recover_after_entry_health_failure_locked()
                 raise PaperReductionGatewayError(
                     "diagnostic broker health could not be proven for entry admission"
                 ) from exc
             if healthy is not True:
-                self._started = False
+                await self._recover_after_entry_health_failure_locked()
                 raise PaperReductionGatewayError(
                     "diagnostic broker is unavailable for entry admission"
                 )
@@ -298,15 +361,18 @@ class PaperReductionGateway:
                 "portfolio has no registered paper reduction submitter"
             )
         async with self._account_order_gate:
-            if not self._started:
-                raise PaperReductionGatewayError("paper reduction gateway is not started")
+            await self._ensure_diagnostic_ready_locked()
             context = assert_validated_runtime_safety_context(self._runtime_context)
             runtime_contract = context.runtime_contract
 
-            initial_broker = await self._client.get_broker_contract_safety_snapshot(
-                context,
-                order.symbol,
-            )
+            try:
+                initial_broker = await self._client.get_broker_contract_safety_snapshot(
+                    context,
+                    order.symbol,
+                )
+            except BaseException as error:
+                await self._mark_broker_boundary_recovery_pending_locked(error)
+                raise AssertionError("broker-boundary failure was not preserved")
             initial_allocation = await self._database.get_safety_allocation_snapshot(
                 order.symbol,
                 runtime_contract=runtime_contract,
@@ -379,7 +445,7 @@ class PaperReductionGateway:
                     order.symbol,
                     finalize,
                 )
-            except BaseException:
+            except BaseException as error:
                 # The broker lifecycle boundary can fail or be cancelled before
                 # invoking the callback. In that case no final proof can ever
                 # consume this permit, so invalidate it explicitly. Once the
@@ -387,6 +453,7 @@ class PaperReductionGateway:
                 # submitter own every later terminal or uncertain state.
                 if not finalization_started:
                     self._coordinator._invalidate_unsubmitted_authorization(authorization)
+                    await self._mark_broker_boundary_recovery_pending_locked(error)
                 raise
 
     def _validate_reduction_inputs(

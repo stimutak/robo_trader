@@ -1701,7 +1701,7 @@ async def test_partial_initialization_connection_is_quarantined_on_close_failure
 
 
 @pytest.mark.asyncio
-async def test_stale_replacement_close_failure_poisons_reinitialized_pool(
+async def test_stale_replacement_closes_only_owned_handle(
     tmp_path,
     monkeypatch,
 ):
@@ -1741,7 +1741,8 @@ async def test_stale_replacement_close_failure_poisons_reinitialized_pool(
     try:
         await database.close()
         await database.initialize()
-        assert len(database._pool) == 1
+        fresh_generation = database._pool_generation
+        fresh_connection = database._pool[0]
         assert database._pool_recovery_failure is None
 
         release_replacement.set()
@@ -1749,13 +1750,14 @@ async def test_stale_replacement_close_failure_poisons_reinitialized_pool(
         assert isinstance(old_result, sqlite3.OperationalError)
         assert str(old_result) == "forced pool failure"
         assert database._quarantined_connections == []
-        assert database._pool == []
-
-        with pytest.raises(
-            SafetyDatabasePoolError,
-            match="stale replacement close failed",
-        ):
-            await _bounded_await(_borrow_connection(database), 0.25)
+        assert captured["replacement"] in database._proven_closed_connections
+        assert database._pool_generation is fresh_generation
+        assert database._pool_recovery_failure is None
+        assert database._pool == [fresh_connection]
+        assert database._available.qsize() == 1
+        async with database.get_connection() as connection:
+            assert connection is fresh_connection
+            assert await (await connection.execute("SELECT 1")).fetchone() == (1,)
     finally:
         release_replacement.set()
         await asyncio.gather(old_borrower, return_exceptions=True)

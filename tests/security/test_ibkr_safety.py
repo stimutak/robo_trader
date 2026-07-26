@@ -12,6 +12,7 @@ and SECURITY_AUDIT_ROUND2_2026-05-10.md Section 2.E:
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import subprocess
@@ -192,9 +193,15 @@ async def test_subprocess_client_ignores_external_venv(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("worker_runtime_environment", "expected_synthetic_environment"),
+    [("test", "test"), ("production", None)],
+)
 async def test_subprocess_worker_launch_isolated_from_cwd_pythonpath_and_secrets(
     monkeypatch,
     tmp_path,
+    worker_runtime_environment,
+    expected_synthetic_environment,
 ):
     """The child executes one verified project script with no parent secrets."""
     pytest.importorskip("pytest_asyncio")
@@ -216,6 +223,9 @@ async def test_subprocess_worker_launch_isolated_from_cwd_pythonpath_and_secrets
     monkeypatch.setenv("IBKR_PASSWORD", "broker-secret")
     monkeypatch.setenv("MODEL_SIGNING_KEY", "model-secret")
     monkeypatch.setenv("DATABASE_URL", "database-secret")
+    # These ambient values must never decide the isolated worker's policy.
+    monkeypatch.setenv("ENVIRONMENT", "dev")
+    monkeypatch.setenv("RT_TEST_MODE", "1")
 
     captured = {}
 
@@ -230,7 +240,9 @@ async def test_subprocess_worker_launch_isolated_from_cwd_pythonpath_and_secrets
         mod._INTERPRETER_PREFIX_ALLOWLIST + (Path(sys.executable).resolve().parent,),
     )
 
-    client = mod.SubprocessIBKRClient()
+    client = mod.SubprocessIBKRClient(
+        worker_runtime_environment=worker_runtime_environment,
+    )
     with pytest.raises(RuntimeError, match="captured isolated worker launch"):
         await client.start()
 
@@ -253,6 +265,8 @@ async def test_subprocess_worker_launch_isolated_from_cwd_pythonpath_and_secrets
     assert "IBKR_PASSWORD" not in child_env
     assert "MODEL_SIGNING_KEY" not in child_env
     assert "DATABASE_URL" not in child_env
+    assert "ENVIRONMENT" not in child_env
+    assert "RT_TEST_MODE" not in child_env
     assert set(child_env) <= (
         mod._WORKER_ENV_ALLOWLIST
         | {
@@ -260,10 +274,68 @@ async def test_subprocess_worker_launch_isolated_from_cwd_pythonpath_and_secrets
             "PYTHONSAFEPATH",
             "PYTHONUNBUFFERED",
             "ROBOTRADER_WORKER_GENERATION_ID",
+            mod._WORKER_SYNTHETIC_ACCOUNT_ENVIRONMENT,
         }
     )
     assert child_env["PYTHONSAFEPATH"] == "1"
     assert child_env["ROBOTRADER_WORKER_GENERATION_ID"]
+    if expected_synthetic_environment is None:
+        assert mod._WORKER_SYNTHETIC_ACCOUNT_ENVIRONMENT not in child_env
+    else:
+        assert (
+            child_env[mod._WORKER_SYNTHETIC_ACCOUNT_ENVIRONMENT] == expected_synthetic_environment
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("worker_runtime_environment", "synthetic_account_permitted"),
+    [("test", True), ("production", False)],
+)
+async def test_real_worker_child_attests_isolated_policy_without_gateway(
+    monkeypatch,
+    tmp_path,
+    worker_runtime_environment,
+    synthetic_account_permitted,
+):
+    """Exercise the real isolated child handshake and its effective policy."""
+
+    from robo_trader.clients import subprocess_ibkr_client as mod
+
+    evil_cwd = tmp_path / "attacker"
+    evil_cwd.mkdir()
+    monkeypatch.chdir(evil_cwd)
+    monkeypatch.setenv("PYTHONPATH", str(evil_cwd))
+    monkeypatch.setenv("VIRTUAL_ENV", str(evil_cwd / "venv"))
+    monkeypatch.setenv("DASHBOARD_PASSWORD_HASH", "dashboard-secret")
+    monkeypatch.setenv("IBKR_PASSWORD", "broker-secret")
+    monkeypatch.setenv("MODEL_SIGNING_KEY", "model-secret")
+    monkeypatch.setenv("DATABASE_URL", "database-secret")
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("RT_TEST_MODE", "1")
+    monkeypatch.setattr(
+        mod,
+        "_INTERPRETER_PREFIX_ALLOWLIST",
+        mod._INTERPRETER_PREFIX_ALLOWLIST + (Path(sys.executable).resolve().parent,),
+    )
+
+    client = mod.SubprocessIBKRClient(
+        worker_runtime_environment=worker_runtime_environment,
+    )
+    try:
+        await asyncio.wait_for(client.start(), timeout=10.0)
+        policy_response = await asyncio.wait_for(
+            client._execute_command({"command": "health"}, timeout=5.0),
+            timeout=10.0,
+        )
+    finally:
+        await asyncio.wait_for(client.stop(), timeout=10.0)
+
+    assert client.process is None
+    assert policy_response["worker_policy"] == {
+        "reserved_synthetic_account_permitted": synthetic_account_permitted,
+        "forbidden_ambient_keys_present": [],
+    }
 
 
 @pytest.mark.asyncio

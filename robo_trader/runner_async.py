@@ -1212,7 +1212,10 @@ class AsyncRunner:
                     "Reduction blocked: live protective feed unavailable"
                 )
             gateway = self.paper_reduction_gateway
-            if type(gateway) is not PaperReductionGateway or not gateway.started:
+            if (
+                type(gateway) is not PaperReductionGateway
+                or not gateway.can_attempt_order_admission
+            ):
                 return self._rejected_order_result("Reduction blocked: safety gateway unavailable")
             lock = getattr(self, "_order_admission_lock", None)
             if lock is None:
@@ -1309,7 +1312,10 @@ class AsyncRunner:
                         self._order_admitted_tasks = set()
                     self._order_admitted_tasks.add(current_task)
                 gateway = self.paper_reduction_gateway
-                if type(gateway) is not PaperReductionGateway or not gateway.started:
+                if (
+                    type(gateway) is not PaperReductionGateway
+                    or not gateway.can_attempt_order_admission
+                ):
                     return self._rejected_order_result("Entry blocked: safety gateway unavailable")
                 # Hold the same account-wide lock used by reductions. This
                 # prevents an entry from changing the simulator allocation
@@ -2282,22 +2288,63 @@ class AsyncRunner:
         await self.load_existing_positions()
         self._assert_existing_position_protection()
 
-        # Seal the portfolio's executor only after every fallible setup and
-        # existing-position protection gate has passed. A partial setup must
-        # never leave a stale registration that blocks a clean retry.
-        self.paper_reduction_gateway.register_paper_executor(
+        # Registration and the healthy-runtime audit transition are deferred
+        # until the caller completes any post-setup health attachment. The
+        # gateway has no unregister operation, so exposing this executor here
+        # would permanently leak a stale portfolio binding if that attachment
+        # failed.
+
+    def _activate_after_setup(self) -> None:
+        """Publish the executor only after every setup readiness gate passes."""
+
+        gateway = self.paper_reduction_gateway
+        if type(gateway) is not PaperReductionGateway or not gateway.can_attempt_order_admission:
+            raise RuntimeError("active paper runtime requires a started reduction gateway")
+        if type(self.executor) is not PaperExecutor:
+            raise RuntimeError("active paper runtime requires an exact PaperExecutor")
+        gateway.register_paper_executor(
             self.portfolio_id,
             self.executor,
         )
-
-        # Mark setup as complete for persistent connections
         self._setup_complete = True
         logger.info("AsyncRunner setup complete")
 
-        # B2 (2026-05-12): Setup succeeded — runner is healthy. Clear any
-        # stale exit-audit file so the dashboard/watchdog reads "no exit"
-        # while the runner is actually trading.
+        # B2 (2026-05-12): Setup and post-setup readiness succeeded — runner
+        # is healthy. Clear any stale exit audit only after executor
+        # registration becomes authoritative.
         _clear_exit_audit()
+
+    async def _ensure_health_monitor_for_activation(self) -> None:
+        """Attach one live, healthy monitor to the exact active broker client."""
+
+        ib_client = getattr(self, "ib", None)
+        if ib_client is None:
+            raise RuntimeError("active paper runtime requires an IBKR client")
+
+        health = getattr(self, "health", None)
+        if health is not None and getattr(health, "_ib_client", None) is ib_client:
+            monitor_task = getattr(health, "_monitor_task", None)
+            if (
+                monitor_task is not None
+                and not monitor_task.done()
+                and health.status is HealthStatus.HEALTHY
+            ):
+                return
+            raise RuntimeError("active paper runtime requires a running healthy connection monitor")
+
+        await self._attach_health_monitor()
+        health = getattr(self, "health", None)
+        monitor_task = getattr(health, "_monitor_task", None)
+        if (
+            health is None
+            or getattr(health, "_ib_client", None) is not ib_client
+            or monitor_task is None
+            or monitor_task.done()
+            or health.status is not HealthStatus.HEALTHY
+        ):
+            raise RuntimeError(
+                "connection health attachment did not establish activation readiness"
+            )
 
     def _initialize_or_reuse_paper_executor(self) -> None:
         """Keep one exact executor identity across persistent reconnect setup."""
@@ -3481,19 +3528,14 @@ class AsyncRunner:
     async def teardown(self, full_cleanup: bool = False):
         """Clean up resources after a run cycle.
 
-        Between cycles (the default, full_cleanup=False), only stops cycle-level
-        monitors (production_monitor, correlation_manager). The IBKR connection
-        and subprocess stay alive — this is the persistent-connection design
-        landed in commit daa8b61.
+        The default cycle teardown deliberately preserves every long-lived
+        runner resource. In particular, production monitoring and correlation
+        refresh belong to the persistent runner, not one trading cycle. The
+        IBKR connection and subprocess are likewise retained across cycles.
 
         On process exit (full_cleanup=True, called from run_continuous's outer
         finally), fully tears down the connection via cleanup().
         """
-        if self.production_monitor:
-            await self.production_monitor.stop()
-        if self.correlation_manager:
-            await self.correlation_manager.stop()
-
         if full_cleanup:
             await self.cleanup()
 
@@ -5161,11 +5203,18 @@ class AsyncRunner:
         """Main run method - process all symbols and update account."""
         try:
             await self.setup()
-        except UnprotectedExistingPositionsError:
-            # setup() can fail after starting IBKR, DB, health, and stop-monitor
-            # resources. A one-shot caller has no outer runner registry to
-            # clean those partial resources, so cleanup must be local.
-            await self.cleanup()
+            await self._ensure_health_monitor_for_activation()
+            self._activate_after_setup()
+        except BaseException:
+            # setup/activation can fail after starting IBKR, DB, health, and
+            # stop-monitor resources. A one-shot caller has no outer runner
+            # registry to clean those partial resources, so cleanup must be
+            # cancellation-owned and local.
+            self._setup_complete = False
+            try:
+                await _cleanup_runner_owned(self)
+            except BaseException:
+                logger.exception("event=one_shot_partial_setup_cleanup_failed")
             raise
         try:
             # Check market status
@@ -6030,15 +6079,19 @@ class AsyncRunner:
 
     async def cleanup(self):
         """Clean up resources when runner is done."""
+        self._setup_complete = False
         cleanup_failures = 0
+        first_cleanup_failure: Optional[tuple[BaseException, Optional[TracebackType]]] = None
 
-        def record_failure(resource: str) -> None:
-            nonlocal cleanup_failures
+        def record_failure(resource: str, error: BaseException) -> None:
+            nonlocal cleanup_failures, first_cleanup_failure
             cleanup_failures += 1
+            if first_cleanup_failure is None:
+                first_cleanup_failure = (error, error.__traceback__)
             logger.warning(
                 "event=runner_cleanup_resource_failed resource=%s",
                 resource,
-                exc_info=True,
+                exc_info=(type(error), error, error.__traceback__),
             )
 
         async def cancel_task(task: Optional[asyncio.Task], resource: str) -> None:
@@ -6049,8 +6102,47 @@ class AsyncRunner:
                 await task
             except asyncio.CancelledError:
                 pass
-            except Exception:
-                record_failure(resource)
+            except BaseException as error:
+                record_failure(resource, error)
+
+        async def stop_cycle_manager(
+            attribute: str,
+            *,
+            active_attribute: str,
+            task_attribute: str,
+            resource: str,
+        ) -> None:
+            """Stop one setup-owned background manager and release it on success."""
+
+            manager = getattr(self, attribute, None)
+            if manager is None:
+                return
+
+            try:
+                # Inspect state inside this resource's isolation boundary. A
+                # malformed manager must not prevent the other manager, IBKR,
+                # or the database from being cleaned.
+                manager_task = getattr(manager, task_attribute, None)
+                task_done = manager_task is None or manager_task.done() is True
+                already_stopped = getattr(manager, active_attribute, None) is False and task_done
+                if not already_stopped:
+                    stop_result = manager.stop()
+                    if inspect.isawaitable(stop_result):
+                        await stop_result
+
+                # A non-raising stop call is not sufficient proof. Retain
+                # ownership unless both the active flag and task state confirm
+                # shutdown, so a later idempotent cleanup can retry.
+                manager_task = getattr(manager, task_attribute, None)
+                task_done = manager_task is None or manager_task.done() is True
+                if getattr(manager, active_attribute, None) is not False or not task_done:
+                    raise RuntimeError(f"{resource} stop returned without proving shutdown")
+            except BaseException as error:
+                # Retain the reference so a later idempotent cleanup can retry
+                # an incomplete stop instead of losing ownership of a live task.
+                record_failure(resource, error)
+            else:
+                setattr(self, attribute, None)
 
         # Every resource is isolated. A failed stop-monitor shutdown must never
         # prevent the IBKR subprocess or database from being closed after a
@@ -6058,10 +6150,23 @@ class AsyncRunner:
         if getattr(self, "health", None) is not None:
             try:
                 await self.health.stop_monitoring()
-            except Exception:
-                record_failure("connection_health")
+            except BaseException as error:
+                record_failure("connection_health", error)
             finally:
                 self.health = None
+
+        await stop_cycle_manager(
+            "production_monitor",
+            active_attribute="is_running",
+            task_attribute="monitoring_task",
+            resource="production_monitor",
+        )
+        await stop_cycle_manager(
+            "correlation_manager",
+            active_attribute="running",
+            task_attribute="update_task",
+            resource="correlation_manager",
+        )
 
         await cancel_task(
             getattr(self, "subprocess_monitor_task", None),
@@ -6081,8 +6186,8 @@ class AsyncRunner:
             logger.info("Stopping stop-loss monitor...")
             try:
                 await stop_monitor.stop_monitoring()
-            except Exception:
-                record_failure("stop_loss_monitor")
+            except BaseException as error:
+                record_failure("stop_loss_monitor", error)
             try:
                 metrics = stop_monitor.get_metrics()
                 logger.info(
@@ -6090,8 +6195,8 @@ class AsyncRunner:
                     f"Executed: {metrics.executed_today}, Failed: {metrics.failed_today}, "
                     f"Prevented loss: ${metrics.total_prevented_loss:.2f}"
                 )
-            except Exception:
-                record_failure("stop_loss_metrics")
+            except BaseException as error:
+                record_failure("stop_loss_metrics", error)
 
         if getattr(self, "use_advanced_risk", False) and getattr(self, "advanced_risk", None):
             try:
@@ -6099,8 +6204,8 @@ class AsyncRunner:
                 state_file.parent.mkdir(exist_ok=True)
                 self.advanced_risk.save_state(state_file)
                 logger.info("Advanced risk manager state saved")
-            except Exception:
-                record_failure("advanced_risk_state")
+            except BaseException as error:
+                record_failure("advanced_risk_state", error)
 
         ib_client = getattr(self, "ib", None)
         if ib_client is not None:
@@ -6110,32 +6215,35 @@ class AsyncRunner:
                     disconnect_result = ib_client.disconnect()
                     if inspect.isawaitable(disconnect_result):
                         await disconnect_result
-                except Exception:
-                    record_failure("ibkr_disconnect")
+                except BaseException as error:
+                    record_failure("ibkr_disconnect", error)
             if hasattr(ib_client, "stop"):
                 try:
                     stop_result = ib_client.stop()
                     if inspect.isawaitable(stop_result):
                         await stop_result
                     logger.info("Stopped IBKR subprocess")
-                except Exception:
-                    record_failure("ibkr_subprocess")
+                except BaseException as error:
+                    record_failure("ibkr_subprocess", error)
 
         database = getattr(self, "db", None)
         if database is not None and getattr(self, "_owns_database", True):
             try:
                 await database.close()
-            except Exception:
-                record_failure("database")
+            except BaseException as error:
+                record_failure("database", error)
 
         websocket = getattr(self, "ws_client", None)
         if websocket is not None:
             try:
                 websocket.stop()
-            except Exception:
-                record_failure("websocket")
+            except BaseException as error:
+                record_failure("websocket", error)
 
         logger.info("Cleanup completed (resource_failures=%d)", cleanup_failures)
+        if first_cleanup_failure is not None:
+            error, traceback = first_cleanup_failure
+            raise error.with_traceback(traceback)
 
     async def _safe_disconnect(self) -> None:
         """Disconnect IBKR cleanly when possible; never crash Gateway.
@@ -6698,12 +6806,25 @@ async def _start_paper_order_runtime(
             database,
         )
         await gateway.start()
-    except BaseException:
-        await database.close()
-        raise
+    except BaseException as startup_error:
+        try:
+            await _await_cleanup_owned(
+                database.close(),
+                failure_event="paper_order_runtime_database_cleanup_failed_during_startup",
+            )
+        except BaseException:
+            logger.exception("event=paper_order_runtime_database_cleanup_failed_during_startup")
+        raise startup_error.with_traceback(startup_error.__traceback__)
     if gateway is None:
-        await database.close()
-        raise RuntimeError("paper reduction gateway startup returned no gateway")
+        missing_gateway = RuntimeError("paper reduction gateway startup returned no gateway")
+        try:
+            await _await_cleanup_owned(
+                database.close(),
+                failure_event="paper_order_runtime_database_cleanup_failed_without_gateway",
+            )
+        except BaseException:
+            logger.exception("event=paper_order_runtime_database_cleanup_failed_without_gateway")
+        raise missing_gateway
     return _PaperOrderRuntimeResources(database=database, gateway=gateway)
 
 
@@ -6937,13 +7058,15 @@ async def _setup_continuous_runner(runner: AsyncRunner) -> None:
 
     try:
         await runner.setup()
-        await runner._attach_health_monitor()
-    except BaseException:
+        await runner._ensure_health_monitor_for_activation()
+        runner._activate_after_setup()
+    except BaseException as setup_error:
+        runner._setup_complete = False
         try:
-            await runner.cleanup()
+            await _cleanup_runner_owned(runner)
         except BaseException:
             logger.exception("event=partial_runner_setup_cleanup_failed")
-        raise
+        raise setup_error.with_traceback(setup_error.__traceback__)
 
 
 async def run_continuous(
@@ -7234,8 +7357,6 @@ async def run_continuous(
                             portfolio_runner.health.record_failure(
                                 cycle_err, f"cycle:{portfolio_id}"
                             )
-
-                    await portfolio_runner.teardown(full_cleanup=False)
 
                 # Wait before next iteration. This sleep must run on EVERY
                 # path: with --force-connect and the market closed, neither

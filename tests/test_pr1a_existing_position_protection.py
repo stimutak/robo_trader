@@ -23,6 +23,7 @@ from robo_trader.risk_manager import Position
 from robo_trader.runner_async import (
     AsyncRunner,
     UnprotectedExistingPositionsError,
+    _cleanup_runner_owned,
     _clear_exit_audit,
     _setup_continuous_runner,
     _write_exit_audit,
@@ -2003,12 +2004,39 @@ async def test_cleanup_reaches_ibkr_and_database_after_stop_monitor_failure() ->
     runner.db = SimpleNamespace(close=AsyncMock())
     runner.ws_client = None
 
-    await runner.cleanup()
+    with pytest.raises(RuntimeError, match="monitor failed"):
+        await runner.cleanup()
 
     runner.stop_loss_monitor.stop_monitoring.assert_awaited_once_with()
     runner.ib.disconnect.assert_awaited_once_with()
     runner.ib.stop.assert_awaited_once_with()
     runner.db.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_internal_cancellation_still_reaches_ibkr_and_database() -> None:
+    runner = object.__new__(AsyncRunner)
+    runner._setup_complete = True
+    runner.health = SimpleNamespace(stop_monitoring=AsyncMock(side_effect=asyncio.CancelledError()))
+    runner.subprocess_monitor_task = None
+    runner.risk_monitor_task = None
+    runner.cleanup_task = None
+    runner.stop_loss_monitor = None
+    runner.use_advanced_risk = False
+    runner.advanced_risk = None
+    runner.ib = SimpleNamespace(disconnect=AsyncMock(), stop=AsyncMock())
+    runner.db = SimpleNamespace(close=AsyncMock())
+    runner._owns_database = True
+    runner.ws_client = None
+
+    with pytest.raises(asyncio.CancelledError):
+        await _cleanup_runner_owned(runner)
+
+    runner.ib.disconnect.assert_awaited_once_with()
+    runner.ib.stop.assert_awaited_once_with()
+    runner.db.close.assert_awaited_once_with()
+    assert runner.health is None
+    assert runner._setup_complete is False
 
 
 def test_continuous_loop_treats_unprotected_positions_as_nonretryable() -> None:

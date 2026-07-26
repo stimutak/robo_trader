@@ -1158,6 +1158,8 @@ async def test_next_cycle_resets_abort_only_after_prior_drain() -> None:
 async def test_symbol_cycle_abort_suppresses_all_run_level_downstream_work() -> None:
     runner = AsyncRunner.__new__(AsyncRunner)
     runner.setup = AsyncMock()
+    runner._ensure_health_monitor_for_activation = AsyncMock()
+    runner._activate_after_setup = MagicMock()
     runner.teardown = AsyncMock()
     runner.positions = {}
     runner.cfg = SimpleNamespace(symbols=["AAPL"])
@@ -1195,6 +1197,8 @@ async def test_symbol_cycle_abort_suppresses_all_run_level_downstream_work() -> 
 async def test_recoverable_disconnect_suppresses_all_run_level_downstream_work() -> None:
     runner = AsyncRunner.__new__(AsyncRunner)
     runner.setup = AsyncMock()
+    runner._ensure_health_monitor_for_activation = AsyncMock()
+    runner._activate_after_setup = MagicMock()
     runner.teardown = AsyncMock()
     runner.positions = {}
     runner.cfg = SimpleNamespace(symbols=["AAPL"])
@@ -1276,7 +1280,9 @@ async def test_continuous_authoritative_disconnect_recovers_without_watchdog_exi
     runner.recover_connection.assert_awaited_once()
     runner._safe_disconnect.assert_not_awaited()
     assert runner._recovery_exhausted is False
-    runner.teardown.assert_awaited_once_with(full_cleanup=False)
+    # AsyncRunner.run owns its cycle-finalization hook. The continuous loop
+    # must not invoke it a second time after a recovered cycle failure.
+    runner.teardown.assert_not_awaited()
     runner.cleanup.assert_awaited_once()
 
 

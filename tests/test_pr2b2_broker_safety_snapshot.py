@@ -154,8 +154,8 @@ async def _worker_contract_payload(fake_ib, symbol="MSFT"):
     return result["data"]
 
 
-def _connected_client(monkeypatch, payload):
-    client = SubprocessIBKRClient()
+def _connected_client(monkeypatch, payload, *, worker_runtime_environment=None):
+    client = SubprocessIBKRClient(worker_runtime_environment=worker_runtime_environment)
     generation = _WorkerGeneration(
         generation_id="snapshot-generation",
         process=SimpleNamespace(poll=lambda: None),
@@ -210,6 +210,7 @@ def _runtime_context(
     account=ACCOUNT,
     account_scope=None,
     host="127.0.0.1",
+    environment="dev",
 ):
     ibc_path = tmp_path / "config" / "ibc" / "config.ini"
     ibc_path.parent.mkdir(parents=True, exist_ok=True)
@@ -217,7 +218,7 @@ def _runtime_context(
     if account_scope is None:
         account_scope = _derive_safety_account_scope(SAFETY_SCOPE_KEY, account)
     contract = RuntimeContract(
-        environment="dev",
+        environment=environment,
         execution_mode="paper",
         execution_source="paper_simulator",
         ibkr_host=host,
@@ -247,6 +248,110 @@ def _runtime_context(
         },
     )
     return context, ibc_path
+
+
+@pytest.mark.asyncio
+async def test_reserved_synthetic_account_crosses_worker_client_and_capability_only_off_prod(
+    fake_ib,
+    monkeypatch,
+    tmp_path,
+):
+    synthetic_account = "DU_CI_PAPER"
+    monkeypatch.setitem(globals(), "ACCOUNT", synthetic_account)
+    monkeypatch.setenv("ROBOTRADER_WORKER_SYNTHETIC_ACCOUNT_ENVIRONMENT", "dev")
+    payload = await _worker_payload(fake_ib)
+    client, generation, execute = _connected_client(
+        monkeypatch,
+        payload,
+        worker_runtime_environment="dev",
+    )
+    runtime_context, _ = _runtime_context(
+        tmp_path,
+        monkeypatch,
+        account=synthetic_account,
+        environment="dev",
+    )
+
+    snapshot = await client.get_broker_safety_snapshot(runtime_context, "AAPL")
+
+    assert type(snapshot) is BrokerSafetySnapshot
+    assert snapshot.transport_generation == generation.generation_id
+    assert_producer_owned_broker_safety_snapshot(snapshot)
+    assert execute.await_args.args[0]["params"]["expected_account"] == synthetic_account
+
+
+@pytest.mark.asyncio
+async def test_reserved_synthetic_account_crosses_contract_snapshot_path_off_prod(
+    fake_ib,
+    monkeypatch,
+    tmp_path,
+):
+    synthetic_account = "DU_TEST_PAPER"
+    monkeypatch.setitem(globals(), "ACCOUNT", synthetic_account)
+    monkeypatch.setenv("ROBOTRADER_WORKER_SYNTHETIC_ACCOUNT_ENVIRONMENT", "test")
+    payload = await _worker_contract_payload(fake_ib)
+    client, generation, execute = _connected_client(
+        monkeypatch,
+        payload,
+        worker_runtime_environment="test",
+    )
+    runtime_context, _ = _runtime_context(
+        tmp_path,
+        monkeypatch,
+        account=synthetic_account,
+        environment="test",
+    )
+
+    snapshot = await client.get_broker_contract_safety_snapshot(
+        runtime_context,
+        "MSFT",
+    )
+
+    assert type(snapshot) is BrokerContractSafetySnapshot
+    assert snapshot.transport_generation == generation.generation_id
+    assert_producer_owned_broker_contract_safety_snapshot(snapshot)
+    assert execute.await_args.args[0]["params"]["expected_account"] == synthetic_account
+
+
+@pytest.mark.asyncio
+async def test_worker_rejects_synthetic_account_when_process_environment_is_production(
+    fake_ib,
+    monkeypatch,
+):
+    monkeypatch.delenv("ROBOTRADER_WORKER_SYNTHETIC_ACCOUNT_ENVIRONMENT", raising=False)
+    monkeypatch.setenv("RT_TEST_MODE", "1")
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    fake_ib.calls.clear()
+
+    result = await worker.handle_get_broker_safety_snapshot(
+        {"expected_account": "DU_CI_PAPER", "requested_symbol": "AAPL"}
+    )
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "BrokerSnapshotAccountMismatchError"
+    assert fake_ib.calls == ["isConnected"]
+
+
+@pytest.mark.asyncio
+async def test_client_rejects_synthetic_account_in_production_before_worker_call(
+    fake_ib,
+    monkeypatch,
+    tmp_path,
+):
+    payload = await _worker_payload(fake_ib)
+    client, generation, execute = _connected_client(monkeypatch, payload)
+    runtime_context, _ = _runtime_context(
+        tmp_path,
+        monkeypatch,
+        account="DU_CI_PAPER",
+        environment="production",
+    )
+
+    with pytest.raises(IBKRTransportPoisonedError, match="runtime context"):
+        await client.get_broker_safety_snapshot(runtime_context, "AAPL")
+
+    assert generation.poisoned_reason is not None
+    execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio

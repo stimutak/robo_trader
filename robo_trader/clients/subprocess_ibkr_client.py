@@ -33,6 +33,10 @@ from typing import Any, Awaitable, Callable, Optional, TypeVar, cast
 
 import structlog
 
+from robo_trader.broker_account_identity import (
+    is_supported_paper_account_identifier,
+    normalize_synthetic_paper_account_environment,
+)
 from robo_trader.broker_safety_evidence import (
     BrokerContractSafetySnapshot,
     BrokerSafetyContract,
@@ -107,6 +111,7 @@ _WORKER_ENV_ALLOWLIST = frozenset(
         "WINDIR",
     }
 )
+_WORKER_SYNTHETIC_ACCOUNT_ENVIRONMENT = "ROBOTRADER_WORKER_SYNTHETIC_ACCOUNT_ENVIRONMENT"
 _LSOF_EXECUTABLE_CANDIDATES: tuple[Path, ...] = (
     Path("/usr/sbin/lsof"),
     Path("/usr/bin/lsof"),
@@ -346,7 +351,7 @@ class SubprocessIBKRClient:
         WORKER_HANDSHAKE_TIMEOUT + WORKER_STABILIZATION_DELAY + WORKER_ACCOUNT_TIMEOUT
     )  # 25.5s
 
-    def __init__(self):
+    def __init__(self, *, worker_runtime_environment: object = None):
         self.process: Optional[subprocess.Popen] = None
         self.lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
@@ -370,6 +375,13 @@ class SubprocessIBKRClient:
         self._historical_lineage_lock = threading.Lock()
         self._historical_lineage_generation_id: Optional[str] = None
         self._historical_lineage_by_symbol: dict[str, QualifiedStockContractLineage] = {}
+        # The worker receives a fresh, secret-free environment rather than the
+        # parent's ambient process environment. Preserve only the validated
+        # dev/test classification needed by deterministic synthetic accounts;
+        # every other value is production-like and therefore omitted.
+        self._worker_synthetic_account_environment = (
+            normalize_synthetic_paper_account_environment(worker_runtime_environment) or ""
+        )
 
     def _invalidate_historical_lineage(self) -> None:
         """Forget broker identity evidence whenever its transport is no longer current."""
@@ -818,6 +830,10 @@ class SubprocessIBKRClient:
                     "ROBOTRADER_WORKER_GENERATION_ID": generation_id,
                 }
             )
+            if self._worker_synthetic_account_environment:
+                worker_env[_WORKER_SYNTHETIC_ACCOUNT_ENVIRONMENT] = (
+                    self._worker_synthetic_account_environment
+                )
             # CRITICAL FIX: Use regular subprocess.Popen with threading instead of
             # asyncio.create_subprocess_exec to avoid event loop starvation in
             # busy async environments
@@ -2258,7 +2274,10 @@ class SubprocessIBKRClient:
         if (
             not isinstance(expected_account, str)
             or expected_account != expected_account.strip()
-            or not re.fullmatch(r"DU[0-9]{4,20}", expected_account)
+            or not is_supported_paper_account_identifier(
+                expected_account,
+                environment=context.runtime_contract.environment,
+            )
         ):
             raise ValueError("validated runtime does not identify a paper account")
         contract = context.runtime_contract

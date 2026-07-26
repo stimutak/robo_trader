@@ -18,6 +18,7 @@ from robo_trader.broker_safety_evidence import (
     _issue_broker_contract_snapshot_capability,
     _produce_broker_contract_safety_snapshot,
 )
+from robo_trader.clients.subprocess_ibkr_client import IBKRTransportPoisonedError
 from robo_trader.config import _derive_safety_account_scope
 from robo_trader.database_async import (
     AsyncTradingDatabase,
@@ -230,10 +231,20 @@ async def test_gateway_start_cancellation_stops_partial_client(
 
 
 @pytest.mark.asyncio
-async def test_entry_serialization_fails_closed_when_diagnostic_ping_is_false(
+async def test_entry_ping_false_denies_current_entry_and_recovers_for_next_entry(
     harness: GatewayHarness,
 ) -> None:
-    harness.gateway._client.ping = AsyncMock(return_value=False)
+    client = harness.gateway._client
+    client.start.reset_mock()
+    client.connect.reset_mock()
+    client.stop.reset_mock()
+    ping_results = iter((False, True, True))
+
+    async def locked_ping() -> bool:
+        assert harness.gateway._account_order_gate.locked()
+        return next(ping_results)
+
+    client.ping = AsyncMock(side_effect=locked_ping)
     entered = False
 
     with pytest.raises(PaperReductionGatewayError, match="unavailable for entry"):
@@ -241,21 +252,107 @@ async def test_entry_serialization_fails_closed_when_diagnostic_ping_is_false(
             entered = True
 
     assert entered is False
-    assert harness.gateway.started is False
-    harness.gateway._client.ping.assert_awaited_once()
+    assert harness.gateway.started is True
+    client.stop.assert_awaited_once()
+    client.start.assert_awaited_once()
+    client.connect.assert_awaited_once()
+
+    async with harness.gateway.serialize_entry():
+        entered = True
+
+    assert entered is True
+    assert client.ping.await_count == 3
 
 
 @pytest.mark.asyncio
-async def test_entry_serialization_fails_closed_when_diagnostic_ping_errors(
+async def test_entry_ping_error_denies_current_entry_and_recovers_for_next_entry(
     harness: GatewayHarness,
 ) -> None:
-    harness.gateway._client.ping = AsyncMock(side_effect=OSError("diagnostic failed"))
+    client = harness.gateway._client
+    client.start.reset_mock()
+    client.connect.reset_mock()
+    client.stop.reset_mock()
+    client.ping = AsyncMock(side_effect=[OSError("diagnostic failed"), True, True])
 
     with pytest.raises(PaperReductionGatewayError, match="health could not be proven"):
         async with harness.gateway.serialize_entry():
             pytest.fail("entry admission must not yield with an unhealthy diagnostic client")
 
+    assert harness.gateway.started is True
+    async with harness.gateway.serialize_entry():
+        pass
+    assert client.ping.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_failed_inline_recovery_is_retried_by_next_admission(
+    harness: GatewayHarness,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = harness.gateway._client
+    client.start.reset_mock()
+    client.connect.reset_mock()
+    client.stop.reset_mock()
+    client.connect = AsyncMock(side_effect=[False, True])
+    client.ping = AsyncMock(side_effect=[False, True, True])
+
+    with caplog.at_level(
+        "ERROR",
+        logger="robo_trader.paper_reduction_gateway",
+    ):
+        with pytest.raises(PaperReductionGatewayError, match="unavailable for entry"):
+            async with harness.gateway.serialize_entry():
+                pytest.fail("a failed health check must deny the current entry")
+
     assert harness.gateway.started is False
+    assert any(
+        record.getMessage() == "event=paper_reduction_gateway_entry_health_recovery_failed"
+        for record in caplog.records
+    )
+
+    async with harness.gateway.serialize_entry():
+        pass
+
+    assert harness.gateway.started is True
+    assert client.start.await_count == 2
+    assert client.connect.await_count == 2
+    assert client.ping.await_count == 3
+
+
+class _FatalProcessSignal(BaseException):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_pre_admission_recovery_propagates_fatal_base_exception(
+    harness: GatewayHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness.gateway._started = False
+    harness.gateway._diagnostic_recovery_required = True
+    refresh = AsyncMock(side_effect=_FatalProcessSignal("terminate"))
+    monkeypatch.setattr(harness.gateway, "_refresh_diagnostic_connection_locked", refresh)
+
+    with pytest.raises(_FatalProcessSignal, match="terminate"):
+        await harness.gateway._ensure_diagnostic_ready_locked()
+
+    refresh.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_entry_health_recovery_propagates_fatal_base_exception(
+    harness: GatewayHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    refresh = AsyncMock(side_effect=_FatalProcessSignal("terminate"))
+    monkeypatch.setattr(harness.gateway, "_refresh_diagnostic_connection_locked", refresh)
+
+    with pytest.raises(_FatalProcessSignal, match="terminate"):
+        await harness.gateway._recover_after_entry_health_failure_locked()
+
+    assert harness.gateway.started is False
+    assert harness.gateway._diagnostic_recovery_required is True
+    refresh.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -645,6 +742,164 @@ async def test_account_lock_serializes_entry_and_cross_portfolio_reductions(
     assert entry_entered.is_set()
     assert len(executor_a.fills) == 1
     assert len(executor_b.fills) == 0
+
+
+@pytest.mark.asyncio
+async def test_reduction_admission_retries_gateway_after_entry_recovery_failed(
+    harness: GatewayHarness,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    client = harness.gateway._client
+    client.start.reset_mock()
+    client.stop.reset_mock()
+    client.connect = AsyncMock(side_effect=[False, True])
+    client.ping = AsyncMock(side_effect=[False, True])
+
+    with pytest.raises(PaperReductionGatewayError, match="unavailable for entry"):
+        async with harness.gateway.serialize_entry():
+            pytest.fail("the failed entry health check must remain denied")
+
+    assert harness.gateway.started is False
+    executor = PaperExecutor()
+    harness.gateway.register_paper_executor("portfolio-a", executor)
+    _install_broker_boundary(harness, monkeypatch)
+
+    result = await harness.gateway.submit_reduction(
+        order=_order(order_ref="recover-before-reduction"),
+        portfolio_id="portfolio-a",
+    )
+
+    assert result.ok is True
+    assert harness.gateway.started is True
+    assert client.start.await_count == 2
+    assert client.connect.await_count == 2
+    assert client.ping.await_count == 2
+    assert len(executor.fills) == 1
+
+
+@pytest.mark.asyncio
+async def test_initial_broker_snapshot_failure_drains_and_defers_recovery_to_next_admission(
+    harness: GatewayHarness,
+) -> None:
+    executor = PaperExecutor()
+    harness.gateway.register_paper_executor("portfolio-a", executor)
+    client = harness.gateway._client
+    client.start.reset_mock()
+    client.connect.reset_mock()
+    client.ping.reset_mock()
+    client.stop.reset_mock()
+    client.get_broker_contract_safety_snapshot = AsyncMock(
+        side_effect=IBKRTransportPoisonedError("initial snapshot transport failed")
+    )
+
+    with pytest.raises(IBKRTransportPoisonedError, match="initial snapshot transport failed"):
+        await harness.gateway.submit_reduction(
+            order=_order(order_ref="initial-transport-failure"),
+            portfolio_id="portfolio-a",
+        )
+
+    assert harness.gateway.started is False
+    assert harness.gateway._diagnostic_recovery_required is True
+    client.stop.assert_awaited_once()
+    assert executor.fills == {}
+    assert harness.journal.replay().active_reservations == ()
+
+    async with harness.gateway.serialize_entry():
+        pass
+
+    assert harness.gateway.started is True
+    assert harness.gateway._diagnostic_recovery_required is False
+    assert client.stop.await_count == 2
+    client.start.assert_awaited_once()
+    client.connect.assert_awaited_once()
+    assert client.ping.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_final_broker_snapshot_failure_drains_without_retrying_ambiguous_reduction(
+    harness: GatewayHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = PaperExecutor()
+    harness.gateway.register_paper_executor("portfolio-a", executor)
+    _install_broker_boundary(harness, monkeypatch)
+    client = harness.gateway._client
+    client.start.reset_mock()
+    client.connect.reset_mock()
+    client.ping.reset_mock()
+    client.stop.reset_mock()
+    client.run_with_locked_broker_contract_safety_snapshot = AsyncMock(
+        side_effect=IBKRTransportPoisonedError("final snapshot transport failed")
+    )
+
+    with pytest.raises(IBKRTransportPoisonedError, match="final snapshot transport failed"):
+        await harness.gateway.submit_reduction(
+            order=_order(order_ref="final-transport-failure"),
+            portfolio_id="portfolio-a",
+        )
+
+    assert harness.gateway.started is False
+    assert harness.gateway._diagnostic_recovery_required is True
+    client.run_with_locked_broker_contract_safety_snapshot.assert_awaited_once()
+    client.stop.assert_awaited_once()
+    assert executor.fills == {}
+    assert len(harness.journal.replay().quarantined_reservations) == 1
+
+    async with harness.gateway.serialize_entry():
+        pass
+
+    assert harness.gateway.started is True
+    assert harness.gateway._diagnostic_recovery_required is False
+    assert client.stop.await_count == 2
+    client.start.assert_awaited_once()
+    client.connect.assert_awaited_once()
+    assert client.ping.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["initial", "final"])
+async def test_broker_snapshot_cancellation_drains_and_requires_fresh_health(
+    harness: GatewayHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    executor = PaperExecutor()
+    harness.gateway.register_paper_executor("portfolio-a", executor)
+    _install_broker_boundary(harness, monkeypatch)
+    client = harness.gateway._client
+    client.start.reset_mock()
+    client.connect.reset_mock()
+    client.ping.reset_mock()
+    client.stop.reset_mock()
+    if phase == "initial":
+        client.get_broker_contract_safety_snapshot = AsyncMock(
+            side_effect=asyncio.CancelledError("initial snapshot cancelled")
+        )
+    else:
+        client.run_with_locked_broker_contract_safety_snapshot = AsyncMock(
+            side_effect=asyncio.CancelledError("final snapshot cancelled")
+        )
+
+    with pytest.raises(asyncio.CancelledError, match=f"{phase} snapshot cancelled"):
+        await harness.gateway.submit_reduction(
+            order=_order(order_ref=f"{phase}-snapshot-cancelled"),
+            portfolio_id="portfolio-a",
+        )
+
+    assert harness.gateway.started is False
+    assert harness.gateway._diagnostic_recovery_required is True
+    client.stop.assert_awaited_once()
+    assert executor.fills == {}
+
+    async with harness.gateway.serialize_entry():
+        pass
+
+    assert harness.gateway.started is True
+    assert harness.gateway._diagnostic_recovery_required is False
+    assert client.stop.await_count == 2
+    client.start.assert_awaited_once()
+    client.connect.assert_awaited_once()
+    assert client.ping.await_count == 2
 
 
 @pytest.mark.asyncio
