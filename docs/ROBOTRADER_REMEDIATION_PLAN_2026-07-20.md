@@ -1,7 +1,7 @@
 # RoboTrader Remediation and Launch Plan
 
 Document date: 2026-07-20
-Last updated: 2026-07-25
+Last updated: 2026-07-26
 Status: Active execution plan; Gate A remains closed
 Source baseline: repository audit at commit `51f0e99` on branch `main`
 Target: safe supervised paper operation first, then remote read-only access, then an explicitly gated limited live canary
@@ -32,11 +32,17 @@ runtime wiring. PR 2B.1 merged through PR #104 as
 `3ecdaa05b3352ddcd4519662b0fe957751f3fdb1` from exact reviewed head
 `0d5585b46f8f1b495d944e24b23df5a7c01cfc2d`. It binds the dormant paper
 safety coordinator to startup replay but deliberately leaves production order
-authorization and submission unwired. PR 2B.2 implementation and two-phase
-local review are complete on `codex/pr2b2-broker-bound-exits`; hosted review
-and merge remain pending. The implementation is deliberately dormant behind
-a shared terminal-settlement readiness gate. Gate A remains closed and this
-work is not a launch authorization.
+authorization and submission unwired. PR 2B.2 merged through PR #106 as
+`8328c822733b1a2358a8d6f26d368ab0819cd106` from exact reviewed head
+`6e2b768ea474d7e8e41037c7b3e9a3606ed00482`. Its full Python matrices,
+integration, performance, lint, security, container, Cursor security, and
+exact-head Codex review gates passed; the Claude workflow was unavailable
+because its repository OAuth token was revoked before review. The
+implementation remains deliberately dormant behind the shared
+terminal-settlement readiness gate. PR 2B.3 implementation and exact-head local
+review are complete at `14f6b55` on `codex/pr2b3-terminal-settlement` from the
+PR #106 merge commit; hosted review and merge remain pending. Gate A remains
+closed and this work is not a launch authorization.
 
 ## 1. Purpose
 
@@ -459,22 +465,23 @@ runtime-integration changes:
   `3ecdaa05b3352ddcd4519662b0fe957751f3fdb1`.
 - **PR 2B.2 / issue #101:** route paper exits through broker-bound reduce-only
   authorization and separate hard safety blocks from entry-only soft blocks.
-  Implementation and two-phase local review are complete on
-  `codex/pr2b2-broker-bound-exits` from implementation head
-  `5ba3bde2948bb3a1469245ea1f893d346cb90d4f`; hosted review and merge remain
-  pending. Every operational submission boundary remains hard-disabled.
+  PR #106 merged this stage as
+  `8328c822733b1a2358a8d6f26d368ab0819cd106` from exact reviewed head
+  `6e2b768ea474d7e8e41037c7b3e9a3606ed00482`. Every operational submission
+  boundary remains hard-disabled.
 - **PR 2B.3 / issue #102:** add exact settlement, ambiguity handling, and
   crash/restart quarantine release, and bind every reduction price to
   producer-owned fresh protective-quote price, timestamp, and lineage. This
-  stage remains pending and must be complete before the shared readiness gate
-  can be enabled.
+  implementation and exact-head local review are complete at `14f6b55` on
+  `codex/pr2b3-terminal-settlement`; hosted review and merge remain pending.
+  The shared readiness gate remains false.
 
 PR 2A grants no broker connection or submission authority by itself. PR 2B.1
 now imports the safety runtime in the production runner and launcher only to
 bind identity and replay the journal before supervised process or Gateway
 mutation. It still does not call authorization, consume a production
 submission permit, or wire the executor/stop monitor to the safety coordinator.
-Gate A remains closed, the trader remains stopped, and PRs 2B.2, 2B.3, and the
+Gate A remains closed, the trader remains stopped, and PR 2B.3 plus the
 remaining Gate A work are required before any supervised paper start.
 
 ### Objective
@@ -1330,9 +1337,13 @@ Update after each merge.
   as `d17b0d5b4f31ab15e2a9b138cca006c0103b7276`. PR #104 merged PR 2B.1
   on 2026-07-25 from exact reviewed head
   `0d5585b46f8f1b495d944e24b23df5a7c01cfc2d` as
-  `3ecdaa05b3352ddcd4519662b0fe957751f3fdb1`. PR 2B.2 implementation and
-  local review are complete on `codex/pr2b2-broker-bound-exits`; hosted review
-  and merge remain pending. PR 2B.3 remains pending.
+  `3ecdaa05b3352ddcd4519662b0fe957751f3fdb1`. PR #106 merged PR 2B.2
+  on 2026-07-26 from exact reviewed head
+  `6e2b768ea474d7e8e41037c7b3e9a3606ed00482` as
+  `8328c822733b1a2358a8d6f26d368ab0819cd106`. PR 2B.3 implementation and
+  exact-head local review are complete at `14f6b55` on
+  `codex/pr2b3-terminal-settlement`; hosted review and merge remain pending and
+  its readiness gate remains false.
 
   PR 2A contains strict exact-`Decimal` models, account/portfolio-aware
   reduce-only validation, zero-crossing and over-close rejection, deterministic
@@ -1409,15 +1420,12 @@ Update after each merge.
   authorize or automatically correct a local simulator reduction. Broker state
   becomes authoritative before any future broker-write capability can exist.
 
-  PR 2B.2 remains deliberately dormant. A shared readiness gate defaults false
-  and is enforced independently by the runner, paper-order runtime, gateway
-  startup, entry serialization, and reduction submission. The only strict
-  XFAIL demonstrates the reason: a successful local fill is not yet durably
-  applied to the allocation ledger and terminally settled in the safety
-  journal before the account-wide lock is released. PR 2B.3 must close that
-  gap and bind the authorized reference price to producer-owned fresh
-  protective-quote price, timestamp, and lineage before readiness may become
-  true.
+  PR 2B.2 remains deliberately dormant after merge. A shared readiness gate
+  defaults false and is enforced independently by the runner, paper-order
+  runtime, gateway startup, entry serialization, and reduction submission.
+  PR 2B.3 closes the previously strict-XFAIL settlement and protective-quote
+  lineage gap in code, but the gate remains false through hosted review, merge,
+  exact-state bootstrap design, and the remaining cumulative Gate-A work.
 
   Final local PR 2B.2 implementation evidence: the full repository suite passed
   2,001 tests with 5 expected skips, 1 strict settlement XFAIL, and 20 known
@@ -1429,8 +1437,9 @@ Update after each merge.
   found no new blocker, and classified terminal settlement and protective-price
   lineage as high-severity PR 2B.3 pre-activation requirements. Durable detail
   is recorded in
-  `docs/reviews/PR2B2_LOCAL_REVIEW_EVIDENCE_2026-07-25.md`. Hosted CI and hosted
-  review are still required before merge and are not represented as passed.
+  `docs/reviews/PR2B2_LOCAL_REVIEW_EVIDENCE_2026-07-25.md`. Exact-head hosted
+  CI, security review, and Codex review later passed before PR #106 merged;
+  the unavailable Claude review was recorded and was not counted as a pass.
   GitHub Codex subsequently found relative-ledger-path and persistent-reconnect
   executor-identity defects; both were reproduced and fixed end to end with
   regressions before the final 2,001-test run.
@@ -1439,11 +1448,48 @@ Update after each merge.
   jobs now fail closed with bounded job and command timeouts plus periodic
   Python thread dumps; a workflow-policy regression preserves the controls.
 
+  PR 2B.3 exact-head local implementation evidence at `14f6b55`: every
+  successful local-paper reduction commits the exact trade, signed position,
+  cash, realized P&L, daily P&L, day-start baseline/date, exact cost/mark state,
+  protective-quote payload, and terminal outbox receipt in one SQLite
+  transaction before runtime projection and journal release. Producer-owned
+  quote lineage is revalidated at submission. Long and short partial/full
+  exits bridge the prior exact mark to the authenticated protective mark before
+  replacing removed unrealized exposure with realized fill P&L. Float-only
+  compatibility updates cannot mint or overwrite exact settlement authority.
+  Restart restores exact marks and same-day risk state or performs a persisted,
+  exact new-UTC-day rollover; missing, future, stale, or tampered state fails
+  closed.
+
+  Filled and zero-fill crash-after-commit outcomes have a stopped-system,
+  confirmation-gated offline recovery path. It verifies the linked trade,
+  position and aggregate, exact basis and marks, account state, baseline/date,
+  timestamps, settlement source lineage, database identity, and quote payload
+  from one read-only snapshot before appending one terminal journal event. It
+  never rewrites the financial ledger. Forged, partial, ambiguous, outbox-only,
+  or tampered evidence remains quarantined.
+
+  The final full local suite passed 2,240 tests with 5 expected skips and 20
+  known warnings. The final settlement/routing/security matrix passed 375 tests
+  with 2 expected skips. Black, isort, full Flake8, compilation, dependency,
+  diff, targeted Bandit, targeted new-module mypy, and secret-pattern checks
+  passed. Two-phase code, bug, trading-safety, style, and challenger review
+  reproduced and closed the daily-risk restart, offline projection,
+  crash-recovery, quote-lineage, signed short/cover, zero-fill, float-authority,
+  and changing-mark failures. Durable detail is recorded in
+  `docs/reviews/PR2B3_LOCAL_REVIEW_EVIDENCE_2026-07-26.md`.
+
+  This is not launch evidence. The exact-state bootstrap for existing ledgers,
+  strict FIFO lot accounting, PRs 3 through 5, the Gate-A subset of PR 7,
+  reconciliation/restore drills, and a clean ordinary preflight remain required
+  before any supervised paper start. `PAPER_TERMINAL_SETTLEMENT_READY` remains
+  false and IBKR remains read-only.
+
   PR 2B.1 schema v2 intentionally fails closed on a schema-v1 PR 2A journal.
   No operational v1 journal is known and none exists in the inspected runtime,
   so this is not a dormant-PR blocker. Any discovered v1 file must be preserved;
   a later migration must use an explicit backup/copy-and-verify procedure and
-  must never rebind or rewrite the only copy. PRs 2B.2, 2B.3, 3 through 5, and
+  must never rebind or rewrite the only copy. PR 2B.3, PRs 3 through 5, and
   relevant PR 7 work remain outstanding.
 
   Final PR 2B.1 evidence: after two late GitHub Codex findings, the configured
