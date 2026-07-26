@@ -673,7 +673,7 @@ class AsyncTradingDatabase:
                     self._quarantine_pool_connection(connection)
                     await self._poison_connection_pool(
                         self._pool_failure_error(failure),
-                        self._pool_generation,
+                        generation,
                         "orphaned checkout close",
                     )
                 raise self._pool_failure_error(failure)
@@ -760,7 +760,7 @@ class AsyncTradingDatabase:
                         self._quarantine_pool_connection(orphaned_connection)
                         await self._poison_connection_pool(
                             SafetyDatabasePoolError("orphaned pool wait connection"),
-                            self._pool_generation,
+                            generation,
                             "orphaned pool wait close",
                         )
         except asyncio.CancelledError as error:

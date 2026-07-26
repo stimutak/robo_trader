@@ -62,6 +62,98 @@ async def test_snapshot_owned_cleanup_reuses_concurrent_close_identity_proof(
 
 
 @pytest.mark.asyncio
+async def test_stale_waiter_cleanup_does_not_poison_reinitialized_pool(
+    tmp_path,
+):
+    """An orphan from a retired queue cannot latch failure on its successor."""
+
+    database = AsyncTradingDatabase(tmp_path / "stale-waiter.db", pool_size=1)
+    await database.initialize()
+    old_queue = database._available
+    old_generation = database._pool_generation
+    connection_wait = asyncio.create_task(old_queue.get())
+    old_connection = await connection_wait
+    failure_wait = asyncio.create_task(old_generation.failure_event.wait())
+
+    await database.close()
+    await database.initialize()
+    fresh_generation = database._pool_generation
+    fresh_connection = database._pool[0]
+
+    try:
+        await database._cleanup_pool_waiters(
+            connection_wait,
+            failure_wait,
+            old_queue,
+            old_generation,
+            False,
+        )
+
+        assert old_connection in database._proven_closed_connections
+        assert database._pool_generation is fresh_generation
+        assert database._pool_recovery_failure is None
+        assert database._pool == [fresh_connection]
+        assert database._available.qsize() == 1
+        async with database.get_connection() as connection:
+            assert connection is fresh_connection
+            assert await (await connection.execute("SELECT 1")).fetchone() == (1,)
+        assert database._available.qsize() == 1
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_simultaneous_failure_and_checkout_do_not_poison_new_pool(
+    tmp_path,
+    monkeypatch,
+):
+    """Both completed old waiters still retain their captured generation."""
+
+    database = AsyncTradingDatabase(tmp_path / "simultaneous-old-waiters.db", pool_size=1)
+    await database.initialize()
+    old_queue = database._available
+    old_generation = database._pool_generation
+    old_connection = database._pool[0]
+    fresh = {}
+    original_wait = database_module.asyncio.wait
+
+    async def retire_between_wait_and_result(waiters, **_kwargs):
+        connection_wait, failure_wait = tuple(waiters)
+        await asyncio.sleep(0)
+        assert connection_wait.done()
+        assert connection_wait.result() is old_connection
+        await database.close()
+        await failure_wait
+        await database.initialize()
+        fresh["generation"] = database._pool_generation
+        fresh["connection"] = database._pool[0]
+        return {connection_wait, failure_wait}, set()
+
+    monkeypatch.setattr(
+        database_module.asyncio,
+        "wait",
+        retire_between_wait_and_result,
+    )
+
+    try:
+        with pytest.raises(SafetyDatabasePoolError, match="database was closed"):
+            await database._wait_for_pool_connection(old_queue, old_generation)
+        monkeypatch.setattr(database_module.asyncio, "wait", original_wait)
+
+        assert old_connection in database._proven_closed_connections
+        assert database._pool_generation is fresh["generation"]
+        assert database._pool_recovery_failure is None
+        assert database._pool == [fresh["connection"]]
+        assert database._available.qsize() == 1
+        async with database.get_connection() as connection:
+            assert connection is fresh["connection"]
+            assert await (await connection.execute("SELECT 1")).fetchone() == (1,)
+        assert database._available.qsize() == 1
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
 async def test_raised_exact_close_has_no_identity_proof_and_stays_quarantined(
     tmp_path,
     monkeypatch,

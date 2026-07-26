@@ -9,6 +9,7 @@ shared by every portfolio runner in the process.
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 import stat
@@ -39,6 +40,8 @@ from .safety import (
 from .safety.readiness import require_paper_terminal_settlement_ready
 from .safety.sqlite_identity import lexical_path_preserving_leaf
 from .safety_runtime_evidence import assemble_local_paper_safety_evidence
+
+logger = logging.getLogger(__name__)
 
 
 class PaperReductionGatewayError(RuntimeError):
@@ -131,19 +134,96 @@ class PaperReductionGateway:
                     raise PaperReductionGatewayError(
                         "diagnostic broker connection was not established"
                     )
-            except BaseException:
-                await self._client.stop()
+            except BaseException as error:
+                await self._stop_client_owned(error)
                 raise
             self._started = True
+
+    async def _stop_client_owned(
+        self,
+        primary_error: BaseException | None = None,
+    ) -> None:
+        """Drain one client stop through cancellation and preserve the first error."""
+
+        task = asyncio.create_task(self._client.stop())
+        cancellation: asyncio.CancelledError | None = None
+        stop_failure: BaseException | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                if task.cancelled():
+                    stop_failure = error
+                    break
+                if cancellation is None:
+                    cancellation = error
+                continue
+            except BaseException as error:
+                stop_failure = error
+                break
+        if stop_failure is None:
+            try:
+                task.result()
+            except BaseException as error:
+                stop_failure = error
+
+        if primary_error is not None:
+            if stop_failure is not None:
+                logger.error(
+                    "event=paper_reduction_gateway_client_stop_failed_after_primary_error",
+                    exc_info=(
+                        type(stop_failure),
+                        stop_failure,
+                        stop_failure.__traceback__,
+                    ),
+                )
+            raise primary_error.with_traceback(primary_error.__traceback__)
+        if cancellation is not None:
+            raise cancellation.with_traceback(cancellation.__traceback__)
+        if stop_failure is not None:
+            raise stop_failure.with_traceback(stop_failure.__traceback__)
 
     async def close(self) -> None:
         """Stop only the gateway-owned diagnostic client."""
 
         async with self._account_order_gate:
+            self._started = False
             try:
-                await self._client.stop()
+                await self._stop_client_owned()
             finally:
                 self._started = False
+
+    async def refresh_diagnostic_connection(self) -> None:
+        """Replace stale broker state before order admission can resume.
+
+        The runner and this gateway intentionally own separate read-only IBKR
+        clients.  A runner recovery therefore cannot prove that the gateway's
+        diagnostic session survived the same outage.  Hold the account-wide
+        gate, mark this boundary unavailable before the first await, and only
+        restore ``started`` after a fresh connect and active ping both succeed.
+        """
+
+        require_paper_terminal_settlement_ready()
+        async with self._account_order_gate:
+            self._started = False
+            try:
+                context = assert_validated_runtime_safety_context(self._runtime_context)
+                connection = context.diagnostic_connection
+                await self._stop_client_owned()
+                await self._client.start()
+                connected = await self._client.connect(
+                    host=connection.host,
+                    port=connection.port,
+                    client_id=connection.client_id,
+                    readonly=connection.readonly,
+                    timeout=30.0,
+                )
+                if connected is not True or await self._client.ping() is not True:
+                    raise PaperReductionGatewayError("diagnostic broker connection did not recover")
+            except BaseException as error:
+                await self._stop_client_owned(error)
+                raise
+            self._started = True
 
     def register_paper_executor(
         self,
@@ -181,6 +261,21 @@ class PaperReductionGateway:
             if not self._started:
                 raise PaperReductionGatewayError(
                     "paper reduction gateway stopped before entry admission"
+                )
+            try:
+                healthy = await self._client.ping()
+            except asyncio.CancelledError:
+                self._started = False
+                raise
+            except Exception as exc:
+                self._started = False
+                raise PaperReductionGatewayError(
+                    "diagnostic broker health could not be proven for entry admission"
+                ) from exc
+            if healthy is not True:
+                self._started = False
+                raise PaperReductionGatewayError(
+                    "diagnostic broker is unavailable for entry admission"
                 )
             yield
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -162,6 +163,13 @@ def test_runner_accepts_exact_absolute_binding_for_relative_database_input(
     )
     with pytest.raises(RuntimeError, match="validated runtime ledger"):
         runner._assert_runtime_ledger_database()
+
+
+def test_runner_database_fallback_uses_validated_contract_path() -> None:
+    setup_source = inspect.getsource(AsyncRunner.setup)
+
+    assert "AsyncTradingDatabase(Path(self.cfg.runtime_contract.database_path))" in setup_source
+    assert "else AsyncTradingDatabase()" not in setup_source
 
 
 @pytest.mark.asyncio

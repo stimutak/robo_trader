@@ -475,6 +475,96 @@ class SafetyJournal:
         finally:
             self._close_connection(connection)
 
+    def initialize_new(
+        self,
+        *,
+        execution_domain_scope: str,
+        account_scope: str,
+    ) -> ReplayState:
+        """Atomically create, initialize, replay, and bind one absent journal.
+
+        This is the provisioning boundary for callers that must never adopt an
+        existing filesystem object. The reserved descriptor remains open until
+        schema commit and identity-bound replay finish, preventing inode reuse
+        between exclusive creation and SQLite's own descriptor binding.
+        """
+
+        execution_domain_scope = _strict_text(
+            execution_domain_scope,
+            "execution_domain_scope",
+            max_length=128,
+        )
+        account_scope = _strict_account_scope(account_scope)
+        flags = (
+            os.O_CREAT
+            | os.O_EXCL
+            | os.O_RDWR
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            reservation_descriptor = os.open(self._path, flags, 0o600)
+        except FileExistsError as exc:
+            raise JournalIntegrityError(
+                "safety journal path appeared during exclusive initialization"
+            ) from exc
+        except OSError as exc:
+            raise JournalIntegrityError(
+                "cannot atomically reserve the new safety journal path"
+            ) from exc
+        try:
+            reservation_stat = os.fstat(reservation_descriptor)
+            if not stat.S_ISREG(reservation_stat.st_mode):
+                raise JournalIntegrityError("new safety journal path is not a regular file")
+            reserved_identity = (reservation_stat.st_dev, reservation_stat.st_ino)
+            with self._permit_lock:
+                if self._runtime_path_identity is not None:
+                    raise JournalIntegrityError(
+                        "new safety journal instance is already bound to a filesystem identity"
+                    )
+                self._runtime_path_identity = reserved_identity
+
+            self.initialize(
+                execution_domain_scope=execution_domain_scope,
+                account_scope=account_scope,
+            )
+            self._assert_reserved_path_identity(
+                reservation_descriptor,
+                reserved_identity,
+            )
+            state = self.replay_and_bind_runtime_path(
+                expected_execution_domain_scope=execution_domain_scope,
+                expected_account_scope=account_scope,
+            )
+            self._assert_reserved_path_identity(
+                reservation_descriptor,
+                reserved_identity,
+            )
+            return state
+        finally:
+            os.close(reservation_descriptor)
+
+    def _assert_reserved_path_identity(
+        self,
+        reservation_descriptor: int,
+        expected_identity: Tuple[int, int],
+    ) -> None:
+        """Prove an exclusive-creation descriptor still owns the named path."""
+
+        try:
+            reservation_stat = os.fstat(reservation_descriptor)
+            path_identity = self._path_identity()
+        except (OSError, JournalIntegrityError) as exc:
+            raise JournalIntegrityError(
+                "new safety journal path identity is no longer authoritative"
+            ) from exc
+        if (
+            not stat.S_ISREG(reservation_stat.st_mode)
+            or (reservation_stat.st_dev, reservation_stat.st_ino) != expected_identity
+            or path_identity != expected_identity
+        ):
+            raise JournalIntegrityError("new safety journal path identity changed")
+
     def _assert_existing_path_is_dedicated(self) -> None:
         """Inspect an existing path read-only before WAL or chmod can mutate it."""
 

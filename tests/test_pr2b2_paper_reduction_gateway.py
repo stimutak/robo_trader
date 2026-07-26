@@ -161,6 +161,7 @@ async def _build_harness(
     gateway = PaperReductionGateway(context, coordinator, database)
     gateway._client.start = AsyncMock(return_value=None)
     gateway._client.connect = AsyncMock(return_value=True)
+    gateway._client.ping = AsyncMock(return_value=True)
     gateway._client.stop = AsyncMock(return_value=None)
     await gateway.start()
     return GatewayHarness(context, database, journal, coordinator, gateway)
@@ -226,6 +227,152 @@ async def test_gateway_start_cancellation_stops_partial_client(
 
     harness.gateway._client.stop.assert_awaited_once()
     assert harness.gateway.started is False
+
+
+@pytest.mark.asyncio
+async def test_entry_serialization_fails_closed_when_diagnostic_ping_is_false(
+    harness: GatewayHarness,
+) -> None:
+    harness.gateway._client.ping = AsyncMock(return_value=False)
+    entered = False
+
+    with pytest.raises(PaperReductionGatewayError, match="unavailable for entry"):
+        async with harness.gateway.serialize_entry():
+            entered = True
+
+    assert entered is False
+    assert harness.gateway.started is False
+    harness.gateway._client.ping.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_entry_serialization_fails_closed_when_diagnostic_ping_errors(
+    harness: GatewayHarness,
+) -> None:
+    harness.gateway._client.ping = AsyncMock(side_effect=OSError("diagnostic failed"))
+
+    with pytest.raises(PaperReductionGatewayError, match="health could not be proven"):
+        async with harness.gateway.serialize_entry():
+            pytest.fail("entry admission must not yield with an unhealthy diagnostic client")
+
+    assert harness.gateway.started is False
+
+
+@pytest.mark.asyncio
+async def test_refresh_reconnects_and_proves_gateway_health_before_started(
+    harness: GatewayHarness,
+) -> None:
+    client = harness.gateway._client
+    client.start.reset_mock()
+    client.connect.reset_mock()
+    client.ping.reset_mock()
+    client.stop.reset_mock()
+
+    await harness.gateway.refresh_diagnostic_connection()
+
+    assert harness.gateway.started is True
+    client.stop.assert_awaited_once()
+    client.start.assert_awaited_once()
+    client.connect.assert_awaited_once_with(
+        host=harness.context.diagnostic_connection.host,
+        port=harness.context.diagnostic_connection.port,
+        client_id=harness.context.diagnostic_connection.client_id,
+        readonly=True,
+        timeout=30.0,
+    )
+    client.ping.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_refresh_failure_keeps_gateway_stopped_and_cleans_worker(
+    harness: GatewayHarness,
+) -> None:
+    client = harness.gateway._client
+    client.start.reset_mock()
+    client.connect.reset_mock()
+    client.ping = AsyncMock(return_value=False)
+    client.stop.reset_mock()
+
+    with pytest.raises(PaperReductionGatewayError, match="did not recover"):
+        await harness.gateway.refresh_diagnostic_connection()
+
+    assert harness.gateway.started is False
+    assert client.stop.await_count == 2
+    client.start.assert_awaited_once()
+    client.connect.assert_awaited_once()
+    client.ping.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_refresh_identity_drift_drains_stop_through_repeated_cancellation(
+    harness: GatewayHarness,
+) -> None:
+    stop_entered = asyncio.Event()
+    release_stop = asyncio.Event()
+    stop_finished = asyncio.Event()
+
+    async def blocking_stop() -> None:
+        stop_entered.set()
+        await release_stop.wait()
+        stop_finished.set()
+
+    harness.gateway._runtime_context = object()
+    harness.gateway._client.start.reset_mock()
+    harness.gateway._client.stop = AsyncMock(side_effect=blocking_stop)
+    refresh = asyncio.create_task(harness.gateway.refresh_diagnostic_connection())
+    await stop_entered.wait()
+
+    refresh.cancel()
+    await asyncio.sleep(0)
+    assert refresh.done() is False
+    refresh.cancel()
+    await asyncio.sleep(0)
+    assert refresh.done() is False
+    release_stop.set()
+
+    with pytest.raises(RuntimeIdentityError, match="validated RuntimeSafetyContext"):
+        await refresh
+
+    assert stop_finished.is_set()
+    assert harness.gateway.started is False
+    harness.gateway._client.start.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refresh_identity_drift_preserves_primary_and_logs_stop_failure(
+    harness: GatewayHarness,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    harness.gateway._runtime_context = object()
+    harness.gateway._client.start.reset_mock()
+    original_stop = harness.gateway._client.stop
+    harness.gateway._client.stop = AsyncMock(side_effect=OSError("diagnostic client stop failed"))
+
+    try:
+        with caplog.at_level(
+            "ERROR",
+            logger="robo_trader.paper_reduction_gateway",
+        ):
+            with pytest.raises(
+                RuntimeIdentityError,
+                match="validated RuntimeSafetyContext",
+            ):
+                await harness.gateway.refresh_diagnostic_connection()
+
+        matching_records = [
+            record
+            for record in caplog.records
+            if record.getMessage()
+            == "event=paper_reduction_gateway_client_stop_failed_after_primary_error"
+        ]
+        assert len(matching_records) == 1
+        assert matching_records[0].exc_info is not None
+        assert matching_records[0].exc_info[0] is OSError
+        assert str(matching_records[0].exc_info[1]) == "diagnostic client stop failed"
+        assert harness.gateway.started is False
+        harness.gateway._client.start.assert_not_awaited()
+    finally:
+        harness.gateway._client.stop = original_stop
 
 
 def _broker_snapshot(

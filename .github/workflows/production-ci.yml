@@ -111,7 +111,10 @@ jobs:
     - name: Run integration tests
       if: matrix.test-type == 'integration'
       run: |
-        pytest tests/integration/ -v --cov=robo_trader --cov-append
+        timeout --signal=TERM --kill-after=30s 10m \
+          pytest tests/integration/ -v \
+          -o faulthandler_timeout=120 \
+          --cov=robo_trader --cov-append
 
     - name: Run performance tests
       if: matrix.test-type == 'performance'

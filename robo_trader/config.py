@@ -37,6 +37,15 @@ _SAFETY_ACCOUNT_SCOPE_DOMAIN = b"robotrader-safety-account-scope-v1\0"
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _legacy_safety_scope_migration_guidance() -> str:
+    return (
+        " Existing PR2B1 random-scope journals must remain stopped and be migrated "
+        "with scripts/manage_paper_safety_journal.py migrate-empty-legacy "
+        "--target <distinct-new-path> --confirm "
+        "MIGRATE-EMPTY-LEGACY-PAPER-SAFETY-JOURNAL."
+    )
+
+
 def _resolve_project_path(
     value: str,
     *,
@@ -346,13 +355,19 @@ def load_runtime_contract_from_env(
             raise ConfigValidationError(
                 "SAFETY_ACCOUNT_SCOPE must not be an unsalted hash of IBKR_ACCOUNT."
             )
-        expected_safety_scope = _derive_safety_account_scope(
-            env.get("SAFETY_ACCOUNT_SCOPE_KEY"),
-            account,
-        )
+        try:
+            expected_safety_scope = _derive_safety_account_scope(
+                env.get("SAFETY_ACCOUNT_SCOPE_KEY"),
+                account,
+            )
+        except ConfigValidationError as exc:
+            raise ConfigValidationError(
+                str(exc) + _legacy_safety_scope_migration_guidance()
+            ) from exc
         if not hmac.compare_digest(safety_account_scope, expected_safety_scope):
             raise ConfigValidationError(
-                "SAFETY_ACCOUNT_SCOPE does not match the keyed paper-account binding"
+                "SAFETY_ACCOUNT_SCOPE does not match the keyed paper-account binding."
+                + _legacy_safety_scope_migration_guidance()
             )
 
         safety_journal_path = str(env.get("SAFETY_JOURNAL_PATH", "")).strip()

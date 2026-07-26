@@ -27,8 +27,8 @@ load_dotenv()  # noqa: E402 - must run before imports that use os.getenv()
 from dataclasses import dataclass  # isort:skip  # noqa: E402
 from datetime import date, datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Callable, Dict, List, NoReturn, Optional, Tuple
+from types import SimpleNamespace, TracebackType
+from typing import Any, Callable, Coroutine, Dict, List, NoReturn, Optional, Tuple
 
 import pandas as pd
 from ib_async import Stock
@@ -1958,7 +1958,9 @@ class AsyncRunner:
         # exact database object as the account-wide reduction gateway. This is
         # what makes the cross-portfolio allocation snapshot authoritative.
         self._raw_db = (
-            self._shared_database if self._shared_database is not None else AsyncTradingDatabase()
+            self._shared_database
+            if self._shared_database is not None
+            else AsyncTradingDatabase(Path(self.cfg.runtime_contract.database_path))
         )
         self._assert_runtime_ledger_database()
         await self._raw_db.initialize()
@@ -6589,6 +6591,17 @@ class AsyncRunner:
 
             try:
                 await self.initialize_connection()
+                gateway = getattr(self, "paper_reduction_gateway", None)
+                if gateway is not None:
+                    if type(gateway) is not PaperReductionGateway:
+                        raise RuntimeError(
+                            "connection recovery requires the exact paper reduction gateway"
+                        )
+                    # The runner and gateway own distinct diagnostic clients.
+                    # Recovery is incomplete until both have fresh read-only
+                    # sessions; otherwise entries could resume while broker-
+                    # bound reductions remain unavailable.
+                    await gateway.refresh_diagnostic_connection()
                 health = getattr(self, "health", None)
                 if health is not None:
                     # initialize_connection installs a new monitor whose
@@ -6705,6 +6718,73 @@ async def _close_paper_order_runtime(
         await resources.database.close()
 
 
+async def _await_cleanup_owned(
+    cleanup: Coroutine[Any, Any, None],
+    *,
+    failure_event: str,
+) -> None:
+    """Drain one owned cleanup coroutine before propagating cancellation."""
+
+    task = asyncio.create_task(cleanup)
+    cancellation: Optional[tuple[asyncio.CancelledError, Optional[TracebackType]]] = None
+    cleanup_failure: Optional[tuple[BaseException, Optional[TracebackType]]] = None
+
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            if task.cancelled():
+                cleanup_failure = (error, error.__traceback__)
+                break
+            if cancellation is None:
+                cancellation = (error, error.__traceback__)
+            continue
+        except BaseException as error:
+            cleanup_failure = (error, error.__traceback__)
+            break
+
+    if cleanup_failure is None:
+        try:
+            task.result()
+        except BaseException as error:
+            cleanup_failure = (error, error.__traceback__)
+
+    if cancellation is not None:
+        if cleanup_failure is not None:
+            logger.error(
+                "event=%s",
+                failure_event,
+                exc_info=(
+                    type(cleanup_failure[0]),
+                    cleanup_failure[0],
+                    cleanup_failure[1],
+                ),
+            )
+        raise cancellation[0].with_traceback(cancellation[1])
+    if cleanup_failure is not None:
+        raise cleanup_failure[0].with_traceback(cleanup_failure[1])
+
+
+async def _close_paper_order_runtime_owned(
+    resources: _PaperOrderRuntimeResources,
+) -> None:
+    """Finish shared-runtime cleanup before propagating outer cancellation."""
+
+    await _await_cleanup_owned(
+        _close_paper_order_runtime(resources),
+        failure_event="paper_order_runtime_cleanup_failed_during_cancellation",
+    )
+
+
+async def _cleanup_runner_owned(runner: AsyncRunner) -> None:
+    """Finish one runner's cleanup before propagating outer cancellation."""
+
+    await _await_cleanup_owned(
+        runner.cleanup(),
+        failure_event="runner_cleanup_failed_during_cancellation",
+    )
+
+
 async def run_once(
     symbols: Optional[List[str]] = None,
     duration: str = "1 D",
@@ -6755,9 +6835,29 @@ async def run_once(
         )
         await runner.run(symbols)
     finally:
+        active_failure = sys.exc_info()[1]
+        cleanup_failure: Optional[tuple[BaseException, Optional[TracebackType]]] = None
         if runner is not None:
-            await runner.cleanup()
-        await _close_paper_order_runtime(resources)
+            try:
+                await _cleanup_runner_owned(runner)
+            except BaseException as error:
+                logger.error(
+                    "event=one_shot_runner_cleanup_failed",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+                cleanup_failure = (error, error.__traceback__)
+        try:
+            await _close_paper_order_runtime_owned(resources)
+        except BaseException as error:
+            if cleanup_failure is None:
+                cleanup_failure = (error, error.__traceback__)
+            else:
+                logger.error(
+                    "event=paper_order_runtime_cleanup_failed_after_runner_cleanup",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+        if active_failure is None and cleanup_failure is not None:
+            raise cleanup_failure[0].with_traceback(cleanup_failure[1])
 
 
 # 2026-07-10 disk-fill incident: with --force-connect and the market closed,
@@ -7218,16 +7318,22 @@ async def run_continuous(
                     )
 
     finally:
+        active_failure = sys.exc_info()[1]
+        cleanup_failure: Optional[tuple[BaseException, Optional[TracebackType]]] = None
         # Final cleanup: all portfolios get full disconnect on process exit
         for pid, r in runners.items():
             try:
-                await r.cleanup()
-            except Exception:
+                await _cleanup_runner_owned(r)
+            except BaseException as error:
                 logger.exception("event=final_cleanup_failed portfolio=%s", pid)
+                if cleanup_failure is None:
+                    cleanup_failure = (error, error.__traceback__)
         try:
-            await _close_paper_order_runtime(resources)
-        except Exception:
+            await _close_paper_order_runtime_owned(resources)
+        except BaseException as error:
             logger.exception("event=paper_order_runtime_cleanup_failed")
+            if cleanup_failure is None:
+                cleanup_failure = (error, error.__traceback__)
         logger.info("Trading system shutdown complete")
         # B2 (2026-05-12): Record a clean exit so dashboard/watchdog know
         # the runner ended normally (vs crashing). Best-effort — don't
@@ -7235,8 +7341,11 @@ async def run_continuous(
         # if it was set in the same second. (We always write, and consumers
         # can read the most recent reason.)
         if not fatal_safety_exit_written:
-            _write_exit_audit("clean_shutdown", exit_code=0)
-            _fire_runner_exit_alert("clean_shutdown", None)
+            if active_failure is None and cleanup_failure is None:
+                _write_exit_audit("clean_shutdown", exit_code=0)
+                _fire_runner_exit_alert("clean_shutdown", None)
+        if active_failure is None and cleanup_failure is not None:
+            raise cleanup_failure[0].with_traceback(cleanup_failure[1])
 
 
 def check_gateway_zombies(port: int = 4002) -> bool:
