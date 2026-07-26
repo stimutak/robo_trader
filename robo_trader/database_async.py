@@ -222,6 +222,11 @@ class AsyncTradingDatabase:
         self._pool: List[aiosqlite.Connection] = []
         self._leased_connections: List[aiosqlite.Connection] = []
         self._quarantined_connections: List[aiosqlite.Connection] = []
+        # Object-identity evidence only: aiosqlite 0.19 marks its private
+        # fields closed even when the underlying close raises, so those fields
+        # cannot prove revocation.  Membership is recorded solely after the
+        # exact captured close coroutine completes successfully.
+        self._proven_closed_connections: weakref.WeakSet = weakref.WeakSet()
         self._available: asyncio.Queue = asyncio.Queue(maxsize=pool_size)
         self._pool_generation = _PoolGenerationState()
         self._initialized = False
@@ -407,6 +412,9 @@ class AsyncTradingDatabase:
         cancellation: Optional[asyncio.CancelledError] = None
         for connection in list(self._quarantined_connections):
             try:
+                if connection in self._proven_closed_connections:
+                    self._forget_quarantined_connection(connection)
+                    continue
                 if rollback:
                     try:
                         in_transaction = getattr(connection, "in_transaction", False)
@@ -432,6 +440,7 @@ class AsyncTradingDatabase:
                     close_task,
                     cancellation,
                 )
+                self._proven_closed_connections.add(connection)
                 self._forget_quarantined_connection(connection)
             except BaseException as error:
                 if first_error is None:
@@ -456,6 +465,16 @@ class AsyncTradingDatabase:
         """Prove one temporary connection closed before releasing ownership."""
 
         self._quarantine_pool_connection(connection)
+        if connection in self._proven_closed_connections:
+            # A concurrent lifecycle close can revoke a temporary initializer
+            # or snapshot handle before its owner's finally block runs.
+            # aiosqlite 0.19 rejects a second exact close, so consume only the
+            # prior successful-close identity proof; a raised/unproven close
+            # never enters this branch.
+            self._forget_quarantined_connection(connection)
+            if cancellation is not None:
+                raise cancellation
+            return
         close_task = asyncio.create_task(_EXACT_AIOSQLITE_CLOSE(connection))
         try:
             cancellation = await self._await_owned_cleanup_task(
@@ -464,6 +483,7 @@ class AsyncTradingDatabase:
             )
         except BaseException as error:
             raise SafetyDatabasePoolError(message) from error
+        self._proven_closed_connections.add(connection)
         self._forget_quarantined_connection(connection)
         if cancellation is not None:
             raise cancellation
@@ -606,6 +626,8 @@ class AsyncTradingDatabase:
         return any(item is connection for item in self._leased_connections)
 
     def _quarantine_pool_connection(self, connection: aiosqlite.Connection) -> None:
+        if connection in self._proven_closed_connections:
+            return
         if not any(item is connection for item in self._quarantined_connections):
             self._quarantined_connections.append(connection)
 

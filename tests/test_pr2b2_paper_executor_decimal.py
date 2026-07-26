@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
+import robo_trader.execution as execution_module
 from robo_trader.execution import ExecutionResult, Order, PaperExecutor
 
 
@@ -19,11 +21,20 @@ def _order(*, side: str = "BUY", price: float | Decimal = Decimal("123.45")) -> 
     )
 
 
+def _patch_execution_path_exists(monkeypatch, exists) -> None:
+    """Patch only execution.py's filesystem seam, not the process-wide os module."""
+    monkeypatch.setattr(
+        execution_module,
+        "os",
+        SimpleNamespace(path=SimpleNamespace(exists=exists)),
+    )
+
+
 def test_public_place_order_preserves_exact_decimal_into_simple_sink(monkeypatch) -> None:
     executor = PaperExecutor(slippage_bps=0)
     captured: list[Order] = []
 
-    monkeypatch.setattr("robo_trader.execution.os.path.exists", lambda _path: False)
+    _patch_execution_path_exists(monkeypatch, lambda _path: False)
 
     def simple_sink(order: Order) -> ExecutionResult:
         captured.append(order)
@@ -123,7 +134,7 @@ def test_public_kill_switch_gate_blocks_while_private_sink_remains_narrowly_call
         probes.append(path)
         return path == "data/kill_switch.lock"
 
-    monkeypatch.setattr("robo_trader.execution.os.path.exists", kill_switch_exists)
+    _patch_execution_path_exists(monkeypatch, kill_switch_exists)
     executor = PaperExecutor(slippage_bps=0)
     order = _order(side="SELL")
 

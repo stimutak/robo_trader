@@ -87,6 +87,21 @@ async def _snapshot(database: AsyncTradingDatabase):
     )
 
 
+async def _bounded_await(awaitable, timeout: float):
+    """Bound an await using the Python 3.10-compatible asyncio API."""
+    return await asyncio.wait_for(awaitable, timeout=timeout)
+
+
+async def _borrow_connection(database: AsyncTradingDatabase) -> None:
+    async with database.get_connection():
+        pass
+
+
+async def _select_one(database: AsyncTradingDatabase):
+    async with database.get_connection() as connection:
+        return await (await connection.execute("SELECT 1")).fetchone()
+
+
 @pytest.mark.asyncio
 async def test_snapshot_binds_runtime_identity_path_and_opened_inode(tmp_path):
     path = tmp_path / "paper-ledger.db"
@@ -754,9 +769,7 @@ async def test_pool_error_replaces_one_connection_with_identity_bound_connection
         identity = await database._sqlite_descriptor_identity(replacement)
         assert (identity.device, identity.inode) == expected
 
-        async with asyncio.timeout(1):
-            async with database.get_connection() as connection:
-                assert await (await connection.execute("SELECT 1")).fetchone() == (1,)
+        assert await _bounded_await(_select_one(database), 1) == (1,)
     finally:
         await database.close()
 
@@ -791,10 +804,8 @@ async def test_failed_pool_replacement_poison_is_prompt_and_ensure_recovers(
         assert database._pool == []
         assert database._available.qsize() == 0
 
-        async with asyncio.timeout(0.25):
-            with pytest.raises(SafetyDatabasePoolError, match="pool is poisoned"):
-                async with database.get_connection():
-                    pass
+        with pytest.raises(SafetyDatabasePoolError, match="pool is poisoned"):
+            await _bounded_await(_borrow_connection(database), 0.25)
 
         monkeypatch.setattr(
             database,
@@ -807,9 +818,7 @@ async def test_failed_pool_replacement_poison_is_prompt_and_ensure_recovers(
         assert database._expected_database_file_identity == expected_identity
         assert len(database._pool) == 1
         assert database._available.qsize() == 1
-        async with asyncio.timeout(1):
-            async with database.get_connection() as connection:
-                assert await (await connection.execute("SELECT 1")).fetchone() == (1,)
+        assert await _bounded_await(_select_one(database), 1) == (1,)
     finally:
         await database.close()
 
@@ -890,19 +899,22 @@ async def test_failed_pool_replacement_wakes_concurrent_waiter(
     await asyncio.sleep(0)
     release_failure.set()
 
+    async def finish_failed_recovery():
+        first_result = (await asyncio.gather(failing_borrower, return_exceptions=True))[0]
+        monkeypatch.setattr(
+            database,
+            "_open_identity_bound_pool_connection",
+            open_replacement,
+        )
+        await database.ensure_connection()
+        queued_results = await asyncio.gather(
+            *queued_borrowers,
+            return_exceptions=True,
+        )
+        return first_result, queued_results
+
     try:
-        async with asyncio.timeout(1):
-            first_result = (await asyncio.gather(failing_borrower, return_exceptions=True))[0]
-            monkeypatch.setattr(
-                database,
-                "_open_identity_bound_pool_connection",
-                open_replacement,
-            )
-            await database.ensure_connection()
-            queued_results = await asyncio.gather(
-                *queued_borrowers,
-                return_exceptions=True,
-            )
+        first_result, queued_results = await _bounded_await(finish_failed_recovery(), 1)
         assert isinstance(first_result, sqlite3.OperationalError)
         assert str(first_result) == "forced pool failure"
         assert all(isinstance(result, SafetyDatabasePoolError) for result in queued_results)
@@ -1031,10 +1043,12 @@ async def test_close_wakes_waiter_on_retired_pool_generation(tmp_path):
     waiter = asyncio.create_task(borrow_connection())
     await asyncio.sleep(0)
 
+    async def close_and_collect_waiter():
+        await database.close()
+        return (await asyncio.gather(waiter, return_exceptions=True))[0]
+
     try:
-        async with asyncio.timeout(1):
-            await database.close()
-            waiter_result = (await asyncio.gather(waiter, return_exceptions=True))[0]
+        waiter_result = await _bounded_await(close_and_collect_waiter(), 1)
         assert isinstance(waiter_result, SafetyDatabasePoolError)
         assert "database was closed" in str(waiter_result)
         assert database._closed is True
@@ -1067,10 +1081,12 @@ async def test_concurrent_close_wins_over_ensure_reinitialization(
     ensure_task = asyncio.create_task(database.ensure_connection())
     await health_entered.wait()
 
-    async with asyncio.timeout(1):
+    async def close_and_finish_ensure():
         await database.close()
         release_health.set()
         await ensure_task
+
+    await _bounded_await(close_and_finish_ensure(), 1)
 
     assert database._closed is True
     assert database._initialized is False
@@ -1218,10 +1234,8 @@ async def test_cancelled_poison_waits_until_active_lease_is_exactly_revoked(
                 ).fetchall()
                 == []
             )
-        async with asyncio.timeout(0.25):
-            with pytest.raises(SafetyDatabasePoolError, match="pool is poisoned"):
-                async with database.get_connection():
-                    pass
+        with pytest.raises(SafetyDatabasePoolError, match="pool is poisoned"):
+            await _bounded_await(_borrow_connection(database), 0.25)
     finally:
         release_close.set()
         release_holder.set()
@@ -1460,13 +1474,11 @@ async def test_cancelled_pool_replacement_still_latches_prompt_failure(
 
         # Exercise the normal context-manager entry path too; the cancelled
         # replacement must have poisoned it before propagating cancellation.
-        async with asyncio.timeout(0.25):
-            with pytest.raises(
-                SafetyDatabasePoolError,
-                match="replacement connection opening was cancelled",
-            ):
-                async with database.get_connection():
-                    pass
+        with pytest.raises(
+            SafetyDatabasePoolError,
+            match="replacement connection opening was cancelled",
+        ):
+            await _bounded_await(_borrow_connection(database), 0.25)
 
         assert database._pool == []
         assert database._available.qsize() == 0
@@ -1514,13 +1526,11 @@ async def test_task_cancel_during_bad_connection_close_poisons_before_propagatin
             await borrower
         assert database._pool == []
         assert database._quarantined_connections == []
-        async with asyncio.timeout(0.25):
-            with pytest.raises(
-                SafetyDatabasePoolError,
-                match="bad connection cleanup was cancelled",
-            ):
-                async with database.get_connection():
-                    pass
+        with pytest.raises(
+            SafetyDatabasePoolError,
+            match="bad connection cleanup was cancelled",
+        ):
+            await _bounded_await(_borrow_connection(database), 0.25)
     finally:
         monkeypatch.setattr(database_module, "_EXACT_AIOSQLITE_CLOSE", exact_close)
         await database.close()
@@ -1557,13 +1567,11 @@ async def test_task_cancel_during_rollback_poisons_before_propagating(
         connection = captured["connection"]
         assert database._pool == []
         assert database._quarantined_connections == []
-        async with asyncio.timeout(0.25):
-            with pytest.raises(
-                SafetyDatabasePoolError,
-                match="pooled connection rollback was cancelled",
-            ):
-                async with database.get_connection():
-                    pass
+        with pytest.raises(
+            SafetyDatabasePoolError,
+            match="pooled connection rollback was cancelled",
+        ):
+            await _bounded_await(_borrow_connection(database), 0.25)
     finally:
         connection = captured.get("connection")
         if connection is not None:
@@ -1743,13 +1751,11 @@ async def test_stale_replacement_close_failure_poisons_reinitialized_pool(
         assert database._quarantined_connections == []
         assert database._pool == []
 
-        async with asyncio.timeout(0.25):
-            with pytest.raises(
-                SafetyDatabasePoolError,
-                match="stale replacement close failed",
-            ):
-                async with database.get_connection():
-                    pass
+        with pytest.raises(
+            SafetyDatabasePoolError,
+            match="stale replacement close failed",
+        ):
+            await _bounded_await(_borrow_connection(database), 0.25)
     finally:
         release_replacement.set()
         await asyncio.gather(old_borrower, return_exceptions=True)
