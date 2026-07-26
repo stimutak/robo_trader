@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from robo_trader import protective_quote_evidence as quote_evidence_module
 from robo_trader.protective_quote_evidence import (
     ProtectiveQuoteEvidence,
     ProtectiveQuoteSource,
@@ -88,6 +89,34 @@ async def test_live_quote_is_exact_immutable_registered_and_current() -> None:
     assert "_producer_marker" not in repr(quote)
     with pytest.raises(FrozenInstanceError):
         quote.price = Decimal("1")  # type: ignore[misc]
+
+
+@pytest.mark.asyncio
+async def test_registry_digest_never_runs_under_cleanup_lock(monkeypatch) -> None:
+    class TrackingLock:
+        held = False
+
+        def __enter__(self):
+            assert self.held is False
+            self.held = True
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self.held = False
+
+    tracking_lock = TrackingLock()
+    original_digest = quote_evidence_module._digest
+
+    def guarded_digest(evidence: ProtectiveQuoteEvidence) -> str:
+        assert tracking_lock.held is False
+        return original_digest(evidence)
+
+    monkeypatch.setattr(quote_evidence_module, "_REGISTRY_LOCK", tracking_lock)
+    monkeypatch.setattr(quote_evidence_module, "_digest", guarded_digest)
+
+    monitor = _monitor()
+    quote = await _live_quote(monitor)
+    assert _strict(monitor, quote) is quote
 
 
 @pytest.mark.asyncio

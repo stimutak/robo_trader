@@ -304,8 +304,13 @@ def _produce_protective_quote(
 
     evidence_reference = weakref.ref(evidence, discard)
     producer_reference = weakref.ref(producer)
+    # Digest construction allocates temporary objects and can trigger cyclic
+    # garbage collection.  A prior quote's weakref cleanup must never run while
+    # this non-reentrant registry lock is held, or it will deadlock trying to
+    # remove its own entry (observed on Python 3.10).
+    evidence_digest = _digest(evidence)
     with _REGISTRY_LOCK:
-        _REGISTRY[object_id] = (evidence_reference, producer_reference, _digest(evidence))
+        _REGISTRY[object_id] = (evidence_reference, producer_reference, evidence_digest)
     return evidence
 
 
@@ -318,6 +323,7 @@ def assert_producer_owned_protective_quote(
 
     if type(evidence) is not ProtectiveQuoteEvidence:
         raise ProtectiveQuoteValidationError("exact ProtectiveQuoteEvidence is required")
+    evidence_digest = _digest(evidence)
     with _REGISTRY_LOCK:
         registered = _REGISTRY.get(id(evidence))
         if registered is None or registered[0]() is not evidence:
@@ -328,7 +334,7 @@ def assert_producer_owned_protective_quote(
         if producer is not None and registered_producer is not producer:
             raise ProtectiveQuoteValidationError("quote belongs to a different producer")
         if evidence._producer_marker is not _PRODUCER_MARKER or not hmac.compare_digest(
-            registered[2], _digest(evidence)
+            registered[2], evidence_digest
         ):
             raise ProtectiveQuoteValidationError("quote changed after production")
     return evidence
