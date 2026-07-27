@@ -19,6 +19,11 @@ from robo_trader.connection_health import HealthStatus
 from robo_trader.execution import Order
 from robo_trader.monitoring.performance import PerformanceMonitor
 from robo_trader.paper_reduction_gateway import PaperReductionGateway
+from robo_trader.protective_quote_evidence import (
+    ProtectiveQuoteEvidence,
+    ProtectiveQuoteSource,
+    assert_producer_owned_protective_quote,
+)
 from robo_trader.runner_async import (
     AsyncRunner,
     MarketDataContractError,
@@ -27,6 +32,7 @@ from robo_trader.runner_async import (
     SymbolResult,
     run_continuous,
 )
+from robo_trader.stop_loss_monitor import StopLossMonitor
 
 
 @pytest.fixture(autouse=True)
@@ -552,7 +558,7 @@ def _runner_for_parallel(process_symbol) -> AsyncRunner:
     return runner
 
 
-def _configure_order_runtime(runner: AsyncRunner, executor_result=None) -> None:
+async def _configure_order_runtime(runner: AsyncRunner, executor_result=None) -> None:
     runner.portfolio_id = "default"
     accepted_at = datetime.now(timezone.utc)
     accepted_monotonic = 1000.0
@@ -575,16 +581,23 @@ def _configure_order_runtime(runner: AsyncRunner, executor_result=None) -> None:
         for symbol in ("AAPL", "MSFT", "TSLA", "NVDA")
     }
     runner._test_protective_clock = protective_clock
-    runner.stop_loss_monitor = SimpleNamespace(
-        last_prices={symbol: 100.0 for symbol in ("AAPL", "MSFT", "TSLA", "NVDA")},
-        price_event_times={symbol: accepted_at for symbol in ("AAPL", "MSFT", "TSLA", "NVDA")},
-        price_receipt_monotonic={
-            symbol: accepted_monotonic for symbol in ("AAPL", "MSFT", "TSLA", "NVDA")
-        },
-        max_price_age_seconds=10,
-        _utcnow=lambda: protective_clock["utc"],
-        _monotonic=lambda: protective_clock["monotonic"],
+    runner.stop_loss_monitor = StopLossMonitor(
+        execute_reduction=AsyncMock(),
+        risk_manager=SimpleNamespace(),
+        portfolio_id="default",
     )
+    runner.stop_loss_monitor._utcnow = lambda: protective_clock["utc"]
+    runner.stop_loss_monitor._monotonic = lambda: protective_clock["monotonic"]
+    for index, symbol in enumerate(("AAPL", "MSFT", "TSLA", "NVDA"), start=1):
+        assert await runner.stop_loss_monitor.update_price(
+            symbol,
+            100.0,
+            source_timestamp=accepted_at,
+            source=ProtectiveQuoteSource.LIVE_BROKER,
+            con_id=265_000 + index,
+            transport_generation="test-generation-1",
+            source_event_id=f"event-{index}",
+        )
     runner.risk = MagicMock(emergency_shutdown_triggered=False)
     runner.advanced_risk = None
     runner.circuit_breaker = MagicMock()
@@ -631,7 +644,7 @@ async def test_central_order_admission_requires_exact_live_protection(
     status: dict | None,
 ) -> None:
     runner = AsyncRunner.__new__(AsyncRunner)
-    _configure_order_runtime(runner)
+    await _configure_order_runtime(runner)
     runner._protective_feed_status = {} if status is None else {"AAPL": status}
 
     result = await runner._place_order_with_circuit_breaker(
@@ -647,7 +660,7 @@ async def test_central_order_admission_requires_exact_live_protection(
 @pytest.mark.parametrize("side", ["BUY", "SELL", "SELL_SHORT", "BUY_TO_COVER"])
 async def test_central_order_admission_accepts_exact_live_protection(side: str) -> None:
     runner = AsyncRunner.__new__(AsyncRunner)
-    _configure_order_runtime(runner)
+    await _configure_order_runtime(runner)
 
     result = await runner._place_order_with_circuit_breaker(
         Order(symbol="AAPL", quantity=1, side=side, price=100.0)
@@ -656,6 +669,18 @@ async def test_central_order_admission_accepts_exact_live_protection(side: str) 
     assert result.ok is True
     if side in {"SELL", "BUY_TO_COVER"}:
         runner.paper_reduction_gateway.submit_reduction.assert_awaited_once()
+        submitted = runner.paper_reduction_gateway.submit_reduction.await_args.kwargs
+        assert submitted["order"].price is None
+        quote = submitted["protective_quote"]
+        assert type(quote) is ProtectiveQuoteEvidence
+        assert quote.source is ProtectiveQuoteSource.LIVE_BROKER
+        assert (
+            assert_producer_owned_protective_quote(
+                quote,
+                producer=runner.stop_loss_monitor,
+            )
+            is quote
+        )
         runner.executor.place_order.assert_not_called()
     else:
         runner.executor.place_order.assert_called_once()
@@ -670,7 +695,7 @@ async def test_order_admission_rechecks_monitor_owned_protective_freshness(
 ) -> None:
     """The current central feed gate applies to exits as well as entries."""
     runner = AsyncRunner.__new__(AsyncRunner)
-    _configure_order_runtime(runner)
+    await _configure_order_runtime(runner)
     assert runner._has_live_protective_feed("AAPL") is True
 
     if aged_clock == "event":
@@ -883,7 +908,7 @@ async def test_transport_abort_drains_running_sibling_and_blocks_its_order() -> 
 
     runner = _runner_for_parallel(process)
     runner.max_concurrent_symbols = 2
-    _configure_order_runtime(runner)
+    await _configure_order_runtime(runner)
     with pytest.raises(SymbolCycleAbortError, match="poisoned generation"):
         await runner.run_parallel(["AAPL", "MSFT"])
 
@@ -954,7 +979,7 @@ async def test_transport_abort_preserves_first_causal_error() -> None:
 @pytest.mark.asyncio
 async def test_abort_before_order_admission_has_no_fill() -> None:
     runner = AsyncRunner.__new__(AsyncRunner)
-    _configure_order_runtime(runner)
+    await _configure_order_runtime(runner)
     await runner._order_admission_lock.acquire()
     abort_task = asyncio.create_task(runner._latch_symbol_cycle_abort())
     await asyncio.sleep(0)
@@ -974,7 +999,7 @@ async def test_abort_before_order_admission_has_no_fill() -> None:
 @pytest.mark.asyncio
 async def test_queued_order_cannot_beat_abort_intent_to_admission_lock() -> None:
     runner = AsyncRunner.__new__(AsyncRunner)
-    _configure_order_runtime(runner)
+    await _configure_order_runtime(runner)
     await runner._order_admission_lock.acquire()
 
     # Queue the order first so it is the lock's oldest waiter.
@@ -1025,7 +1050,7 @@ async def test_fill_then_sibling_abort_drains_accounting() -> None:
 
     runner = _runner_for_parallel(process)
     runner.max_concurrent_symbols = 2
-    _configure_order_runtime(runner)
+    await _configure_order_runtime(runner)
 
     def fill(_order):
         fill_happened.set()
@@ -1065,7 +1090,7 @@ async def test_parent_cancel_after_fill_waits_for_accounting() -> None:
         return SymbolResult("AAPL", 1, 100.0, 1, result.ok, "accounted")
 
     runner = _runner_for_parallel(process)
-    _configure_order_runtime(runner)
+    await _configure_order_runtime(runner)
     parent = asyncio.create_task(runner.run_parallel(["AAPL"]))
     await fill_happened.wait()
     parent.cancel()
@@ -1100,7 +1125,7 @@ async def test_parent_cancel_during_abort_drain_preserves_cancellation() -> None
 
     runner = _runner_for_parallel(process)
     runner.max_concurrent_symbols = 2
-    _configure_order_runtime(runner)
+    await _configure_order_runtime(runner)
     parent = asyncio.create_task(runner.run_parallel(["AAPL", "MSFT"]))
 
     await fill_happened.wait()
@@ -1124,7 +1149,7 @@ async def test_parent_cancel_during_abort_drain_preserves_cancellation() -> None
 @pytest.mark.asyncio
 async def test_cancel_while_waiting_for_admission_does_not_leak_cycle_lock() -> None:
     runner = _runner_for_parallel(AsyncMock())
-    _configure_order_runtime(runner)
+    await _configure_order_runtime(runner)
     await runner._order_admission_lock.acquire()
     cycle = asyncio.create_task(runner.run_parallel(["AAPL"]))
     await asyncio.sleep(0)
@@ -1452,7 +1477,7 @@ async def test_continuous_transport_abort_disconnects_and_exits_without_next_cyc
 @pytest.mark.asyncio
 async def test_extended_hours_blocks_entry_sides_but_not_exit() -> None:
     runner = AsyncRunner.__new__(AsyncRunner)
-    _configure_order_runtime(runner)
+    await _configure_order_runtime(runner)
     with patch("robo_trader.runner_async.is_extended_hours", return_value=True):
         for side in ("BUY", "SELL_SHORT"):
             result = await runner._place_order_with_circuit_breaker(
@@ -1464,13 +1489,24 @@ async def test_extended_hours_blocks_entry_sides_but_not_exit() -> None:
         )
     assert exit_result.ok is True
     runner.paper_reduction_gateway.submit_reduction.assert_awaited_once()
+    submitted = runner.paper_reduction_gateway.submit_reduction.await_args.kwargs
+    assert submitted["order"].price is None
+    quote = submitted["protective_quote"]
+    assert quote.source is ProtectiveQuoteSource.LIVE_BROKER
+    assert (
+        assert_producer_owned_protective_quote(
+            quote,
+            producer=runner.stop_loss_monitor,
+        )
+        is quote
+    )
     runner.executor.place_order.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_regular_hours_entry_reaches_executor() -> None:
     runner = AsyncRunner.__new__(AsyncRunner)
-    _configure_order_runtime(runner)
+    await _configure_order_runtime(runner)
     with patch("robo_trader.runner_async.is_extended_hours", return_value=False):
         result = await runner._place_order_with_circuit_breaker(
             Order(symbol="AAPL", quantity=1, side="BUY", price=100.0)

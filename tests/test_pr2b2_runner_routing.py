@@ -6,6 +6,7 @@ import asyncio
 import inspect
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -18,7 +19,12 @@ from robo_trader.paper_reduction_gateway import (
     PaperReductionGateway,
     PaperReductionGatewayError,
 )
+from robo_trader.protective_quote_evidence import (
+    ProtectiveQuoteSource,
+    _produce_protective_quote,
+)
 from robo_trader.runner_async import AsyncRunner
+from robo_trader.stop_loss_monitor import StopLossMonitor
 
 
 class _EntrySerializationProbe(AbstractAsyncContextManager):
@@ -90,14 +96,42 @@ def _runner(
         if live_feed
         else {}
     )
-    runner.stop_loss_monitor = SimpleNamespace(
-        last_prices={"AAPL": 100.0},
-        price_event_times={"AAPL": now},
-        price_receipt_monotonic={"AAPL": monotonic_now},
-        max_price_age_seconds=10.0,
-        _utcnow=lambda: now,
-        _monotonic=lambda: monotonic_now,
+
+    async def unused_stop_execution(*_args):
+        raise AssertionError("routing fixture must not execute a stop")
+
+    monitor = StopLossMonitor(
+        execute_reduction=unused_stop_execution,
+        risk_manager=None,
+        portfolio_id="default",
     )
+    monitor._utcnow = lambda: now
+    monitor._monotonic = lambda: monotonic_now
+    monitor.max_price_age_seconds = 10.0
+    if live_feed:
+        quote = _produce_protective_quote(
+            monitor,
+            portfolio_id="default",
+            symbol="AAPL",
+            price=Decimal("100.0"),
+            source_timestamp=now,
+            receipt_monotonic=monotonic_now,
+            receipt_order=1,
+            source=ProtectiveQuoteSource.LIVE_BROKER,
+            con_id=265598,
+            transport_generation="routing-generation",
+            source_event_id="routing-event-1",
+        )
+        monitor.last_prices["AAPL"] = 100.0
+        monitor.price_event_times["AAPL"] = now
+        monitor.price_receipt_monotonic["AAPL"] = monotonic_now
+        monitor.price_receipt_orders["AAPL"] = 1
+        monitor._price_receipt_order = 1
+        monitor._protective_quote_evidence["AAPL"] = quote
+        runner._test_protective_quote = quote
+    else:
+        runner._test_protective_quote = None
+    runner.stop_loss_monitor = monitor
 
     runner.risk = SimpleNamespace(
         emergency_shutdown_triggered=emergency_block,
@@ -129,6 +163,17 @@ def _order(side: str) -> Order:
         side=side,
         price=100.0,
         order_ref=f"routing-{side.lower()}",
+    )
+
+
+def _gateway_reduction_order(side: str) -> Order:
+    order = _order(side)
+    return Order(
+        symbol=order.symbol,
+        quantity=order.quantity,
+        side=order.side,
+        price=None,
+        order_ref=order.order_ref,
     )
 
 
@@ -228,8 +273,9 @@ async def test_reductions_bypass_entry_soft_blocks_through_gateway_once(
 
     assert result is expected
     gateway.submit_reduction.assert_awaited_once_with(
-        order=_order(side),
+        order=_gateway_reduction_order(side),
         portfolio_id="default",
+        protective_quote=runner._test_protective_quote,
     )
     gateway.serialize_entry.assert_not_called()
     runner.circuit_breaker.can_proceed.assert_not_awaited()
@@ -280,8 +326,9 @@ async def test_reductions_reach_gateway_when_diagnostic_recovery_is_pending(side
 
     assert result is expected
     gateway.submit_reduction.assert_awaited_once_with(
-        order=_order(side),
+        order=_gateway_reduction_order(side),
         portfolio_id="default",
+        protective_quote=runner._test_protective_quote,
     )
     runner.executor.place_order.assert_not_called()
 

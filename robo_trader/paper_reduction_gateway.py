@@ -10,21 +10,29 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import os
 import stat
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 
 from .broker_safety_evidence import BrokerContractSafetySnapshot
 from .clients.subprocess_ibkr_client import SubprocessIBKRClient
 from .database_async import AsyncTradingDatabase
-from .execution import ExecutionResult, Order, PaperExecutor
+from .execution import Order, PaperExecutor
 from .paper_reduction_submitter import (
+    LocalPaperOrderStatus,
+    LocalPaperTerminalOutcome,
     PaperReductionSubmitter,
     _bind_paper_reduction_submitter,
+)
+from .paper_runtime_settlement import PaperRuntimeSettlementParticipant
+from .paper_terminal_settlement import PaperTerminalSettlementRequest
+from .protective_quote_evidence import (
+    ProtectiveQuoteEvidence,
+    assert_current_authoritative_protective_quote,
 )
 from .reconciliation.identity import (
     RuntimeSafetyContext,
@@ -35,6 +43,7 @@ from .safety import (
     OrderType,
     RuntimeOrderRequest,
     SafetyRuntimeCoordinator,
+    TerminalOrderStatus,
     TimeInForce,
 )
 from .safety.readiness import require_paper_terminal_settlement_ready
@@ -49,6 +58,13 @@ class PaperReductionGatewayError(RuntimeError):
 
 
 _REFERENCE_PRICE_TICK = Decimal("0.0001")
+
+
+@dataclass(frozen=True, slots=True)
+class _PaperRuntimeBinding:
+    submitter: PaperReductionSubmitter
+    protective_quote_producer: object
+    settlement_participant: PaperRuntimeSettlementParticipant
 
 
 class PaperReductionGateway:
@@ -107,9 +123,10 @@ class PaperReductionGateway:
             worker_runtime_environment=self._runtime_context.runtime_contract.environment,
         )
         self._account_order_gate = asyncio.Lock()
-        self._submitters: dict[str, PaperReductionSubmitter] = {}
+        self._bindings: dict[str, _PaperRuntimeBinding] = {}
         self._started = False
         self._diagnostic_recovery_required = False
+        self._terminal_quarantine_reason: str | None = None
 
     @property
     def started(self) -> bool:
@@ -119,13 +136,25 @@ class PaperReductionGateway:
     def can_attempt_order_admission(self) -> bool:
         """Allow the locked boundary to retry health failures, not explicit closes."""
 
-        return self._started or self._diagnostic_recovery_required
+        return getattr(self, "_terminal_quarantine_reason", None) is None and (
+            self._started or self._diagnostic_recovery_required
+        )
+
+    @property
+    def terminal_quarantine_reason(self) -> str | None:
+        """Return the sanitized first terminal failure for operator diagnostics."""
+
+        return self._terminal_quarantine_reason
 
     async def start(self) -> None:
         """Start one persistent diagnostic paper/read-only broker connection."""
 
         require_paper_terminal_settlement_ready()
         async with self._account_order_gate:
+            if getattr(self, "_terminal_quarantine_reason", None) is not None:
+                raise PaperReductionGatewayError(
+                    "paper reduction gateway is terminally quarantined"
+                )
             if self._started:
                 return
             self._diagnostic_recovery_required = False
@@ -247,6 +276,8 @@ class PaperReductionGateway:
     async def _ensure_diagnostic_ready_locked(self) -> None:
         """Retry only a gateway health failure, never an intentional close."""
 
+        if getattr(self, "_terminal_quarantine_reason", None) is not None:
+            raise PaperReductionGatewayError("paper reduction gateway is terminally quarantined")
         if self._started:
             return
         if not self._diagnostic_recovery_required:
@@ -296,8 +327,11 @@ class PaperReductionGateway:
         self,
         portfolio_id: str,
         executor: PaperExecutor,
+        *,
+        protective_quote_producer: object,
+        settlement_participant: PaperRuntimeSettlementParticipant,
     ) -> None:
-        """Bind one portfolio to one exact local paper executor."""
+        """Bind one portfolio's executor, quote producer, and projection owner."""
 
         if (
             not isinstance(portfolio_id, str)
@@ -307,14 +341,37 @@ class PaperReductionGateway:
             raise PaperReductionGatewayError("portfolio_id is malformed")
         if type(executor) is not PaperExecutor:
             raise PaperReductionGatewayError("executor must be exactly PaperExecutor")
-        existing = self._submitters.get(portfolio_id)
+        from .stop_loss_monitor import StopLossMonitor
+
+        if type(protective_quote_producer) is not StopLossMonitor:
+            raise PaperReductionGatewayError(
+                "protective quote producer must be exactly StopLossMonitor"
+            )
+        if protective_quote_producer.portfolio_id != portfolio_id:
+            raise PaperReductionGatewayError("protective quote producer portfolio does not match")
+        if (
+            type(settlement_participant) is not PaperRuntimeSettlementParticipant
+            or settlement_participant.portfolio_id != portfolio_id
+        ):
+            raise PaperReductionGatewayError(
+                "exact matching paper runtime settlement participant is required"
+            )
+        existing = self._bindings.get(portfolio_id)
         if existing is not None:
-            if existing._is_bound_to(executor, self._coordinator):
+            if (
+                existing.submitter._is_bound_to(executor, self._coordinator)
+                and existing.protective_quote_producer is protective_quote_producer
+                and existing.settlement_participant is settlement_participant
+            ):
                 return
-            raise PaperReductionGatewayError("portfolio paper executor is already registered")
-        self._submitters[portfolio_id] = _bind_paper_reduction_submitter(
-            executor,
-            self._coordinator,
+            raise PaperReductionGatewayError("portfolio paper runtime is already registered")
+        self._bindings[portfolio_id] = _PaperRuntimeBinding(
+            submitter=_bind_paper_reduction_submitter(
+                executor,
+                self._coordinator,
+            ),
+            protective_quote_producer=protective_quote_producer,
+            settlement_participant=settlement_participant,
         )
 
     @asynccontextmanager
@@ -347,18 +404,25 @@ class PaperReductionGateway:
         *,
         order: Order,
         portfolio_id: str,
-    ) -> ExecutionResult:
-        """Authorize, revalidate, consume, and submit exactly one paper exit."""
+        protective_quote: Optional[ProtectiveQuoteEvidence] = None,
+    ) -> LocalPaperTerminalOutcome:
+        """Authorize, submit, settle, project, and release one paper exit."""
 
         require_paper_terminal_settlement_ready()
         request_side = self._validate_reduction_inputs(
             order=order,
             portfolio_id=portfolio_id,
         )
-        submitter = self._submitters.get(portfolio_id)
-        if type(submitter) is not PaperReductionSubmitter:
+        binding = self._bindings.get(portfolio_id)
+        if type(binding) is not _PaperRuntimeBinding:
+            raise PaperReductionGatewayError("portfolio has no registered paper runtime binding")
+        if protective_quote is None:
+            protective_quote = binding.protective_quote_producer.get_protective_quote_evidence(
+                order.symbol
+            )
+        if type(protective_quote) is not ProtectiveQuoteEvidence:
             raise PaperReductionGatewayError(
-                "portfolio has no registered paper reduction submitter"
+                "paper reduction requires exact protective quote evidence"
             )
         async with self._account_order_gate:
             await self._ensure_diagnostic_ready_locked()
@@ -383,13 +447,21 @@ class PaperReductionGateway:
                 initial_broker,
                 initial_allocation,
             )
-            price = self._normalized_reference_price(order.price)
+            quote = assert_current_authoritative_protective_quote(
+                protective_quote,
+                producer=binding.protective_quote_producer,
+                expected_portfolio_id=portfolio_id,
+                expected_symbol=order.symbol,
+                expected_con_id=initial_contract.con_id,
+                expected_transport_generation=initial_contract.transport_generation,
+            )
+            price = self._normalized_reference_price(quote.price)
             request = RuntimeOrderRequest(
                 portfolio_id=portfolio_id,
                 contract=initial_contract,
                 side=request_side,
                 quantity=Decimal(order.quantity),
-                order_type=OrderType.LIMIT if price is not None else OrderType.MARKET,
+                order_type=OrderType.LIMIT,
                 time_in_force=TimeInForce.DAY,
                 order_ref=str(order.order_ref),
                 limit_price=price,
@@ -404,11 +476,12 @@ class PaperReductionGateway:
             )
 
             finalization_started = False
+            permit_consumed = False
 
             async def finalize(
                 final_broker: BrokerContractSafetySnapshot,
-            ) -> ExecutionResult:
-                nonlocal finalization_started
+            ) -> LocalPaperTerminalOutcome:
+                nonlocal finalization_started, permit_consumed
                 finalization_started = True
                 try:
                     final_allocation = await self._database.get_safety_allocation_snapshot(
@@ -433,11 +506,52 @@ class PaperReductionGateway:
                     final_contract,
                     final_snapshot,
                 )
+                try:
+                    final_quote = assert_current_authoritative_protective_quote(
+                        quote,
+                        producer=binding.protective_quote_producer,
+                        expected_portfolio_id=portfolio_id,
+                        expected_symbol=order.symbol,
+                        expected_con_id=final_contract.con_id,
+                        expected_transport_generation=final_contract.transport_generation,
+                    )
+                except BaseException:
+                    self._coordinator._invalidate_unsubmitted_authorization(authorization)
+                    raise
+                # From the first instruction inside the consume boundary onward,
+                # non-consumption cannot be proven by this caller.  The journal
+                # may have durably appended OUTCOME_UNKNOWN before a later
+                # validation or descriptor check raises.  Mark the boundary
+                # uncertain *before* entering it so every such failure latches
+                # terminal quarantine instead of leaving admission open.
+                permit_consumed = True
                 envelope = self._coordinator._consume_authorization_for_paper_submission(
                     authorization,
                     proof,
                 )
-                return submitter._submit_once(envelope)
+                try:
+                    outcome = binding.submitter._submit_once(envelope)
+                except BaseException as error:
+                    self._latch_terminal_quarantine(
+                        portfolio_id,
+                        f"local paper submission outcome unknown: {type(error).__name__}",
+                    )
+                    raise
+                completion = asyncio.create_task(
+                    self._settle_consumed_outcome_locked(
+                        authorization=authorization,
+                        final_allocation=final_allocation,
+                        final_contract=final_contract,
+                        final_quote=final_quote,
+                        outcome=outcome,
+                        binding=binding,
+                        runtime_contract=runtime_contract,
+                    )
+                )
+                return await self._drain_irrevocable_completion(
+                    completion,
+                    portfolio_id=portfolio_id,
+                )
 
             try:
                 return await self._client.run_with_locked_broker_contract_safety_snapshot(
@@ -454,7 +568,229 @@ class PaperReductionGateway:
                 if not finalization_started:
                     self._coordinator._invalidate_unsubmitted_authorization(authorization)
                     await self._mark_broker_boundary_recovery_pending_locked(error)
+                elif permit_consumed:
+                    self._latch_terminal_quarantine(
+                        portfolio_id,
+                        f"consumed paper reduction failed: {type(error).__name__}",
+                    )
                 raise
+
+    async def _drain_irrevocable_completion(
+        self,
+        task: asyncio.Task[LocalPaperTerminalOutcome],
+        *,
+        portfolio_id: str,
+    ) -> LocalPaperTerminalOutcome:
+        """Do not let cancellation abandon a consumed permit or committed fill."""
+
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                if task.cancelled():
+                    self._latch_terminal_quarantine(
+                        portfolio_id,
+                        "paper settlement task was cancelled after permit consumption",
+                    )
+                    raise
+                if cancellation is None:
+                    cancellation = error
+                continue
+            except BaseException:
+                # The owned task is complete with an exception.  Read it below
+                # through ``task.result()`` so every post-consumption failure
+                # receives the same stage-specific quarantine diagnostic.
+                break
+        try:
+            result = task.result()
+        except BaseException as error:
+            self._latch_terminal_quarantine(
+                portfolio_id,
+                f"paper terminal settlement failed: {type(error).__name__}",
+            )
+            raise
+        if cancellation is not None:
+            raise cancellation.with_traceback(cancellation.__traceback__)
+        return result
+
+    async def _settle_consumed_outcome_locked(
+        self,
+        *,
+        authorization: object,
+        final_allocation: object,
+        final_contract: object,
+        final_quote: ProtectiveQuoteEvidence,
+        outcome: LocalPaperTerminalOutcome,
+        binding: _PaperRuntimeBinding,
+        runtime_contract: object,
+    ) -> LocalPaperTerminalOutcome:
+        """Complete every post-consumption step while the account gate is held."""
+
+        if type(outcome) is not LocalPaperTerminalOutcome:
+            raise PaperReductionGatewayError(
+                "paper submitter returned an unexpected terminal outcome"
+            )
+        if outcome.order_ref != authorization.claim.order_ref:
+            raise PaperReductionGatewayError(
+                "paper outcome order reference does not match authorization"
+            )
+        if outcome.requested_quantity != authorization._request.quantity:
+            raise PaperReductionGatewayError("paper outcome quantity does not match authorization")
+        if outcome.terminal is not True or outcome.status not in {
+            LocalPaperOrderStatus.FILLED,
+            LocalPaperOrderStatus.REJECTED,
+            LocalPaperOrderStatus.CANCELLED,
+            LocalPaperOrderStatus.EXPIRED,
+        }:
+            raise PaperReductionGatewayError(
+                "partial, nonterminal, or unknown paper outcome is quarantined"
+            )
+
+        allocation = next(
+            (
+                row
+                for row in final_allocation.allocations
+                if row.portfolio_id == authorization._request.portfolio_id
+            ),
+            None,
+        )
+        if allocation is None:
+            raise PaperReductionGatewayError(
+                "authorized portfolio allocation disappeared before settlement"
+            )
+        pre_position = allocation.quantity
+        pre_aggregate = final_allocation.aggregate_allocated_quantity
+        signed_fill = outcome.filled_quantity
+        if authorization._request.side is OrderSide.SELL and signed_fill:
+            signed_fill = signed_fill.copy_negate()
+        post_position = pre_position + signed_fill
+        post_aggregate = pre_aggregate + signed_fill
+        terminal_status = {
+            LocalPaperOrderStatus.FILLED: TerminalOrderStatus.FILLED,
+            LocalPaperOrderStatus.REJECTED: TerminalOrderStatus.REJECTED,
+            LocalPaperOrderStatus.CANCELLED: TerminalOrderStatus.CANCELLED,
+            LocalPaperOrderStatus.EXPIRED: TerminalOrderStatus.EXPIRED,
+        }[outcome.status]
+        account_state = await self._database.get_paper_account_settlement_state(
+            authorization._request.portfolio_id,
+            final_contract.symbol,
+            runtime_contract=runtime_contract,
+        )
+        post_cash, post_realized_pnl, post_daily_pnl = account_state.post_values(
+            side=authorization._request.side,
+            filled_quantity=outcome.filled_quantity,
+            fill_price=outcome.exact_fill_price,
+            protective_mark_price=final_quote.price,
+            pre_position_quantity=pre_position,
+        )
+        settlement_request = PaperTerminalSettlementRequest(
+            execution_domain_scope=authorization.claim.execution_domain_scope,
+            account_scope=authorization.claim.account_scope,
+            portfolio_id=authorization._request.portfolio_id,
+            con_id=final_contract.con_id,
+            symbol=final_contract.symbol,
+            reservation_id=authorization.reservation.reservation_id,
+            claim_id=authorization.claim.claim_id,
+            claim_sequence=authorization.claim.sequence,
+            submission_descriptor_fingerprint=authorization.descriptor_fingerprint,
+            protective_quote_fingerprint=final_quote.fingerprint,
+            protective_quote_payload=final_quote.canonical_payload(),
+            order_ref=authorization.claim.order_ref,
+            side=authorization._request.side,
+            requested_quantity=outcome.requested_quantity,
+            filled_quantity=outcome.filled_quantity,
+            remaining_quantity=outcome.remaining_quantity,
+            expected_pre_position_quantity=pre_position,
+            expected_post_position_quantity=post_position,
+            expected_pre_aggregate_quantity=pre_aggregate,
+            expected_post_aggregate_quantity=post_aggregate,
+            expected_pre_cash=account_state.cash,
+            expected_post_cash=post_cash,
+            expected_pre_realized_pnl=account_state.realized_pnl,
+            expected_post_realized_pnl=post_realized_pnl,
+            expected_pre_daily_pnl=account_state.daily_pnl,
+            expected_post_daily_pnl=post_daily_pnl,
+            expected_daily_pnl_baseline=account_state.daily_pnl_baseline,
+            expected_daily_pnl_date=account_state.daily_pnl_date,
+            expected_position_cost_basis=account_state.position_cost_basis,
+            expected_pre_position_mark_price=account_state.position_mark_price,
+            expected_pre_position_source_settlement_id=(
+                account_state.position_source_settlement_id
+            ),
+            terminal_status=terminal_status,
+            fill_price=outcome.exact_fill_price,
+            outcome_at=outcome.observed_at,
+        )
+        receipt = await self._database.commit_paper_reduction_outcome(
+            settlement_request,
+            runtime_contract=runtime_contract,
+        )
+        await binding.settlement_participant.apply_and_verify(receipt)
+
+        post_snapshot = await self._database.get_safety_allocation_snapshot(
+            final_contract.symbol,
+            runtime_contract=runtime_contract,
+        )
+        post_allocation = next(
+            (
+                row
+                for row in post_snapshot.allocations
+                if row.portfolio_id == authorization._request.portfolio_id
+            ),
+            None,
+        )
+        observed_post_position = (
+            Decimal("0") if post_allocation is None else post_allocation.quantity
+        )
+        if (
+            observed_post_position != post_position
+            or post_snapshot.aggregate_allocated_quantity != post_aggregate
+        ):
+            raise PaperReductionGatewayError("post-settlement ledger projection is inconsistent")
+
+        released = self._coordinator.release_after_local_paper_settlement(
+            authorization.reservation.idempotency_key,
+            authorization.decision.intent_fingerprint,
+            receipt,
+        )
+        if released.released is not True or released.terminal_sequence is None:
+            raise PaperReductionGatewayError("paper settlement journal release was not terminal")
+        if outcome.status is not LocalPaperOrderStatus.FILLED:
+            # The journal is clean and a zero fill is certain, but continuing
+            # admission would leave the crossed stop without an executable
+            # authority. Preserve the stop's TRIGGERED state and require an
+            # operator-supervised restart/reconciliation before any later order.
+            self._latch_terminal_quarantine(
+                authorization._request.portfolio_id,
+                f"terminal paper reduction had no fill: {outcome.status.value}",
+            )
+        return outcome
+
+    def _latch_terminal_quarantine(self, portfolio_id: str, reason: str) -> None:
+        """Synchronously close all later admissions without recursive lock waits."""
+
+        reason_text = str(reason or "paper settlement failure").strip()
+        if not reason_text:
+            reason_text = "paper settlement failure"
+        if self._terminal_quarantine_reason is not None:
+            return
+        self._terminal_quarantine_reason = reason_text
+        binding = self._bindings.get(portfolio_id)
+        if type(binding) is _PaperRuntimeBinding:
+            try:
+                binding.settlement_participant.latch_quarantine(reason_text)
+            except Exception:
+                logger.critical(
+                    "event=paper_runtime_quarantine_callback_failed portfolio_id=%s",
+                    portfolio_id,
+                    exc_info=True,
+                )
+        logger.critical(
+            "event=paper_reduction_gateway_terminal_quarantine portfolio_id=%s reason=%s",
+            portfolio_id,
+            reason_text,
+        )
 
     def _validate_reduction_inputs(
         self,
@@ -479,13 +815,10 @@ class PaperReductionGateway:
             or not order.symbol
         ):
             raise PaperReductionGatewayError("paper reduction order has invalid symbol or quantity")
-        if order.price is not None and (
-            isinstance(order.price, bool)
-            or not isinstance(order.price, (int, float, Decimal))
-            or not math.isfinite(float(order.price))
-            or float(order.price) <= 0
-        ):
-            raise PaperReductionGatewayError("paper reduction price must be finite and positive")
+        if order.price is not None:
+            raise PaperReductionGatewayError(
+                "paper reduction price must come from producer-owned quote evidence"
+            )
         if (
             not isinstance(order.order_ref, str)
             or not order.order_ref

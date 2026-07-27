@@ -19,15 +19,31 @@ import uuid
 import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, localcontext
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import aiosqlite
 
 from robo_trader.database_validator import DatabaseValidator, ValidationError
 from robo_trader.logger import get_logger
+from robo_trader.paper_terminal_settlement import (
+    PaperAccountSettlementState,
+    PaperTerminalSettlementConflict,
+    PaperTerminalSettlementError,
+    PaperTerminalSettlementReceipt,
+    PaperTerminalSettlementRequest,
+    _produce_paper_terminal_settlement_receipt,
+)
+from robo_trader.safety.models import (
+    MODEL_VERSION,
+    _strict_decimal,
+    decimal_to_fixed,
+    parse_fixed_decimal,
+    parse_utc_text,
+    utc_to_text,
+)
 from robo_trader.safety.sqlite_identity import (
     SQLiteDescriptorIdentity,
     SQLiteIdentityError,
@@ -236,6 +252,10 @@ class AsyncTradingDatabase:
         self._lifecycle_revision = 0
         self._pool_recovery_failure: Optional[_PoolRecoveryFailure] = None
         self._expected_database_file_identity = self._existing_database_file_identity()
+        # Test-only fault seam. Production leaves this unset. Keeping the hook
+        # on the database instance lets rollback behavior be tested without a
+        # public flag that could weaken settlement in deployed code.
+        self._paper_settlement_fault_hook: Optional[Callable[[str], None]] = None
 
     def _existing_database_file_identity(self) -> Optional[Tuple[int, int]]:
         """Capture a pre-existing regular ledger without following its leaf."""
@@ -1217,12 +1237,107 @@ class AsyncTradingDatabase:
                 ON trades (portfolio_id, symbol, timestamp DESC)
             """)
 
+            # Append-only idempotency/outbox record for local paper reductions.
+            # Exact quantities and prices live in the canonical request JSON;
+            # the legacy trades/positions representations remain compatible
+            # with existing dashboard and portfolio readers.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS paper_reduction_settlements (
+                    settlement_id TEXT PRIMARY KEY,
+                    execution_domain_scope TEXT NOT NULL,
+                    account_scope TEXT NOT NULL,
+                    portfolio_id TEXT NOT NULL,
+                    con_id INTEGER NOT NULL CHECK (con_id > 0),
+                    symbol TEXT NOT NULL,
+                    reservation_id TEXT NOT NULL UNIQUE,
+                    claim_id TEXT NOT NULL UNIQUE,
+                    order_ref TEXT NOT NULL,
+                    protective_quote_payload TEXT NOT NULL,
+                    request_fingerprint TEXT NOT NULL,
+                    request_payload_json TEXT NOT NULL,
+                    terminal_status TEXT NOT NULL,
+                    trade_id INTEGER,
+                    database_path TEXT NOT NULL,
+                    database_identity TEXT NOT NULL,
+                    database_device INTEGER NOT NULL,
+                    database_inode INTEGER NOT NULL,
+                    committed_at TEXT NOT NULL,
+                    receipt_fingerprint TEXT NOT NULL,
+                    schema_version INTEGER NOT NULL,
+                    UNIQUE(execution_domain_scope, account_scope, order_ref),
+                    FOREIGN KEY(trade_id) REFERENCES trades(id)
+                )
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_paper_reduction_settlement_scope
+                ON paper_reduction_settlements
+                   (execution_domain_scope, account_scope, portfolio_id, symbol)
+            """)
+
+            await conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS paper_reduction_settlements_no_update
+                BEFORE UPDATE ON paper_reduction_settlements
+                BEGIN
+                    SELECT RAISE(ABORT, 'paper reduction settlements are append-only');
+                END
+            """)
+
+            await conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS paper_reduction_settlements_no_delete
+                BEFORE DELETE ON paper_reduction_settlements
+                BEGIN
+                    SELECT RAISE(ABORT, 'paper reduction settlements are append-only');
+                END
+            """)
+
+            # Exact current-account materialization for the local-paper
+            # settlement boundary. Legacy REAL account columns remain as
+            # dashboard-compatible projections; settlement correctness reads
+            # and writes only these canonical fixed-point strings.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS paper_account_settlement_state (
+                    portfolio_id TEXT PRIMARY KEY,
+                    cash_text TEXT NOT NULL,
+                    realized_pnl_text TEXT NOT NULL,
+                    daily_pnl_text TEXT NOT NULL,
+                    daily_pnl_baseline_text TEXT NOT NULL,
+                    daily_pnl_date TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    source_settlement_id TEXT,
+                    FOREIGN KEY(source_settlement_id)
+                        REFERENCES paper_reduction_settlements(settlement_id)
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS paper_position_settlement_state (
+                    portfolio_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    cost_basis_text TEXT NOT NULL,
+                    mark_price_text TEXT,
+                    source_settlement_id TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (portfolio_id, symbol),
+                    FOREIGN KEY(source_settlement_id)
+                        REFERENCES paper_reduction_settlements(settlement_id)
+                )
+            """)
+
             # Migrations for existing tables
             migrations = [
                 "ALTER TABLE trades ADD COLUMN pnl REAL DEFAULT NULL",
                 "ALTER TABLE trades ADD COLUMN notional REAL DEFAULT 0",
                 "ALTER TABLE trades ADD COLUMN portfolio_id TEXT DEFAULT 'default'",
                 "ALTER TABLE positions ADD COLUMN portfolio_id TEXT DEFAULT 'default'",
+                "ALTER TABLE paper_reduction_settlements "
+                "ADD COLUMN protective_quote_payload TEXT",
+                "ALTER TABLE paper_account_settlement_state " "ADD COLUMN daily_pnl_text TEXT",
+                "ALTER TABLE paper_account_settlement_state "
+                "ADD COLUMN daily_pnl_baseline_text TEXT",
+                "ALTER TABLE paper_account_settlement_state " "ADD COLUMN daily_pnl_date TEXT",
+                "ALTER TABLE paper_position_settlement_state " "ADD COLUMN mark_price_text TEXT",
+                "ALTER TABLE paper_position_settlement_state "
+                "ADD COLUMN source_settlement_id TEXT",
             ]
             for migration in migrations:
                 try:
@@ -1299,10 +1414,24 @@ class AsyncTradingDatabase:
             """)
 
             # Insert default account if not exists
-            await conn.execute("""
+            default_account = await conn.execute("""
                 INSERT OR IGNORE INTO account (portfolio_id, cash, equity)
                 VALUES ('default', 100000, 100000)
             """)
+            if default_account.rowcount == 1:
+                await conn.execute(
+                    """
+                    INSERT INTO paper_account_settlement_state (
+                        portfolio_id, cash_text, realized_pnl_text, daily_pnl_text,
+                        daily_pnl_baseline_text, daily_pnl_date,
+                        updated_at, source_settlement_id
+                    ) VALUES ('default', '100000', '0', '0', '0', ?, ?, NULL)
+                    """,
+                    (
+                        datetime.now(timezone.utc).date().isoformat(),
+                        utc_to_text(datetime.now(timezone.utc)),
+                    ),
+                )
 
             await conn.commit()
             connection_binding.assert_connection_identity(
@@ -1320,16 +1449,660 @@ class AsyncTradingDatabase:
         if cancellation is not None:
             raise cancellation
 
+    def _paper_settlement_fault(self, step: str) -> None:
+        """Invoke the test-only transaction fault seam when configured."""
+
+        hook = self._paper_settlement_fault_hook
+        if hook is not None:
+            hook(step)
+
+    async def get_paper_account_settlement_state(
+        self,
+        portfolio_id: str,
+        symbol: str,
+        *,
+        runtime_contract: Optional[object] = None,
+    ) -> PaperAccountSettlementState:
+        """Read the exact pre-account state used to build a settlement request.
+
+        This is a preflight snapshot only. ``commit_paper_reduction_outcome``
+        repeats the comparison while holding ``BEGIN IMMEDIATE`` so a write
+        between this read and the settlement fails closed.
+        """
+
+        expected_path, _ = self._expected_safety_database(runtime_contract=runtime_contract)
+        if (
+            expected_path != self.db_path
+            or getattr(runtime_contract, "execution_mode", None) != "paper"
+            or getattr(runtime_contract, "state_namespace", None) != "paper"
+        ):
+            raise PaperTerminalSettlementError(
+                "paper account snapshot does not match the validated runtime"
+            )
+        try:
+            portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
+            symbol = DatabaseValidator.validate_symbol(symbol)
+        except ValidationError as exc:
+            raise PaperTerminalSettlementError(
+                "paper account snapshot identity is invalid"
+            ) from exc
+
+        async with self.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT cash_text, realized_pnl_text, daily_pnl_text,
+                       daily_pnl_baseline_text, daily_pnl_date
+                FROM paper_account_settlement_state
+                WHERE portfolio_id = ?
+                """,
+                (portfolio_id,),
+            )
+            account_row = await cursor.fetchone()
+            if account_row is None:
+                raise PaperTerminalSettlementError(
+                    "exact paper account state is unavailable; refresh account state first"
+                )
+            cursor = await conn.execute(
+                """
+                SELECT state.cost_basis_text, state.mark_price_text,
+                       state.source_settlement_id,
+                       settled.settlement_id, settled.portfolio_id, settled.symbol
+                FROM paper_position_settlement_state AS state
+                LEFT JOIN paper_reduction_settlements AS settled
+                  ON settled.settlement_id = state.source_settlement_id
+                WHERE state.portfolio_id = ? AND state.symbol = ?
+                """,
+                (portfolio_id, symbol),
+            )
+            position_state_row = await cursor.fetchone()
+        if position_state_row is None:
+            cost_basis = None
+            position_mark = None
+            position_source = None
+        else:
+            try:
+                cost_basis = parse_fixed_decimal(
+                    position_state_row[0],
+                    "cost_basis_text",
+                )
+                _strict_decimal(cost_basis, "position_cost_basis", positive=True)
+                position_mark = (
+                    None
+                    if position_state_row[1] is None
+                    else parse_fixed_decimal(
+                        position_state_row[1],
+                        "mark_price_text",
+                    )
+                )
+                if position_mark is not None:
+                    _strict_decimal(
+                        position_mark,
+                        "position_mark_price",
+                        positive=True,
+                    )
+            except ValidationError as exc:
+                raise PaperTerminalSettlementError(
+                    "paper position cost basis is not an exact usable decimal"
+                ) from exc
+            if position_state_row[2] is not None and (
+                position_state_row[3] != position_state_row[2]
+                or position_state_row[4] != portfolio_id
+                or position_state_row[5] != symbol
+            ):
+                raise PaperTerminalSettlementError(
+                    "paper position mark settlement lineage cannot be resolved"
+                )
+            position_source = position_state_row[2]
+        try:
+            return PaperAccountSettlementState(
+                portfolio_id=portfolio_id,
+                cash=parse_fixed_decimal(account_row[0], "cash_text"),
+                realized_pnl=parse_fixed_decimal(
+                    account_row[1],
+                    "realized_pnl_text",
+                ),
+                daily_pnl=parse_fixed_decimal(account_row[2], "daily_pnl_text"),
+                daily_pnl_baseline=parse_fixed_decimal(
+                    account_row[3],
+                    "daily_pnl_baseline_text",
+                ),
+                daily_pnl_date=account_row[4],
+                position_cost_basis=cost_basis,
+                position_mark_price=position_mark,
+                position_source_settlement_id=position_source,
+            )
+        except ValidationError as exc:
+            raise PaperTerminalSettlementError("exact paper account state is malformed") from exc
+
+    @staticmethod
+    def _paper_settlement_receipt_from_row(
+        row: Tuple,
+    ) -> PaperTerminalSettlementReceipt:
+        """Rebuild and authenticate one exact persisted settlement receipt."""
+
+        (
+            settlement_id,
+            request_fingerprint,
+            request_payload_json,
+            protective_quote_payload,
+            trade_id,
+            database_path,
+            database_identity,
+            database_device,
+            database_inode,
+            committed_at,
+            receipt_fingerprint,
+            schema_version,
+        ) = row
+        request = PaperTerminalSettlementRequest.from_canonical_payload(request_payload_json)
+        if request.fingerprint() != request_fingerprint:
+            raise PaperTerminalSettlementError(
+                "stored paper settlement request fingerprint does not match"
+            )
+        if request.protective_quote_payload != protective_quote_payload:
+            raise PaperTerminalSettlementError(
+                "stored protective quote payload does not match settlement request"
+            )
+        receipt = _produce_paper_terminal_settlement_receipt(
+            settlement_id=settlement_id,
+            request=request,
+            trade_id=trade_id,
+            database_path=database_path,
+            database_identity=database_identity,
+            database_device=database_device,
+            database_inode=database_inode,
+            committed_at=parse_utc_text(committed_at, "committed_at"),
+            schema_version=schema_version,
+        )
+        if receipt.fingerprint() != receipt_fingerprint:
+            raise PaperTerminalSettlementError(
+                "stored paper settlement receipt fingerprint does not match"
+            )
+        return receipt
+
+    async def commit_paper_reduction_outcome(
+        self,
+        request: PaperTerminalSettlementRequest,
+        *,
+        runtime_contract: Optional[object] = None,
+    ) -> PaperTerminalSettlementReceipt:
+        """Atomically apply and outbox one exact local-paper terminal outcome.
+
+        Exact replay returns the previously committed receipt without inserting
+        another trade or mutating the position. Any identity collision with a
+        different request fails closed. The method never deletes a position;
+        a fully closed allocation remains as an explicit zero-quantity row so
+        the terminal allocation is durably inspectable.
+        """
+
+        if type(request) is not PaperTerminalSettlementRequest:
+            raise TypeError("request must be PaperTerminalSettlementRequest")
+        expected_path, database_identity = self._expected_safety_database(
+            runtime_contract=runtime_contract,
+        )
+        if (
+            getattr(runtime_contract, "execution_mode", None) != "paper"
+            or getattr(runtime_contract, "state_namespace", None) != "paper"
+            or getattr(runtime_contract, "safety_execution_domain_scope", None)
+            != request.execution_domain_scope
+            or getattr(runtime_contract, "safety_account_scope", None) != request.account_scope
+        ):
+            raise PaperTerminalSettlementError(
+                "settlement request does not match the validated paper runtime"
+            )
+        try:
+            symbol = DatabaseValidator.validate_symbol(request.symbol)
+            portfolio_id = DatabaseValidator.validate_portfolio_id(request.portfolio_id)
+        except ValidationError as exc:
+            raise PaperTerminalSettlementError("settlement allocation identity is invalid") from exc
+        if symbol != request.symbol or portfolio_id != request.portfolio_id:
+            raise PaperTerminalSettlementError("settlement allocation identity is not canonical")
+        now = datetime.now(timezone.utc)
+        if request.outcome_at > now:
+            raise PaperTerminalSettlementError("terminal outcome is future-dated")
+
+        async with self.get_connection() as conn:
+            descriptor_identity = await self._sqlite_descriptor_identity(conn)
+            expected_file_identity = self._expected_database_file_identity
+            if (
+                expected_path != self.db_path
+                or expected_file_identity is None
+                or (descriptor_identity.device, descriptor_identity.inode) != expected_file_identity
+            ):
+                raise PaperTerminalSettlementError("settlement database identity cannot be proven")
+            try:
+                await conn.execute("BEGIN IMMEDIATE")
+                self._paper_settlement_fault("AFTER_BEGIN")
+
+                # Search every durable idempotency identity together. A
+                # request must not evade a claim collision by changing only
+                # its order reference (or vice versa).
+                cursor = await conn.execute(
+                    """
+                    SELECT settlement_id, request_fingerprint, request_payload_json,
+                           protective_quote_payload, trade_id, database_path, database_identity,
+                           database_device, database_inode, committed_at,
+                           receipt_fingerprint, schema_version
+                    FROM paper_reduction_settlements
+                    WHERE reservation_id = ? OR claim_id = ? OR (
+                        execution_domain_scope = ? AND account_scope = ? AND order_ref = ?
+                    )
+                    """,
+                    (
+                        request.reservation_id,
+                        request.claim_id,
+                        request.execution_domain_scope,
+                        request.account_scope,
+                        request.order_ref,
+                    ),
+                )
+                replay_rows = await cursor.fetchall()
+                if len(replay_rows) > 1:
+                    raise PaperTerminalSettlementConflict(
+                        "paper settlement identities resolve to different records"
+                    )
+                if replay_rows:
+                    receipt = self._paper_settlement_receipt_from_row(replay_rows[0])
+                    if receipt.request.fingerprint() != request.fingerprint():
+                        raise PaperTerminalSettlementConflict(
+                            "paper settlement identity is bound to a different request"
+                        )
+                    if (
+                        receipt.database_path != str(expected_path)
+                        or receipt.database_identity != database_identity
+                        or receipt.database_device != descriptor_identity.device
+                        or receipt.database_inode != descriptor_identity.inode
+                    ):
+                        raise PaperTerminalSettlementError(
+                            "persisted settlement database provenance changed"
+                        )
+                    await conn.rollback()
+                    return receipt
+
+                cursor = await conn.execute(
+                    "SELECT id FROM portfolios WHERE id = ?",
+                    (portfolio_id,),
+                )
+                if await cursor.fetchone() is None:
+                    raise PaperTerminalSettlementError(
+                        "settlement portfolio is absent from the authoritative registry"
+                    )
+
+                cursor = await conn.execute(
+                    """
+                    SELECT quantity, typeof(quantity), avg_cost, market_price
+                    FROM positions
+                    WHERE portfolio_id = ? AND symbol = ?
+                    """,
+                    (portfolio_id, symbol),
+                )
+                position_row = await cursor.fetchone()
+                if position_row is None:
+                    current_position = Decimal(0)
+                    avg_cost = None
+                    market_price = None
+                else:
+                    stored_quantity, storage_type, avg_cost, market_price = position_row
+                    if storage_type != "integer" or type(stored_quantity) is not int:
+                        raise PaperTerminalSettlementError(
+                            "current paper position is not stored as an exact integer"
+                        )
+                    current_position = Decimal(stored_quantity)
+                if current_position != request.expected_pre_position_quantity:
+                    raise PaperTerminalSettlementConflict(
+                        "current paper position differs from the authorized pre-position"
+                    )
+
+                cursor = await conn.execute(
+                    """
+                    SELECT quantity, typeof(quantity)
+                    FROM positions WHERE symbol = ?
+                    """,
+                    (symbol,),
+                )
+                aggregate_rows = await cursor.fetchall()
+                if any(
+                    storage_type != "integer" or type(quantity) is not int
+                    for quantity, storage_type in aggregate_rows
+                ):
+                    raise PaperTerminalSettlementError(
+                        "paper aggregate contains a non-integer allocation"
+                    )
+                current_aggregate = Decimal(sum(quantity for quantity, _ in aggregate_rows))
+                if current_aggregate != request.expected_pre_aggregate_quantity:
+                    raise PaperTerminalSettlementConflict(
+                        "current paper aggregate differs from the authorized pre-allocation"
+                    )
+
+                cursor = await conn.execute(
+                    """
+                    SELECT cash_text, realized_pnl_text, daily_pnl_text,
+                           daily_pnl_baseline_text, daily_pnl_date
+                    FROM paper_account_settlement_state
+                    WHERE portfolio_id = ?
+                    """,
+                    (portfolio_id,),
+                )
+                account_state_row = await cursor.fetchone()
+                if account_state_row is None:
+                    raise PaperTerminalSettlementError("exact paper account state is unavailable")
+                try:
+                    current_cash = parse_fixed_decimal(account_state_row[0], "cash_text")
+                    current_realized_pnl = parse_fixed_decimal(
+                        account_state_row[1],
+                        "realized_pnl_text",
+                    )
+                    current_daily_pnl = parse_fixed_decimal(
+                        account_state_row[2],
+                        "daily_pnl_text",
+                    )
+                    current_daily_pnl_baseline = parse_fixed_decimal(
+                        account_state_row[3],
+                        "daily_pnl_baseline_text",
+                    )
+                    current_daily_pnl_date = account_state_row[4]
+                except ValidationError as exc:
+                    raise PaperTerminalSettlementError(
+                        "exact paper account state is malformed"
+                    ) from exc
+                if (
+                    current_cash != request.expected_pre_cash
+                    or current_realized_pnl != request.expected_pre_realized_pnl
+                    or current_daily_pnl != request.expected_pre_daily_pnl
+                    or current_daily_pnl_baseline != request.expected_daily_pnl_baseline
+                    or current_daily_pnl_date != request.expected_daily_pnl_date
+                ):
+                    raise PaperTerminalSettlementConflict(
+                        "current paper account differs from the requested pre-account state"
+                    )
+                cursor = await conn.execute(
+                    "SELECT 1 FROM account WHERE portfolio_id = ?",
+                    (portfolio_id,),
+                )
+                if await cursor.fetchone() is None:
+                    raise PaperTerminalSettlementError(
+                        "paper account compatibility projection is absent"
+                    )
+
+                trade_id: Optional[int] = None
+                committed_at = datetime.now(timezone.utc)
+                if request.filled_quantity > 0:
+                    if position_row is None or avg_cost is None or request.fill_price is None:
+                        raise PaperTerminalSettlementError(
+                            "filled reduction has no authoritative local cost basis"
+                        )
+                    quantity_int = int(request.filled_quantity)
+                    price_float = DatabaseValidator.validate_price(
+                        float(request.fill_price), field_name="paper fill price"
+                    )
+                    protective_mark_float = DatabaseValidator.validate_price(
+                        float(request.protective_mark_price),
+                        field_name="paper protective mark",
+                    )
+                    cursor = await conn.execute(
+                        """
+                        SELECT cost_basis_text, mark_price_text,
+                               source_settlement_id
+                        FROM paper_position_settlement_state
+                        WHERE portfolio_id = ? AND symbol = ?
+                        """,
+                        (portfolio_id, symbol),
+                    )
+                    cost_basis_row = await cursor.fetchone()
+                    if cost_basis_row is None:
+                        raise PaperTerminalSettlementError(
+                            "exact paper position cost basis is unavailable"
+                        )
+                    try:
+                        stored_cost_basis = parse_fixed_decimal(
+                            cost_basis_row[0],
+                            "cost_basis_text",
+                        )
+                    except ValidationError as exc:
+                        raise PaperTerminalSettlementError(
+                            "exact paper position cost basis is malformed"
+                        ) from exc
+                    if stored_cost_basis != request.expected_position_cost_basis:
+                        raise PaperTerminalSettlementConflict(
+                            "paper position cost basis differs from settlement request"
+                        )
+                    if Decimal(str(avg_cost)) != stored_cost_basis:
+                        raise PaperTerminalSettlementConflict(
+                            "legacy position cost basis diverges from exact authority"
+                        )
+                    try:
+                        stored_position_mark = parse_fixed_decimal(
+                            cost_basis_row[1],
+                            "mark_price_text",
+                        )
+                    except ValidationError as exc:
+                        raise PaperTerminalSettlementError(
+                            "exact paper position mark is unavailable or malformed"
+                        ) from exc
+                    if stored_position_mark != request.expected_pre_position_mark_price:
+                        raise PaperTerminalSettlementConflict(
+                            "paper position mark differs from settlement request"
+                        )
+                    if cost_basis_row[2] != request.expected_pre_position_source_settlement_id:
+                        raise PaperTerminalSettlementConflict(
+                            "paper position mark source differs from settlement request"
+                        )
+                    exact_pnl = (
+                        request.expected_post_realized_pnl - request.expected_pre_realized_pnl
+                    )
+                    exact_notional = request.fill_price * request.filled_quantity
+                    cursor = await conn.execute(
+                        """
+                        INSERT INTO trades (
+                            portfolio_id, symbol, side, quantity, price, notional,
+                            slippage, commission, pnl, timestamp
+                        ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+                        """,
+                        (
+                            portfolio_id,
+                            symbol,
+                            request.side.value,
+                            quantity_int,
+                            price_float,
+                            float(exact_notional),
+                            float(exact_pnl),
+                            utc_to_text(committed_at),
+                        ),
+                    )
+                    trade_id = cursor.lastrowid
+                    if type(trade_id) is not int or trade_id <= 0:
+                        raise PaperTerminalSettlementError(
+                            "terminal trade row did not receive an identifier"
+                        )
+                    self._paper_settlement_fault("AFTER_TRADE_INSERT")
+                    await conn.execute(
+                        """
+                        UPDATE positions
+                        SET quantity = ?, avg_cost = ?, market_price = ?, timestamp = ?
+                        WHERE portfolio_id = ? AND symbol = ?
+                        """,
+                        (
+                            int(request.expected_post_position_quantity),
+                            avg_cost,
+                            protective_mark_float,
+                            utc_to_text(committed_at),
+                            portfolio_id,
+                            symbol,
+                        ),
+                    )
+                    self._paper_settlement_fault("AFTER_POSITION_UPDATE")
+
+                    await conn.execute(
+                        """
+                        UPDATE account
+                        SET cash = ?, realized_pnl = ?, daily_pnl = ?,
+                            unrealized_pnl = ?, timestamp = ?
+                        WHERE portfolio_id = ?
+                        """,
+                        (
+                            float(request.expected_post_cash),
+                            float(request.expected_post_realized_pnl),
+                            float(request.expected_post_daily_pnl),
+                            float(
+                                request.expected_post_daily_pnl
+                                + request.expected_daily_pnl_baseline
+                                - request.expected_post_realized_pnl
+                            ),
+                            utc_to_text(committed_at),
+                            portfolio_id,
+                        ),
+                    )
+                    await conn.execute(
+                        """
+                        UPDATE paper_account_settlement_state
+                        SET cash_text = ?, realized_pnl_text = ?, daily_pnl_text = ?,
+                            updated_at = ?,
+                            source_settlement_id = NULL
+                        WHERE portfolio_id = ?
+                        """,
+                        (
+                            decimal_to_fixed(request.expected_post_cash),
+                            decimal_to_fixed(request.expected_post_realized_pnl),
+                            decimal_to_fixed(request.expected_post_daily_pnl),
+                            utc_to_text(committed_at),
+                            portfolio_id,
+                        ),
+                    )
+                    self._paper_settlement_fault("AFTER_ACCOUNT_UPDATE")
+
+                cursor = await conn.execute(
+                    """
+                    SELECT quantity, typeof(quantity)
+                    FROM positions WHERE symbol = ?
+                    """,
+                    (symbol,),
+                )
+                final_rows = await cursor.fetchall()
+                if any(
+                    storage_type != "integer" or type(quantity) is not int
+                    for quantity, storage_type in final_rows
+                ):
+                    raise PaperTerminalSettlementError(
+                        "post-settlement aggregate contains a non-integer allocation"
+                    )
+                final_aggregate = Decimal(sum(quantity for quantity, _ in final_rows))
+                if final_aggregate != request.expected_post_aggregate_quantity:
+                    raise PaperTerminalSettlementError(
+                        "post-settlement aggregate does not match the terminal request"
+                    )
+
+                settlement_id = f"pset-{uuid.uuid4().hex}"
+                receipt = _produce_paper_terminal_settlement_receipt(
+                    settlement_id=settlement_id,
+                    request=request,
+                    trade_id=trade_id,
+                    database_path=str(expected_path),
+                    database_identity=database_identity,
+                    database_device=descriptor_identity.device,
+                    database_inode=descriptor_identity.inode,
+                    committed_at=committed_at,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO paper_reduction_settlements (
+                        settlement_id, execution_domain_scope, account_scope,
+                        portfolio_id, con_id, symbol, reservation_id, claim_id,
+                        order_ref, protective_quote_payload, request_fingerprint,
+                        request_payload_json,
+                        terminal_status, trade_id, database_path, database_identity,
+                        database_device, database_inode, committed_at,
+                        receipt_fingerprint, schema_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        settlement_id,
+                        request.execution_domain_scope,
+                        request.account_scope,
+                        portfolio_id,
+                        request.con_id,
+                        symbol,
+                        request.reservation_id,
+                        request.claim_id,
+                        request.order_ref,
+                        request.protective_quote_payload,
+                        request.fingerprint(),
+                        request.canonical_payload(),
+                        request.terminal_status.value,
+                        trade_id,
+                        str(expected_path),
+                        database_identity,
+                        descriptor_identity.device,
+                        descriptor_identity.inode,
+                        utc_to_text(committed_at),
+                        receipt.fingerprint(),
+                        MODEL_VERSION,
+                    ),
+                )
+                if request.filled_quantity > 0:
+                    await conn.execute(
+                        """
+                        UPDATE paper_position_settlement_state
+                        SET mark_price_text = ?, source_settlement_id = ?,
+                            updated_at = ?
+                        WHERE portfolio_id = ? AND symbol = ?
+                        """,
+                        (
+                            decimal_to_fixed(request.protective_mark_price),
+                            settlement_id,
+                            utc_to_text(committed_at),
+                            portfolio_id,
+                            symbol,
+                        ),
+                    )
+                self._paper_settlement_fault("AFTER_SETTLEMENT_INSERT")
+                await conn.execute(
+                    """
+                    UPDATE paper_account_settlement_state
+                    SET source_settlement_id = ?
+                    WHERE portfolio_id = ?
+                    """,
+                    (settlement_id, portfolio_id),
+                )
+                final_descriptor_identity = await self._sqlite_descriptor_identity(conn)
+                if final_descriptor_identity != descriptor_identity:
+                    raise PaperTerminalSettlementError(
+                        "settlement database descriptor identity changed"
+                    )
+                self._paper_settlement_fault("BEFORE_COMMIT")
+                await conn.commit()
+                return receipt
+            except BaseException:
+                if getattr(conn, "in_transaction", False):
+                    await conn.rollback()
+                raise
+
     async def update_position(
         self,
         symbol: str,
         quantity: int,
-        avg_cost: float,
-        market_price: Optional[float] = None,
+        avg_cost: float | Decimal,
+        market_price: Optional[float | Decimal] = None,
         portfolio_id: str = DEFAULT_PORTFOLIO_ID,
     ) -> None:
         """Update or insert a position asynchronously."""
-        # Validate inputs
+        exact_avg_cost: Optional[Decimal] = None
+        exact_market_price: Optional[Decimal] = None
+        if quantity != 0:
+            try:
+                if type(avg_cost) is Decimal:
+                    exact_avg_cost = avg_cost
+                    _strict_decimal(exact_avg_cost, "avg_cost", positive=True)
+                if type(market_price) is Decimal:
+                    exact_market_price = market_price
+                    _strict_decimal(
+                        exact_market_price,
+                        "market_price",
+                        positive=True,
+                    )
+            except (ArithmeticError, ValidationError) as exc:
+                raise ValidationError("position exact cost basis is invalid") from exc
+
+        # Validate compatibility projections.
         try:
             symbol = DatabaseValidator.validate_symbol(symbol)
             quantity = DatabaseValidator.validate_quantity(quantity, allow_negative=True)
@@ -1346,24 +2119,56 @@ class AsyncTradingDatabase:
             raise
 
         async with self.get_connection() as conn:
-            if quantity == 0:
-                # Close position - delete from database
-                await conn.execute(
-                    "DELETE FROM positions WHERE portfolio_id = ? AND symbol = ?",
-                    (portfolio_id, symbol),
-                )
-                logger.info(f"Closed position for {symbol} (portfolio={portfolio_id})")
-            else:
-                # Update or insert position
-                await conn.execute(
-                    """
-                    INSERT OR REPLACE INTO positions (portfolio_id, symbol, quantity, avg_cost, market_price)
-                    VALUES (?, ?, ?, ?, ?)
-                """,
-                    (portfolio_id, symbol, quantity, avg_cost, market_price),
-                )
+            try:
+                await conn.execute("BEGIN IMMEDIATE")
+                if quantity == 0:
+                    # Close position - delete from database
+                    await conn.execute(
+                        "DELETE FROM positions WHERE portfolio_id = ? AND symbol = ?",
+                        (portfolio_id, symbol),
+                    )
+                    logger.info(f"Closed position for {symbol} (portfolio={portfolio_id})")
+                else:
+                    # Update or insert position and its exact settlement basis.
+                    await conn.execute(
+                        """
+                        INSERT OR REPLACE INTO positions (
+                            portfolio_id, symbol, quantity, avg_cost, market_price
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (portfolio_id, symbol, quantity, avg_cost, market_price),
+                    )
+                    if exact_avg_cost is not None:
+                        await conn.execute(
+                            """
+                            INSERT INTO paper_position_settlement_state (
+                                portfolio_id, symbol, cost_basis_text,
+                                mark_price_text, source_settlement_id, updated_at
+                            ) VALUES (?, ?, ?, ?, NULL, ?)
+                            ON CONFLICT(portfolio_id, symbol) DO UPDATE SET
+                                cost_basis_text = excluded.cost_basis_text,
+                                mark_price_text = excluded.mark_price_text,
+                                source_settlement_id = NULL,
+                                updated_at = excluded.updated_at
+                            """,
+                            (
+                                portfolio_id,
+                                symbol,
+                                decimal_to_fixed(exact_avg_cost),
+                                (
+                                    None
+                                    if exact_market_price is None
+                                    else decimal_to_fixed(exact_market_price)
+                                ),
+                                utc_to_text(datetime.now(timezone.utc)),
+                            ),
+                        )
 
-            await conn.commit()
+                await conn.commit()
+            except BaseException:
+                if getattr(conn, "in_transaction", False):
+                    await conn.rollback()
+                raise
             logger.debug(
                 f"Updated position: {symbol} qty={quantity} avg={avg_cost} (portfolio={portfolio_id})"
             )
@@ -1493,15 +2298,45 @@ class AsyncTradingDatabase:
 
     async def update_account(
         self,
-        cash: float,
-        equity: float,
-        daily_pnl: float = 0.0,
-        realized_pnl: float = 0.0,
-        unrealized_pnl: float = 0.0,
+        cash: float | Decimal,
+        equity: float | Decimal,
+        daily_pnl: float | Decimal = Decimal(0),
+        realized_pnl: float | Decimal = Decimal(0),
+        unrealized_pnl: float | Decimal = Decimal(0),
         portfolio_id: str = DEFAULT_PORTFOLIO_ID,
+        daily_pnl_baseline: Optional[Decimal] = None,
+        daily_pnl_date: Optional[date] = None,
     ) -> None:
         """Update account values asynchronously."""
-        # Validate inputs
+        # Exact shadow state may only be minted by callers that retained true
+        # Decimal values across the producer boundary. Legacy floats update
+        # compatibility projections only and can never become durable trading
+        # authority through Decimal(str(...)) reconstruction.
+        authoritative_exact_input = all(
+            type(value) is Decimal for value in (cash, daily_pnl, realized_pnl, unrealized_pnl)
+        )
+        try:
+            exact_cash = cash if authoritative_exact_input else None
+            exact_realized_pnl = realized_pnl if authoritative_exact_input else None
+            exact_daily_pnl = daily_pnl if authoritative_exact_input else None
+            exact_unrealized_pnl = unrealized_pnl if authoritative_exact_input else None
+            if authoritative_exact_input:
+                _strict_decimal(exact_cash, "cash")
+                _strict_decimal(exact_realized_pnl, "realized_pnl")
+                _strict_decimal(exact_daily_pnl, "daily_pnl")
+                _strict_decimal(exact_unrealized_pnl, "unrealized_pnl")
+            exact_daily_pnl_baseline = (
+                None
+                if daily_pnl_baseline is None
+                else _strict_decimal(daily_pnl_baseline, "daily_pnl_baseline")
+            )
+            if daily_pnl_date is not None and type(daily_pnl_date) is not date:
+                raise ValidationError("daily_pnl_date must be an exact date")
+            exact_daily_pnl_date = daily_pnl_date
+        except (ArithmeticError, ValidationError) as exc:
+            raise ValidationError("account exact values are invalid") from exc
+
+        # Validate compatibility projections.
         try:
             portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
             account_data = {
@@ -1522,15 +2357,138 @@ class AsyncTradingDatabase:
             raise
 
         async with self.get_connection() as conn:
-            await conn.execute(
-                """
-                INSERT OR REPLACE INTO account
-                    (portfolio_id, cash, equity, daily_pnl, realized_pnl, unrealized_pnl, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            """,
-                (portfolio_id, cash, equity, daily_pnl, realized_pnl, unrealized_pnl),
-            )
-            await conn.commit()
+            try:
+                await conn.execute("BEGIN IMMEDIATE")
+                if not authoritative_exact_input:
+                    await conn.execute(
+                        """
+                        INSERT OR REPLACE INTO account
+                            (portfolio_id, cash, equity, daily_pnl, realized_pnl,
+                             unrealized_pnl, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        """,
+                        (
+                            portfolio_id,
+                            cash,
+                            equity,
+                            daily_pnl,
+                            realized_pnl,
+                            unrealized_pnl,
+                        ),
+                    )
+                    await conn.commit()
+                    logger.debug(
+                        "Updated legacy account projection without exact authority "
+                        f"(portfolio={portfolio_id})"
+                    )
+                    return
+                cursor = await conn.execute(
+                    """
+                    SELECT daily_pnl_baseline_text, daily_pnl_date,
+                           source_settlement_id
+                    FROM paper_account_settlement_state
+                    WHERE portfolio_id = ?
+                    """,
+                    (portfolio_id,),
+                )
+                existing_exact_state = await cursor.fetchone()
+                existing_daily_pnl_date = None
+                source_settlement_id = None
+                if exact_daily_pnl_baseline is None:
+                    if existing_exact_state is not None:
+                        (
+                            baseline_text,
+                            existing_daily_pnl_date,
+                            source_settlement_id,
+                        ) = existing_exact_state
+                        if baseline_text is None:
+                            if source_settlement_id is not None:
+                                raise PaperTerminalSettlementError(
+                                    "settled paper account has no exact daily P&L baseline"
+                                )
+                        else:
+                            exact_daily_pnl_baseline = parse_fixed_decimal(
+                                baseline_text,
+                                "daily_pnl_baseline_text",
+                            )
+                    if exact_daily_pnl_baseline is None:
+                        exact_daily_pnl_baseline = (
+                            exact_realized_pnl + exact_unrealized_pnl - exact_daily_pnl
+                        )
+                        _strict_decimal(
+                            exact_daily_pnl_baseline,
+                            "derived daily_pnl_baseline",
+                        )
+                else:
+                    existing_daily_pnl_date = (
+                        None if existing_exact_state is None else existing_exact_state[1]
+                    )
+                    source_settlement_id = (
+                        None if existing_exact_state is None else existing_exact_state[2]
+                    )
+                if exact_daily_pnl_date is None:
+                    if existing_daily_pnl_date is None:
+                        if source_settlement_id is not None:
+                            raise PaperTerminalSettlementError(
+                                "settled paper account has no exact daily P&L date"
+                            )
+                        exact_daily_pnl_date = datetime.now(timezone.utc).date()
+                    else:
+                        try:
+                            exact_daily_pnl_date = date.fromisoformat(existing_daily_pnl_date)
+                        except (TypeError, ValueError) as exc:
+                            raise PaperTerminalSettlementError(
+                                "paper account daily P&L date is malformed"
+                            ) from exc
+                with localcontext() as context:
+                    context.prec = 64
+                    contract_daily_pnl = (
+                        exact_realized_pnl + exact_unrealized_pnl - exact_daily_pnl_baseline
+                    )
+                if contract_daily_pnl != exact_daily_pnl:
+                    raise ValidationError(
+                        "daily_pnl must equal realized plus unrealized less the exact baseline"
+                    )
+                await conn.execute(
+                    """
+                    INSERT OR REPLACE INTO account
+                        (portfolio_id, cash, equity, daily_pnl, realized_pnl,
+                         unrealized_pnl, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (portfolio_id, cash, equity, daily_pnl, realized_pnl, unrealized_pnl),
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO paper_account_settlement_state (
+                        portfolio_id, cash_text, realized_pnl_text, daily_pnl_text,
+                        daily_pnl_baseline_text, daily_pnl_date,
+                        updated_at, source_settlement_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+                    ON CONFLICT(portfolio_id) DO UPDATE SET
+                        cash_text = excluded.cash_text,
+                        realized_pnl_text = excluded.realized_pnl_text,
+                        daily_pnl_text = excluded.daily_pnl_text,
+                        daily_pnl_baseline_text = excluded.daily_pnl_baseline_text,
+                        daily_pnl_date = excluded.daily_pnl_date,
+                        updated_at = excluded.updated_at,
+                        source_settlement_id = paper_account_settlement_state.source_settlement_id
+                    """,
+                    (
+                        portfolio_id,
+                        decimal_to_fixed(exact_cash),
+                        decimal_to_fixed(exact_realized_pnl),
+                        decimal_to_fixed(exact_daily_pnl),
+                        decimal_to_fixed(exact_daily_pnl_baseline),
+                        exact_daily_pnl_date.isoformat(),
+                        utc_to_text(datetime.now(timezone.utc)),
+                    ),
+                )
+                await conn.commit()
+            except BaseException:
+                if getattr(conn, "in_transaction", False):
+                    await conn.rollback()
+                raise
             logger.debug(
                 f"Updated account: cash={cash:.2f} equity={equity:.2f} (portfolio={portfolio_id})"
             )
@@ -1643,19 +2601,38 @@ class AsyncTradingDatabase:
         async with self.get_connection() as conn:
             cursor = await conn.execute(
                 """
-                SELECT symbol, quantity, avg_cost, market_price
-                FROM positions
-                WHERE portfolio_id = ? AND symbol = ? AND quantity != 0
+                SELECT p.symbol, p.quantity, p.avg_cost, p.market_price,
+                       s.mark_price_text, s.source_settlement_id,
+                       settled.settlement_id, settled.portfolio_id, settled.symbol
+                FROM positions AS p
+                LEFT JOIN paper_position_settlement_state AS s
+                  ON s.portfolio_id = p.portfolio_id AND s.symbol = p.symbol
+                LEFT JOIN paper_reduction_settlements AS settled
+                  ON settled.settlement_id = s.source_settlement_id
+                WHERE p.portfolio_id = ? AND p.symbol = ? AND p.quantity != 0
             """,
                 (portfolio_id, symbol),
             )
             row = await cursor.fetchone()
             if row:
+                exact_mark = (
+                    None if row[4] is None else parse_fixed_decimal(row[4], "mark_price_text")
+                )
+                if exact_mark is not None:
+                    _strict_decimal(exact_mark, "position exact mark", positive=True)
+                if row[5] is not None and (
+                    row[6] != row[5] or row[7] != portfolio_id or row[8] != row[0]
+                ):
+                    raise PaperTerminalSettlementError(
+                        "paper position mark settlement lineage cannot be resolved"
+                    )
                 return {
                     "symbol": row[0],
                     "quantity": row[1],
                     "avg_cost": row[2],
                     "market_price": row[3],
+                    "market_price_exact": exact_mark,
+                    "mark_source_settlement_id": row[5],
                 }
             return None
 
@@ -1665,22 +2642,43 @@ class AsyncTradingDatabase:
         async with self.get_connection() as conn:
             cursor = await conn.execute(
                 """
-                SELECT symbol, quantity, avg_cost, market_price
-                FROM positions
-                WHERE portfolio_id = ? AND quantity != 0
+                SELECT p.symbol, p.quantity, p.avg_cost, p.market_price,
+                       s.mark_price_text, s.source_settlement_id,
+                       settled.settlement_id, settled.portfolio_id, settled.symbol
+                FROM positions AS p
+                LEFT JOIN paper_position_settlement_state AS s
+                  ON s.portfolio_id = p.portfolio_id AND s.symbol = p.symbol
+                LEFT JOIN paper_reduction_settlements AS settled
+                  ON settled.settlement_id = s.source_settlement_id
+                WHERE p.portfolio_id = ? AND p.quantity != 0
             """,
                 (portfolio_id,),
             )
             rows = await cursor.fetchall()
-            return [
-                {
-                    "symbol": row[0],
-                    "quantity": row[1],
-                    "avg_cost": row[2],
-                    "market_price": row[3],
-                }
-                for row in rows
-            ]
+            positions = []
+            for row in rows:
+                exact_mark = (
+                    None if row[4] is None else parse_fixed_decimal(row[4], "mark_price_text")
+                )
+                if exact_mark is not None:
+                    _strict_decimal(exact_mark, "position exact mark", positive=True)
+                if row[5] is not None and (
+                    row[6] != row[5] or row[7] != portfolio_id or row[8] != row[0]
+                ):
+                    raise PaperTerminalSettlementError(
+                        "paper position mark settlement lineage cannot be resolved"
+                    )
+                positions.append(
+                    {
+                        "symbol": row[0],
+                        "quantity": row[1],
+                        "avg_cost": row[2],
+                        "market_price": row[3],
+                        "market_price_exact": exact_mark,
+                        "mark_source_settlement_id": row[5],
+                    }
+                )
+            return positions
 
     async def get_all_positions(self) -> List[Dict]:
         """Get all current positions across ALL portfolios."""
@@ -2242,14 +3240,77 @@ class AsyncTradingDatabase:
         async with self.get_connection() as conn:
             cursor = await conn.execute(
                 """
-                SELECT cash, equity, daily_pnl, realized_pnl, unrealized_pnl, timestamp
-                FROM account
-                WHERE portfolio_id = ?
+                SELECT a.cash, a.equity, a.daily_pnl, a.realized_pnl,
+                       a.unrealized_pnl, a.timestamp,
+                       s.cash_text, s.realized_pnl_text, s.daily_pnl_text,
+                       s.daily_pnl_baseline_text, s.source_settlement_id,
+                       s.daily_pnl_date,
+                       settled.settlement_id, settled.portfolio_id
+                FROM account AS a
+                LEFT JOIN paper_account_settlement_state AS s
+                  ON s.portfolio_id = a.portfolio_id
+                LEFT JOIN paper_reduction_settlements AS settled
+                  ON settled.settlement_id = s.source_settlement_id
+                WHERE a.portfolio_id = ?
             """,
                 (portfolio_id,),
             )
             row = await cursor.fetchone()
             if row:
+                exact_values = row[6:10]
+                source_settlement_id = row[10]
+                exact_daily_pnl_date_text = row[11]
+                if any(value is None for value in exact_values):
+                    if not all(value is None for value in exact_values):
+                        raise PaperTerminalSettlementError(
+                            "exact paper account state is partially populated"
+                        )
+                    if source_settlement_id is not None:
+                        raise PaperTerminalSettlementError(
+                            "paper account settlement lineage has no exact state"
+                        )
+                    exact_cash = None
+                    exact_realized_pnl = None
+                    exact_daily_pnl = None
+                    exact_daily_pnl_baseline = None
+                    exact_daily_pnl_date = None
+                else:
+                    try:
+                        exact_cash = parse_fixed_decimal(exact_values[0], "cash_text")
+                        exact_realized_pnl = parse_fixed_decimal(
+                            exact_values[1],
+                            "realized_pnl_text",
+                        )
+                        exact_daily_pnl = parse_fixed_decimal(
+                            exact_values[2],
+                            "daily_pnl_text",
+                        )
+                        exact_daily_pnl_baseline = parse_fixed_decimal(
+                            exact_values[3],
+                            "daily_pnl_baseline_text",
+                        )
+                        try:
+                            exact_daily_pnl_date = date.fromisoformat(exact_daily_pnl_date_text)
+                        except (TypeError, ValueError) as exc:
+                            raise PaperTerminalSettlementError(
+                                "exact paper account daily P&L date is malformed"
+                            ) from exc
+                        if exact_daily_pnl_date.isoformat() != exact_daily_pnl_date_text:
+                            raise PaperTerminalSettlementError(
+                                "exact paper account daily P&L date is not canonical"
+                            )
+                    except ValidationError as exc:
+                        raise PaperTerminalSettlementError(
+                            "exact paper account state is malformed"
+                        ) from exc
+                if source_settlement_id is not None and row[12] != source_settlement_id:
+                    raise PaperTerminalSettlementError(
+                        "paper account settlement lineage cannot be resolved"
+                    )
+                if source_settlement_id is not None and row[13] != portfolio_id:
+                    raise PaperTerminalSettlementError(
+                        "paper account settlement lineage belongs to another portfolio"
+                    )
                 return {
                     "cash": row[0],
                     "equity": row[1],
@@ -2257,6 +3318,12 @@ class AsyncTradingDatabase:
                     "realized_pnl": row[3],
                     "unrealized_pnl": row[4],
                     "timestamp": row[5],
+                    "cash_exact": exact_cash,
+                    "realized_pnl_exact": exact_realized_pnl,
+                    "daily_pnl_exact": exact_daily_pnl,
+                    "daily_pnl_baseline_exact": exact_daily_pnl_baseline,
+                    "daily_pnl_date_exact": exact_daily_pnl_date,
+                    "source_settlement_id": source_settlement_id,
                 }
             return {}
 

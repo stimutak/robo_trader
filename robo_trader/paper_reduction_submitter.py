@@ -8,7 +8,11 @@ cannot make the same authority reusable.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from enum import Enum
+from typing import Optional
 
 from .execution import ExecutionResult, Order, PaperExecutor
 from .runtime_contract_constants import PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
@@ -36,6 +40,159 @@ class PaperReductionSubmissionError(RuntimeError):
     """The sealed paper submission boundary rejected unsafe input or output."""
 
 
+class LocalPaperOutcomeProvenance(str, Enum):
+    """Explicitly distinguishes simulation evidence from broker evidence."""
+
+    LOCAL_PAPER_EXECUTOR = "local-paper-executor-v1"
+
+
+class LocalPaperOrderStatus(str, Enum):
+    """Exact simulator lifecycle status, including unsafe nonterminal states."""
+
+    FILLED = "FILLED"
+    REJECTED = "REJECTED"
+    CANCELLED = "CANCELLED"
+    EXPIRED = "EXPIRED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    SUBMITTED = "SUBMITTED"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True, slots=True)
+class LocalPaperTerminalOutcome:
+    """Immutable exact metadata for one local-paper submission observation.
+
+    The production ``PaperExecutor`` currently emits only full ``FILLED`` or
+    zero-fill ``REJECTED`` outcomes.  Partial and nonterminal variants remain
+    representable so the gateway can identify and quarantine them explicitly
+    during failure injection instead of treating them as an incidental type
+    error.
+    """
+
+    order_ref: str
+    status: LocalPaperOrderStatus
+    requested_quantity: Decimal
+    filled_quantity: Decimal
+    remaining_quantity: Decimal
+    exact_fill_price: Decimal | None
+    observed_at: datetime
+    provenance: LocalPaperOutcomeProvenance
+    terminal: bool
+    message: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.order_ref) is not str
+            or not self.order_ref
+            or self.order_ref != self.order_ref.strip()
+            or len(self.order_ref) > 128
+            or not self.order_ref.isprintable()
+        ):
+            raise PaperReductionSubmissionError("terminal outcome order_ref is malformed")
+        if type(self.status) is not LocalPaperOrderStatus:
+            raise PaperReductionSubmissionError("terminal outcome status is malformed")
+        for name in ("requested_quantity", "filled_quantity", "remaining_quantity"):
+            value = getattr(self, name)
+            if type(value) is not Decimal or not value.is_finite() or value < 0:
+                raise PaperReductionSubmissionError(f"{name} must be an exact non-negative Decimal")
+        if self.requested_quantity <= 0:
+            raise PaperReductionSubmissionError("requested_quantity must be positive")
+        if self.filled_quantity + self.remaining_quantity != self.requested_quantity:
+            raise PaperReductionSubmissionError("terminal quantities do not reconcile")
+        if type(self.terminal) is not bool:
+            raise PaperReductionSubmissionError("terminal must be a bool")
+        if (
+            not isinstance(self.observed_at, datetime)
+            or self.observed_at.tzinfo is None
+            or self.observed_at.utcoffset() is None
+        ):
+            raise PaperReductionSubmissionError("terminal outcome timestamp must be timezone-aware")
+        object.__setattr__(self, "observed_at", self.observed_at.astimezone(timezone.utc))
+        if type(self.provenance) is not LocalPaperOutcomeProvenance:
+            raise PaperReductionSubmissionError("terminal outcome provenance is malformed")
+        if (
+            type(self.message) is not str
+            or not self.message
+            or self.message != self.message.strip()
+            or len(self.message) > 512
+            or not self.message.isprintable()
+        ):
+            raise PaperReductionSubmissionError("terminal outcome message is malformed")
+        if self.status is LocalPaperOrderStatus.FILLED:
+            if self.terminal is not True:
+                raise PaperReductionSubmissionError("FILLED outcome must be terminal")
+            if self.filled_quantity != self.requested_quantity or self.remaining_quantity != 0:
+                raise PaperReductionSubmissionError("FILLED outcome must be a full fill")
+            if (
+                type(self.exact_fill_price) is not Decimal
+                or not self.exact_fill_price.is_finite()
+                or self.exact_fill_price <= 0
+            ):
+                raise PaperReductionSubmissionError(
+                    "FILLED outcome requires an exact positive price"
+                )
+        elif self.status in {
+            LocalPaperOrderStatus.REJECTED,
+            LocalPaperOrderStatus.CANCELLED,
+            LocalPaperOrderStatus.EXPIRED,
+        }:
+            if self.terminal is not True:
+                raise PaperReductionSubmissionError("unfilled terminal outcome must be terminal")
+            if (
+                self.filled_quantity != 0
+                or self.remaining_quantity != self.requested_quantity
+                or self.exact_fill_price is not None
+            ):
+                raise PaperReductionSubmissionError(
+                    "unfilled terminal outcome must not carry a fill"
+                )
+        elif self.status is LocalPaperOrderStatus.PARTIALLY_FILLED:
+            if self.terminal is not False:
+                raise PaperReductionSubmissionError(
+                    "PARTIALLY_FILLED outcome must remain nonterminal"
+                )
+            if not 0 < self.filled_quantity < self.requested_quantity:
+                raise PaperReductionSubmissionError(
+                    "PARTIALLY_FILLED outcome requires an incomplete positive fill"
+                )
+            if (
+                type(self.exact_fill_price) is not Decimal
+                or not self.exact_fill_price.is_finite()
+                or self.exact_fill_price <= 0
+            ):
+                raise PaperReductionSubmissionError(
+                    "PARTIALLY_FILLED outcome requires an exact positive price"
+                )
+        elif self.status in {
+            LocalPaperOrderStatus.SUBMITTED,
+            LocalPaperOrderStatus.UNKNOWN,
+        }:
+            if self.terminal is not False:
+                raise PaperReductionSubmissionError(
+                    "submitted or unknown outcome must remain nonterminal"
+                )
+            if (
+                self.filled_quantity != 0
+                or self.remaining_quantity != self.requested_quantity
+                or self.exact_fill_price is not None
+            ):
+                raise PaperReductionSubmissionError(
+                    "submitted or unknown outcome cannot claim a fill"
+                )
+
+    @property
+    def ok(self) -> bool:
+        """Compatibility for existing callers while settlement is migrated."""
+
+        return self.status is LocalPaperOrderStatus.FILLED and self.terminal is True
+
+    @property
+    def fill_price(self) -> float | None:
+        """Legacy float view; safety code must use ``exact_fill_price``."""
+
+        return float(self.exact_fill_price) if self.exact_fill_price is not None else None
+
+
 class PaperReductionSubmitter:
     """Capability-narrow adapter for exactly one simple paper submission."""
 
@@ -46,7 +203,7 @@ class PaperReductionSubmitter:
         executor: PaperExecutor,
         coordinator: SafetyRuntimeCoordinator,
         *,
-        _token: object | None = None,
+        _token: Optional[object] = None,
     ) -> None:
         if _token is not _BIND_TOKEN:
             raise PaperReductionSubmissionError(
@@ -81,7 +238,7 @@ class PaperReductionSubmitter:
     def _submit_once(
         self,
         envelope: ConsumedPaperSubmissionEnvelope,
-    ) -> ExecutionResult:
+    ) -> LocalPaperTerminalOutcome:
         """Claim and submit one exact coordinator-consumed envelope."""
 
         executor = self.__executor
@@ -109,8 +266,7 @@ class PaperReductionSubmitter:
         # legacy soft gates only after final safety revalidation and durable
         # permit consumption; there is no validation, smart, fallback, or retry.
         result = executor._place_simple_order(order)
-        _validate_execution_result(result)
-        return result
+        return _terminal_outcome(result, safe_descriptor)
 
 
 def _bind_paper_reduction_submitter(
@@ -130,7 +286,10 @@ def _validate_executor_configuration(executor: PaperExecutor) -> None:
         raise PaperReductionSubmissionError("paper slippage is outside safe bounds")
 
 
-def _validate_execution_result(result: object) -> None:
+def _terminal_outcome(
+    result: object,
+    descriptor: SubmissionDescriptor,
+) -> LocalPaperTerminalOutcome:
     if type(result) is not ExecutionResult:
         raise PaperReductionSubmissionError("PaperExecutor returned an unexpected execution result")
     if type(result.ok) is not bool:
@@ -152,8 +311,52 @@ def _validate_execution_result(result: object) -> None:
             raise PaperReductionSubmissionError(
                 "successful execution result requires a finite positive float fill"
             )
+        exact_fill_price = result.exact_fill_price
+        if (
+            type(exact_fill_price) is not Decimal
+            or not exact_fill_price.is_finite()
+            or exact_fill_price <= 0
+            or Decimal(str(result.fill_price)) != exact_fill_price
+        ):
+            raise PaperReductionSubmissionError(
+                "successful execution result requires a matching exact Decimal fill"
+            )
     elif result.fill_price is not None:
         raise PaperReductionSubmissionError("rejected execution result must not carry a fill price")
+    elif result.exact_fill_price is not None:
+        raise PaperReductionSubmissionError(
+            "rejected execution result must not carry an exact fill"
+        )
+
+    requested = descriptor.quantity
+    if type(requested) is not Decimal or not requested.is_finite() or requested <= 0:
+        raise PaperReductionSubmissionError("descriptor quantity is malformed after submission")
+    observed_at = datetime.now(timezone.utc)
+    if result.ok:
+        return LocalPaperTerminalOutcome(
+            order_ref=descriptor.order_ref,
+            status=LocalPaperOrderStatus.FILLED,
+            requested_quantity=requested,
+            filled_quantity=requested,
+            remaining_quantity=Decimal("0"),
+            exact_fill_price=result.exact_fill_price,
+            observed_at=observed_at,
+            provenance=LocalPaperOutcomeProvenance.LOCAL_PAPER_EXECUTOR,
+            terminal=True,
+            message=result.message,
+        )
+    return LocalPaperTerminalOutcome(
+        order_ref=descriptor.order_ref,
+        status=LocalPaperOrderStatus.REJECTED,
+        requested_quantity=requested,
+        filled_quantity=Decimal("0"),
+        remaining_quantity=requested,
+        exact_fill_price=None,
+        observed_at=observed_at,
+        provenance=LocalPaperOutcomeProvenance.LOCAL_PAPER_EXECUTOR,
+        terminal=True,
+        message=result.message,
+    )
 
 
 def _snapshot_descriptor(descriptor: SubmissionDescriptor) -> SubmissionDescriptor:

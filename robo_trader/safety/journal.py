@@ -35,6 +35,7 @@ from .models import (
     GateContext,
     JournalEvent,
     JournalEventType,
+    LocalPaperTerminalEvidence,
     OrderIntent,
     OrderSide,
     OrderType,
@@ -1261,6 +1262,230 @@ class SafetyJournal:
 
     release_reservation = release_after_reconciliation
 
+    def recover_after_verified_local_paper_settlement(
+        self,
+        idempotency_key: str,
+        intent_fingerprint: str,
+        evidence: LocalPaperTerminalEvidence,
+        *,
+        expected_execution_domain_scope: str,
+        expected_account_scope: str,
+    ) -> ReplayReservation:
+        """Release one active reservation from externally verified local evidence.
+
+        This is the narrow offline crash-recovery entry point. It first binds a
+        read-only replay to the configured runtime identity, requires the exact
+        reservation to remain active, and then delegates to the same atomic
+        terminal append used by the producer-owned live path.
+        """
+
+        if type(evidence) is not LocalPaperTerminalEvidence:
+            raise TypeError("evidence must be LocalPaperTerminalEvidence")
+        state = self.replay_and_bind_runtime_path(
+            expected_execution_domain_scope=expected_execution_domain_scope,
+            expected_account_scope=expected_account_scope,
+        )
+        matches = tuple(
+            reservation
+            for reservation in state.active_reservations
+            if reservation.idempotency_key == idempotency_key
+            and reservation.intent_fingerprint == intent_fingerprint
+            and reservation.reservation_id == evidence.reservation_id
+            and reservation.claim_id == evidence.claim_id
+        )
+        if len(matches) != 1:
+            raise StateTransitionError(
+                "offline local settlement does not identify one active reservation"
+            )
+        reservation = matches[0]
+        if (
+            evidence.execution_domain_scope != expected_execution_domain_scope
+            or evidence.account_scope != expected_account_scope
+            or evidence.execution_domain_scope != reservation.execution_domain_scope
+            or evidence.account_scope != reservation.account_scope
+        ):
+            raise StateTransitionError("offline local settlement scope mismatch")
+        if not reservation.outcome_unknown or not reservation.quarantined:
+            raise StateTransitionError(
+                "offline local settlement requires a quarantined unknown outcome"
+            )
+        return self.release_after_local_paper_settlement(
+            idempotency_key,
+            intent_fingerprint,
+            evidence,
+        )
+
+    def release_after_local_paper_settlement(
+        self,
+        idempotency_key: str,
+        intent_fingerprint: str,
+        evidence: LocalPaperTerminalEvidence,
+    ) -> ReplayReservation:
+        """Release one reservation from exact local-paper ledger evidence.
+
+        This path deliberately makes no broker-position or broker-order claim.
+        It proves only that the local simulator's authoritative allocation and
+        terminal outbox were committed atomically for the exact durable claim.
+        """
+
+        key = _strict_text(idempotency_key, "idempotency_key", max_length=128)
+        self._validate_hash(intent_fingerprint, "intent_fingerprint")
+        if type(evidence) is not LocalPaperTerminalEvidence:
+            raise TypeError("evidence must be LocalPaperTerminalEvidence")
+        evidence = replace(evidence)
+
+        def operation(connection: sqlite3.Connection):
+            at = self._event_time()
+            state = self._replay_connection(connection)
+            reservation = self._require_reservation(state, key, intent_fingerprint)
+            if reservation.released:
+                return reservation
+
+            failures = []
+            exact_pairs = (
+                (
+                    evidence.execution_domain_scope,
+                    reservation.execution_domain_scope,
+                    "execution domain",
+                ),
+                (evidence.account_scope, reservation.account_scope, "account"),
+                (evidence.portfolio_id, reservation.portfolio_id, "portfolio"),
+                (evidence.con_id, reservation.con_id, "conId"),
+                (evidence.symbol, reservation.symbol, "symbol metadata"),
+                (evidence.reservation_id, reservation.reservation_id, "reservation"),
+                (evidence.claim_id, reservation.claim_id, "claim"),
+                (evidence.claim_sequence, reservation.claim_sequence, "claim sequence"),
+                (
+                    evidence.submission_descriptor_fingerprint,
+                    reservation.submission_descriptor_fingerprint,
+                    "submission descriptor",
+                ),
+                (evidence.order_ref, reservation.order_ref, "order reference"),
+            )
+            failures.extend(
+                f"{label} mismatch" for actual, expected, label in exact_pairs if actual != expected
+            )
+            if reservation.claim_time is None:
+                failures.append("claim time missing")
+            else:
+                if evidence.committed_at <= reservation.claim_time:
+                    failures.append("local settlement must strictly postdate the claim")
+                if evidence.committed_at > at:
+                    failures.append("local settlement is future-dated")
+
+            signed_full = (
+                reservation.quantity
+                if reservation.side is OrderSide.BUY_TO_COVER
+                else reservation.quantity.copy_negate()
+            )
+            signed_fill = (
+                evidence.filled_quantity
+                if reservation.side is OrderSide.BUY_TO_COVER
+                else (
+                    evidence.filled_quantity
+                    if evidence.filled_quantity.is_zero()
+                    else evidence.filled_quantity.copy_negate()
+                )
+            )
+            try:
+                expected_pre_aggregate = _exact_decimal_subtract(
+                    reservation.target_quantity,
+                    signed_full,
+                    "pre-settlement aggregate",
+                )
+                expected_pre_position = _exact_decimal_subtract(
+                    reservation.portfolio_target_quantity,
+                    signed_full,
+                    "pre-settlement position",
+                )
+                expected_final_aggregate = _exact_decimal_add(
+                    expected_pre_aggregate,
+                    signed_fill,
+                    "final settled aggregate",
+                )
+                expected_final_position = _exact_decimal_add(
+                    expected_pre_position,
+                    signed_fill,
+                    "final settled position",
+                )
+                terminal_quantity = _exact_decimal_add(
+                    evidence.filled_quantity,
+                    evidence.remaining_quantity,
+                    "terminal claimed quantity",
+                )
+            except ValidationError as exc:
+                failures.append(f"local settlement arithmetic invalid: {exc}")
+                expected_pre_aggregate = None
+                expected_pre_position = None
+                expected_final_aggregate = None
+                expected_final_position = None
+                terminal_quantity = None
+
+            if evidence.pre_aggregate_quantity != expected_pre_aggregate:
+                failures.append("settlement pre-aggregate does not match authorization")
+            if evidence.pre_position_quantity != expected_pre_position:
+                failures.append("settlement pre-position does not match authorization")
+            if evidence.final_aggregate_quantity != expected_final_aggregate:
+                failures.append("settlement final aggregate does not match terminal fill")
+            if evidence.final_position_quantity != expected_final_position:
+                failures.append("settlement final position does not match terminal fill")
+            if terminal_quantity != reservation.quantity:
+                failures.append("terminal quantities do not equal claimed quantity")
+            if evidence.terminal_status is TerminalOrderStatus.FILLED and (
+                evidence.filled_quantity != reservation.quantity or evidence.remaining_quantity != 0
+            ):
+                failures.append("filled settlement is not the complete authorized quantity")
+            if evidence.terminal_status in {
+                TerminalOrderStatus.CANCELLED,
+                TerminalOrderStatus.REJECTED,
+                TerminalOrderStatus.EXPIRED,
+                TerminalOrderStatus.NO_SUBMISSION_CONFIRMED,
+            } and (
+                evidence.filled_quantity != 0 or evidence.remaining_quantity != reservation.quantity
+            ):
+                failures.append("unfilled terminal settlement quantities are inconsistent")
+
+            dispatch_time = self._permit_consumed_event_time(state, reservation)
+            if evidence.terminal_status is TerminalOrderStatus.NO_SUBMISSION_CONFIRMED:
+                if dispatch_time is not None:
+                    failures.append("no-submission evidence cannot release dispatched authority")
+            elif dispatch_time is None:
+                failures.append("local terminal outcome lacks durable permit dispatch")
+            elif evidence.committed_at <= dispatch_time:
+                failures.append("local settlement must strictly postdate permit dispatch")
+
+            if failures:
+                raise StateTransitionError("; ".join(failures))
+
+            event = self._append(
+                connection,
+                JournalEventType.TERMINAL_RECONCILED,
+                at,
+                key,
+                reservation.execution_domain_scope,
+                reservation.account_scope,
+                reservation.portfolio_id,
+                reservation.con_id,
+                intent_fingerprint,
+                reservation.claim_id,
+                {
+                    "evidence_kind": "LOCAL_PAPER_TERMINAL_SETTLEMENT",
+                    "evidence": json.loads(evidence.canonical_payload()),
+                    "reservation_id": reservation.reservation_id,
+                },
+            )
+            return replace(
+                reservation,
+                quarantined=False,
+                released=True,
+                terminal_sequence=event.sequence,
+            )
+
+        with self._permit_lock:
+            result = self._write_transaction(operation)
+            self._invalidate_claim_permits_locked(result.claim_id)
+            return result
+
     def replay(
         self,
         *,
@@ -2478,6 +2703,162 @@ class SafetyJournal:
             )
             if not exact:
                 raise JournalIntegrityError("terminal evidence correlation mismatch")
+            if payload.get("evidence_kind") == "LOCAL_PAPER_TERMINAL_SETTLEMENT":
+                if set(payload) != {"evidence_kind", "evidence", "reservation_id"}:
+                    raise JournalIntegrityError(
+                        "local terminal settlement payload fields are invalid"
+                    )
+                try:
+                    local_evidence = LocalPaperTerminalEvidence(
+                        execution_domain_scope=evidence["execution_domain_scope"],
+                        account_scope=evidence["account_scope"],
+                        portfolio_id=evidence["portfolio_id"],
+                        con_id=evidence["con_id"],
+                        symbol=evidence["symbol"],
+                        reservation_id=evidence["reservation_id"],
+                        claim_id=evidence["claim_id"],
+                        claim_sequence=evidence["claim_sequence"],
+                        submission_descriptor_fingerprint=evidence[
+                            "submission_descriptor_fingerprint"
+                        ],
+                        protective_quote_fingerprint=evidence["protective_quote_fingerprint"],
+                        order_ref=evidence["order_ref"],
+                        settlement_id=evidence["settlement_id"],
+                        settlement_request_fingerprint=evidence["settlement_request_fingerprint"],
+                        settlement_receipt_fingerprint=evidence["settlement_receipt_fingerprint"],
+                        database_path=evidence["database_path"],
+                        database_identity=evidence["database_identity"],
+                        database_device=evidence["database_device"],
+                        database_inode=evidence["database_inode"],
+                        committed_at=parse_utc_text(evidence["committed_at"], "committed_at"),
+                        terminal_status=TerminalOrderStatus(evidence["terminal_status"]),
+                        filled_quantity=parse_fixed_decimal(
+                            evidence["filled_quantity"], "filled_quantity"
+                        ),
+                        remaining_quantity=parse_fixed_decimal(
+                            evidence["remaining_quantity"], "remaining_quantity"
+                        ),
+                        pre_position_quantity=parse_fixed_decimal(
+                            evidence["pre_position_quantity"],
+                            "pre_position_quantity",
+                        ),
+                        final_position_quantity=parse_fixed_decimal(
+                            evidence["final_position_quantity"],
+                            "final_position_quantity",
+                        ),
+                        pre_aggregate_quantity=parse_fixed_decimal(
+                            evidence["pre_aggregate_quantity"],
+                            "pre_aggregate_quantity",
+                        ),
+                        final_aggregate_quantity=parse_fixed_decimal(
+                            evidence["final_aggregate_quantity"],
+                            "final_aggregate_quantity",
+                        ),
+                        source=evidence["source"],
+                        schema_version=evidence["schema_version"],
+                    )
+                except (KeyError, TypeError, ValueError, ValidationError) as exc:
+                    raise JournalIntegrityError(
+                        "local terminal settlement evidence is invalid"
+                    ) from exc
+                if json.loads(local_evidence.canonical_payload()) != evidence:
+                    raise JournalIntegrityError(
+                        "local terminal settlement evidence is not canonical"
+                    )
+                committed = local_evidence.committed_at
+                if (
+                    current.claim_time is None
+                    or committed <= current.claim_time
+                    or committed > event.occurred_at
+                ):
+                    raise JournalIntegrityError("local terminal settlement time is invalid")
+                dispatch_time = dispatch_times.get(event.idempotency_key)
+                if local_evidence.terminal_status is TerminalOrderStatus.NO_SUBMISSION_CONFIRMED:
+                    if dispatch_time is not None:
+                        raise JournalIntegrityError(
+                            "no-submission local terminal follows durable dispatch"
+                        )
+                elif dispatch_time is None:
+                    raise JournalIntegrityError(
+                        "local terminal outcome lacks durable permit dispatch"
+                    )
+                elif committed <= dispatch_time:
+                    raise JournalIntegrityError(
+                        "local terminal settlement does not strictly postdate dispatch"
+                    )
+                signed_full = (
+                    current.quantity
+                    if current.side is OrderSide.BUY_TO_COVER
+                    else current.quantity.copy_negate()
+                )
+                filled = local_evidence.filled_quantity
+                signed_fill = (
+                    filled
+                    if current.side is OrderSide.BUY_TO_COVER or filled.is_zero()
+                    else filled.copy_negate()
+                )
+                try:
+                    pre_aggregate = _exact_decimal_subtract(
+                        current.target_quantity,
+                        signed_full,
+                        "pre-settlement aggregate",
+                    )
+                    pre_position = _exact_decimal_subtract(
+                        current.portfolio_target_quantity,
+                        signed_full,
+                        "pre-settlement position",
+                    )
+                    final_aggregate = _exact_decimal_add(
+                        pre_aggregate,
+                        signed_fill,
+                        "final settled aggregate",
+                    )
+                    final_position = _exact_decimal_add(
+                        pre_position,
+                        signed_fill,
+                        "final settled position",
+                    )
+                    terminal_quantity = _exact_decimal_add(
+                        filled,
+                        local_evidence.remaining_quantity,
+                        "terminal claimed quantity",
+                    )
+                except ValidationError as exc:
+                    raise JournalIntegrityError(
+                        "local terminal settlement arithmetic is invalid"
+                    ) from exc
+                if (
+                    local_evidence.pre_aggregate_quantity != pre_aggregate
+                    or local_evidence.pre_position_quantity != pre_position
+                    or local_evidence.final_aggregate_quantity != final_aggregate
+                    or local_evidence.final_position_quantity != final_position
+                    or terminal_quantity != current.quantity
+                ):
+                    raise JournalIntegrityError(
+                        "local terminal settlement does not match exact claimed fill"
+                    )
+                if local_evidence.terminal_status is TerminalOrderStatus.FILLED and (
+                    filled != current.quantity or local_evidence.remaining_quantity != 0
+                ):
+                    raise JournalIntegrityError(
+                        "filled local settlement is not the complete claimed quantity"
+                    )
+                if local_evidence.terminal_status in {
+                    TerminalOrderStatus.CANCELLED,
+                    TerminalOrderStatus.REJECTED,
+                    TerminalOrderStatus.EXPIRED,
+                    TerminalOrderStatus.NO_SUBMISSION_CONFIRMED,
+                } and (filled != 0 or local_evidence.remaining_quantity != current.quantity):
+                    raise JournalIntegrityError(
+                        "unfilled local terminal quantities are inconsistent"
+                    )
+                reservations[event.idempotency_key] = replace(
+                    current,
+                    quarantined=False,
+                    released=True,
+                    terminal_sequence=event.sequence,
+                )
+                return
             observed = parse_utc_text(evidence.get("observed_at"), "observed_at")
             position_observed = parse_utc_text(
                 evidence.get("position_observed_at"), "position_observed_at"
@@ -2790,11 +3171,21 @@ class SafetyJournal:
                 continue
             if event.account_scope != intent.account_scope or event.con_id != intent.con_id:
                 continue
-            evidence = json.loads(event.payload_json)["evidence"]
-            terminal_position_time = parse_utc_text(
-                evidence["position_observed_at"], "position_observed_at"
-            )
-            terminal_order_time = parse_utc_text(evidence["observed_at"], "observed_at")
+            terminal_payload = json.loads(event.payload_json)
+            evidence = terminal_payload["evidence"]
+            if terminal_payload.get("evidence_kind") == "LOCAL_PAPER_TERMINAL_SETTLEMENT":
+                # Local simulator settlement has one atomic commit timestamp;
+                # it does not claim broker position/open-order observation.
+                terminal_position_time = parse_utc_text(
+                    evidence["committed_at"],
+                    "committed_at",
+                )
+                terminal_order_time = terminal_position_time
+            else:
+                terminal_position_time = parse_utc_text(
+                    evidence["position_observed_at"], "position_observed_at"
+                )
+                terminal_order_time = parse_utc_text(evidence["observed_at"], "observed_at")
             return (
                 exposure.observed_at <= terminal_position_time
                 or allocation.observed_at <= terminal_position_time

@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, Inexact, InvalidOperation, Rounded, localcontext
 from enum import Enum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Optional, Tuple
 
@@ -28,6 +29,7 @@ _BROKER_ACCOUNT_RE = re.compile(r"(?i)(?:DU|DF|U|F)\d{4,}")
 _SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
 _SCOPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 _OPAQUE_ACCOUNT_SCOPE_RE = re.compile(r"^acct_v1_[0-9a-f]{64}$")
+_DATABASE_IDENTITY_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}:[0-9a-f]{12}$")
 
 
 class ValidationError(ValueError):
@@ -129,6 +131,22 @@ def _strict_text(
         raise ValidationError(f"{field} must be opaque, not a numeric account identifier")
     if pattern is not None and not pattern.fullmatch(value):
         raise ValidationError(f"{field} has an invalid format")
+    return value
+
+
+def _strict_database_identity(value: object) -> str:
+    """Validate the runtime contract's opaque path-hash identity.
+
+    The final component is hexadecimal, so a legitimate digest can contain a
+    substring such as ``f12345`` that resembles an IBKR account.  Validate the
+    complete producer-owned format instead of applying the free-text secret
+    scanner to an already-opaque digest.
+    """
+
+    if not isinstance(value, str):
+        raise ValidationError("database_identity must be a string")
+    if not _DATABASE_IDENTITY_RE.fullmatch(value):
+        raise ValidationError("database_identity must be an opaque path-hash identity")
     return value
 
 
@@ -720,6 +738,144 @@ class ReconciliationEvidence:
                 "symbol": self.symbol,
                 "terminal_order_status": self.terminal_order_status,
                 "transport_state": self.transport_state,
+            }
+        )
+
+
+@dataclass(frozen=True)
+class LocalPaperTerminalEvidence:
+    """Exact durable local-ledger evidence; never broker reconciliation truth."""
+
+    execution_domain_scope: str
+    account_scope: str
+    portfolio_id: str
+    con_id: int
+    symbol: str
+    reservation_id: str
+    claim_id: str
+    claim_sequence: int
+    submission_descriptor_fingerprint: str
+    protective_quote_fingerprint: str
+    order_ref: str
+    settlement_id: str
+    settlement_request_fingerprint: str
+    settlement_receipt_fingerprint: str
+    database_path: str
+    database_identity: str
+    database_device: int
+    database_inode: int
+    committed_at: datetime
+    terminal_status: TerminalOrderStatus
+    filled_quantity: Decimal
+    remaining_quantity: Decimal
+    pre_position_quantity: Decimal
+    final_position_quantity: Decimal
+    pre_aggregate_quantity: Decimal
+    final_aggregate_quantity: Decimal
+    source: str
+    schema_version: int = MODEL_VERSION
+
+    def __post_init__(self) -> None:
+        _strict_version(self.schema_version)
+        _strict_text(self.execution_domain_scope, "execution_domain_scope", pattern=_SCOPE_RE)
+        _strict_account_scope(self.account_scope)
+        _strict_text(self.portfolio_id, "portfolio_id", pattern=_SCOPE_RE)
+        _strict_positive_int(self.con_id, "con_id")
+        _strict_text(self.symbol, "symbol", max_length=32, pattern=_SYMBOL_RE)
+        _strict_internal_id(self.reservation_id, "reservation_id", "res")
+        _strict_internal_id(self.claim_id, "claim_id", "claim")
+        _strict_positive_int(self.claim_sequence, "claim_sequence")
+        _strict_hash(
+            self.submission_descriptor_fingerprint,
+            "submission_descriptor_fingerprint",
+        )
+        _strict_hash(self.protective_quote_fingerprint, "protective_quote_fingerprint")
+        _strict_text(self.order_ref, "order_ref", max_length=128)
+        if not isinstance(self.settlement_id, str) or not re.fullmatch(
+            r"pset-[0-9a-f]{32}", self.settlement_id
+        ):
+            raise ValidationError("settlement_id must be an opaque paper-settlement identifier")
+        _strict_hash(self.settlement_request_fingerprint, "settlement_request_fingerprint")
+        _strict_hash(self.settlement_receipt_fingerprint, "settlement_receipt_fingerprint")
+        path = Path(self.database_path)
+        if (
+            not path.is_absolute()
+            or str(path) != self.database_path
+            or path.parent.resolve(strict=False) / path.name != path
+        ):
+            raise ValidationError("database_path must be absolute and preserve its lexical leaf")
+        _strict_database_identity(self.database_identity)
+        for field_name in ("database_device", "database_inode"):
+            value = getattr(self, field_name)
+            if type(value) is not int or value < 0:
+                raise ValidationError(f"{field_name} must be a nonnegative integer")
+        object.__setattr__(
+            self,
+            "committed_at",
+            _strict_utc(self.committed_at, "committed_at"),
+        )
+        _strict_enum(self.terminal_status, TerminalOrderStatus, "terminal_status")
+        for field_name in (
+            "filled_quantity",
+            "remaining_quantity",
+            "pre_position_quantity",
+            "final_position_quantity",
+            "pre_aggregate_quantity",
+            "final_aggregate_quantity",
+        ):
+            value = _strict_decimal(getattr(self, field_name), field_name)
+            if value != value.to_integral_value():
+                raise ValidationError(f"{field_name} must be an integral share quantity")
+        if self.filled_quantity < 0 or self.remaining_quantity < 0:
+            raise ValidationError("terminal fill quantities must be nonnegative")
+        if self.terminal_status is TerminalOrderStatus.FILLED:
+            if self.filled_quantity <= 0 or self.remaining_quantity != 0:
+                raise ValidationError("FILLED local evidence must describe a complete fill")
+        elif (
+            self.terminal_status
+            in {
+                TerminalOrderStatus.CANCELLED,
+                TerminalOrderStatus.REJECTED,
+                TerminalOrderStatus.EXPIRED,
+                TerminalOrderStatus.NO_SUBMISSION_CONFIRMED,
+            }
+            and self.filled_quantity != 0
+        ):
+            raise ValidationError("unfilled local terminal status cannot contain a fill")
+        if self.source != "LOCAL_PAPER_SETTLEMENT_LEDGER":
+            raise ValidationError("local paper terminal evidence has an untrusted source")
+
+    def canonical_payload(self) -> str:
+        return canonical_json(
+            {
+                "account_scope": self.account_scope,
+                "claim_id": self.claim_id,
+                "claim_sequence": self.claim_sequence,
+                "committed_at": self.committed_at,
+                "con_id": self.con_id,
+                "database_device": self.database_device,
+                "database_identity": self.database_identity,
+                "database_inode": self.database_inode,
+                "database_path": self.database_path,
+                "execution_domain_scope": self.execution_domain_scope,
+                "filled_quantity": self.filled_quantity,
+                "final_aggregate_quantity": self.final_aggregate_quantity,
+                "final_position_quantity": self.final_position_quantity,
+                "order_ref": self.order_ref,
+                "portfolio_id": self.portfolio_id,
+                "pre_aggregate_quantity": self.pre_aggregate_quantity,
+                "pre_position_quantity": self.pre_position_quantity,
+                "protective_quote_fingerprint": self.protective_quote_fingerprint,
+                "remaining_quantity": self.remaining_quantity,
+                "reservation_id": self.reservation_id,
+                "schema_version": self.schema_version,
+                "settlement_id": self.settlement_id,
+                "settlement_receipt_fingerprint": self.settlement_receipt_fingerprint,
+                "settlement_request_fingerprint": self.settlement_request_fingerprint,
+                "source": self.source,
+                "submission_descriptor_fingerprint": (self.submission_descriptor_fingerprint),
+                "symbol": self.symbol,
+                "terminal_status": self.terminal_status,
             }
         )
 

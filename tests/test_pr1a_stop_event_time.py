@@ -9,7 +9,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from robo_trader.execution import ExecutionResult
+from robo_trader.paper_reduction_submitter import (
+    LocalPaperOrderStatus,
+    LocalPaperOutcomeProvenance,
+    LocalPaperTerminalOutcome,
+)
 from robo_trader.risk_manager import Position
 from robo_trader.runner_async import AsyncRunner
 from robo_trader.stop_loss_monitor import StopLossMonitor, StopStatus, StopType
@@ -20,6 +24,22 @@ def _monitor() -> StopLossMonitor:
         execute_reduction=AsyncMock(),
         risk_manager=MagicMock(),
         portfolio_id="default",
+    )
+
+
+def _filled_terminal_outcome(order, fill_price: float) -> LocalPaperTerminalOutcome:
+    quantity = Decimal(order.quantity)
+    return LocalPaperTerminalOutcome(
+        order_ref=order.order_ref,
+        status=LocalPaperOrderStatus.FILLED,
+        requested_quantity=quantity,
+        filled_quantity=quantity,
+        remaining_quantity=Decimal("0"),
+        exact_fill_price=Decimal(str(fill_price)),
+        observed_at=datetime.now(timezone.utc),
+        provenance=LocalPaperOutcomeProvenance.LOCAL_PAPER_EXECUTOR,
+        terminal=True,
+        message="exact local paper fill",
     )
 
 
@@ -212,10 +232,8 @@ async def test_burst_crossing_is_latched_for_fixed_and_trailing_long_and_short(
     newer_recovery,
 ) -> None:
     monitor = _monitor()
-    monitor._execute_reduction.return_value = ExecutionResult(
-        True,
-        "filled",
-        fill_price=trigger_price,
+    monitor._execute_reduction.side_effect = lambda _stop, order: _filled_terminal_outcome(
+        order, trigger_price
     )
     position = Position(symbol="AAPL", quantity=quantity, avg_price=Decimal("100"))
     stop = await monitor.add_stop_loss(
@@ -467,7 +485,7 @@ async def test_fresh_historical_close_is_never_rewarmed_as_live_protection(caplo
 
 
 @pytest.mark.asyncio
-async def test_fresh_live_protective_event_can_rewarm_stop_monitor() -> None:
+async def test_cached_live_label_cannot_manufacture_post_reconnect_quote_lineage() -> None:
     monitor = _monitor()
     position = Position(symbol="AAPL", quantity=10, avg_price=Decimal("100"))
     await monitor.add_stop_loss("AAPL", position, stop_percent=0.02)
@@ -480,6 +498,6 @@ async def test_fresh_live_protective_event_can_rewarm_stop_monitor() -> None:
     runner.latest_price_times = {"AAPL": now - timedelta(seconds=1)}
     runner.latest_price_sources = {"AAPL": "live_protective"}
 
-    await runner._rewarm_stop_loss_prices_after_recovery()
+    assert await runner._rewarm_stop_loss_prices_after_recovery() is False
 
-    assert monitor.last_prices == {"AAPL": 99.0}
+    assert monitor.last_prices == {}

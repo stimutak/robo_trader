@@ -7,6 +7,7 @@ automated kill switches, and comprehensive risk monitoring.
 
 import asyncio
 import json
+import math
 import os
 import warnings
 from collections import deque
@@ -311,6 +312,7 @@ class KillSwitch:
         # Position tracking
         self.position_pnl: Dict[str, float] = {}
         self.position_entry: Dict[str, Tuple[float, datetime]] = {}
+        self.position_quantity: Dict[str, int] = {}
 
         # Persistence (TC-M5): allow caller to specify a path to persist
         # triggered state across restarts. Default path lives under data/.
@@ -432,11 +434,9 @@ class KillSwitch:
             return True  # Fail safe
 
         # Side-aware loss calculation (TC-L2): for short positions, a price
-        # increase is the loss direction.
-        pos = self.positions.get(symbol) if hasattr(self, "positions") else None
-        quantity = 0
-        if isinstance(pos, dict):
-            quantity = int(pos.get("quantity", 0) or 0)
+        # increase is the loss direction.  Quantity is mirrored explicitly by
+        # AdvancedRiskManager so restart-seeded shorts retain their direction.
+        quantity = self.position_quantity.get(symbol, 0)
         side_sign = 1 if quantity >= 0 else -1
         loss_pct = ((entry_price - current_price) / entry_price) * side_sign
 
@@ -829,69 +829,168 @@ class AdvancedRiskManager:
                 # Reduce position size to meet risk limit
                 position_size = int(max_risk / risk_per_share)
                 position_value = position_size * current_price
-                result["warnings"].append(f"Position reduced to meet risk limit")
+                result["warnings"].append("Position reduced to meet risk limit")
 
         result["position_size"] = position_size
         result["position_value"] = position_value
 
         return result
 
-    def update_position(self, symbol: str, quantity: int, price: float, side: str) -> None:
-        """Update position tracking."""
-        if side.upper() in ["BUY", "BUY_TO_COVER"]:
-            if symbol in self.positions:
-                # Update existing position
-                pos = self.positions[symbol]
-                total_qty = pos["quantity"] + quantity
-                if total_qty != 0:
-                    new_avg = (pos["avg_price"] * pos["quantity"] + price * quantity) / total_qty
-                    self.positions[symbol] = {
-                        "quantity": total_qty,
-                        "avg_price": new_avg,
-                        "value": total_qty * price,
-                        "entry_time": pos.get("entry_time", get_market_time()),
-                    }
-                else:
-                    del self.positions[symbol]
+    @staticmethod
+    def _validated_position_inputs(
+        symbol: str,
+        quantity: int,
+        price: float,
+    ) -> Tuple[str, int, float]:
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise ValueError("advanced-risk position symbol must be non-empty")
+        if type(quantity) is not int or quantity <= 0:
+            raise ValueError("advanced-risk fill quantity must be a positive integer")
+        if (
+            not isinstance(price, (int, float))
+            or isinstance(price, bool)
+            or not math.isfinite(float(price))
+            or float(price) <= 0
+        ):
+            raise ValueError("advanced-risk fill price must be finite and positive")
+        return symbol.strip(), quantity, float(price)
+
+    def _set_position(
+        self,
+        symbol: str,
+        quantity: int,
+        avg_price: float,
+        market_price: float,
+        entry_time: datetime,
+    ) -> None:
+        """Install one signed position and mirror its kill-switch direction."""
+
+        self.positions[symbol] = {
+            "quantity": quantity,
+            "avg_price": avg_price,
+            "value": quantity * market_price,
+            "entry_time": entry_time,
+        }
+        if self.kill_switch:
+            self.kill_switch.position_entry[symbol] = (avg_price, entry_time)
+            self.kill_switch.position_quantity[symbol] = quantity
+
+    def _remove_position(self, symbol: str) -> None:
+        self.positions.pop(symbol, None)
+        if self.kill_switch:
+            self.kill_switch.position_entry.pop(symbol, None)
+            self.kill_switch.position_quantity.pop(symbol, None)
+
+    def seed_position(
+        self,
+        symbol: str,
+        signed_quantity: int,
+        avg_price: float,
+        *,
+        entry_time: Optional[datetime] = None,
+    ) -> None:
+        """Seed one authoritative preexisting position without recording a fill."""
+
+        if type(signed_quantity) is not int or signed_quantity == 0:
+            raise ValueError("advanced-risk seeded quantity must be a non-zero integer")
+        symbol, _, price = self._validated_position_inputs(
+            symbol,
+            abs(signed_quantity),
+            avg_price,
+        )
+        seeded_at = entry_time if isinstance(entry_time, datetime) else get_market_time()
+        self._set_position(symbol, signed_quantity, price, price, seeded_at)
+
+    def reset_positions_for_authoritative_seed(self) -> None:
+        """Discard only derived position views before an authoritative DB seed."""
+
+        self.positions.clear()
+        if self.kill_switch:
+            self.kill_switch.position_entry.clear()
+            self.kill_switch.position_quantity.clear()
+
+    def seed_realized_pnl(self, *, total_pnl: float, daily_pnl: float) -> None:
+        """Seed the inherently-float risk ledger from authoritative account state."""
+
+        values = (float(total_pnl), float(daily_pnl))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("advanced-risk seeded P&L must be finite")
+        self.total_pnl, self.daily_pnl = values
+
+    def _record_realized_pnl(self, symbol: str, pnl: float, avg_price: float) -> None:
+        self.daily_pnl += pnl
+        self.total_pnl += pnl
+        if self.kelly_sizer:
+            self.kelly_sizer.add_trade(symbol, pnl, avg_price)
+        if self.kill_switch:
+            self.kill_switch.check_consecutive_losses(pnl)
+
+    def update_position(self, symbol: str, quantity: int, price: float, side: str) -> float:
+        """Apply one fill using signed long/short accounting; return realized P&L."""
+
+        symbol, quantity, price = self._validated_position_inputs(symbol, quantity, price)
+        normalized_side = str(side).upper()
+        if normalized_side not in {"BUY", "SELL", "SELL_SHORT", "BUY_TO_COVER"}:
+            raise ValueError(f"unsupported advanced-risk position side: {side}")
+
+        pos = self.positions.get(symbol)
+        current_quantity = 0 if pos is None else int(pos["quantity"])
+        current_avg = 0.0 if pos is None else float(pos["avg_price"])
+        entry_time = get_market_time() if pos is None else pos.get("entry_time", get_market_time())
+        realized_pnl = 0.0
+
+        if normalized_side == "BUY":
+            if current_quantity < 0:
+                raise ValueError("BUY cannot increase or cover an advanced-risk short position")
+            new_quantity = current_quantity + quantity
+            new_avg = (
+                price
+                if current_quantity == 0
+                else (current_avg * current_quantity + price * quantity) / new_quantity
+            )
+            self._set_position(symbol, new_quantity, new_avg, price, entry_time)
+
+        elif normalized_side == "SELL_SHORT":
+            if current_quantity > 0:
+                raise ValueError("SELL_SHORT cannot reduce an advanced-risk long position")
+            prior_short = abs(current_quantity)
+            new_short = prior_short + quantity
+            new_avg = (
+                price
+                if prior_short == 0
+                else (current_avg * prior_short + price * quantity) / new_short
+            )
+            self._set_position(symbol, -new_short, new_avg, price, entry_time)
+
+        elif normalized_side == "SELL":
+            if current_quantity <= 0 or quantity > current_quantity:
+                raise ValueError(
+                    "SELL must reduce, but not reverse, an advanced-risk long position"
+                )
+            realized_pnl = (price - current_avg) * quantity
+            remaining = current_quantity - quantity
+            if remaining:
+                self._set_position(symbol, remaining, current_avg, price, entry_time)
             else:
-                # New position
-                self.positions[symbol] = {
-                    "quantity": quantity,
-                    "avg_price": price,
-                    "value": quantity * price,
-                    "entry_time": get_market_time(),
-                }
+                self._remove_position(symbol)
+            self._record_realized_pnl(symbol, realized_pnl, current_avg)
 
-                # Track for kill switch
-                if self.kill_switch:
-                    self.kill_switch.position_entry[symbol] = (price, get_market_time())
+        else:  # BUY_TO_COVER
+            short_quantity = abs(current_quantity)
+            if current_quantity >= 0 or quantity > short_quantity:
+                raise ValueError(
+                    "BUY_TO_COVER must reduce, but not reverse, an advanced-risk short position"
+                )
+            realized_pnl = (current_avg - price) * quantity
+            remaining = current_quantity + quantity
+            if remaining:
+                # A cover never changes the cost basis of the remaining short.
+                self._set_position(symbol, remaining, current_avg, price, entry_time)
+            else:
+                self._remove_position(symbol)
+            self._record_realized_pnl(symbol, realized_pnl, current_avg)
 
-        elif side.upper() in ["SELL", "SELL_SHORT"]:
-            if symbol in self.positions:
-                pos = self.positions[symbol]
-
-                # Calculate PnL
-                pnl = (price - pos["avg_price"]) * min(quantity, pos["quantity"])
-                self.daily_pnl += pnl
-                self.total_pnl += pnl
-
-                # Update Kelly sizer with trade result
-                if self.kelly_sizer:
-                    self.kelly_sizer.add_trade(symbol, pnl, pos["avg_price"])
-
-                # Check kill switch conditions
-                if self.kill_switch:
-                    self.kill_switch.check_consecutive_losses(pnl)
-
-                # Update or remove position
-                remaining = pos["quantity"] - quantity
-                if remaining > 0:
-                    self.positions[symbol]["quantity"] = remaining
-                    self.positions[symbol]["value"] = remaining * price
-                else:
-                    del self.positions[symbol]
-                    if self.kill_switch and symbol in self.kill_switch.position_entry:
-                        del self.kill_switch.position_entry[symbol]
+        return realized_pnl
 
     def update_market_prices(self, prices: Dict[str, float]) -> None:
         """Update positions with current market prices."""
