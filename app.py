@@ -29,6 +29,11 @@ from flask_cors import CORS
 
 load_dotenv()
 
+from robo_trader.websocket_config import (  # noqa: E402
+    get_websocket_port,
+    should_start_websocket_server,
+)
+
 # Multi-process logging fix: the dashboard and the trading runner both emit logs,
 # but logging.handlers.RotatingFileHandler is NOT multi-process safe. Two writers
 # on one file race on rotation — the loser strands its fd on the renamed inode
@@ -4252,7 +4257,8 @@ HTML_TEMPLATE = """
             // The token is injected by the index() view from the env var; it
             // is visible only to authenticated dashboard users.
             var wsAuthToken = {{ ws_auth_token | tojson }};
-            var wsUrl = 'ws://' + window.location.hostname + ':8765';
+            var wsScheme = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+            var wsUrl = wsScheme + window.location.hostname + ':{{ websocket_port }}';
             if (wsAuthToken) {
                 wsUrl += '?token=' + encodeURIComponent(wsAuthToken);
             }
@@ -4947,6 +4953,7 @@ def index():
     return render_template_string(
         HTML_TEMPLATE,
         ws_auth_token=os.getenv("WS_AUTH_TOKEN", "").strip(),
+        websocket_port=get_websocket_port(),
         runtime_identity=runtime_contract.public_dict(),
     )
 
@@ -8160,14 +8167,6 @@ if __name__ == "__main__":
     # Initialize components
     logger.info("Starting RoboTrader Dashboard...")
 
-    # Start WebSocket server for real-time log streaming
-    from robo_trader.websocket_server import ws_manager
-
-    logger.info("Starting WebSocket server...")
-    ws_manager.start()
-
-    logger.info(f"Dashboard starting on port {os.getenv('DASH_PORT', 5555)}")
-
     # A-1 (branch audit, CRITICAL): the Werkzeug debugger is unauth RCE-as-
     # a-feature, gated only by a guessable PIN. The previous guard refused to
     # start on a non-loopback host but still enabled debug=True on loopback.
@@ -8184,6 +8183,19 @@ if __name__ == "__main__":
             "Refusing to start: FLASK_ENV=development with DASH_HOST=%r is "
             "ambiguous. Set DASH_HOST=127.0.0.1 or unset FLASK_ENV." % _dash_host
         )
+
+    # Start WebSocket server for real-time log streaming. When Werkzeug's
+    # development reloader is active, only its serving child may own the
+    # listener; the supervisory parent deliberately skips this bind.
+    if should_start_websocket_server(use_reloader=_dev_reload):
+        from robo_trader.websocket_server import ws_manager
+
+        logger.info("Starting WebSocket server...")
+        ws_manager.start()
+    else:
+        logger.info("WebSocket bind deferred to Werkzeug reloader child")
+
+    logger.info(f"Dashboard starting on port {os.getenv('DASH_PORT', 5555)}")
 
     # Run Flask app
     # W-H1: bind to loopback by default. Set DASH_HOST=0.0.0.0 to expose on LAN

@@ -17,6 +17,7 @@ import websockets
 from websockets.server import WebSocketServerProtocol
 
 from robo_trader.logger import get_logger
+from robo_trader.websocket_config import get_websocket_port
 
 logger = get_logger(__name__)
 
@@ -141,9 +142,9 @@ class WebSocketManager:
     """Manages WebSocket connections and broadcasts updates."""
 
     # W-H3: bind to loopback by default; override with WS_HOST env var.
-    def __init__(self, host: Optional[str] = None, port: int = 8765):
+    def __init__(self, host: Optional[str] = None, port: Optional[int] = None):
         self.host = host if host is not None else os.getenv("WS_HOST", "127.0.0.1")
-        self.port = port
+        self.port = get_websocket_port() if port is None else port
         self.clients: Set[WebSocketServerProtocol] = set()
         # Producer connections (the runner) are tagged on handshake via the
         # X-WS-Role: producer header. Inbound messages from producers are
@@ -155,6 +156,8 @@ class WebSocketManager:
         self.server = None
         self.loop = None
         self.thread = None
+        self._startup_event = threading.Event()
+        self._startup_error: Optional[BaseException] = None
         # W-M1: optional shared secret for authenticating WS clients via ?token=...
         self.auth_token = os.getenv("WS_AUTH_TOKEN", "")
 
@@ -392,6 +395,8 @@ class WebSocketManager:
 
         # Create server and queue processor tasks
         server = await websockets.serve(self.handle_client, self.host, self.port)
+        self.server = server
+        self._startup_event.set()
 
         # Run both server and queue processor
         await asyncio.gather(server.wait_closed(), self.process_queue())
@@ -404,16 +409,39 @@ class WebSocketManager:
         try:
             self.loop.run_until_complete(self.start_server())
         except Exception as e:
-            logger.error(f"WebSocket server error: {e}")
+            self._startup_error = e
+            self._startup_event.set()
+            logger.exception("WebSocket server failed")
         finally:
+            self._startup_event.set()
             self.loop.close()
 
-    def start(self):
-        """Start the WebSocket server in a background thread."""
+    def start(self, timeout: float = 5.0):
+        """Start the server and fail synchronously if the socket cannot bind."""
         if self.thread is None or not self.thread.is_alive():
+            self._startup_event.clear()
+            self._startup_error = None
+            self.server = None
             self.thread = threading.Thread(target=self.run_in_thread, daemon=True)
             self.thread.start()
-            logger.info("WebSocket server thread started")
+            if not self._startup_event.wait(timeout):
+                raise RuntimeError(
+                    f"WebSocket server did not bind {self.host}:{self.port} "
+                    f"within {timeout:.1f}s"
+                )
+            if self._startup_error is not None:
+                raise RuntimeError(
+                    f"WebSocket server could not bind {self.host}:{self.port}"
+                ) from self._startup_error
+            if self.server is None:
+                raise RuntimeError(
+                    f"WebSocket server exited before binding {self.host}:{self.port}"
+                )
+            logger.info(
+                "WebSocket server thread started",
+                websocket_host=self.host,
+                websocket_port=self.port,
+            )
 
     def stop(self):
         """Stop the WebSocket server."""
@@ -562,7 +590,7 @@ if __name__ == "__main__":
 
     signal.signal(signal.SIGINT, signal_handler)
 
-    print(f"Starting WebSocket server on ws://localhost:8765")
+    print(f"Starting WebSocket server on ws://localhost:{ws_manager.port}")
     print("Press Ctrl+C to stop")
 
     # Run the server
