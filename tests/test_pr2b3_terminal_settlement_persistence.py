@@ -192,6 +192,32 @@ def _request(*, outcome_at: datetime) -> PaperTerminalSettlementRequest:
     )
 
 
+def test_protective_quote_timestamp_accepts_canonical_z_utc_text() -> None:
+    request = _request(outcome_at=datetime.now(timezone.utc))
+    payload = json.loads(request.protective_quote_payload)
+    payload["source_timestamp"] = "2026-07-25T12:00:00.000000Z"
+    payload_json = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    with_z_timestamp = replace(
+        request,
+        protective_quote_payload=payload_json,
+        protective_quote_fingerprint=hashlib.sha256(payload_json.encode()).hexdigest(),
+    )
+
+    assert with_z_timestamp.protective_mark_timestamp == datetime(
+        2026,
+        7,
+        25,
+        12,
+        tzinfo=timezone.utc,
+    )
+
+
 @pytest.mark.asyncio
 async def test_existing_exact_state_without_daily_pnl_is_not_backfilled(tmp_path: Path):
     """Schema upgrade preserves old values and fails closed on missing daily truth."""

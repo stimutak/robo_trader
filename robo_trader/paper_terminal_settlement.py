@@ -15,7 +15,7 @@ import re
 import threading
 import weakref
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -77,6 +77,27 @@ def _exact_decimal_multiply(left: Decimal, right: Decimal, field_name: str) -> D
         context.prec = 64
         product = left * right
     return _strict_decimal(product, field_name)
+
+
+def _parse_protective_quote_timestamp(value: object) -> datetime:
+    """Parse the two UTC spellings used by canonical quote evidence.
+
+    Python 3.10's ``datetime.fromisoformat`` does not accept the trailing ``Z``
+    form that the durable safety journal uses, while Python 3.11+ does. Normalize
+    only that suffix and continue to reject naive and non-UTC timestamps.
+    """
+
+    if type(value) is not str or not value:
+        raise ValueError("protective quote timestamp must be text")
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    parsed = datetime.fromisoformat(normalized)
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() is None
+        or parsed.utcoffset().total_seconds() != 0
+    ):
+        raise ValueError("protective quote timestamp must be UTC")
+    return parsed.astimezone(timezone.utc)
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,7 +370,7 @@ class PaperTerminalSettlementRequest:
         try:
             quote_price = Decimal(quote_payload["price"])
             receipt_monotonic = float.fromhex(quote_payload["receipt_monotonic"])
-            source_timestamp = datetime.fromisoformat(quote_payload["source_timestamp"])
+            source_timestamp = _parse_protective_quote_timestamp(quote_payload["source_timestamp"])
         except (TypeError, ValueError, ArithmeticError) as exc:
             raise ValidationError("protective quote payload values are malformed") from exc
         _strict_decimal(quote_price, "protective quote price", positive=True)
@@ -522,10 +543,10 @@ class PaperTerminalSettlementRequest:
         """Return the authenticated broker-event timestamp for the mark."""
 
         payload = json.loads(self.protective_quote_payload)
-        return _strict_utc(
-            datetime.fromisoformat(payload["source_timestamp"]),
-            "protective quote timestamp",
-        )
+        try:
+            return _parse_protective_quote_timestamp(payload["source_timestamp"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValidationError("protective quote timestamp is malformed") from exc
 
     @classmethod
     def from_canonical_payload(cls, payload_json: str) -> "PaperTerminalSettlementRequest":
