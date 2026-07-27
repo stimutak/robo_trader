@@ -14,7 +14,7 @@ from typing import Any, Dict, Optional
 import websockets
 
 from robo_trader.logger import get_logger
-from robo_trader.websocket_config import get_websocket_client_uri
+from robo_trader.websocket_config import get_websocket_client_uri, validate_websocket_uri
 
 logger = get_logger(__name__)
 
@@ -23,7 +23,7 @@ class WebSocketClient:
     """Client for sending updates to the WebSocket server."""
 
     def __init__(self, uri: Optional[str] = None, max_queue_size: int = 1000):
-        self.uri = get_websocket_client_uri() if uri is None else uri
+        self.uri = get_websocket_client_uri() if uri is None else validate_websocket_uri(uri)
         self.websocket = None
         self.connected = False
         self.message_queue: Queue[Dict[str, Any]] = Queue(maxsize=max_queue_size)

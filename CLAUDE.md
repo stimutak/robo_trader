@@ -327,7 +327,9 @@ service can occupy the default port, causing the dashboard to connect to the
 wrong process while RoboTrader's WebSocket thread fails to bind. Check with
 `lsof -nP -iTCP:${WEBSOCKET_PORT:-8765} -sTCP:LISTEN`. Configure one free
 `WEBSOCKET_PORT` in `.env`; the launcher must verify that the dashboard PID owns
-that listener and must never kill an unrelated process.
+that listener and must never kill an unrelated process. `WEBSOCKET_URL` is for
+direct/container deployments; `START_TRADER.sh` rejects any non-loopback or
+port-mismatched override, then exports its verified local endpoint to the runner.
 
 ---
 

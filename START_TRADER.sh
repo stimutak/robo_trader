@@ -68,6 +68,7 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
     SYMBOLS=$(grep "^SYMBOLS=" "$SCRIPT_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '"' | tr -d "'" | xargs)
     ENV_IBKR_PORT=$(grep "^IBKR_PORT=" "$SCRIPT_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '"' | tr -d "'" | xargs)
     ENV_WEBSOCKET_PORT=$(grep "^WEBSOCKET_PORT=" "$SCRIPT_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '"' | tr -d "'" | xargs)
+    ENV_WEBSOCKET_URL=$(grep "^WEBSOCKET_URL=" "$SCRIPT_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '"' | tr -d "'" | xargs)
 fi
 
 # Fallback default if .env doesn't have SYMBOLS
@@ -85,6 +86,25 @@ if [ "$WEBSOCKET_PORT" -lt 1024 ] || [ "$WEBSOCKET_PORT" -gt 65535 ]; then
     exit 5
 fi
 export WEBSOCKET_PORT
+# START_TRADER owns a local server and producer as one supervised lifecycle.
+# Reject conflicting inherited/.env overrides before touching Gateway or any
+# process, then force both children onto the verified local listener. Direct
+# and container launches continue to support remote WEBSOCKET_URL endpoints.
+if [ "${WEBSOCKET_URL+x}" = x ]; then
+    SUPERVISED_WEBSOCKET_URL="$WEBSOCKET_URL"
+else
+    SUPERVISED_WEBSOCKET_URL="${ENV_WEBSOCKET_URL:-}"
+fi
+case "$SUPERVISED_WEBSOCKET_URL" in
+    ""|"ws://localhost:$WEBSOCKET_PORT"|"ws://127.0.0.1:$WEBSOCKET_PORT"|"ws://[::1]:$WEBSOCKET_PORT")
+        ;;
+    *)
+        echo "FATAL: WEBSOCKET_URL conflicts with supervised local WEBSOCKET_PORT." >&2
+        echo "       Remove the override or set it to ws://localhost:$WEBSOCKET_PORT." >&2
+        exit 5
+        ;;
+esac
+export WEBSOCKET_URL="ws://localhost:$WEBSOCKET_PORT"
 case "$PORT" in
     4002)
         ;;
