@@ -72,3 +72,15 @@ def test_authoritative_launcher_disables_werkzeug_reloader():
     dashboard_launch = launcher.index("$PYTHON app.py")
 
     assert production_export < dashboard_launch
+
+
+def test_launcher_requires_dashboard_pid_to_own_http_and_websocket_ports():
+    launcher = (Path(__file__).resolve().parents[1] / "START_TRADER.sh").read_text()
+
+    ownership_guard = (
+        '"$LSOF" -nP -a -p "$DASH_PID" '
+        '-iTCP:"$DASH_PORT" -sTCP:LISTEN >/dev/null 2>&1 && \\\n'
+        '    "$LSOF" -nP -a -p "$DASH_PID" '
+        '-iTCP:"$WEBSOCKET_PORT" -sTCP:LISTEN >/dev/null 2>&1'
+    )
+    assert ownership_guard in launcher

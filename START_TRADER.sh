@@ -674,16 +674,6 @@ stop_processes_gracefully "dashboard" '(^|[/[:space:]])app[.]py([[:space:]]|$)'
 stop_processes_gracefully "websocket_server" "robo_trader[./]websocket_server"
 echo ""
 
-# Never connect the dashboard to an unrelated listener. A foreign service on
-# the configured port previously left Flask alive while its WebSocket thread
-# died in the background, producing an endless reconnect loop.
-if "$LSOF" -nP -iTCP:"$WEBSOCKET_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-    echo "FATAL: WebSocket port $WEBSOCKET_PORT is already owned by another process." >&2
-    "$LSOF" -nP -iTCP:"$WEBSOCKET_PORT" -sTCP:LISTEN >&2 || true
-    echo "Set a free WEBSOCKET_PORT in .env; refusing to kill the foreign process." >&2
-    exit 5
-fi
-
 # Step 5: Start dashboard (includes WebSocket server)
 echo "5. Starting dashboard with WebSocket server..."
 export DASH_PORT=5555
@@ -691,6 +681,22 @@ export DASH_PORT=5555
 # remain in this exact PID. Never let an inherited/local .env development mode
 # spawn Werkzeug's reloader parent/child pair under START_TRADER.sh.
 export FLASK_ENV=production
+
+# Never connect to or hide behind an unrelated listener. A foreign service on
+# the WebSocket port previously caused an endless reconnect loop; the same race
+# on the HTTP port could leave the runner active without an accessible dashboard.
+if [ "$DASH_PORT" -eq "$WEBSOCKET_PORT" ]; then
+    echo "FATAL: DASH_PORT and WEBSOCKET_PORT must be different; both are $DASH_PORT." >&2
+    exit 5
+fi
+for SERVICE_PORT in "$DASH_PORT" "$WEBSOCKET_PORT"; do
+    if "$LSOF" -nP -iTCP:"$SERVICE_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "FATAL: monitoring port $SERVICE_PORT is already owned by another process." >&2
+        "$LSOF" -nP -iTCP:"$SERVICE_PORT" -sTCP:LISTEN >&2 || true
+        echo "Choose free DASH_PORT/WEBSOCKET_PORT values; refusing to kill the foreign process." >&2
+        exit 5
+    fi
+done
 # Redirect stdout/stderr: backgrounded children otherwise inherit the
 # caller's fds — under the watchdog/launchd that was watchdog.log, which
 # bypassed all rotation and filled the disk on 2026-07-10. Rotate one
@@ -700,7 +706,8 @@ rotate_log "$SCRIPT_DIR/dashboard_stdout.log"
 $PYTHON app.py > "$SCRIPT_DIR/dashboard_stdout.log" 2>&1 200>&- &
 DASH_PID=$!
 for _ in $(seq 1 10); do
-    if "$LSOF" -nP -a -p "$DASH_PID" -iTCP:"$WEBSOCKET_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    if "$LSOF" -nP -a -p "$DASH_PID" -iTCP:"$DASH_PORT" -sTCP:LISTEN >/dev/null 2>&1 && \
+        "$LSOF" -nP -a -p "$DASH_PID" -iTCP:"$WEBSOCKET_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
         break
     fi
     if ! ps -p "$DASH_PID" >/dev/null 2>&1; then
@@ -710,11 +717,12 @@ for _ in $(seq 1 10); do
 done
 
 if ps -p "$DASH_PID" >/dev/null 2>&1 && \
+    "$LSOF" -nP -a -p "$DASH_PID" -iTCP:"$DASH_PORT" -sTCP:LISTEN >/dev/null 2>&1 && \
     "$LSOF" -nP -a -p "$DASH_PID" -iTCP:"$WEBSOCKET_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
     echo "   ✓ Dashboard started (PID: $DASH_PID)"
     echo "   ✓ WebSocket server running on ws://localhost:$WEBSOCKET_PORT"
 else
-    echo "FATAL: dashboard/WebSocket failed to bind port $WEBSOCKET_PORT." >&2
+    echo "FATAL: dashboard PID $DASH_PID failed to own HTTP $DASH_PORT and WebSocket $WEBSOCKET_PORT." >&2
     echo "       Check logs: tail -50 $SCRIPT_DIR/dashboard_stdout.log" >&2
     kill -TERM "$DASH_PID" 2>/dev/null || true
     exit 5
