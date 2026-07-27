@@ -10,6 +10,7 @@ and W-R2-L1 (refuse debug=True on non-loopback host).
 import base64
 import hashlib
 import importlib
+import json
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -871,9 +872,7 @@ def test_ws_request_headers_shim_handles_v15_api():
 
 
 def test_ws_auth_end_to_end_against_real_library():
-    """Smoke: stand up the real WebSocketManager and connect with a Bearer
-    token. This would have caught the v15 regression at PR time.
-    """
+    """Pin browser auth, producer auth/role, registration, and live relay."""
     import asyncio
 
     import websockets
@@ -885,22 +884,61 @@ def test_ws_auth_end_to_end_against_real_library():
         mgr.auth_token = "test-token-32-chars-aaaaaaaaaaaaa"
         server = await websockets.serve(mgr.handle_client, "127.0.0.1", 18766)
         try:
-            headers = {
+            browser = await websockets.connect(
+                f"ws://127.0.0.1:18766?token={mgr.auth_token}",
+                origin="http://127.0.0.1:5555",
+            )
+            browser_initial = json.loads(await browser.recv())
+            assert browser_initial["status"] == "connected"
+
+            producer_headers = {
                 "Authorization": f"Bearer {mgr.auth_token}",
                 "Origin": "http://127.0.0.1:5555",
+                "X-WS-Role": "producer",
             }
             try:
-                ws = await websockets.connect("ws://127.0.0.1:18766", additional_headers=headers)
+                producer = await websockets.connect(
+                    "ws://127.0.0.1:18766",
+                    additional_headers=producer_headers,
+                )
             except TypeError:
-                ws = await websockets.connect("ws://127.0.0.1:18766", extra_headers=headers)
-            await ws.send('{"type":"subscribe","symbols":["AAPL"]}')
-            await asyncio.sleep(0.2)
-            await ws.close()
+                producer = await websockets.connect(
+                    "ws://127.0.0.1:18766",
+                    extra_headers=producer_headers,
+                )
+            producer_initial = json.loads(await producer.recv())
+            assert producer_initial["status"] == "connected"
+            assert len(mgr.clients) == 2
+            assert len(mgr.producer_clients) == 1
+
+            payload = '{"type":"market_data","symbol":"AAPL","price":123.45}'
+            await producer.send(payload)
+            assert json.loads(await asyncio.wait_for(browser.recv(), timeout=1.0)) == json.loads(
+                payload
+            )
+
+            await producer.close()
+            await browser.close()
         finally:
             server.close()
             await server.wait_closed()
 
     asyncio.run(go())
+
+
+def test_dashboard_uses_configured_websocket_port(monkeypatch):
+    """The browser must use the same validated port as server and runner."""
+
+    app_mod = _reload_app(
+        monkeypatch,
+        DASH_AUTH_ENABLED="false",
+        WEBSOCKET_PORT="18767",
+    )
+    response = app_mod.app.test_client().get("/")
+
+    assert response.status_code == 200
+    assert b"window.location.hostname + ':18767'" in response.data
+    assert b"window.location.protocol === 'https:'" in response.data
 
 
 # ---------------------------------------------------------------------------

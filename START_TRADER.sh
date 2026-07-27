@@ -67,11 +67,24 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
     # Read only the startup values we need instead of sourcing arbitrary shell.
     SYMBOLS=$(grep "^SYMBOLS=" "$SCRIPT_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '"' | tr -d "'" | xargs)
     ENV_IBKR_PORT=$(grep "^IBKR_PORT=" "$SCRIPT_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '"' | tr -d "'" | xargs)
+    ENV_WEBSOCKET_PORT=$(grep "^WEBSOCKET_PORT=" "$SCRIPT_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | tr -d '"' | tr -d "'" | xargs)
 fi
 
 # Fallback default if .env doesn't have SYMBOLS
 SYMBOLS="${SYMBOLS:-AAPL,NVDA,TSLA}"
 PORT="${PORT:-${ENV_IBKR_PORT:-4002}}"
+WEBSOCKET_PORT="${WEBSOCKET_PORT:-${ENV_WEBSOCKET_PORT:-8765}}"
+case "$WEBSOCKET_PORT" in
+    ''|*[!0-9]*)
+        echo "FATAL: WEBSOCKET_PORT must be an integer between 1024 and 65535; got '$WEBSOCKET_PORT'." >&2
+        exit 5
+        ;;
+esac
+if [ "$WEBSOCKET_PORT" -lt 1024 ] || [ "$WEBSOCKET_PORT" -gt 65535 ]; then
+    echo "FATAL: WEBSOCKET_PORT must be between 1024 and 65535; got '$WEBSOCKET_PORT'." >&2
+    exit 5
+fi
+export WEBSOCKET_PORT
 case "$PORT" in
     4002)
         ;;
@@ -661,9 +674,23 @@ stop_processes_gracefully "dashboard" '(^|[/[:space:]])app[.]py([[:space:]]|$)'
 stop_processes_gracefully "websocket_server" "robo_trader[./]websocket_server"
 echo ""
 
+# Never connect the dashboard to an unrelated listener. A foreign service on
+# the configured port previously left Flask alive while its WebSocket thread
+# died in the background, producing an endless reconnect loop.
+if "$LSOF" -nP -iTCP:"$WEBSOCKET_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "FATAL: WebSocket port $WEBSOCKET_PORT is already owned by another process." >&2
+    "$LSOF" -nP -iTCP:"$WEBSOCKET_PORT" -sTCP:LISTEN >&2 || true
+    echo "Set a free WEBSOCKET_PORT in .env; refusing to kill the foreign process." >&2
+    exit 5
+fi
+
 # Step 5: Start dashboard (includes WebSocket server)
 echo "5. Starting dashboard with WebSocket server..."
 export DASH_PORT=5555
+# Canonical lifecycle ownership requires Flask and the WebSocket listener to
+# remain in this exact PID. Never let an inherited/local .env development mode
+# spawn Werkzeug's reloader parent/child pair under START_TRADER.sh.
+export FLASK_ENV=production
 # Redirect stdout/stderr: backgrounded children otherwise inherit the
 # caller's fds — under the watchdog/launchd that was watchdog.log, which
 # bypassed all rotation and filled the disk on 2026-07-10. Rotate one
@@ -672,14 +699,25 @@ export DASH_PORT=5555
 rotate_log "$SCRIPT_DIR/dashboard_stdout.log"
 $PYTHON app.py > "$SCRIPT_DIR/dashboard_stdout.log" 2>&1 200>&- &
 DASH_PID=$!
-sleep 2
+for _ in $(seq 1 10); do
+    if "$LSOF" -nP -a -p "$DASH_PID" -iTCP:"$WEBSOCKET_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        break
+    fi
+    if ! ps -p "$DASH_PID" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
 
-if ps -p $DASH_PID > /dev/null; then
+if ps -p "$DASH_PID" >/dev/null 2>&1 && \
+    "$LSOF" -nP -a -p "$DASH_PID" -iTCP:"$WEBSOCKET_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
     echo "   ✓ Dashboard started (PID: $DASH_PID)"
-    echo "   ✓ WebSocket server running on ws://localhost:8765"
+    echo "   ✓ WebSocket server running on ws://localhost:$WEBSOCKET_PORT"
 else
-    echo "   ⚠️  Dashboard may have failed to start"
-    echo "      Check logs: tail -50 $SCRIPT_DIR/dashboard_stdout.log"
+    echo "FATAL: dashboard/WebSocket failed to bind port $WEBSOCKET_PORT." >&2
+    echo "       Check logs: tail -50 $SCRIPT_DIR/dashboard_stdout.log" >&2
+    kill -TERM "$DASH_PID" 2>/dev/null || true
+    exit 5
 fi
 echo ""
 
@@ -720,7 +758,7 @@ if ps -p $TRADER_PID > /dev/null; then
     echo "Monitor logs: tail -f robo_trader.log"
     echo "  Pre-logger crash output (import/.env errors): runner_stdout.log, dashboard_stdout.log"
     echo "View dashboard: http://localhost:5555"
-    echo "WebSocket: ws://localhost:8765"
+    echo "WebSocket: ws://localhost:$WEBSOCKET_PORT"
     echo ""
     echo "To stop gracefully:"
     echo "  pkill -TERM -f 'robo_trader[./]runner_async'"

@@ -322,6 +322,13 @@ Any code that hard-codes one of these forms will `AttributeError`, the broad `ex
 
 **Don't trust `Connected to WebSocket server` in the runner log.** The `websockets` client logs that BEFORE the server's handshake completes. Look for `WS rejected` warnings on the server side, and for `client_count` increases on `WebSocket client connected` events.
 
+**Don't trust a listener on port 8765 without checking its owner.** Another local
+service can occupy the default port, causing the dashboard to connect to the
+wrong process while RoboTrader's WebSocket thread fails to bind. Check with
+`lsof -nP -iTCP:${WEBSOCKET_PORT:-8765} -sTCP:LISTEN`. Configure one free
+`WEBSOCKET_PORT` in `.env`; the launcher must verify that the dashboard PID owns
+that listener and must never kill an unrelated process.
+
 ---
 
 ## Current Issues Status
