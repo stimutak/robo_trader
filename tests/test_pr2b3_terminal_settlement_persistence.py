@@ -25,6 +25,7 @@ from robo_trader.paper_terminal_settlement import (
     PaperTerminalSettlementRequest,
     assert_producer_owned_paper_terminal_settlement_receipt,
 )
+from robo_trader.portfolio import Portfolio, PositionSnapshot
 from robo_trader.runner_async import AsyncRunner
 from robo_trader.safety import (
     PAPER_EXECUTION_DOMAIN_SCOPE,
@@ -372,15 +373,42 @@ async def test_runner_market_refresh_preserves_exact_settlement_mark(tmp_path: P
             Decimal("100"),
             Decimal("101"),
         )
+        await database.update_account(
+            cash=Decimal("99500"),
+            equity=Decimal("100005"),
+            daily_pnl=Decimal("5"),
+            realized_pnl=Decimal("0"),
+            unrealized_pnl=Decimal("5"),
+            daily_pnl_baseline=Decimal("0"),
+        )
         runner = object.__new__(AsyncRunner)
         runner.db = database
         runner.positions = {"AAPL": SimpleNamespace(quantity=5, avg_price=Decimal("100"))}
+        runner.portfolio = Portfolio(99500)
+        runner.portfolio.positions = {"AAPL": PositionSnapshot("AAPL", 5, Decimal("100"))}
+        runner.portfolio_manager = None
+        runner._starting_unrealized_today_exact = Decimal("0")
+        runner._daily_pnl_exact = Decimal("5")
+        runner._daily_pnl_date = datetime.now(timezone.utc).date()
+        runner._ml_predictions = {}
+        runner.daily_pnl = 5.0
+        runner.advanced_risk = None
 
         await runner.update_position_market_prices({"AAPL": 102.5})
+        await runner.update_account_summary()
 
         projection = await database.get_position("AAPL")
         assert projection is not None
         assert projection["market_price"] == 102.5
+        account = await database.get_account_info()
+        assert account["equity"] == 100012.5
+        assert account["unrealized_pnl"] == 12.5
+        assert account["daily_pnl"] == 12.5
+        assert account["cash_exact"] == Decimal("99500")
+        assert account["realized_pnl_exact"] == Decimal("0")
+        assert account["daily_pnl_exact"] == Decimal("5")
+        assert account["daily_pnl_baseline_exact"] == Decimal("0")
+        assert runner._daily_pnl_exact == Decimal("5")
         async with database.get_connection() as connection:
             exact_position = await (await connection.execute("""
                     SELECT cost_basis_text, mark_price_text

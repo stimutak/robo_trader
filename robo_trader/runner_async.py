@@ -5412,6 +5412,14 @@ class AsyncRunner:
             logger.warning(f"Negative cash balance: ${raw_cash:,.2f} (margin usage)")
         cash_float = raw_cash  # Preserve actual cash value, don't clamp
         realized_pnl_float = float(self.portfolio.realized_pnl)
+        # Routine quotes are still legacy float observations.  They may update
+        # dashboard/account projections, but they cannot replace producer-owned
+        # exact settlement state.  Keep the compatibility daily P&L internally
+        # coherent with the same float unrealized projection while leaving the
+        # runner's exact risk value untouched until an authoritative refresh.
+        daily_pnl_float = (
+            realized_pnl_float + unrealized_float - float(self._starting_unrealized_today_exact)
+        )
 
         # Update portfolio manager capital and consider rebalancing
         if self.portfolio_manager:
@@ -5424,13 +5432,11 @@ class AsyncRunner:
                 logger.debug(f"Portfolio manager update failed: {e}")
 
         await self.db.update_account(
-            cash=self.portfolio.cash,
+            cash=cash_float,
             equity=equity_float,
-            daily_pnl=self._daily_pnl_exact,
-            realized_pnl=self.portfolio.realized_pnl,
-            unrealized_pnl=unrealized,
-            daily_pnl_baseline=self._starting_unrealized_today_exact,
-            daily_pnl_date=self._daily_pnl_date,
+            daily_pnl=daily_pnl_float,
+            realized_pnl=realized_pnl_float,
+            unrealized_pnl=unrealized_float,
         )
 
         # Save daily equity snapshot for portfolio value tracking (industry standard)

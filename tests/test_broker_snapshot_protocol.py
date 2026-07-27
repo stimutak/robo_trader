@@ -56,7 +56,10 @@ class _FakeIB:
 
     async def reqCurrentTimeAsync(self):
         self.calls.append("reqCurrentTimeAsync")
-        return NOW + timedelta(seconds=len(self.calls))
+        # Broker clock evidence is captured when the worker call runs.  Using
+        # the module-import timestamp makes this otherwise valid fake expire
+        # when the full suite takes longer than the safety skew window.
+        return datetime.now(timezone.utc) + timedelta(seconds=len(self.calls))
 
     async def reqPositionsAsync(self):
         self.calls.append("reqPositionsAsync")
