@@ -2167,6 +2167,79 @@ signal.pause()
     assert not _anchor_path(path).exists()
 
 
+def test_authenticated_anchor_does_not_destroy_spilled_legacy_journal(tmp_path):
+    if not hasattr(signal, "SIGKILL"):
+        pytest.skip("SIGKILL unavailable on this host")
+    path = tmp_path / "anchored-legacy-spill.db"
+    ledger = _service(path)
+
+    with sqlite3.connect(path) as connection:
+        for trigger in ledger_module._TRIGGER_SQL:
+            connection.execute(f'DROP TRIGGER "{trigger}"')
+        connection.execute("ALTER TABLE daily_filled_notional_schema RENAME TO discarded_v3_schema")
+        connection.execute("""
+            CREATE TABLE daily_filled_notional_schema (
+                singleton INTEGER PRIMARY KEY,
+                schema_version INTEGER NOT NULL
+            )
+            """)
+        connection.execute("INSERT INTO daily_filled_notional_schema VALUES (1, 1)")
+        connection.execute("DROP TABLE discarded_v3_schema")
+        connection.execute("CREATE TABLE spill_payload (id INTEGER PRIMARY KEY, value BLOB)")
+        connection.executemany(
+            "INSERT INTO spill_payload VALUES (?, ?)",
+            ((index, b"a" * 4096) for index in range(1, 257)),
+        )
+
+    script = f"""
+import signal
+import sqlite3
+
+connection = sqlite3.connect({str(path)!r}, isolation_level=None)
+connection.execute('PRAGMA journal_mode=DELETE')
+connection.execute('PRAGMA synchronous=FULL')
+connection.execute('PRAGMA cache_size=1')
+connection.execute('PRAGMA cache_spill=ON')
+connection.execute('BEGIN IMMEDIATE')
+connection.execute('UPDATE daily_filled_notional_schema SET schema_version = 2')
+connection.execute('UPDATE spill_payload SET value = randomblob(4096)')
+print('READY', flush=True)
+signal.pause()
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "READY"
+        os.kill(child.pid, signal.SIGKILL)
+        child.wait(timeout=10)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+
+    journal = Path(f"{path}-journal")
+    assert journal.exists() and journal.stat().st_size > 0
+    with sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True) as connection:
+        assert connection.execute(
+            "SELECT schema_version FROM daily_filled_notional_schema"
+        ).fetchone() == (2,)
+    database_before = _file_snapshot(path)
+    journal_before = _file_snapshot(journal)
+    anchor_before = _file_snapshot(ledger.anchor_path)
+
+    with pytest.raises(FilledNotionalMigrationRequired, match="reviewed copy migration"):
+        _service(path)
+
+    assert _file_snapshot(path) == database_before
+    assert _file_snapshot(journal) == journal_before
+    assert _file_snapshot(ledger.anchor_path) == anchor_before
+
+
 def test_future_schema_version_fails_closed_without_downgrade(tmp_path):
     path = tmp_path / "future.db"
     with sqlite3.connect(path) as connection:

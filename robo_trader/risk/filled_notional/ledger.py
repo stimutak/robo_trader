@@ -36,6 +36,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import tempfile
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -1694,6 +1695,7 @@ class DailyFilledNotional:
                 raise FilledNotionalUnavailable(
                     "hot journal recovery anchor does not bind this database"
                 )
+            self._validate_hot_journal_recovery_on_copy()
             return True
         try:
             with self._connection(readonly=True, immutable=True) as connection:
@@ -1707,6 +1709,101 @@ class DailyFilledNotional:
                 "existing schema cannot be detected without SQLite recovery"
             ) from exc
         return False
+
+    @staticmethod
+    def _copy_exclusive_regular_file(source: Path, target: Path) -> None:
+        """Copy a stable, single-link source without following a replacement path."""
+
+        source_descriptor: Optional[int] = None
+        target_descriptor: Optional[int] = None
+        try:
+            before = os.lstat(source)
+            source_descriptor = os.open(
+                source,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            )
+            opened = os.fstat(source_descriptor)
+            if (
+                stat.S_ISLNK(before.st_mode)
+                or not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+            ):
+                raise FilledNotionalUnavailable(
+                    "hot-journal recovery source is not an exclusive stable file"
+                )
+            target_descriptor = os.open(
+                target,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            while True:
+                chunk = os.read(source_descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(target_descriptor, view)
+                    if written <= 0:
+                        raise FilledNotionalUnavailable(
+                            "hot-journal recovery copy could not be completed"
+                        )
+                    view = view[written:]
+            os.fsync(target_descriptor)
+            after = os.fstat(source_descriptor)
+            current = os.lstat(source)
+            stable_fields = (
+                "st_dev",
+                "st_ino",
+                "st_nlink",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+            if any(
+                getattr(opened, field) != getattr(after, field)
+                or getattr(opened, field) != getattr(current, field)
+                for field in stable_fields
+            ):
+                raise FilledNotionalUnavailable(
+                    "hot-journal recovery evidence changed while being copied"
+                )
+        except FilledNotionalError:
+            raise
+        except OSError as exc:
+            raise FilledNotionalUnavailable(
+                "hot-journal recovery evidence cannot be copied safely"
+            ) from exc
+        finally:
+            if target_descriptor is not None:
+                os.close(target_descriptor)
+            if source_descriptor is not None:
+                os.close(source_descriptor)
+
+    def _validate_hot_journal_recovery_on_copy(self) -> None:
+        """Prove recovery yields the anchored current schema before touching evidence."""
+
+        journal = Path(f"{self._path}-journal")
+        try:
+            with tempfile.TemporaryDirectory(prefix="filled-notional-recovery-") as directory:
+                copied_database = Path(directory) / "ledger.sqlite3"
+                copied_journal = Path(f"{copied_database}-journal")
+                self._copy_exclusive_regular_file(self._path, copied_database)
+                self._copy_exclusive_regular_file(journal, copied_journal)
+                with sqlite3.connect(copied_database, isolation_level=None) as connection:
+                    connection.row_factory = sqlite3.Row
+                    connection.execute("BEGIN")
+                    state = self._validate_ledger(connection)
+                    self._require_anchor_authenticates_recovered_state(state)
+                    connection.commit()
+        except FilledNotionalError:
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            raise FilledNotionalUnavailable(
+                "hot-journal recovery copy could not authenticate current-schema state"
+            ) from exc
 
     def _require_exclusive_database_path(
         self, binding: Optional[SQLitePathBinding] = None
@@ -2421,6 +2518,26 @@ class DailyFilledNotional:
             raise _PendingAnchorInProgress
         if anchor.state != state:
             raise FilledNotionalIntegrityError("ledger and durable anchor differ")
+        return anchor
+
+    def _require_anchor_authenticates_recovered_state(self, state: _LedgerState) -> _Anchor:
+        """Read-only validation for one endpoint of an atomic anchor transition."""
+
+        anchor = self._load_anchor()
+        pending = anchor.pending_state
+        if pending is None:
+            if anchor.state != state:
+                raise FilledNotionalIntegrityError("ledger and durable anchor differ")
+            return anchor
+        if (
+            pending.ledger_id != anchor.state.ledger_id
+            or pending.database_device != anchor.state.database_device
+            or pending.database_inode != anchor.state.database_inode
+            or state not in (anchor.state, pending)
+        ):
+            raise FilledNotionalIntegrityError(
+                "pending anchor does not authenticate recovered ledger state"
+            )
         return anchor
 
     def _resolve_pending_anchor(self) -> None:
