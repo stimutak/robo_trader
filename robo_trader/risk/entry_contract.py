@@ -10,6 +10,8 @@ boundary.
 from __future__ import annotations
 
 import re
+import threading
+import weakref
 from dataclasses import InitVar, dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import (
@@ -25,7 +27,7 @@ from decimal import (
     localcontext,
 )
 from enum import Enum
-from typing import Optional
+from typing import Optional, cast
 
 ENTRY_RISK_CONTRACT_VERSION = 1
 GATE_A_MAX_POSITION_FRACTION = Decimal("0.02")
@@ -34,8 +36,59 @@ _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SYMBOL = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
 _SECTOR = re.compile(r"^[A-Za-z][A-Za-z0-9 &./_-]{0,63}$")
 _BROKER_IDENTITY = re.compile(r"^[A-Z0-9][A-Z0-9._:/-]{0,63}$")
-_ENTRY_INTENT_MARKER = object()
-_QUOTE_EVIDENCE_MARKER = object()
+
+
+def _build_capability_authority():
+    seal = object()
+    registry: dict[
+        int,
+        tuple[weakref.ReferenceType[object], type[object], tuple[object, ...]],
+    ] = {}
+    lock = threading.Lock()
+
+    def is_sealed(candidate: object) -> bool:
+        return candidate is seal
+
+    def mint(capability_type, values: dict[str, object]):
+        capability = capability_type(**values, _seal=seal)
+        state = _capability_state(capability)
+        object_id = id(capability)
+
+        def discard(reference: weakref.ReferenceType[object]) -> None:
+            with lock:
+                registered = registry.get(object_id)
+                if registered is not None and registered[0] is reference:
+                    registry.pop(object_id, None)
+
+        reference = weakref.ref(capability, discard)
+        with lock:
+            registry[object_id] = (reference, capability_type, state)
+        return capability
+
+    def consume(capability: object, expected_type):
+        if type(capability) is not expected_type:
+            raise EntryRiskContractError(f"exact {expected_type.__name__} capability is required")
+        with lock:
+            registered = registry.pop(id(capability), None)
+        try:
+            current_state = _capability_state(capability)
+        except Exception:
+            current_state = None
+        if (
+            registered is None
+            or registered[0]() is not capability
+            or registered[1] is not expected_type
+            or registered[2] != current_state
+        ):
+            raise EntryRiskContractError(
+                f"{expected_type.__name__} is altered, copied, forged, or already consumed"
+            )
+        return capability
+
+    return is_sealed, mint, consume
+
+
+_is_capability_seal, _mint_capability, _consume_capability = _build_capability_authority()
 
 
 class EntryRiskContractError(ValueError):
@@ -54,6 +107,10 @@ class SignalSource(str, Enum):
     SMART_EXECUTION = "smart_execution"
 
 
+class RefreshedQuoteSource(str, Enum):
+    LIVE_BROKER = "live-broker"
+
+
 class RiskReason(str, Enum):
     APPROVED = "approved"
     CONTRACT_NOT_READY = "contract_not_ready"
@@ -67,6 +124,7 @@ class RiskReason(str, Enum):
     MISSING_SECTOR = "missing_sector"
     MISSING_CORRELATION = "missing_correlation"
     MISSING_LIQUIDITY = "missing_liquidity"
+    MISSING_ML_CORROBORATION = "missing_ml_corroboration"
     MISSING_CASH = "missing_cash"
     MISSING_BUYING_POWER = "missing_buying_power"
     MISSING_DAILY_NOTIONAL = "missing_daily_notional"
@@ -77,8 +135,10 @@ class RiskReason(str, Enum):
     STALE_ACCOUNT_EVIDENCE = "stale_account_evidence"
     QUOTE_NOT_REFRESHED = "quote_not_refreshed"
     QUOTE_BROKER_LINEAGE_MISMATCH = "quote_broker_lineage_mismatch"
+    QUOTE_SOURCE_MISMATCH = "quote_source_mismatch"
     CORRELATION_LIMIT = "correlation_limit"
     LIQUIDITY_LIMIT = "liquidity_limit"
+    ML_CORROBORATION_REQUIRED = "ml_corroboration_required"
     NO_CAPACITY = "no_capacity"
 
 
@@ -173,6 +233,27 @@ def _flag(value: object, field_name: str) -> bool:
     return value
 
 
+class _SealedCapability:
+    """Copy/pickle guard shared by short-lived one-shot contract records."""
+
+    __slots__ = ("__weakref__",)
+
+    def __copy__(self):
+        raise TypeError(f"{type(self).__name__} cannot be copied")
+
+    def __deepcopy__(self, memo: object):
+        del memo
+        raise TypeError(f"{type(self).__name__} cannot be copied")
+
+    def __reduce__(self):
+        raise TypeError(f"{type(self).__name__} cannot be pickled")
+
+
+def _require_sealed(value: object, record_name: str) -> None:
+    if not _is_capability_seal(value):
+        raise EntryRiskContractError(f"{record_name} is factory-only")
+
+
 @dataclass(frozen=True, slots=True)
 class EntryBrokerContractIdentity:
     """One exact, fully qualified SMART/USD stock contract."""
@@ -193,18 +274,18 @@ class EntryBrokerContractIdentity:
         local_symbol = _symbol(self.local_symbol)
         if local_symbol != symbol:
             raise EntryRiskContractError("broker contract local_symbol must match symbol")
-        if self.security_type != "STK":
+        if type(self.security_type) is not str or self.security_type != "STK":
             raise EntryRiskContractError("broker contract security_type must be STK")
-        if self.currency != "USD":
+        if type(self.currency) is not str or self.currency != "USD":
             raise EntryRiskContractError("broker contract currency must be USD")
-        if self.exchange != "SMART":
+        if type(self.exchange) is not str or self.exchange != "SMART":
             raise EntryRiskContractError("broker contract exchange must be SMART")
         _broker_identity(self.primary_exchange, "broker contract primary_exchange")
         _broker_identity(self.trading_class, "broker contract trading_class")
 
 
 @dataclass(frozen=True, slots=True)
-class EntrySignal:
+class EntrySignal(_SealedCapability):
     signal_id: str
     portfolio_id: str
     symbol: str
@@ -218,8 +299,10 @@ class EntrySignal:
     observed_at: datetime
     expires_at: datetime
     schema_version: int = ENTRY_RISK_CONTRACT_VERSION
+    _seal: InitVar[object] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _seal: object) -> None:
+        _require_sealed(_seal, "entry signal")
         _schema_version(self.schema_version)
         object.__setattr__(self, "signal_id", _identifier(self.signal_id, "signal_id"))
         object.__setattr__(self, "portfolio_id", _identifier(self.portfolio_id, "portfolio_id"))
@@ -263,19 +346,45 @@ class EntrySignal:
         object.__setattr__(self, "observed_at", observed)
         object.__setattr__(self, "expires_at", expires)
 
-    def __copy__(self) -> "EntrySignal":
-        raise TypeError("entry signal cannot be copied")
 
-    def __deepcopy__(self, memo: object) -> "EntrySignal":
-        del memo
-        raise TypeError("entry signal cannot be copied")
+def build_entry_signal(
+    *,
+    signal_id: str,
+    portfolio_id: str,
+    symbol: str,
+    side: EntrySide,
+    source: SignalSource,
+    confidence_fraction: Decimal,
+    requested_position_fraction: Decimal,
+    source_data_version: str,
+    broker_contract: EntryBrokerContractIdentity,
+    transport_generation: str,
+    observed_at: datetime,
+    expires_at: datetime,
+) -> EntrySignal:
+    """Mint one immutable, single-use entry signal."""
 
-    def __reduce__(self) -> str:
-        raise TypeError("entry signal cannot be pickled")
+    return _mint_capability(
+        EntrySignal,
+        {
+            "signal_id": signal_id,
+            "portfolio_id": portfolio_id,
+            "symbol": symbol,
+            "side": side,
+            "source": source,
+            "confidence_fraction": confidence_fraction,
+            "requested_position_fraction": requested_position_fraction,
+            "source_data_version": source_data_version,
+            "broker_contract": broker_contract,
+            "transport_generation": transport_generation,
+            "observed_at": observed_at,
+            "expires_at": expires_at,
+        },
+    )
 
 
 @dataclass(frozen=True, slots=True)
-class EntryIntent:
+class EntryIntent(_SealedCapability):
     intent_id: str
     signal_id: str
     portfolio_id: str
@@ -291,11 +400,10 @@ class EntryIntent:
     created_at: datetime
     expires_at: datetime
     schema_version: int = ENTRY_RISK_CONTRACT_VERSION
-    _builder_marker: InitVar[object] = None
+    _seal: InitVar[object] = None
 
-    def __post_init__(self, _builder_marker: object) -> None:
-        if _builder_marker is not _ENTRY_INTENT_MARKER:
-            raise EntryRiskContractError("entry intent is not signal-derived")
+    def __post_init__(self, _seal: object) -> None:
+        _require_sealed(_seal, "entry intent")
         _schema_version(self.schema_version)
         for field_name in (
             "intent_id",
@@ -338,16 +446,6 @@ class EntryIntent:
         object.__setattr__(self, "created_at", created)
         object.__setattr__(self, "expires_at", expires)
 
-    def __copy__(self) -> "EntryIntent":
-        raise TypeError("entry intent cannot be copied")
-
-    def __deepcopy__(self, memo: object) -> "EntryIntent":
-        del memo
-        raise TypeError("entry intent cannot be copied")
-
-    def __reduce__(self) -> str:
-        raise TypeError("entry intent cannot be pickled")
-
 
 def build_entry_intent(
     signal: EntrySignal,
@@ -360,30 +458,36 @@ def build_entry_intent(
 
     if type(signal) is not EntrySignal:
         raise EntryRiskContractError("entry intent requires an exact EntrySignal")
+    signal = _consume_capability(signal, EntrySignal)
     created = _timestamp(created_at, "intent created_at")
     if created < signal.observed_at or created >= signal.expires_at:
         raise EntryRiskContractError("signal is not active at intent creation")
-    return EntryIntent(
-        intent_id=intent_id,
-        signal_id=signal.signal_id,
-        portfolio_id=signal.portfolio_id,
-        symbol=signal.symbol,
-        side=signal.side,
-        source=signal.source,
-        confidence_fraction=signal.confidence_fraction,
-        requested_position_fraction=signal.requested_position_fraction,
-        source_data_version=signal.source_data_version,
-        broker_contract=signal.broker_contract,
-        transport_generation=signal.transport_generation,
-        quote_refresh_request_id=quote_refresh_request_id,
-        created_at=created,
-        expires_at=signal.expires_at,
-        _builder_marker=_ENTRY_INTENT_MARKER,
+    return _mint_capability(
+        EntryIntent,
+        {
+            "intent_id": intent_id,
+            "signal_id": signal.signal_id,
+            "portfolio_id": signal.portfolio_id,
+            "symbol": signal.symbol,
+            "side": signal.side,
+            "source": signal.source,
+            "confidence_fraction": signal.confidence_fraction,
+            "requested_position_fraction": signal.requested_position_fraction,
+            "source_data_version": signal.source_data_version,
+            "broker_contract": signal.broker_contract,
+            "transport_generation": signal.transport_generation,
+            "quote_refresh_request_id": quote_refresh_request_id,
+            "created_at": created,
+            "expires_at": signal.expires_at,
+        },
     )
 
 
 @dataclass(frozen=True, slots=True)
-class RefreshedQuoteEvidence:
+class LiveBrokerQuoteSourceCapability(_SealedCapability):
+    """One producer-owned broker quote receipt transferable exactly once."""
+
+    producer_id: str
     quote_id: str
     refresh_request_id: str
     symbol: str
@@ -391,13 +495,12 @@ class RefreshedQuoteEvidence:
     price_usd: Decimal
     observed_at: datetime
     transport_generation: str
-    source: str
-    _builder_marker: InitVar[object] = None
+    source: RefreshedQuoteSource
+    _seal: InitVar[object] = None
 
-    def __post_init__(self, _builder_marker: object) -> None:
-        if _builder_marker is not _QUOTE_EVIDENCE_MARKER:
-            raise EntryRiskContractError("refreshed quote is not factory-produced")
-        for field_name in ("quote_id", "refresh_request_id"):
+    def __post_init__(self, _seal: object) -> None:
+        _require_sealed(_seal, "live broker quote source")
+        for field_name in ("producer_id", "quote_id", "refresh_request_id"):
             object.__setattr__(self, field_name, _identifier(getattr(self, field_name), field_name))
         object.__setattr__(
             self,
@@ -411,55 +514,127 @@ class RefreshedQuoteEvidence:
             raise EntryRiskContractError("quote symbol does not match broker contract")
         object.__setattr__(self, "price_usd", _decimal(self.price_usd, "price_usd", positive=True))
         object.__setattr__(self, "observed_at", _timestamp(self.observed_at, "quote observed_at"))
-        if type(self.source) is not str or self.source != "live-broker":
+        if self.source is not RefreshedQuoteSource.LIVE_BROKER:
             raise EntryRiskContractError("refreshed quote source must be live-broker")
 
-    def __copy__(self) -> "RefreshedQuoteEvidence":
-        raise TypeError("refreshed quote evidence cannot be copied")
 
-    def __deepcopy__(self, memo: object) -> "RefreshedQuoteEvidence":
-        del memo
-        raise TypeError("refreshed quote evidence cannot be copied")
+@dataclass(frozen=True, slots=True)
+class RefreshedQuoteEvidence(_SealedCapability):
+    producer_id: str
+    quote_id: str
+    refresh_request_id: str
+    symbol: str
+    broker_contract: EntryBrokerContractIdentity
+    price_usd: Decimal
+    observed_at: datetime
+    transport_generation: str
+    source: RefreshedQuoteSource
+    _seal: InitVar[object] = None
 
-    def __reduce__(self) -> str:
-        raise TypeError("refreshed quote evidence cannot be pickled")
+    def __post_init__(self, _seal: object) -> None:
+        _require_sealed(_seal, "refreshed quote evidence")
+        for field_name in ("producer_id", "quote_id", "refresh_request_id"):
+            object.__setattr__(self, field_name, _identifier(getattr(self, field_name), field_name))
+        object.__setattr__(self, "symbol", _symbol(self.symbol))
+        if type(self.broker_contract) is not EntryBrokerContractIdentity:
+            raise EntryRiskContractError("quote broker contract is malformed")
+        if self.broker_contract.symbol != self.symbol:
+            raise EntryRiskContractError("quote symbol does not match broker contract")
+        object.__setattr__(
+            self,
+            "transport_generation",
+            _transport_generation(self.transport_generation, "transport_generation"),
+        )
+        object.__setattr__(self, "price_usd", _decimal(self.price_usd, "price_usd", positive=True))
+        object.__setattr__(self, "observed_at", _timestamp(self.observed_at, "quote observed_at"))
+        if self.source is not RefreshedQuoteSource.LIVE_BROKER:
+            raise EntryRiskContractError("refreshed quote source must be live-broker")
 
 
-def build_refreshed_quote_evidence(
+def produce_live_broker_quote_source(
     *,
+    producer_id: str,
     quote_id: str,
     refresh_request_id: str,
     broker_contract: EntryBrokerContractIdentity,
     price_usd: Decimal,
     observed_at: datetime,
     transport_generation: str,
-    source: str,
+) -> LiveBrokerQuoteSourceCapability:
+    """Mint the typed source capability a broker quote producer transfers."""
+
+    if type(broker_contract) is not EntryBrokerContractIdentity:
+        raise EntryRiskContractError("quote source requires an exact broker contract")
+    return _mint_capability(
+        LiveBrokerQuoteSourceCapability,
+        {
+            "producer_id": producer_id,
+            "quote_id": quote_id,
+            "refresh_request_id": refresh_request_id,
+            "symbol": broker_contract.symbol,
+            "broker_contract": broker_contract,
+            "price_usd": price_usd,
+            "observed_at": observed_at,
+            "transport_generation": transport_generation,
+            "source": RefreshedQuoteSource.LIVE_BROKER,
+        },
+    )
+
+
+def build_refreshed_quote_evidence(
+    *,
+    source_capability: LiveBrokerQuoteSourceCapability,
 ) -> RefreshedQuoteEvidence:
     """Build an immutable quote bound to one exact contract and transport."""
 
-    if type(broker_contract) is not EntryBrokerContractIdentity:
-        raise EntryRiskContractError("quote requires an exact broker contract")
-    return RefreshedQuoteEvidence(
-        quote_id=quote_id,
-        refresh_request_id=refresh_request_id,
-        symbol=broker_contract.symbol,
-        broker_contract=broker_contract,
-        price_usd=price_usd,
-        observed_at=observed_at,
-        transport_generation=transport_generation,
-        source=source,
-        _builder_marker=_QUOTE_EVIDENCE_MARKER,
+    source = _consume_capability(source_capability, LiveBrokerQuoteSourceCapability)
+    return _mint_capability(
+        RefreshedQuoteEvidence,
+        {
+            "producer_id": source.producer_id,
+            "quote_id": source.quote_id,
+            "refresh_request_id": source.refresh_request_id,
+            "symbol": source.symbol,
+            "broker_contract": source.broker_contract,
+            "price_usd": source.price_usd,
+            "observed_at": source.observed_at,
+            "transport_generation": source.transport_generation,
+            "source": source.source,
+        },
     )
 
 
 @dataclass(frozen=True, slots=True)
-class CorrelationEvidence:
+class CorrelationEvidence(_SealedCapability):
+    portfolio_id: str
+    symbol: str
+    source_data_version: str
+    broker_contract: EntryBrokerContractIdentity
+    transport_generation: str
     complete: bool
     existing_position_count: int
     max_absolute_correlation: Decimal
     observed_at: datetime
+    _seal: InitVar[object] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _seal: object) -> None:
+        _require_sealed(_seal, "correlation evidence")
+        object.__setattr__(self, "portfolio_id", _identifier(self.portfolio_id, "portfolio_id"))
+        object.__setattr__(self, "symbol", _symbol(self.symbol))
+        object.__setattr__(
+            self,
+            "source_data_version",
+            _identifier(self.source_data_version, "source_data_version"),
+        )
+        if type(self.broker_contract) is not EntryBrokerContractIdentity:
+            raise EntryRiskContractError("correlation broker contract is malformed")
+        if self.broker_contract.symbol != self.symbol:
+            raise EntryRiskContractError("correlation symbol does not match broker contract")
+        object.__setattr__(
+            self,
+            "transport_generation",
+            _transport_generation(self.transport_generation, "transport_generation"),
+        )
         _flag(self.complete, "correlation complete")
         if type(self.existing_position_count) is not int or self.existing_position_count < 0:
             raise EntryRiskContractError("existing_position_count must be nonnegative")
@@ -474,13 +649,64 @@ class CorrelationEvidence:
         )
 
 
+def build_correlation_evidence(
+    *,
+    portfolio_id: str,
+    symbol: str,
+    source_data_version: str,
+    broker_contract: EntryBrokerContractIdentity,
+    transport_generation: str,
+    complete: bool,
+    existing_position_count: int,
+    max_absolute_correlation: Decimal,
+    observed_at: datetime,
+) -> CorrelationEvidence:
+    return _mint_capability(
+        CorrelationEvidence,
+        {
+            "portfolio_id": portfolio_id,
+            "symbol": symbol,
+            "source_data_version": source_data_version,
+            "broker_contract": broker_contract,
+            "transport_generation": transport_generation,
+            "complete": complete,
+            "existing_position_count": existing_position_count,
+            "max_absolute_correlation": max_absolute_correlation,
+            "observed_at": observed_at,
+        },
+    )
+
+
 @dataclass(frozen=True, slots=True)
-class LiquidityEvidence:
+class LiquidityEvidence(_SealedCapability):
+    portfolio_id: str
+    symbol: str
+    source_data_version: str
+    broker_contract: EntryBrokerContractIdentity
+    transport_generation: str
     complete: bool
     average_daily_dollar_volume_usd: Decimal
     observed_at: datetime
+    _seal: InitVar[object] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _seal: object) -> None:
+        _require_sealed(_seal, "liquidity evidence")
+        object.__setattr__(self, "portfolio_id", _identifier(self.portfolio_id, "portfolio_id"))
+        object.__setattr__(self, "symbol", _symbol(self.symbol))
+        object.__setattr__(
+            self,
+            "source_data_version",
+            _identifier(self.source_data_version, "source_data_version"),
+        )
+        if type(self.broker_contract) is not EntryBrokerContractIdentity:
+            raise EntryRiskContractError("liquidity broker contract is malformed")
+        if self.broker_contract.symbol != self.symbol:
+            raise EntryRiskContractError("liquidity symbol does not match broker contract")
+        object.__setattr__(
+            self,
+            "transport_generation",
+            _transport_generation(self.transport_generation, "transport_generation"),
+        )
         _flag(self.complete, "liquidity complete")
         object.__setattr__(
             self,
@@ -498,8 +724,109 @@ class LiquidityEvidence:
         )
 
 
+def build_liquidity_evidence(
+    *,
+    portfolio_id: str,
+    symbol: str,
+    source_data_version: str,
+    broker_contract: EntryBrokerContractIdentity,
+    transport_generation: str,
+    complete: bool,
+    average_daily_dollar_volume_usd: Decimal,
+    observed_at: datetime,
+) -> LiquidityEvidence:
+    return _mint_capability(
+        LiquidityEvidence,
+        {
+            "portfolio_id": portfolio_id,
+            "symbol": symbol,
+            "source_data_version": source_data_version,
+            "broker_contract": broker_contract,
+            "transport_generation": transport_generation,
+            "complete": complete,
+            "average_daily_dollar_volume_usd": average_daily_dollar_volume_usd,
+            "observed_at": observed_at,
+        },
+    )
+
+
 @dataclass(frozen=True, slots=True)
-class EntryRiskEvidence:
+class MLCorroborationEvidence(_SealedCapability):
+    signal_id: str
+    portfolio_id: str
+    symbol: str
+    source_data_version: str
+    broker_contract: EntryBrokerContractIdentity
+    transport_generation: str
+    model_id: str
+    corroborated: bool
+    confidence_fraction: Decimal
+    observed_at: datetime
+    expires_at: datetime
+    _seal: InitVar[object] = None
+
+    def __post_init__(self, _seal: object) -> None:
+        _require_sealed(_seal, "ML corroboration evidence")
+        for field_name in ("signal_id", "portfolio_id", "source_data_version", "model_id"):
+            object.__setattr__(self, field_name, _identifier(getattr(self, field_name), field_name))
+        object.__setattr__(self, "symbol", _symbol(self.symbol))
+        if type(self.broker_contract) is not EntryBrokerContractIdentity:
+            raise EntryRiskContractError("ML broker contract is malformed")
+        if self.broker_contract.symbol != self.symbol:
+            raise EntryRiskContractError("ML symbol does not match broker contract")
+        object.__setattr__(
+            self,
+            "transport_generation",
+            _transport_generation(self.transport_generation, "transport_generation"),
+        )
+        _flag(self.corroborated, "ML corroborated")
+        object.__setattr__(
+            self,
+            "confidence_fraction",
+            _fraction(self.confidence_fraction, "ML confidence_fraction"),
+        )
+        observed = _timestamp(self.observed_at, "ML observed_at")
+        expires = _timestamp(self.expires_at, "ML expires_at")
+        if expires <= observed:
+            raise EntryRiskContractError("ML corroboration expiry must follow observation")
+        object.__setattr__(self, "observed_at", observed)
+        object.__setattr__(self, "expires_at", expires)
+
+
+def build_ml_corroboration_evidence(
+    *,
+    signal_id: str,
+    portfolio_id: str,
+    symbol: str,
+    source_data_version: str,
+    broker_contract: EntryBrokerContractIdentity,
+    transport_generation: str,
+    model_id: str,
+    corroborated: bool,
+    confidence_fraction: Decimal,
+    observed_at: datetime,
+    expires_at: datetime,
+) -> MLCorroborationEvidence:
+    return _mint_capability(
+        MLCorroborationEvidence,
+        {
+            "signal_id": signal_id,
+            "portfolio_id": portfolio_id,
+            "symbol": symbol,
+            "source_data_version": source_data_version,
+            "broker_contract": broker_contract,
+            "transport_generation": transport_generation,
+            "model_id": model_id,
+            "corroborated": corroborated,
+            "confidence_fraction": confidence_fraction,
+            "observed_at": observed_at,
+            "expires_at": expires_at,
+        },
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class EntryRiskEvidence(_SealedCapability):
     portfolio_id: Optional[str] = None
     symbol: Optional[str] = None
     observed_at: Optional[datetime] = None
@@ -507,6 +834,7 @@ class EntryRiskEvidence:
     sector: Optional[str] = None
     correlation: Optional[CorrelationEvidence] = None
     liquidity: Optional[LiquidityEvidence] = None
+    ml_corroboration: Optional[MLCorroborationEvidence] = None
     portfolio_equity_usd: Optional[Decimal] = None
     cash_available_usd: Optional[Decimal] = None
     buying_power_usd: Optional[Decimal] = None
@@ -514,8 +842,10 @@ class EntryRiskEvidence:
     current_sector_gross_notional_usd: Optional[Decimal] = None
     portfolio_gross_notional_usd: Optional[Decimal] = None
     daily_executed_notional_usd: Optional[Decimal] = None
+    _seal: InitVar[object] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _seal: object) -> None:
+        _require_sealed(_seal, "entry risk evidence")
         if self.portfolio_id is not None:
             object.__setattr__(
                 self,
@@ -538,6 +868,11 @@ class EntryRiskEvidence:
             raise EntryRiskContractError("correlation evidence is malformed")
         if self.liquidity is not None and type(self.liquidity) is not LiquidityEvidence:
             raise EntryRiskContractError("liquidity evidence is malformed")
+        if (
+            self.ml_corroboration is not None
+            and type(self.ml_corroboration) is not MLCorroborationEvidence
+        ):
+            raise EntryRiskContractError("ML corroboration evidence is malformed")
         for field_name in (
             "portfolio_equity_usd",
             "cash_available_usd",
@@ -559,6 +894,59 @@ class EntryRiskEvidence:
                         nonnegative=field_name != "portfolio_equity_usd",
                     ),
                 )
+
+
+def build_entry_risk_evidence(
+    *,
+    portfolio_id: Optional[str] = None,
+    symbol: Optional[str] = None,
+    observed_at: Optional[datetime] = None,
+    quote: Optional[RefreshedQuoteEvidence] = None,
+    sector: Optional[str] = None,
+    correlation: Optional[CorrelationEvidence] = None,
+    liquidity: Optional[LiquidityEvidence] = None,
+    ml_corroboration: Optional[MLCorroborationEvidence] = None,
+    portfolio_equity_usd: Optional[Decimal] = None,
+    cash_available_usd: Optional[Decimal] = None,
+    buying_power_usd: Optional[Decimal] = None,
+    current_symbol_gross_notional_usd: Optional[Decimal] = None,
+    current_sector_gross_notional_usd: Optional[Decimal] = None,
+    portfolio_gross_notional_usd: Optional[Decimal] = None,
+    daily_executed_notional_usd: Optional[Decimal] = None,
+) -> EntryRiskEvidence:
+    """Transfer exact component evidence into one single-use risk snapshot."""
+
+    if quote is not None:
+        quote = _consume_capability(quote, RefreshedQuoteEvidence)
+    if correlation is not None:
+        correlation = _consume_capability(correlation, CorrelationEvidence)
+    if liquidity is not None:
+        liquidity = _consume_capability(liquidity, LiquidityEvidence)
+    if ml_corroboration is not None:
+        ml_corroboration = _consume_capability(
+            ml_corroboration,
+            MLCorroborationEvidence,
+        )
+    return _mint_capability(
+        EntryRiskEvidence,
+        {
+            "portfolio_id": portfolio_id,
+            "symbol": symbol,
+            "observed_at": observed_at,
+            "quote": quote,
+            "sector": sector,
+            "correlation": correlation,
+            "liquidity": liquidity,
+            "ml_corroboration": ml_corroboration,
+            "portfolio_equity_usd": portfolio_equity_usd,
+            "cash_available_usd": cash_available_usd,
+            "buying_power_usd": buying_power_usd,
+            "current_symbol_gross_notional_usd": current_symbol_gross_notional_usd,
+            "current_sector_gross_notional_usd": current_sector_gross_notional_usd,
+            "portfolio_gross_notional_usd": portfolio_gross_notional_usd,
+            "daily_executed_notional_usd": daily_executed_notional_usd,
+        },
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -646,7 +1034,7 @@ class EntryFeatureFlags:
 
 
 @dataclass(frozen=True, slots=True)
-class RiskDecision:
+class RiskDecision(_SealedCapability):
     intent_id: str
     signal_id: str
     portfolio_id: str
@@ -664,8 +1052,10 @@ class RiskDecision:
     authorizes_order_submission: bool = False
     runtime_integration_ready: bool = False
     schema_version: int = ENTRY_RISK_CONTRACT_VERSION
+    _seal: InitVar[object] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _seal: object) -> None:
+        _require_sealed(_seal, "risk decision")
         _schema_version(self.schema_version)
         for field_name in ("intent_id", "signal_id", "portfolio_id"):
             object.__setattr__(self, field_name, _identifier(getattr(self, field_name), field_name))
@@ -728,22 +1118,205 @@ def _rejected(
     quote: Optional[RefreshedQuoteEvidence],
 ) -> RiskDecision:
     ordered = tuple(dict.fromkeys(reasons))
-    return RiskDecision(
-        intent_id=intent.intent_id,
-        signal_id=intent.signal_id,
-        portfolio_id=intent.portfolio_id,
-        symbol=intent.symbol,
-        side=intent.side,
-        broker_contract=intent.broker_contract,
-        transport_generation=intent.transport_generation,
-        evaluated_at=evaluated_at,
-        risk_approved=False,
-        reasons=ordered,
-        approved_quantity=0,
-        approved_notional_usd=Decimal(0),
-        quote_id=None if quote is None else quote.quote_id,
-        limiting_capacity=None,
+    return _mint_capability(
+        RiskDecision,
+        {
+            "intent_id": intent.intent_id,
+            "signal_id": intent.signal_id,
+            "portfolio_id": intent.portfolio_id,
+            "symbol": intent.symbol,
+            "side": intent.side,
+            "broker_contract": intent.broker_contract,
+            "transport_generation": intent.transport_generation,
+            "evaluated_at": evaluated_at,
+            "risk_approved": False,
+            "reasons": ordered,
+            "approved_quantity": 0,
+            "approved_notional_usd": Decimal(0),
+            "quote_id": None if quote is None else quote.quote_id,
+            "limiting_capacity": None,
+        },
     )
+
+
+def _contract_state(contract: EntryBrokerContractIdentity) -> tuple[object, ...]:
+    return (
+        contract.con_id,
+        contract.symbol,
+        contract.local_symbol,
+        contract.security_type,
+        contract.currency,
+        contract.exchange,
+        contract.primary_exchange,
+        contract.trading_class,
+    )
+
+
+def _optional_decimal_state(value: Optional[Decimal]) -> Optional[str]:
+    return None if value is None else str(value)
+
+
+def _optional_time_state(value: Optional[datetime]) -> Optional[str]:
+    return None if value is None else value.isoformat(timespec="microseconds")
+
+
+def _capability_state(capability: object) -> tuple[object, ...]:
+    """Return an immutable exact snapshot used by the sealed registry."""
+
+    if type(capability) is EntrySignal:
+        signal = cast(EntrySignal, capability)
+        return (
+            "signal",
+            signal.signal_id,
+            signal.portfolio_id,
+            signal.symbol,
+            signal.side.value,
+            signal.source.value,
+            str(signal.confidence_fraction),
+            str(signal.requested_position_fraction),
+            signal.source_data_version,
+            _contract_state(signal.broker_contract),
+            signal.transport_generation,
+            signal.observed_at.isoformat(timespec="microseconds"),
+            signal.expires_at.isoformat(timespec="microseconds"),
+            signal.schema_version,
+        )
+    if type(capability) is EntryIntent:
+        intent = cast(EntryIntent, capability)
+        return (
+            "intent",
+            intent.intent_id,
+            intent.signal_id,
+            intent.portfolio_id,
+            intent.symbol,
+            intent.side.value,
+            intent.source.value,
+            str(intent.confidence_fraction),
+            str(intent.requested_position_fraction),
+            intent.source_data_version,
+            _contract_state(intent.broker_contract),
+            intent.transport_generation,
+            intent.quote_refresh_request_id,
+            intent.created_at.isoformat(timespec="microseconds"),
+            intent.expires_at.isoformat(timespec="microseconds"),
+            intent.schema_version,
+        )
+    if type(capability) in {
+        LiveBrokerQuoteSourceCapability,
+        RefreshedQuoteEvidence,
+    }:
+        quote = cast(
+            LiveBrokerQuoteSourceCapability | RefreshedQuoteEvidence,
+            capability,
+        )
+        return (
+            type(quote).__name__,
+            quote.producer_id,
+            quote.quote_id,
+            quote.refresh_request_id,
+            quote.symbol,
+            _contract_state(quote.broker_contract),
+            str(quote.price_usd),
+            quote.observed_at.isoformat(timespec="microseconds"),
+            quote.transport_generation,
+            quote.source.value,
+        )
+    if type(capability) is CorrelationEvidence:
+        correlation = cast(CorrelationEvidence, capability)
+        return (
+            "correlation",
+            correlation.portfolio_id,
+            correlation.symbol,
+            correlation.source_data_version,
+            _contract_state(correlation.broker_contract),
+            correlation.transport_generation,
+            correlation.complete,
+            correlation.existing_position_count,
+            str(correlation.max_absolute_correlation),
+            correlation.observed_at.isoformat(timespec="microseconds"),
+        )
+    if type(capability) is LiquidityEvidence:
+        liquidity = cast(LiquidityEvidence, capability)
+        return (
+            "liquidity",
+            liquidity.portfolio_id,
+            liquidity.symbol,
+            liquidity.source_data_version,
+            _contract_state(liquidity.broker_contract),
+            liquidity.transport_generation,
+            liquidity.complete,
+            str(liquidity.average_daily_dollar_volume_usd),
+            liquidity.observed_at.isoformat(timespec="microseconds"),
+        )
+    if type(capability) is MLCorroborationEvidence:
+        ml = cast(MLCorroborationEvidence, capability)
+        return (
+            "ml",
+            ml.signal_id,
+            ml.portfolio_id,
+            ml.symbol,
+            ml.source_data_version,
+            _contract_state(ml.broker_contract),
+            ml.transport_generation,
+            ml.model_id,
+            ml.corroborated,
+            str(ml.confidence_fraction),
+            ml.observed_at.isoformat(timespec="microseconds"),
+            ml.expires_at.isoformat(timespec="microseconds"),
+        )
+    if type(capability) is EntryRiskEvidence:
+        evidence = cast(EntryRiskEvidence, capability)
+        return (
+            "risk-evidence",
+            evidence.portfolio_id,
+            evidence.symbol,
+            _optional_time_state(evidence.observed_at),
+            None if evidence.quote is None else _capability_state(evidence.quote),
+            evidence.sector,
+            None if evidence.correlation is None else _capability_state(evidence.correlation),
+            None if evidence.liquidity is None else _capability_state(evidence.liquidity),
+            (
+                None
+                if evidence.ml_corroboration is None
+                else _capability_state(evidence.ml_corroboration)
+            ),
+            _optional_decimal_state(evidence.portfolio_equity_usd),
+            _optional_decimal_state(evidence.cash_available_usd),
+            _optional_decimal_state(evidence.buying_power_usd),
+            _optional_decimal_state(evidence.current_symbol_gross_notional_usd),
+            _optional_decimal_state(evidence.current_sector_gross_notional_usd),
+            _optional_decimal_state(evidence.portfolio_gross_notional_usd),
+            _optional_decimal_state(evidence.daily_executed_notional_usd),
+        )
+    if type(capability) is RiskDecision:
+        decision = cast(RiskDecision, capability)
+        return (
+            "decision",
+            decision.intent_id,
+            decision.signal_id,
+            decision.portfolio_id,
+            decision.symbol,
+            decision.side.value,
+            _contract_state(decision.broker_contract),
+            decision.transport_generation,
+            decision.evaluated_at.isoformat(timespec="microseconds"),
+            decision.risk_approved,
+            tuple(reason.value for reason in decision.reasons),
+            decision.approved_quantity,
+            str(decision.approved_notional_usd),
+            decision.quote_id,
+            None if decision.limiting_capacity is None else decision.limiting_capacity.value,
+            decision.authorizes_order_submission,
+            decision.runtime_integration_ready,
+            decision.schema_version,
+        )
+    raise EntryRiskContractError("unknown sealed capability type")
+
+
+def assert_and_consume_risk_decision(decision: object) -> RiskDecision:
+    """Consume an exact decision once at a future dormant integration seam."""
+
+    return _consume_capability(decision, RiskDecision)
 
 
 def _source_enabled(source: SignalSource, flags: EntryFeatureFlags) -> bool:
@@ -764,6 +1337,24 @@ def _evidence_is_current(
 ) -> bool:
     return (
         intent.created_at <= observed_at <= evaluated_at and evaluated_at - observed_at <= max_age
+    )
+
+
+def _scoped_market_evidence_matches(
+    evidence: object,
+    *,
+    intent: EntryIntent,
+    expected_broker_contract: EntryBrokerContractIdentity,
+    expected_transport_generation: str,
+) -> bool:
+    return (
+        getattr(evidence, "portfolio_id", None) == intent.portfolio_id
+        and getattr(evidence, "symbol", None) == intent.symbol
+        and getattr(evidence, "source_data_version", None) == intent.source_data_version
+        and getattr(evidence, "broker_contract", None) == intent.broker_contract
+        and getattr(evidence, "broker_contract", None) == expected_broker_contract
+        and getattr(evidence, "transport_generation", None) == intent.transport_generation
+        and getattr(evidence, "transport_generation", None) == expected_transport_generation
     )
 
 
@@ -870,6 +1461,7 @@ def evaluate_entry_intent(
     *,
     expected_broker_contract: EntryBrokerContractIdentity,
     expected_transport_generation: str,
+    expected_quote_producer_id: str,
     evaluated_at: datetime,
 ) -> RiskDecision:
     """Evaluate one intent using complete, refreshed evidence and exact units."""
@@ -886,6 +1478,12 @@ def evaluate_entry_intent(
         expected_transport_generation,
         "expected_transport_generation",
     )
+    active_quote_producer = _identifier(
+        expected_quote_producer_id,
+        "expected_quote_producer_id",
+    )
+    intent = _consume_capability(intent, EntryIntent)
+    evidence = _consume_capability(evidence, EntryRiskEvidence)
     now = _timestamp(evaluated_at, "evaluated_at")
     reasons: list[RiskReason] = []
 
@@ -933,6 +1531,13 @@ def evaluate_entry_intent(
         reasons.append(RiskReason.MISSING_SECTOR)
     if evidence.correlation is None or not evidence.correlation.complete:
         reasons.append(RiskReason.MISSING_CORRELATION)
+    elif not _scoped_market_evidence_matches(
+        evidence.correlation,
+        intent=intent,
+        expected_broker_contract=expected_broker_contract,
+        expected_transport_generation=active_generation,
+    ):
+        reasons.append(RiskReason.EVIDENCE_SCOPE_MISMATCH)
     elif not _evidence_is_current(
         evidence.correlation.observed_at,
         intent=intent,
@@ -942,6 +1547,13 @@ def evaluate_entry_intent(
         reasons.append(RiskReason.MISSING_CORRELATION)
     if evidence.liquidity is None or not evidence.liquidity.complete:
         reasons.append(RiskReason.MISSING_LIQUIDITY)
+    elif not _scoped_market_evidence_matches(
+        evidence.liquidity,
+        intent=intent,
+        expected_broker_contract=expected_broker_contract,
+        expected_transport_generation=active_generation,
+    ):
+        reasons.append(RiskReason.EVIDENCE_SCOPE_MISMATCH)
     elif not _evidence_is_current(
         evidence.liquidity.observed_at,
         intent=intent,
@@ -971,6 +1583,34 @@ def evaluate_entry_intent(
         or quote.transport_generation != intent.transport_generation
     ):
         reasons.append(RiskReason.QUOTE_BROKER_LINEAGE_MISMATCH)
+    if quote is not None and quote.producer_id != active_quote_producer:
+        reasons.append(RiskReason.QUOTE_SOURCE_MISMATCH)
+
+    ml = evidence.ml_corroboration
+    if ml is not None and not _scoped_market_evidence_matches(
+        ml,
+        intent=intent,
+        expected_broker_contract=expected_broker_contract,
+        expected_transport_generation=active_generation,
+    ):
+        reasons.append(RiskReason.EVIDENCE_SCOPE_MISMATCH)
+    if intent.source is SignalSource.AI_DISCOVERY:
+        if ml is None:
+            reasons.append(RiskReason.MISSING_ML_CORROBORATION)
+        elif (
+            ml.signal_id != intent.signal_id
+            or not ml.corroborated
+            or ml.confidence_fraction <= 0
+            or intent.confidence_fraction <= 0
+            or now >= ml.expires_at
+            or not _evidence_is_current(
+                ml.observed_at,
+                intent=intent,
+                evaluated_at=now,
+                max_age=limits.max_account_evidence_age,
+            )
+        ):
+            reasons.append(RiskReason.ML_CORROBORATION_REQUIRED)
 
     if reasons:
         return _rejected(intent, now, reasons, quote)
@@ -1077,21 +1717,24 @@ def evaluate_entry_intent(
         capacities=capacities,
     )
 
-    return RiskDecision(
-        intent_id=intent.intent_id,
-        signal_id=intent.signal_id,
-        portfolio_id=intent.portfolio_id,
-        symbol=intent.symbol,
-        side=intent.side,
-        broker_contract=intent.broker_contract,
-        transport_generation=intent.transport_generation,
-        evaluated_at=now,
-        risk_approved=True,
-        reasons=(RiskReason.APPROVED,),
-        approved_quantity=quantity,
-        approved_notional_usd=approved_notional,
-        quote_id=quote.quote_id,
-        limiting_capacity=limiting_capacity,
+    return _mint_capability(
+        RiskDecision,
+        {
+            "intent_id": intent.intent_id,
+            "signal_id": intent.signal_id,
+            "portfolio_id": intent.portfolio_id,
+            "symbol": intent.symbol,
+            "side": intent.side,
+            "broker_contract": intent.broker_contract,
+            "transport_generation": intent.transport_generation,
+            "evaluated_at": now,
+            "risk_approved": True,
+            "reasons": (RiskReason.APPROVED,),
+            "approved_quantity": quantity,
+            "approved_notional_usd": approved_notional,
+            "quote_id": quote.quote_id,
+            "limiting_capacity": limiting_capacity,
+        },
     )
 
 
@@ -1109,11 +1752,21 @@ __all__ = [
     "EntrySignal",
     "LimitingCapacity",
     "LiquidityEvidence",
+    "LiveBrokerQuoteSourceCapability",
+    "MLCorroborationEvidence",
     "RefreshedQuoteEvidence",
+    "RefreshedQuoteSource",
     "RiskDecision",
     "RiskReason",
     "SignalSource",
+    "assert_and_consume_risk_decision",
+    "build_correlation_evidence",
+    "build_entry_risk_evidence",
+    "build_entry_signal",
     "build_entry_intent",
+    "build_liquidity_evidence",
+    "build_ml_corroboration_evidence",
     "build_refreshed_quote_evidence",
     "evaluate_entry_intent",
+    "produce_live_broker_quote_source",
 ]

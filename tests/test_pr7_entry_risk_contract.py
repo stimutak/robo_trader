@@ -2,7 +2,7 @@
 
 import copy
 import pickle
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, fields, replace
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_UP, Decimal, Overflow, localcontext
 
@@ -23,16 +23,28 @@ from robo_trader.risk.entry_contract import (
     EntrySignal,
     LimitingCapacity,
     LiquidityEvidence,
+    LiveBrokerQuoteSourceCapability,
+    MLCorroborationEvidence,
     RefreshedQuoteEvidence,
+    RefreshedQuoteSource,
     RiskReason,
     SignalSource,
+    assert_and_consume_risk_decision,
+    build_correlation_evidence,
+    build_entry_risk_evidence,
+    build_entry_signal,
     build_entry_intent,
+    build_liquidity_evidence,
+    build_ml_corroboration_evidence,
     build_refreshed_quote_evidence,
     evaluate_entry_intent,
+    produce_live_broker_quote_source,
 )
 
 NOW = datetime(2026, 7, 28, 15, 0, tzinfo=timezone.utc)
 ACTIVE_GENERATION = "ib-session-42"
+SOURCE_DATA_VERSION = "bars-20260728T145900Z"
+QUOTE_PRODUCER_ID = "ibkr-readonly-worker-7"
 _UNSET = object()
 
 
@@ -60,14 +72,14 @@ def _signal(**changes: object) -> EntrySignal:
         "source": SignalSource.BASE_STRATEGY,
         "confidence_fraction": Decimal("0.81"),
         "requested_position_fraction": Decimal("0.10"),
-        "source_data_version": "bars-20260728T145900Z",
+        "source_data_version": SOURCE_DATA_VERSION,
         "broker_contract": _contract(),
         "transport_generation": ACTIVE_GENERATION,
         "observed_at": NOW - timedelta(seconds=10),
         "expires_at": NOW + timedelta(minutes=2),
     }
     values.update(changes)
-    return EntrySignal(**values)  # type: ignore[arg-type]
+    return build_entry_signal(**values)  # type: ignore[arg-type]
 
 
 def _intent(**signal_changes: object) -> EntryIntent:
@@ -117,30 +129,78 @@ def _quote(**changes: object) -> RefreshedQuoteEvidence:
         "price_usd": Decimal("333"),
         "observed_at": NOW - timedelta(seconds=1),
         "transport_generation": ACTIVE_GENERATION,
-        "source": "live-broker",
     }
     values.update(changes)
-    return build_refreshed_quote_evidence(**values)  # type: ignore[arg-type]
+    source = produce_live_broker_quote_source(
+        producer_id=QUOTE_PRODUCER_ID,
+        **values,  # type: ignore[arg-type]
+    )
+    return build_refreshed_quote_evidence(source_capability=source)
+
+
+def _correlation(**changes: object) -> CorrelationEvidence:
+    values: dict[str, object] = {
+        "portfolio_id": "portfolio-alpha",
+        "symbol": "AAPL",
+        "source_data_version": SOURCE_DATA_VERSION,
+        "broker_contract": _contract(),
+        "transport_generation": ACTIVE_GENERATION,
+        "complete": True,
+        "existing_position_count": 0,
+        "max_absolute_correlation": Decimal("0"),
+        "observed_at": NOW - timedelta(seconds=1),
+    }
+    values.update(changes)
+    return build_correlation_evidence(**values)  # type: ignore[arg-type]
+
+
+def _liquidity(**changes: object) -> LiquidityEvidence:
+    values: dict[str, object] = {
+        "portfolio_id": "portfolio-alpha",
+        "symbol": "AAPL",
+        "source_data_version": SOURCE_DATA_VERSION,
+        "broker_contract": _contract(),
+        "transport_generation": ACTIVE_GENERATION,
+        "complete": True,
+        "average_daily_dollar_volume_usd": Decimal("10000000"),
+        "observed_at": NOW - timedelta(seconds=1),
+    }
+    values.update(changes)
+    return build_liquidity_evidence(**values)  # type: ignore[arg-type]
+
+
+def _ml(**changes: object) -> MLCorroborationEvidence:
+    values: dict[str, object] = {
+        "signal_id": "sig-001",
+        "portfolio_id": "portfolio-alpha",
+        "symbol": "AAPL",
+        "source_data_version": SOURCE_DATA_VERSION,
+        "broker_contract": _contract(),
+        "transport_generation": ACTIVE_GENERATION,
+        "model_id": "entry-ml-v1",
+        "corroborated": True,
+        "confidence_fraction": Decimal("0.77"),
+        "observed_at": NOW - timedelta(seconds=1),
+        "expires_at": NOW + timedelta(seconds=10),
+    }
+    values.update(changes)
+    return build_ml_corroboration_evidence(**values)  # type: ignore[arg-type]
 
 
 def _evidence(**changes: object) -> EntryRiskEvidence:
+    quote = changes.pop("quote") if "quote" in changes else _quote()
+    correlation = changes.pop("correlation") if "correlation" in changes else _correlation()
+    liquidity = changes.pop("liquidity") if "liquidity" in changes else _liquidity()
+    ml = changes.pop("ml_corroboration") if "ml_corroboration" in changes else None
     values: dict[str, object] = {
         "portfolio_id": "portfolio-alpha",
         "symbol": "AAPL",
         "observed_at": NOW - timedelta(seconds=1),
-        "quote": _quote(),
+        "quote": quote,
         "sector": "Technology",
-        "correlation": CorrelationEvidence(
-            complete=True,
-            existing_position_count=0,
-            max_absolute_correlation=Decimal("0"),
-            observed_at=NOW - timedelta(seconds=1),
-        ),
-        "liquidity": LiquidityEvidence(
-            complete=True,
-            average_daily_dollar_volume_usd=Decimal("10000000"),
-            observed_at=NOW - timedelta(seconds=1),
-        ),
+        "correlation": correlation,
+        "liquidity": liquidity,
+        "ml_corroboration": ml,
         "portfolio_equity_usd": Decimal("100000"),
         "cash_available_usd": Decimal("50000"),
         "buying_power_usd": Decimal("100000"),
@@ -150,7 +210,7 @@ def _evidence(**changes: object) -> EntryRiskEvidence:
         "daily_executed_notional_usd": Decimal("0"),
     }
     values.update(changes)
-    return EntryRiskEvidence(**values)  # type: ignore[arg-type]
+    return build_entry_risk_evidence(**values)  # type: ignore[arg-type]
 
 
 def _evaluate(
@@ -161,6 +221,7 @@ def _evaluate(
     flags: EntryFeatureFlags | None = None,
     expected_broker_contract: object = _UNSET,
     expected_transport_generation: object = ACTIVE_GENERATION,
+    expected_quote_producer_id: object = QUOTE_PRODUCER_ID,
     evaluated_at: datetime = NOW,
 ):
     authoritative_contract = (
@@ -173,6 +234,7 @@ def _evaluate(
         flags or _flags(),
         expected_broker_contract=authoritative_contract,  # type: ignore[arg-type]
         expected_transport_generation=expected_transport_generation,  # type: ignore[arg-type]
+        expected_quote_producer_id=expected_quote_producer_id,  # type: ignore[arg-type]
         evaluated_at=evaluated_at,
     )
 
@@ -272,10 +334,8 @@ def test_intent_generation_rollback_future_and_substitution_are_rejected(
     decision = _evaluate(intent=intent, evidence=_evidence(quote=quote))
 
     assert decision.risk_approved is False
-    assert decision.reasons == (
-        RiskReason.INTENT_BROKER_LINEAGE_MISMATCH,
-        RiskReason.QUOTE_BROKER_LINEAGE_MISMATCH,
-    )
+    assert RiskReason.INTENT_BROKER_LINEAGE_MISMATCH in decision.reasons
+    assert RiskReason.QUOTE_BROKER_LINEAGE_MISMATCH in decision.reasons
 
 
 @pytest.mark.parametrize(
@@ -301,10 +361,8 @@ def test_intent_contract_substitution_is_rejected_even_with_matching_quote() -> 
     decision = _evaluate(intent=intent, evidence=_evidence(quote=quote))
 
     assert decision.risk_approved is False
-    assert decision.reasons == (
-        RiskReason.INTENT_BROKER_LINEAGE_MISMATCH,
-        RiskReason.QUOTE_BROKER_LINEAGE_MISMATCH,
-    )
+    assert RiskReason.INTENT_BROKER_LINEAGE_MISMATCH in decision.reasons
+    assert RiskReason.QUOTE_BROKER_LINEAGE_MISMATCH in decision.reasons
 
 
 @pytest.mark.parametrize(
@@ -351,6 +409,293 @@ def test_intent_and_quote_cannot_be_copied_or_replaced(
 ) -> None:
     with pytest.raises((EntryRiskContractError, TypeError, ValueError)):
         operation(evidence_factory())
+
+
+@pytest.mark.parametrize("kind", ["correlation", "liquidity"])
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"portfolio_id": "portfolio-beta"},
+        {"source_data_version": "bars-other"},
+        {"broker_contract": _contract(con_id=265599)},
+        {"transport_generation": "ib-session-other"},
+    ],
+)
+def test_nested_market_evidence_is_bound_to_the_exact_intent_scope(
+    kind: str,
+    changes: dict[str, object],
+) -> None:
+    builder = _correlation if kind == "correlation" else _liquidity
+    nested = builder(**changes)
+
+    decision = _evaluate(evidence=_evidence(**{kind: nested}))
+
+    assert decision.risk_approved is False
+    assert RiskReason.EVIDENCE_SCOPE_MISMATCH in decision.reasons
+
+
+@pytest.mark.parametrize("kind", ["correlation", "liquidity"])
+def test_nested_market_evidence_rejects_cross_symbol_substitution(kind: str) -> None:
+    microsoft = _contract(
+        con_id=272093,
+        symbol="MSFT",
+        local_symbol="MSFT",
+        primary_exchange="NASDAQ",
+        trading_class="NMS",
+    )
+    builder = _correlation if kind == "correlation" else _liquidity
+    nested = builder(symbol="MSFT", broker_contract=microsoft)
+
+    decision = _evaluate(evidence=_evidence(**{kind: nested}))
+
+    assert decision.risk_approved is False
+    assert RiskReason.EVIDENCE_SCOPE_MISMATCH in decision.reasons
+
+
+def test_ai_discovery_flag_alone_cannot_replace_ml_corroboration() -> None:
+    intent = _intent(source=SignalSource.AI_DISCOVERY)
+
+    decision = _evaluate(
+        intent=intent,
+        flags=_flags(ai_discovery_entries_enabled=True),
+    )
+
+    assert decision.risk_approved is False
+    assert RiskReason.MISSING_ML_CORROBORATION in decision.reasons
+
+
+def test_fresh_exact_ml_corroboration_allows_enabled_ai_discovery_risk_evaluation() -> None:
+    contract = _contract()
+    intent = _intent(
+        source=SignalSource.AI_DISCOVERY,
+        broker_contract=contract,
+    )
+    ml = _ml(broker_contract=contract)
+
+    decision = _evaluate(
+        intent=intent,
+        evidence=_evidence(ml_corroboration=ml),
+        flags=_flags(ai_discovery_entries_enabled=True),
+        expected_broker_contract=contract,
+    )
+
+    assert decision.risk_approved is True
+    assert decision.reasons == (RiskReason.APPROVED,)
+
+
+@pytest.mark.parametrize(
+    "ml_changes",
+    [
+        {"signal_id": "sig-other"},
+        {"portfolio_id": "portfolio-beta"},
+        {"source_data_version": "bars-other"},
+        {"broker_contract": _contract(con_id=265599)},
+        {"transport_generation": "ib-session-other"},
+        {"corroborated": False},
+        {"confidence_fraction": Decimal("0")},
+        {
+            "observed_at": NOW - timedelta(seconds=40),
+            "expires_at": NOW + timedelta(seconds=1),
+        },
+        {
+            "observed_at": NOW - timedelta(seconds=2),
+            "expires_at": NOW - timedelta(seconds=1),
+        },
+    ],
+)
+def test_ai_discovery_rejects_unscoped_stale_or_negative_ml_corroboration(
+    ml_changes: dict[str, object],
+) -> None:
+    intent = _intent(source=SignalSource.AI_DISCOVERY)
+    ml = _ml(**ml_changes)
+
+    decision = _evaluate(
+        intent=intent,
+        evidence=_evidence(ml_corroboration=ml),
+        flags=_flags(ai_discovery_entries_enabled=True),
+    )
+
+    assert decision.risk_approved is False
+    assert {
+        RiskReason.EVIDENCE_SCOPE_MISMATCH,
+        RiskReason.ML_CORROBORATION_REQUIRED,
+    }.intersection(decision.reasons)
+
+
+def test_ai_discovery_zero_confidence_signal_fails_despite_positive_ml() -> None:
+    intent = _intent(
+        source=SignalSource.AI_DISCOVERY,
+        confidence_fraction=Decimal("0"),
+    )
+
+    decision = _evaluate(
+        intent=intent,
+        evidence=_evidence(ml_corroboration=_ml()),
+        flags=_flags(ai_discovery_entries_enabled=True),
+    )
+
+    assert decision.risk_approved is False
+    assert RiskReason.ML_CORROBORATION_REQUIRED in decision.reasons
+
+
+def _raw_clone(capability):
+    values = {field.name: getattr(capability, field.name) for field in fields(capability)}
+    return type(capability)(**values)
+
+
+def _source_capability() -> LiveBrokerQuoteSourceCapability:
+    return produce_live_broker_quote_source(
+        producer_id=QUOTE_PRODUCER_ID,
+        quote_id="quote-source-only",
+        refresh_request_id="refresh-source-only",
+        broker_contract=_contract(),
+        price_usd=Decimal("333"),
+        observed_at=NOW - timedelta(seconds=1),
+        transport_generation=ACTIVE_GENERATION,
+    )
+
+
+def _decision():
+    return _evaluate()
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        _signal,
+        _intent,
+        _source_capability,
+        _quote,
+        _correlation,
+        _liquidity,
+        _ml,
+        _evidence,
+        _decision,
+    ],
+)
+def test_sealed_contract_records_reject_raw_reconstruction(factory) -> None:
+    capability = factory()
+
+    assert getattr(capability, "_seal", None) is None
+    with pytest.raises(EntryRiskContractError, match="factory-only"):
+        _raw_clone(capability)
+
+
+@pytest.mark.parametrize("operation", [copy.copy, copy.deepcopy, pickle.dumps, replace])
+@pytest.mark.parametrize(
+    "factory",
+    [
+        _signal,
+        _intent,
+        _source_capability,
+        _quote,
+        _correlation,
+        _liquidity,
+        _ml,
+        _evidence,
+        _decision,
+    ],
+)
+def test_all_sealed_contract_records_reject_copy_pickle_and_replace(
+    operation,
+    factory,
+) -> None:
+    with pytest.raises((EntryRiskContractError, TypeError, ValueError)):
+        operation(factory())
+
+
+def test_quote_builder_requires_and_consumes_exact_typed_source_capability() -> None:
+    with pytest.raises(EntryRiskContractError, match="exact LiveBrokerQuoteSourceCapability"):
+        build_refreshed_quote_evidence(source_capability=object())  # type: ignore[arg-type]
+
+    source = _source_capability()
+    quote = build_refreshed_quote_evidence(source_capability=source)
+    assert quote.source is RefreshedQuoteSource.LIVE_BROKER
+    with pytest.raises(EntryRiskContractError, match="already consumed"):
+        build_refreshed_quote_evidence(source_capability=source)
+
+
+def test_quote_from_another_registered_producer_is_rejected() -> None:
+    source = produce_live_broker_quote_source(
+        producer_id="ibkr-readonly-worker-other",
+        quote_id="quote-other-producer",
+        refresh_request_id="refresh-001",
+        broker_contract=_contract(),
+        price_usd=Decimal("333"),
+        observed_at=NOW - timedelta(seconds=1),
+        transport_generation=ACTIVE_GENERATION,
+    )
+    quote = build_refreshed_quote_evidence(source_capability=source)
+
+    decision = _evaluate(evidence=_evidence(quote=quote))
+
+    assert decision.risk_approved is False
+    assert decision.reasons == (RiskReason.QUOTE_SOURCE_MISMATCH,)
+
+
+def test_capability_mutation_and_replay_cannot_mint_authority() -> None:
+    signal = _signal()
+    object.__setattr__(signal, "symbol", "MSFT")
+    with pytest.raises(EntryRiskContractError, match="altered"):
+        build_entry_intent(
+            signal,
+            intent_id="intent-mutated",
+            quote_refresh_request_id="refresh-mutated",
+            created_at=NOW - timedelta(seconds=5),
+        )
+
+    quote = _quote()
+    object.__setattr__(quote, "price_usd", Decimal("1"))
+    with pytest.raises(EntryRiskContractError, match="altered"):
+        _evidence(quote=quote)
+
+    intent = _intent()
+    evidence = _evidence()
+    object.__setattr__(evidence, "portfolio_id", "portfolio-beta")
+    with pytest.raises(EntryRiskContractError, match="altered"):
+        _evaluate(intent=intent, evidence=evidence)
+
+
+def test_signal_intent_evidence_and_decision_are_each_single_use() -> None:
+    signal = _signal()
+    build_entry_intent(
+        signal,
+        intent_id="intent-first",
+        quote_refresh_request_id="refresh-first",
+        created_at=NOW - timedelta(seconds=5),
+    )
+    with pytest.raises(EntryRiskContractError, match="already consumed"):
+        build_entry_intent(
+            signal,
+            intent_id="intent-second",
+            quote_refresh_request_id="refresh-second",
+            created_at=NOW - timedelta(seconds=4),
+        )
+
+    intent = _intent()
+    evidence = _evidence()
+    decision = _evaluate(intent=intent, evidence=evidence)
+    with pytest.raises(EntryRiskContractError, match="already consumed"):
+        _evaluate(intent=intent, evidence=_evidence())
+    assert assert_and_consume_risk_decision(decision) is decision
+    with pytest.raises(EntryRiskContractError, match="already consumed"):
+        assert_and_consume_risk_decision(decision)
+
+
+def test_mutated_or_replaced_risk_decision_cannot_be_consumed() -> None:
+    replaced_target = _decision()
+    with pytest.raises(EntryRiskContractError, match="factory-only"):
+        replace(
+            replaced_target,
+            risk_approved=True,
+            approved_quantity=999,
+            approved_notional_usd=Decimal("999999"),
+        )
+
+    mutated = _decision()
+    object.__setattr__(mutated, "approved_quantity", 999)
+    with pytest.raises(EntryRiskContractError, match="altered"):
+        assert_and_consume_risk_decision(mutated)
 
 
 def test_configured_two_percent_cap_floors_quantity_and_never_rounds_up() -> None:
@@ -402,8 +747,7 @@ def test_large_coefficients_remain_exact_under_hostile_ambient_context() -> None
         buying_power_usd=generous_capacity,
         current_symbol_gross_notional_usd=Decimal("0.01"),
         quote=_quote(price_usd=price),
-        liquidity=LiquidityEvidence(
-            complete=True,
+        liquidity=_liquidity(
             average_daily_dollar_volume_usd=generous_capacity,
             observed_at=NOW - timedelta(seconds=1),
         ),
@@ -526,17 +870,15 @@ def test_quote_must_be_fresh_and_bound_to_the_intent(quote: RefreshedQuoteEviden
 
 @pytest.mark.parametrize("kind", ["correlation", "liquidity"])
 def test_incomplete_or_stale_market_evidence_fails_closed(kind: str) -> None:
-    evidence = _evidence()
-    item = getattr(evidence, kind)
-    assert item is not None
-    incomplete = replace(item, complete=False)
-    stale = replace(item, observed_at=NOW - timedelta(seconds=31))
+    builder = _correlation if kind == "correlation" else _liquidity
+    incomplete = builder(complete=False)
+    stale = builder(observed_at=NOW - timedelta(seconds=31))
     expected = (
         RiskReason.MISSING_CORRELATION if kind == "correlation" else RiskReason.MISSING_LIQUIDITY
     )
 
-    incomplete_decision = _evaluate(evidence=replace(evidence, **{kind: incomplete}))
-    stale_decision = _evaluate(evidence=replace(evidence, **{kind: stale}))
+    incomplete_decision = _evaluate(evidence=_evidence(**{kind: incomplete}))
+    stale_decision = _evaluate(evidence=_evidence(**{kind: stale}))
 
     assert incomplete_decision.reasons == (expected,)
     assert stale_decision.reasons == (expected,)
@@ -583,16 +925,12 @@ def test_each_exposure_unit_constrains_the_same_usd_order_notional(
 
 
 def test_correlation_and_liquidity_thresholds_reject_before_sizing() -> None:
-    high_correlation = CorrelationEvidence(
-        complete=True,
+    high_correlation = _correlation(
         existing_position_count=2,
         max_absolute_correlation=Decimal("0.81"),
-        observed_at=NOW - timedelta(seconds=1),
     )
-    low_liquidity = LiquidityEvidence(
-        complete=True,
+    low_liquidity = _liquidity(
         average_daily_dollar_volume_usd=Decimal("999999"),
-        observed_at=NOW - timedelta(seconds=1),
     )
 
     assert _evaluate(evidence=_evidence(correlation=high_correlation)).reasons == (
