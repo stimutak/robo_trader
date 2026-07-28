@@ -9,6 +9,7 @@ shared by every portfolio runner in the process.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import stat
@@ -460,13 +461,69 @@ class PaperReductionGateway:
                 )
                 if consecutive_failures >= self._protective_feed_max_recovery_attempts:
                     self._protective_feed_enabled = False
+                    reason = (
+                        "protective quote feed disabled after "
+                        f"{consecutive_failures} consecutive refresh failures"
+                    )
+                    self._latch_protective_feed_quarantine(reason)
                     logger.critical(
                         "event=protective_quote_feed_disabled "
                         "operator_action_required=true consecutive_failures=%d",
                         consecutive_failures,
                     )
+                    await self._emit_protective_feed_operator_alert(reason)
                     break
-            await asyncio.sleep(self._protective_feed_interval_seconds)
+            await self._sleep(self._protective_feed_interval_seconds)
+
+    def _latch_protective_feed_quarantine(self, reason: str) -> None:
+        """Synchronously close account admission when continuous protection dies."""
+
+        reason_text = str(reason or "protective quote feed failure").strip()
+        if not reason_text:
+            reason_text = "protective quote feed failure"
+        if self._terminal_quarantine_reason is not None:
+            return
+        self._terminal_quarantine_reason = reason_text
+        for portfolio_id, binding in tuple(getattr(self, "_bindings", {}).items()):
+            if type(binding) is not _PaperRuntimeBinding:
+                continue
+            try:
+                binding.settlement_participant.latch_quarantine(reason_text)
+            except Exception:
+                logger.critical(
+                    "event=paper_runtime_quarantine_callback_failed portfolio_id=%s",
+                    portfolio_id,
+                    exc_info=True,
+                )
+        logger.critical(
+            "event=paper_reduction_gateway_terminal_quarantine " "scope=account reason=%s",
+            reason_text,
+        )
+
+    async def _emit_protective_feed_operator_alert(self, reason: str) -> None:
+        """Use each runner's existing emergency callback to alert and freeze entries."""
+
+        for portfolio_id, producer in tuple(self._protective_quote_producers.items()):
+            callback = getattr(producer, "emergency_shutdown", None)
+            if not callable(callback):
+                logger.critical(
+                    "event=protective_quote_operator_alert_unavailable portfolio_id=%s",
+                    portfolio_id,
+                )
+                continue
+            try:
+                result = callback(reason)
+                if not inspect.isawaitable(result):
+                    raise PaperReductionGatewayError(
+                        "protective quote operator alert callback must be awaitable"
+                    )
+                await result
+            except Exception:
+                logger.critical(
+                    "event=protective_quote_operator_alert_failed portfolio_id=%s",
+                    portfolio_id,
+                    exc_info=True,
+                )
 
     async def close(self) -> None:
         """Stop only the gateway-owned diagnostic client."""

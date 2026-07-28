@@ -2669,50 +2669,144 @@ class AsyncTradingDatabase:
                         f"batch_store_market_data row[{idx}] is not canonical: {exc}"
                     ) from exc
 
+        canonical_conflict: Optional[Tuple[dict, Tuple[str, ...]]] = None
         async with self.get_connection() as conn:
             if canonical_mode:
-                await conn.executemany(
-                    """
-                    INSERT INTO canonical_market_data (
-                        schema_version, symbol, con_id, exchange,
-                        primary_exchange, timeframe, interval_seconds,
-                        timezone_name, session_policy, timestamp,
-                        open, high, low, close, volume, session, source,
-                        retrieval_timestamp, broker_timestamp,
-                        adjustment_state, quality_flags, transport_generation,
-                        timestamp_semantics, use_rth, what_to_show
-                    ) VALUES (
-                        :schema_version, :symbol, :con_id, :exchange,
-                        :primary_exchange, :timeframe, :interval_seconds,
-                        :timezone_name, :session_policy, :timestamp,
-                        :open, :high, :low, :close, :volume, :session, :source,
-                        :retrieval_timestamp, :broker_timestamp,
-                        :adjustment_state, :quality_flags, :transport_generation,
-                        :timestamp_semantics, :use_rth, :what_to_show
-                    )
-                    ON CONFLICT (
-                        schema_version, source, con_id, timeframe,
-                        session_policy, adjustment_state, timestamp_semantics,
-                        use_rth, what_to_show, timestamp
-                    ) DO UPDATE SET
-                        symbol = excluded.symbol,
-                        exchange = excluded.exchange,
-                        primary_exchange = excluded.primary_exchange,
-                        interval_seconds = excluded.interval_seconds,
-                        timezone_name = excluded.timezone_name,
-                        open = excluded.open,
-                        high = excluded.high,
-                        low = excluded.low,
-                        close = excluded.close,
-                        volume = excluded.volume,
-                        session = excluded.session,
-                        retrieval_timestamp = excluded.retrieval_timestamp,
-                        broker_timestamp = excluded.broker_timestamp,
-                        quality_flags = excluded.quality_flags,
-                        transport_generation = excluded.transport_generation
-                    """,
-                    normalized_canonical_rows,
+                storage_columns = (
+                    "schema_version",
+                    "symbol",
+                    "con_id",
+                    "exchange",
+                    "primary_exchange",
+                    "timeframe",
+                    "interval_seconds",
+                    "timezone_name",
+                    "session_policy",
+                    "timestamp",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "session",
+                    "source",
+                    "retrieval_timestamp",
+                    "broker_timestamp",
+                    "adjustment_state",
+                    "quality_flags",
+                    "transport_generation",
+                    "timestamp_semantics",
+                    "use_rth",
+                    "what_to_show",
                 )
+                identity_columns = (
+                    "schema_version",
+                    "source",
+                    "con_id",
+                    "timeframe",
+                    "session_policy",
+                    "adjustment_state",
+                    "timestamp_semantics",
+                    "use_rth",
+                    "what_to_show",
+                )
+                event_columns = tuple(
+                    column
+                    for column in storage_columns
+                    if column
+                    not in {
+                        "retrieval_timestamp",
+                        "broker_timestamp",
+                        "transport_generation",
+                    }
+                )
+                grouped_rows: Dict[Tuple, List[dict]] = {}
+                incoming_events: Dict[Tuple, dict] = {}
+                for row in normalized_canonical_rows:
+                    group_key = tuple(row[column] for column in identity_columns)
+                    event_key = (*group_key, row["timestamp"])
+                    prior = incoming_events.get(event_key)
+                    if prior is not None:
+                        changed = tuple(
+                            column for column in event_columns if prior[column] != row[column]
+                        )
+                        if changed:
+                            canonical_conflict = (row, changed)
+                            break
+                        continue
+                    incoming_events[event_key] = row
+                    grouped_rows.setdefault(group_key, []).append(row)
+
+                # Lock the writer before comparing immutable event identities.
+                # The retrieval clocks and transport generation describe later
+                # observations of the same broker event; they never rewrite the
+                # first admitted observation. A changed event payload is a
+                # conflict and fails the whole batch before any row is inserted.
+                if canonical_conflict is None:
+                    await conn.execute("BEGIN IMMEDIATE")
+                    for group_key, group_rows in grouped_rows.items():
+                        timestamps = [row["timestamp"] for row in group_rows]
+                        existing_cursor = await conn.execute(
+                            f"""
+                            SELECT {", ".join(storage_columns)}
+                            FROM canonical_market_data
+                            WHERE {" AND ".join(f"{column} = ?" for column in identity_columns)}
+                              AND timestamp BETWEEN ? AND ?
+                            """,
+                            (*group_key, min(timestamps), max(timestamps)),
+                        )
+                        existing_rows = {
+                            existing[storage_columns.index("timestamp")]: dict(
+                                zip(storage_columns, existing)
+                            )
+                            for existing in await existing_cursor.fetchall()
+                        }
+                        for row in group_rows:
+                            existing = existing_rows.get(row["timestamp"])
+                            if existing is None:
+                                continue
+                            changed = tuple(
+                                column
+                                for column in event_columns
+                                if existing[column] != row[column]
+                            )
+                            if changed:
+                                canonical_conflict = (row, changed)
+                                break
+                        if canonical_conflict is not None:
+                            break
+
+                if canonical_conflict is not None:
+                    await conn.rollback()
+                else:
+                    await conn.executemany(
+                        """
+                        INSERT INTO canonical_market_data (
+                            schema_version, symbol, con_id, exchange,
+                            primary_exchange, timeframe, interval_seconds,
+                            timezone_name, session_policy, timestamp,
+                            open, high, low, close, volume, session, source,
+                            retrieval_timestamp, broker_timestamp,
+                            adjustment_state, quality_flags, transport_generation,
+                            timestamp_semantics, use_rth, what_to_show
+                        ) VALUES (
+                            :schema_version, :symbol, :con_id, :exchange,
+                            :primary_exchange, :timeframe, :interval_seconds,
+                            :timezone_name, :session_policy, :timestamp,
+                            :open, :high, :low, :close, :volume, :session, :source,
+                            :retrieval_timestamp, :broker_timestamp,
+                            :adjustment_state, :quality_flags, :transport_generation,
+                            :timestamp_semantics, :use_rth, :what_to_show
+                        )
+                        ON CONFLICT (
+                            schema_version, source, con_id, timeframe,
+                            session_policy, adjustment_state, timestamp_semantics,
+                            use_rth, what_to_show, timestamp
+                        ) DO NOTHING
+                        """,
+                        normalized_canonical_rows,
+                    )
+                    await conn.commit()
             else:
                 await conn.executemany(
                     """
@@ -2728,11 +2822,28 @@ class AsyncTradingDatabase:
                     """,
                     data,
                 )
-            await conn.commit()
-            logger.debug(
-                "Stored %d %s market data bars",
-                len(data),
-                "canonical" if canonical_mode else "legacy",
+            if not canonical_mode:
+                await conn.commit()
+            if canonical_conflict is None:
+                logger.debug(
+                    "Stored %d %s market data bars",
+                    len(data),
+                    "canonical" if canonical_mode else "legacy",
+                )
+        if canonical_conflict is not None:
+            conflict_row, changed_fields = canonical_conflict
+            logger.critical(
+                "event=canonical_market_data_conflict symbol=%s con_id=%s "
+                "timeframe=%s timestamp=%s changed_fields=%s",
+                conflict_row["symbol"],
+                conflict_row["con_id"],
+                conflict_row["timeframe"],
+                conflict_row["timestamp"],
+                ",".join(changed_fields),
+            )
+            raise ValueError(
+                "canonical market-data event conflicts with immutable stored evidence: "
+                + ", ".join(changed_fields)
             )
 
     async def get_position(

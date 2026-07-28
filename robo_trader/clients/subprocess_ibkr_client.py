@@ -59,6 +59,7 @@ from robo_trader.market_data_contract import (
     MarketSession,
     canonicalize_historical_bars,
 )
+from robo_trader.market_hours import get_market_session
 from robo_trader.protective_quote_evidence import (
     MAX_PROTECTIVE_SOURCE_EVENT_ID_LENGTH,
 )
@@ -3279,6 +3280,15 @@ class SubprocessIBKRClient:
                 if (now - source_timestamp).total_seconds() < 0:
                     raise ValueError("protective quote source timestamp is in the future")
                 try:
+                    reported_session = MarketSession(raw["session"])
+                    derived_session = MarketSession(get_market_session(source_timestamp))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "protective quote source timestamp is outside an admitted market session"
+                    ) from exc
+                if reported_session is not derived_session:
+                    raise ValueError("protective quote session contradicts its source timestamp")
+                try:
                     quote = BrokerProtectiveQuote(
                         schema_version=raw["schema_version"],
                         symbol=raw["symbol"],
@@ -3290,7 +3300,7 @@ class SubprocessIBKRClient:
                         price=Decimal(str(raw["price"])),
                         source_timestamp=source_timestamp,
                         retrieval_timestamp=quote_retrieval,
-                        session=MarketSession(raw["session"]),
+                        session=derived_session,
                         source=MarketDataSource(raw["source"]),
                         source_event_id=raw["source_event_id"],
                         transport_generation=generation.generation_id,

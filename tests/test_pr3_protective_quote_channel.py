@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from robo_trader.clients import ibkr_subprocess_worker as worker
+from robo_trader.clients import subprocess_ibkr_client as client_module
 from robo_trader.clients.subprocess_ibkr_client import (
     IBKRTransportPoisonedError,
     SubprocessIBKRClient,
@@ -494,6 +495,7 @@ def _connected_client(
     *,
     generation_id: str = "generation-1",
 ):
+    monkeypatch.setattr(client_module, "get_market_session", lambda _timestamp: "regular")
     client = SubprocessIBKRClient()
     generation = _WorkerGeneration(
         generation_id=generation_id,
@@ -786,6 +788,20 @@ async def test_non_live_quote_poisons_the_exact_worker_generation(
     )
 
     with pytest.raises(IBKRTransportPoisonedError, match="not live"):
+        await client.get_protective_quotes(["AAPL"])
+
+    assert generation.poisoned_reason is not None
+
+
+@pytest.mark.asyncio
+async def test_session_timestamp_mismatch_poisons_the_exact_worker_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _client_response()
+    client, generation = _connected_client(monkeypatch, response)
+    monkeypatch.setattr(client_module, "get_market_session", lambda _timestamp: "after-hours")
+
+    with pytest.raises(IBKRTransportPoisonedError, match="session contradicts"):
         await client.get_protective_quotes(["AAPL"])
 
     assert generation.poisoned_reason is not None
@@ -1343,3 +1359,64 @@ async def test_feed_task_is_singleton_and_cancellable() -> None:
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_feed_recovers_before_failure_limit_without_quarantine() -> None:
+    gateway = object.__new__(PaperReductionGateway)
+    gateway._started = True
+    gateway._diagnostic_recovery_required = False
+    gateway._terminal_quarantine_reason = None
+    gateway._bindings = {}
+    gateway._protective_quote_producers = {}
+    gateway._protective_feed_enabled = True
+    gateway._protective_feed_interval_seconds = 0
+    gateway._protective_feed_max_recovery_attempts = 3
+    gateway.refresh_protective_quotes = AsyncMock(
+        side_effect=[RuntimeError("transient feed failure"), ()]
+    )
+
+    async def stop_after_recovery(_seconds: float) -> None:
+        if gateway.refresh_protective_quotes.await_count == 2:
+            gateway._protective_feed_enabled = False
+
+    gateway._sleep = stop_after_recovery
+
+    await gateway._protective_feed_loop()
+
+    assert gateway.refresh_protective_quotes.await_count == 2
+    assert gateway.terminal_quarantine_reason is None
+    assert gateway.can_attempt_order_admission is True
+
+
+@pytest.mark.asyncio
+async def test_feed_terminal_failure_quarantines_and_alerts_every_runner() -> None:
+    alerts = {portfolio_id: AsyncMock() for portfolio_id in ("growth", "income")}
+    producers = {
+        portfolio_id: SimpleNamespace(emergency_shutdown=callback)
+        for portfolio_id, callback in alerts.items()
+    }
+    gateway = object.__new__(PaperReductionGateway)
+    gateway._started = True
+    gateway._diagnostic_recovery_required = False
+    gateway._terminal_quarantine_reason = None
+    gateway._bindings = {}
+    gateway._protective_quote_producers = producers
+    gateway._protective_feed_enabled = True
+    gateway._protective_feed_interval_seconds = 0
+    gateway._protective_feed_max_recovery_attempts = 3
+    gateway.refresh_protective_quotes = AsyncMock(
+        side_effect=RuntimeError("persistent feed failure")
+    )
+    sleep = AsyncMock()
+    gateway._sleep = sleep
+
+    await gateway._protective_feed_loop()
+
+    assert gateway.refresh_protective_quotes.await_count == 3
+    assert sleep.await_count == 2
+    assert gateway._protective_feed_enabled is False
+    assert gateway.can_attempt_order_admission is False
+    assert "3 consecutive refresh failures" in gateway.terminal_quarantine_reason
+    for callback in alerts.values():
+        callback.assert_awaited_once_with(gateway.terminal_quarantine_reason)

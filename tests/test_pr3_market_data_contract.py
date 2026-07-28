@@ -186,6 +186,60 @@ async def test_canonical_refreshes_accumulate_by_contract_timeframe_and_time(
         await database.close()
 
 
+@pytest.mark.asyncio
+async def test_canonical_event_conflict_rejects_without_overwriting_first_observation(
+    tmp_path: Path,
+) -> None:
+    database = AsyncTradingDatabase(tmp_path / "immutable-market-data.db", pool_size=1)
+    await database.initialize()
+    batch = canonicalize_historical_bars(
+        symbol="AAPL",
+        records=[_record("2026-07-23T15:00:00+00:00")],
+        lineage=_lineage(),
+        bar_size="1 min",
+        use_rth=True,
+        what_to_show="TRADES",
+        now=datetime(2026, 7, 23, 15, 2, tzinfo=timezone.utc),
+    )
+    original = batch.storage_rows()[0]
+    repeated_observation = {
+        **original,
+        "retrieval_timestamp": "2026-07-23T15:03:00+00:00",
+        "broker_timestamp": "2026-07-23T15:03:00+00:00",
+        "transport_generation": "generation-2",
+    }
+    revised = {
+        **repeated_observation,
+        "close": 100.5,
+    }
+    try:
+        await database.batch_store_market_data([original])
+        await database.batch_store_market_data([original])
+        await database.batch_store_market_data([repeated_observation])
+
+        with pytest.raises(ValueError, match="conflicts with immutable stored evidence"):
+            await database.batch_store_market_data([revised])
+
+        async with database.get_connection() as connection:
+            rows = await (
+                await connection.execute(
+                    "SELECT close, retrieval_timestamp, broker_timestamp, "
+                    "transport_generation, quality_flags FROM canonical_market_data"
+                )
+            ).fetchall()
+        assert rows == [
+            (
+                original["close"],
+                original["retrieval_timestamp"],
+                original["broker_timestamp"],
+                original["transport_generation"],
+                original["quality_flags"],
+            )
+        ]
+    finally:
+        await database.close()
+
+
 def test_canonical_values_remain_exact_before_dataframe_projection() -> None:
     record = _record("2026-07-23T15:00:00+00:00")
     record["close"] = "101.1250"
