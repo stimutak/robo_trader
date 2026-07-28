@@ -24,7 +24,7 @@ import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Optional, cast
+from typing import Any, NamedTuple, Optional, cast
 
 # CRITICAL: Enable real disconnect BEFORE importing ib_async or ibkr_safe
 # This prevents zombie connections when the worker process exits
@@ -112,6 +112,15 @@ class BrokerSnapshotStageTimeout(TimeoutError):
     def __init__(self, stage: str):
         self.stage = stage
         super().__init__(f"Broker snapshot stage timed out: {stage}")
+
+
+class _RequestScopedAccountSummaryValue(NamedTuple):
+    """One account-summary callback attributed to an exact IBKR request ID."""
+
+    account: str
+    tag: str
+    value: str
+    currency: str
 
 
 BROKER_SNAPSHOT_SCHEMA_VERSION = 1
@@ -205,47 +214,111 @@ async def _request_fresh_broker_account_summary(account: str) -> list[Any]:
         raise ConnectionError("Not connected to IBKR")
     client = getattr(ib, "client", None)
     wrapper = getattr(ib, "wrapper", None)
-    summary_cache = getattr(wrapper, "acctSummary", None)
     get_request_id = getattr(client, "getReqId", None)
     request_summary = getattr(client, "reqAccountSummary", None)
     cancel_summary = getattr(client, "cancelAccountSummary", None)
     start_request = getattr(wrapper, "startReq", None)
+    end_request = getattr(wrapper, "_endReq", None)
+    account_summary_callback = getattr(wrapper, "accountSummary", None)
+    wrapper_namespace = getattr(wrapper, "__dict__", None)
     if (
-        not isinstance(summary_cache, dict)
-        or not callable(get_request_id)
+        not callable(get_request_id)
         or not callable(request_summary)
         or not callable(cancel_summary)
         or not callable(start_request)
+        or not callable(end_request)
+        or not callable(account_summary_callback)
+        or not isinstance(wrapper_namespace, dict)
     ):
         raise RuntimeError("IBKR client has no fresh account-summary API")
 
-    # accountSummaryAsync() skips broker I/O whenever this cache is nonempty.
-    # Remove only the expected account's prior values before issuing a request
-    # whose request ID and subscription lifetime are owned by this coroutine.
-    for key, value in list(summary_cache.items()):
-        if str(getattr(value, "account", "")).strip() == account:
-            summary_cache.pop(key, None)
-
     request_id = get_request_id()
-    request = start_request(request_id)
+    if isinstance(request_id, bool) or not isinstance(request_id, int) or request_id < 0:
+        raise RuntimeError("IBKR client returned an invalid account-summary request ID")
+
+    missing = object()
+    previous_instance_callback = wrapper_namespace.get("accountSummary", missing)
+    captured: dict[tuple[str, str, str], _RequestScopedAccountSummaryValue] = {}
+    callback_failed = False
+
+    def capture_owned_account_summary(
+        callback_request_id: int,
+        callback_account: str,
+        tag: str,
+        value: str,
+        currency: str,
+    ) -> None:
+        nonlocal callback_failed
+        try:
+            result = account_summary_callback(
+                callback_request_id,
+                callback_account,
+                tag,
+                value,
+                currency,
+            )
+            if inspect.isawaitable(result):
+                if inspect.iscoroutine(result):
+                    result.close()
+                callback_failed = True
+                return
+        except Exception:
+            callback_failed = True
+            raise
+        if type(callback_request_id) is not int or callback_request_id != request_id:
+            return
+        owned_value = _RequestScopedAccountSummaryValue(
+            account=str(callback_account).strip(),
+            tag=str(tag),
+            value=str(value),
+            currency=str(currency).strip(),
+        )
+        captured[(owned_value.account, owned_value.tag, owned_value.currency)] = owned_value
+
+    request: Any = None
+    callback_overridden = False
+    request_registered = False
     request_started = False
     try:
+        setattr(wrapper, "accountSummary", capture_owned_account_summary)
+        callback_overridden = True
+        if getattr(wrapper, "accountSummary", None) is not capture_owned_account_summary:
+            raise RuntimeError("IBKR account-summary callback cannot be scoped")
+        request = start_request(request_id)
+        request_registered = True
+        # Treat the subscription as possibly live before the synchronous send:
+        # a partial transport write must still trigger a cancellation attempt.
+        request_started = True
         request_summary(
             request_id,
             "All",
             BROKER_SNAPSHOT_ACCOUNT_SUMMARY_TAGS,
         )
-        request_started = True
         await request
     finally:
-        if request_started:
-            cancel_summary(request_id)
+        try:
+            if request_started:
+                cancel_summary(request_id)
+        finally:
+            try:
+                if request_registered:
+                    if not request.done():
+                        request.cancel()
+                    end_request(request_id)
+            finally:
+                if callback_overridden:
+                    if previous_instance_callback is missing:
+                        delattr(wrapper, "accountSummary")
+                    else:
+                        setattr(wrapper, "accountSummary", previous_instance_callback)
+
+    if callback_failed:
+        raise RuntimeError("IBKR account-summary callback provenance cannot be proven")
 
     return [
         value
-        for value in summary_cache.values()
-        if str(getattr(value, "account", "")).strip() == account
-        and str(getattr(value, "tag", "")) in BROKER_SNAPSHOT_BALANCE_TAGS
+        for value in captured.values()
+        if value.account == account and value.tag in BROKER_SNAPSHOT_BALANCE_TAGS
     ]
 
 

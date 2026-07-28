@@ -71,6 +71,21 @@ class _FakeAccountSummaryWrapper:
         self.pending[request_id] = future
         return future
 
+    def _endReq(self, request_id):
+        future = self.pending.pop(request_id, None)
+        if future is not None and not future.done():
+            future.set_result(None)
+
+    def accountSummary(self, request_id, account, tag, value, currency):
+        key = (account, tag, currency)
+        self.acctSummary[key] = SimpleNamespace(
+            request_id=request_id,
+            account=account,
+            tag=tag,
+            currency=currency,
+            value=value,
+        )
+
 
 class _FakeAccountSummaryClient:
     def __init__(self, owner):
@@ -93,14 +108,38 @@ class _FakeAccountSummaryClient:
             len(self.owner.account_summary_batches) - 1,
         )
         for value in self.owner.account_summary_batches[batch_index]:
-            key = (value.account, value.tag, value.currency)
-            self.owner.wrapper.acctSummary[key] = value
-        self.owner.wrapper.pending.pop(request_id).set_result(None)
+            if self.owner.account_summary_bypasses_scoped_callback:
+                _FakeAccountSummaryWrapper.accountSummary(
+                    self.owner.wrapper,
+                    request_id,
+                    value.account,
+                    value.tag,
+                    value.value,
+                    value.currency,
+                )
+            else:
+                self.owner.wrapper.accountSummary(
+                    request_id,
+                    value.account,
+                    value.tag,
+                    value.value,
+                    value.currency,
+                )
+        for foreign_request_id, value in self.owner.foreign_account_summary_callbacks:
+            self.owner.wrapper.accountSummary(
+                foreign_request_id,
+                value.account,
+                value.tag,
+                value.value,
+                value.currency,
+            )
+        self.owner.wrapper._endReq(request_id)
 
     def cancelAccountSummary(self, request_id):
         self.owner.calls.append("cancelAccountSummary")
         self.cancelled_request_ids.append(request_id)
-        self.owner.wrapper.pending.pop(request_id, None)
+        if self.owner.account_summary_cancel_raises:
+            raise RuntimeError("raw cancellation failure with sensitive context")
 
 
 class _FakeIB:
@@ -113,6 +152,9 @@ class _FakeIB:
         self.account_summary_batches = [_account_summary_values()]
         self.account_summary_requests = []
         self.account_summary_hangs = False
+        self.account_summary_bypasses_scoped_callback = False
+        self.account_summary_cancel_raises = False
+        self.foreign_account_summary_callbacks = []
         self.wrapper = _FakeAccountSummaryWrapper()
         self.client = _FakeAccountSummaryClient(self)
 
@@ -344,6 +386,43 @@ async def test_worker_repeated_snapshot_forces_fresh_account_summary(fake_ib):
     assert second_balances[("TotalCashValue", "USD")] == "26000"
     assert len(fake_ib.account_summary_requests) == 2
     assert fake_ib.client.cancelled_request_ids == [1, 2]
+    assert "accountSummary" not in fake_ib.wrapper.__dict__
+
+
+@pytest.mark.asyncio
+async def test_worker_account_summary_ignores_foreign_request_cache_interleaving(fake_ib):
+    fake_ib.account_summary_batches = [
+        _account_summary_values("101000.00", "26000.00"),
+    ]
+    fake_ib.foreign_account_summary_callbacks = [
+        (999, value) for value in _account_summary_values("1.00", "2.00")
+    ]
+
+    result = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert result["status"] == "success"
+    balances = {(row["tag"], row["currency"]): row["value"] for row in result["data"]["balances"]}
+    assert balances[("NetLiquidation", "USD")] == "101000"
+    assert balances[("TotalCashValue", "USD")] == "26000"
+    assert fake_ib.wrapper.acctSummary[(ACCOUNT, "NetLiquidation", "USD")].value == "1.00"
+    assert fake_ib.wrapper.acctSummary[(ACCOUNT, "TotalCashValue", "USD")].value == "2.00"
+    assert "accountSummary" not in fake_ib.wrapper.__dict__
+
+
+@pytest.mark.asyncio
+async def test_worker_account_summary_fails_closed_without_owned_callback_provenance(fake_ib):
+    fake_ib.account_summary_bypasses_scoped_callback = True
+
+    result = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert result == {
+        "status": worker.PROTOCOL_ERROR_STATUS,
+        "error": "Broker snapshot collection failed",
+        "error_type": worker.PROTOCOL_ERROR_TYPE,
+    }
+    assert fake_ib.wrapper.acctSummary
+    assert fake_ib.client.cancelled_request_ids == [1]
+    assert "accountSummary" not in fake_ib.wrapper.__dict__
 
 
 @pytest.mark.asyncio
@@ -737,6 +816,41 @@ async def test_worker_account_summary_timeout_cancels_subscription_and_is_saniti
     }
     assert fake_ib.client.cancelled_request_ids == [1]
     assert fake_ib.wrapper.pending == {}
+    assert "accountSummary" not in fake_ib.wrapper.__dict__
+
+
+@pytest.mark.asyncio
+async def test_worker_account_summary_cancellation_restores_callback_and_subscription(fake_ib):
+    fake_ib.account_summary_hangs = True
+
+    task = asyncio.create_task(worker._request_fresh_broker_account_summary(ACCOUNT))
+    while not fake_ib.account_summary_requests:
+        await asyncio.sleep(0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert fake_ib.client.cancelled_request_ids == [1]
+    assert fake_ib.wrapper.pending == {}
+    assert "accountSummary" not in fake_ib.wrapper.__dict__
+
+
+@pytest.mark.asyncio
+async def test_worker_account_summary_cancel_failure_still_cleans_request_and_callback(fake_ib):
+    fake_ib.account_summary_cancel_raises = True
+
+    result = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert result == {
+        "status": worker.PROTOCOL_ERROR_STATUS,
+        "error": "Broker snapshot collection failed",
+        "error_type": worker.PROTOCOL_ERROR_TYPE,
+    }
+    assert fake_ib.client.cancelled_request_ids == [1]
+    assert fake_ib.wrapper.pending == {}
+    assert "accountSummary" not in fake_ib.wrapper.__dict__
+    assert "sensitive context" not in json.dumps(result)
 
 
 @pytest.mark.asyncio
