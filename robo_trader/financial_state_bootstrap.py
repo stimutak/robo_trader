@@ -1799,7 +1799,9 @@ def sqlite_table_evidence(
         quoted = '"' + table.replace('"', '""') + '"'
         columns = connection.execute(f"PRAGMA table_info({quoted})").fetchall()
         order = ",".join(str(index + 1) for index in range(len(columns)))
-        query = f"SELECT * FROM {quoted}"
+        # Identifier comes only from sqlite_master and the strict _SAFE_ID
+        # allowlist above, never from user input; values are not interpolated.
+        query = f"SELECT * FROM {quoted}"  # nosec B608
         if order:
             query += f" ORDER BY {order}"
         digest = hashlib.sha256()

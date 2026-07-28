@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import aiosqlite
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -582,6 +583,36 @@ def _backup_receipt(
         table_hashes=table_hashes,
         backup_content_hash=backup_hash,
     )
+
+
+def test_sqlite_table_evidence_rejects_malformed_schema_identifier(tmp_path: Path) -> None:
+    database = tmp_path / "malformed-sync.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute('CREATE TABLE "bad name" (value TEXT)')
+        with pytest.raises(ExactStateBootstrapError, match="backup table name is malformed"):
+            sqlite_table_evidence(connection)
+
+
+@pytest.mark.asyncio
+async def test_async_backup_compare_rejects_malformed_schema_identifier(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "malformed-async.db"
+    connection = await aiosqlite.connect(database)
+    try:
+        await connection.execute('CREATE TABLE "bad name" (value TEXT)')
+        await connection.commit()
+        forged_receipt = SimpleNamespace(
+            row_counts=(("bad name", 0),),
+            table_hashes=(("bad name", "0" * 64),),
+        )
+        with pytest.raises(ExactStateBootstrapError, match="source table name is malformed"):
+            await AsyncTradingDatabase._assert_prebootstrap_tables_match_backup(
+                connection,
+                forged_receipt,
+            )
+    finally:
+        await connection.close()
 
 
 def _legacy_rows(path: Path) -> dict[str, list[tuple]]:

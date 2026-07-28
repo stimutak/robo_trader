@@ -33,6 +33,7 @@ from robo_trader.database_migrations import (
 )
 from robo_trader.database_validator import DatabaseValidator, ValidationError
 from robo_trader.financial_state_bootstrap import (
+    _SAFE_ID,
     ExactStateBootstrapBackupReceipt,
     ExactStateBootstrapCandidate,
     ExactStateBootstrapCommittedBackupInvalid,
@@ -1669,11 +1670,15 @@ class AsyncTradingDatabase:
         expected_counts = dict(receipt.row_counts)
         expected_hashes = dict(receipt.table_hashes)
         for table in receipt_tables:
+            if not _SAFE_ID.fullmatch(table):
+                raise ExactStateBootstrapError("source table name is malformed")
             quoted = '"' + table.replace('"', '""') + '"'
             columns = await connection.execute(f"PRAGMA table_info({quoted})")
             column_rows = await columns.fetchall()
             order = ",".join(str(index + 1) for index in range(len(column_rows)))
-            query = f"SELECT * FROM {quoted}"
+            # Identifier comes only from sqlite_master and the strict _SAFE_ID
+            # allowlist above, never from user input; values are not interpolated.
+            query = f"SELECT * FROM {quoted}"  # nosec B608
             if order:
                 query += f" ORDER BY {order}"
             rows = await connection.execute(query)
