@@ -4,6 +4,7 @@ import asyncio
 import copy
 import inspect
 import json
+import os
 import pickle
 import weakref
 from dataclasses import FrozenInstanceError, dataclass, replace
@@ -39,6 +40,13 @@ from robo_trader.stop_loss_monitor import StopLossMonitor
 
 NOW = datetime(2026, 7, 28, 15, 0, tzinfo=timezone.utc)
 ACCOUNT_SCOPE = "acct_v1_" + "0123456789abcdef" * 4
+BROKER_ARTIFACT_HASH = "1" * 64
+BROKER_PUBLIC_KEY_FINGERPRINT = "2" * 64
+BROKER_RECEIPT_ID = "bevr-v2-" + "3" * 64
+BROKER_SNAPSHOT_HASH = "4" * 64
+BROKER_SNAPSHOT_ID = "broker-reconciliation-v1-" + "5" * 64
+BUNDLE_ID = "bootstrap-evidence-bundle-v1-" + "6" * 64
+RECONCILIATION_SNAPSHOT_ID = "bootstrap-reconciliation-v1-" + "7" * 64
 
 
 @dataclass(frozen=True)
@@ -51,7 +59,25 @@ class _TestQuoteSourceIdentity:
     transport_generation: str
 
 
+@dataclass(frozen=True)
+class _TestProtectiveMarkBundleIdentity:
+    receiver_type: type[object]
+    bundle_id: str
+    reconciliation_snapshot_id: str
+    broker_snapshot_id: str
+    broker_snapshot_hash: str
+    broker_artifact_hash: str
+    broker_receipt_id: str
+    broker_public_key_fingerprint: str
+    runtime_fingerprint: str
+    account_scope: str
+    database_identity: str
+    database_device: int
+    database_inode: int
+
+
 _TEST_FACTORY_QUOTE_SOURCES: weakref.WeakSet[object] = weakref.WeakSet()
+_TEST_CORE_MARK_RECEIVERS: weakref.WeakSet[object] = weakref.WeakSet()
 
 
 def _runtime(database: Path, **overrides: object) -> RuntimeContract:
@@ -200,6 +226,7 @@ class ProtocolShapedQuoteSource:
 def _install_private_test_quote_source_factory_assertion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from robo_trader import bootstrap_evidence_receivers as receiver_module
     from robo_trader.reconciliation import ibkr_adapter as adapter_module
 
     def assert_test_factory_source(
@@ -242,31 +269,88 @@ def _install_private_test_quote_source_factory_assertion(
         raising=False,
     )
 
+    def assert_test_core_receiver(
+        receiver: object,
+        *,
+        runtime_contract: object,
+    ) -> _TestProtectiveMarkBundleIdentity:
+        if receiver not in _TEST_CORE_MARK_RECEIVERS:
+            raise ValueError("test mark receiver is not core-owned")
+        if type(runtime_contract) is not RuntimeContract:
+            raise ValueError("test mark receiver runtime is not exact")
+        metadata = os.lstat(runtime_contract.database_path)
+        return _TestProtectiveMarkBundleIdentity(
+            receiver_type=type(receiver),
+            bundle_id=receiver.bundle_id,
+            reconciliation_snapshot_id=RECONCILIATION_SNAPSHOT_ID,
+            broker_snapshot_id=BROKER_SNAPSHOT_ID,
+            broker_snapshot_hash=BROKER_SNAPSHOT_HASH,
+            broker_artifact_hash=BROKER_ARTIFACT_HASH,
+            broker_receipt_id=BROKER_RECEIPT_ID,
+            broker_public_key_fingerprint=BROKER_PUBLIC_KEY_FINGERPRINT,
+            runtime_fingerprint=runtime_contract.fingerprint,
+            account_scope=runtime_contract.safety_account_scope,
+            database_identity=runtime_contract.database_identity,
+            database_device=metadata.st_dev,
+            database_inode=metadata.st_ino,
+        )
+
+    monkeypatch.setattr(
+        receiver_module,
+        "assert_protective_mark_receiver_capability",
+        assert_test_core_receiver,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        receiver_module,
+        "ProtectiveMarkBundleIdentity",
+        _TestProtectiveMarkBundleIdentity,
+        raising=False,
+    )
+
 
 class Receiver:
-    def __init__(self) -> None:
+    def __init__(self, *, bundle_id: str = BUNDLE_ID) -> None:
+        self.bundle_id = bundle_id
         self.results: list[UnsignedBootstrapProtectiveMark] = []
+        self.staged: dict[object, UnsignedBootstrapProtectiveMark] = {}
+        self.abort_count = 0
+        _TEST_CORE_MARK_RECEIVERS.add(self)
 
-    def receive_unsigned_bootstrap_protective_mark(
+    def stage_unsigned_bootstrap_protective_mark(
         self,
         result: UnsignedBootstrapProtectiveMark,
-    ) -> UnsignedBootstrapProtectiveMark:
+    ) -> object:
         assert_producer_owned_unsigned_bootstrap_protective_mark(
             result,
             receiver=self,
         )
+        stage = object()
+        self.staged[stage] = result
+        return stage
+
+    def commit_staged_bootstrap_protective_mark(
+        self,
+        stage: object,
+    ) -> UnsignedBootstrapProtectiveMark:
+        result = self.staged.pop(stage)
         self.results.append(result)
         return result
 
+    def abort_staged_bootstrap_protective_mark(self, stage: object) -> None:
+        self.staged.pop(stage)
+        self.abort_count += 1
 
-class CopyChallengeReceiver:
+
+class CopyChallengeReceiver(Receiver):
     def __init__(self) -> None:
+        super().__init__()
         self.result: UnsignedBootstrapProtectiveMark | None = None
 
-    def receive_unsigned_bootstrap_protective_mark(
+    def stage_unsigned_bootstrap_protective_mark(
         self,
         result: UnsignedBootstrapProtectiveMark,
-    ) -> UnsignedBootstrapProtectiveMark:
+    ) -> object:
         copies = (
             replace(result),
             copy.copy(result),
@@ -283,17 +367,20 @@ class CopyChallengeReceiver:
             receiver=self,
         )
         self.result = result
-        return result
+        stage = object()
+        self.staged[stage] = result
+        return stage
 
 
-class WrongReceiverChallenge:
+class WrongReceiverChallenge(Receiver):
     def __init__(self) -> None:
+        super().__init__()
         self.result: UnsignedBootstrapProtectiveMark | None = None
 
-    def receive_unsigned_bootstrap_protective_mark(
+    def stage_unsigned_bootstrap_protective_mark(
         self,
         result: UnsignedBootstrapProtectiveMark,
-    ) -> UnsignedBootstrapProtectiveMark:
+    ) -> object:
         with pytest.raises(BootstrapMarkBlocked, match="different receiver"):
             assert_producer_owned_unsigned_bootstrap_protective_mark(
                 result,
@@ -304,50 +391,95 @@ class WrongReceiverChallenge:
             receiver=self,
         )
         self.result = result
-        return result
+        stage = object()
+        self.staged[stage] = result
+        return stage
 
 
-class NonAuthenticatingReceiver:
+class NonAuthenticatingReceiver(Receiver):
     def __init__(self) -> None:
+        super().__init__()
         self.result: UnsignedBootstrapProtectiveMark | None = None
 
-    def receive_unsigned_bootstrap_protective_mark(
+    def stage_unsigned_bootstrap_protective_mark(
         self,
         result: UnsignedBootstrapProtectiveMark,
-    ) -> UnsignedBootstrapProtectiveMark:
+    ) -> object:
         self.result = result
-        return result
+        stage = object()
+        self.staged[stage] = result
+        return stage
 
 
-class MutatingReceiver:
+class MutatingReceiver(Receiver):
     def __init__(self) -> None:
+        super().__init__()
         self.result: UnsignedBootstrapProtectiveMark | None = None
 
-    def receive_unsigned_bootstrap_protective_mark(
+    def stage_unsigned_bootstrap_protective_mark(
         self,
         result: UnsignedBootstrapProtectiveMark,
-    ) -> UnsignedBootstrapProtectiveMark:
+    ) -> object:
         self.result = result
         object.__setattr__(result, "price", Decimal("188.00"))
         assert_producer_owned_unsigned_bootstrap_protective_mark(
             result,
             receiver=self,
         )
-        return result
+        raise AssertionError("mutated mark must not authenticate")
 
 
-class SourceMutatingReceiver(Receiver):
-    def __init__(self, source: QuoteSource) -> None:
+class FileReceiver(Receiver):
+    def __init__(self, output_directory: Path) -> None:
         super().__init__()
-        self.source = source
+        self.output_directory = output_directory
+        self.stage_paths: dict[object, Path] = {}
+        self.final_path = output_directory / "protective_mark.json"
 
-    def receive_unsigned_bootstrap_protective_mark(
+    def stage_unsigned_bootstrap_protective_mark(
         self,
         result: UnsignedBootstrapProtectiveMark,
+    ) -> object:
+        stage = super().stage_unsigned_bootstrap_protective_mark(result)
+        stage_path = self.output_directory / ".protective_mark.json.stage"
+        stage_path.write_text(result.canonical_payload(), encoding="utf-8")
+        self.stage_paths[stage] = stage_path
+        return stage
+
+    def commit_staged_bootstrap_protective_mark(
+        self,
+        stage: object,
     ) -> UnsignedBootstrapProtectiveMark:
-        received = super().receive_unsigned_bootstrap_protective_mark(result)
+        self.stage_paths.pop(stage).replace(self.final_path)
+        return super().commit_staged_bootstrap_protective_mark(stage)
+
+    def abort_staged_bootstrap_protective_mark(self, stage: object) -> None:
+        self.stage_paths.pop(stage).unlink()
+        super().abort_staged_bootstrap_protective_mark(stage)
+
+
+class SourceMutatingReceiver(FileReceiver):
+    def __init__(self, source: QuoteSource, output_directory: Path) -> None:
+        super().__init__(output_directory)
+        self.source = source
+
+    def stage_unsigned_bootstrap_protective_mark(
+        self,
+        result: UnsignedBootstrapProtectiveMark,
+    ) -> object:
+        stage = super().stage_unsigned_bootstrap_protective_mark(result)
         self.source.transport_generation = "generation-after-handoff"
-        return received
+        return stage
+
+
+class BundleMutatingReceiver(Receiver):
+    def stage_unsigned_bootstrap_protective_mark(
+        self,
+        result: UnsignedBootstrapProtectiveMark,
+    ) -> object:
+        stage = super().stage_unsigned_bootstrap_protective_mark(result)
+        self.bundle_id = "bootstrap-evidence-bundle-v1-" + "8" * 64
+        return stage
 
 
 @pytest.fixture
@@ -363,13 +495,13 @@ def _produce(
     database: Path,
     *,
     runtime: RuntimeContract | None = None,
-    receiver: Receiver | None = None,
+    receiver: object | None = None,
     portfolio_id: str = "default",
     symbol: str = "AAPL",
     con_id: int = 265598,
     transport_generation: str = "generation-1",
     source_event_id: str = "ticker-42",
-) -> tuple[UnsignedBootstrapProtectiveMark, Receiver]:
+) -> tuple[UnsignedBootstrapProtectiveMark, object]:
     sink = receiver or Receiver()
     selected_runtime = runtime or _runtime(database)
     unit_source = QuoteSource((), transport_generation=transport_generation)
@@ -378,11 +510,13 @@ def _produce(
         runtime_contract=selected_runtime,
         expected_transport_generation=transport_generation,
     )
+    _, collector_identity = mark_producer._quote_collector_capability(unit_source)
     mark_producer._register_collected_protective_quote(
         quote,
         producer=monitor,
         quote_source=unit_source,
         source_identity=source_identity,
+        collector_identity=collector_identity,
         runtime=selected_runtime,
         portfolio_id=portfolio_id,
         symbol=symbol,
@@ -413,13 +547,13 @@ async def _collect(
     database: Path,
     *,
     runtime: RuntimeContract | None = None,
-    receiver: Receiver | None = None,
+    receiver: object | None = None,
     portfolio_id: str = "default",
     symbol: str = "AAPL",
     con_id: int = 265598,
     transport_generation: str = "generation-1",
     source_event_id: str | None = None,
-) -> tuple[UnsignedBootstrapProtectiveMark, Receiver]:
+) -> tuple[UnsignedBootstrapProtectiveMark, object]:
     sink = receiver or Receiver()
     result = await collect_and_produce_bootstrap_protective_mark(
         source,  # type: ignore[arg-type]
@@ -733,15 +867,70 @@ async def test_collected_quote_mutation_while_monitor_waits_blocks_receiver(
 @pytest.mark.asyncio
 async def test_source_generation_must_remain_stable_after_mark_handoff(
     database: Path,
+    tmp_path: Path,
 ) -> None:
     monitor = _monitor(database)
     source = QuoteSource((_broker_quote(),))
-    receiver = SourceMutatingReceiver(source)
+    output = tmp_path / "mark-output"
+    output.mkdir()
+    receiver = SourceMutatingReceiver(source, output)
 
     with pytest.raises(BootstrapMarkBlocked, match="transport generation|identity changed"):
         await _collect(source, monitor, database, receiver=receiver)
 
-    assert len(receiver.results) == 1
+    assert receiver.results == []
+    assert receiver.staged == {}
+    assert receiver.abort_count == 1
+    assert not receiver.final_path.exists()
+    assert not list(output.glob("*.stage"))
+
+
+@pytest.mark.asyncio
+async def test_bundle_identity_change_after_stage_aborts_without_publication(
+    database: Path,
+) -> None:
+    monitor = _monitor(database)
+    quote = await _live_quote(monitor)
+    receiver = BundleMutatingReceiver()
+
+    with pytest.raises(BootstrapMarkBlocked, match="bundle identity changed"):
+        _produce(quote, monitor, database, receiver=receiver)
+
+    assert receiver.results == []
+    assert receiver.staged == {}
+    assert receiver.abort_count == 1
+
+
+@pytest.mark.asyncio
+async def test_base_exception_after_stage_aborts_without_publication(
+    database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monitor = _monitor(database)
+    quote = await _live_quote(monitor)
+    receiver = Receiver()
+    original = mark_producer._assert_database_binding
+    calls = 0
+
+    def cancel_during_final_validation(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise asyncio.CancelledError
+        original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        mark_producer,
+        "_assert_database_binding",
+        cancel_during_final_validation,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        _produce(quote, monitor, database, receiver=receiver)
+
+    assert receiver.results == []
+    assert receiver.staged == {}
+    assert receiver.abort_count == 1
 
 
 @pytest.mark.asyncio
@@ -762,6 +951,13 @@ async def test_producer_delivers_canonical_runtime_bound_unsigned_mark(
     assert result.protective_quote_id == quote.quote_id
     assert result.source_event_id == "ticker-42"
     assert result.transport_generation == "generation-1"
+    assert result.bundle_id == BUNDLE_ID
+    assert result.reconciliation_snapshot_id == RECONCILIATION_SNAPSHOT_ID
+    assert result.broker_snapshot_id == BROKER_SNAPSHOT_ID
+    assert result.broker_snapshot_hash == BROKER_SNAPSHOT_HASH
+    assert result.broker_artifact_hash == BROKER_ARTIFACT_HASH
+    assert result.broker_receipt_id == BROKER_RECEIPT_ID
+    assert result.broker_public_key_fingerprint == BROKER_PUBLIC_KEY_FINGERPRINT
     assert result.runtime_fingerprint == runtime.fingerprint
     assert result.account_scope == ACCOUNT_SCOPE
     assert result.database_identity == runtime.database_identity
@@ -773,6 +969,12 @@ async def test_producer_delivers_canonical_runtime_bound_unsigned_mark(
     assert set(payload) == {
         "account_scope",
         "authorizes_startup",
+        "broker_artifact_hash",
+        "broker_public_key_fingerprint",
+        "broker_receipt_id",
+        "broker_snapshot_hash",
+        "broker_snapshot_id",
+        "bundle_id",
         "con_id",
         "database_device",
         "database_identity",
@@ -784,6 +986,7 @@ async def test_producer_delivers_canonical_runtime_bound_unsigned_mark(
         "price_text",
         "protective_quote_id",
         "protective_quote_source",
+        "reconciliation_snapshot_id",
         "runtime_fingerprint",
         "schema_version",
         "source",
@@ -905,6 +1108,13 @@ async def test_direct_unsigned_mark_construction_has_no_producer_authority(
         "con_id": produced.con_id,
         "transport_generation": produced.transport_generation,
         "protective_quote_id": produced.protective_quote_id,
+        "bundle_id": produced.bundle_id,
+        "reconciliation_snapshot_id": produced.reconciliation_snapshot_id,
+        "broker_snapshot_id": produced.broker_snapshot_id,
+        "broker_snapshot_hash": produced.broker_snapshot_hash,
+        "broker_artifact_hash": produced.broker_artifact_hash,
+        "broker_receipt_id": produced.broker_receipt_id,
+        "broker_public_key_fingerprint": produced.broker_public_key_fingerprint,
         "runtime_fingerprint": produced.runtime_fingerprint,
         "execution_domain_scope": produced.execution_domain_scope,
         "account_scope": produced.account_scope,
@@ -1217,7 +1427,7 @@ async def test_missing_receiver_capability_blocks_after_validation(database: Pat
     monitor = _monitor(database)
     quote = await _live_quote(monitor)
 
-    with pytest.raises(BootstrapMarkBlocked, match="receiver capability"):
+    with pytest.raises(BootstrapMarkBlocked, match="not core-owned"):
         _produce(
             quote,
             monitor,

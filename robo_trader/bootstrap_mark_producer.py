@@ -26,7 +26,7 @@ import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Generic, Protocol, TypeVar
+from typing import Generic, Protocol, TypeVar, cast
 
 from .config import PAPER_ONLY_EXECUTION_SOURCE, RuntimeContract
 from .market_data_contract import BrokerProtectiveQuote
@@ -43,9 +43,14 @@ BOOTSTRAP_MARK_SCHEMA_VERSION = 1
 BOOTSTRAP_MARK_SOURCE = "pr3-validated-market-data-v1"
 
 _ACCOUNT_SCOPE = re.compile(r"^acct_v1_[0-9a-f]{64}$")
+_BROKER_RECEIPT_ID = re.compile(r"^bevr-v2-[0-9a-f]{64}$")
+_BROKER_SNAPSHOT_ID = re.compile(r"^broker-reconciliation-v1-[0-9a-f]{64}$")
+_BUNDLE_ID = re.compile(r"^bootstrap-evidence-bundle-v1-[0-9a-f]{64}$")
 _DATABASE_IDENTITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
+_HASH = re.compile(r"^[0-9a-f]{64}$")
 _PORTFOLIO_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _QUOTE_ID = re.compile(r"^quote:v1:[0-9a-f]{64}$")
+_RECONCILIATION_SNAPSHOT_ID = re.compile(r"^bootstrap-reconciliation-v1-[0-9a-f]{64}$")
 _RUNTIME_FINGERPRINT = re.compile(r"^[0-9a-f]{16,64}$")
 _SOURCE_EVENT_ID = re.compile(r"^[^\x00-\x1f\x7f]{1,128}$")
 _SYMBOL = re.compile(r"^[A-Z][A-Z0-9.]{0,9}$")
@@ -115,6 +120,13 @@ class UnsignedBootstrapProtectiveMark:
     con_id: int
     transport_generation: str
     protective_quote_id: str
+    bundle_id: str
+    reconciliation_snapshot_id: str
+    broker_snapshot_id: str
+    broker_snapshot_hash: str
+    broker_artifact_hash: str
+    broker_receipt_id: str
+    broker_public_key_fingerprint: str
     runtime_fingerprint: str
     execution_domain_scope: str
     account_scope: str
@@ -143,6 +155,21 @@ class UnsignedBootstrapProtectiveMark:
             _TRANSPORT_GENERATION,
         )
         _strict_text(self.protective_quote_id, "protective_quote_id", _QUOTE_ID)
+        _strict_text(self.bundle_id, "bundle_id", _BUNDLE_ID)
+        _strict_text(
+            self.reconciliation_snapshot_id,
+            "reconciliation_snapshot_id",
+            _RECONCILIATION_SNAPSHOT_ID,
+        )
+        _strict_text(self.broker_snapshot_id, "broker_snapshot_id", _BROKER_SNAPSHOT_ID)
+        _strict_text(self.broker_snapshot_hash, "broker_snapshot_hash", _HASH)
+        _strict_text(self.broker_artifact_hash, "broker_artifact_hash", _HASH)
+        _strict_text(self.broker_receipt_id, "broker_receipt_id", _BROKER_RECEIPT_ID)
+        _strict_text(
+            self.broker_public_key_fingerprint,
+            "broker_public_key_fingerprint",
+            _HASH,
+        )
         _strict_text(
             self.runtime_fingerprint,
             "runtime_fingerprint",
@@ -175,6 +202,12 @@ class UnsignedBootstrapProtectiveMark:
         return {
             "account_scope": self.account_scope,
             "authorizes_startup": False,
+            "broker_artifact_hash": self.broker_artifact_hash,
+            "broker_public_key_fingerprint": self.broker_public_key_fingerprint,
+            "broker_receipt_id": self.broker_receipt_id,
+            "broker_snapshot_hash": self.broker_snapshot_hash,
+            "broker_snapshot_id": self.broker_snapshot_id,
+            "bundle_id": self.bundle_id,
             "con_id": self.con_id,
             "database_device": self.database_device,
             "database_identity": self.database_identity,
@@ -186,6 +219,7 @@ class UnsignedBootstrapProtectiveMark:
             "price_text": _canonical_decimal(self.price),
             "protective_quote_id": self.protective_quote_id,
             "protective_quote_source": self.protective_quote_source.value,
+            "reconciliation_snapshot_id": self.reconciliation_snapshot_id,
             "runtime_fingerprint": self.runtime_fingerprint,
             "schema_version": self.schema_version,
             "source": self.source,
@@ -222,6 +256,7 @@ class _CollectedQuoteRegistration:
     producer: StopLossMonitor
     quote_source: object
     source_identity: object
+    collector_identity: _CollectorCapabilityIdentity
     runtime_fingerprint: str
     database_identity: str
     portfolio_id: str
@@ -258,6 +293,7 @@ def _register_collected_protective_quote(
     producer: StopLossMonitor,
     quote_source: object,
     source_identity: object,
+    collector_identity: _CollectorCapabilityIdentity,
     runtime: RuntimeContract,
     portfolio_id: str,
     symbol: str,
@@ -282,6 +318,7 @@ def _register_collected_protective_quote(
         producer=producer,
         quote_source=quote_source,
         source_identity=source_identity,
+        collector_identity=collector_identity,
         runtime_fingerprint=runtime.fingerprint,
         database_identity=runtime.database_identity,
         portfolio_id=portfolio_id,
@@ -314,7 +351,7 @@ def _consume_collected_protective_quote(
     con_id: int,
     transport_generation: str,
     source_event_id: str,
-) -> None:
+) -> _CollectedQuoteRegistration:
     if type(evidence) is not ProtectiveQuoteEvidence:
         raise BootstrapMarkBlocked("exact ProtectiveQuoteEvidence is required")
     try:
@@ -345,6 +382,7 @@ def _consume_collected_protective_quote(
         or not hmac.compare_digest(registration.evidence_digest, evidence_digest)
     ):
         raise BootstrapMarkBlocked("protective quote acquisition binding changed")
+    return registration
 
 
 def _register_unsigned_mark(
@@ -431,13 +469,19 @@ ReceiverResult = TypeVar("ReceiverResult", covariant=True)
 
 
 class BootstrapProtectiveMarkReceiver(Protocol, Generic[ReceiverResult]):
-    """The sole post-validation handoff available to a trusted core signer."""
+    """Two-phase handoff available only to the trusted core signer."""
 
-    def receive_unsigned_bootstrap_protective_mark(
+    def stage_unsigned_bootstrap_protective_mark(
         self,
         result: UnsignedBootstrapProtectiveMark,
-    ) -> ReceiverResult:
-        """Consume one validated unsigned protective accounting mark."""
+    ) -> object:
+        """Consume ownership and create only unpublished staged material."""
+
+    def commit_staged_bootstrap_protective_mark(self, stage: object) -> ReceiverResult:
+        """Publish only after the producer completes final source validation."""
+
+    def abort_staged_bootstrap_protective_mark(self, stage: object) -> None:
+        """Remove every unpublished artifact associated with a failed stage."""
 
 
 class ProtectiveQuoteCollector(Protocol):
@@ -624,6 +668,84 @@ def _assert_producer_context(
 class _CollectorCapabilityIdentity:
     collector_type: type[object]
     method_function: object
+
+
+class _ProtectiveMarkBundleIdentity(Protocol):
+    receiver_type: type[object]
+    bundle_id: str
+    reconciliation_snapshot_id: str
+    broker_snapshot_id: str
+    broker_snapshot_hash: str
+    broker_artifact_hash: str
+    broker_receipt_id: str
+    broker_public_key_fingerprint: str
+    runtime_fingerprint: str
+    account_scope: str
+    database_identity: str
+    database_device: int
+    database_inode: int
+
+
+def _assert_core_mark_receiver(
+    receiver: object,
+    *,
+    runtime_contract: RuntimeContract,
+    database_binding: _DatabaseBinding,
+    expected_identity: _ProtectiveMarkBundleIdentity | None = None,
+) -> _ProtectiveMarkBundleIdentity:
+    """Require one exact core-owned receiver and its immutable bundle lineage."""
+
+    from .bootstrap_evidence_receivers import (
+        ProtectiveMarkBundleIdentity,
+        assert_protective_mark_receiver_capability,
+    )
+
+    try:
+        identity = assert_protective_mark_receiver_capability(
+            receiver,
+            runtime_contract=runtime_contract,
+        )
+    except Exception as exc:
+        raise BootstrapMarkBlocked(
+            "protective mark receiver is not core-owned and bundle-bound"
+        ) from exc
+    if type(identity) is not ProtectiveMarkBundleIdentity:
+        raise BootstrapMarkBlocked("protective mark bundle identity is not exact")
+    typed_identity = cast(_ProtectiveMarkBundleIdentity, identity)
+    account_scope = runtime_contract.safety_account_scope
+    if not isinstance(account_scope, str):  # pragma: no cover - runtime validated first
+        raise BootstrapMarkBlocked("runtime account scope is unavailable")
+    if (
+        typed_identity.receiver_type is not type(receiver)
+        or typed_identity.runtime_fingerprint != runtime_contract.fingerprint
+        or typed_identity.account_scope != account_scope
+        or typed_identity.database_identity != runtime_contract.database_identity
+        or typed_identity.database_device != database_binding.device
+        or typed_identity.database_inode != database_binding.inode
+    ):
+        raise BootstrapMarkBlocked("protective mark receiver runtime binding changed")
+    _strict_text(typed_identity.bundle_id, "bundle_id", _BUNDLE_ID)
+    _strict_text(
+        typed_identity.reconciliation_snapshot_id,
+        "reconciliation_snapshot_id",
+        _RECONCILIATION_SNAPSHOT_ID,
+    )
+    _strict_text(
+        typed_identity.broker_snapshot_id,
+        "broker_snapshot_id",
+        _BROKER_SNAPSHOT_ID,
+    )
+    _strict_text(typed_identity.broker_snapshot_hash, "broker_snapshot_hash", _HASH)
+    _strict_text(typed_identity.broker_artifact_hash, "broker_artifact_hash", _HASH)
+    _strict_text(typed_identity.broker_receipt_id, "broker_receipt_id", _BROKER_RECEIPT_ID)
+    _strict_text(
+        typed_identity.broker_public_key_fingerprint,
+        "broker_public_key_fingerprint",
+        _HASH,
+    )
+    if expected_identity is not None and typed_identity != expected_identity:
+        raise BootstrapMarkBlocked("protective mark bundle identity changed")
+    return typed_identity
 
 
 def _assert_factory_owned_quote_source(
@@ -819,9 +941,15 @@ def produce_bootstrap_protective_mark(
         database_binding=database_binding,
         portfolio_id=portfolio_id,
     )
-    _consume_collected_protective_quote(
+    typed_producer = cast(StopLossMonitor, producer)
+    receiver_identity = _assert_core_mark_receiver(
+        receiver,
+        runtime_contract=runtime,
+        database_binding=database_binding,
+    )
+    quote_registration = _consume_collected_protective_quote(
         quote,
-        producer=producer,
+        producer=typed_producer,
         runtime=runtime,
         portfolio_id=portfolio_id,
         symbol=symbol,
@@ -850,6 +978,13 @@ def produce_bootstrap_protective_mark(
         con_id=con_id,
         transport_generation=transport_generation,
         protective_quote_id=checked_quote.quote_id,
+        bundle_id=receiver_identity.bundle_id,
+        reconciliation_snapshot_id=receiver_identity.reconciliation_snapshot_id,
+        broker_snapshot_id=receiver_identity.broker_snapshot_id,
+        broker_snapshot_hash=receiver_identity.broker_snapshot_hash,
+        broker_artifact_hash=receiver_identity.broker_artifact_hash,
+        broker_receipt_id=receiver_identity.broker_receipt_id,
+        broker_public_key_fingerprint=receiver_identity.broker_public_key_fingerprint,
         runtime_fingerprint=runtime.fingerprint,
         execution_domain_scope=PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE,
         account_scope=account_scope,
@@ -872,17 +1007,69 @@ def produce_bootstrap_protective_mark(
         transport_generation=transport_generation,
         source_event_id=source_event_id,
     )
-    capability = getattr(receiver, "receive_unsigned_bootstrap_protective_mark", None)
-    if not callable(capability):
-        raise BootstrapMarkBlocked("bootstrap protective mark receiver capability is unavailable")
+    stage_capability = getattr(receiver, "stage_unsigned_bootstrap_protective_mark", None)
+    commit_capability = getattr(receiver, "commit_staged_bootstrap_protective_mark", None)
+    abort_capability = getattr(receiver, "abort_staged_bootstrap_protective_mark", None)
+    if (
+        not callable(stage_capability)
+        or not callable(commit_capability)
+        or not callable(abort_capability)
+    ):
+        raise BootstrapMarkBlocked(
+            "two-phase bootstrap protective mark receiver capability is unavailable"
+        )
     registration_token = _register_unsigned_mark(result, receiver)
+    no_stage = object()
+    stage: object = no_stage
+    committed = False
     try:
-        received = capability(result)
+        stage = stage_capability(result)
+        _assert_unsigned_mark_registration_consumed(result, registration_token)
+        _assert_database_binding(runtime, database_binding)
+        _assert_producer_context(
+            producer,
+            runtime=runtime,
+            database_binding=database_binding,
+            portfolio_id=portfolio_id,
+        )
+        _revalidate_quote(
+            quote,
+            producer=producer,
+            portfolio_id=portfolio_id,
+            symbol=symbol,
+            con_id=con_id,
+            transport_generation=transport_generation,
+            source_event_id=source_event_id,
+        )
+        _assert_factory_owned_quote_source(
+            quote_registration.quote_source,
+            runtime_contract=runtime,
+            expected_identity=quote_registration.source_identity,
+            expected_transport_generation=transport_generation,
+        )
+        _quote_collector_capability(
+            quote_registration.quote_source,
+            expected=quote_registration.collector_identity,
+        )
+        _assert_core_mark_receiver(
+            receiver,
+            runtime_contract=runtime,
+            database_binding=database_binding,
+            expected_identity=receiver_identity,
+        )
+        received = commit_capability(stage)
+        committed = True
+        return received
     except BaseException:
         _abandon_unsigned_mark_registration(result, registration_token)
+        if stage is not no_stage and not committed:
+            try:
+                abort_capability(stage)
+            except BaseException as exc:
+                raise BootstrapMarkBlocked(
+                    "protective mark receiver could not abort its unpublished stage"
+                ) from exc
         raise
-    _assert_unsigned_mark_registration_consumed(result, registration_token)
-    return received
 
 
 async def collect_and_produce_bootstrap_protective_mark(
@@ -1027,6 +1214,7 @@ async def collect_and_produce_bootstrap_protective_mark(
         producer=typed_producer,
         quote_source=quote_source,
         source_identity=source_identity,
+        collector_identity=capability_identity,
         runtime=runtime,
         portfolio_id=portfolio_id,
         symbol=symbol,
@@ -1048,11 +1236,4 @@ async def collect_and_produce_bootstrap_protective_mark(
         )
     finally:
         _discard_collected_protective_quote(checked_evidence)
-    _quote_collector_capability(quote_source, expected=capability_identity)
-    _assert_factory_owned_quote_source(
-        quote_source,
-        runtime_contract=runtime,
-        expected_identity=source_identity,
-        expected_transport_generation=transport_generation,
-    )
     return received
