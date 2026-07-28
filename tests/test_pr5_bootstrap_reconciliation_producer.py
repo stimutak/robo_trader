@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import os
 import pickle
 import sqlite3
@@ -16,6 +17,8 @@ from unittest.mock import patch
 
 import pytest
 
+from robo_trader import bootstrap_evidence_receivers as receiver_module
+from robo_trader.bootstrap_evidence_receivers import ReconciliationBundleIdentity
 from robo_trader.config import RuntimeContract
 from robo_trader.financial_state_bootstrap import inspect_legacy_state
 from robo_trader.reconciliation import bootstrap_producer as producer_module
@@ -59,6 +62,8 @@ from robo_trader.safety import (
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
 ACCOUNT_SCOPE = "acct_v1_" + "0123456789abcdef" * 4
 OTHER_ACCOUNT_SCOPE = "acct_v1_" + "fedcba9876543210" * 4
+BUNDLE_ID = "bootstrap-evidence-bundle-v1-" + "ab" * 32
+OTHER_BUNDLE_ID = "bootstrap-evidence-bundle-v1-" + "cd" * 32
 
 
 def _legacy_database(path: Path) -> None:
@@ -450,6 +455,15 @@ class BypassReceiver:
         del stage
 
 
+class BundleTamperingReceiver(ClaimingReceiver):
+    def stage_unsigned_bootstrap_reconciliation(
+        self,
+        result: UnsignedBootstrapReconciliation,
+    ) -> object:
+        object.__setattr__(result, "bundle_id", OTHER_BUNDLE_ID)
+        return assert_and_consume_producer_owned_bootstrap_reconciliation(result)
+
+
 @pytest.fixture
 def database(tmp_path: Path) -> Path:
     path = tmp_path / "ledger.db"
@@ -463,10 +477,31 @@ def database(tmp_path: Path) -> Path:
 
 @pytest.fixture(autouse=True)
 def authenticated_test_receiver(monkeypatch: pytest.MonkeyPatch) -> None:
+    def assert_test_receiver(receiver: object) -> ReconciliationBundleIdentity:
+        identity = getattr(receiver, "_test_bundle_identity", None)
+        if type(identity) is not ReconciliationBundleIdentity:
+            raise ValueError("test receiver has no core identity")
+        return identity
+
     monkeypatch.setattr(
-        producer_module,
-        "_assert_core_reconciliation_receiver_capability",
-        lambda receiver: None,
+        receiver_module,
+        "assert_reconciliation_receiver_capability",
+        assert_test_receiver,
+    )
+
+
+def _receiver_identity(
+    receiver: object,
+    runtime: RuntimeContract,
+    *,
+    bundle_id: str = BUNDLE_ID,
+) -> ReconciliationBundleIdentity:
+    return ReconciliationBundleIdentity(
+        receiver_type=type(receiver),
+        bundle_id=bundle_id,
+        runtime_fingerprint=runtime.fingerprint,
+        account_scope=ACCOUNT_SCOPE,
+        database_identity=runtime.database_identity,
     )
 
 
@@ -488,6 +523,7 @@ def _produce(
     verified = envelope or _envelope(snapshot or _snapshot(), contract)
     authority = verifier or FakeBrokerVerifier(verified)
     sink = receiver or ClaimingReceiver()
+    setattr(sink, "_test_bundle_identity", _receiver_identity(sink, contract))
     with (
         patch.object(producer_module, "_system_clock", clock or (lambda: NOW)),
         patch.object(producer_module, "_consume_verified_broker_evidence", authority.consume),
@@ -512,6 +548,9 @@ def test_clean_stage_collects_ledger_and_binds_non_authorizing_result(database: 
     assert delivery.receiver_result is result
     assert delivery.local_position_identities == (("default", "AAPL"), ("default", "MSFT"))
     assert result.status == BOOTSTRAP_RECONCILIATION_STATUS
+    assert result.bundle_id == BUNDLE_ID
+    assert result.binding_dict()["bundle_id"] == BUNDLE_ID
+    assert json.loads(result.canonical_payload())["bundle_id"] == BUNDLE_ID
     assert result.reconciliation_status is ReconciliationStatus.PASSED
     assert result.broker_snapshot_id == envelope.snapshot_id
     assert result.broker_snapshot_hash == envelope.snapshot_hash
@@ -538,7 +577,14 @@ def test_public_interface_accepts_no_snapshot_ledger_clock_or_freshness_authorit
     assert set(parameters) == {"verified_broker_evidence", "runtime_contract", "receiver"}
     assert all(
         forbidden not in parameters
-        for forbidden in ("snapshot", "ledger_evidence", "now", "clock", "max_age_seconds")
+        for forbidden in (
+            "snapshot",
+            "ledger_evidence",
+            "now",
+            "clock",
+            "max_age_seconds",
+            "bundle_id",
+        )
     )
 
 
@@ -622,8 +668,8 @@ def test_receiver_must_be_authenticated_before_evidence_collection(
 ) -> None:
     receiver = ClaimingReceiver()
 
-    def reject_receiver(value: object) -> None:
-        del value
+    def reject_receiver(value: object, *, runtime_contract: RuntimeContract) -> None:
+        del value, runtime_contract
         raise BootstrapReconciliationBlocked("not core-authenticated")
 
     monkeypatch.setattr(
@@ -633,6 +679,75 @@ def test_receiver_must_be_authenticated_before_evidence_collection(
     )
     with pytest.raises(BootstrapReconciliationBlocked, match="core-authenticated"):
         _produce(database, receiver=receiver)
+    assert receiver.results == []
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        ("receiver_type", object),
+        ("bundle_id", "bootstrap-evidence-bundle-v1-not-a-digest"),
+        ("runtime_fingerprint", "f" * 64),
+        ("account_scope", OTHER_ACCOUNT_SCOPE),
+        ("database_identity", "paper:database:other"),
+    ],
+)
+def test_receiver_bundle_identity_must_exactly_match_runtime_and_receiver(
+    database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_field: str,
+    changed_value: object,
+) -> None:
+    runtime = _runtime(database)
+    receiver = ClaimingReceiver()
+    identity = replace(
+        _receiver_identity(receiver, runtime),
+        **{changed_field: changed_value},
+    )
+    monkeypatch.setattr(
+        receiver_module,
+        "assert_reconciliation_receiver_capability",
+        lambda _receiver: identity,
+    )
+
+    with pytest.raises(BootstrapReconciliationBlocked, match="bundle|runtime binding"):
+        _produce(database, runtime=runtime, receiver=receiver)
+
+    assert receiver.results == []
+
+
+def test_receiver_bundle_change_before_delivery_blocks_cross_bundle_handoff(
+    database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(database)
+    receiver = ClaimingReceiver()
+    identities = iter(
+        (
+            _receiver_identity(receiver, runtime),
+            _receiver_identity(receiver, runtime, bundle_id=OTHER_BUNDLE_ID),
+        )
+    )
+    monkeypatch.setattr(
+        receiver_module,
+        "assert_reconciliation_receiver_capability",
+        lambda _receiver: next(identities),
+    )
+
+    with pytest.raises(BootstrapReconciliationBlocked, match="bundle identity changed"):
+        _produce(database, runtime=runtime, receiver=receiver)
+
+    assert receiver.results == []
+
+
+def test_bundle_id_tamper_invalidates_the_producer_owned_canonical_payload(
+    database: Path,
+) -> None:
+    receiver = BundleTamperingReceiver()
+
+    with pytest.raises(BootstrapReconciliationBlocked, match="not producer-owned"):
+        _produce(database, receiver=receiver)
+
     assert receiver.results == []
 
 

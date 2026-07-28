@@ -28,7 +28,17 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Callable, Generic, Iterator, Protocol, SupportsIndex, TypeVar, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Generic,
+    Iterator,
+    Protocol,
+    SupportsIndex,
+    TypeVar,
+    cast,
+)
 
 from robo_trader.config import PAPER_ONLY_EXECUTION_SOURCE, RuntimeContract
 from robo_trader.paper_terminal_settlement import (
@@ -64,6 +74,9 @@ from .policy import (
     evaluate_paper_simulator_reconciliation,
 )
 
+if TYPE_CHECKING:
+    from robo_trader.bootstrap_evidence_receivers import ReconciliationBundleIdentity
+
 BOOTSTRAP_RECONCILIATION_STATUS = "BOOTSTRAP_EVIDENCE_COMPLETE"
 BOOTSTRAP_RECONCILIATION_MAX_AGE = timedelta(seconds=30)
 
@@ -74,6 +87,7 @@ _SYMBOL = re.compile(r"^[A-Z][A-Z0-9.]{0,9}$")
 _BROKER_SNAPSHOT_ID = re.compile(r"^broker-reconciliation-v1-[0-9a-f]{64}$")
 _BROKER_VERDICT_ID = re.compile(r"^reconciliation-verdict-v1-[0-9a-f]{64}$")
 _COLLECTION_EVIDENCE_ID = re.compile(r"^broker-collection-v1-[0-9a-f]{64}$")
+_BUNDLE_ID = re.compile(r"^bootstrap-evidence-bundle-v1-[0-9a-f]{64}$")
 
 _LEDGER_PRODUCER_MARKER = object()
 _RESULT_PRODUCER_MARKER = object()
@@ -963,6 +977,7 @@ class UnsignedBootstrapReconciliation:
     generated_at: datetime
     runtime_fingerprint: str
     account_scope: str
+    bundle_id: str
     database_path: str
     database_identity: str
     database_device: int
@@ -1007,6 +1022,7 @@ class UnsignedBootstrapReconciliation:
         if not _RUNTIME_FINGERPRINT.fullmatch(self.runtime_fingerprint):
             raise BootstrapReconciliationBlocked("runtime_fingerprint is malformed")
         object.__setattr__(self, "account_scope", _account_scope(self.account_scope))
+        _exact_pattern(self.bundle_id, "bundle_id", _BUNDLE_ID)
         path = Path(self.database_path)
         if not path.is_absolute() or str(path) != self.database_path:
             raise BootstrapReconciliationBlocked("database_path must be absolute and lexical")
@@ -1109,6 +1125,7 @@ class UnsignedBootstrapReconciliation:
         return {
             "account_scope": self.account_scope,
             "authorizes_startup": False,
+            "bundle_id": self.bundle_id,
             "broker_collection_evidence_ids": list(self.broker_collection_evidence_ids),
             "broker_artifact_hash": self.broker_artifact_hash,
             "broker_open_orders_count": self.broker_open_orders_count,
@@ -1273,11 +1290,16 @@ def _consume_verified_broker_evidence(
         raise BootstrapReconciliationBlocked("broker evidence is not verifier-owned") from exc
 
 
-def _assert_core_reconciliation_receiver_capability(receiver: object) -> None:
-    """Authenticate the exact factory-issued core signer; no structural fallback."""
+def _assert_core_reconciliation_receiver_capability(
+    receiver: object,
+    *,
+    runtime_contract: RuntimeContract,
+) -> ReconciliationBundleIdentity:
+    """Authenticate one exact receiver and return its core-issued bundle identity."""
 
     try:
         from robo_trader.bootstrap_evidence_receivers import (
+            ReconciliationBundleIdentity,
             assert_reconciliation_receiver_capability,
         )
     except (ImportError, AttributeError) as exc:
@@ -1285,11 +1307,27 @@ def _assert_core_reconciliation_receiver_capability(receiver: object) -> None:
             "reconciliation receiver authority is unavailable"
         ) from exc
     try:
-        assert_reconciliation_receiver_capability(receiver)
+        identity = assert_reconciliation_receiver_capability(receiver)
     except Exception as exc:
         raise BootstrapReconciliationBlocked(
             "reconciliation receiver is not core-authenticated"
         ) from exc
+    if type(identity) is not ReconciliationBundleIdentity:
+        raise BootstrapReconciliationBlocked("reconciliation receiver bundle identity is not exact")
+    account_scope = runtime_contract.safety_account_scope
+    if not isinstance(account_scope, str):  # pragma: no cover - runtime validated first
+        raise BootstrapReconciliationBlocked("runtime account scope is unavailable")
+    if (
+        identity.receiver_type is not type(receiver)
+        or identity.runtime_fingerprint != runtime_contract.fingerprint
+        or identity.account_scope != account_scope
+        or identity.database_identity != runtime_contract.database_identity
+    ):
+        raise BootstrapReconciliationBlocked(
+            "reconciliation receiver bundle is outside the runtime binding"
+        )
+    _exact_pattern(identity.bundle_id, "bundle_id", _BUNDLE_ID)
+    return identity
 
 
 def _validate_verified_broker_envelope(
@@ -1330,7 +1368,10 @@ def produce_bootstrap_reconciliation(
     """Collect, stage, finalize, and publish under fixed internal authorities."""
 
     runtime = _validate_runtime(runtime_contract)
-    _assert_core_reconciliation_receiver_capability(receiver)
+    receiver_identity = _assert_core_reconciliation_receiver_capability(
+        receiver,
+        runtime_contract=runtime,
+    )
     envelope = _consume_verified_broker_evidence(verified_broker_evidence)
     collected: _CollectedLedgerEvidence | None = None
     result: UnsignedBootstrapReconciliation | None = None
@@ -1370,6 +1411,7 @@ def produce_bootstrap_reconciliation(
                 generated_at=checked_at,
                 runtime_fingerprint=runtime.fingerprint,
                 account_scope=runtime.safety_account_scope,
+                bundle_id=receiver_identity.bundle_id,
                 database_path=collected.database_path,
                 database_identity=collected.database_identity,
                 database_device=collected.database_device,
@@ -1406,6 +1448,14 @@ def produce_bootstrap_reconciliation(
             )
             _register_result(result)
             position_identities = collected.position_identities
+            current_receiver_identity = _assert_core_reconciliation_receiver_capability(
+                receiver,
+                runtime_contract=runtime,
+            )
+            if current_receiver_identity != receiver_identity:
+                raise BootstrapReconciliationBlocked(
+                    "reconciliation receiver bundle identity changed"
+                )
             stage = receiver.stage_unsigned_bootstrap_reconciliation(result)
             with _OWNERSHIP_LOCK:
                 if result._producer_nonce not in _CLAIMED_RESULT_NONCES:
