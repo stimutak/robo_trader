@@ -3588,6 +3588,7 @@ class AsyncRunner:
         try:
             account_daily_pnl = None
             account_daily_pnl_date = None
+            account_bootstrap_lineage_valid = None
             # Load account state (cash, realized_pnl) from database
             account_info = await self.db.get_account_info()
             if account_info:
@@ -3597,6 +3598,7 @@ class AsyncRunner:
                 exact_daily_pnl_baseline = account_info.get("daily_pnl_baseline_exact")
                 exact_daily_pnl_date = account_info.get("daily_pnl_date_exact")
                 source_settlement_id = account_info.get("source_settlement_id")
+                account_bootstrap_lineage_valid = account_info.get("bootstrap_lineage_valid")
                 exact_values = (
                     exact_cash,
                     exact_realized_pnl,
@@ -3675,12 +3677,17 @@ class AsyncRunner:
                     raise RuntimeError(
                         f"exact restart mark for {symbol} cannot be projected into runtime"
                     )
+                if pos.get("bootstrap_lineage_valid") is False:
+                    raise RuntimeError(f"nonzero position {symbol} has no sealed bootstrap lineage")
                 self.latest_prices[symbol] = exact_mark_float
                 self.latest_price_sources[symbol] = "paper-position-exact-mark"
 
                 logger.info(
                     f"Loaded existing position: {symbol} qty={quantity} avg_cost=${avg_cost:.2f}"
                 )
+
+            if self.positions and account_bootstrap_lineage_valid is False:
+                raise RuntimeError("nonzero paper simulator has no sealed exact account bootstrap")
 
             # CRITICAL FIX: Create stop-loss orders for existing positions
             # Without this, positions opened in previous sessions have NO stop-loss protection!
