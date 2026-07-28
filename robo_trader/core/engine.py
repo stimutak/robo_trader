@@ -21,6 +21,7 @@ from robo_trader.connection_manager import ConnectionManager, IBKRClient
 from robo_trader.correlation import CorrelationTracker
 from robo_trader.database import TradingDatabase
 from robo_trader.execution import AbstractExecutor, LiveExecutor, PaperExecutor
+from robo_trader.gatea_containment import assert_quarantined_alternate_engine
 from robo_trader.logger import get_logger
 from robo_trader.portfolio import Portfolio
 from robo_trader.risk_manager import RiskManager, create_risk_manager_from_config
@@ -78,6 +79,7 @@ class TradingEngine:
         Args:
             config: Configuration object
         """
+        assert_quarantined_alternate_engine("robo_trader.core.engine.TradingEngine")
         self.config = config
         self.state = EngineState.INITIALIZING
 

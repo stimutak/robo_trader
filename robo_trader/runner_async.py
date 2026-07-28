@@ -39,6 +39,12 @@ from .config import RuntimeContract, load_config
 from .correlation import CorrelationTracker
 from .database_async import AsyncTradingDatabase
 from .execution import ExecutionResult, Order, PaperExecutor
+from .gatea_containment import (
+    GateAContainmentError,
+    assert_gate_a_config,
+    assert_gate_a_runner_options,
+    validate_gate_a_order,
+)
 from .logger import get_logger
 from .market_data_contract import (
     BrokerProtectiveQuote,
@@ -489,6 +495,12 @@ class AsyncRunner:
         shared_database: Optional[AsyncTradingDatabase] = None,
         paper_reduction_gateway: Optional[PaperReductionGateway] = None,
     ):
+        assert_gate_a_runner_options(
+            use_ml_strategy=use_ml_strategy,
+            use_ml_enhanced=use_ml_enhanced,
+            use_smart_execution=use_smart_execution,
+            env=os.environ,
+        )
         if safety_runtime is not None and (
             type(safety_runtime) is not SafetyRuntimeCoordinator or not safety_runtime.started
         ):
@@ -506,6 +518,7 @@ class AsyncRunner:
         self._shared_database = shared_database
         self._owns_database = shared_database is None
         self.paper_reduction_gateway = paper_reduction_gateway
+        self._baseline_entry_handle = None
         self.portfolio_id = portfolio_id
         self.duration = duration
         self.bar_size = bar_size
@@ -518,19 +531,9 @@ class AsyncRunner:
         self.max_concurrent_symbols = max_concurrent_symbols
         self.use_correlation_sizing = use_correlation_sizing
         self.max_correlation = max_correlation
-        self.use_ml_strategy = use_ml_strategy
-        # Auto-detect ML enhanced if not explicitly set
-        if use_ml_enhanced is None:
-            self.use_ml_enhanced = os.getenv("ML_ENHANCED_ENABLED", "true").lower() == "true"
-        else:
-            self.use_ml_enhanced = use_ml_enhanced
-        # Auto-detect smart execution if not explicitly set
-        if use_smart_execution is None:
-            self.use_smart_execution = (
-                os.getenv("SMART_EXECUTION_ENABLED", "true").lower() == "true"
-            )
-        else:
-            self.use_smart_execution = use_smart_execution
+        self.use_ml_strategy = False
+        self.use_ml_enhanced = False
+        self.use_smart_execution = False
 
         # Auto-detect advanced risk management if not explicitly set
         if use_advanced_risk is None:
@@ -664,7 +667,7 @@ class AsyncRunner:
 
         # AI Analyst for news-driven trading
         self.ai_analyst = None
-        self.use_ai_trading = os.getenv("AI_TRADING_ENABLED", "true").lower() == "true"
+        self.use_ai_trading = False
         self.news_cache = {}  # Cache recent news to avoid re-fetching
         self.last_news_fetch = None
         self._ai_opportunities = {}  # AI-identified buying opportunities
@@ -894,6 +897,20 @@ class AsyncRunner:
         Returns:
             (True, reason) if trading should be blocked, else (False, "").
         """
+        # The lock file is the deny-by-default cross-process signal.  It must
+        # be checked independently of the in-memory KillSwitch because another
+        # process can create it after this runner's state was loaded.  A
+        # metadata error is uncertainty about a hard safety signal, so entries
+        # fail closed.  Semantic reductions bypass this entry-only gate above.
+        try:
+            Path("data/kill_switch.lock").lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.error("Kill-switch lock state is unavailable: %s", type(exc).__name__)
+            return True, "Kill switch lock state unavailable"
+        else:
+            return True, "Kill switch lock active"
         try:
             freeze_reason = getattr(self, "_emergency_entry_freeze_reason", None)
             if freeze_reason:
@@ -1468,6 +1485,7 @@ class AsyncRunner:
         order: Order,
         *,
         protective_quote: Optional[ProtectiveQuoteEvidence] = None,
+        _entry_intent: object | None = None,
     ):
         """
         Execute order with circuit breaker protection.
@@ -1495,6 +1513,19 @@ class AsyncRunner:
         is_reduction = side in {"SELL", "BUY_TO_COVER"}
         if not is_reduction and side not in {"BUY", "SELL_SHORT"}:
             return self._rejected_order_result("Unsupported order side")
+
+        contained, containment_reason = validate_gate_a_order(
+            side=side,
+            take_profit=order.take_profit,
+        )
+        if not contained:
+            return self._rejected_order_result(containment_reason)
+        if side == "BUY":
+            registered_entry_handle = getattr(self, "_baseline_entry_handle", None)
+            if registered_entry_handle is None or _entry_intent is None:
+                return self._rejected_order_result(
+                    "Gate-A baseline entry authority is disabled pending risk integration"
+                )
 
         # Semantic reductions bypass entry-only soft stops, but only after the
         # account-wide gateway proves the exact broker contract/read-only
@@ -1634,7 +1665,10 @@ class AsyncRunner:
                 # Hold the same account-wide lock used by reductions. This
                 # prevents an entry from changing the simulator allocation
                 # between a reduction's initial and final evidence snapshots.
-                async with gateway.serialize_entry(order.symbol) as broker_quote:
+                async with gateway.serialize_entry(
+                    order.symbol,
+                    portfolio_id=self.portfolio_id,
+                ) as broker_quote:
                     if type(broker_quote) is not BrokerProtectiveQuote:
                         return self._rejected_order_result(
                             "Entry blocked: refreshed broker quote unavailable"
@@ -1656,6 +1690,7 @@ class AsyncRunner:
                         side=side,
                         price=broker_quote.price,
                         order_ref=order.order_ref,
+                        take_profit=order.take_profit,
                     )
                     portfolio = getattr(self, "portfolio", None)
                     risk = getattr(self, "risk", None)
@@ -1701,7 +1736,19 @@ class AsyncRunner:
                             "Entry blocked: canonical session evidence expired during final admission"
                         )
                     with Timer("order_execution", self.monitor):
-                        result = self.executor.place_order(exact_order)
+                        # Timer.__enter__ invokes the mutable monitor callback.
+                        # Recheck only after that callback and immediately before
+                        # the one-shot entry authority can be consumed.
+                        blocked, reason = self._trading_blocked()
+                        if blocked:
+                            return self._rejected_order_result(
+                                f"Entry blocked at terminal safety gate: {reason}"
+                            )
+                        result = gateway.submit_baseline_entry(
+                            order=exact_order,
+                            portfolio_id=self.portfolio_id,
+                            intent=_entry_intent,
+                        )
 
             # Record success/failure with circuit breaker
             if result.ok:
@@ -2237,6 +2284,10 @@ class AsyncRunner:
                     return
 
         self.cfg = load_config()
+        try:
+            assert_gate_a_config(self.cfg)
+        except GateAContainmentError as exc:
+            raise RuntimeError(f"Gate-A containment contradiction: {exc}") from exc
 
         # B-12 (branch audit, HIGH): belt-and-suspenders on top of
         # config.py's gating — if anything is overriding config to set
@@ -2802,6 +2853,10 @@ class AsyncRunner:
             protective_quote_producer=self.stop_loss_monitor,
             settlement_participant=participant,
         )
+        # Gate-A staging is deliberately non-authorizing for new exposure.
+        # Same-process Python objects cannot be treated as an isolation
+        # boundary, so no reachable entry handle is published.
+        self._baseline_entry_handle = None
         gateway.start_protective_feed()
         self._setup_complete = True
         logger.info("AsyncRunner setup complete")
@@ -4503,6 +4558,10 @@ class AsyncRunner:
                 df,
             )
 
+        # Only the canonical baseline branch below can mint an opaque entry
+        # intent. Alternate producers never receive reusable terminal authority.
+        baseline_entry_intent = None
+
         # Generate trading signal
         with Timer("signal_generation", self.monitor, instance=symbol):
             if self.use_ml_enhanced and self.ml_enhanced_strategy:
@@ -4804,6 +4863,10 @@ class AsyncRunner:
                     fast=self.sma_fast,
                     slow=self.sma_slow,
                 )
+                # PR117 containment remains non-authorizing. Baseline signals
+                # may be observed, but no BUY intent is minted until the
+                # integrated risk-admission boundary is independently enforced.
+                baseline_entry_intent = None
 
         # Generate mean reversion signals if enabled
         if MEAN_REVERSION_AVAILABLE and self.mean_reversion_strategy:
@@ -4856,6 +4919,7 @@ class AsyncRunner:
 
                         # Override signal if mean reversion is stronger
                         if mr_signal.strength > 0.7:
+                            baseline_entry_intent = None
                             signal_value = 1 if mr_signal.signal_type.value == "BUY" else -1
                             signals.iloc[-1]["signal"] = signal_value
 
@@ -5192,7 +5256,13 @@ class AsyncRunner:
                         # _place_order_with_circuit_breaker via _trading_blocked().
 
                         res = await self._place_order_with_circuit_breaker(
-                            Order(symbol=symbol, quantity=qty, side="BUY", price=price)
+                            Order(
+                                symbol=symbol,
+                                quantity=qty,
+                                side="BUY",
+                                price=price,
+                            ),
+                            _entry_intent=baseline_entry_intent,
                         )
                         if res.ok:
                             exact_fill_price = self._exact_entry_fill_price(res)
@@ -7842,20 +7912,9 @@ async def run_continuous(
                 )
 
                 # Load portfolio configurations
-                from .multiuser.portfolio_config import PortfolioConfig, load_portfolio_configs
+                from .multiuser.portfolio_config import load_portfolio_configs
 
-                try:
-                    portfolio_configs = load_portfolio_configs()
-                except Exception as pc_err:
-                    logger.warning(f"Failed to load portfolio configs: {pc_err}, using default")
-                    portfolio_configs = [
-                        PortfolioConfig(
-                            id="default",
-                            name="Default Portfolio",
-                            starting_cash=default_cash or 100000,
-                            symbols=symbols or [],
-                        )
-                    ]
+                portfolio_configs = load_portfolio_configs()
 
                 active_portfolios = [pc for pc in portfolio_configs if pc.active]
                 logger.info(

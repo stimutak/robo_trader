@@ -1567,7 +1567,13 @@ Update after each merge.
 - PR 7: Staged. Dormant entry-risk PR #114, dormant filled-notional PR #116,
   and paper-path containment PR #117 are under review. All must remain within
   the sole Gate-A staging exception above; integration and post-PR6 strategy
-  readiness work remain open.
+  readiness work remain open. PR #117 is explicitly non-authorizing for new
+  exposure: Python code in one interpreter is one trust domain, so private
+  attributes and closure cells are not accepted as security isolation. The
+  staging slice publishes no baseline entry handle or intent, exports no BUY
+  capability issuer, and terminal baseline submission fails closed. Only
+  semantic paper reductions retain capability-backed execution until the
+  integrated risk-admission boundary is independently enforceable.
 - PR 8: Not started
 - PR 9: Not started
 - PR 10: Not started

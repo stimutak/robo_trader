@@ -34,6 +34,7 @@ from robo_trader.risk_manager import (
     create_risk_manager_from_config,
 )
 from robo_trader.stop_loss_monitor import StopLossMonitor, StopStatus, StopType
+from tests.paper_execution_test_support import bind_gateway_reduction_harness
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -216,7 +217,10 @@ def test_validate_order_rejects_nan_quantity() -> None:
 
 def test_paper_executor_rejects_nan_price() -> None:
     px = PaperExecutor()
-    res = px._place_simple_order(Order("AAPL", quantity=1, side="BUY", price=float("nan")))
+    res = bind_gateway_reduction_harness(px, "test").submit(
+        Order("AAPL", quantity=1, side="BUY_TO_COVER", price=float("nan")),
+        pre_position_quantity=Decimal("-1"),
+    )
     assert not res.ok
     assert "non-finite" in res.message.lower() or "invalid" in res.message.lower()
 
@@ -332,7 +336,11 @@ def test_pairs_buy_calls_validate_order() -> None:
 def test_paper_executor_rejects_stale_cached_price(monkeypatch: pytest.MonkeyPatch) -> None:
     px = PaperExecutor()
     # Seed cache with a price ~ now
-    res = px._place_simple_order(Order("AAPL", quantity=1, side="BUY", price=100.0))
+    harness = bind_gateway_reduction_harness(px, "test")
+    res = harness.submit(
+        Order("AAPL", quantity=1, side="BUY_TO_COVER", price=100.0),
+        pre_position_quantity=Decimal("-1"),
+    )
     assert res.ok
 
     # Force the cache timestamp to be very old
@@ -341,7 +349,10 @@ def test_paper_executor_rejects_stale_cached_price(monkeypatch: pytest.MonkeyPat
     px._execution_cache_ts["AAPL"] = dt.datetime.utcnow() - dt.timedelta(seconds=120)
 
     # Now a market order (price=None) should fail with a staleness error
-    res = px._place_simple_order(Order("AAPL", quantity=1, side="BUY", price=None))
+    res = harness.submit(
+        Order("AAPL", quantity=1, side="BUY_TO_COVER", price=None),
+        pre_position_quantity=Decimal("-1"),
+    )
     assert not res.ok
     assert "stale" in res.message.lower()
 

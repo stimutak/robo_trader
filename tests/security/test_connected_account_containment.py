@@ -37,6 +37,11 @@ class _AccountClient:
 def _runner() -> AsyncRunner:
     runner = object.__new__(AsyncRunner)
     runner.cfg = SimpleNamespace(
+        execution=SimpleNamespace(
+            mode="paper",
+            enable_short_selling=False,
+            use_smart_execution=False,
+        ),
         ibkr=SimpleNamespace(
             account=EXPECTED_ACCOUNT,
             host="127.0.0.1",
@@ -50,6 +55,12 @@ def _runner() -> AsyncRunner:
             stop_loss_pct=0.02,
             use_trailing_stop=True,
             trailing_stop_pct=0.05,
+            enable_take_profit=False,
+        ),
+        strategy=SimpleNamespace(
+            enabled_strategies=["baseline_sma"],
+            enable_ai_discovery=False,
+            enable_ml_selectors=False,
         ),
     )
     runner._client_id = 123

@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 import pytest_asyncio
 
-from robo_trader.execution import ExecutionResult, PaperExecutor
+from robo_trader.execution import PaperExecutor
 from robo_trader.paper_reduction_gateway import (
     PaperReductionGateway,
     PaperReductionGatewayError,
@@ -210,8 +210,9 @@ async def test_partial_nonterminal_and_unknown_outcomes_are_quarantined(
     order_ref = f"unsafe-{status.value.lower()}"
     submit_calls = 0
 
-    def injected_submit(_submitter, _envelope):
+    def injected_submit(_submitter, _envelope, *, pre_position_quantity):
         nonlocal submit_calls
+        assert pre_position_quantity == Decimal("7")
         submit_calls += 1
         return _unsafe_outcome(order_ref=order_ref, status=status)
 
@@ -251,8 +252,9 @@ async def test_failure_after_durable_dispatch_before_executor_submit_blocks_rest
     _install_broker_boundary(harness, monkeypatch)
     submit_calls = 0
 
-    def fail_before_executor(_submitter, _envelope):
+    def fail_before_executor(_submitter, _envelope, *, pre_position_quantity):
         nonlocal submit_calls
+        assert pre_position_quantity == Decimal("7")
         submit_calls += 1
         raise RuntimeError("injected failure before executor submit")
 
@@ -424,12 +426,16 @@ async def test_terminal_rejection_releases_once_and_restart_cannot_retry(
     harness = failure_harness
     rejection_calls = 0
 
-    def reject(_executor, _order):
+    def reject(_submitter, _envelope, *, pre_position_quantity):
         nonlocal rejection_calls
+        assert pre_position_quantity == Decimal("7")
         rejection_calls += 1
-        return ExecutionResult(False, "injected definitive rejection")
+        return _unfilled_terminal_outcome(
+            order_ref="terminal-rejection-survives-restart",
+            status=LocalPaperOrderStatus.REJECTED,
+        )
 
-    monkeypatch.setattr(PaperExecutor, "_place_simple_order", reject)
+    monkeypatch.setattr(PaperReductionSubmitter, "_submit_once", reject)
     first_executor = PaperExecutor()
     await _bind_runtime(harness, "portfolio-a", first_executor)
     _install_broker_boundary(harness, monkeypatch)
@@ -501,8 +507,9 @@ async def test_unfilled_terminal_status_releases_exactly_once(
     order_ref = f"terminal-{status.value.lower()}"
     submit_calls = 0
 
-    def terminal_without_fill(_submitter, _envelope):
+    def terminal_without_fill(_submitter, _envelope, *, pre_position_quantity):
         nonlocal submit_calls
+        assert pre_position_quantity == Decimal("7")
         submit_calls += 1
         return _unfilled_terminal_outcome(order_ref=order_ref, status=status)
 
