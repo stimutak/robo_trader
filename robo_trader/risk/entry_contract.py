@@ -41,13 +41,14 @@ _BROKER_IDENTITY = re.compile(r"^[A-Z0-9][A-Z0-9._:/-]{0,63}$")
 class _DecisionReplayTombstones:
     """Bounded live-window semantic replay records."""
 
-    __slots__ = ("_entries", "_limit")
+    __slots__ = ("_entries", "_limit", "_retired_through")
 
     def __init__(self, limit: int) -> None:
         if type(limit) is not int or limit <= 0:
             raise ValueError("decision replay tombstone limit must be positive")
         self._entries: dict[tuple[object, ...], datetime] = {}
         self._limit = limit
+        self._retired_through: Optional[datetime] = None
 
     def record(
         self,
@@ -64,6 +65,10 @@ class _DecisionReplayTombstones:
 
         if replay_key in self._entries:
             raise EntryRiskContractError("RiskDecision semantic replay detected")
+        if self._retired_through is not None and consumed_at <= self._retired_through:
+            raise EntryRiskContractError(
+                "RiskDecision consumption predates the retained replay window"
+            )
 
         # A rejected call must not weaken replay protection for any other
         # decision.  Derive the next registry state without mutating the live
@@ -71,8 +76,15 @@ class _DecisionReplayTombstones:
         survivors = {key: expiry for key, expiry in self._entries.items() if expiry > consumed_at}
         if len(survivors) >= self._limit:
             raise EntryRiskContractError("RiskDecision live replay registry capacity exhausted")
+        retired_expiries = tuple(
+            expiry for expiry in self._entries.values() if expiry <= consumed_at
+        )
         survivors[replay_key] = expires_at
         self._entries = survivors
+        if retired_expiries:
+            retired_through = max(retired_expiries)
+            if self._retired_through is None or retired_through > self._retired_through:
+                self._retired_through = retired_through
 
 
 def _build_capability_authority():

@@ -1291,6 +1291,28 @@ def test_replay_tombstones_allow_concurrent_out_of_order_consumption_times() -> 
     )
 
 
+def test_successful_pruning_retires_out_of_order_replay_window() -> None:
+    tombstones = _DecisionReplayTombstones(2)
+    replay_key = ("risk-decision-v1", 1, "portfolio-alpha", "intent-retired")
+    tombstones.record(
+        replay_key,
+        expires_at=NOW + timedelta(seconds=2),
+        consumed_at=NOW,
+    )
+    tombstones.record(
+        ("risk-decision-v1", 1, "portfolio-alpha", "intent-later"),
+        expires_at=NOW + timedelta(seconds=10),
+        consumed_at=NOW + timedelta(seconds=3),
+    )
+
+    with pytest.raises(EntryRiskContractError, match="retained replay window"):
+        tombstones.record(
+            replay_key,
+            expires_at=NOW + timedelta(seconds=2),
+            consumed_at=NOW + timedelta(seconds=1),
+        )
+
+
 def test_invalid_future_consumption_does_not_mutate_live_replay_state() -> None:
     tombstones = _DecisionReplayTombstones(2)
     replay_key = ("risk-decision-v1", 1, "portfolio-alpha", "intent-live")
