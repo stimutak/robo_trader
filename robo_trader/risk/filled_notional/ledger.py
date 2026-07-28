@@ -1634,7 +1634,15 @@ class DailyFilledNotional:
             )
 
     def _validate_existing_rollback_journal(self) -> None:
-        """Ensure a rollback journal cannot redirect mutations through another inode name."""
+        """Reject every authoritative open while rollback evidence exists.
+
+        Merely authenticating a hot journal is not enough: opening the database
+        through SQLite can recover it implicitly, rewrite the ledger, and remove
+        the only crash evidence.  Recovery is intentionally restricted to an
+        isolated reviewed copy, so both read and write connections must remain
+        unavailable until an operator installs a separately authenticated
+        generation.
+        """
 
         self._require_exclusive_database_path()
         journal = Path(f"{self._path}-journal")
@@ -1671,6 +1679,12 @@ class DailyFilledNotional:
             raise FilledNotionalUnavailable(
                 "hot journal recovery anchor does not bind this database"
             )
+        if self._review_only and anchor.pending_state is not None:
+            raise _PendingAnchorInProgress
+        raise FilledNotionalUnavailable(
+            "hot journal requires reviewed isolated-copy recovery; "
+            "authoritative database open is blocked"
+        )
 
     @staticmethod
     def _require_rollback_journal_header(binding: SQLitePathBinding) -> None:

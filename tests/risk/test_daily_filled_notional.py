@@ -2396,6 +2396,55 @@ signal.pause()
     assert _file_snapshot(ledger.anchor_path) == anchor_before
 
 
+def test_existing_service_rejects_new_hot_journal_without_sqlite_recovery(tmp_path):
+    if not hasattr(signal, "SIGKILL"):
+        pytest.skip("SIGKILL unavailable on this host")
+    path = tmp_path / "existing-service-hot-journal.db"
+    ledger = _service(path)
+    ledger.record_fill(_fill("existing-service-initial"))
+
+    script = f"""
+import signal
+import sqlite3
+
+connection = sqlite3.connect({str(path)!r}, isolation_level=None)
+connection.execute('PRAGMA journal_mode=DELETE')
+connection.execute('PRAGMA synchronous=FULL')
+connection.execute('BEGIN IMMEDIATE')
+connection.execute('CREATE TABLE crash_probe (value TEXT)')
+print('READY', flush=True)
+signal.pause()
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "READY"
+        os.kill(child.pid, signal.SIGKILL)
+        child.wait(timeout=10)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+
+    journal = Path(f"{path}-journal")
+    assert journal.exists() and journal.stat().st_size > 0
+    database_before = _file_snapshot(path)
+    journal_before = _file_snapshot(journal)
+    anchor_before = _file_snapshot(ledger.anchor_path)
+
+    with pytest.raises(FilledNotionalUnavailable, match="reviewed isolated-copy recovery"):
+        ledger.record_fill(_fill("existing-service-must-block"))
+
+    assert _file_snapshot(path) == database_before
+    assert _file_snapshot(journal) == journal_before
+    assert _file_snapshot(ledger.anchor_path) == anchor_before
+
+
 def test_future_schema_version_fails_closed_without_downgrade(tmp_path):
     path = tmp_path / "future.db"
     with sqlite3.connect(path) as connection:
