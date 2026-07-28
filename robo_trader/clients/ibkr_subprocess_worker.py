@@ -162,6 +162,7 @@ BROKER_SNAPSHOT_BALANCE_TAGS = frozenset(
 )
 BROKER_SNAPSHOT_REQUIRED_BALANCE_TAGS = frozenset({"NetLiquidation", "TotalCashValue"})
 BROKER_SNAPSHOT_STAGE_TIMEOUT_SECONDS = 5.0
+BROKER_SNAPSHOT_ACCOUNT_SUMMARY_TAGS = ",".join(sorted(BROKER_SNAPSHOT_BALANCE_TAGS))
 BROKER_SNAPSHOT_REQUEST_STAGES = frozenset(
     {
         "broker_time_before",
@@ -196,6 +197,56 @@ async def _await_broker_snapshot_stage(stage: str, request: Any) -> Any:
         )
     except (asyncio.TimeoutError, TimeoutError) as exc:
         raise BrokerSnapshotStageTimeout(stage) from exc
+
+
+async def _request_fresh_broker_account_summary(account: str) -> list[Any]:
+    """Return only values produced by one fresh, cancelled summary request."""
+    if ib is None:
+        raise ConnectionError("Not connected to IBKR")
+    client = getattr(ib, "client", None)
+    wrapper = getattr(ib, "wrapper", None)
+    summary_cache = getattr(wrapper, "acctSummary", None)
+    get_request_id = getattr(client, "getReqId", None)
+    request_summary = getattr(client, "reqAccountSummary", None)
+    cancel_summary = getattr(client, "cancelAccountSummary", None)
+    start_request = getattr(wrapper, "startReq", None)
+    if (
+        not isinstance(summary_cache, dict)
+        or not callable(get_request_id)
+        or not callable(request_summary)
+        or not callable(cancel_summary)
+        or not callable(start_request)
+    ):
+        raise RuntimeError("IBKR client has no fresh account-summary API")
+
+    # accountSummaryAsync() skips broker I/O whenever this cache is nonempty.
+    # Remove only the expected account's prior values before issuing a request
+    # whose request ID and subscription lifetime are owned by this coroutine.
+    for key, value in list(summary_cache.items()):
+        if str(getattr(value, "account", "")).strip() == account:
+            summary_cache.pop(key, None)
+
+    request_id = get_request_id()
+    request = start_request(request_id)
+    request_started = False
+    try:
+        request_summary(
+            request_id,
+            "All",
+            BROKER_SNAPSHOT_ACCOUNT_SUMMARY_TAGS,
+        )
+        request_started = True
+        await request
+    finally:
+        if request_started:
+            cancel_summary(request_id)
+
+    return [
+        value
+        for value in summary_cache.values()
+        if str(getattr(value, "account", "")).strip() == account
+        and str(getattr(value, "tag", "")) in BROKER_SNAPSHOT_BALANCE_TAGS
+    ]
 
 
 def _aware_iso(value: Any) -> str:
@@ -1077,7 +1128,7 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
             )
 
         account_values = await _await_broker_snapshot_stage(
-            "account_summary", ib.accountSummaryAsync(account)
+            "account_summary", _request_fresh_broker_account_summary(account)
         )
         if not ib.isConnected():
             raise ConnectionError("Broker disconnected during snapshot collection")

@@ -38,6 +38,71 @@ def _contract(symbol="AAPL", con_id=265598):
     )
 
 
+def _account_summary_values(net_liquidation="100000.00", total_cash="25000.500"):
+    return [
+        SimpleNamespace(
+            account=ACCOUNT,
+            tag="NetLiquidation",
+            currency="USD",
+            value=net_liquidation,
+        ),
+        SimpleNamespace(
+            account=ACCOUNT,
+            tag="TotalCashValue",
+            currency="USD",
+            value=total_cash,
+        ),
+        SimpleNamespace(
+            account=ACCOUNT,
+            tag="BuyingPower",
+            currency="USD",
+            value="999999",
+        ),
+    ]
+
+
+class _FakeAccountSummaryWrapper:
+    def __init__(self):
+        self.acctSummary = {}
+        self.pending = {}
+
+    def startReq(self, request_id):
+        future = asyncio.get_running_loop().create_future()
+        self.pending[request_id] = future
+        return future
+
+
+class _FakeAccountSummaryClient:
+    def __init__(self, owner):
+        self.owner = owner
+        self.next_request_id = 1
+        self.cancelled_request_ids = []
+
+    def getReqId(self):
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        return request_id
+
+    def reqAccountSummary(self, request_id, group, tags):
+        self.owner.calls.append("reqAccountSummary")
+        self.owner.account_summary_requests.append((request_id, group, tags))
+        if self.owner.account_summary_hangs:
+            return
+        batch_index = min(
+            len(self.owner.account_summary_requests) - 1,
+            len(self.owner.account_summary_batches) - 1,
+        )
+        for value in self.owner.account_summary_batches[batch_index]:
+            key = (value.account, value.tag, value.currency)
+            self.owner.wrapper.acctSummary[key] = value
+        self.owner.wrapper.pending.pop(request_id).set_result(None)
+
+    def cancelAccountSummary(self, request_id):
+        self.owner.calls.append("cancelAccountSummary")
+        self.cancelled_request_ids.append(request_id)
+        self.owner.wrapper.pending.pop(request_id, None)
+
+
 class _FakeIB:
     def __init__(self):
         self.calls = []
@@ -45,6 +110,11 @@ class _FakeIB:
         self.account_reads = 0
         self.contract = _contract()
         self.execution_filters = []
+        self.account_summary_batches = [_account_summary_values()]
+        self.account_summary_requests = []
+        self.account_summary_hangs = False
+        self.wrapper = _FakeAccountSummaryWrapper()
+        self.client = _FakeAccountSummaryClient(self)
 
     def isConnected(self):
         self.calls.append("isConnected")
@@ -129,30 +199,6 @@ class _FakeIB:
             )
         ]
 
-    async def accountSummaryAsync(self, account):
-        self.calls.append("accountSummaryAsync")
-        assert account == ACCOUNT
-        return [
-            SimpleNamespace(
-                account=ACCOUNT,
-                tag="NetLiquidation",
-                currency="USD",
-                value="100000.00",
-            ),
-            SimpleNamespace(
-                account=ACCOUNT,
-                tag="TotalCashValue",
-                currency="USD",
-                value="25000.500",
-            ),
-            SimpleNamespace(
-                account=ACCOUNT,
-                tag="BuyingPower",
-                currency="USD",
-                value="999999",
-            ),
-        ]
-
     def accountValues(self, account):
         self.calls.append("accountValues")
         assert account == ACCOUNT
@@ -233,14 +279,16 @@ async def test_worker_snapshot_is_fresh_atomic_read_only_and_precise(fake_ib):
         "reqPositionsAsync",
         "reqAllOpenOrdersAsync",
         "reqExecutionsAsync",
-        "accountSummaryAsync",
+        "reqAccountSummary",
+        "cancelAccountSummary",
         "qualifyContractsAsync",
     }
     assert set(fake_ib.calls) <= allowed
     assert "reqPositionsAsync" in fake_ib.calls
     assert "reqAllOpenOrdersAsync" in fake_ib.calls
     assert "reqExecutionsAsync" in fake_ib.calls
-    assert "accountSummaryAsync" in fake_ib.calls
+    assert "reqAccountSummary" in fake_ib.calls
+    assert "cancelAccountSummary" in fake_ib.calls
     assert "accountValues" not in fake_ib.calls
     execution_request_index = fake_ib.calls.index("reqExecutionsAsync")
     assert fake_ib.calls[execution_request_index - 1] == "reqCurrentTimeAsync"
@@ -273,6 +321,32 @@ async def test_worker_snapshot_rechecks_account_and_suppresses_sensitive_errors(
 
 
 @pytest.mark.asyncio
+async def test_worker_repeated_snapshot_forces_fresh_account_summary(fake_ib):
+    fake_ib.account_summary_batches = [
+        _account_summary_values("100000.00", "25000.00"),
+        _account_summary_values("101000.00", "26000.00"),
+    ]
+
+    first = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+    second = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert first["status"] == "success"
+    assert second["status"] == "success"
+    first_balances = {
+        (row["tag"], row["currency"]): row["value"] for row in first["data"]["balances"]
+    }
+    second_balances = {
+        (row["tag"], row["currency"]): row["value"] for row in second["data"]["balances"]
+    }
+    assert first_balances[("NetLiquidation", "USD")] == "100000"
+    assert second_balances[("NetLiquidation", "USD")] == "101000"
+    assert first_balances[("TotalCashValue", "USD")] == "25000"
+    assert second_balances[("TotalCashValue", "USD")] == "26000"
+    assert len(fake_ib.account_summary_requests) == 2
+    assert fake_ib.client.cancelled_request_ids == [1, 2]
+
+
+@pytest.mark.asyncio
 async def test_worker_wrong_expected_account_performs_zero_data_reads(fake_ib):
     result = await worker.handle_get_broker_snapshot({"expected_account": "DU_WRONG_ACCOUNT"})
 
@@ -280,7 +354,12 @@ async def test_worker_wrong_expected_account_performs_zero_data_reads(fake_ib):
     assert result["error_type"] == "BrokerSnapshotAccountMismatchError"
     assert not any(
         call.startswith("req")
-        or call in {"accountSummaryAsync", "accountValues", "qualifyContractsAsync"}
+        or call
+        in {
+            "accountValues",
+            "cancelAccountSummary",
+            "qualifyContractsAsync",
+        }
         for call in fake_ib.calls
     )
 
@@ -639,6 +718,25 @@ async def test_worker_snapshot_timeout_preserves_parent_timeout_poison(fake_ib, 
     assert generation.poisoned_reason is not None
     assert "worker-reported broker timeout" in generation.poisoned_reason
     assert "get_broker_snapshot" in generation.poisoned_reason
+
+
+@pytest.mark.asyncio
+async def test_worker_account_summary_timeout_cancels_subscription_and_is_sanitized(
+    fake_ib, monkeypatch
+):
+    fake_ib.account_summary_hangs = True
+    monkeypatch.setattr(worker, "BROKER_SNAPSHOT_STAGE_TIMEOUT_SECONDS", 0.001)
+
+    worker_response = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert worker_response == {
+        "status": "error",
+        "error": "Broker snapshot collection timed out",
+        "error_type": "TimeoutError",
+        "detail": "Broker snapshot stage timed out: account_summary",
+    }
+    assert fake_ib.client.cancelled_request_ids == [1]
+    assert fake_ib.wrapper.pending == {}
 
 
 @pytest.mark.asyncio
