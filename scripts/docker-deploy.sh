@@ -46,7 +46,7 @@ create_env_file() {
 # Trading Configuration
 TRADING_MODE=paper
 TRADING_SYMBOLS=AAPL,NVDA,TSLA,GOOGL,MSFT
-STRATEGY_ENABLED_STRATEGIES=momentum,mean_reversion
+STRATEGY_ENABLED_STRATEGIES=baseline_sma
 
 # IBKR Configuration
 IBKR_HOST=host.docker.internal

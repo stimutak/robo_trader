@@ -107,7 +107,7 @@ services:
       - SAFETY_JOURNAL_PATH=${SAFETY_JOURNAL_PATH:?Set the dedicated paper safety journal path}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - WEBSOCKET_URL=ws://websocket:8765
-      - STRATEGY_ENABLED_STRATEGIES=${STRATEGY_ENABLED_STRATEGIES:-momentum,mean_reversion}
+      - STRATEGY_ENABLED_STRATEGIES=${STRATEGY_ENABLED_STRATEGIES:-baseline_sma}
       - RISK_MAX_POSITION_SIZE=${RISK_MAX_POSITION_SIZE:-10000}
       - RISK_STOP_LOSS_PERCENT=${RISK_STOP_LOSS_PERCENT:-0.02}
     volumes:

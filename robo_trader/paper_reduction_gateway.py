@@ -23,8 +23,13 @@ from typing import AsyncIterator, Awaitable, Callable, Optional
 from .broker_safety_evidence import BrokerContractSafetySnapshot
 from .clients.subprocess_ibkr_client import SubprocessIBKRClient
 from .database_async import AsyncTradingDatabase
-from .execution import Order, PaperExecutor
+from .execution import ExecutionResult, Order, PaperExecutor
 from .market_data_contract import BrokerProtectiveQuote
+from .paper_execution_capability import (
+    PaperReductionExecutionAuthority,
+    _bind_gateway_reduction_execution,
+    _issue_gateway_reduction_binding_capability,
+)
 from .paper_reduction_submitter import (
     LocalPaperOrderStatus,
     LocalPaperTerminalOutcome,
@@ -67,8 +72,18 @@ _REFERENCE_PRICE_TICK = Decimal("0.0001")
 @dataclass(frozen=True, slots=True)
 class _PaperRuntimeBinding:
     submitter: PaperReductionSubmitter
+    reduction_execution_authority: PaperReductionExecutionAuthority
     protective_quote_producer: object
     settlement_participant: PaperRuntimeSettlementParticipant
+
+
+@dataclass(slots=True)
+class _PaperRuntimeBindingSession:
+    gateway: "PaperReductionGateway"
+    runtime_context: RuntimeSafetyContext
+    executor: PaperExecutor
+    portfolio_id: str
+    reduction_capability_issued: bool = False
 
 
 class PaperReductionGateway:
@@ -131,6 +146,7 @@ class PaperReductionGateway:
         )
         self._account_order_gate = asyncio.Lock()
         self._bindings: dict[str, _PaperRuntimeBinding] = {}
+        self._active_runtime_binding_session: _PaperRuntimeBindingSession | None = None
         self._started = False
         self._diagnostic_recovery_required = False
         self._terminal_quarantine_reason: str | None = None
@@ -675,30 +691,74 @@ class PaperReductionGateway:
         existing = self._bindings.get(portfolio_id)
         if existing is not None:
             if (
-                existing.submitter._is_bound_to(executor, self._coordinator)
+                existing.submitter._is_bound_to(
+                    executor,
+                    self._coordinator,
+                    existing.reduction_execution_authority,
+                )
                 and existing.protective_quote_producer is protective_quote_producer
                 and existing.settlement_participant is settlement_participant
             ):
-                return
+                return None
             raise PaperReductionGatewayError("portfolio paper runtime is already registered")
         attached = self._protective_quote_producers.get(portfolio_id)
         if attached is not protective_quote_producer:
             raise PaperReductionGatewayError(
                 "paper runtime quote producer was not provisionally attached"
             )
+        if not self._started:
+            raise PaperReductionGatewayError(
+                "paper runtime registration requires a started gateway"
+            )
+        if self._active_runtime_binding_session is not None:
+            raise PaperReductionGatewayError("paper runtime registration session is already active")
+        binding_session = _PaperRuntimeBindingSession(
+            gateway=self,
+            runtime_context=self._runtime_context,
+            executor=executor,
+            portfolio_id=portfolio_id,
+        )
+        self._active_runtime_binding_session = binding_session
+        try:
+            reduction_binding_capability = _issue_gateway_reduction_binding_capability(
+                gateway=self,
+                runtime_context=self._runtime_context,
+                binding_session=binding_session,
+                executor=executor,
+                portfolio_id=portfolio_id,
+                coordinator=self._coordinator,
+            )
+            reduction_execution_authority = _bind_gateway_reduction_execution(
+                gateway=self,
+                runtime_context=self._runtime_context,
+                binding_session=binding_session,
+                executor=executor,
+                portfolio_id=portfolio_id,
+                coordinator=self._coordinator,
+                capability=reduction_binding_capability,
+            )
+        finally:
+            if self._active_runtime_binding_session is binding_session:
+                self._active_runtime_binding_session = None
         self._bindings[portfolio_id] = _PaperRuntimeBinding(
             submitter=_bind_paper_reduction_submitter(
                 executor,
                 self._coordinator,
+                reduction_execution_authority,
+                portfolio_id,
             ),
+            reduction_execution_authority=reduction_execution_authority,
             protective_quote_producer=protective_quote_producer,
             settlement_participant=settlement_participant,
         )
+        return None
 
     @asynccontextmanager
     async def serialize_entry(
         self,
         symbol: str | None = None,
+        *,
+        portfolio_id: str | None = None,
     ) -> AsyncIterator[BrokerProtectiveQuote | None]:
         """Refresh entry evidence and hold it stable through paper dispatch."""
 
@@ -756,7 +816,29 @@ class PaperReductionGateway:
                         raise PaperReductionGatewayError(
                             "entry blocked while a protective reduction is pending"
                         )
+            if portfolio_id is not None:
+                binding = self._bindings.get(portfolio_id)
+                if type(binding) is not _PaperRuntimeBinding:
+                    raise PaperReductionGatewayError(
+                        "entry portfolio has no registered paper runtime binding"
+                    )
+                if symbol is None or current_quote is None:
+                    raise PaperReductionGatewayError("entry serialization scope is malformed")
             yield current_quote
+
+    def submit_baseline_entry(
+        self,
+        *,
+        order: Order,
+        portfolio_id: str,
+        intent: object,
+    ) -> ExecutionResult:
+        """Deny every BUY until admission is independently enforceable."""
+
+        del order, portfolio_id, intent
+        raise PaperReductionGatewayError(
+            "Gate-A baseline entry authority is disabled pending integrated risk admission"
+        )
 
     async def submit_reduction(
         self,
@@ -889,7 +971,22 @@ class PaperReductionGateway:
                     proof,
                 )
                 try:
-                    outcome = binding.submitter._submit_once(envelope)
+                    allocation = next(
+                        (
+                            row
+                            for row in final_allocation.allocations
+                            if row.portfolio_id == portfolio_id
+                        ),
+                        None,
+                    )
+                    if allocation is None:
+                        raise PaperReductionGatewayError(
+                            "authorized portfolio allocation disappeared before submission"
+                        )
+                    outcome = binding.submitter._submit_once(
+                        envelope,
+                        pre_position_quantity=allocation.quantity,
+                    )
                 except BaseException as error:
                     self._latch_terminal_quarantine(
                         portfolio_id,

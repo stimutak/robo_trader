@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol
 
 import pandas as pd
 
+from ..gatea_containment import assert_quarantined_alternate_engine
 from ..logger import get_logger
 from ..monitoring.performance import Timer
 
@@ -110,6 +111,7 @@ class SignalGenerator:
         use_ml_strategy: bool = False,
         use_correlation_sizing: bool = False,
     ):
+        assert_quarantined_alternate_engine("robo_trader.runner.SignalGenerator")
         self.ml_enhanced_strategy = ml_enhanced_strategy
         self.ml_strategy = ml_strategy
         self.ai_analyst = ai_analyst

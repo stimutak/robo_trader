@@ -28,6 +28,8 @@ def _minimal_runner() -> AsyncRunner:
     runner.advanced_risk = None
     runner.running = True
     runner.stop_loss_monitor = None
+    runner._baseline_entry_handle = object()
+    runner._baseline_entry_intent = object()
     return runner
 
 
@@ -88,7 +90,13 @@ async def test_entry_waiting_at_final_admission_is_rejected_after_freeze():
     await runner._order_admission_lock.acquire()
     order_task = asyncio.create_task(
         runner._place_order_with_circuit_breaker(
-            Order(symbol="NVDA", quantity=1, side="BUY", price=100.0)
+            Order(
+                symbol="NVDA",
+                quantity=1,
+                side="BUY",
+                price=100.0,
+            ),
+            _entry_intent=runner._baseline_entry_intent,
         )
     )
     await asyncio.sleep(0)
