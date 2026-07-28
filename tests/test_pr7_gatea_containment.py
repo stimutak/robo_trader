@@ -329,6 +329,28 @@ def test_terminal_fill_direct_call_without_exact_authority_cannot_fill() -> None
     assert executor.fills == {}
 
 
+def test_terminal_authority_state_is_not_importable_or_directly_constructible() -> None:
+    for name in (
+        "_CAPABILITY_TOKEN",
+        "_CAPABILITIES",
+        "_CapabilityRecord",
+        "_REGISTRY_LOCK",
+        "_TERMINAL_DISPATCH_TOKEN",
+        "_REDUCTION_DISPATCHES",
+    ):
+        assert not hasattr(capability_module, name)
+
+    with pytest.raises(PaperExecutionCapabilityError, match="minted only"):
+        capability_module._PaperExecutionCapability()
+
+    executor = PaperExecutor()
+    order = Order("AAPL", 1, "SELL", Decimal("100.0000"))
+    unissued = object.__new__(capability_module._PaperExecutionCapability)
+    with pytest.raises(PaperExecutionCapabilityError, match="unknown|already consumed"):
+        capability_module._execute_sealed_paper_fill(executor, order, unissued)
+    assert executor.fills == {}
+
+
 def test_reduction_traceback_retains_only_burned_capability() -> None:
     executor = PaperExecutor()
     harness = bind_gateway_reduction_harness(executor, "default")
@@ -350,12 +372,20 @@ def test_reduction_traceback_retains_only_burned_capability() -> None:
         )
 
     capability = None
+    retained_records = []
     traceback = raised.value.__traceback__
     while traceback is not None:
         if traceback.tb_frame.f_code.co_name == "_submit_gateway_reduction_once":
             capability = traceback.tb_frame.f_locals.get("capability")
+        record = traceback.tb_frame.f_locals.get("record")
+        if record is not None and hasattr(record, "consumed"):
+            retained_records.append(record)
         traceback = traceback.tb_next
     assert capability is not None
+    for record in retained_records:
+        with pytest.raises(AttributeError):
+            record.consumed = False
+        replace(record, consumed=False)
     with pytest.raises(PaperExecutionCapabilityError):
         copy.copy(capability)
     with pytest.raises(PaperExecutionCapabilityError):
@@ -372,49 +402,28 @@ def test_reduction_traceback_retains_only_burned_capability() -> None:
     assert executor.fills == {}
 
 
-def test_reduction_consume_failure_cannot_promote_burned_capability(
+def test_reduction_consume_uses_closure_captured_fingerprint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     executor = PaperExecutor()
     harness = bind_gateway_reduction_harness(executor, "default")
     original = Order("AAPL", 1, "SELL", Decimal("100.0000"))
     dispatch = harness.issue(original, pre_position_quantity=Decimal("1"))
-    original_fingerprint = capability_module._fingerprint_order
-    fingerprint_calls = 0
 
-    def fail_during_consume(order):
-        nonlocal fingerprint_calls
-        fingerprint_calls += 1
-        if fingerprint_calls == 2:
-            raise LookupError("injected consume validation failure")
-        return original_fingerprint(order)
+    def forged_fingerprint(_order):
+        pytest.fail("mutable module fingerprint must not replace the captured primitive")
 
-    monkeypatch.setattr(capability_module, "_fingerprint_order", fail_during_consume)
-    with pytest.raises(LookupError, match="consume validation") as raised:
-        _submit_gateway_reduction_once(
-            harness.authority,
-            dispatch,
-            submitter=harness.submitter_identity,
-            order=original,
-            pre_position_quantity=Decimal("1"),
-        )
+    monkeypatch.setattr(capability_module, "_fingerprint_order", forged_fingerprint)
+    result = _submit_gateway_reduction_once(
+        harness.authority,
+        dispatch,
+        submitter=harness.submitter_identity,
+        order=original,
+        pre_position_quantity=Decimal("1"),
+    )
 
-    capability = None
-    traceback = raised.value.__traceback__
-    while traceback is not None:
-        candidate = traceback.tb_frame.f_locals.get("capability")
-        if candidate is not None:
-            capability = candidate
-        traceback = traceback.tb_next
-    assert capability is not None
-
-    monkeypatch.setattr(capability_module, "_fingerprint_order", original_fingerprint)
-    replay = PaperExecutor._place_simple_order(executor, original, _capability=capability)
-    assert replay.ok is False
-    assert "already consumed" in replay.message
-    with pytest.raises(PaperExecutionCapabilityError, match="unconsumed|mismatched"):
-        capability_module._apply_consumed_paper_fill(executor, original, capability)
-    assert executor.fills == {}
+    assert result.ok is True
+    assert len(executor.fills) == 1
 
 
 @pytest.mark.parametrize(

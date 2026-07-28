@@ -615,7 +615,6 @@ class RuntimeAuthorization:
 
 _FINAL_EVIDENCE_PROOF_MARKER = object()
 _CONSUMED_ENVELOPE_MARKER = object()
-_CLAIMED_PAPER_ALLOCATION_TOKEN = object()
 _RUNTIME_AUTHORIZATION_REGISTRY_LOCK = threading.RLock()
 _RUNTIME_AUTHORIZATION_REGISTRY: dict[
     int, tuple[weakref.ReferenceType[RuntimeAuthorization], str]
@@ -627,16 +626,6 @@ _FINAL_EVIDENCE_REGISTRY: dict[
 _CONSUMED_ENVELOPE_REGISTRY_LOCK = threading.RLock()
 _CONSUMED_ENVELOPE_REGISTRY: dict[
     int, tuple[weakref.ReferenceType["ConsumedPaperSubmissionEnvelope"], str]
-] = {}
-_CLAIMED_PAPER_ALLOCATION_REGISTRY_LOCK = threading.RLock()
-_CLAIMED_PAPER_ALLOCATION_REGISTRY: dict[
-    int,
-    tuple[
-        weakref.ReferenceType["_ClaimedPaperSubmissionAllocation"],
-        object,
-        SubmissionDescriptor,
-        AuthoritativeContract,
-    ],
 ] = {}
 
 
@@ -776,6 +765,7 @@ class FinalSubmissionEvidenceProof:
     contract_snapshot_id: str
     contract_transport_generation: str
     final_evidence_fingerprint: str
+    pre_position_quantity: Decimal
     expires_at: datetime
     _contract: AuthoritativeContract = field(repr=False, compare=False)
     _coordinator_token: object = field(repr=False, compare=False)
@@ -787,6 +777,11 @@ class FinalSubmissionEvidenceProof:
                 "FinalSubmissionEvidenceProof requires trusted final evidence production"
             )
         object.__setattr__(self, "expires_at", _utc(self.expires_at, "expires_at"))
+        object.__setattr__(
+            self,
+            "pre_position_quantity",
+            _decimal(self.pre_position_quantity, "pre_position_quantity"),
+        )
 
     def __copy__(self):
         raise TypeError("FinalSubmissionEvidenceProof cannot be copied")
@@ -810,6 +805,7 @@ class ConsumedPaperSubmissionEnvelope:
     contract_snapshot_id: str
     contract_transport_generation: str
     final_evidence_fingerprint: str
+    pre_position_quantity: Decimal
     _descriptor: SubmissionDescriptor = field(repr=False, compare=False)
     _contract: AuthoritativeContract = field(repr=False, compare=False)
     _coordinator_token: object = field(repr=False, compare=False)
@@ -820,6 +816,11 @@ class ConsumedPaperSubmissionEnvelope:
             raise RuntimeSafetyError(
                 "ConsumedPaperSubmissionEnvelope requires coordinator permit consumption"
             )
+        object.__setattr__(
+            self,
+            "pre_position_quantity",
+            _decimal(self.pre_position_quantity, "pre_position_quantity"),
+        )
 
     def __copy__(self):
         raise TypeError("ConsumedPaperSubmissionEnvelope cannot be copied")
@@ -831,103 +832,134 @@ class ConsumedPaperSubmissionEnvelope:
         raise TypeError("ConsumedPaperSubmissionEnvelope cannot be serialized")
 
 
-class _ClaimedPaperSubmissionAllocation:
-    """Opaque one-shot identity emitted only after coordinator envelope claim."""
+def _make_claimed_paper_allocation_state():
+    """Build closure-owned one-shot state for final allocation claims."""
 
-    __slots__ = ("__weakref__",)
+    issue_token = object()
+    registry_lock = threading.RLock()
+    registry: dict[
+        int,
+        tuple[
+            weakref.ReferenceType[object],
+            object,
+            SubmissionDescriptor,
+            AuthoritativeContract,
+            Decimal,
+        ],
+    ] = {}
 
-    def __new__(cls, *, _token: object | None = None):
-        if _token is not _CLAIMED_PAPER_ALLOCATION_TOKEN:
-            raise RuntimeSafetyError("claimed paper allocation is coordinator-only")
-        return super().__new__(cls)
+    class _ClaimedPaperSubmissionAllocation:
+        """Opaque identity emitted only after an exact coordinator claim."""
 
-    def __copy__(self):
-        raise TypeError("claimed paper allocation cannot be copied")
+        __slots__ = ("__weakref__",)
 
-    def __deepcopy__(self, _memo):
-        return self.__copy__()
+        def __new__(cls, *, _token: object | None = None):
+            if _token is not issue_token:
+                raise RuntimeSafetyError("claimed paper allocation is coordinator-only")
+            return super().__new__(cls)
 
-    def __reduce__(self):
-        raise TypeError("claimed paper allocation cannot be serialized")
+        def __copy__(self):
+            raise TypeError("claimed paper allocation cannot be copied")
 
+        def __deepcopy__(self, _memo):
+            return self.__copy__()
 
-def _register_claimed_paper_submission_allocation(
-    allocation: _ClaimedPaperSubmissionAllocation,
-    *,
-    coordinator_token: object,
-    descriptor: SubmissionDescriptor,
-    contract: AuthoritativeContract,
-) -> None:
-    object_id = id(allocation)
+        def __reduce__(self):
+            raise TypeError("claimed paper allocation cannot be serialized")
 
-    def discard(reference: weakref.ReferenceType[_ClaimedPaperSubmissionAllocation]) -> None:
-        with _CLAIMED_PAPER_ALLOCATION_REGISTRY_LOCK:
-            registered = _CLAIMED_PAPER_ALLOCATION_REGISTRY.get(object_id)
-            if registered is not None and registered[0] is reference:
-                _CLAIMED_PAPER_ALLOCATION_REGISTRY.pop(object_id, None)
+    def issue(
+        *,
+        coordinator_token: object,
+        descriptor: SubmissionDescriptor,
+        contract: AuthoritativeContract,
+        pre_position_quantity: Decimal,
+    ) -> _ClaimedPaperSubmissionAllocation:
+        allocation = _ClaimedPaperSubmissionAllocation(_token=issue_token)
+        object_id = id(allocation)
 
-    reference = weakref.ref(allocation, discard)
-    with _CLAIMED_PAPER_ALLOCATION_REGISTRY_LOCK:
-        _CLAIMED_PAPER_ALLOCATION_REGISTRY[object_id] = (
-            reference,
-            coordinator_token,
-            descriptor,
-            contract,
-        )
+        def discard(reference: weakref.ReferenceType[object]) -> None:
+            with registry_lock:
+                registered = registry.get(object_id)
+                if registered is not None and registered[0] is reference:
+                    registry.pop(object_id, None)
 
+        reference = weakref.ref(allocation, discard)
+        with registry_lock:
+            registry[object_id] = (
+                reference,
+                coordinator_token,
+                descriptor,
+                contract,
+                pre_position_quantity,
+            )
+        return allocation
 
-def _consume_claimed_paper_submission_allocation(
-    allocation: object,
-    *,
-    coordinator: object,
-    descriptor: object,
-    contract: object,
-) -> None:
-    """Burn and verify the exact final allocation before terminal dispatch."""
+    def consume(
+        allocation: object,
+        *,
+        coordinator: object,
+        descriptor: object,
+        contract: object,
+        pre_position_quantity: Decimal,
+    ) -> Decimal:
+        """Burn and verify the exact final allocation before dispatch."""
 
-    if type(allocation) is not _ClaimedPaperSubmissionAllocation:
-        raise RuntimeSafetyError("exact claimed paper allocation is required")
-    with _CLAIMED_PAPER_ALLOCATION_REGISTRY_LOCK:
-        registered = _CLAIMED_PAPER_ALLOCATION_REGISTRY.pop(id(allocation), None)
-    if (
-        registered is None
-        or registered[0]() is not allocation
-        or type(coordinator) is not SafetyRuntimeCoordinator
-        or registered[1] is not coordinator._coordinator_token
-        or registered[2] is not descriptor
-        or registered[3] is not contract
-    ):
-        raise RuntimeSafetyError(
-            "claimed paper allocation is forged, changed, replayed, or foreign"
-        )
-
-
-def _retire_claimed_paper_submission_allocation(
-    allocation: object,
-    *,
-    coordinator: object,
-    descriptor: object,
-    contract: object,
-) -> bool:
-    """Retire an unissued exact allocation without ever making it reusable."""
-
-    if (
-        type(allocation) is not _ClaimedPaperSubmissionAllocation
-        or type(coordinator) is not SafetyRuntimeCoordinator
-    ):
-        return False
-    with _CLAIMED_PAPER_ALLOCATION_REGISTRY_LOCK:
-        registered = _CLAIMED_PAPER_ALLOCATION_REGISTRY.get(id(allocation))
+        if type(allocation) is not _ClaimedPaperSubmissionAllocation:
+            raise RuntimeSafetyError("exact claimed paper allocation is required")
+        with registry_lock:
+            registered = registry.pop(id(allocation), None)
         if (
             registered is None
             or registered[0]() is not allocation
+            or type(coordinator) is not SafetyRuntimeCoordinator
             or registered[1] is not coordinator._coordinator_token
             or registered[2] is not descriptor
             or registered[3] is not contract
+            or type(pre_position_quantity) is not Decimal
+            or registered[4] != pre_position_quantity
+        ):
+            raise RuntimeSafetyError(
+                "claimed paper allocation is forged, changed, replayed, foreign, or mismatched"
+            )
+        return registered[4]
+
+    def retire(
+        allocation: object,
+        *,
+        coordinator: object,
+        descriptor: object,
+        contract: object,
+    ) -> bool:
+        """Retire an unissued exact allocation without making it reusable."""
+
+        if (
+            type(allocation) is not _ClaimedPaperSubmissionAllocation
+            or type(coordinator) is not SafetyRuntimeCoordinator
         ):
             return False
-        _CLAIMED_PAPER_ALLOCATION_REGISTRY.pop(id(allocation), None)
-        return True
+        with registry_lock:
+            registered = registry.get(id(allocation))
+            if (
+                registered is None
+                or registered[0]() is not allocation
+                or registered[1] is not coordinator._coordinator_token
+                or registered[2] is not descriptor
+                or registered[3] is not contract
+            ):
+                return False
+            registry.pop(id(allocation), None)
+            return True
+
+    return _ClaimedPaperSubmissionAllocation, issue, consume, retire
+
+
+(
+    _ClaimedPaperSubmissionAllocation,
+    _issue_claimed_paper_submission_allocation,
+    _consume_claimed_paper_submission_allocation,
+    _retire_claimed_paper_submission_allocation,
+) = _make_claimed_paper_allocation_state()
+del _make_claimed_paper_allocation_state
 
 
 def _final_evidence_digest(proof: FinalSubmissionEvidenceProof) -> str:
@@ -942,6 +974,7 @@ def _final_evidence_digest(proof: FinalSubmissionEvidenceProof) -> str:
             "execution_domain_scope": proof.execution_domain_scope,
             "expires_at": proof.expires_at,
             "final_evidence_fingerprint": proof.final_evidence_fingerprint,
+            "pre_position_quantity": proof.pre_position_quantity,
             "symbol": proof.symbol,
         }
     )
@@ -960,6 +993,7 @@ def _envelope_digest(envelope: ConsumedPaperSubmissionEnvelope) -> str:
             "descriptor_fingerprint": envelope.descriptor_fingerprint,
             "execution_domain_scope": envelope.execution_domain_scope,
             "final_evidence_fingerprint": envelope.final_evidence_fingerprint,
+            "pre_position_quantity": envelope.pre_position_quantity,
             "symbol": envelope.symbol,
         }
     )
@@ -1428,6 +1462,7 @@ class SafetyRuntimeCoordinator:
                 contract_snapshot_id=contract.snapshot_id,
                 contract_transport_generation=contract.transport_generation,
                 final_evidence_fingerprint=final_evidence_fingerprint,
+                pre_position_quantity=allocation.position_quantity,
                 expires_at=expires_at,
                 _contract=contract,
                 _coordinator_token=self._coordinator_token,
@@ -1470,6 +1505,7 @@ class SafetyRuntimeCoordinator:
                 != final_evidence._contract.transport_generation
                 or final_evidence.contract_transport_generation
                 != authorization.contract.transport_generation
+                or type(final_evidence.pre_position_quantity) is not Decimal
             ):
                 raise RuntimeSafetyError(
                     "final evidence proof does not match authorized submission"
@@ -1513,6 +1549,7 @@ class SafetyRuntimeCoordinator:
                 contract_snapshot_id=final_evidence.contract_snapshot_id,
                 contract_transport_generation=(final_evidence.contract_transport_generation),
                 final_evidence_fingerprint=(final_evidence.final_evidence_fingerprint),
+                pre_position_quantity=final_evidence.pre_position_quantity,
                 _descriptor=descriptor,
                 _contract=final_evidence._contract,
                 _coordinator_token=self._coordinator_token,
@@ -1551,12 +1588,11 @@ class SafetyRuntimeCoordinator:
                 or contract.transport_generation != envelope.contract_transport_generation
             ):
                 raise RuntimeSafetyError("claimed paper envelope lineage is inconsistent")
-            allocation = _ClaimedPaperSubmissionAllocation(_token=_CLAIMED_PAPER_ALLOCATION_TOKEN)
-            _register_claimed_paper_submission_allocation(
-                allocation,
+            allocation = _issue_claimed_paper_submission_allocation(
                 coordinator_token=self._coordinator_token,
                 descriptor=descriptor,
                 contract=contract,
+                pre_position_quantity=envelope.pre_position_quantity,
             )
             return descriptor, contract, allocation
 

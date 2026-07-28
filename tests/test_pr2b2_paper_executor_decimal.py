@@ -46,28 +46,26 @@ def _patch_execution_path_exists(monkeypatch, exists) -> None:
     )
 
 
-def test_public_place_order_preserves_exact_decimal_into_simple_sink(monkeypatch) -> None:
+def test_authorized_sink_preserves_exact_decimal_without_mutable_executor_method(
+    monkeypatch,
+) -> None:
     executor = PaperExecutor(slippage_bps=0)
-    captured: list[Order] = []
-
-    _patch_execution_path_exists(monkeypatch, lambda _path: False)
-
-    def simple_sink(order: Order, *, _capability: object) -> ExecutionResult:
-        assert _capability is not None
-        captured.append(order)
-        return ExecutionResult(True, "captured", fill_price=float(order.price))
-
-    monkeypatch.setattr(executor, "_place_simple_order", simple_sink)
+    monkeypatch.setattr(
+        executor,
+        "_place_simple_order",
+        lambda *_args, **_kwargs: pytest.fail("mutable executor method cannot receive authority"),
+    )
     exact_price = Decimal("123.4500")
     order = _order(price=exact_price)
 
     result = _submit(executor, order)
 
     assert result.ok is True
-    assert captured == [order]
-    assert type(captured[0].price) is Decimal
-    assert captured[0].price is exact_price
-    assert captured[0].price.as_tuple() == exact_price.as_tuple()
+    filled_order = next(iter(executor.fills.values()))[1]
+    assert filled_order is order
+    assert type(filled_order.price) is Decimal
+    assert filled_order.price is exact_price
+    assert filled_order.price.as_tuple() == exact_price.as_tuple()
 
 
 @pytest.mark.parametrize("slippage_bps", [0.0, 12.5])
@@ -142,7 +140,7 @@ def test_decimal_nonfinite_or_nonpositive_fill_fails_closed(
 
     assert result.ok is False
     assert result.fill_price is None
-    assert result.message == "Invalid paper execution fill"
+    assert "slippage" in result.message
     assert executor.fills == {}
 
 
@@ -150,7 +148,9 @@ def test_decimal_nonfinite_or_nonpositive_fill_fails_closed(
     ("side", "expected"),
     [("SELL", 99.9), ("BUY_TO_COVER", 100.1)],
 )
-def test_legacy_float_price_behavior_is_unchanged(side: str, expected: float) -> None:
+def test_legacy_float_price_is_normalized_before_authorized_fill(
+    side: str, expected: float
+) -> None:
     order = _order(side=side, price=100.0)
     executor = PaperExecutor(slippage_bps=10.0)
 
@@ -158,7 +158,7 @@ def test_legacy_float_price_behavior_is_unchanged(side: str, expected: float) ->
 
     assert result.ok is True
     assert result.fill_price == pytest.approx(expected)
-    assert type(order.price) is float
+    assert order.price == Decimal("100.0")
     assert next(iter(executor.fills.values()))[1] is order
 
 

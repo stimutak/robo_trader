@@ -256,6 +256,21 @@ def _submit(case: RuntimeCase, envelope):
     )
 
 
+def test_submitter_rejects_caller_quantity_that_differs_from_final_allocation(
+    tmp_path: Path,
+) -> None:
+    case = _make_case(tmp_path)
+    envelope = _envelope(case)
+
+    assert envelope.pre_position_quantity == Decimal("10")
+    with pytest.raises(PaperExecutionCapabilityError, match="exact final allocation"):
+        case.submitter._submit_once(
+            envelope,
+            pre_position_quantity=Decimal("11"),
+        )
+    assert case.executor.fills == {}
+
+
 def test_binding_is_private_sealed_and_exact(tmp_path: Path) -> None:
     case = _make_case(tmp_path)
     with pytest.raises(PaperReductionSubmissionError, match="private bind"):
@@ -443,6 +458,7 @@ def test_proof_and_envelope_copies_forgery_and_replay_reject(
         ("con_id", 999),
         ("descriptor_fingerprint", "0" * 64),
         ("final_evidence_fingerprint", "1" * 64),
+        ("pre_position_quantity", Decimal("11")),
     ],
 )
 def test_tampered_final_proof_rejects_before_permit_consumption(
@@ -473,6 +489,7 @@ def test_tampered_final_proof_rejects_before_permit_consumption(
         ("con_id", 999),
         ("descriptor_fingerprint", "0" * 64),
         ("final_evidence_fingerprint", "1" * 64),
+        ("pre_position_quantity", Decimal("11")),
     ],
 )
 def test_tampered_envelope_scope_identity_and_fingerprint_reject_before_fill(
