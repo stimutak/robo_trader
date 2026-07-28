@@ -1524,7 +1524,7 @@ class AsyncRunner:
             registered_entry_handle = getattr(self, "_baseline_entry_handle", None)
             if registered_entry_handle is None or _entry_intent is None:
                 return self._rejected_order_result(
-                    "Gate-A entry lacks canonical baseline runtime authority"
+                    "Gate-A baseline entry authority is disabled pending risk integration"
                 )
 
         # Semantic reductions bypass entry-only soft stops, but only after the
@@ -2847,12 +2847,16 @@ class AsyncRunner:
             self._paper_settlement_participant = participant
         if type(participant) is not PaperRuntimeSettlementParticipant:
             raise RuntimeError("active paper runtime settlement participant is malformed")
-        self._baseline_entry_handle = gateway.register_paper_executor(
+        gateway.register_paper_executor(
             self.portfolio_id,
             self.executor,
             protective_quote_producer=self.stop_loss_monitor,
             settlement_participant=participant,
         )
+        # Gate-A staging is deliberately non-authorizing for new exposure.
+        # Same-process Python objects cannot be treated as an isolation
+        # boundary, so no reachable entry handle is published.
+        self._baseline_entry_handle = None
         gateway.start_protective_feed()
         self._setup_complete = True
         logger.info("AsyncRunner setup complete")
@@ -4859,20 +4863,10 @@ class AsyncRunner:
                     fast=self.sma_fast,
                     slow=self.sma_slow,
                 )
-                entry_gateway = self.paper_reduction_gateway
-                if entry_gateway is None:
-                    return self._blocked_result(
-                        symbol,
-                        0,
-                        latest_price,
-                        "Execution blocked: paper entry gateway unavailable",
-                        df,
-                    )
-                baseline_entry_intent = entry_gateway.issue_baseline_entry_intent(
-                    portfolio_id=self.portfolio_id,
-                    symbol=symbol,
-                    handle=self._baseline_entry_handle,
-                )
+                # PR117 containment remains non-authorizing. Baseline signals
+                # may be observed, but no BUY intent is minted until the
+                # integrated risk-admission boundary is independently enforced.
+                baseline_entry_intent = None
 
         # Generate mean reversion signals if enabled
         if MEAN_REVERSION_AVAILABLE and self.mean_reversion_strategy:

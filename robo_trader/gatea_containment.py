@@ -1,9 +1,9 @@
 """Machine-enforced Gate-A strategy and order containment.
 
-Gate A intentionally supports one narrow runtime profile: local paper execution,
-simple long entries from the baseline SMA strategy, and semantic reductions.
-Advanced entry producers stay unavailable until their full PR 7/11 contracts
-and evidence gates are implemented.
+This staging slice permits baseline SMA signal observation and semantic paper
+reductions, but it mints no authority for a risk-increasing order. Python code
+inside one interpreter is one trust domain, so an independently enforceable
+entry-risk boundary must land before even baseline BUY execution is enabled.
 """
 
 from __future__ import annotations
@@ -185,7 +185,7 @@ def validate_gate_a_order(
         return False, "Gate-A profile blocks new short exposure"
     if normalized_side != "BUY":
         return False, "Gate-A profile rejects unsupported order side"
-    return True, "Gate-A simple long candidate requires terminal capability"
+    return True, "Gate-A baseline candidate has no terminal authority in this staging slice"
 
 
 def assert_quarantined_alternate_engine(component: str) -> None:

@@ -185,7 +185,7 @@ def test_forgeable_intent_source_field_no_longer_exists() -> None:
         Order("AAPL", 1, "BUY", 100.0, intent_source="baseline_sma")
 
 
-def test_baseline_intent_and_terminal_capability_have_single_runtime_call_sites() -> None:
+def test_baseline_intent_and_terminal_capability_have_no_runtime_call_sites() -> None:
     package = Path(__file__).parents[1] / "robo_trader"
     issue_calls: list[Path] = []
     terminal_calls: list[Path] = []
@@ -203,8 +203,8 @@ def test_baseline_intent_and_terminal_capability_have_single_runtime_call_sites(
             ):
                 terminal_calls.append(path)
 
-    assert issue_calls == [package / "runner_async.py"]
-    assert terminal_calls == [package / "paper_reduction_gateway.py"]
+    assert issue_calls == []
+    assert terminal_calls == []
 
 
 def test_no_independently_bindable_baseline_authority_exists() -> None:

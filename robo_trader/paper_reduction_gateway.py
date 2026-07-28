@@ -26,19 +26,9 @@ from .database_async import AsyncTradingDatabase
 from .execution import ExecutionResult, Order, PaperExecutor
 from .market_data_contract import BrokerProtectiveQuote
 from .paper_execution_capability import (
-    PaperBaselineAdmissionError,
     PaperReductionExecutionAuthority,
-    _begin_gateway_baseline_entry_session,
-    _bind_gateway_baseline_execution,
     _bind_gateway_reduction_execution,
-    _end_gateway_baseline_entry_session,
-    _GatewayBaselineExecutionBinding,
-    _get_gateway_baseline_entry_handle,
-    _issue_gateway_baseline_entry_intent,
-    _issue_gateway_baseline_terminal_dispatch,
-    _issue_gateway_execution_binding_capability,
     _issue_gateway_reduction_binding_capability,
-    _submit_gateway_baseline_once,
 )
 from .paper_reduction_submitter import (
     LocalPaperOrderStatus,
@@ -83,8 +73,6 @@ _REFERENCE_PRICE_TICK = Decimal("0.0001")
 class _PaperRuntimeBinding:
     submitter: PaperReductionSubmitter
     reduction_execution_authority: PaperReductionExecutionAuthority
-    baseline_execution_binding: _GatewayBaselineExecutionBinding
-    baseline_entry_handle: object
     protective_quote_producer: object
     settlement_participant: PaperRuntimeSettlementParticipant
 
@@ -95,7 +83,6 @@ class _PaperRuntimeBindingSession:
     runtime_context: RuntimeSafetyContext
     executor: PaperExecutor
     portfolio_id: str
-    capability_issued: bool = False
     reduction_capability_issued: bool = False
 
 
@@ -675,7 +662,7 @@ class PaperReductionGateway:
         *,
         protective_quote_producer: object,
         settlement_participant: PaperRuntimeSettlementParticipant,
-    ) -> object:
+    ) -> None:
         """Bind one portfolio's executor, quote producer, and projection owner."""
 
         if (
@@ -712,7 +699,7 @@ class PaperReductionGateway:
                 and existing.protective_quote_producer is protective_quote_producer
                 and existing.settlement_participant is settlement_participant
             ):
-                return existing.baseline_entry_handle
+                return None
             raise PaperReductionGatewayError("portfolio paper runtime is already registered")
         attached = self._protective_quote_producers.get(portfolio_id)
         if attached is not protective_quote_producer:
@@ -733,21 +720,6 @@ class PaperReductionGateway:
         )
         self._active_runtime_binding_session = binding_session
         try:
-            binding_capability = _issue_gateway_execution_binding_capability(
-                gateway=self,
-                runtime_context=self._runtime_context,
-                binding_session=binding_session,
-                executor=executor,
-                portfolio_id=portfolio_id,
-            )
-            baseline_execution_binding = _bind_gateway_baseline_execution(
-                gateway=self,
-                runtime_context=self._runtime_context,
-                binding_session=binding_session,
-                executor=executor,
-                portfolio_id=portfolio_id,
-                capability=binding_capability,
-            )
             reduction_binding_capability = _issue_gateway_reduction_binding_capability(
                 gateway=self,
                 runtime_context=self._runtime_context,
@@ -768,11 +740,6 @@ class PaperReductionGateway:
         finally:
             if self._active_runtime_binding_session is binding_session:
                 self._active_runtime_binding_session = None
-        baseline_entry_handle = _get_gateway_baseline_entry_handle(
-            baseline_execution_binding,
-            gateway=self,
-            runtime_context=self._runtime_context,
-        )
         self._bindings[portfolio_id] = _PaperRuntimeBinding(
             submitter=_bind_paper_reduction_submitter(
                 executor,
@@ -781,36 +748,10 @@ class PaperReductionGateway:
                 portfolio_id,
             ),
             reduction_execution_authority=reduction_execution_authority,
-            baseline_execution_binding=baseline_execution_binding,
-            baseline_entry_handle=baseline_entry_handle,
             protective_quote_producer=protective_quote_producer,
             settlement_participant=settlement_participant,
         )
-        return baseline_entry_handle
-
-    def issue_baseline_entry_intent(
-        self,
-        *,
-        portfolio_id: str,
-        symbol: str,
-        handle: object,
-    ) -> object:
-        """Mint one opaque intent at the canonical baseline producer branch."""
-
-        binding = self._bindings.get(portfolio_id)
-        if type(binding) is not _PaperRuntimeBinding:
-            raise PaperReductionGatewayError("baseline entry intent request is malformed")
-        try:
-            return _issue_gateway_baseline_entry_intent(
-                binding.baseline_execution_binding,
-                gateway=self,
-                runtime_context=self._runtime_context,
-                portfolio_id=portfolio_id,
-                symbol=symbol,
-                handle=handle,
-            )
-        except PaperBaselineAdmissionError as exc:
-            raise PaperReductionGatewayError(str(exc)) from exc
+        return None
 
     @asynccontextmanager
     async def serialize_entry(
@@ -875,36 +816,15 @@ class PaperReductionGateway:
                         raise PaperReductionGatewayError(
                             "entry blocked while a protective reduction is pending"
                         )
-            task = asyncio.current_task()
-            session: object | None = None
-            session_binding: object | None = None
             if portfolio_id is not None:
                 binding = self._bindings.get(portfolio_id)
                 if type(binding) is not _PaperRuntimeBinding:
                     raise PaperReductionGatewayError(
                         "entry portfolio has no registered paper runtime binding"
                     )
-                if type(task) is not asyncio.Task or symbol is None or current_quote is None:
+                if symbol is None or current_quote is None:
                     raise PaperReductionGatewayError("entry serialization scope is malformed")
-                session_binding = binding.baseline_execution_binding
-                session = _begin_gateway_baseline_entry_session(
-                    session_binding,
-                    gateway=self,
-                    runtime_context=self._runtime_context,
-                    portfolio_id=portfolio_id,
-                    symbol=symbol,
-                    quote=current_quote,
-                )
-            try:
-                yield current_quote
-            finally:
-                if session is not None and session_binding is not None:
-                    _end_gateway_baseline_entry_session(
-                        session_binding,
-                        session,
-                        gateway=self,
-                        runtime_context=self._runtime_context,
-                    )
+            yield current_quote
 
     def submit_baseline_entry(
         self,
@@ -913,30 +833,11 @@ class PaperReductionGateway:
         portfolio_id: str,
         intent: object,
     ) -> ExecutionResult:
-        """Derive one terminal capability inside an active entry session."""
+        """Deny every BUY until admission is independently enforceable."""
 
-        binding = self._bindings.get(portfolio_id)
-        if type(binding) is not _PaperRuntimeBinding:
-            raise PaperReductionGatewayError("baseline entry intent does not match runtime")
-        # The sealed issuer burns the task-bound session before it validates
-        # any caller-controlled order field. Keep order validation there so a
-        # malformed probe cannot preserve terminal entry authority.
-        try:
-            terminal_dispatch = _issue_gateway_baseline_terminal_dispatch(
-                binding.baseline_execution_binding,
-                gateway=self,
-                runtime_context=self._runtime_context,
-                intent=intent,
-                order=order,
-            )
-        except PaperBaselineAdmissionError as exc:
-            raise PaperReductionGatewayError(str(exc)) from exc
-        return _submit_gateway_baseline_once(
-            binding.baseline_execution_binding,
-            terminal_dispatch,
-            gateway=self,
-            runtime_context=self._runtime_context,
-            order=order,
+        del order, portfolio_id, intent
+        raise PaperReductionGatewayError(
+            "Gate-A baseline entry authority is disabled pending integrated risk admission"
         )
 
     async def submit_reduction(

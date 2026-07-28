@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import copy
-import pickle
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -34,17 +32,9 @@ from robo_trader.market_data_contract import (
     MarketDataSource,
     MarketSession,
 )
-from robo_trader.paper_execution_capability import (
-    PaperExecutionCapabilityError,
-    _bind_gateway_baseline_execution,
-    _issue_gateway_baseline_terminal_dispatch,
-    _issue_gateway_execution_binding_capability,
-    _submit_gateway_baseline_once,
-)
 from robo_trader.paper_reduction_gateway import (
     PaperReductionGateway,
     PaperReductionGatewayError,
-    _PaperRuntimeBindingSession,
 )
 from robo_trader.paper_reduction_submitter import PaperReductionSubmissionError
 from robo_trader.paper_runtime_settlement import (
@@ -656,7 +646,7 @@ async def _bind_runtime(
     *,
     price: Decimal = Decimal("123.4500"),
     generation: str = "gateway-generation",
-) -> object:
+) -> object | None:
     monitor, participant = _runtime_components(harness, portfolio_id)
     harness.gateway.attach_protective_quote_producer(portfolio_id, monitor)
     entry_handle = harness.gateway.register_paper_executor(
@@ -679,184 +669,34 @@ async def _bind_runtime(
     return entry_handle
 
 
-def test_gateway_binding_capability_rejects_direct_copy_substitution_and_replay(
-    harness: GatewayHarness,
-) -> None:
-    gateway = harness.gateway
-    executor = PaperExecutor()
-
-    def activate():
-        session = _PaperRuntimeBindingSession(
-            gateway=gateway,
-            runtime_context=harness.context,
-            executor=executor,
-            portfolio_id="portfolio-a",
-        )
-        gateway._active_runtime_binding_session = session
-        kwargs = {
-            "gateway": gateway,
-            "runtime_context": harness.context,
-            "binding_session": session,
-            "executor": executor,
-            "portfolio_id": "portfolio-a",
-        }
-        return kwargs
-
-    issue_kwargs = activate()
-    gateway._active_runtime_binding_session = None
-
-    with pytest.raises(PaperExecutionCapabilityError, match="scope is invalid"):
-        _issue_gateway_execution_binding_capability(**issue_kwargs)
-
-    try:
-        issue_kwargs = activate()
-        capability = _issue_gateway_execution_binding_capability(**issue_kwargs)
-        with pytest.raises(PaperExecutionCapabilityError, match="cannot copy"):
-            copy.copy(capability)
-        with pytest.raises(PaperExecutionCapabilityError, match="already issued"):
-            _issue_gateway_execution_binding_capability(**issue_kwargs)
-        with pytest.raises(PaperExecutionCapabilityError, match="already consumed"):
-            _bind_gateway_baseline_execution(
-                **issue_kwargs,
-                capability=capability,
-            )
-
-        issue_kwargs = activate()
-        capability = _issue_gateway_execution_binding_capability(**issue_kwargs)
-        with pytest.raises(PaperExecutionCapabilityError, match="capability is invalid"):
-            _bind_gateway_baseline_execution(
-                **issue_kwargs,
-                capability=object(),
-            )
-        with pytest.raises(PaperExecutionCapabilityError, match="scope is invalid"):
-            _bind_gateway_baseline_execution(
-                **{**issue_kwargs, "portfolio_id": "portfolio-b"},
-                capability=capability,
-            )
-        with pytest.raises(PaperExecutionCapabilityError, match="already consumed"):
-            _bind_gateway_baseline_execution(
-                **issue_kwargs,
-                capability=capability,
-            )
-
-        issue_kwargs = activate()
-        substituted = _issue_gateway_execution_binding_capability(**issue_kwargs)
-        with pytest.raises(PaperExecutionCapabilityError, match="scope is invalid"):
-            _bind_gateway_baseline_execution(
-                **{**issue_kwargs, "executor": PaperExecutor()},
-                capability=substituted,
-            )
-        with pytest.raises(PaperExecutionCapabilityError, match="already consumed"):
-            _bind_gateway_baseline_execution(
-                **issue_kwargs,
-                capability=substituted,
-            )
-
-        issue_kwargs = activate()
-        admitted = _issue_gateway_execution_binding_capability(**issue_kwargs)
-        binding = _bind_gateway_baseline_execution(
-            **issue_kwargs,
-            capability=admitted,
-        )
-        assert not hasattr(binding, "_submit_baseline_once")
-        with pytest.raises(PaperExecutionCapabilityError, match="cannot copy"):
-            copy.copy(binding)
-        with pytest.raises(PaperExecutionCapabilityError, match="cannot copy"):
-            copy.deepcopy(binding)
-        with pytest.raises(PaperExecutionCapabilityError, match="cannot serialize"):
-            pickle.dumps(binding)
-        with pytest.raises(PaperExecutionCapabilityError, match="already consumed"):
-            _bind_gateway_baseline_execution(
-                **issue_kwargs,
-                capability=admitted,
-            )
-    finally:
-        gateway._active_runtime_binding_session = None
+def test_baseline_entry_authority_is_not_exported() -> None:
+    forbidden = (
+        "_GatewayExecutionBindingCapability",
+        "_GatewayBaselineExecutionBinding",
+        "_BaselineTerminalDispatch",
+        "_issue_gateway_execution_binding_capability",
+        "_bind_gateway_baseline_execution",
+        "_get_gateway_baseline_entry_handle",
+        "_issue_gateway_baseline_entry_intent",
+        "_begin_gateway_baseline_entry_session",
+        "_end_gateway_baseline_entry_session",
+        "_issue_gateway_baseline_terminal_dispatch",
+        "_submit_gateway_baseline_once",
+    )
+    for name in forbidden:
+        assert not hasattr(capability_module, name)
 
 
 @pytest.mark.asyncio
 async def test_baseline_entry_intent_is_exact_session_scoped_and_one_shot(
     harness: GatewayHarness,
 ) -> None:
-    executor_a = PaperExecutor()
-    executor_b = PaperExecutor()
-    handle_a = await _bind_runtime(harness, "portfolio-a", executor_a)
-    handle_b = await _bind_runtime(harness, "portfolio-b", executor_b)
-    intent_a = harness.gateway.issue_baseline_entry_intent(
-        portfolio_id="portfolio-a",
-        symbol=SYMBOL,
-        handle=handle_a,
-    )
-    intent_b = harness.gateway.issue_baseline_entry_intent(
-        portfolio_id="portfolio-b",
-        symbol=SYMBOL,
-        handle=handle_b,
-    )
-    binding_a = harness.gateway._bindings["portfolio-a"].baseline_execution_binding
-    with pytest.raises(PaperExecutionCapabilityError, match="dispatch is invalid"):
-        _submit_gateway_baseline_once(
-            binding_a,
-            object(),
-            gateway=harness.gateway,
-            runtime_context=harness.context,
-            order=Order(SYMBOL, 1, "BUY", Decimal("123.4500")),
-        )
-    now = datetime.now(timezone.utc)
-    quote = BrokerProtectiveQuote(
-        schema_version=1,
-        symbol=SYMBOL,
-        con_id=CON_ID,
-        exchange="SMART",
-        primary_exchange="NASDAQ",
-        currency="USD",
-        security_type="STK",
-        price=Decimal("123.4500"),
-        source_timestamp=now,
-        retrieval_timestamp=now,
-        session=MarketSession.REGULAR,
-        source=MarketDataSource.IBKR_LIVE_LAST_TRADE,
-        source_event_id="entry-capability-test",
-        transport_generation="gateway-generation",
-        market_data_type=1,
-    )
-    harness.gateway._fetch_protective_quotes_locked = AsyncMock(return_value=(quote,))
-    order = Order(SYMBOL, 1, "BUY", quote.price, order_ref="baseline-entry-test")
-
-    async with harness.gateway.serialize_entry(SYMBOL, portfolio_id="portfolio-a"):
-        with pytest.raises(PaperReductionGatewayError, match="does not match runtime"):
-            harness.gateway.submit_baseline_entry(
-                order=order,
-                portfolio_id="portfolio-a",
-                intent=intent_b,
-            )
-        with pytest.raises(PaperReductionGatewayError, match="already consumed"):
-            harness.gateway.submit_baseline_entry(
-                order=order,
-                portfolio_id="portfolio-b",
-                intent=intent_b,
-            )
-        result = harness.gateway.submit_baseline_entry(
-            order=order,
-            portfolio_id="portfolio-a",
-            intent=intent_a,
-        )
-        with pytest.raises(PaperReductionGatewayError, match="already consumed"):
-            harness.gateway.submit_baseline_entry(
-                order=order,
-                portfolio_id="portfolio-a",
-                intent=intent_a,
-            )
-
-    assert result.ok is True
-    assert result.exact_fill_price == quote.price
-    assert len(executor_a.fills) == 1
-    assert executor_b.fills == {}
-    with pytest.raises(PaperReductionGatewayError, match="already consumed"):
-        harness.gateway.submit_baseline_entry(
-            order=order,
-            portfolio_id="portfolio-a",
-            intent=intent_a,
-        )
+    executor = PaperExecutor()
+    handle = await _bind_runtime(harness, "portfolio-a", executor)
+    assert handle is None
+    assert not hasattr(harness.gateway._bindings["portfolio-a"], "baseline_entry_handle")
+    assert not hasattr(harness.gateway, "issue_baseline_entry_intent")
+    assert executor.fills == {}
 
 
 @pytest.mark.asyncio
@@ -868,49 +708,15 @@ async def test_baseline_terminal_boundary_rechecks_cross_process_kill_switch(
     monkeypatch.chdir(tmp_path)
     (tmp_path / "data").mkdir()
     executor = PaperExecutor()
-    handle = await _bind_runtime(harness, "portfolio-a", executor)
-    intent = harness.gateway.issue_baseline_entry_intent(
-        portfolio_id="portfolio-a",
-        symbol=SYMBOL,
-        handle=handle,
-    )
-    now = datetime.now(timezone.utc)
-    quote = BrokerProtectiveQuote(
-        schema_version=1,
-        symbol=SYMBOL,
-        con_id=CON_ID,
-        exchange="SMART",
-        primary_exchange="NASDAQ",
-        currency="USD",
-        security_type="STK",
-        price=Decimal("123.4500"),
-        source_timestamp=now,
-        retrieval_timestamp=now,
-        session=MarketSession.REGULAR,
-        source=MarketDataSource.IBKR_LIVE_LAST_TRADE,
-        source_event_id="entry-terminal-kill-switch-test",
-        transport_generation="gateway-generation",
-        market_data_type=1,
-    )
-    harness.gateway._fetch_protective_quotes_locked = AsyncMock(return_value=(quote,))
-    order = Order(SYMBOL, 1, "BUY", quote.price, order_ref="terminal-kill-switch")
-
-    async with harness.gateway.serialize_entry(SYMBOL, portfolio_id="portfolio-a"):
-        (tmp_path / "data" / "kill_switch.lock").touch()
-        with pytest.raises(PaperExecutionCapabilityError, match="kill-switch lock is active"):
-            harness.gateway.submit_baseline_entry(
-                order=order,
-                portfolio_id="portfolio-a",
-                intent=intent,
-            )
-
-    assert executor.fills == {}
-    with pytest.raises(PaperReductionGatewayError, match="already consumed"):
+    await _bind_runtime(harness, "portfolio-a", executor)
+    (tmp_path / "data" / "kill_switch.lock").touch()
+    with pytest.raises(PaperReductionGatewayError, match="authority is disabled"):
         harness.gateway.submit_baseline_entry(
-            order=order,
+            order=Order(SYMBOL, 1, "BUY", Decimal("123.4500")),
             portfolio_id="portfolio-a",
-            intent=intent,
+            intent=object(),
         )
+    assert executor.fills == {}
 
 
 @pytest.mark.asyncio
@@ -919,9 +725,8 @@ async def test_forged_mutable_entry_session_cannot_mint_terminal_dispatch(
 ) -> None:
     executor = PaperExecutor()
     await _bind_runtime(harness, "portfolio-a", executor)
-    binding = harness.gateway._bindings["portfolio-a"].baseline_execution_binding
     now = datetime.now(timezone.utc)
-    quote = BrokerProtectiveQuote(
+    forged_quote = BrokerProtectiveQuote(
         schema_version=1,
         symbol=SYMBOL,
         con_id=CON_ID,
@@ -929,7 +734,7 @@ async def test_forged_mutable_entry_session_cannot_mint_terminal_dispatch(
         primary_exchange="NASDAQ",
         currency="USD",
         security_type="STK",
-        price=Decimal("123.4500"),
+        price=Decimal("999.9900"),
         source_timestamp=now,
         retrieval_timestamp=now,
         session=MarketSession.REGULAR,
@@ -938,48 +743,16 @@ async def test_forged_mutable_entry_session_cannot_mint_terminal_dispatch(
         transport_generation="gateway-generation",
         market_data_type=1,
     )
-    harness.gateway._fetch_protective_quotes_locked = AsyncMock(return_value=(quote,))
-    order = Order(SYMBOL, 1, "BUY", quote.price, order_ref="forged-entry-session")
-
-    @dataclass
-    class ForgedEntrySession:
-        portfolio_id: str
-        symbol: str
-        quote: BrokerProtectiveQuote
-        consumed: bool = True
-        dispatch_issued: bool = False
-
-    task = asyncio.current_task()
-    assert task is not None
-    forged = ForgedEntrySession("portfolio-a", SYMBOL, quote)
-    assert not hasattr(capability_module, "GatewayBaselineEntrySession")
-    assert not hasattr(capability_module, "GatewayBaselineEntryIntent")
+    assert not hasattr(capability_module, "_begin_gateway_baseline_entry_session")
+    assert not hasattr(capability_module, "_issue_gateway_baseline_entry_intent")
+    assert not hasattr(capability_module, "_issue_gateway_baseline_terminal_dispatch")
     assert not hasattr(gateway_module, "_ActiveEntrySession")
-    assert not hasattr(gateway_module, "_BaselineEntryIntent")
-    assert not hasattr(gateway_module, "_ENTRY_HANDLE_TOKEN")
-    assert not hasattr(harness.gateway, "_active_entry_sessions")
-    # Recreate the reviewed exploit against the old public mutable registry.
-    # The sealed runtime must ignore both the attacker-created attribute and
-    # its plausible session object because no closure-owned session exists.
-    harness.gateway._active_entry_sessions = {task: forged}
-    with pytest.raises(PaperExecutionCapabilityError, match="intent is invalid"):
-        _issue_gateway_baseline_terminal_dispatch(
-            binding,
-            gateway=harness.gateway,
-            runtime_context=harness.context,
+    with pytest.raises(PaperReductionGatewayError, match="authority is disabled"):
+        harness.gateway.submit_baseline_entry(
+            order=Order(SYMBOL, 1, "BUY", forged_quote.price),
+            portfolio_id="portfolio-a",
             intent=object(),
-            order=order,
         )
-
-    with pytest.raises(PaperExecutionCapabilityError, match="dispatch is invalid"):
-        _submit_gateway_baseline_once(
-            binding,
-            object(),
-            gateway=harness.gateway,
-            runtime_context=harness.context,
-            order=order,
-        )
-
     assert executor.fills == {}
 
 
@@ -989,38 +762,17 @@ async def test_terminal_helpers_cannot_bypass_baseline_producer_intent(
 ) -> None:
     executor = PaperExecutor()
     await _bind_runtime(harness, "portfolio-a", executor)
-    binding = harness.gateway._bindings["portfolio-a"].baseline_execution_binding
-    now = datetime.now(timezone.utc)
-    quote = BrokerProtectiveQuote(
-        schema_version=1,
-        symbol=SYMBOL,
-        con_id=CON_ID,
-        exchange="SMART",
-        primary_exchange="NASDAQ",
-        currency="USD",
-        security_type="STK",
-        price=Decimal("123.4500"),
-        source_timestamp=now,
-        retrieval_timestamp=now,
-        session=MarketSession.REGULAR,
-        source=MarketDataSource.IBKR_LIVE_LAST_TRADE,
-        source_event_id="missing-producer-intent-test",
-        transport_generation="gateway-generation",
-        market_data_type=1,
-    )
-    harness.gateway._fetch_protective_quotes_locked = AsyncMock(return_value=(quote,))
-    order = Order(SYMBOL, 1, "BUY", quote.price, order_ref="missing-producer-intent")
-
-    async with harness.gateway.serialize_entry(SYMBOL, portfolio_id="portfolio-a"):
-        with pytest.raises(PaperExecutionCapabilityError, match="intent is invalid"):
-            _issue_gateway_baseline_terminal_dispatch(
-                binding,
-                gateway=harness.gateway,
-                runtime_context=harness.context,
-                intent=object(),
-                order=order,
-            )
-
+    assert not any("baseline" in name.casefold() for name in vars(capability_module))
+    for candidate in vars(capability_module).values():
+        for cell in getattr(candidate, "__closure__", None) or ():
+            cell_type = type(cell.cell_contents).__qualname__.casefold()
+            assert "baseline" not in cell_type
+    with pytest.raises(PaperReductionGatewayError, match="authority is disabled"):
+        harness.gateway.submit_baseline_entry(
+            order=Order(SYMBOL, 1, "BUY", Decimal("123.4500")),
+            portfolio_id="portfolio-a",
+            intent=object(),
+        )
     assert executor.fills == {}
 
 
@@ -1030,124 +782,63 @@ async def test_baseline_terminal_dispatch_never_calls_mutable_executor_method(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     executor = PaperExecutor()
-    handle = await _bind_runtime(harness, "portfolio-a", executor)
-    intent = harness.gateway.issue_baseline_entry_intent(
-        portfolio_id="portfolio-a",
-        symbol=SYMBOL,
-        handle=handle,
-    )
-    now = datetime.now(timezone.utc)
-    quote = BrokerProtectiveQuote(
-        schema_version=1,
-        symbol=SYMBOL,
-        con_id=CON_ID,
-        exchange="SMART",
-        primary_exchange="NASDAQ",
-        currency="USD",
-        security_type="STK",
-        price=Decimal("123.4500"),
-        source_timestamp=now,
-        retrieval_timestamp=now,
-        session=MarketSession.REGULAR,
-        source=MarketDataSource.IBKR_LIVE_LAST_TRADE,
-        source_event_id="entry-mutable-method-test",
-        transport_generation="gateway-generation",
-        market_data_type=1,
-    )
-    harness.gateway._fetch_protective_quotes_locked = AsyncMock(return_value=(quote,))
-    order = Order(SYMBOL, 1, "BUY", quote.price, order_ref="baseline-mutable-method")
+    await _bind_runtime(harness, "portfolio-a", executor)
     monkeypatch.setattr(
         executor,
         "_place_simple_order",
         lambda *_args, **_kwargs: pytest.fail("mutable executor method must not receive authority"),
     )
-    monkeypatch.setattr(
-        capability_module,
-        "_execute_sealed_paper_fill",
-        lambda *_args, **_kwargs: pytest.fail("captured terminal sink must be immutable"),
-    )
-    monkeypatch.setattr(
-        capability_module,
-        "consume_paper_execution_capability",
-        lambda *_args, **_kwargs: pytest.fail("captured consume primitive must be immutable"),
-    )
-
-    async with harness.gateway.serialize_entry(SYMBOL, portfolio_id="portfolio-a"):
-        result = harness.gateway.submit_baseline_entry(
-            order=order,
+    with pytest.raises(PaperReductionGatewayError, match="authority is disabled"):
+        harness.gateway.submit_baseline_entry(
+            order=Order(SYMBOL, 1, "BUY", Decimal("123.4500")),
             portfolio_id="portfolio-a",
-            intent=intent,
+            intent=object(),
         )
-
-    assert result.ok is True
-    assert len(executor.fills) == 1
+    assert executor.fills == {}
 
 
 @pytest.mark.asyncio
-async def test_baseline_traceback_retains_only_burned_capability(
+async def test_baseline_entry_rejects_adversarial_prices_without_capability(
     harness: GatewayHarness,
 ) -> None:
     executor = PaperExecutor()
-    handle = await _bind_runtime(harness, "portfolio-a", executor)
-    intent = harness.gateway.issue_baseline_entry_intent(
-        portfolio_id="portfolio-a",
-        symbol=SYMBOL,
-        handle=handle,
-    )
-    now = datetime.now(timezone.utc)
-    quote = BrokerProtectiveQuote(
-        schema_version=1,
-        symbol=SYMBOL,
-        con_id=CON_ID,
-        exchange="SMART",
-        primary_exchange="NASDAQ",
-        currency="USD",
-        security_type="STK",
-        price=Decimal("123.4500"),
-        source_timestamp=now,
-        retrieval_timestamp=now,
-        session=MarketSession.REGULAR,
-        source=MarketDataSource.IBKR_LIVE_LAST_TRADE,
-        source_event_id="entry-traceback-capability-test",
-        transport_generation="gateway-generation",
-        market_data_type=1,
-    )
-    harness.gateway._fetch_protective_quotes_locked = AsyncMock(return_value=(quote,))
-    order = Order(SYMBOL, 1, "BUY", quote.price, order_ref="baseline-traceback")
+    await _bind_runtime(harness, "portfolio-a", executor)
 
-    class RaisingFills(dict):
-        def __setitem__(self, _key, _value):
-            raise LookupError("injected post-consume fill failure")
+    class DeceptivePrice:
+        compared = False
+        converted = False
 
-    executor.fills = RaisingFills()
-    with pytest.raises(LookupError, match="post-consume") as raised:
-        async with harness.gateway.serialize_entry(SYMBOL, portfolio_id="portfolio-a"):
+        def __eq__(self, _other: object) -> bool:
+            self.compared = True
+            return True
+
+        def __ne__(self, _other: object) -> bool:
+            self.compared = True
+            return False
+
+        def __float__(self) -> float:
+            self.converted = True
+            return 777.77
+
+    deceptive = DeceptivePrice()
+    prices: tuple[object, ...] = (
+        deceptive,
+        Decimal("NaN"),
+        Decimal("Infinity"),
+        Decimal("0"),
+        Decimal("-1"),
+        123.45,
+    )
+    for price in prices:
+        with pytest.raises(PaperReductionGatewayError, match="authority is disabled"):
             harness.gateway.submit_baseline_entry(
-                order=order,
+                order=Order(SYMBOL, 1, "BUY", price),
                 portfolio_id="portfolio-a",
-                intent=intent,
+                intent=object(),
             )
-
-    capability = None
-    traceback = raised.value.__traceback__
-    while traceback is not None:
-        if traceback.tb_frame.f_code.co_name == "_submit_gateway_baseline_once":
-            capability = traceback.tb_frame.f_locals.get("capability")
-        traceback = traceback.tb_next
-    assert capability is not None
-    with pytest.raises(PaperExecutionCapabilityError):
-        copy.copy(capability)
-    with pytest.raises(PaperExecutionCapabilityError):
-        copy.deepcopy(capability)
-    with pytest.raises(PaperExecutionCapabilityError):
-        pickle.dumps(capability)
-    with pytest.raises(TypeError):
-        replace(capability)
-
-    replay = PaperExecutor._place_simple_order(executor, order, _capability=capability)
-    assert replay.ok is False
-    assert "already consumed" in replay.message
     assert executor.fills == {}
+    assert deceptive.compared is False
+    assert deceptive.converted is False
 
 
 def test_gateway_requires_exact_runtime_coordinator_database_and_executor_binding(
