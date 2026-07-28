@@ -25,7 +25,6 @@ from robo_trader.paper_reduction_submitter import (
     LocalPaperOutcomeProvenance,
     LocalPaperTerminalOutcome,
 )
-from tests.paper_execution_test_support import bind_gateway_reduction_harness
 from robo_trader.portfolio import Portfolio
 from robo_trader.protective_quote_evidence import ProtectiveQuoteSource
 from robo_trader.risk.advanced_risk import AdvancedRiskManager, KillSwitch
@@ -35,6 +34,7 @@ from robo_trader.risk_manager import (
     create_risk_manager_from_config,
 )
 from robo_trader.stop_loss_monitor import StopLossMonitor, StopStatus, StopType
+from tests.paper_execution_test_support import bind_gateway_reduction_harness
 
 # ---------------------------------------------------------------------------
 # Test doubles

@@ -12,7 +12,12 @@ from pathlib import Path
 
 import pytest
 
+import robo_trader.paper_reduction_submitter as submitter_module
 from robo_trader.execution import ExecutionResult, Order, PaperExecutor
+from robo_trader.paper_execution_capability import (
+    PaperExecutionCapabilityError,
+    _issue_gateway_reduction_terminal_dispatch,
+)
 from robo_trader.paper_reduction_submitter import (
     LocalPaperOrderStatus,
     LocalPaperOutcomeProvenance,
@@ -696,6 +701,70 @@ def test_nonfinite_or_out_of_bounds_slippage_rejects_before_execution(
         _submit(case, envelope)
     with pytest.raises(PaperReductionSubmissionError, match="claim failed"):
         _submit(case, envelope)
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    ["descriptor_snapshot", "contract_snapshot", "nan_slippage", "order_map"],
+)
+def test_preterminal_failure_retires_traceback_retained_final_allocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    case = _make_case(tmp_path, key_suffix=f"retire-{failure_point}")
+    envelope = _envelope(case)
+    original_map = submitter_module._map_order
+
+    if failure_point == "descriptor_snapshot":
+        monkeypatch.setattr(
+            submitter_module,
+            "_snapshot_descriptor",
+            lambda _descriptor: (_ for _ in ()).throw(RuntimeError("snapshot descriptor")),
+        )
+    elif failure_point == "contract_snapshot":
+        monkeypatch.setattr(
+            submitter_module,
+            "_snapshot_contract",
+            lambda _contract: (_ for _ in ()).throw(RuntimeError("snapshot contract")),
+        )
+    elif failure_point == "nan_slippage":
+        case.executor.slippage_bps = float("nan")
+    else:
+        monkeypatch.setattr(
+            submitter_module,
+            "_map_order",
+            lambda _descriptor, _contract: (_ for _ in ()).throw(RuntimeError("order map")),
+        )
+
+    with pytest.raises((PaperReductionSubmissionError, RuntimeError)) as raised:
+        _submit(case, envelope)
+
+    retained: dict[str, object] = {}
+    traceback = raised.value.__traceback__
+    while traceback is not None:
+        for name in ("final_allocation", "descriptor", "contract"):
+            if name in traceback.tb_frame.f_locals:
+                retained[name] = traceback.tb_frame.f_locals[name]
+        traceback = traceback.tb_next
+    assert set(retained) == {"final_allocation", "descriptor", "contract"}
+
+    order = original_map(retained["descriptor"], retained["contract"])
+    authority = getattr(case.submitter, "_PaperReductionSubmitter__authority")
+    with pytest.raises(PaperExecutionCapabilityError, match="final allocation"):
+        _issue_gateway_reduction_terminal_dispatch(
+            authority,
+            submitter=case.submitter,
+            executor=case.executor,
+            coordinator=case.coordinator,
+            final_allocation=retained["final_allocation"],
+            descriptor=retained["descriptor"],
+            contract=retained["contract"],
+            order=order,
+            pre_position_quantity=Decimal("10"),
+        )
+
+    assert case.executor.fills == {}
 
 
 @pytest.mark.parametrize(

@@ -35,6 +35,7 @@ from .safety.runtime import (
     AuthoritativeContract,
     ConsumedPaperSubmissionEnvelope,
     SafetyRuntimeCoordinator,
+    _retire_claimed_paper_submission_allocation,
 )
 
 _BIND_TOKEN = object()
@@ -281,34 +282,18 @@ class PaperReductionSubmitter:
                 "bound coordinator is no longer SafetyRuntimeCoordinator"
             )
 
-        # Claim first. Every subsequent failure remains one-shot and cannot
-        # cause a second paper fill through replay or concurrent reuse.
-        try:
-            descriptor, contract, final_allocation = coordinator._claim_consumed_paper_submission(
-                envelope
-            )
-        except (RuntimeError, TypeError, ValidationError) as exc:
-            raise PaperReductionSubmissionError("paper submission envelope claim failed") from exc
-
-        safe_descriptor = _snapshot_descriptor(descriptor)
-        safe_contract = _snapshot_contract(contract)
-        _validate_executor_configuration(executor)
-        order = _map_order(safe_descriptor, safe_contract)
-
-        # This is deliberately the adapter's sole execution call. It bypasses
-        # legacy soft gates only after final safety revalidation and durable
-        # permit consumption; there is no validation, smart, fallback, or retry.
-        terminal_dispatch = _issue_gateway_reduction_terminal_dispatch(
+        safe_descriptor, order, terminal_dispatch = _claim_and_issue_terminal_dispatch(
             self.__authority,
             submitter=self,
             executor=executor,
             coordinator=coordinator,
-            final_allocation=final_allocation,
-            descriptor=descriptor,
-            contract=contract,
-            order=order,
+            envelope=envelope,
             pre_position_quantity=pre_position_quantity,
         )
+
+        # This is deliberately the adapter's sole execution call. It bypasses
+        # legacy soft gates only after final safety revalidation and durable
+        # permit consumption; there is no validation, smart, fallback, or retry.
         result = _submit_gateway_reduction_once(
             self.__authority,
             terminal_dispatch,
@@ -317,6 +302,50 @@ class PaperReductionSubmitter:
             pre_position_quantity=pre_position_quantity,
         )
         return _terminal_outcome(result, safe_descriptor)
+
+
+def _claim_and_issue_terminal_dispatch(
+    authority: PaperReductionExecutionAuthority,
+    *,
+    submitter: PaperReductionSubmitter,
+    executor: PaperExecutor,
+    coordinator: SafetyRuntimeCoordinator,
+    envelope: ConsumedPaperSubmissionEnvelope,
+    pre_position_quantity: Decimal,
+) -> tuple[SubmissionDescriptor, Order, object]:
+    """Own one claimed allocation until it is issued or safely retired."""
+
+    try:
+        descriptor, contract, final_allocation = coordinator._claim_consumed_paper_submission(
+            envelope
+        )
+    except (RuntimeError, TypeError, ValidationError) as exc:
+        raise PaperReductionSubmissionError("paper submission envelope claim failed") from exc
+
+    try:
+        safe_descriptor = _snapshot_descriptor(descriptor)
+        safe_contract = _snapshot_contract(contract)
+        _validate_executor_configuration(executor)
+        order = _map_order(safe_descriptor, safe_contract)
+        terminal_dispatch = _issue_gateway_reduction_terminal_dispatch(
+            authority,
+            submitter=submitter,
+            executor=executor,
+            coordinator=coordinator,
+            final_allocation=final_allocation,
+            descriptor=descriptor,
+            contract=contract,
+            order=order,
+            pre_position_quantity=pre_position_quantity,
+        )
+        return safe_descriptor, order, terminal_dispatch
+    finally:
+        _retire_claimed_paper_submission_allocation(
+            final_allocation,
+            coordinator=coordinator,
+            descriptor=descriptor,
+            contract=contract,
+        )
 
 
 def _bind_paper_reduction_submitter(

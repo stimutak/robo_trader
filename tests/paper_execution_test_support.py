@@ -8,21 +8,21 @@ from decimal import Decimal
 
 from robo_trader.execution import ExecutionResult, Order, PaperExecutor
 from robo_trader.paper_execution_capability import (
-    PaperReductionExecutionAuthority,
-    _CapabilityKind,
-    _CapabilityRecord,
     _CAPABILITIES,
     _CAPABILITY_TOKEN,
-    _PaperExecutionCapability,
     _REDUCTION_DISPATCHES,
     _REGISTRY_LOCK,
-    _ReductionTerminalDispatch,
     _TERMINAL_DISPATCH_TOKEN,
-    _TerminalDispatchRecord,
+    PaperReductionExecutionAuthority,
     _attach_gateway_reduction_submitter,
     _bind_gateway_reduction_execution,
+    _CapabilityKind,
+    _CapabilityRecord,
     _fingerprint_order,
     _issue_gateway_reduction_binding_capability,
+    _PaperExecutionCapability,
+    _ReductionTerminalDispatch,
+    _TerminalDispatchRecord,
 )
 from robo_trader.paper_reduction_gateway import (
     PaperReductionGateway,

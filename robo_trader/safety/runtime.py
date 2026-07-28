@@ -902,6 +902,34 @@ def _consume_claimed_paper_submission_allocation(
         )
 
 
+def _retire_claimed_paper_submission_allocation(
+    allocation: object,
+    *,
+    coordinator: object,
+    descriptor: object,
+    contract: object,
+) -> bool:
+    """Retire an unissued exact allocation without ever making it reusable."""
+
+    if (
+        type(allocation) is not _ClaimedPaperSubmissionAllocation
+        or type(coordinator) is not SafetyRuntimeCoordinator
+    ):
+        return False
+    with _CLAIMED_PAPER_ALLOCATION_REGISTRY_LOCK:
+        registered = _CLAIMED_PAPER_ALLOCATION_REGISTRY.get(id(allocation))
+        if (
+            registered is None
+            or registered[0]() is not allocation
+            or registered[1] is not coordinator._coordinator_token
+            or registered[2] is not descriptor
+            or registered[3] is not contract
+        ):
+            return False
+        _CLAIMED_PAPER_ALLOCATION_REGISTRY.pop(id(allocation), None)
+        return True
+
+
 def _final_evidence_digest(proof: FinalSubmissionEvidenceProof) -> str:
     payload = canonical_json(
         {
