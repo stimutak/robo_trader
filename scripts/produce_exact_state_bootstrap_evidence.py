@@ -73,6 +73,7 @@ async def produce_bootstrap_evidence_bundle(
 ) -> dict[str, object]:
     """Run fresh producers in dependency order and require complete mark coverage."""
 
+    provider_closed = False
     try:
         broker_envelope = await snapshot_provider.produce_normalized_snapshot(
             receiver=receivers.broker_snapshot,
@@ -107,17 +108,33 @@ async def produce_bootstrap_evidence_bundle(
             raise BootstrapEvidencePipelineError(
                 "reconciliation receiver returned invalid evidence"
             )
+        try:
+            cleanup_cancelled = await await_cleanup_required(snapshot_provider.close())
+        finally:
+            provider_closed = True
+        if cleanup_cancelled:
+            raise asyncio.CancelledError
+        receivers.publish_complete_bundle(set(reconciliation_delivery.local_position_identities))
         return {
             "authorizes_startup": False,
-            "broker_snapshot": str(broker_artifact.artifact_path),
-            "protective_marks": [str(item.artifact_path) for item in mark_artifacts],
-            "reconciliation_report": str(reconciliation_artifact.artifact_path),
+            "broker_snapshot": str(receivers.published_artifact_path(broker_artifact)),
+            "protective_marks": [
+                str(receivers.published_artifact_path(item)) for item in mark_artifacts
+            ],
+            "reconciliation_report": str(
+                receivers.published_artifact_path(reconciliation_artifact)
+            ),
             "schema_version": 1,
             "status": "EVIDENCE_COMPLETE_GATE_A_STILL_CLOSED",
         }
+    except BaseException:
+        receivers.discard_unpublished_bundle()
+        raise
     finally:
         try:
-            cleanup_cancelled = await await_cleanup_required(snapshot_provider.close())
+            cleanup_cancelled = False
+            if not provider_closed:
+                cleanup_cancelled = await await_cleanup_required(snapshot_provider.close())
         finally:
             receivers.close()
         if cleanup_cancelled:

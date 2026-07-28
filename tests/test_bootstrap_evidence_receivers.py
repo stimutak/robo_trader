@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 import scripts.produce_exact_state_bootstrap_evidence as evidence_cli
 from robo_trader import bootstrap_evidence_auth as auth
+from robo_trader import bootstrap_evidence_receivers as receiver_core
 from robo_trader.bootstrap_evidence_receivers import (
     BROKER_PRIVATE_KEY_FILENAME,
     PROTECTIVE_MARK_PRIVATE_KEY_FILENAME,
@@ -26,7 +27,10 @@ from robo_trader.bootstrap_evidence_receivers import (
     create_bootstrap_evidence_receivers,
 )
 from robo_trader.config import RuntimeContract
-from robo_trader.financial_state_bootstrap import load_exact_state_bootstrap_evidence
+from robo_trader.financial_state_bootstrap import (
+    ExactStateBootstrapError,
+    load_exact_state_bootstrap_evidence,
+)
 from robo_trader.reconciliation import bootstrap_producer as reconciliation_producer
 from robo_trader.reconciliation.domain import (
     BrokerCollectionEvidence,
@@ -455,10 +459,39 @@ def test_public_receivers_expose_no_raw_key_or_generic_signing_callable(
             assert not any(isinstance(value, Ed25519PrivateKey) for value in exposed)
             assert not hasattr(receiver, "sign")
             assert not hasattr(receiver, "sign_bytes")
+            assert not hasattr(receiver, f"_{type(receiver).__name__}__authority")
             assert not any(
                 callable(getattr(receiver, name))
                 for name in dir(receiver)
                 if name.strip("_") in {"sign", "sign_bytes", "sign_payload"}
+            )
+    finally:
+        receivers.close()
+
+
+def test_callback_visible_receiver_cannot_reach_old_arbitrary_signing_oracle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _install_test_trust(monkeypatch, tmp_path)
+    database = tmp_path / "ledger.db"
+    _ledger(database)
+    receivers = create_bootstrap_evidence_receivers(
+        runtime_contract=_runtime(database),
+        capability_directory=capability,
+        output_directory=tmp_path / "evidence",
+    )
+    try:
+        receiver = receivers.protective_mark
+        assert not hasattr(receiver, "_ProtectiveMarkEvidenceReceiver__authority")
+        assert not hasattr(receiver_core, "_sign_bound_artifact_receipt")
+        assert not hasattr(receiver_core, "_SigningAuthorityHandle")
+        signer = receiver_core._sign_registered_staged_artifact
+        with pytest.raises(BootstrapEvidenceReceiverError, match="signing stage is invalid"):
+            signer(
+                receiver,
+                object(),
+                datetime.now(timezone.utc),
             )
     finally:
         receivers.close()
@@ -587,5 +620,90 @@ async def test_mark_cancellation_reaps_provider_and_releases_receivers(
         )
 
     assert provider.closed is True
+    output = tmp_path / "evidence"
+    assert not output.exists()
+    assert not list(tmp_path.glob(".evidence.unpublished-*"))
+    with pytest.raises(ExactStateBootstrapError, match="cannot be read safely"):
+        load_exact_state_bootstrap_evidence(
+            reconciliation_path=output / "reconciliation_report.json",
+            broker_snapshot_path=output / "broker_snapshot.json",
+            protective_mark_paths=[],
+            expected_runtime_contract=runtime,
+        )
     with pytest.raises(BootstrapEvidenceReceiverError, match="not issued"):
         assert_reconciliation_receiver_capability(receivers.reconciliation_report)
+
+
+@pytest.mark.asyncio
+async def test_zero_position_mark_failure_leaves_no_publishable_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _install_test_trust(monkeypatch, tmp_path)
+    database = tmp_path / "ledger.db"
+    _ledger(database)
+    runtime = _runtime(database)
+    output = tmp_path / "evidence"
+    receivers = create_bootstrap_evidence_receivers(
+        runtime_contract=runtime,
+        capability_directory=capability,
+        output_directory=output,
+    )
+    provider = _Provider(_broker_result(datetime.now(timezone.utc) - timedelta(milliseconds=50)))
+
+    async def failed_marks(**kwargs: object) -> tuple:
+        assert kwargs["mark_identities"] == ()
+        raise RuntimeError("collector failed after reconciliation")
+
+    with pytest.raises(RuntimeError, match="collector failed"):
+        await produce_bootstrap_evidence_bundle(
+            runtime_contract=runtime,
+            snapshot_provider=provider,
+            receivers=receivers,
+            protective_mark_collector=failed_marks,
+        )
+
+    assert provider.closed is True
+    assert not output.exists()
+    assert not list(tmp_path.glob(".evidence.unpublished-*"))
+
+
+@pytest.mark.asyncio
+async def test_atomic_publication_never_replaces_a_racing_final_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _install_test_trust(monkeypatch, tmp_path)
+    database = tmp_path / "ledger.db"
+    _ledger(database)
+    runtime = _runtime(database)
+    output = tmp_path / "evidence"
+    receivers = create_bootstrap_evidence_receivers(
+        runtime_contract=runtime,
+        capability_directory=capability,
+        output_directory=output,
+    )
+
+    class RacingProvider(_Provider):
+        async def close(self) -> None:
+            output.mkdir()
+            (output / "unrelated.txt").write_text("preserve", encoding="utf-8")
+            await super().close()
+
+    provider = RacingProvider(
+        _broker_result(datetime.now(timezone.utc) - timedelta(milliseconds=50))
+    )
+
+    async def no_marks(**_kwargs: object) -> tuple:
+        return ()
+
+    with pytest.raises(BootstrapEvidenceReceiverError, match="publication"):
+        await produce_bootstrap_evidence_bundle(
+            runtime_contract=runtime,
+            snapshot_provider=provider,
+            receivers=receivers,
+            protective_mark_collector=no_marks,
+        )
+
+    assert (output / "unrelated.txt").read_text(encoding="utf-8") == "preserve"
+    assert not list(tmp_path.glob(".evidence.unpublished-*"))

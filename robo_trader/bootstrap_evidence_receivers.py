@@ -16,11 +16,13 @@ stronger threat model.
 from __future__ import annotations
 
 import base64
+import ctypes
 import hashlib
 import json
 import os
 import secrets
 import stat
+import sys
 import threading
 import weakref
 from dataclasses import dataclass, field
@@ -82,14 +84,9 @@ _RECONCILIATION_STAGE_REGISTRY: dict[int, "_StagedReconciliationEvidence"] = {}
 _PROTECTIVE_MARK_STAGE_MARKER = object()
 _PROTECTIVE_MARK_STAGE_REGISTRY_LOCK = threading.Lock()
 _PROTECTIVE_MARK_STAGE_REGISTRY: dict[int, "_StagedProtectiveMarkEvidence"] = {}
-_SIGNING_AUTHORITY_MARKER = object()
 _SIGNING_AUTHORITY_LOCK = threading.Lock()
-
-
-@dataclass(frozen=True, slots=True)
-class _SigningAuthorityHandle:
-    nonce: str
-    marker: object = field(repr=False, compare=False)
+_SIGNING_STAGE_MARKER = object()
+_SIGNING_STAGE_LOCK = threading.Lock()
 
 
 @dataclass(slots=True)
@@ -100,14 +97,64 @@ class _SigningAuthority:
     runtime_fingerprint: str
     account_scope: str
     bundle_id: str
-    signed_object_ids: set[str] = field(default_factory=set, repr=False)
+    receiver: object = field(repr=False)
 
 
-_SIGNING_AUTHORITIES: dict[str, _SigningAuthority] = {}
+_SIGNING_AUTHORITIES: dict[int, _SigningAuthority] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class _RegisteredSigningStage:
+    receiver: object = field(repr=False, compare=False)
+    staged_artifact_path: Path
+    artifact_kind: str
+    producer_object_id: str
+    runtime_fingerprint: str
+    account_scope: str
+    bundle_id: str
+    marker: object = field(repr=False, compare=False)
+
+
+_SIGNING_STAGES: dict[int, _RegisteredSigningStage] = {}
 
 
 class BootstrapEvidenceReceiverError(ValueError):
     """A signing capability or typed producer handoff is unsafe."""
+
+
+def _rename_directory_exclusive(source: Path, destination: Path) -> None:
+    """Atomically rename one sibling directory without replacing a target."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if sys.platform == "darwin":
+        rename_exclusive = getattr(libc, "renameatx_np", None)
+        if rename_exclusive is None:  # pragma: no cover - supported macOS invariant
+            raise BootstrapEvidenceReceiverError("exclusive directory rename is unavailable")
+        result = rename_exclusive(
+            ctypes.c_int(-2),
+            ctypes.c_char_p(source_bytes),
+            ctypes.c_int(-2),
+            ctypes.c_char_p(destination_bytes),
+            ctypes.c_uint(0x00000004),
+        )
+    else:
+        rename_exclusive = getattr(libc, "renameat2", None)
+        if rename_exclusive is None:
+            raise BootstrapEvidenceReceiverError("exclusive directory rename is unavailable")
+        result = rename_exclusive(
+            ctypes.c_int(-100),
+            ctypes.c_char_p(source_bytes),
+            ctypes.c_int(-100),
+            ctypes.c_char_p(destination_bytes),
+            ctypes.c_uint(1),
+        )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise BootstrapEvidenceReceiverError(
+            "exclusive evidence directory publication failed"
+        ) from OSError(error_number, os.strerror(error_number), str(destination))
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,6 +319,13 @@ class _BundleBindings:
     runtime_fingerprint: str
     account_scope: str
     database_identity: str
+    staging_output_directory: Path
+    final_output_directory: Path
+    staging_output_device: int
+    staging_output_inode: int
+    output_parent_device: int
+    output_parent_inode: int
+    published: bool = False
     broker_snapshot_id: str | None = None
     broker_snapshot_hash: str | None = None
     broker_artifact_hash: str | None = None
@@ -356,6 +410,117 @@ class BootstrapEvidenceReceiverSet:
         self.broker_snapshot._release_capability()
         self.reconciliation_report._release_capability()
         self.protective_mark._release_capability()
+        _release_signing_authority(self)
+        if not self._state.published:
+            self.discard_unpublished_bundle()
+
+    def publish_complete_bundle(
+        self,
+        expected_marks: set[tuple[str, str]],
+    ) -> Path:
+        """Atomically publish the complete, provider-closed evidence directory."""
+
+        self.assert_complete(expected_marks)
+        state = self._state
+        if state.published:
+            raise BootstrapEvidenceReceiverError("evidence bundle was already published")
+        parent = state.final_output_directory.parent
+        parent_metadata = os.lstat(parent)
+        staging_metadata = os.lstat(state.staging_output_directory)
+        if (
+            (parent_metadata.st_dev, parent_metadata.st_ino)
+            != (state.output_parent_device, state.output_parent_inode)
+            or stat.S_ISLNK(parent_metadata.st_mode)
+            or not stat.S_ISDIR(parent_metadata.st_mode)
+            or stat.S_ISLNK(staging_metadata.st_mode)
+            or not stat.S_ISDIR(staging_metadata.st_mode)
+            or (staging_metadata.st_dev, staging_metadata.st_ino)
+            != (state.staging_output_device, state.staging_output_inode)
+            or staging_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(staging_metadata.st_mode) != 0o700
+            or os.path.lexists(state.final_output_directory)
+        ):
+            raise BootstrapEvidenceReceiverError(
+                "evidence publication paths changed or final output already exists"
+            )
+        directory_descriptor = os.open(
+            state.staging_output_directory,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        parent_descriptor = os.open(
+            parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        renamed = False
+        try:
+            os.fsync(directory_descriptor)
+            _rename_directory_exclusive(
+                state.staging_output_directory,
+                state.final_output_directory,
+            )
+            renamed = True
+            os.fsync(parent_descriptor)
+        except BaseException:
+            if renamed:
+                try:
+                    _rename_directory_exclusive(
+                        state.final_output_directory,
+                        state.staging_output_directory,
+                    )
+                except BootstrapEvidenceReceiverError as exc:
+                    state.published = True
+                    raise BootstrapEvidenceReceiverError(
+                        "evidence publication durability failed and rollback was impossible"
+                    ) from exc
+            raise
+        finally:
+            os.close(parent_descriptor)
+            os.close(directory_descriptor)
+        state.published = True
+        return state.final_output_directory
+
+    def discard_unpublished_bundle(self) -> None:
+        """Remove only this factory-created unpublished sibling directory."""
+
+        state = self._state
+        if state.published or not os.path.lexists(state.staging_output_directory):
+            return
+        try:
+            metadata = os.lstat(state.staging_output_directory)
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or (metadata.st_dev, metadata.st_ino)
+                != (state.staging_output_device, state.staging_output_inode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                raise BootstrapEvidenceReceiverError(
+                    "unpublished evidence directory cannot be removed safely"
+                )
+            for entry in os.scandir(state.staging_output_directory):
+                entry_metadata = entry.stat(follow_symlinks=False)
+                if (
+                    not entry.is_file(follow_symlinks=False)
+                    or entry_metadata.st_uid != os.geteuid()
+                    or entry_metadata.st_nlink != 1
+                ):
+                    raise BootstrapEvidenceReceiverError(
+                        "unpublished evidence contains an unsafe entry"
+                    )
+                os.unlink(entry.path)
+            os.rmdir(state.staging_output_directory)
+        except OSError as exc:
+            raise BootstrapEvidenceReceiverError(
+                "unpublished evidence bundle could not be removed"
+            ) from exc
+
+    def published_artifact_path(self, artifact: SealedBootstrapEvidenceArtifact) -> Path:
+        if not self._state.published:
+            raise BootstrapEvidenceReceiverError("evidence bundle is not published")
+        if artifact.artifact_path.parent != self._state.staging_output_directory:
+            raise BootstrapEvidenceReceiverError("artifact is outside this evidence bundle")
+        return self._state.final_output_directory / artifact.artifact_path.name
 
     @property
     def broker_artifact(self) -> SealedBootstrapEvidenceArtifact:
@@ -371,15 +536,14 @@ def _utc_text(value: datetime) -> str:
 
 def _register_signing_authority(
     *,
+    receiver: object,
     key: Ed25519PrivateKey,
     artifact_kind: str,
     producer_id: str,
     runtime_fingerprint: str,
     account_scope: str,
     bundle_id: str,
-) -> _SigningAuthorityHandle:
-    nonce = secrets.token_hex(32)
-    handle = _SigningAuthorityHandle(nonce=nonce, marker=_SIGNING_AUTHORITY_MARKER)
+) -> None:
     authority = _SigningAuthority(
         key=key,
         artifact_kind=artifact_kind,
@@ -387,53 +551,94 @@ def _register_signing_authority(
         runtime_fingerprint=runtime_fingerprint,
         account_scope=account_scope,
         bundle_id=bundle_id,
+        receiver=receiver,
     )
     with _SIGNING_AUTHORITY_LOCK:
-        if nonce in _SIGNING_AUTHORITIES:  # pragma: no cover - random collision invariant
-            raise BootstrapEvidenceReceiverError("signing authority nonce collision")
-        _SIGNING_AUTHORITIES[nonce] = authority
-    return handle
+        if id(receiver) in _SIGNING_AUTHORITIES:
+            raise BootstrapEvidenceReceiverError("signing authority is already registered")
+        _SIGNING_AUTHORITIES[id(receiver)] = authority
 
 
-def _sign_bound_artifact_receipt(
-    handle: _SigningAuthorityHandle,
+def _register_signing_stage(
     *,
+    receiver: object,
+    staged_artifact_path: Path,
     artifact_kind: str,
-    artifact_sha256: str,
     producer_object_id: str,
     runtime_fingerprint: str,
     account_scope: str,
     bundle_id: str,
+) -> _RegisteredSigningStage:
+    stage = _RegisteredSigningStage(
+        receiver=receiver,
+        staged_artifact_path=staged_artifact_path,
+        artifact_kind=artifact_kind,
+        producer_object_id=producer_object_id,
+        runtime_fingerprint=runtime_fingerprint,
+        account_scope=account_scope,
+        bundle_id=bundle_id,
+        marker=_SIGNING_STAGE_MARKER,
+    )
+    with _SIGNING_STAGE_LOCK:
+        _SIGNING_STAGES[id(stage)] = stage
+    return stage
+
+
+def _discard_signing_stage(stage: _RegisteredSigningStage | None) -> None:
+    if type(stage) is not _RegisteredSigningStage:
+        return
+    with _SIGNING_STAGE_LOCK:
+        registered = _SIGNING_STAGES.get(id(stage))
+        if registered is stage:
+            _SIGNING_STAGES.pop(id(stage), None)
+
+
+def _sign_registered_staged_artifact(
+    receiver: object,
+    stage: _RegisteredSigningStage,
     now: datetime,
 ) -> tuple[dict[str, object], AuthenticatedEvidenceReceipt]:
-    """Perform one artifact-bound signing operation inside trusted core."""
+    """Sign only exact sealed bytes registered by a typed producer receiver.
 
+    The only unavoidable boundary is arbitrary code already executing inside
+    this trusted module's interpreter, which can inspect module globals.  This
+    API deliberately accepts no caller-selected hash, object ID, kind, or
+    runtime binding.
+    """
+
+    if type(stage) is not _RegisteredSigningStage:
+        raise BootstrapEvidenceReceiverError("signing stage is invalid")
+    with _SIGNING_STAGE_LOCK:
+        registered = _SIGNING_STAGES.pop(id(stage), None)
     if (
-        type(handle) is not _SigningAuthorityHandle
-        or handle.marker is not _SIGNING_AUTHORITY_MARKER
+        registered is not stage
+        or stage.receiver is not receiver
+        or stage.marker is not _SIGNING_STAGE_MARKER
     ):
-        raise BootstrapEvidenceReceiverError("signing authority handle is invalid")
+        raise BootstrapEvidenceReceiverError("signing stage is forged or already consumed")
+    payload, _metadata = _read_sealed_staged_file(stage.staged_artifact_path)
+    artifact_sha256 = hashlib.sha256(payload).hexdigest()
     with _SIGNING_AUTHORITY_LOCK:
-        authority = _SIGNING_AUTHORITIES.get(handle.nonce)
+        authority = _SIGNING_AUTHORITIES.get(id(receiver))
         if (
             authority is None
-            or authority.artifact_kind != artifact_kind
-            or authority.runtime_fingerprint != runtime_fingerprint
-            or authority.account_scope != account_scope
-            or authority.bundle_id != bundle_id
-            or producer_object_id in authority.signed_object_ids
+            or authority.receiver is not receiver
+            or authority.artifact_kind != stage.artifact_kind
+            or authority.runtime_fingerprint != stage.runtime_fingerprint
+            or authority.account_scope != stage.account_scope
+            or authority.bundle_id != stage.bundle_id
         ):
             raise BootstrapEvidenceReceiverError(
-                "signing authority is absent, replayed, or outside its bundle binding"
+                "signing authority is absent or outside its sealed stage binding"
             )
         values: dict[str, object] = {
             "schema_version": AUTH_SCHEMA_VERSION,
             "receipt_id": "bevr-v2-" + secrets.token_hex(32),
-            "artifact_kind": artifact_kind,
+            "artifact_kind": stage.artifact_kind,
             "producer_id": authority.producer_id,
             "artifact_sha256": artifact_sha256,
-            "runtime_fingerprint": runtime_fingerprint,
-            "account_scope": account_scope,
+            "runtime_fingerprint": stage.runtime_fingerprint,
+            "account_scope": stage.account_scope,
             "issued_at": _utc_text(now),
             "expires_at": _utc_text(now + MAX_RECEIPT_LIFETIME),
             "public_key_fingerprint": ed25519_public_key_fingerprint(authority.key.public_key()),
@@ -443,21 +648,26 @@ def _sign_bound_artifact_receipt(
         ).decode("ascii")
         authentication = verify_receipt(
             raw=values,
-            artifact_kind=artifact_kind,
+            artifact_kind=stage.artifact_kind,
             artifact_sha256=artifact_sha256,
-            runtime_fingerprint=runtime_fingerprint,
-            account_scope=account_scope,
+            runtime_fingerprint=stage.runtime_fingerprint,
+            account_scope=stage.account_scope,
             now=now,
         )
-        authority.signed_object_ids.add(producer_object_id)
     return values, authentication
 
 
-def _release_signing_authority(handle: _SigningAuthorityHandle | None) -> None:
-    if type(handle) is not _SigningAuthorityHandle:
-        return
+def _release_signing_authority(receiver: object) -> None:
     with _SIGNING_AUTHORITY_LOCK:
-        _SIGNING_AUTHORITIES.pop(handle.nonce, None)
+        authority = _SIGNING_AUTHORITIES.get(id(receiver))
+        if authority is not None and authority.receiver is receiver:
+            _SIGNING_AUTHORITIES.pop(id(receiver), None)
+
+
+def _has_signing_authority(receiver: object) -> bool:
+    with _SIGNING_AUTHORITY_LOCK:
+        authority = _SIGNING_AUTHORITIES.get(id(receiver))
+        return authority is not None and authority.receiver is receiver
 
 
 def _safe_private_key(
@@ -539,30 +749,47 @@ def _safe_private_key(
     return key
 
 
-def _prepare_output_directory(path: Path, capability_directory: Path) -> Path:
-    output = Path(path)
+def _prepare_output_directory(
+    path: Path,
+    capability_directory: Path,
+) -> tuple[Path, Path, int, int, int, int]:
+    final_output = Path(path)
     if (
-        not output.is_absolute()
-        or output == capability_directory
-        or capability_directory in output.parents
-        or output.parent.resolve(strict=True) / output.name != output
+        not final_output.is_absolute()
+        or final_output == capability_directory
+        or capability_directory in final_output.parents
+        or final_output.parent.resolve(strict=True) / final_output.name != final_output
+        or os.path.lexists(final_output)
     ):
         raise BootstrapEvidenceReceiverError("evidence output directory is unsafe")
+    parent_metadata = os.lstat(final_output.parent)
+    if stat.S_ISLNK(parent_metadata.st_mode) or not stat.S_ISDIR(parent_metadata.st_mode):
+        raise BootstrapEvidenceReceiverError("evidence output parent is unsafe")
+    staging_output = final_output.with_name(
+        f".{final_output.name}.unpublished-{secrets.token_hex(32)}"
+    )
     try:
-        os.mkdir(output, 0o700)
+        os.mkdir(staging_output, 0o700)
     except OSError as exc:
         raise BootstrapEvidenceReceiverError(
-            "evidence output directory must be new and exclusive"
+            "evidence staging directory must be new and exclusive"
         ) from exc
-    metadata = os.lstat(output)
+    metadata = os.lstat(staging_output)
     if (
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != os.geteuid()
         or stat.S_IMODE(metadata.st_mode) != 0o700
     ):
-        raise BootstrapEvidenceReceiverError("evidence output directory is not owner-only")
-    return output
+        raise BootstrapEvidenceReceiverError("evidence staging directory is not owner-only")
+    return (
+        staging_output,
+        final_output,
+        metadata.st_dev,
+        metadata.st_ino,
+        parent_metadata.st_dev,
+        parent_metadata.st_ino,
+    )
 
 
 def _write_new_sealed_file(path: Path, payload: bytes) -> None:
@@ -602,6 +829,42 @@ def _write_new_sealed_file(path: Path, payload: bytes) -> None:
             os.close(descriptor)
 
 
+def _read_sealed_staged_file(path: Path) -> tuple[bytes, os.stat_result]:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o400
+            or before.st_size > _MAX_ARTIFACT_BYTES
+        ):
+            raise BootstrapEvidenceReceiverError("signing stage is not a sealed owner file")
+        payload = os.read(descriptor, _MAX_ARTIFACT_BYTES + 1)
+        after = os.fstat(descriptor)
+        current = os.lstat(path)
+        if (
+            len(payload) > _MAX_ARTIFACT_BYTES
+            or os.read(descriptor, 1)
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or (after.st_dev, after.st_ino) != (current.st_dev, current.st_ino)
+            or current.st_nlink != 1
+        ):
+            raise BootstrapEvidenceReceiverError("sealed signing stage changed while read")
+        return payload, after
+    except OSError as exc:
+        raise BootstrapEvidenceReceiverError("sealed signing stage cannot be read") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _canonical_payload_bytes(payload: str) -> bytes:
     if type(payload) is not str:
         raise BootstrapEvidenceReceiverError("producer canonical payload must be text")
@@ -616,7 +879,7 @@ def _canonical_payload_bytes(payload: str) -> bytes:
 
 
 class BrokerSnapshotEvidenceReceiver:
-    __slots__ = ("__authority", "__clock", "__output", "__runtime", "__state")
+    __slots__ = ("__clock", "__output", "__runtime", "__state")
 
     def __init__(
         self,
@@ -624,7 +887,6 @@ class BrokerSnapshotEvidenceReceiver:
         runtime: RuntimeContract,
         output: Path,
         state: _BundleBindings,
-        authority: _SigningAuthorityHandle,
         clock: Callable[[], datetime],
     ) -> None:
         if token is not _FACTORY_TOKEN:
@@ -632,14 +894,13 @@ class BrokerSnapshotEvidenceReceiver:
         self.__runtime = runtime
         self.__output = output
         self.__state = state
-        self.__authority: _SigningAuthorityHandle | None = authority
         self.__clock = clock
 
     def receive_broker_snapshot_producer_result(
         self,
         result: BrokerSnapshotProducerResult,
     ) -> VerifiedBrokerEvidenceEnvelope:
-        if self.__authority is None:
+        if not _has_signing_authority(self):
             raise BootstrapEvidenceReceiverError("broker signing capability was released")
         # This one-shot producer claim must happen before any field or payload
         # is read, hashed, persisted, or signed.
@@ -659,25 +920,47 @@ class BrokerSnapshotEvidenceReceiver:
         payload = _canonical_payload_bytes(result.canonical_payload)
         artifact_hash = hashlib.sha256(payload).hexdigest()
         artifact_path = self.__output / _BROKER_ARTIFACT_FILENAME
-        _write_new_sealed_file(artifact_path, payload)
-        now = self.__clock().astimezone(timezone.utc)
-        values, authentication = _sign_bound_artifact_receipt(
-            self.__authority,
+        receipt_path = artifact_path.with_name(artifact_path.name + AUTH_SUFFIX)
+        stage_nonce = secrets.token_hex(32)
+        staged_artifact_path = self.__output / (f".{_BROKER_ARTIFACT_FILENAME}.stage-{stage_nonce}")
+        staged_receipt_path = self.__output / (
+            f".{_BROKER_ARTIFACT_FILENAME}{AUTH_SUFFIX}.stage-{stage_nonce}"
+        )
+        if artifact_path.exists() or receipt_path.exists():
+            raise BootstrapEvidenceReceiverError("broker evidence was already published")
+        _write_new_sealed_file(staged_artifact_path, payload)
+        signing_stage = _register_signing_stage(
+            receiver=self,
+            staged_artifact_path=staged_artifact_path,
             artifact_kind="broker_snapshot",
-            artifact_sha256=artifact_hash,
             producer_object_id=result.snapshot_id,
             runtime_fingerprint=self.__state.runtime_fingerprint,
             account_scope=self.__state.account_scope,
             bundle_id=self.__state.bundle_id,
-            now=now,
         )
-        receipt_path = artifact_path.with_name(artifact_path.name + AUTH_SUFFIX)
-        _write_new_sealed_file(
-            receipt_path,
-            json.dumps(values, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode(
-                "utf-8"
-            ),
-        )
+        try:
+            now = self.__clock().astimezone(timezone.utc)
+            values, authentication = _sign_registered_staged_artifact(
+                self,
+                signing_stage,
+                now,
+            )
+            _write_new_sealed_file(
+                staged_receipt_path,
+                json.dumps(
+                    values,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8"),
+            )
+            staged_artifact_path.rename(artifact_path)
+            staged_receipt_path.rename(receipt_path)
+        except BaseException:
+            _discard_signing_stage(signing_stage)
+            for path in (staged_receipt_path, staged_artifact_path):
+                path.unlink(missing_ok=True)
+            raise
         self.__state.broker_snapshot_id = result.snapshot_id
         snapshot_hash = hashlib.sha256(
             result.snapshot.canonical_payload().encode("utf-8")
@@ -710,33 +993,30 @@ class BrokerSnapshotEvidenceReceiver:
         )
 
     def _release_capability(self) -> None:
-        _release_signing_authority(self.__authority)
-        self.__authority = None
+        _release_signing_authority(self)
 
 
 class ReconciliationEvidenceReceiver:
-    __slots__ = ("__authority", "__clock", "__output", "__state", "__weakref__")
+    __slots__ = ("__clock", "__output", "__state", "__weakref__")
 
     def __init__(
         self,
         token: object,
         output: Path,
         state: _BundleBindings,
-        authority: _SigningAuthorityHandle,
         clock: Callable[[], datetime],
     ) -> None:
         if token is not _FACTORY_TOKEN:
             raise BootstrapEvidenceReceiverError("reconciliation receiver is factory-only")
         self.__output = output
         self.__state = state
-        self.__authority: _SigningAuthorityHandle | None = authority
         self.__clock = clock
 
     def stage_unsigned_bootstrap_reconciliation(
         self,
         result: UnsignedBootstrapReconciliation,
     ) -> object:
-        if self.__authority is None:
+        if not _has_signing_authority(self):
             raise BootstrapEvidenceReceiverError("reconciliation signing capability was released")
         # Claim the producer-owned one-shot result before reading any field,
         # hashing its payload, or creating unpublished staging files.
@@ -773,23 +1053,6 @@ class ReconciliationEvidenceReceiver:
         )
         if final_artifact_path.exists() or final_receipt_path.exists():
             raise BootstrapEvidenceReceiverError("reconciliation evidence was already published")
-        now = self.__clock().astimezone(timezone.utc)
-        values, _authentication = _sign_bound_artifact_receipt(
-            self.__authority,
-            artifact_kind="reconciliation_report",
-            artifact_sha256=artifact_hash,
-            producer_object_id=result.snapshot_id,
-            runtime_fingerprint=self.__state.runtime_fingerprint,
-            account_scope=self.__state.account_scope,
-            bundle_id=self.__state.bundle_id,
-            now=now,
-        )
-        receipt_payload = json.dumps(
-            values,
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
         artifact = SealedBootstrapEvidenceArtifact(
             artifact_kind="reconciliation_report",
             artifact_path=final_artifact_path,
@@ -820,12 +1083,34 @@ class ReconciliationEvidenceReceiver:
             broker_open_orders_count=result.broker_open_orders_count,
             marker=_RECONCILIATION_STAGE_MARKER,
         )
+        signing_stage: _RegisteredSigningStage | None = None
         try:
             _write_new_sealed_file(staged_artifact_path, payload)
+            signing_stage = _register_signing_stage(
+                receiver=self,
+                staged_artifact_path=staged_artifact_path,
+                artifact_kind="reconciliation_report",
+                producer_object_id=result.snapshot_id,
+                runtime_fingerprint=self.__state.runtime_fingerprint,
+                account_scope=self.__state.account_scope,
+                bundle_id=self.__state.bundle_id,
+            )
+            values, _authentication = _sign_registered_staged_artifact(
+                self,
+                signing_stage,
+                self.__clock().astimezone(timezone.utc),
+            )
+            receipt_payload = json.dumps(
+                values,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
             _write_new_sealed_file(staged_receipt_path, receipt_payload)
             with _RECONCILIATION_STAGE_REGISTRY_LOCK:
                 _RECONCILIATION_STAGE_REGISTRY[id(stage)] = stage
         except BaseException:
+            _discard_signing_stage(signing_stage)
             for path in (staged_receipt_path, staged_artifact_path):
                 try:
                     path.unlink(missing_ok=True)
@@ -911,8 +1196,7 @@ class ReconciliationEvidenceReceiver:
             registered = _RECONCILIATION_RECEIVER_REGISTRY.get(id(self))
             if registered is self:
                 _RECONCILIATION_RECEIVER_REGISTRY.pop(id(self), None)
-        _release_signing_authority(self.__authority)
-        self.__authority = None
+        _release_signing_authority(self)
 
     def _bundle_identity(self) -> ReconciliationBundleIdentity:
         return ReconciliationBundleIdentity(
@@ -943,28 +1227,26 @@ def assert_reconciliation_receiver_capability(
 
 
 class ProtectiveMarkEvidenceReceiver:
-    __slots__ = ("__authority", "__clock", "__output", "__state", "__weakref__")
+    __slots__ = ("__clock", "__output", "__state", "__weakref__")
 
     def __init__(
         self,
         token: object,
         output: Path,
         state: _BundleBindings,
-        authority: _SigningAuthorityHandle,
         clock: Callable[[], datetime],
     ) -> None:
         if token is not _FACTORY_TOKEN:
             raise BootstrapEvidenceReceiverError("protective mark receiver is factory-only")
         self.__output = output
         self.__state = state
-        self.__authority: _SigningAuthorityHandle | None = authority
         self.__clock = clock
 
     def stage_unsigned_bootstrap_protective_mark(
         self,
         result: UnsignedBootstrapProtectiveMark,
     ) -> object:
-        if self.__authority is None:
+        if not _has_signing_authority(self):
             raise BootstrapEvidenceReceiverError("mark signing capability was released")
         # Producer ownership is receiver-bound and one-shot.  Consume it
         # before reading any result field or creating any artifact.
@@ -1008,23 +1290,6 @@ class ProtectiveMarkEvidenceReceiver:
         staged_receipt_path = self.__output / (f".{final_receipt_path.name}.stage-{stage_nonce}")
         if final_artifact_path.exists() or final_receipt_path.exists():
             raise BootstrapEvidenceReceiverError("protective mark was already published")
-        now = self.__clock().astimezone(timezone.utc)
-        values, _authentication = _sign_bound_artifact_receipt(
-            self.__authority,
-            artifact_kind="protective_mark",
-            artifact_sha256=artifact_hash,
-            producer_object_id=result.protective_quote_id,
-            runtime_fingerprint=self.__state.runtime_fingerprint,
-            account_scope=self.__state.account_scope,
-            bundle_id=self.__state.bundle_id,
-            now=now,
-        )
-        receipt_payload = json.dumps(
-            values,
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
         artifact = SealedBootstrapEvidenceArtifact(
             artifact_kind="protective_mark",
             artifact_path=final_artifact_path,
@@ -1042,12 +1307,34 @@ class ProtectiveMarkEvidenceReceiver:
             final_receipt_path=final_receipt_path,
             marker=_PROTECTIVE_MARK_STAGE_MARKER,
         )
+        signing_stage: _RegisteredSigningStage | None = None
         try:
             _write_new_sealed_file(staged_artifact_path, payload)
+            signing_stage = _register_signing_stage(
+                receiver=self,
+                staged_artifact_path=staged_artifact_path,
+                artifact_kind="protective_mark",
+                producer_object_id=result.protective_quote_id,
+                runtime_fingerprint=self.__state.runtime_fingerprint,
+                account_scope=self.__state.account_scope,
+                bundle_id=self.__state.bundle_id,
+            )
+            values, _authentication = _sign_registered_staged_artifact(
+                self,
+                signing_stage,
+                self.__clock().astimezone(timezone.utc),
+            )
+            receipt_payload = json.dumps(
+                values,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
             _write_new_sealed_file(staged_receipt_path, receipt_payload)
             with _PROTECTIVE_MARK_STAGE_REGISTRY_LOCK:
                 _PROTECTIVE_MARK_STAGE_REGISTRY[id(stage)] = stage
         except BaseException:
+            _discard_signing_stage(signing_stage)
             for path in (staged_receipt_path, staged_artifact_path):
                 try:
                     path.unlink(missing_ok=True)
@@ -1119,8 +1406,7 @@ class ProtectiveMarkEvidenceReceiver:
             registered = _PROTECTIVE_MARK_RECEIVER_REGISTRY.get(id(self))
             if registered is self:
                 _PROTECTIVE_MARK_RECEIVER_REGISTRY.pop(id(self), None)
-        _release_signing_authority(self.__authority)
-        self.__authority = None
+        _release_signing_authority(self)
 
     def _bundle_identity(self) -> ProtectiveMarkBundleIdentity:
         state = self.__state
@@ -1233,13 +1519,26 @@ def create_bootstrap_evidence_receivers(
         != 3
     ):
         raise BootstrapEvidenceReceiverError("signing capabilities must be pairwise distinct")
-    output = _prepare_output_directory(Path(output_directory), capability_directory)
+    (
+        output,
+        final_output,
+        staging_device,
+        staging_inode,
+        parent_device,
+        parent_inode,
+    ) = _prepare_output_directory(Path(output_directory), capability_directory)
     bundle_id = "bootstrap-evidence-bundle-v1-" + secrets.token_hex(32)
     state = _BundleBindings(
         bundle_id=bundle_id,
         runtime_fingerprint=runtime_contract.fingerprint,
         account_scope=runtime_contract.safety_account_scope,
         database_identity=runtime_contract.database_identity,
+        staging_output_directory=output,
+        final_output_directory=final_output,
+        staging_output_device=staging_device,
+        staging_output_inode=staging_inode,
+        output_parent_device=parent_device,
+        output_parent_inode=parent_inode,
         safety_journal_path=runtime_contract.safety_journal_path,
         safety_journal_identity=runtime_contract.safety_journal_identity,
     )
@@ -1247,9 +1546,30 @@ def create_bootstrap_evidence_receivers(
     def clock() -> datetime:
         return datetime.now(timezone.utc)
 
-    authorities: list[_SigningAuthorityHandle] = []
+    receivers: list[object] = []
     try:
-        broker_authority = _register_signing_authority(
+        broker_receiver = BrokerSnapshotEvidenceReceiver(
+            _FACTORY_TOKEN,
+            runtime_contract,
+            output,
+            state,
+            clock,
+        )
+        reconciliation_receiver = ReconciliationEvidenceReceiver(
+            _FACTORY_TOKEN,
+            output,
+            state,
+            clock,
+        )
+        mark_receiver = ProtectiveMarkEvidenceReceiver(
+            _FACTORY_TOKEN,
+            output,
+            state,
+            clock,
+        )
+        receivers.extend((broker_receiver, reconciliation_receiver, mark_receiver))
+        _register_signing_authority(
+            receiver=broker_receiver,
             key=broker_key,
             artifact_kind="broker_snapshot",
             producer_id="robotrader-broker-snapshot-producer-v1",
@@ -1257,8 +1577,8 @@ def create_bootstrap_evidence_receivers(
             account_scope=state.account_scope,
             bundle_id=bundle_id,
         )
-        authorities.append(broker_authority)
-        reconciliation_authority = _register_signing_authority(
+        _register_signing_authority(
+            receiver=reconciliation_receiver,
             key=reconciliation_key,
             artifact_kind="reconciliation_report",
             producer_id="robotrader-reconciliation-producer-v1",
@@ -1266,8 +1586,8 @@ def create_bootstrap_evidence_receivers(
             account_scope=state.account_scope,
             bundle_id=bundle_id,
         )
-        authorities.append(reconciliation_authority)
-        mark_authority = _register_signing_authority(
+        _register_signing_authority(
+            receiver=mark_receiver,
             key=mark_key,
             artifact_kind="protective_mark",
             producer_id="robotrader-protective-mark-producer-v1",
@@ -1275,39 +1595,23 @@ def create_bootstrap_evidence_receivers(
             account_scope=state.account_scope,
             bundle_id=bundle_id,
         )
-        authorities.append(mark_authority)
-        reconciliation_receiver = ReconciliationEvidenceReceiver(
-            _FACTORY_TOKEN,
-            output,
-            state,
-            reconciliation_authority,
-            clock,
-        )
-        mark_receiver = ProtectiveMarkEvidenceReceiver(
-            _FACTORY_TOKEN,
-            output,
-            state,
-            mark_authority,
-            clock,
-        )
         with _RECONCILIATION_RECEIVER_REGISTRY_LOCK:
             _RECONCILIATION_RECEIVER_REGISTRY[id(reconciliation_receiver)] = reconciliation_receiver
         with _PROTECTIVE_MARK_RECEIVER_REGISTRY_LOCK:
             _PROTECTIVE_MARK_RECEIVER_REGISTRY[id(mark_receiver)] = mark_receiver
-        return BootstrapEvidenceReceiverSet(
-            broker_snapshot=BrokerSnapshotEvidenceReceiver(
-                _FACTORY_TOKEN,
-                runtime_contract,
-                output,
-                state,
-                broker_authority,
-                clock,
-            ),
+        receiver_set = BootstrapEvidenceReceiverSet(
+            broker_snapshot=broker_receiver,
             reconciliation_report=reconciliation_receiver,
             protective_mark=mark_receiver,
             _state=state,
         )
+        return receiver_set
     except BaseException:
-        for authority in authorities:
-            _release_signing_authority(authority)
+        for receiver in receivers:
+            _release_signing_authority(receiver)
+        if output.exists():
+            for entry in os.scandir(output):
+                if entry.is_file(follow_symlinks=False):
+                    os.unlink(entry.path)
+            os.rmdir(output)
         raise
