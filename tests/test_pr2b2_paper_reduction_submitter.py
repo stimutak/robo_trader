@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 import robo_trader.paper_reduction_submitter as submitter_module
+import robo_trader.safety.runtime as runtime_module
 from robo_trader.execution import ExecutionResult, Order, PaperExecutor
 from robo_trader.paper_execution_capability import (
     PaperExecutionCapabilityError,
@@ -269,6 +270,26 @@ def test_submitter_rejects_caller_quantity_that_differs_from_final_allocation(
             pre_position_quantity=Decimal("11"),
         )
     assert case.executor.fills == {}
+
+
+def test_one_envelope_cannot_mint_two_allocations_or_fill_twice(tmp_path: Path) -> None:
+    case = _make_case(tmp_path)
+    envelope = _envelope(case)
+
+    assert not hasattr(runtime_module, "_issue_claimed_paper_submission_allocation")
+
+    first = case.submitter._submit_once(
+        envelope,
+        pre_position_quantity=Decimal("10"),
+    )
+    with pytest.raises(PaperReductionSubmissionError, match="envelope claim failed"):
+        case.submitter._submit_once(
+            envelope,
+            pre_position_quantity=Decimal("10"),
+        )
+
+    assert first.status is LocalPaperOrderStatus.FILLED
+    assert len(case.executor.fills) == 1
 
 
 def test_binding_is_private_sealed_and_exact(tmp_path: Path) -> None:

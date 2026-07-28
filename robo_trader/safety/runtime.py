@@ -832,9 +832,12 @@ class ConsumedPaperSubmissionEnvelope:
         raise TypeError("ConsumedPaperSubmissionEnvelope cannot be serialized")
 
 
-def _make_claimed_paper_allocation_state():
+def _make_claimed_paper_allocation_state(claim_envelope):
     """Build closure-owned one-shot state for final allocation claims."""
 
+    # Threat boundary: closure capability hygiene constrains supported call paths;
+    # it cannot isolate arbitrary same-interpreter code. Hostile plugins or
+    # broker-write authority require a separate process-isolation boundary.
     issue_token = object()
     registry_lock = threading.RLock()
     registry: dict[
@@ -867,13 +870,37 @@ def _make_claimed_paper_allocation_state():
         def __reduce__(self):
             raise TypeError("claimed paper allocation cannot be serialized")
 
-    def issue(
+    def claim_and_issue(
+        envelope: object,
         *,
-        coordinator_token: object,
-        descriptor: SubmissionDescriptor,
-        contract: AuthoritativeContract,
-        pre_position_quantity: Decimal,
-    ) -> _ClaimedPaperSubmissionAllocation:
+        coordinator: object,
+    ) -> tuple[
+        SubmissionDescriptor,
+        AuthoritativeContract,
+        _ClaimedPaperSubmissionAllocation,
+    ]:
+        """Claim one exact envelope and mint its sole allocation identity."""
+
+        if type(coordinator) is not SafetyRuntimeCoordinator:
+            raise RuntimeSafetyError("exact paper safety coordinator is required")
+        descriptor, contract = claim_envelope(
+            envelope,
+            coordinator_token=coordinator._coordinator_token,
+        )
+        if (
+            envelope.execution_domain_scope != coordinator._identity.execution_domain_scope
+            or envelope.account_scope != coordinator._identity.account_scope
+            or descriptor.execution_domain_scope != envelope.execution_domain_scope
+            or descriptor.account_scope != envelope.account_scope
+            or descriptor.con_id != envelope.con_id
+            or descriptor.fingerprint() != envelope.descriptor_fingerprint
+            or contract.con_id != envelope.con_id
+            or contract.symbol != envelope.symbol
+            or contract.snapshot_id != envelope.contract_snapshot_id
+            or contract.transport_generation != envelope.contract_transport_generation
+        ):
+            raise RuntimeSafetyError("claimed paper envelope lineage is inconsistent")
+
         allocation = _ClaimedPaperSubmissionAllocation(_token=issue_token)
         object_id = id(allocation)
 
@@ -887,12 +914,12 @@ def _make_claimed_paper_allocation_state():
         with registry_lock:
             registry[object_id] = (
                 reference,
-                coordinator_token,
+                coordinator._coordinator_token,
                 descriptor,
                 contract,
-                pre_position_quantity,
+                envelope.pre_position_quantity,
             )
-        return allocation
+        return descriptor, contract, allocation
 
     def consume(
         allocation: object,
@@ -950,16 +977,7 @@ def _make_claimed_paper_allocation_state():
             registry.pop(id(allocation), None)
             return True
 
-    return _ClaimedPaperSubmissionAllocation, issue, consume, retire
-
-
-(
-    _ClaimedPaperSubmissionAllocation,
-    _issue_claimed_paper_submission_allocation,
-    _consume_claimed_paper_submission_allocation,
-    _retire_claimed_paper_submission_allocation,
-) = _make_claimed_paper_allocation_state()
-del _make_claimed_paper_allocation_state
+    return _ClaimedPaperSubmissionAllocation, claim_and_issue, consume, retire
 
 
 def _final_evidence_digest(proof: FinalSubmissionEvidenceProof) -> str:
@@ -1072,6 +1090,15 @@ def _claim_consumed_envelope(
             )
         _CONSUMED_ENVELOPE_REGISTRY.pop(id(envelope), None)
         return envelope._descriptor, envelope._contract
+
+
+(
+    _ClaimedPaperSubmissionAllocation,
+    _claim_and_issue_paper_submission_allocation,
+    _consume_claimed_paper_submission_allocation,
+    _retire_claimed_paper_submission_allocation,
+) = _make_claimed_paper_allocation_state(_claim_consumed_envelope)
+del _make_claimed_paper_allocation_state
 
 
 @dataclass(frozen=True)
@@ -1571,30 +1598,10 @@ class SafetyRuntimeCoordinator:
         with self._startup_lock:
             if not self._started:
                 raise RuntimeNotStarted("successful journal replay is required")
-            descriptor, contract = _claim_consumed_envelope(
+            return _claim_and_issue_paper_submission_allocation(
                 envelope,
-                coordinator_token=self._coordinator_token,
+                coordinator=self,
             )
-            if (
-                envelope.execution_domain_scope != self._identity.execution_domain_scope
-                or envelope.account_scope != self._identity.account_scope
-                or descriptor.execution_domain_scope != envelope.execution_domain_scope
-                or descriptor.account_scope != envelope.account_scope
-                or descriptor.con_id != envelope.con_id
-                or descriptor.fingerprint() != envelope.descriptor_fingerprint
-                or contract.con_id != envelope.con_id
-                or contract.symbol != envelope.symbol
-                or contract.snapshot_id != envelope.contract_snapshot_id
-                or contract.transport_generation != envelope.contract_transport_generation
-            ):
-                raise RuntimeSafetyError("claimed paper envelope lineage is inconsistent")
-            allocation = _issue_claimed_paper_submission_allocation(
-                coordinator_token=self._coordinator_token,
-                descriptor=descriptor,
-                contract=contract,
-                pre_position_quantity=envelope.pre_position_quantity,
-            )
-            return descriptor, contract, allocation
 
     def release_after_local_paper_settlement(
         self,
