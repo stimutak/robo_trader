@@ -5,7 +5,8 @@ import copy
 import inspect
 import json
 import pickle
-from dataclasses import FrozenInstanceError, replace
+import weakref
+from dataclasses import FrozenInstanceError, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -40,6 +41,19 @@ NOW = datetime(2026, 7, 28, 15, 0, tzinfo=timezone.utc)
 ACCOUNT_SCOPE = "acct_v1_" + "0123456789abcdef" * 4
 
 
+@dataclass(frozen=True)
+class _TestQuoteSourceIdentity:
+    source: object
+    source_type: type[object]
+    method_function: object
+    runtime_fingerprint: str
+    provider_identity: str
+    transport_generation: str
+
+
+_TEST_FACTORY_QUOTE_SOURCES: weakref.WeakSet[object] = weakref.WeakSet()
+
+
 def _runtime(database: Path, **overrides: object) -> RuntimeContract:
     values: dict[str, object] = {
         "environment": "test",
@@ -61,10 +75,20 @@ def _runtime(database: Path, **overrides: object) -> RuntimeContract:
     return RuntimeContract(**values)  # type: ignore[arg-type]
 
 
-def _monitor(portfolio_id: str = "default") -> StopLossMonitor:
+def _ordinary_monitor(portfolio_id: str = "default") -> StopLossMonitor:
     monitor = StopLossMonitor(
         execute_reduction=AsyncMock(),
         risk_manager=MagicMock(),
+        portfolio_id=portfolio_id,
+    )
+    monitor._utcnow = MagicMock(return_value=NOW)
+    monitor._monotonic = MagicMock(return_value=100.0)
+    return monitor
+
+
+def _monitor(database: Path, portfolio_id: str = "default") -> StopLossMonitor:
+    monitor = create_runtime_bound_mark_only_producer(
+        _runtime(database),
         portfolio_id=portfolio_id,
     )
     monitor._utcnow = MagicMock(return_value=NOW)
@@ -117,11 +141,20 @@ def _broker_quote(
 
 
 class QuoteSource:
-    def __init__(self, quotes: tuple[BrokerProtectiveQuote, ...]) -> None:
+    def __init__(
+        self,
+        quotes: tuple[BrokerProtectiveQuote, ...],
+        *,
+        transport_generation: str | None = None,
+    ) -> None:
         self.quotes = quotes
+        self.transport_generation = transport_generation or (
+            quotes[0].transport_generation if quotes else "generation-1"
+        )
         self.connected: object = True
         self.requests: list[tuple[tuple[str, ...], tuple[str, ...] | None]] = []
         self.after_collect = None
+        _TEST_FACTORY_QUOTE_SOURCES.add(self)
 
     @property
     def is_connected(self) -> object:
@@ -142,6 +175,72 @@ class QuoteSource:
         if self.after_collect is not None:
             self.after_collect()
         return self.quotes
+
+
+class ProtocolShapedQuoteSource:
+    def __init__(self, quote: BrokerProtectiveQuote) -> None:
+        self.quote = quote
+        self.called = False
+
+    @property
+    def is_connected(self) -> bool:
+        return True
+
+    async def get_protective_quotes(
+        self,
+        _symbols: list[str] | tuple[str, ...],
+        *,
+        active_symbols: list[str] | tuple[str, ...] | None = None,
+    ) -> tuple[BrokerProtectiveQuote, ...]:
+        self.called = True
+        return (self.quote,)
+
+
+@pytest.fixture(autouse=True)
+def _install_private_test_quote_source_factory_assertion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from robo_trader.reconciliation import ibkr_adapter as adapter_module
+
+    def assert_test_factory_source(
+        source: object,
+        *,
+        runtime_contract: object,
+    ) -> _TestQuoteSourceIdentity:
+        if (
+            source not in _TEST_FACTORY_QUOTE_SOURCES
+            or type(source) is not QuoteSource
+            or type(source.connected) is not bool
+            or source.connected is not True
+        ):
+            raise ValueError("test quote source is not factory-owned and connected")
+        method = source.get_protective_quotes
+        method_function = getattr(method, "__func__", None)
+        if getattr(method, "__self__", None) is not source or method_function is None:
+            raise ValueError("test quote source capability changed")
+        if type(runtime_contract) is not RuntimeContract:
+            raise ValueError("test quote source runtime is not exact")
+        return _TestQuoteSourceIdentity(
+            source=source,
+            source_type=type(source),
+            method_function=method_function,
+            runtime_fingerprint=runtime_contract.fingerprint,
+            provider_identity="private-test-protective-quote-provider",
+            transport_generation=source.transport_generation,
+        )
+
+    monkeypatch.setattr(
+        adapter_module,
+        "assert_factory_owned_protective_quote_source",
+        assert_test_factory_source,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        adapter_module,
+        "ProtectiveQuoteSourceIdentity",
+        _TestQuoteSourceIdentity,
+        raising=False,
+    )
 
 
 class Receiver:
@@ -237,6 +336,20 @@ class MutatingReceiver:
         return result
 
 
+class SourceMutatingReceiver(Receiver):
+    def __init__(self, source: QuoteSource) -> None:
+        super().__init__()
+        self.source = source
+
+    def receive_unsigned_bootstrap_protective_mark(
+        self,
+        result: UnsignedBootstrapProtectiveMark,
+    ) -> UnsignedBootstrapProtectiveMark:
+        received = super().receive_unsigned_bootstrap_protective_mark(result)
+        self.source.transport_generation = "generation-after-handoff"
+        return received
+
+
 @pytest.fixture
 def database(tmp_path: Path) -> Path:
     path = tmp_path / "trading.db"
@@ -258,17 +371,39 @@ def _produce(
     source_event_id: str = "ticker-42",
 ) -> tuple[UnsignedBootstrapProtectiveMark, Receiver]:
     sink = receiver or Receiver()
-    result = produce_bootstrap_protective_mark(
-        quote,
-        monitor,
-        runtime or _runtime(database),
-        sink,
-        expected_portfolio_id=portfolio_id,
-        expected_symbol=symbol,
-        expected_con_id=con_id,
+    selected_runtime = runtime or _runtime(database)
+    unit_source = QuoteSource((), transport_generation=transport_generation)
+    source_identity = mark_producer._assert_factory_owned_quote_source(
+        unit_source,
+        runtime_contract=selected_runtime,
         expected_transport_generation=transport_generation,
-        expected_source_event_id=source_event_id,
     )
+    mark_producer._register_collected_protective_quote(
+        quote,
+        producer=monitor,
+        quote_source=unit_source,
+        source_identity=source_identity,
+        runtime=selected_runtime,
+        portfolio_id=portfolio_id,
+        symbol=symbol,
+        con_id=con_id,
+        transport_generation=transport_generation,
+        source_event_id=source_event_id,
+    )
+    try:
+        result = produce_bootstrap_protective_mark(
+            quote,
+            monitor,
+            selected_runtime,
+            sink,
+            expected_portfolio_id=portfolio_id,
+            expected_symbol=symbol,
+            expected_con_id=con_id,
+            expected_transport_generation=transport_generation,
+            expected_source_event_id=source_event_id,
+        )
+    finally:
+        mark_producer._discard_collected_protective_quote(quote)
     return result, sink
 
 
@@ -302,7 +437,7 @@ async def _collect(
 
 @pytest.mark.asyncio
 async def test_collector_uses_real_typed_path_before_receiver_delivery(database: Path) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     source_quote = _broker_quote()
     source = QuoteSource((source_quote,))
 
@@ -317,6 +452,75 @@ async def test_collector_uses_real_typed_path_before_receiver_delivery(database:
     evidence = monitor.get_protective_quote_evidence("AAPL")
     assert evidence is not None
     assert evidence.quote_id == result.protective_quote_id
+
+
+@pytest.mark.asyncio
+async def test_protocol_fake_with_current_timestamp_never_reaches_receiver(
+    database: Path,
+) -> None:
+    source = ProtocolShapedQuoteSource(_broker_quote(source_timestamp=NOW))
+    monitor = _monitor(database)
+    receiver = Receiver()
+
+    with pytest.raises(BootstrapMarkBlocked, match="not factory-owned"):
+        await collect_and_produce_bootstrap_protective_mark(
+            source,  # type: ignore[arg-type]
+            monitor,
+            _runtime(database),
+            receiver,
+            expected_portfolio_id="default",
+            expected_symbol="AAPL",
+            expected_con_id=265598,
+            expected_transport_generation="generation-1",
+        )
+
+    assert source.called is False
+    assert receiver.results == []
+
+
+@pytest.mark.asyncio
+async def test_ordinary_monitor_cannot_produce_or_collect_bootstrap_mark(
+    database: Path,
+) -> None:
+    monitor = _ordinary_monitor()
+    quote = await _live_quote(monitor)
+    receiver = Receiver()
+
+    with pytest.raises(BootstrapMarkBlocked, match="mark-only factory"):
+        _produce(quote, monitor, database, receiver=receiver)
+    with pytest.raises(BootstrapMarkBlocked, match="mark-only factory"):
+        await _collect(
+            QuoteSource((_broker_quote(),)),
+            monitor,
+            database,
+            receiver=receiver,
+        )
+
+    assert receiver.results == []
+
+
+@pytest.mark.asyncio
+async def test_factory_monitor_cannot_turn_manually_published_quote_into_mark(
+    database: Path,
+) -> None:
+    monitor = _monitor(database)
+    quote = await _live_quote(monitor)
+    receiver = Receiver()
+
+    with pytest.raises(BootstrapMarkBlocked, match="factory-owned collection path"):
+        produce_bootstrap_protective_mark(
+            quote,
+            monitor,
+            _runtime(database),
+            receiver,
+            expected_portfolio_id="default",
+            expected_symbol="AAPL",
+            expected_con_id=265598,
+            expected_transport_generation="generation-1",
+            expected_source_event_id="ticker-42",
+        )
+
+    assert receiver.results == []
 
 
 @pytest.mark.asyncio
@@ -360,7 +564,7 @@ async def test_collector_rejects_wrong_typed_quote_lineage_without_delivery(
     collect_overrides: dict[str, object],
     message: str,
 ) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     source = QuoteSource((_broker_quote(**quote_overrides),))  # type: ignore[arg-type]
     receiver = Receiver()
 
@@ -379,7 +583,7 @@ async def test_collector_rejects_wrong_typed_quote_lineage_without_delivery(
 
 @pytest.mark.asyncio
 async def test_collector_rejects_stale_quote_before_delivery(database: Path) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     source = QuoteSource((_broker_quote(source_timestamp=NOW - timedelta(seconds=11)),))
     receiver = Receiver()
 
@@ -395,7 +599,7 @@ async def test_collector_revalidates_mutated_nonpositive_or_nan_typed_quote(
     database: Path,
     bad_price: Decimal,
 ) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     quote = _broker_quote()
     object.__setattr__(quote, "price", bad_price)
     source = QuoteSource((quote,))
@@ -412,13 +616,13 @@ async def test_collector_revalidates_mutated_nonpositive_or_nan_typed_quote(
 async def test_collector_rejects_disconnected_or_mutated_client_capability(
     database: Path,
 ) -> None:
-    for mutation in ("disconnect", "replace_method"):
-        monitor = _monitor()
+    for mutation in ("disconnect", "replace_method", "replace_generation"):
+        monitor = _monitor(database)
         source = QuoteSource((_broker_quote(),))
         receiver = Receiver()
         if mutation == "disconnect":
             source.after_collect = lambda: setattr(source, "connected", False)
-        else:
+        elif mutation == "replace_method":
 
             async def replacement(
                 _self: QuoteSource,
@@ -433,8 +637,17 @@ async def test_collector_rejects_disconnected_or_mutated_client_capability(
                 "get_protective_quotes",
                 MethodType(replacement, source),
             )
+        else:
+            source.after_collect = lambda: setattr(
+                source,
+                "transport_generation",
+                "generation-2",
+            )
 
-        with pytest.raises(BootstrapMarkBlocked, match="not connected|capability changed"):
+        with pytest.raises(
+            BootstrapMarkBlocked,
+            match="not connected|capability changed|transport generation|identity changed",
+        ):
             await _collect(source, monitor, database, receiver=receiver)
 
         assert receiver.results == []
@@ -446,9 +659,13 @@ async def test_collector_rejects_inexact_coverage_and_cross_portfolio_producer(
     database: Path,
 ) -> None:
     cases = (
-        (QuoteSource(()), _monitor(), "exact and complete"),
-        (QuoteSource((_broker_quote(), _broker_quote())), _monitor(), "exact and complete"),
-        (QuoteSource((_broker_quote(),)), _monitor("other"), "portfolio"),
+        (QuoteSource(()), _monitor(database), "exact and complete"),
+        (
+            QuoteSource((_broker_quote(), _broker_quote())),
+            _monitor(database),
+            "exact and complete",
+        ),
+        (QuoteSource((_broker_quote(),)), _monitor(database, "other"), "portfolio"),
     )
     for source, monitor, message in cases:
         receiver = Receiver()
@@ -497,7 +714,7 @@ async def test_mark_only_factory_binding_and_execution_state_cannot_be_reassigne
 async def test_collected_quote_mutation_while_monitor_waits_blocks_receiver(
     database: Path,
 ) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     quote = _broker_quote()
     source = QuoteSource((quote,))
     receiver = Receiver()
@@ -514,10 +731,24 @@ async def test_collected_quote_mutation_while_monitor_waits_blocks_receiver(
 
 
 @pytest.mark.asyncio
+async def test_source_generation_must_remain_stable_after_mark_handoff(
+    database: Path,
+) -> None:
+    monitor = _monitor(database)
+    source = QuoteSource((_broker_quote(),))
+    receiver = SourceMutatingReceiver(source)
+
+    with pytest.raises(BootstrapMarkBlocked, match="transport generation|identity changed"):
+        await _collect(source, monitor, database, receiver=receiver)
+
+    assert len(receiver.results) == 1
+
+
+@pytest.mark.asyncio
 async def test_producer_delivers_canonical_runtime_bound_unsigned_mark(
     database: Path,
 ) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     quote = await _live_quote(monitor)
     runtime = _runtime(database)
 
@@ -573,7 +804,7 @@ async def test_producer_delivers_canonical_runtime_bound_unsigned_mark(
 async def test_unsigned_mark_registration_is_exact_receiver_bound_and_one_shot(
     database: Path,
 ) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     quote = await _live_quote(monitor)
     receiver = WrongReceiverChallenge()
 
@@ -596,7 +827,7 @@ async def test_unsigned_mark_registration_is_exact_receiver_bound_and_one_shot(
 async def test_copy_replace_and_pickle_reconstruction_never_inherit_authority(
     database: Path,
 ) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     quote = await _live_quote(monitor)
     receiver = CopyChallengeReceiver()
 
@@ -614,7 +845,7 @@ async def test_copy_replace_and_pickle_reconstruction_never_inherit_authority(
 async def test_receiver_must_authenticate_and_consume_registered_result(
     database: Path,
 ) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     quote = await _live_quote(monitor)
     receiver = NonAuthenticatingReceiver()
 
@@ -638,7 +869,7 @@ async def test_receiver_must_authenticate_and_consume_registered_result(
 async def test_post_production_mutation_revokes_unsigned_mark_registration(
     database: Path,
 ) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     quote = await _live_quote(monitor)
     receiver = MutatingReceiver()
 
@@ -662,7 +893,7 @@ async def test_post_production_mutation_revokes_unsigned_mark_registration(
 async def test_direct_unsigned_mark_construction_has_no_producer_authority(
     database: Path,
 ) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     quote = await _live_quote(monitor)
     produced, _ = _produce(quote, monitor, database)
     values = {
@@ -708,7 +939,7 @@ async def test_lineage_mismatch_blocks_without_receiver_call(
     value: object,
     message: str,
 ) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     quote = await _live_quote(monitor)
     receiver = Receiver()
     kwargs = {override: value}
@@ -740,7 +971,7 @@ async def test_stale_future_or_rolled_back_clock_blocks_without_receiver_call(
     wall_now: datetime,
     monotonic_now: float,
 ) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     quote = await _live_quote(monitor)
     monitor._utcnow = MagicMock(return_value=wall_now)
     monitor._monotonic = MagicMock(return_value=monotonic_now)
@@ -756,10 +987,10 @@ async def test_stale_future_or_rolled_back_clock_blocks_without_receiver_call(
 async def test_copy_reassigned_producer_and_legacy_quote_are_rejected(
     database: Path,
 ) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     quote = await _live_quote(monitor)
     copied = replace(quote)
-    other_monitor = _monitor()
+    other_monitor = _monitor(database)
     receiver = Receiver()
 
     for candidate, owner in ((copied, monitor), (quote, other_monitor)):
@@ -772,7 +1003,7 @@ async def test_copy_reassigned_producer_and_legacy_quote_are_rejected(
         _produce(quote, monitor, database, receiver=receiver)
     assert receiver.results == []
 
-    legacy_monitor = _monitor()
+    legacy_monitor = _monitor(database)
     assert await legacy_monitor.update_price(
         "AAPL",
         187.25,
@@ -790,7 +1021,7 @@ async def test_copy_reassigned_producer_and_legacy_quote_are_rejected(
 async def test_live_quote_without_source_event_is_not_bootstrap_mark_evidence(
     database: Path,
 ) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     assert await monitor.update_price(
         "AAPL",
         Decimal("187.25"),
@@ -815,7 +1046,7 @@ async def test_mutated_nan_or_nonpositive_quote_blocks_without_receiver_call(
     database: Path,
     bad_price: Decimal,
 ) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     quote = await _live_quote(monitor)
     object.__setattr__(quote, "price", bad_price)
     receiver = Receiver()
@@ -830,7 +1061,7 @@ async def test_mutated_nan_or_nonpositive_quote_blocks_without_receiver_call(
 async def test_bootstrap_accounting_mark_cannot_be_reused_as_live_quote(
     database: Path,
 ) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     quote = await _live_quote(monitor)
     mark, _ = _produce(quote, monitor, database)
     receiver = Receiver()
@@ -856,7 +1087,7 @@ async def test_unsealed_runtime_database_alias_and_subclass_block_delivery(
     database: Path,
     tmp_path: Path,
 ) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     quote = await _live_quote(monitor)
 
     class RuntimeSubclass(RuntimeContract):
@@ -871,7 +1102,10 @@ async def test_unsealed_runtime_database_alias_and_subclass_block_delivery(
     )
     for runtime in cases:
         receiver = Receiver()
-        with pytest.raises(BootstrapMarkBlocked, match="RuntimeContract|account|runtime|database"):
+        with pytest.raises(
+            BootstrapMarkBlocked,
+            match="RuntimeContract|account|runtime|database|factory-owned",
+        ):
             _produce(
                 quote,
                 monitor,
@@ -887,7 +1121,7 @@ async def test_database_drift_before_final_revalidation_blocks_delivery(
     database: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     quote = await _live_quote(monitor)
     receiver = Receiver()
     original = mark_producer._revalidate_quote
@@ -915,7 +1149,7 @@ async def test_quote_that_expires_before_final_revalidation_is_not_delivered(
     database: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     quote = await _live_quote(monitor)
     receiver = Receiver()
     original = mark_producer._revalidate_quote
@@ -980,18 +1214,13 @@ def test_interface_has_no_price_path_json_signer_or_key_capability() -> None:
 
 @pytest.mark.asyncio
 async def test_missing_receiver_capability_blocks_after_validation(database: Path) -> None:
-    monitor = _monitor()
+    monitor = _monitor(database)
     quote = await _live_quote(monitor)
 
     with pytest.raises(BootstrapMarkBlocked, match="receiver capability"):
-        produce_bootstrap_protective_mark(
+        _produce(
             quote,
             monitor,
-            _runtime(database),
-            object(),  # type: ignore[arg-type]
-            expected_portfolio_id="default",
-            expected_symbol="AAPL",
-            expected_con_id=265598,
-            expected_transport_generation="generation-1",
-            expected_source_event_id="ticker-42",
+            database,
+            receiver=object(),  # type: ignore[arg-type]
         )
