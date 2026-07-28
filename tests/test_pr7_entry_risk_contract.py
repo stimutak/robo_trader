@@ -1,5 +1,7 @@
 """Adversarial tests for the dormant PR-7 Gate-A entry-risk contract."""
 
+import copy
+import pickle
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_UP, Decimal, Overflow, localcontext
@@ -11,6 +13,7 @@ from robo_trader.risk.entry_contract import (
     ENTRY_RISK_CONTRACT_VERSION,
     GATE_A_MAX_POSITION_FRACTION,
     CorrelationEvidence,
+    EntryBrokerContractIdentity,
     EntryFeatureFlags,
     EntryIntent,
     EntryRiskContractError,
@@ -24,10 +27,28 @@ from robo_trader.risk.entry_contract import (
     RiskReason,
     SignalSource,
     build_entry_intent,
+    build_refreshed_quote_evidence,
     evaluate_entry_intent,
 )
 
 NOW = datetime(2026, 7, 28, 15, 0, tzinfo=timezone.utc)
+ACTIVE_GENERATION = "ib-session-42"
+_UNSET = object()
+
+
+def _contract(**changes: object) -> EntryBrokerContractIdentity:
+    values: dict[str, object] = {
+        "con_id": 265598,
+        "symbol": "AAPL",
+        "local_symbol": "AAPL",
+        "security_type": "STK",
+        "currency": "USD",
+        "exchange": "SMART",
+        "primary_exchange": "NASDAQ",
+        "trading_class": "NMS",
+    }
+    values.update(changes)
+    return EntryBrokerContractIdentity(**values)  # type: ignore[arg-type]
 
 
 def _signal(**changes: object) -> EntrySignal:
@@ -40,6 +61,8 @@ def _signal(**changes: object) -> EntrySignal:
         "confidence_fraction": Decimal("0.81"),
         "requested_position_fraction": Decimal("0.10"),
         "source_data_version": "bars-20260728T145900Z",
+        "broker_contract": _contract(),
+        "transport_generation": ACTIVE_GENERATION,
         "observed_at": NOW - timedelta(seconds=10),
         "expires_at": NOW + timedelta(minutes=2),
     }
@@ -90,14 +113,14 @@ def _quote(**changes: object) -> RefreshedQuoteEvidence:
     values: dict[str, object] = {
         "quote_id": "quote-001",
         "refresh_request_id": "refresh-001",
-        "symbol": "AAPL",
+        "broker_contract": _contract(),
         "price_usd": Decimal("333"),
         "observed_at": NOW - timedelta(seconds=1),
-        "transport_generation": "ib-session-42",
+        "transport_generation": ACTIVE_GENERATION,
         "source": "live-broker",
     }
     values.update(changes)
-    return RefreshedQuoteEvidence(**values)  # type: ignore[arg-type]
+    return build_refreshed_quote_evidence(**values)  # type: ignore[arg-type]
 
 
 def _evidence(**changes: object) -> EntryRiskEvidence:
@@ -136,13 +159,20 @@ def _evaluate(
     evidence: EntryRiskEvidence | None = None,
     limits: EntryRiskLimits | None = None,
     flags: EntryFeatureFlags | None = None,
+    expected_broker_contract: object = _UNSET,
+    expected_transport_generation: object = ACTIVE_GENERATION,
     evaluated_at: datetime = NOW,
 ):
+    authoritative_contract = (
+        _contract() if expected_broker_contract is _UNSET else expected_broker_contract
+    )
     return evaluate_entry_intent(
         intent or _intent(),
         evidence or _evidence(),
         limits or _limits(),
         flags or _flags(),
+        expected_broker_contract=authoritative_contract,  # type: ignore[arg-type]
+        expected_transport_generation=expected_transport_generation,  # type: ignore[arg-type]
         evaluated_at=evaluated_at,
     )
 
@@ -165,14 +195,162 @@ def test_signal_to_intent_to_decision_preserves_versioned_lineage() -> None:
     assert intent.source is signal.source
     assert intent.confidence_fraction == signal.confidence_fraction
     assert intent.source_data_version == signal.source_data_version
+    assert intent.broker_contract is signal.broker_contract
+    assert intent.transport_generation == signal.transport_generation
     assert decision.signal_id == signal.signal_id
     assert decision.portfolio_id == signal.portfolio_id
     assert decision.symbol == signal.symbol
     assert decision.side is signal.side
+    assert decision.broker_contract == signal.broker_contract
+    assert decision.transport_generation == signal.transport_generation
     assert decision.authorizes_order_submission is False
     assert decision.runtime_integration_ready is False
     with pytest.raises(FrozenInstanceError):
         intent.symbol = "MSFT"  # type: ignore[misc]
+
+
+def test_exact_contract_and_active_generation_are_legitimately_approved() -> None:
+    contract = _contract()
+    intent = _intent(
+        broker_contract=contract,
+        transport_generation=ACTIVE_GENERATION,
+    )
+    quote = _quote(
+        broker_contract=contract,
+        transport_generation=ACTIVE_GENERATION,
+    )
+
+    decision = _evaluate(
+        intent=intent,
+        evidence=_evidence(quote=quote),
+        expected_broker_contract=contract,
+        expected_transport_generation=ACTIVE_GENERATION,
+    )
+
+    assert decision.risk_approved is True
+    assert decision.reasons == (RiskReason.APPROVED,)
+    assert decision.broker_contract is contract
+    assert decision.transport_generation == ACTIVE_GENERATION
+
+
+def test_reconnect_retires_matching_pre_reconnect_quote_and_intent() -> None:
+    retired_generation = "ib-session-41"
+    intent = _intent(transport_generation=retired_generation)
+    quote = _quote(transport_generation=retired_generation)
+
+    decision = _evaluate(
+        intent=intent,
+        evidence=_evidence(quote=quote),
+        expected_transport_generation=ACTIVE_GENERATION,
+    )
+
+    assert decision.risk_approved is False
+    assert RiskReason.INTENT_BROKER_LINEAGE_MISMATCH in decision.reasons
+    assert RiskReason.QUOTE_BROKER_LINEAGE_MISMATCH in decision.reasons
+
+
+def test_same_symbol_different_con_id_quote_is_rejected() -> None:
+    wrong_contract = _contract(con_id=265599)
+    quote = _quote(broker_contract=wrong_contract)
+
+    decision = _evaluate(evidence=_evidence(quote=quote))
+
+    assert decision.risk_approved is False
+    assert decision.reasons == (RiskReason.QUOTE_BROKER_LINEAGE_MISMATCH,)
+
+
+@pytest.mark.parametrize(
+    "intent_generation",
+    ["ib-session-41", "ib-session-43", "ib-session-substituted"],
+)
+def test_intent_generation_rollback_future_and_substitution_are_rejected(
+    intent_generation: str,
+) -> None:
+    intent = _intent(transport_generation=intent_generation)
+    quote = _quote(transport_generation=intent_generation)
+
+    decision = _evaluate(intent=intent, evidence=_evidence(quote=quote))
+
+    assert decision.risk_approved is False
+    assert decision.reasons == (
+        RiskReason.INTENT_BROKER_LINEAGE_MISMATCH,
+        RiskReason.QUOTE_BROKER_LINEAGE_MISMATCH,
+    )
+
+
+@pytest.mark.parametrize(
+    "quote_generation",
+    ["ib-session-41", "ib-session-43", "ib-session-substituted"],
+)
+def test_quote_generation_rollback_future_and_substitution_are_rejected(
+    quote_generation: str,
+) -> None:
+    quote = _quote(transport_generation=quote_generation)
+
+    decision = _evaluate(evidence=_evidence(quote=quote))
+
+    assert decision.risk_approved is False
+    assert decision.reasons == (RiskReason.QUOTE_BROKER_LINEAGE_MISMATCH,)
+
+
+def test_intent_contract_substitution_is_rejected_even_with_matching_quote() -> None:
+    substituted_contract = _contract(primary_exchange="NYSE")
+    intent = _intent(broker_contract=substituted_contract)
+    quote = _quote(broker_contract=substituted_contract)
+
+    decision = _evaluate(intent=intent, evidence=_evidence(quote=quote))
+
+    assert decision.risk_approved is False
+    assert decision.reasons == (
+        RiskReason.INTENT_BROKER_LINEAGE_MISMATCH,
+        RiskReason.QUOTE_BROKER_LINEAGE_MISMATCH,
+    )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"con_id": None},
+        {"con_id": True},
+        {"con_id": 0},
+        {"local_symbol": "MSFT"},
+        {"security_type": "OPT"},
+        {"currency": "EUR"},
+        {"exchange": "NYSE"},
+        {"primary_exchange": ""},
+        {"trading_class": ""},
+    ],
+)
+def test_broker_contract_identity_requires_complete_canonical_stock_lineage(
+    changes: dict[str, object],
+) -> None:
+    with pytest.raises(EntryRiskContractError, match="broker contract"):
+        _contract(**changes)
+
+
+@pytest.mark.parametrize(
+    ("expected_contract", "expected_generation"),
+    [(None, ACTIVE_GENERATION), (_contract(), None), (_contract(), "")],
+)
+def test_missing_authoritative_contract_or_generation_is_rejected(
+    expected_contract: object,
+    expected_generation: object,
+) -> None:
+    with pytest.raises(EntryRiskContractError, match="expected|transport"):
+        _evaluate(
+            expected_broker_contract=expected_contract,
+            expected_transport_generation=expected_generation,
+        )
+
+
+@pytest.mark.parametrize("operation", [copy.copy, copy.deepcopy, pickle.dumps, replace])
+@pytest.mark.parametrize("evidence_factory", [_intent, _quote])
+def test_intent_and_quote_cannot_be_copied_or_replaced(
+    operation,
+    evidence_factory,
+) -> None:
+    with pytest.raises((EntryRiskContractError, TypeError, ValueError)):
+        operation(evidence_factory())
 
 
 def test_configured_two_percent_cap_floors_quantity_and_never_rounds_up() -> None:
@@ -326,7 +504,15 @@ def test_wrong_portfolio_or_symbol_evidence_cannot_cross_scope(changes: dict[str
     "quote",
     [
         _quote(refresh_request_id="refresh-other"),
-        _quote(symbol="MSFT"),
+        _quote(
+            broker_contract=_contract(
+                con_id=272093,
+                symbol="MSFT",
+                local_symbol="MSFT",
+                primary_exchange="NASDAQ",
+                trading_class="NMS",
+            )
+        ),
         _quote(observed_at=NOW - timedelta(seconds=6)),
         _quote(observed_at=NOW + timedelta(microseconds=1)),
     ],
@@ -335,7 +521,7 @@ def test_quote_must_be_fresh_and_bound_to_the_intent(quote: RefreshedQuoteEviden
     decision = _evaluate(evidence=_evidence(quote=quote))
 
     assert decision.risk_approved is False
-    assert decision.reasons == (RiskReason.QUOTE_NOT_REFRESHED,)
+    assert RiskReason.QUOTE_NOT_REFRESHED in decision.reasons
 
 
 @pytest.mark.parametrize("kind", ["correlation", "liquidity"])

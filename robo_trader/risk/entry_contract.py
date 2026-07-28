@@ -10,7 +10,7 @@ boundary.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import (
     MAX_EMAX,
@@ -33,6 +33,9 @@ GATE_A_MAX_POSITION_FRACTION = Decimal("0.02")
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SYMBOL = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
 _SECTOR = re.compile(r"^[A-Za-z][A-Za-z0-9 &./_-]{0,63}$")
+_BROKER_IDENTITY = re.compile(r"^[A-Z0-9][A-Z0-9._:/-]{0,63}$")
+_ENTRY_INTENT_MARKER = object()
+_QUOTE_EVIDENCE_MARKER = object()
 
 
 class EntryRiskContractError(ValueError):
@@ -57,6 +60,7 @@ class RiskReason(str, Enum):
     STRATEGY_NOT_READY = "strategy_not_ready"
     SIDE_NOT_READY = "side_not_ready"
     INTENT_NOT_ACTIVE = "intent_not_active"
+    INTENT_BROKER_LINEAGE_MISMATCH = "intent_broker_lineage_mismatch"
     MISSING_EVIDENCE_SCOPE = "missing_evidence_scope"
     EVIDENCE_SCOPE_MISMATCH = "evidence_scope_mismatch"
     MISSING_QUOTE = "missing_quote"
@@ -72,6 +76,7 @@ class RiskReason(str, Enum):
     MISSING_PORTFOLIO_EXPOSURE = "missing_portfolio_exposure"
     STALE_ACCOUNT_EVIDENCE = "stale_account_evidence"
     QUOTE_NOT_REFRESHED = "quote_not_refreshed"
+    QUOTE_BROKER_LINEAGE_MISMATCH = "quote_broker_lineage_mismatch"
     CORRELATION_LIMIT = "correlation_limit"
     LIQUIDITY_LIMIT = "liquidity_limit"
     NO_CAPACITY = "no_capacity"
@@ -89,20 +94,38 @@ class LimitingCapacity(str, Enum):
 
 
 def _identifier(value: object, field_name: str) -> str:
-    if not isinstance(value, str) or value != value.strip() or not _IDENTIFIER.fullmatch(value):
+    if type(value) is not str or value != value.strip() or not _IDENTIFIER.fullmatch(value):
         raise EntryRiskContractError(f"{field_name} is malformed")
     return value
 
 
 def _symbol(value: object) -> str:
-    if not isinstance(value, str) or value != value.upper() or not _SYMBOL.fullmatch(value):
+    if type(value) is not str or value != value.upper() or not _SYMBOL.fullmatch(value):
         raise EntryRiskContractError("symbol is malformed")
     return value
 
 
 def _sector(value: object) -> str:
-    if not isinstance(value, str) or value != value.strip() or not _SECTOR.fullmatch(value):
+    if type(value) is not str or value != value.strip() or not _SECTOR.fullmatch(value):
         raise EntryRiskContractError("sector is malformed")
+    return value
+
+
+def _broker_identity(value: object, field_name: str) -> str:
+    if type(value) is not str or not _BROKER_IDENTITY.fullmatch(value):
+        raise EntryRiskContractError(f"{field_name} is malformed")
+    return value
+
+
+def _transport_generation(value: object, field_name: str) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or len(value) > 256
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise EntryRiskContractError(f"{field_name} is malformed")
     return value
 
 
@@ -151,6 +174,36 @@ def _flag(value: object, field_name: str) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
+class EntryBrokerContractIdentity:
+    """One exact, fully qualified SMART/USD stock contract."""
+
+    con_id: int
+    symbol: str
+    local_symbol: str
+    security_type: str
+    currency: str
+    exchange: str
+    primary_exchange: str
+    trading_class: str
+
+    def __post_init__(self) -> None:
+        if type(self.con_id) is not int or self.con_id <= 0:
+            raise EntryRiskContractError("broker contract con_id must be a positive integer")
+        symbol = _symbol(self.symbol)
+        local_symbol = _symbol(self.local_symbol)
+        if local_symbol != symbol:
+            raise EntryRiskContractError("broker contract local_symbol must match symbol")
+        if self.security_type != "STK":
+            raise EntryRiskContractError("broker contract security_type must be STK")
+        if self.currency != "USD":
+            raise EntryRiskContractError("broker contract currency must be USD")
+        if self.exchange != "SMART":
+            raise EntryRiskContractError("broker contract exchange must be SMART")
+        _broker_identity(self.primary_exchange, "broker contract primary_exchange")
+        _broker_identity(self.trading_class, "broker contract trading_class")
+
+
+@dataclass(frozen=True, slots=True)
 class EntrySignal:
     signal_id: str
     portfolio_id: str
@@ -160,6 +213,8 @@ class EntrySignal:
     confidence_fraction: Decimal
     requested_position_fraction: Decimal
     source_data_version: str
+    broker_contract: EntryBrokerContractIdentity
+    transport_generation: str
     observed_at: datetime
     expires_at: datetime
     schema_version: int = ENTRY_RISK_CONTRACT_VERSION
@@ -192,12 +247,31 @@ class EntrySignal:
             "source_data_version",
             _identifier(self.source_data_version, "source_data_version"),
         )
+        if type(self.broker_contract) is not EntryBrokerContractIdentity:
+            raise EntryRiskContractError("signal broker contract is malformed")
+        if self.broker_contract.symbol != self.symbol:
+            raise EntryRiskContractError("signal symbol does not match broker contract")
+        object.__setattr__(
+            self,
+            "transport_generation",
+            _transport_generation(self.transport_generation, "transport_generation"),
+        )
         observed = _timestamp(self.observed_at, "signal observed_at")
         expires = _timestamp(self.expires_at, "signal expires_at")
         if expires <= observed:
             raise EntryRiskContractError("signal expiry must follow its observation")
         object.__setattr__(self, "observed_at", observed)
         object.__setattr__(self, "expires_at", expires)
+
+    def __copy__(self) -> "EntrySignal":
+        raise TypeError("entry signal cannot be copied")
+
+    def __deepcopy__(self, memo: object) -> "EntrySignal":
+        del memo
+        raise TypeError("entry signal cannot be copied")
+
+    def __reduce__(self) -> str:
+        raise TypeError("entry signal cannot be pickled")
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,12 +285,17 @@ class EntryIntent:
     confidence_fraction: Decimal
     requested_position_fraction: Decimal
     source_data_version: str
+    broker_contract: EntryBrokerContractIdentity
+    transport_generation: str
     quote_refresh_request_id: str
     created_at: datetime
     expires_at: datetime
     schema_version: int = ENTRY_RISK_CONTRACT_VERSION
+    _builder_marker: InitVar[object] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _builder_marker: object) -> None:
+        if _builder_marker is not _ENTRY_INTENT_MARKER:
+            raise EntryRiskContractError("entry intent is not signal-derived")
         _schema_version(self.schema_version)
         for field_name in (
             "intent_id",
@@ -229,6 +308,15 @@ class EntryIntent:
         object.__setattr__(self, "symbol", _symbol(self.symbol))
         if type(self.side) is not EntrySide or type(self.source) is not SignalSource:
             raise EntryRiskContractError("entry intent side or source is invalid")
+        if type(self.broker_contract) is not EntryBrokerContractIdentity:
+            raise EntryRiskContractError("entry intent broker contract is malformed")
+        if self.broker_contract.symbol != self.symbol:
+            raise EntryRiskContractError("entry intent symbol does not match broker contract")
+        object.__setattr__(
+            self,
+            "transport_generation",
+            _transport_generation(self.transport_generation, "transport_generation"),
+        )
         object.__setattr__(
             self,
             "confidence_fraction",
@@ -249,6 +337,16 @@ class EntryIntent:
             raise EntryRiskContractError("entry intent expiry must follow creation")
         object.__setattr__(self, "created_at", created)
         object.__setattr__(self, "expires_at", expires)
+
+    def __copy__(self) -> "EntryIntent":
+        raise TypeError("entry intent cannot be copied")
+
+    def __deepcopy__(self, memo: object) -> "EntryIntent":
+        del memo
+        raise TypeError("entry intent cannot be copied")
+
+    def __reduce__(self) -> str:
+        raise TypeError("entry intent cannot be pickled")
 
 
 def build_entry_intent(
@@ -275,9 +373,12 @@ def build_entry_intent(
         confidence_fraction=signal.confidence_fraction,
         requested_position_fraction=signal.requested_position_fraction,
         source_data_version=signal.source_data_version,
+        broker_contract=signal.broker_contract,
+        transport_generation=signal.transport_generation,
         quote_refresh_request_id=quote_refresh_request_id,
         created_at=created,
         expires_at=signal.expires_at,
+        _builder_marker=_ENTRY_INTENT_MARKER,
     )
 
 
@@ -286,19 +387,69 @@ class RefreshedQuoteEvidence:
     quote_id: str
     refresh_request_id: str
     symbol: str
+    broker_contract: EntryBrokerContractIdentity
     price_usd: Decimal
     observed_at: datetime
     transport_generation: str
     source: str
+    _builder_marker: InitVar[object] = None
 
-    def __post_init__(self) -> None:
-        for field_name in ("quote_id", "refresh_request_id", "transport_generation"):
+    def __post_init__(self, _builder_marker: object) -> None:
+        if _builder_marker is not _QUOTE_EVIDENCE_MARKER:
+            raise EntryRiskContractError("refreshed quote is not factory-produced")
+        for field_name in ("quote_id", "refresh_request_id"):
             object.__setattr__(self, field_name, _identifier(getattr(self, field_name), field_name))
+        object.__setattr__(
+            self,
+            "transport_generation",
+            _transport_generation(self.transport_generation, "transport_generation"),
+        )
         object.__setattr__(self, "symbol", _symbol(self.symbol))
+        if type(self.broker_contract) is not EntryBrokerContractIdentity:
+            raise EntryRiskContractError("quote broker contract is malformed")
+        if self.broker_contract.symbol != self.symbol:
+            raise EntryRiskContractError("quote symbol does not match broker contract")
         object.__setattr__(self, "price_usd", _decimal(self.price_usd, "price_usd", positive=True))
         object.__setattr__(self, "observed_at", _timestamp(self.observed_at, "quote observed_at"))
-        if self.source != "live-broker":
+        if type(self.source) is not str or self.source != "live-broker":
             raise EntryRiskContractError("refreshed quote source must be live-broker")
+
+    def __copy__(self) -> "RefreshedQuoteEvidence":
+        raise TypeError("refreshed quote evidence cannot be copied")
+
+    def __deepcopy__(self, memo: object) -> "RefreshedQuoteEvidence":
+        del memo
+        raise TypeError("refreshed quote evidence cannot be copied")
+
+    def __reduce__(self) -> str:
+        raise TypeError("refreshed quote evidence cannot be pickled")
+
+
+def build_refreshed_quote_evidence(
+    *,
+    quote_id: str,
+    refresh_request_id: str,
+    broker_contract: EntryBrokerContractIdentity,
+    price_usd: Decimal,
+    observed_at: datetime,
+    transport_generation: str,
+    source: str,
+) -> RefreshedQuoteEvidence:
+    """Build an immutable quote bound to one exact contract and transport."""
+
+    if type(broker_contract) is not EntryBrokerContractIdentity:
+        raise EntryRiskContractError("quote requires an exact broker contract")
+    return RefreshedQuoteEvidence(
+        quote_id=quote_id,
+        refresh_request_id=refresh_request_id,
+        symbol=broker_contract.symbol,
+        broker_contract=broker_contract,
+        price_usd=price_usd,
+        observed_at=observed_at,
+        transport_generation=transport_generation,
+        source=source,
+        _builder_marker=_QUOTE_EVIDENCE_MARKER,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -501,6 +652,8 @@ class RiskDecision:
     portfolio_id: str
     symbol: str
     side: EntrySide
+    broker_contract: EntryBrokerContractIdentity
+    transport_generation: str
     evaluated_at: datetime
     risk_approved: bool
     reasons: tuple[RiskReason, ...]
@@ -519,6 +672,15 @@ class RiskDecision:
         object.__setattr__(self, "symbol", _symbol(self.symbol))
         if type(self.side) is not EntrySide:
             raise EntryRiskContractError("risk decision side is invalid")
+        if type(self.broker_contract) is not EntryBrokerContractIdentity:
+            raise EntryRiskContractError("risk decision broker contract is malformed")
+        if self.broker_contract.symbol != self.symbol:
+            raise EntryRiskContractError("risk decision symbol does not match broker contract")
+        object.__setattr__(
+            self,
+            "transport_generation",
+            _transport_generation(self.transport_generation, "transport_generation"),
+        )
         object.__setattr__(self, "evaluated_at", _timestamp(self.evaluated_at, "evaluated_at"))
         _flag(self.risk_approved, "risk_approved")
         if (
@@ -572,6 +734,8 @@ def _rejected(
         portfolio_id=intent.portfolio_id,
         symbol=intent.symbol,
         side=intent.side,
+        broker_contract=intent.broker_contract,
+        transport_generation=intent.transport_generation,
         evaluated_at=evaluated_at,
         risk_approved=False,
         reasons=ordered,
@@ -704,6 +868,8 @@ def evaluate_entry_intent(
     limits: EntryRiskLimits,
     flags: EntryFeatureFlags,
     *,
+    expected_broker_contract: EntryBrokerContractIdentity,
+    expected_transport_generation: str,
     evaluated_at: datetime,
 ) -> RiskDecision:
     """Evaluate one intent using complete, refreshed evidence and exact units."""
@@ -714,6 +880,12 @@ def evaluate_entry_intent(
         raise EntryRiskContractError("risk evaluation requires exact EntryRiskEvidence")
     if type(limits) is not EntryRiskLimits or type(flags) is not EntryFeatureFlags:
         raise EntryRiskContractError("risk evaluation configuration is malformed")
+    if type(expected_broker_contract) is not EntryBrokerContractIdentity:
+        raise EntryRiskContractError("expected broker contract is missing or malformed")
+    active_generation = _transport_generation(
+        expected_transport_generation,
+        "expected_transport_generation",
+    )
     now = _timestamp(evaluated_at, "evaluated_at")
     reasons: list[RiskReason] = []
 
@@ -725,6 +897,11 @@ def evaluate_entry_intent(
         reasons.append(RiskReason.SIDE_NOT_READY)
     if now < intent.created_at or now >= intent.expires_at:
         reasons.append(RiskReason.INTENT_NOT_ACTIVE)
+    if (
+        intent.broker_contract != expected_broker_contract
+        or intent.transport_generation != active_generation
+    ):
+        reasons.append(RiskReason.INTENT_BROKER_LINEAGE_MISMATCH)
 
     if evidence.portfolio_id is None or evidence.symbol is None:
         reasons.append(RiskReason.MISSING_EVIDENCE_SCOPE)
@@ -787,6 +964,13 @@ def evaluate_entry_intent(
         )
     ):
         reasons.append(RiskReason.QUOTE_NOT_REFRESHED)
+    if quote is not None and (
+        quote.broker_contract != expected_broker_contract
+        or quote.transport_generation != active_generation
+        or quote.broker_contract != intent.broker_contract
+        or quote.transport_generation != intent.transport_generation
+    ):
+        reasons.append(RiskReason.QUOTE_BROKER_LINEAGE_MISMATCH)
 
     if reasons:
         return _rejected(intent, now, reasons, quote)
@@ -899,6 +1083,8 @@ def evaluate_entry_intent(
         portfolio_id=intent.portfolio_id,
         symbol=intent.symbol,
         side=intent.side,
+        broker_contract=intent.broker_contract,
+        transport_generation=intent.transport_generation,
         evaluated_at=now,
         risk_approved=True,
         reasons=(RiskReason.APPROVED,),
@@ -913,6 +1099,7 @@ __all__ = [
     "ENTRY_RISK_CONTRACT_VERSION",
     "GATE_A_MAX_POSITION_FRACTION",
     "CorrelationEvidence",
+    "EntryBrokerContractIdentity",
     "EntryFeatureFlags",
     "EntryIntent",
     "EntryRiskContractError",
@@ -927,5 +1114,6 @@ __all__ = [
     "RiskReason",
     "SignalSource",
     "build_entry_intent",
+    "build_refreshed_quote_evidence",
     "evaluate_entry_intent",
 ]
