@@ -122,6 +122,15 @@ _WORKER_ENV_ALLOWLIST = frozenset(
         "WINDIR",
     }
 )
+_WORKER_FORBIDDEN_SIGNING_ENV = frozenset(
+    {
+        "BOOTSTRAP_BROKER_EVIDENCE_PRIVATE_KEY_PATH",
+        "BOOTSTRAP_EVIDENCE_PRIVATE_KEY_PATH",
+        "BOOTSTRAP_EVIDENCE_SIGNING_KEY",
+        "BOOTSTRAP_MARK_EVIDENCE_PRIVATE_KEY_PATH",
+        "BOOTSTRAP_RECONCILIATION_EVIDENCE_PRIVATE_KEY_PATH",
+    }
+)
 _WORKER_SYNTHETIC_ACCOUNT_ENVIRONMENT = "ROBOTRADER_WORKER_SYNTHETIC_ACCOUNT_ENVIRONMENT"
 _LSOF_EXECUTABLE_CANDIDATES: tuple[Path, ...] = (
     Path("/usr/sbin/lsof"),
@@ -148,6 +157,30 @@ def _trusted_lsof_executable() -> Path:
             continue
         return resolved
     raise IBKRError("Trusted absolute lsof executable is unavailable")
+
+
+def _build_worker_environment(
+    generation_id: str,
+    *,
+    synthetic_account_environment: str = "",
+) -> dict[str, str]:
+    """Construct the complete keyless worker environment from an allowlist."""
+
+    worker_env = {name: os.environ[name] for name in _WORKER_ENV_ALLOWLIST if name in os.environ}
+    worker_env.update(
+        {
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONSAFEPATH": "1",
+            "PYTHONUNBUFFERED": "1",
+            "ROBOTRADER_WORKER_GENERATION_ID": generation_id,
+        }
+    )
+    if synthetic_account_environment:
+        worker_env[_WORKER_SYNTHETIC_ACCOUNT_ENVIRONMENT] = synthetic_account_environment
+    forbidden = _WORKER_FORBIDDEN_SIGNING_ENV.intersection(worker_env)
+    if forbidden:
+        raise RuntimeError("IBKR worker environment contains signing authority")
+    return worker_env
 
 
 def _is_interpreter_path_safe(resolved: Path, project_root: Path) -> bool:
@@ -241,10 +274,11 @@ _INTRADAY_BAR_SIZES = {
     "4 hours",
     "8 hours",
 }
-_BROKER_SNAPSHOT_SCHEMA_VERSION = 1
+_BROKER_SNAPSHOT_SCHEMA_VERSION = 3
 _BROKER_SAFETY_SNAPSHOT_SCHEMA_VERSION = 1
 _BROKER_CONTRACT_SAFETY_SNAPSHOT_SCHEMA_VERSION = 1
 _BROKER_SNAPSHOT_BALANCE_TAGS = {
+    "BuyingPower",
     "NetLiquidation",
     "TotalCashValue",
     "SettledCash",
@@ -252,14 +286,41 @@ _BROKER_SNAPSHOT_BALANCE_TAGS = {
     "RealizedPnL",
     "UnrealizedPnL",
 }
-_BROKER_SNAPSHOT_REQUIRED_BALANCE_TAGS = {"NetLiquidation", "TotalCashValue"}
+_BROKER_SNAPSHOT_REQUIRED_BALANCE_TAGS = {
+    "BuyingPower",
+    "NetLiquidation",
+    "TotalCashValue",
+}
+_BROKER_SNAPSHOT_COLLECTIONS = {
+    "positions",
+    "open_orders",
+    "completed_orders",
+    "executions",
+    "commissions",
+}
+_COMPLETED_ORDER_SCOPE_KEYS = {
+    "kind",
+    "api_method",
+    "api_only",
+    "client_scope",
+    "request_count",
+    "stability_check",
+    "retention_scope",
+    "full_history",
+    "request_started_at",
+    "request_completed_at",
+    "verification_started_at",
+    "verification_completed_at",
+    "broker_time_before",
+    "broker_time_after",
+}
 _BROKER_SNAPSHOT_MAX_AGE_SECONDS = 300.0
 _BROKER_SNAPSHOT_MAX_WINDOW_SECONDS = 60.0
 _BROKER_SNAPSHOT_MAX_CLOCK_SKEW_SECONDS = 120.0
-_BROKER_EXECUTION_LOOKBACK_SECONDS = 24 * 60 * 60
 _CONTRACT_TEXT_RE = re.compile(r"^[A-Z0-9][A-Z0-9._:/-]{0,63}$")
 _BROKER_SAFETY_SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
 _OPAQUE_ACCOUNT_SCOPE_RE = re.compile(r"^acct_v1_[0-9a-f]{64}$")
+_COLLECTION_EVIDENCE_ID_RE = re.compile(r"^broker-collection-v1-[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -830,21 +891,10 @@ class SubprocessIBKRClient:
         generation: Optional[_WorkerGeneration] = None
         try:
             generation_id = uuid.uuid4().hex
-            worker_env = {
-                name: os.environ[name] for name in _WORKER_ENV_ALLOWLIST if name in os.environ
-            }
-            worker_env.update(
-                {
-                    "PYTHONIOENCODING": "utf-8",
-                    "PYTHONSAFEPATH": "1",
-                    "PYTHONUNBUFFERED": "1",
-                    "ROBOTRADER_WORKER_GENERATION_ID": generation_id,
-                }
+            worker_env = _build_worker_environment(
+                generation_id,
+                synthetic_account_environment=self._worker_synthetic_account_environment,
             )
-            if self._worker_synthetic_account_environment:
-                worker_env[_WORKER_SYNTHETIC_ACCOUNT_ENVIRONMENT] = (
-                    self._worker_synthetic_account_environment
-                )
             # CRITICAL FIX: Use regular subprocess.Popen with threading instead of
             # asyncio.create_subprocess_exec to avoid event loop starvation in
             # busy async environments
@@ -1878,14 +1928,23 @@ class SubprocessIBKRClient:
         top_keys = {
             "snapshot_schema_version",
             "account",
+            "account_type",
+            "account_structure",
+            "base_currency",
+            "total_cash",
+            "buying_power",
+            "account_observed_at",
             "broker_time_before",
             "broker_time_after",
             "retrieved_at",
             "positions",
             "balances",
             "open_orders",
+            "completed_orders",
             "executions",
             "execution_scope",
+            "completeness",
+            "collection_evidence",
         }
         try:
             if set(data) != top_keys:
@@ -1908,10 +1967,30 @@ class SubprocessIBKRClient:
                     f"(expected={self._masked_account(expected_account)}, "
                     f"connected={self._masked_account(account)})"
                 )
+            if data["account_type"] != "paper":
+                raise ValueError("broker snapshot account type is not paper")
+            account_structure = data["account_structure"]
+            if (
+                not isinstance(account_structure, str)
+                or account_structure != account_structure.strip().upper()
+                or not re.fullmatch(r"[A-Z][A-Z0-9 _-]{0,63}", account_structure)
+            ):
+                raise ValueError("broker snapshot account structure is malformed")
+            base_currency = data["base_currency"]
+            if not isinstance(base_currency, str) or not re.fullmatch(r"[A-Z]{3}", base_currency):
+                raise ValueError("broker snapshot base currency is malformed")
+            total_cash = self._strict_decimal(data["total_cash"], "total cash")
+            buying_power = self._strict_decimal(data["buying_power"], "buying power")
+            if buying_power < 0:
+                raise ValueError("broker snapshot buying power is negative")
 
             broker_before = self._strict_timestamp(data["broker_time_before"], "broker_time_before")
             broker_after = self._strict_timestamp(data["broker_time_after"], "broker_time_after")
             retrieved_at = self._strict_timestamp(data["retrieved_at"], "retrieved_at")
+            account_observed_at = self._strict_timestamp(
+                data["account_observed_at"],
+                "account_observed_at",
+            )
             if broker_after < broker_before:
                 raise ValueError("broker snapshot broker times are reversed")
             broker_window = (broker_after - broker_before).total_seconds()
@@ -1920,6 +1999,11 @@ class SubprocessIBKRClient:
                 or broker_window > _BROKER_SNAPSHOT_MAX_WINDOW_SECONDS
             ):
                 raise ValueError("broker snapshot collection window is unbounded")
+            if not broker_before <= account_observed_at <= broker_after:
+                raise ValueError("broker snapshot account evidence is outside collection bounds")
+            retrieval_delay = (retrieved_at - broker_after).total_seconds()
+            if retrieval_delay < 0 or retrieval_delay > 5:
+                raise ValueError("broker snapshot retrieval delay is outside safety bounds")
             age = (
                 datetime.now(timezone.utc) - retrieved_at.astimezone(timezone.utc)
             ).total_seconds()
@@ -1979,23 +2063,59 @@ class SubprocessIBKRClient:
                 self._strict_decimal(balance["value"], "balance value")
             if not _BROKER_SNAPSHOT_REQUIRED_BALANCE_TAGS.issubset(present_tags):
                 raise ValueError("broker snapshot required balances are missing")
+            balances_by_identity = {
+                (balance["tag"], balance["currency"]): self._strict_decimal(
+                    balance["value"], "balance value"
+                )
+                for balance in balances
+            }
+            if balances_by_identity.get(("TotalCashValue", base_currency)) != total_cash:
+                raise ValueError("broker snapshot total cash contradicts balance evidence")
+            if balances_by_identity.get(("BuyingPower", base_currency)) != buying_power:
+                raise ValueError("broker snapshot buying power contradicts balance evidence")
+            if ("NetLiquidation", base_currency) not in balances_by_identity:
+                raise ValueError("broker snapshot base currency lacks net liquidation evidence")
 
-            self._validate_snapshot_orders(data["open_orders"], expected_account)
+            open_order_identities = self._validate_snapshot_orders(
+                data["open_orders"],
+                expected_account,
+                collection="open",
+            )
+            completed_order_identities = self._validate_snapshot_orders(
+                data["completed_orders"],
+                expected_account,
+                collection="completed",
+            )
+            if open_order_identities.intersection(completed_order_identities):
+                raise ValueError("broker order appears in open and completed collections")
             execution_scope = data["execution_scope"]
             if not isinstance(execution_scope, dict) or set(execution_scope) != {
                 "kind",
                 "start_at",
                 "end_at",
+                "retention_scope",
+                "full_history",
+                "commission_scope",
             }:
                 raise ValueError("broker snapshot execution scope schema is invalid")
-            if execution_scope["kind"] != "bounded_execution_filter":
+            if execution_scope["kind"] != "broker_date_since_midnight":
                 raise ValueError("broker snapshot execution scope is unsupported")
+            if (
+                execution_scope["retention_scope"] != "ibkr_gateway_broker_date_since_midnight"
+                or execution_scope["full_history"] is not False
+                or execution_scope["commission_scope"]
+                != "matching_callbacks_for_returned_executions"
+            ):
+                raise ValueError("broker snapshot execution retention scope is unsupported")
             execution_start = self._strict_timestamp(
                 execution_scope["start_at"], "execution scope start"
             )
             execution_end = self._strict_timestamp(execution_scope["end_at"], "execution scope end")
-            expected_execution_start = broker_before.replace(microsecond=0) - timedelta(
-                seconds=_BROKER_EXECUTION_LOOKBACK_SECONDS
+            expected_execution_start = broker_before.replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
             )
             if execution_start != expected_execution_start:
                 raise ValueError("broker snapshot execution scope does not match the wire filter")
@@ -2009,6 +2129,33 @@ class SubprocessIBKRClient:
                 execution_start,
                 execution_end,
             )
+            completeness = data["completeness"]
+            completeness_keys = {
+                "account",
+                "positions",
+                "open_orders",
+                "completed_orders",
+                "executions",
+                "commissions",
+            }
+            if (
+                not isinstance(completeness, dict)
+                or set(completeness) != completeness_keys
+                or any(completeness[key] is not True for key in completeness_keys)
+            ):
+                raise ValueError("broker snapshot completeness evidence is not complete")
+            self._validate_collection_evidence(
+                data["collection_evidence"],
+                broker_before=broker_before,
+                broker_after=broker_after,
+                counts={
+                    "positions": len(positions),
+                    "open_orders": len(data["open_orders"]),
+                    "completed_orders": len(data["completed_orders"]),
+                    "executions": len(data["executions"]),
+                    "commissions": len(data["executions"]),
+                },
+            )
             return data
         except BrokerSnapshotAccountMismatchError:
             raise
@@ -2016,9 +2163,15 @@ class SubprocessIBKRClient:
             self._snapshot_fail(generation, str(exc))
         raise AssertionError("unreachable")
 
-    def _validate_snapshot_orders(self, orders: Any, account: str) -> None:
+    def _validate_snapshot_orders(
+        self,
+        orders: Any,
+        account: str,
+        *,
+        collection: str = "open",
+    ) -> set[tuple[int, int]]:
         if not isinstance(orders, list):
-            raise ValueError("broker snapshot open orders are not a list")
+            raise ValueError(f"broker snapshot {collection} orders are not a list")
         keys = {
             "account",
             "broker_order_id",
@@ -2048,7 +2201,7 @@ class SubprocessIBKRClient:
         seen: set[tuple[int, int]] = set()
         for order in orders:
             if not isinstance(order, dict) or set(order) != keys:
-                raise ValueError("broker snapshot open-order schema is invalid")
+                raise ValueError(f"broker snapshot {collection}-order schema is invalid")
             self._validate_unavailable(order, optional)
             if order["account"] != account:
                 raise ValueError("broker snapshot order account is inconsistent")
@@ -2080,6 +2233,130 @@ class SubprocessIBKRClient:
                         raise ValueError("broker snapshot order price evidence is not positive")
             if order["last_status_at"] is not None:
                 self._strict_timestamp(order["last_status_at"], "last_status_at")
+            if collection == "completed" and order["status"] not in {
+                "ApiCancelled",
+                "Cancelled",
+                "Filled",
+                "Inactive",
+            }:
+                raise ValueError("broker snapshot completed order is not terminal")
+        return seen
+
+    def _validate_collection_evidence(
+        self,
+        value: Any,
+        *,
+        broker_before: datetime,
+        broker_after: datetime,
+        counts: dict[str, int],
+    ) -> None:
+        if not isinstance(value, list) or len(value) != len(_BROKER_SNAPSHOT_COLLECTIONS):
+            raise ValueError("broker snapshot collection evidence is incomplete")
+        seen_collections: set[str] = set()
+        seen_evidence_ids: set[str] = set()
+        for evidence in value:
+            if not isinstance(evidence, dict) or set(evidence) != {
+                "collection",
+                "evidence_id",
+                "observed_at",
+                "result_count",
+                "scope",
+            }:
+                raise ValueError("broker snapshot collection evidence schema is invalid")
+            collection = evidence["collection"]
+            evidence_id = evidence["evidence_id"]
+            if collection not in _BROKER_SNAPSHOT_COLLECTIONS or collection in seen_collections:
+                raise ValueError("broker snapshot collection evidence kind is invalid")
+            if (
+                not isinstance(evidence_id, str)
+                or not _COLLECTION_EVIDENCE_ID_RE.fullmatch(evidence_id)
+                or evidence_id in seen_evidence_ids
+            ):
+                raise ValueError("broker snapshot collection evidence identity is invalid")
+            observed_at = self._strict_timestamp(
+                evidence["observed_at"],
+                "collection evidence observed_at",
+            )
+            if not broker_before <= observed_at <= broker_after:
+                raise ValueError("broker snapshot collection evidence is outside bounds")
+            result_count = evidence["result_count"]
+            if (
+                isinstance(result_count, bool)
+                or not isinstance(result_count, int)
+                or result_count < 0
+                or result_count != counts[collection]
+            ):
+                raise ValueError("broker snapshot collection evidence count is inconsistent")
+            scope = evidence["scope"]
+            if collection == "completed_orders":
+                self._validate_completed_order_scope(
+                    scope,
+                    broker_before=broker_before,
+                    broker_after=broker_after,
+                )
+            elif scope is not None:
+                raise ValueError("broker snapshot collection scope is unexpected")
+            seen_collections.add(collection)
+            seen_evidence_ids.add(evidence_id)
+        if seen_collections != _BROKER_SNAPSHOT_COLLECTIONS:
+            raise ValueError("broker snapshot collection evidence is incomplete")
+
+    def _validate_completed_order_scope(
+        self,
+        value: Any,
+        *,
+        broker_before: datetime,
+        broker_after: datetime,
+    ) -> None:
+        """Accept only IBKR's explicit current-retained, all-client query scope."""
+
+        if not isinstance(value, dict) or set(value) != _COMPLETED_ORDER_SCOPE_KEYS:
+            raise ValueError("broker snapshot completed-order scope schema is invalid")
+        if (
+            value["kind"] != "ibkr_current_retained_completed_orders"
+            or value["api_method"] != "reqCompletedOrders"
+            or value["api_only"] is not False
+            or value["client_scope"] != "api_and_manual_orders_visible_to_current_tws_session"
+            or type(value["request_count"]) is not int
+            or value["request_count"] != 2
+            or value["stability_check"] != "identical_second_read"
+            or value["retention_scope"] != "current_tws_or_gateway_retained_set"
+            or value["full_history"] is not False
+        ):
+            raise ValueError("broker snapshot completed-order scope is unsupported")
+        request_started = self._strict_timestamp(
+            value["request_started_at"], "completed-order request start"
+        )
+        request_completed = self._strict_timestamp(
+            value["request_completed_at"], "completed-order request completion"
+        )
+        verification_started = self._strict_timestamp(
+            value["verification_started_at"], "completed-order verification start"
+        )
+        verification_completed = self._strict_timestamp(
+            value["verification_completed_at"], "completed-order verification completion"
+        )
+        scope_broker_before = self._strict_timestamp(
+            value["broker_time_before"], "completed-order broker time before"
+        )
+        scope_broker_after = self._strict_timestamp(
+            value["broker_time_after"], "completed-order broker time after"
+        )
+        if scope_broker_before != broker_before or scope_broker_after != broker_after:
+            raise ValueError("broker snapshot completed-order broker bounds are inconsistent")
+        if not (
+            request_started <= request_completed <= verification_started <= verification_completed
+        ):
+            raise ValueError("broker snapshot completed-order request bounds are reversed")
+        if (
+            (verification_completed - request_started).total_seconds()
+            > _BROKER_SNAPSHOT_MAX_WINDOW_SECONDS
+            or request_started
+            < broker_before - timedelta(seconds=_BROKER_SNAPSHOT_MAX_CLOCK_SKEW_SECONDS)
+            or verification_completed
+            > broker_after + timedelta(seconds=_BROKER_SNAPSHOT_MAX_CLOCK_SKEW_SECONDS)
+        ):
+            raise ValueError("broker snapshot completed-order request bounds are unbounded")
 
     def _validate_snapshot_executions(
         self,
@@ -2111,8 +2388,6 @@ class SubprocessIBKRClient:
         optional = {
             "broker_order_id",
             "permanent_id",
-            "commission",
-            "commission_currency",
             "realized_pnl",
         }
         seen: set[str] = set()
@@ -2147,12 +2422,11 @@ class SubprocessIBKRClient:
                 or not execution["execution_exchange"]
             ):
                 raise ValueError("broker snapshot execution exchange is missing")
-            for field_name in ("commission", "realized_pnl"):
-                if execution[field_name] is not None:
-                    self._strict_decimal(execution[field_name], field_name)
-            if execution["commission_currency"] is not None and (
-                not isinstance(execution["commission_currency"], str)
-                or not execution["commission_currency"]
+            self._strict_decimal(execution["commission"], "commission")
+            if execution["realized_pnl"] is not None:
+                self._strict_decimal(execution["realized_pnl"], "realized_pnl")
+            if not isinstance(execution["commission_currency"], str) or not re.fullmatch(
+                r"[A-Z]{3}", execution["commission_currency"]
             ):
                 raise ValueError("broker snapshot commission currency is invalid")
 
@@ -3488,6 +3762,32 @@ class SubprocessIBKRClient:
         """Check if connected to IBKR"""
         connected, _, _, _, _, _ = self._connection_state_snapshot()
         return connected
+
+    @property
+    def protective_quote_generation(self) -> str:
+        """Return the exact live read-only generation usable for quote collection."""
+
+        generation = self._generation
+        if generation is None:
+            raise IBKRTransportPoisonedError(
+                "Protective quote source has no current worker generation"
+            )
+        with generation.state_lock:
+            with self._connection_state_lock:
+                identity = self._connection_identity
+                if (
+                    self._generation is not generation
+                    or generation.poisoned_reason is not None
+                    or self._connected is not True
+                    or self._connection_generation_id != generation.generation_id
+                    or identity is None
+                    or identity[1] != 4002
+                    or identity[3] is not True
+                ):
+                    raise IBKRTransportPoisonedError(
+                        "Protective quote source generation is not current paper/read-only"
+                    )
+                return generation.generation_id
 
     @property
     def gateway_failure_detail(self) -> Optional[str]:

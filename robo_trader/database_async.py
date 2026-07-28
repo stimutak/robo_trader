@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import os
+import sqlite3
 import stat
 import threading
 import uuid
@@ -26,7 +27,27 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import aiosqlite
 
+from robo_trader.database_migrations import (
+    apply_exact_state_migrations,
+    assert_exact_state_schema,
+)
 from robo_trader.database_validator import DatabaseValidator, ValidationError
+from robo_trader.financial_state_bootstrap import (
+    _SAFE_ID,
+    ExactStateBootstrapBackupReceipt,
+    ExactStateBootstrapCandidate,
+    ExactStateBootstrapCommittedBackupInvalid,
+    ExactStateBootstrapError,
+    ExactStateBootstrapEvidence,
+    ExactStateBootstrapReceipt,
+    ExactStateSafetyJournalGuard,
+    _canonical_legacy_rows,
+    acquire_exact_state_safety_journal_guard,
+    assert_exact_state_bootstrap_evidence,
+    inspect_legacy_state,
+    sqlite_table_evidence,
+    verified_file_sha256,
+)
 from robo_trader.logger import get_logger
 from robo_trader.market_data_contract import (
     CANONICAL_STORAGE_KEYS,
@@ -338,6 +359,12 @@ class AsyncTradingDatabase:
                     )
                     await conn.execute("PRAGMA journal_mode=WAL")
                     await conn.execute("PRAGMA busy_timeout=5000")
+                    await conn.execute("PRAGMA foreign_keys=ON")
+                    foreign_keys = await conn.execute("PRAGMA foreign_keys")
+                    if await foreign_keys.fetchone() != (1,):
+                        raise SafetyDatabasePoolError(
+                            "SQLite foreign-key enforcement is unavailable"
+                        )
                     pool_binding.assert_connection_identity(
                         await self._sqlite_descriptor_identity(conn)
                     )
@@ -858,6 +885,10 @@ class AsyncTradingDatabase:
             )
             await connection.execute("PRAGMA journal_mode=WAL")
             await connection.execute("PRAGMA busy_timeout=5000")
+            await connection.execute("PRAGMA foreign_keys=ON")
+            foreign_keys = await connection.execute("PRAGMA foreign_keys")
+            if await foreign_keys.fetchone() != (1,):
+                raise SafetyDatabasePoolError("SQLite foreign-key enforcement is unavailable")
             pool_binding.assert_connection_identity(
                 await self._sqlite_descriptor_identity(connection)
             )
@@ -1106,6 +1137,10 @@ class AsyncTradingDatabase:
             # Set WAL and busy timeout on the initializer connection too, to avoid rollback journal usage
             await conn.execute("PRAGMA journal_mode=WAL")
             await conn.execute("PRAGMA busy_timeout=5000")
+            await conn.execute("PRAGMA foreign_keys=ON")
+            foreign_keys = await conn.execute("PRAGMA foreign_keys")
+            if await foreign_keys.fetchone() != (1,):
+                raise SafetyDatabasePoolError("SQLite foreign-key enforcement is unavailable")
 
             # Portfolios table (multi-portfolio support)
             await conn.execute("""
@@ -1352,6 +1387,11 @@ class AsyncTradingDatabase:
                 except Exception:
                     pass  # Column already exists
 
+            # PR4 exact-state migrations are component-scoped and validated;
+            # they never infer authoritative values from legacy REAL rows.
+            await apply_exact_state_migrations(conn)
+            await assert_exact_state_schema(conn)
+
             # Account table (portfolio-scoped, keyed by portfolio_id)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS account (
@@ -1486,24 +1526,10 @@ class AsyncTradingDatabase:
             """)
 
             # Insert default account if not exists
-            default_account = await conn.execute("""
+            await conn.execute("""
                 INSERT OR IGNORE INTO account (portfolio_id, cash, equity)
                 VALUES ('default', 100000, 100000)
             """)
-            if default_account.rowcount == 1:
-                await conn.execute(
-                    """
-                    INSERT INTO paper_account_settlement_state (
-                        portfolio_id, cash_text, realized_pnl_text, daily_pnl_text,
-                        daily_pnl_baseline_text, daily_pnl_date,
-                        updated_at, source_settlement_id
-                    ) VALUES ('default', '100000', '0', '0', '0', ?, ?, NULL)
-                    """,
-                    (
-                        datetime.now(timezone.utc).date().isoformat(),
-                        utc_to_text(datetime.now(timezone.utc)),
-                    ),
-                )
 
             await conn.commit()
             connection_binding.assert_connection_identity(
@@ -1527,6 +1553,759 @@ class AsyncTradingDatabase:
         hook = self._paper_settlement_fault_hook
         if hook is not None:
             hook(step)
+
+    def _verify_exact_state_backup(
+        self,
+        candidate: ExactStateBootstrapCandidate,
+        evidence: ExactStateBootstrapEvidence,
+        receipt: ExactStateBootstrapBackupReceipt,
+        descriptor: SQLiteDescriptorIdentity,
+    ) -> None:
+        """Re-open the independently created backup and prove it matches this apply."""
+
+        if type(receipt) is not ExactStateBootstrapBackupReceipt:
+            raise ExactStateBootstrapError("bootstrap requires an exact backup receipt")
+        try:
+            source_metadata = os.lstat(self.db_path)
+        except OSError as exc:
+            raise ExactStateBootstrapError("bootstrap source cannot be revalidated") from exc
+        if (
+            receipt.schema_version != 1
+            or not stat.S_ISREG(source_metadata.st_mode)
+            or stat.S_ISLNK(source_metadata.st_mode)
+            or source_metadata.st_nlink != 1
+            or (source_metadata.st_dev, source_metadata.st_ino)
+            != (descriptor.device, descriptor.inode)
+            or receipt.source_path != str(self.db_path)
+            or (receipt.source_device, receipt.source_inode)
+            != (descriptor.device, descriptor.inode)
+            or (evidence.database_device, evidence.database_inode)
+            != (descriptor.device, descriptor.inode)
+            or receipt.source_snapshot_hash != candidate.legacy_snapshot_hash
+            or receipt.candidate_fingerprint != candidate.fingerprint()
+        ):
+            raise ExactStateBootstrapError("backup receipt is not bound to this bootstrap source")
+        backup_path = Path(receipt.backup_path)
+        if backup_path == self.db_path:
+            raise ExactStateBootstrapError("backup path must differ from the source ledger")
+        backup_hash, backup_metadata = verified_file_sha256(
+            backup_path,
+            "bootstrap backup",
+        )
+        if (
+            not hmac.compare_digest(backup_hash, receipt.backup_content_hash)
+            or (
+                backup_metadata.st_dev,
+                backup_metadata.st_ino,
+            )
+            != (receipt.backup_device, receipt.backup_inode)
+            or (stat.S_IMODE(backup_metadata.st_mode) & 0o222)
+        ):
+            raise ExactStateBootstrapError("bootstrap backup identity or hash changed")
+        backup_state = inspect_legacy_state(backup_path)
+        backup_binding: Optional[SQLitePathBinding] = None
+        backup_connection: Optional[sqlite3.Connection] = None
+        try:
+            backup_binding = SQLitePathBinding.open_for_initialization(
+                backup_path,
+                create=False,
+            )
+            if (backup_binding.device, backup_binding.inode) != (
+                receipt.backup_device,
+                receipt.backup_inode,
+            ):
+                raise ExactStateBootstrapError("bootstrap backup descriptor changed")
+            backup_connection = sqlite3.connect(
+                backup_path.as_uri() + "?mode=ro",
+                uri=True,
+            )
+            bound = backup_binding.bind_sqlite_connection(
+                sqlite_connection_file_identity(backup_connection)
+            )
+            bound.assert_connection_identity(sqlite_connection_file_identity(backup_connection))
+            backup_connection.execute("BEGIN")
+            integrity_rows = backup_connection.execute("PRAGMA integrity_check").fetchall()
+            if integrity_rows != [(receipt.integrity_check,)]:
+                raise ExactStateBootstrapError("bootstrap backup integrity proof changed")
+            backup_counts, backup_hashes = sqlite_table_evidence(backup_connection)
+            bound.assert_connection_identity(sqlite_connection_file_identity(backup_connection))
+            backup_binding.assert_path_identity()
+            backup_connection.rollback()
+        except (OSError, sqlite3.Error, SQLiteIdentityError) as exc:
+            raise ExactStateBootstrapError("bootstrap backup cannot be verified safely") from exc
+        finally:
+            if backup_connection is not None:
+                backup_connection.close()
+            if backup_binding is not None:
+                backup_binding.close()
+        final_hash, final_metadata = verified_file_sha256(backup_path, "bootstrap backup")
+        if (
+            backup_state["snapshot_hash"] != candidate.legacy_snapshot_hash
+            or backup_counts != receipt.row_counts
+            or backup_hashes != receipt.table_hashes
+            or (backup_state["database_device"], backup_state["database_inode"])
+            != (receipt.backup_device, receipt.backup_inode)
+            or (final_metadata.st_dev, final_metadata.st_ino)
+            != (receipt.backup_device, receipt.backup_inode)
+            or not hmac.compare_digest(final_hash, receipt.backup_content_hash)
+        ):
+            raise ExactStateBootstrapError("bootstrap backup does not restore the reviewed ledger")
+
+    @staticmethod
+    async def _assert_prebootstrap_tables_match_backup(
+        connection: aiosqlite.Connection,
+        receipt: ExactStateBootstrapBackupReceipt,
+    ) -> None:
+        """Prove every table present in the raw source still matches its backup."""
+
+        cursor = await connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )
+        live_tables = tuple(str(row[0]) for row in await cursor.fetchall())
+        receipt_tables = tuple(name for name, _ in receipt.row_counts)
+        if live_tables != receipt_tables:
+            raise ExactStateBootstrapError("source table set changed after the bootstrap backup")
+
+        expected_counts = dict(receipt.row_counts)
+        expected_hashes = dict(receipt.table_hashes)
+        for table in receipt_tables:
+            if not _SAFE_ID.fullmatch(table):
+                raise ExactStateBootstrapError("source table name is malformed")
+            quoted = '"' + table.replace('"', '""') + '"'
+            columns = await connection.execute(f"PRAGMA table_info({quoted})")
+            column_rows = await columns.fetchall()
+            order = ",".join(str(index + 1) for index in range(len(column_rows)))
+            # Identifier comes only from sqlite_master and the strict _SAFE_ID
+            # allowlist above, never from user input; values are not interpolated.
+            query = f"SELECT * FROM {quoted}"  # nosec B608
+            if order:
+                query += f" ORDER BY {order}"
+            rows = await connection.execute(query)
+            digest = hashlib.sha256()
+            count = 0
+            for row in await rows.fetchall():
+                values: list[object] = []
+                for value in row:
+                    if isinstance(value, bytes):
+                        values.append({"blob_hex": value.hex()})
+                    elif value is None or type(value) in {str, int, float}:
+                        values.append(value)
+                    else:
+                        raise ExactStateBootstrapError(
+                            "source contains an unsupported SQLite value"
+                        )
+                encoded = json.dumps(
+                    values,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+                count += 1
+            if count != expected_counts[table] or not hmac.compare_digest(
+                digest.hexdigest(), expected_hashes[table]
+            ):
+                raise ExactStateBootstrapError(f"source table changed after backup: {table}")
+
+    @staticmethod
+    async def _prepare_exact_bootstrap_schema(
+        connection: aiosqlite.Connection,
+    ) -> None:
+        """Prepare only the exact-state dependency graph in the caller transaction."""
+
+        await connection.execute("""
+            CREATE TABLE IF NOT EXISTS paper_reduction_settlements (
+                settlement_id TEXT PRIMARY KEY,
+                execution_domain_scope TEXT NOT NULL,
+                account_scope TEXT NOT NULL,
+                portfolio_id TEXT NOT NULL,
+                con_id INTEGER NOT NULL CHECK (con_id > 0),
+                symbol TEXT NOT NULL,
+                reservation_id TEXT NOT NULL UNIQUE,
+                claim_id TEXT NOT NULL UNIQUE,
+                order_ref TEXT NOT NULL,
+                protective_quote_payload TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                request_payload_json TEXT NOT NULL,
+                terminal_status TEXT NOT NULL,
+                trade_id INTEGER,
+                database_path TEXT NOT NULL,
+                database_identity TEXT NOT NULL,
+                database_device INTEGER NOT NULL,
+                database_inode INTEGER NOT NULL,
+                committed_at TEXT NOT NULL,
+                receipt_fingerprint TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,
+                UNIQUE(execution_domain_scope, account_scope, order_ref),
+                FOREIGN KEY(trade_id) REFERENCES trades(id)
+            )
+        """)
+        await connection.execute("""
+            CREATE TABLE IF NOT EXISTS paper_account_settlement_state (
+                portfolio_id TEXT PRIMARY KEY,
+                cash_text TEXT NOT NULL,
+                realized_pnl_text TEXT NOT NULL,
+                daily_pnl_text TEXT NOT NULL,
+                daily_pnl_baseline_text TEXT NOT NULL,
+                daily_pnl_date TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                source_settlement_id TEXT,
+                FOREIGN KEY(source_settlement_id)
+                    REFERENCES paper_reduction_settlements(settlement_id)
+            )
+        """)
+        await connection.execute("""
+            CREATE TABLE IF NOT EXISTS paper_position_settlement_state (
+                portfolio_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                cost_basis_text TEXT NOT NULL,
+                mark_price_text TEXT,
+                source_settlement_id TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (portfolio_id, symbol),
+                FOREIGN KEY(source_settlement_id)
+                    REFERENCES paper_reduction_settlements(settlement_id)
+            )
+        """)
+        await apply_exact_state_migrations(connection)
+        await assert_exact_state_schema(connection)
+
+    async def apply_exact_state_bootstrap_offline_atomic(
+        self,
+        candidate: ExactStateBootstrapCandidate,
+        *,
+        evidence: ExactStateBootstrapEvidence,
+        backup_receipt: ExactStateBootstrapBackupReceipt,
+        operator_reason: str,
+        runtime_contract: object,
+    ) -> ExactStateBootstrapReceipt:
+        """Prepare schema and bootstrap an existing raw ledger in one commit."""
+
+        expected_identity = self._expected_database_file_identity
+        if expected_identity is None:
+            raise ExactStateBootstrapError("bootstrap requires an existing database")
+        binding: Optional[SQLitePathBinding] = None
+        connection: Optional[aiosqlite.Connection] = None
+        committed_receipt: Optional[ExactStateBootstrapReceipt] = None
+        journal_guard: Optional[ExactStateSafetyJournalGuard] = None
+        try:
+            journal_guard = acquire_exact_state_safety_journal_guard(
+                evidence,
+                runtime_contract,
+            )
+            binding = SQLitePathBinding.open_for_initialization(self.db_path, create=False)
+            if (binding.device, binding.inode) != expected_identity:
+                raise ExactStateBootstrapError(
+                    "bootstrap database changed before atomic schema preparation"
+                )
+            binding.assert_path_identity()
+            connection = await aiosqlite.connect(self.db_path)
+            self._quarantine_pool_connection(connection)
+            connection_binding = binding.bind_sqlite_connection(
+                await self._sqlite_descriptor_identity(connection)
+            )
+            await connection.execute("PRAGMA busy_timeout=5000")
+            await connection.execute("PRAGMA foreign_keys=ON")
+            foreign_keys = await connection.execute("PRAGMA foreign_keys")
+            if await foreign_keys.fetchone() != (1,):
+                raise ExactStateBootstrapError("SQLite foreign-key enforcement is unavailable")
+            descriptor = await self._sqlite_descriptor_identity(connection)
+            connection_binding.assert_connection_identity(descriptor)
+            self._verify_exact_state_backup(candidate, evidence, backup_receipt, descriptor)
+
+            await connection.execute("BEGIN IMMEDIATE")
+            journal_guard.assert_unchanged()
+            await self._assert_prebootstrap_tables_match_backup(connection, backup_receipt)
+            self._paper_settlement_fault("BEFORE_EXACT_BOOTSTRAP_SCHEMA_PREP")
+            await self._prepare_exact_bootstrap_schema(connection)
+            self._paper_settlement_fault("AFTER_EXACT_BOOTSTRAP_SCHEMA_PREP")
+            committed_receipt = await self._apply_exact_state_bootstrap(
+                candidate,
+                evidence=evidence,
+                backup_receipt=backup_receipt,
+                operator_reason=operator_reason,
+                runtime_contract=runtime_contract,
+                connection=connection,
+                transaction_started=True,
+                journal_guard=journal_guard,
+            )
+            connection_binding.assert_connection_identity(
+                await self._sqlite_descriptor_identity(connection)
+            )
+            binding.assert_path_identity()
+        except BaseException as exc:
+            if connection is not None and getattr(connection, "in_transaction", False):
+                await connection.rollback()
+            if committed_receipt is not None and not isinstance(
+                exc, ExactStateBootstrapCommittedBackupInvalid
+            ):
+                raise ExactStateBootstrapCommittedBackupInvalid(
+                    bootstrap_id=candidate.bootstrap_id,
+                    candidate_fingerprint=candidate.fingerprint(),
+                    detail=str(exc),
+                ) from exc
+            raise
+        finally:
+            if connection is not None:
+                try:
+                    await self._close_scoped_quarantined_connections(
+                        [connection],
+                        "offline bootstrap connection could not be closed",
+                    )
+                except BaseException as exc:
+                    if committed_receipt is not None:
+                        raise ExactStateBootstrapCommittedBackupInvalid(
+                            bootstrap_id=candidate.bootstrap_id,
+                            candidate_fingerprint=candidate.fingerprint(),
+                            detail=str(exc),
+                        ) from exc
+                    raise
+            if binding is not None:
+                binding.close()
+            if journal_guard is not None:
+                journal_guard.close()
+        if committed_receipt is None:
+            raise ExactStateBootstrapError("atomic bootstrap returned no receipt")
+        return committed_receipt
+
+    async def apply_exact_state_bootstrap(
+        self,
+        candidate: ExactStateBootstrapCandidate,
+        *,
+        evidence: ExactStateBootstrapEvidence,
+        backup_receipt: ExactStateBootstrapBackupReceipt,
+        operator_reason: str,
+        runtime_contract: object,
+    ) -> ExactStateBootstrapReceipt:
+        journal_guard = acquire_exact_state_safety_journal_guard(
+            evidence,
+            runtime_contract,
+        )
+        try:
+            return await self._apply_exact_state_bootstrap(
+                candidate,
+                evidence=evidence,
+                backup_receipt=backup_receipt,
+                operator_reason=operator_reason,
+                runtime_contract=runtime_contract,
+                journal_guard=journal_guard,
+            )
+        finally:
+            journal_guard.close()
+
+    async def _apply_exact_state_bootstrap(
+        self,
+        candidate: ExactStateBootstrapCandidate,
+        *,
+        evidence: ExactStateBootstrapEvidence,
+        backup_receipt: ExactStateBootstrapBackupReceipt,
+        operator_reason: str,
+        runtime_contract: object,
+        connection: Optional[aiosqlite.Connection] = None,
+        transaction_started: bool = False,
+        journal_guard: Optional[ExactStateSafetyJournalGuard] = None,
+    ) -> ExactStateBootstrapReceipt:
+        """Insert one sealed exact accounting epoch without rewriting legacy rows.
+
+        The caller must separately hold the process lifecycle lock and prove the
+        trader and Gateway are stopped.  This transaction binds the candidate
+        to the currently opened database descriptor, verifies the complete
+        legacy projection fingerprint, and inserts only bootstrap/exact-shadow
+        rows.  Existing account, position, trade, and equity-history rows are
+        never updated or deleted.
+        """
+
+        if type(candidate) is not ExactStateBootstrapCandidate:
+            raise TypeError("candidate must be ExactStateBootstrapCandidate")
+        reason = str(operator_reason).strip()
+        if len(reason) < 10:
+            raise ExactStateBootstrapError(
+                "operator_reason must be a specific sentence of at least 10 characters"
+            )
+        if Path(candidate.database_path) != self.db_path:
+            raise ExactStateBootstrapError("bootstrap database path does not match this ledger")
+        expected_path, runtime_identity = self._expected_safety_database(
+            runtime_contract=runtime_contract
+        )
+        if expected_path != self.db_path or runtime_identity != candidate.database_identity:
+            raise ExactStateBootstrapError(
+                "bootstrap database identity does not match the runtime contract"
+            )
+        assert_exact_state_bootstrap_evidence(candidate, evidence, runtime_contract)
+        if journal_guard is None:
+            raise ExactStateBootstrapError("bootstrap requires a held exact safety-journal guard")
+        journal_guard.assert_unchanged()
+
+        @asynccontextmanager
+        async def connection_scope():
+            if connection is not None:
+                yield connection
+                return
+            async with self.get_connection() as pooled_connection:
+                yield pooled_connection
+
+        async with connection_scope() as conn:
+            descriptor = await self._sqlite_descriptor_identity(conn)
+            expected_file_identity = self._expected_database_file_identity
+            if expected_file_identity != (descriptor.device, descriptor.inode):
+                raise ExactStateBootstrapError("bootstrap database descriptor changed")
+            self._verify_exact_state_backup(
+                candidate,
+                evidence,
+                backup_receipt,
+                descriptor,
+            )
+            try:
+                if transaction_started:
+                    if not getattr(conn, "in_transaction", False):
+                        raise ExactStateBootstrapError(
+                            "atomic bootstrap transaction was not started"
+                        )
+                else:
+                    await conn.execute("BEGIN IMMEDIATE")
+                journal_guard.assert_unchanged()
+                for authentication in evidence.authentication_receipts:
+                    replay = await conn.execute(
+                        """
+                        SELECT bootstrap_id FROM exact_bootstrap_evidence_consumptions
+                        WHERE receipt_id = ?
+                        """,
+                        (authentication.receipt_id,),
+                    )
+                    if await replay.fetchone() is not None:
+                        raise ExactStateBootstrapError(
+                            "bootstrap evidence receipt replay is forbidden"
+                        )
+                cursor = await conn.execute(
+                    """
+                    SELECT bootstrap_id, candidate_fingerprint, operator_action_id,
+                           database_device, database_inode, committed_at
+                    FROM paper_state_bootstraps
+                    WHERE bootstrap_id = ? OR candidate_fingerprint = ?
+                    """,
+                    (candidate.bootstrap_id, candidate.fingerprint()),
+                )
+                replay_rows = await cursor.fetchall()
+                if len(replay_rows) > 1:
+                    raise ExactStateBootstrapError(
+                        "bootstrap identities resolve to different records"
+                    )
+                if replay_rows:
+                    row = replay_rows[0]
+                    if row[0] != candidate.bootstrap_id or row[1] != candidate.fingerprint():
+                        raise ExactStateBootstrapError(
+                            "bootstrap identity is already bound to different evidence"
+                        )
+                    await conn.rollback()
+                    self._verify_exact_state_backup(
+                        candidate,
+                        evidence,
+                        backup_receipt,
+                        descriptor,
+                    )
+                    return ExactStateBootstrapReceipt(
+                        bootstrap_id=row[0],
+                        candidate_fingerprint=row[1],
+                        operator_action_id=row[2],
+                        database_device=row[3],
+                        database_inode=row[4],
+                        committed_at=parse_utc_text(row[5], "bootstrap committed_at"),
+                    )
+
+                cursor = await conn.execute("""
+                    SELECT portfolio_id,cash,equity,daily_pnl,realized_pnl,
+                           unrealized_pnl,timestamp
+                    FROM account ORDER BY portfolio_id
+                    """)
+                account_rows = await cursor.fetchall()
+                cursor = await conn.execute("""
+                    SELECT portfolio_id,symbol,quantity,avg_cost,market_price,timestamp
+                    FROM positions WHERE quantity <> 0 ORDER BY portfolio_id,symbol
+                    """)
+                position_rows = await cursor.fetchall()
+                cursor = await conn.execute("""
+                    SELECT id,portfolio_id,symbol,side,quantity,price,notional,slippage,
+                           commission,pnl,timestamp FROM trades ORDER BY id
+                    """)
+                trade_rows = await cursor.fetchall()
+                cursor = await conn.execute("""
+                    SELECT id,portfolio_id,date,equity,cash,positions_value,realized_pnl,
+                           unrealized_pnl,timestamp FROM equity_history ORDER BY id
+                    """)
+                equity_history_rows = await cursor.fetchall()
+                legacy_payload = _canonical_legacy_rows(
+                    account_rows,
+                    position_rows,
+                    trade_rows,
+                    equity_history_rows,
+                )
+                actual_legacy_hash = hashlib.sha256(legacy_payload.encode("utf-8")).hexdigest()
+                if actual_legacy_hash != candidate.legacy_snapshot_hash:
+                    raise ExactStateBootstrapError(
+                        "legacy ledger changed after bootstrap candidate review"
+                    )
+
+                portfolio_accounts = [
+                    row for row in account_rows if row[0] == candidate.portfolio_id
+                ]
+                if len(portfolio_accounts) != 1:
+                    raise ExactStateBootstrapError(
+                        "bootstrap portfolio must have exactly one legacy account row"
+                    )
+                legacy_positions = {
+                    row[1]: row for row in position_rows if row[0] == candidate.portfolio_id
+                }
+                candidate_positions = {
+                    position.symbol: position for position in candidate.positions
+                }
+                if set(legacy_positions) != set(candidate_positions):
+                    raise ExactStateBootstrapError(
+                        "bootstrap positions do not cover the complete legacy allocation"
+                    )
+                for symbol, position in candidate_positions.items():
+                    legacy = legacy_positions[symbol]
+                    if type(legacy[2]) is not int or legacy[2] != position.quantity:
+                        raise ExactStateBootstrapError(
+                            f"bootstrap quantity differs from legacy allocation for {symbol}"
+                        )
+                    if Decimal(str(legacy[3])) != position.cost_basis:
+                        raise ExactStateBootstrapError(
+                            f"bootstrap cost basis differs from reviewed projection for {symbol}"
+                        )
+
+                cursor = await conn.execute(
+                    """
+                    SELECT COUNT(*) FROM paper_state_bootstraps
+                    WHERE execution_domain_scope = ? AND account_scope = ?
+                      AND portfolio_id = ?
+                    """,
+                    (
+                        candidate.execution_domain_scope,
+                        candidate.account_scope,
+                        candidate.portfolio_id,
+                    ),
+                )
+                if await cursor.fetchone() != (0,):
+                    raise ExactStateBootstrapError(
+                        "paper simulator already has a sealed accounting epoch"
+                    )
+                account = candidate.account
+                cursor = await conn.execute(
+                    """
+                    SELECT cash_text,realized_pnl_text,daily_pnl_text,
+                           daily_pnl_baseline_text,daily_pnl_date,
+                           source_settlement_id,origin_bootstrap_id
+                    FROM paper_account_settlement_state WHERE portfolio_id = ?
+                    """,
+                    (candidate.portfolio_id,),
+                )
+                existing_account = await cursor.fetchone()
+                expected_account = (
+                    decimal_to_fixed(account.cash),
+                    decimal_to_fixed(account.realized_pnl),
+                    decimal_to_fixed(account.daily_pnl),
+                    decimal_to_fixed(account.daily_pnl_baseline),
+                    account.daily_pnl_date.isoformat(),
+                    None,
+                    None,
+                )
+                if existing_account is not None and tuple(existing_account) != expected_account:
+                    raise ExactStateBootstrapError(
+                        "existing exact account state does not exactly match reviewed candidate"
+                    )
+
+                cursor = await conn.execute(
+                    """
+                    SELECT symbol,cost_basis_text,mark_price_text,
+                           source_settlement_id,origin_bootstrap_id
+                    FROM paper_position_settlement_state
+                    WHERE portfolio_id = ? ORDER BY symbol
+                    """,
+                    (candidate.portfolio_id,),
+                )
+                existing_position_rows = await cursor.fetchall()
+                expected_position_rows = [
+                    (
+                        position.symbol,
+                        decimal_to_fixed(position.cost_basis),
+                        decimal_to_fixed(position.mark_price),
+                        None,
+                        None,
+                    )
+                    for position in candidate.positions
+                ]
+                if existing_position_rows and [tuple(row) for row in existing_position_rows] != (
+                    expected_position_rows
+                ):
+                    raise ExactStateBootstrapError(
+                        "existing exact position state does not exactly match reviewed candidate"
+                    )
+
+                committed_at = datetime.now(timezone.utc)
+                action_id = f"padmin-{uuid.uuid4().hex}"
+                await conn.execute(
+                    """
+                    INSERT INTO administrator_actions(
+                        action_id, action_type, reason, evidence_hash, created_at
+                    ) VALUES (?, 'APPLY_EXACT_STATE_BOOTSTRAP', ?, ?, ?)
+                    """,
+                    (
+                        action_id,
+                        reason,
+                        candidate.fingerprint(),
+                        utc_to_text(committed_at),
+                    ),
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO paper_state_bootstraps(
+                        bootstrap_id, schema_version, execution_domain_scope,
+                        account_scope, portfolio_id, reconciliation_snapshot_id,
+                        reconciliation_report_hash, broker_snapshot_hash,
+                        legacy_snapshot_hash, database_path, database_identity,
+                        database_device, database_inode, effective_at,
+                        candidate_payload_json, candidate_fingerprint,
+                        operator_action_id, committed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        candidate.bootstrap_id,
+                        candidate.schema_version,
+                        candidate.execution_domain_scope,
+                        candidate.account_scope,
+                        candidate.portfolio_id,
+                        candidate.reconciliation_snapshot_id,
+                        candidate.reconciliation_report_hash,
+                        candidate.broker_snapshot_hash,
+                        candidate.legacy_snapshot_hash,
+                        candidate.database_path,
+                        candidate.database_identity,
+                        descriptor.device,
+                        descriptor.inode,
+                        utc_to_text(candidate.effective_at),
+                        candidate.canonical_payload(),
+                        candidate.fingerprint(),
+                        action_id,
+                        utc_to_text(committed_at),
+                    ),
+                )
+                for authentication in evidence.authentication_receipts:
+                    await conn.execute(
+                        """
+                        INSERT INTO exact_bootstrap_evidence_consumptions(
+                            receipt_id,bootstrap_id,artifact_kind,producer_id,
+                            artifact_sha256,runtime_fingerprint,account_scope,consumed_at
+                        ) VALUES (?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            authentication.receipt_id,
+                            candidate.bootstrap_id,
+                            authentication.artifact_kind,
+                            authentication.producer_id,
+                            authentication.artifact_sha256,
+                            authentication.runtime_fingerprint,
+                            authentication.account_scope,
+                            utc_to_text(committed_at),
+                        ),
+                    )
+                if existing_account is None:
+                    await conn.execute(
+                        """
+                        INSERT INTO paper_account_settlement_state(
+                            portfolio_id, cash_text, realized_pnl_text, daily_pnl_text,
+                            daily_pnl_baseline_text, daily_pnl_date, updated_at,
+                            source_settlement_id, origin_bootstrap_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                        """,
+                        (
+                            candidate.portfolio_id,
+                            decimal_to_fixed(account.cash),
+                            decimal_to_fixed(account.realized_pnl),
+                            decimal_to_fixed(account.daily_pnl),
+                            decimal_to_fixed(account.daily_pnl_baseline),
+                            account.daily_pnl_date.isoformat(),
+                            utc_to_text(committed_at),
+                            candidate.bootstrap_id,
+                        ),
+                    )
+                else:
+                    adopted = await conn.execute(
+                        """
+                        UPDATE paper_account_settlement_state
+                        SET origin_bootstrap_id = ?
+                        WHERE portfolio_id = ? AND origin_bootstrap_id IS NULL
+                        """,
+                        (candidate.bootstrap_id, candidate.portfolio_id),
+                    )
+                    if adopted.rowcount != 1:
+                        raise ExactStateBootstrapError(
+                            "exact account adoption lost its lineage race"
+                        )
+                if not existing_position_rows:
+                    for position in candidate.positions:
+                        await conn.execute(
+                            """
+                        INSERT INTO paper_position_settlement_state(
+                            portfolio_id, symbol, cost_basis_text, mark_price_text,
+                            source_settlement_id, updated_at, origin_bootstrap_id
+                        ) VALUES (?, ?, ?, ?, NULL, ?, ?)
+                        """,
+                            (
+                                candidate.portfolio_id,
+                                position.symbol,
+                                decimal_to_fixed(position.cost_basis),
+                                decimal_to_fixed(position.mark_price),
+                                utc_to_text(committed_at),
+                                candidate.bootstrap_id,
+                            ),
+                        )
+                else:
+                    adopted = await conn.execute(
+                        """
+                        UPDATE paper_position_settlement_state
+                        SET origin_bootstrap_id = ?
+                        WHERE portfolio_id = ? AND origin_bootstrap_id IS NULL
+                        """,
+                        (candidate.bootstrap_id, candidate.portfolio_id),
+                    )
+                    if adopted.rowcount != len(expected_position_rows):
+                        raise ExactStateBootstrapError(
+                            "exact position adoption lost its lineage race"
+                        )
+                final_descriptor = await self._sqlite_descriptor_identity(conn)
+                if final_descriptor != descriptor:
+                    raise ExactStateBootstrapError(
+                        "bootstrap database descriptor changed before commit"
+                    )
+                journal_guard.assert_unchanged()
+                await conn.commit()
+                try:
+                    self._paper_settlement_fault("AFTER_EXACT_BOOTSTRAP_COMMIT")
+                    self._verify_exact_state_backup(
+                        candidate,
+                        evidence,
+                        backup_receipt,
+                        descriptor,
+                    )
+                except BaseException as exc:
+                    raise ExactStateBootstrapCommittedBackupInvalid(
+                        bootstrap_id=candidate.bootstrap_id,
+                        candidate_fingerprint=candidate.fingerprint(),
+                        detail=str(exc),
+                    ) from exc
+                return ExactStateBootstrapReceipt(
+                    bootstrap_id=candidate.bootstrap_id,
+                    candidate_fingerprint=candidate.fingerprint(),
+                    operator_action_id=action_id,
+                    database_device=descriptor.device,
+                    database_inode=descriptor.inode,
+                    committed_at=committed_at,
+                )
+            except BaseException:
+                if getattr(conn, "in_transaction", False):
+                    await conn.rollback()
+                raise
 
     async def get_paper_account_settlement_state(
         self,
@@ -2215,13 +2994,22 @@ class AsyncTradingDatabase:
                             """
                             INSERT INTO paper_position_settlement_state (
                                 portfolio_id, symbol, cost_basis_text,
-                                mark_price_text, source_settlement_id, updated_at
-                            ) VALUES (?, ?, ?, ?, NULL, ?)
+                                mark_price_text, source_settlement_id, updated_at,
+                                origin_bootstrap_id
+                            ) VALUES (?, ?, ?, ?, NULL, ?, (
+                                SELECT origin_bootstrap_id
+                                FROM paper_account_settlement_state
+                                WHERE portfolio_id = ?
+                            ))
                             ON CONFLICT(portfolio_id, symbol) DO UPDATE SET
                                 cost_basis_text = excluded.cost_basis_text,
                                 mark_price_text = excluded.mark_price_text,
                                 source_settlement_id = NULL,
-                                updated_at = excluded.updated_at
+                                updated_at = excluded.updated_at,
+                                origin_bootstrap_id = COALESCE(
+                                    paper_position_settlement_state.origin_bootstrap_id,
+                                    excluded.origin_bootstrap_id
+                                )
                             """,
                             (
                                 portfolio_id,
@@ -2233,6 +3021,7 @@ class AsyncTradingDatabase:
                                     else decimal_to_fixed(exact_market_price)
                                 ),
                                 utc_to_text(datetime.now(timezone.utc)),
+                                portfolio_id,
                             ),
                         )
 
@@ -2893,7 +3682,47 @@ class AsyncTradingDatabase:
                 }
             return None
 
-    async def get_positions(self, portfolio_id: str = DEFAULT_PORTFOLIO_ID) -> List[Dict]:
+    def _bootstrap_lineage_matches_runtime(
+        self,
+        *,
+        runtime_contract: Optional[object],
+        descriptor: SQLiteDescriptorIdentity,
+        portfolio_id: str,
+        bootstrap_id: object,
+        bootstrap_portfolio_id: object,
+        execution_domain_scope: object,
+        account_scope: object,
+        database_path: object,
+        database_identity: object,
+        database_device: object,
+        database_inode: object,
+    ) -> bool:
+        """Return true only for lineage sealed to this exact runtime ledger."""
+
+        try:
+            expected_path, expected_identity = self._expected_safety_database(
+                runtime_contract=runtime_contract
+            )
+        except SafetyAllocationSnapshotError:
+            return False
+        return not (
+            bootstrap_id is None
+            or bootstrap_portfolio_id != portfolio_id
+            or execution_domain_scope
+            != getattr(runtime_contract, "safety_execution_domain_scope", None)
+            or account_scope != getattr(runtime_contract, "safety_account_scope", None)
+            or database_path != str(expected_path)
+            or database_identity != expected_identity
+            or database_device != descriptor.device
+            or database_inode != descriptor.inode
+        )
+
+    async def get_positions(
+        self,
+        portfolio_id: str = DEFAULT_PORTFOLIO_ID,
+        *,
+        runtime_contract: Optional[object] = None,
+    ) -> List[Dict]:
         """Get all current positions for a portfolio."""
         portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
         async with self.get_connection() as conn:
@@ -2901,17 +3730,25 @@ class AsyncTradingDatabase:
                 """
                 SELECT p.symbol, p.quantity, p.avg_cost, p.market_price,
                        s.mark_price_text, s.source_settlement_id,
-                       settled.settlement_id, settled.portfolio_id, settled.symbol
+                       s.origin_bootstrap_id,
+                       settled.settlement_id, settled.portfolio_id, settled.symbol,
+                       bootstrap.bootstrap_id, bootstrap.portfolio_id,
+                       bootstrap.execution_domain_scope, bootstrap.account_scope,
+                       bootstrap.database_path, bootstrap.database_identity,
+                       bootstrap.database_device, bootstrap.database_inode
                 FROM positions AS p
                 LEFT JOIN paper_position_settlement_state AS s
                   ON s.portfolio_id = p.portfolio_id AND s.symbol = p.symbol
                 LEFT JOIN paper_reduction_settlements AS settled
                   ON settled.settlement_id = s.source_settlement_id
+                LEFT JOIN paper_state_bootstraps AS bootstrap
+                  ON bootstrap.bootstrap_id = s.origin_bootstrap_id
                 WHERE p.portfolio_id = ? AND p.quantity != 0
             """,
                 (portfolio_id,),
             )
             rows = await cursor.fetchall()
+            descriptor = await self._sqlite_descriptor_identity(conn)
             positions = []
             for row in rows:
                 exact_mark = (
@@ -2920,11 +3757,27 @@ class AsyncTradingDatabase:
                 if exact_mark is not None:
                     _strict_decimal(exact_mark, "position exact mark", positive=True)
                 if row[5] is not None and (
-                    row[6] != row[5] or row[7] != portfolio_id or row[8] != row[0]
+                    row[7] != row[5] or row[8] != portfolio_id or row[9] != row[0]
                 ):
                     raise PaperTerminalSettlementError(
                         "paper position mark settlement lineage cannot be resolved"
                     )
+                bootstrap_lineage_valid = (
+                    exact_mark is not None
+                    and self._bootstrap_lineage_matches_runtime(
+                        runtime_contract=runtime_contract,
+                        descriptor=descriptor,
+                        portfolio_id=portfolio_id,
+                        bootstrap_id=row[10],
+                        bootstrap_portfolio_id=row[11],
+                        execution_domain_scope=row[12],
+                        account_scope=row[13],
+                        database_path=row[14],
+                        database_identity=row[15],
+                        database_device=row[16],
+                        database_inode=row[17],
+                    )
+                )
                 positions.append(
                     {
                         "symbol": row[0],
@@ -2933,6 +3786,8 @@ class AsyncTradingDatabase:
                         "market_price": row[3],
                         "market_price_exact": exact_mark,
                         "mark_source_settlement_id": row[5],
+                        "origin_bootstrap_id": row[6],
+                        "bootstrap_lineage_valid": bootstrap_lineage_valid,
                     }
                 )
             return positions
@@ -3491,7 +4346,12 @@ class AsyncTradingDatabase:
                 for row in rows
             ]
 
-    async def get_account_info(self, portfolio_id: str = DEFAULT_PORTFOLIO_ID) -> Dict:
+    async def get_account_info(
+        self,
+        portfolio_id: str = DEFAULT_PORTFOLIO_ID,
+        *,
+        runtime_contract: Optional[object] = None,
+    ) -> Dict:
         """Get current account information for a portfolio."""
         portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
         async with self.get_connection() as conn:
@@ -3501,22 +4361,30 @@ class AsyncTradingDatabase:
                        a.unrealized_pnl, a.timestamp,
                        s.cash_text, s.realized_pnl_text, s.daily_pnl_text,
                        s.daily_pnl_baseline_text, s.source_settlement_id,
-                       s.daily_pnl_date,
-                       settled.settlement_id, settled.portfolio_id
+                       s.daily_pnl_date, s.origin_bootstrap_id,
+                       settled.settlement_id, settled.portfolio_id,
+                       bootstrap.bootstrap_id, bootstrap.portfolio_id,
+                       bootstrap.execution_domain_scope, bootstrap.account_scope,
+                       bootstrap.database_path, bootstrap.database_identity,
+                       bootstrap.database_device, bootstrap.database_inode
                 FROM account AS a
                 LEFT JOIN paper_account_settlement_state AS s
                   ON s.portfolio_id = a.portfolio_id
                 LEFT JOIN paper_reduction_settlements AS settled
                   ON settled.settlement_id = s.source_settlement_id
+                LEFT JOIN paper_state_bootstraps AS bootstrap
+                  ON bootstrap.bootstrap_id = s.origin_bootstrap_id
                 WHERE a.portfolio_id = ?
             """,
                 (portfolio_id,),
             )
             row = await cursor.fetchone()
             if row:
+                descriptor = await self._sqlite_descriptor_identity(conn)
                 exact_values = row[6:10]
                 source_settlement_id = row[10]
                 exact_daily_pnl_date_text = row[11]
+                origin_bootstrap_id = row[12]
                 if any(value is None for value in exact_values):
                     if not all(value is None for value in exact_values):
                         raise PaperTerminalSettlementError(
@@ -3560,14 +4428,29 @@ class AsyncTradingDatabase:
                         raise PaperTerminalSettlementError(
                             "exact paper account state is malformed"
                         ) from exc
-                if source_settlement_id is not None and row[12] != source_settlement_id:
+                if source_settlement_id is not None and row[13] != source_settlement_id:
                     raise PaperTerminalSettlementError(
                         "paper account settlement lineage cannot be resolved"
                     )
-                if source_settlement_id is not None and row[13] != portfolio_id:
+                if source_settlement_id is not None and row[14] != portfolio_id:
                     raise PaperTerminalSettlementError(
                         "paper account settlement lineage belongs to another portfolio"
                     )
+                bootstrap_lineage_valid = all(
+                    value is not None for value in exact_values
+                ) and self._bootstrap_lineage_matches_runtime(
+                    runtime_contract=runtime_contract,
+                    descriptor=descriptor,
+                    portfolio_id=portfolio_id,
+                    bootstrap_id=row[15],
+                    bootstrap_portfolio_id=row[16],
+                    execution_domain_scope=row[17],
+                    account_scope=row[18],
+                    database_path=row[19],
+                    database_identity=row[20],
+                    database_device=row[21],
+                    database_inode=row[22],
+                )
                 return {
                     "cash": row[0],
                     "equity": row[1],
@@ -3581,6 +4464,8 @@ class AsyncTradingDatabase:
                     "daily_pnl_baseline_exact": exact_daily_pnl_baseline,
                     "daily_pnl_date_exact": exact_daily_pnl_date,
                     "source_settlement_id": source_settlement_id,
+                    "origin_bootstrap_id": origin_bootstrap_id,
+                    "bootstrap_lineage_valid": bootstrap_lineage_valid,
                 }
             return {}
 
@@ -3899,12 +4784,26 @@ class AsyncTradingDatabase:
         async with self.get_connection() as conn:
             await conn.execute(
                 """
-                INSERT OR REPLACE INTO portfolios
+                INSERT INTO portfolios
                     (id, name, starting_cash, symbols, active,
                      max_position_pct, max_daily_loss_pct, max_open_positions,
                      stop_loss_pct, trailing_stop_pct, use_trailing_stop,
                      enabled_strategies, min_confidence, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    starting_cash = excluded.starting_cash,
+                    symbols = excluded.symbols,
+                    active = excluded.active,
+                    max_position_pct = excluded.max_position_pct,
+                    max_daily_loss_pct = excluded.max_daily_loss_pct,
+                    max_open_positions = excluded.max_open_positions,
+                    stop_loss_pct = excluded.stop_loss_pct,
+                    trailing_stop_pct = excluded.trailing_stop_pct,
+                    use_trailing_stop = excluded.use_trailing_stop,
+                    enabled_strategies = excluded.enabled_strategies,
+                    min_confidence = excluded.min_confidence,
+                    updated_at = CURRENT_TIMESTAMP
             """,
                 (
                     portfolio_data["id"],

@@ -1,23 +1,79 @@
 import asyncio
+import copy
+import json
+import pickle
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import MappingProxyType, SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from robo_trader.clients import subprocess_ibkr_client as client_module
-from robo_trader.clients.subprocess_ibkr_client import SubprocessIBKRClient
+from robo_trader.clients.subprocess_ibkr_client import SubprocessIBKRClient, _WorkerGeneration
+from robo_trader.reconciliation import ibkr_adapter as adapter_module
 from robo_trader.reconciliation.broker import assert_read_only_provider_surface
 from robo_trader.reconciliation.errors import BrokerEvidenceError
 from robo_trader.reconciliation.ibkr_adapter import (
+    BrokerSnapshotProducerResult,
     IBKRDiagnosticSnapshotProvider,
+    ProtectiveQuoteSourceCapability,
+    ProtectiveQuoteSourceIdentity,
+    assert_factory_owned_protective_quote_source,
+    assert_producer_owned_broker_snapshot_result,
     build_diagnostic_provider,
+    normalized_snapshot_from_transport,
     snapshot_from_transport,
 )
+from robo_trader.reconciliation.models import BrokerExecutionScope
 
 ACCOUNT = "DU_TEST_4567"
+ACCOUNT_SCOPE = "acct_v1_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 NOW = datetime.now(timezone.utc).replace(microsecond=0)
+RUNTIME_FINGERPRINT = "runtime-v1-" + ("a" * 64)
+
+
+class _ConsumingBrokerReceiver:
+    def __init__(self):
+        self.result = None
+
+    def receive_broker_snapshot_producer_result(self, result):
+        self.result = assert_producer_owned_broker_snapshot_result(result, receiver=self)
+        return "sealed-broker-evidence"
+
+
+class _NonConsumingBrokerReceiver:
+    def receive_broker_snapshot_producer_result(self, result):
+        return "untrusted"
+
+
+async def _factory_provider(monkeypatch, *, payload=None):
+    transport = SubprocessIBKRClient()
+    generation = _WorkerGeneration("quote-generation-1", Mock())
+    transport._generation = generation
+    transport._connected = True
+    transport._connection_identity = ("127.0.0.1", 4002, 997, True)
+    transport._connection_generation_id = generation.generation_id
+    transport.start = AsyncMock()
+    transport.connect = AsyncMock(return_value=True)
+    transport.get_broker_snapshot = AsyncMock(
+        return_value=(
+            _payload(now=datetime.now(timezone.utc).replace(microsecond=0))
+            if payload is None
+            else payload
+        )
+    )
+    transport.get_protective_quotes = AsyncMock(return_value=())
+    transport.stop = AsyncMock()
+    monkeypatch.setattr(
+        adapter_module,
+        "assert_validated_runtime_safety_context",
+        lambda runtime: runtime,
+    )
+    runtime = _runtime()
+    provider = await build_diagnostic_provider(runtime, transport_factory=lambda: transport)
+    return provider, transport, runtime
 
 
 def _contract():
@@ -33,13 +89,19 @@ def _contract():
     }
 
 
-def _payload():
+def _payload(*, now: datetime = NOW):
     return {
-        "snapshot_schema_version": 1,
+        "snapshot_schema_version": 3,
         "account": ACCOUNT,
-        "broker_time_before": (NOW - timedelta(seconds=2)).isoformat(),
-        "broker_time_after": NOW.isoformat(),
-        "retrieved_at": NOW.isoformat(),
+        "account_type": "paper",
+        "account_structure": "INDIVIDUAL",
+        "base_currency": "USD",
+        "total_cash": "25000.5",
+        "buying_power": "999999",
+        "account_observed_at": now.isoformat(),
+        "broker_time_before": (now - timedelta(seconds=2)).isoformat(),
+        "broker_time_after": now.isoformat(),
+        "retrieved_at": now.isoformat(),
         "positions": [
             {
                 "account": ACCOUNT,
@@ -51,6 +113,7 @@ def _payload():
         "balances": [
             {"tag": "NetLiquidation", "currency": "USD", "value": "100000"},
             {"tag": "TotalCashValue", "currency": "USD", "value": "25000.5"},
+            {"tag": "BuyingPower", "currency": "USD", "value": "999999"},
         ],
         "open_orders": [
             {
@@ -69,13 +132,14 @@ def _payload():
                 "limit_price": "120.25",
                 "stop_price": None,
                 "avg_fill_price": None,
-                "last_status_at": NOW.isoformat(),
+                "last_status_at": now.isoformat(),
                 "unavailable": {
                     "stop_price": "not supplied for this order type",
                     "avg_fill_price": "order has no fills",
                 },
             }
         ],
+        "completed_orders": [],
         "executions": [
             {
                 "account": ACCOUNT,
@@ -88,22 +152,77 @@ def _payload():
                 "quantity": "1.25",
                 "price": "120.25",
                 "average_price": "120.25",
-                "executed_at": (NOW - timedelta(minutes=1)).isoformat(),
+                "executed_at": (now - timedelta(minutes=1)).isoformat(),
                 "execution_exchange": "NASDAQ",
-                "commission": None,
-                "commission_currency": None,
-                "realized_pnl": None,
-                "unavailable": {
-                    "commission": "not returned by the bounded execution request",
-                    "commission_currency": "not returned by the bounded execution request",
-                    "realized_pnl": "not returned by the bounded execution request",
-                },
+                "commission": "1.23",
+                "commission_currency": "USD",
+                "realized_pnl": "4.56",
+                "unavailable": {},
             }
         ],
+        "completeness": {
+            "account": True,
+            "positions": True,
+            "open_orders": True,
+            "completed_orders": True,
+            "executions": True,
+            "commissions": True,
+        },
+        "collection_evidence": [
+            {
+                "collection": collection,
+                "evidence_id": f"broker-collection-v1-{index:064x}",
+                "observed_at": now.isoformat(),
+                "result_count": count,
+                "scope": (
+                    {
+                        "kind": "ibkr_current_retained_completed_orders",
+                        "api_method": "reqCompletedOrders",
+                        "api_only": False,
+                        "client_scope": "api_and_manual_orders_visible_to_current_tws_session",
+                        "request_count": 2,
+                        "stability_check": "identical_second_read",
+                        "retention_scope": "current_tws_or_gateway_retained_set",
+                        "full_history": False,
+                        "request_started_at": (
+                            now - timedelta(seconds=1, microseconds=800000)
+                        ).isoformat(),
+                        "request_completed_at": (
+                            now - timedelta(seconds=1, microseconds=700000)
+                        ).isoformat(),
+                        "verification_started_at": (
+                            now - timedelta(microseconds=200000)
+                        ).isoformat(),
+                        "verification_completed_at": (
+                            now - timedelta(microseconds=100000)
+                        ).isoformat(),
+                        "broker_time_before": (now - timedelta(seconds=2)).isoformat(),
+                        "broker_time_after": now.isoformat(),
+                    }
+                    if collection == "completed_orders"
+                    else None
+                ),
+            }
+            for index, (collection, count) in enumerate(
+                (
+                    ("positions", 1),
+                    ("open_orders", 1),
+                    ("completed_orders", 0),
+                    ("executions", 1),
+                    ("commissions", 1),
+                ),
+                start=1,
+            )
+        ],
         "execution_scope": {
-            "kind": "bounded_execution_filter",
-            "start_at": (NOW - timedelta(hours=24, seconds=2)).isoformat(),
-            "end_at": NOW.isoformat(),
+            "kind": "broker_date_since_midnight",
+            "start_at": (now - timedelta(seconds=2))
+            .replace(hour=0, minute=0, second=0, microsecond=0)
+            .isoformat(),
+            "end_at": now.isoformat(),
+            "retention_scope": "ibkr_gateway_broker_date_since_midnight",
+            "full_history": False,
+            "commission_scope": "matching_callbacks_for_returned_executions",
         },
     }
 
@@ -113,8 +232,10 @@ def test_transport_payload_maps_to_immutable_reconciliation_models():
 
     assert snapshot.account_alias == "***4567"
     assert snapshot.execution_scope.public_dict() == {
-        "kind": "bounded_execution_filter",
-        "start_at": (NOW - timedelta(hours=24, seconds=2)).isoformat(),
+        "kind": "broker_date_since_midnight",
+        "start_at": (NOW - timedelta(seconds=2))
+        .replace(hour=0, minute=0, second=0, microsecond=0)
+        .isoformat(),
         "end_at": NOW.isoformat(),
     }
     assert snapshot.positions[0].quantity == Decimal("10.5")
@@ -122,6 +243,7 @@ def test_transport_payload_maps_to_immutable_reconciliation_models():
     assert snapshot.balances == {
         "NetLiquidation:USD": Decimal("100000"),
         "TotalCashValue:USD": Decimal("25000.5"),
+        "BuyingPower:USD": Decimal("999999"),
     }
     assert isinstance(snapshot.balances, MappingProxyType)
     assert snapshot.open_orders[0].order_id == "101"
@@ -135,12 +257,8 @@ def test_transport_payload_maps_to_immutable_reconciliation_models():
     }
     assert isinstance(snapshot.open_orders[0].unavailable, MappingProxyType)
     assert snapshot.recent_executions[0].execution_id == "0001.01"
-    assert snapshot.recent_executions[0].commission is None
-    assert snapshot.recent_executions[0].unavailable == {
-        "commission": "not returned by the bounded execution request",
-        "commission_currency": "not returned by the bounded execution request",
-        "realized_pnl": "not returned by the bounded execution request",
-    }
+    assert snapshot.recent_executions[0].commission == Decimal("1.23")
+    assert snapshot.recent_executions[0].unavailable == {}
 
     with pytest.raises(TypeError):
         snapshot.balances["BuyingPower:USD"] = Decimal("1")
@@ -160,6 +278,339 @@ def test_adapter_accepts_worker_canonical_small_fixed_point_and_rejects_exponent
         snapshot_from_transport(payload, expected_account=ACCOUNT)
 
 
+def test_complete_transport_maps_to_normalized_snapshot():
+    snapshot = normalized_snapshot_from_transport(
+        _payload(),
+        expected_account=ACCOUNT,
+        account_scope=ACCOUNT_SCOPE,
+        max_age_seconds=30.0,
+        now=NOW + timedelta(seconds=1),
+    )
+    assert snapshot.account.account_type == "paper"
+    assert snapshot.account.base_currency == "USD"
+    assert snapshot.account.total_cash == Decimal("25000.5")
+    assert snapshot.account.buying_power == Decimal("999999")
+    assert snapshot.completeness.complete is True
+    assert snapshot.completed_orders == ()
+    assert snapshot.executions[0].commission == Decimal("1.23")
+    assert ACCOUNT not in snapshot.canonical_payload()
+
+
+def test_zero_broker_collections_require_positive_zero_count_evidence():
+    payload = _payload()
+    payload["positions"] = []
+    payload["open_orders"] = []
+    for evidence in payload["collection_evidence"]:
+        if evidence["collection"] in {"positions", "open_orders"}:
+            evidence["result_count"] = 0
+
+    snapshot = normalized_snapshot_from_transport(
+        payload,
+        expected_account=ACCOUNT,
+        account_scope=ACCOUNT_SCOPE,
+        max_age_seconds=30.0,
+        now=NOW + timedelta(seconds=1),
+    )
+    assert snapshot.positions == ()
+    assert snapshot.open_orders == ()
+
+    payload["collection_evidence"] = [
+        evidence
+        for evidence in payload["collection_evidence"]
+        if evidence["collection"] != "positions"
+    ]
+    with pytest.raises(BrokerEvidenceError, match="incomplete"):
+        normalized_snapshot_from_transport(
+            payload,
+            expected_account=ACCOUNT,
+            account_scope=ACCOUNT_SCOPE,
+            max_age_seconds=30.0,
+            now=NOW + timedelta(seconds=1),
+        )
+
+
+def test_completed_order_transport_maps_to_completed_domain_collection():
+    payload = _payload()
+    completed = payload["open_orders"][0].copy()
+    completed.update(
+        broker_order_id=202,
+        permanent_id=602,
+        status="Filled",
+        filled_quantity="2",
+        remaining_quantity="0",
+        avg_fill_price="120.25",
+        unavailable={"stop_price": "not supplied for this order type"},
+    )
+    payload["completed_orders"] = [completed]
+    for evidence in payload["collection_evidence"]:
+        if evidence["collection"] == "completed_orders":
+            evidence["result_count"] = 1
+
+    snapshot = normalized_snapshot_from_transport(
+        payload,
+        expected_account=ACCOUNT,
+        account_scope=ACCOUNT_SCOPE,
+        max_age_seconds=30.0,
+        now=NOW + timedelta(seconds=1),
+    )
+
+    assert len(snapshot.completed_orders) == 1
+    assert snapshot.completed_orders[0].broker_order_id == 202
+    assert snapshot.completed_orders[0].status == "Filled"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload["completeness"].update(commissions=False),
+        lambda payload: payload["executions"][0].update(commission=None),
+        lambda payload: payload["collection_evidence"][0].update(result_count=0),
+        lambda payload: payload.update(account="DU_OTHER_0000"),
+    ],
+)
+def test_normalized_mapper_rejects_partial_or_wrong_account_evidence(mutate):
+    payload = _payload()
+    mutate(payload)
+
+    with pytest.raises(BrokerEvidenceError):
+        normalized_snapshot_from_transport(
+            payload,
+            expected_account=ACCOUNT,
+            account_scope=ACCOUNT_SCOPE,
+            max_age_seconds=30.0,
+            now=NOW + timedelta(seconds=1),
+        )
+
+
+def test_normalized_mapper_rejects_stale_transport_evidence():
+    with pytest.raises(BrokerEvidenceError, match="stale"):
+        normalized_snapshot_from_transport(
+            _payload(),
+            expected_account=ACCOUNT,
+            account_scope=ACCOUNT_SCOPE,
+            max_age_seconds=30.0,
+            now=NOW + timedelta(minutes=5),
+        )
+
+
+@pytest.mark.asyncio
+async def test_factory_provider_hands_raw_result_only_to_exact_consuming_receiver(monkeypatch):
+    provider, transport, _ = await _factory_provider(monkeypatch)
+    receiver = _ConsumingBrokerReceiver()
+
+    received = await provider.produce_normalized_snapshot(
+        receiver=receiver,
+        max_age_seconds=30.0,
+    )
+    result = receiver.result
+
+    assert received == "sealed-broker-evidence"
+    assert type(result) is BrokerSnapshotProducerResult
+    assert result.snapshot.account.account_scope == ACCOUNT_SCOPE
+    assert result.purpose == "bootstrap-broker-signing-v1"
+    canonical = json.loads(result.canonical_payload)
+    assert canonical["purpose"] == "bootstrap-broker-signing-v1"
+    assert canonical["completed_order_collection_scope"]["client_scope"] == (
+        "api_and_manual_orders_visible_to_current_tws_session"
+    )
+    assert canonical["completed_order_collection_scope"]["request_count"] == 2
+    assert canonical["completed_order_collection_scope"]["full_history"] is False
+    assert canonical["execution_collection_scope"]["kind"] == "broker_date_since_midnight"
+    assert canonical["execution_collection_scope"]["full_history"] is False
+    assert canonical["execution_collection_scope"]["commission_scope"] == (
+        "matching_callbacks_for_returned_executions"
+    )
+    assert ACCOUNT not in result.canonical_payload
+    with pytest.raises(BrokerEvidenceError, match="already consumed"):
+        assert_producer_owned_broker_snapshot_result(result, receiver=receiver)
+    transport.get_broker_snapshot.assert_awaited_once_with(
+        ACCOUNT,
+        max_age_seconds=30.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_producer_result_rejects_copy_replace_pickle_replay_and_nonconsuming_receiver(
+    monkeypatch,
+):
+    provider, _, _ = await _factory_provider(monkeypatch)
+    receiver = _ConsumingBrokerReceiver()
+    await provider.produce_normalized_snapshot(
+        receiver=receiver,
+        max_age_seconds=30.0,
+    )
+    result = receiver.result
+
+    with pytest.raises(TypeError):
+        BrokerSnapshotProducerResult(snapshot=result.snapshot)
+    with pytest.raises(TypeError):
+        copy.copy(result)
+    with pytest.raises(TypeError):
+        copy.deepcopy(result)
+    with pytest.raises(BrokerEvidenceError, match="already consumed"):
+        replace(result)
+    with pytest.raises(TypeError):
+        pickle.dumps(result)
+
+    with pytest.raises(BrokerEvidenceError, match="already consumed"):
+        assert_producer_owned_broker_snapshot_result(result, receiver=receiver)
+
+    provider, _, _ = await _factory_provider(monkeypatch)
+    with pytest.raises(BrokerEvidenceError, match="did not authenticate"):
+        await provider.produce_normalized_snapshot(
+            receiver=_NonConsumingBrokerReceiver(),
+            max_age_seconds=30.0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_public_protocol_shaped_provider_cannot_mint_broker_result():
+    transport = SimpleNamespace(
+        get_broker_snapshot=AsyncMock(return_value=_payload()),
+        stop=AsyncMock(),
+    )
+    provider = IBKRDiagnosticSnapshotProvider(
+        transport,
+        expected_account=ACCOUNT,
+        account_scope=ACCOUNT_SCOPE,
+    )
+
+    with pytest.raises(BrokerEvidenceError, match="factory-owned"):
+        await provider.produce_normalized_snapshot(
+            receiver=_ConsumingBrokerReceiver(),
+            max_age_seconds=30.0,
+        )
+    transport.get_broker_snapshot.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_factory_quote_source_is_narrow_runtime_and_generation_bound(monkeypatch):
+    provider, transport, runtime = await _factory_provider(monkeypatch)
+
+    source = provider.issue_protective_quote_source(
+        runtime_contract=runtime.runtime_contract,
+    )
+    identity = assert_factory_owned_protective_quote_source(
+        source,
+        runtime_contract=runtime.runtime_contract,
+    )
+
+    assert type(source) is ProtectiveQuoteSourceCapability
+    assert type(identity) is ProtectiveQuoteSourceIdentity
+    assert identity.runtime_fingerprint == RUNTIME_FINGERPRINT
+    assert identity.transport_generation == "quote-generation-1"
+    assert source.is_connected is True
+    assert await source.get_protective_quotes(("AAPL",), active_symbols=("AAPL",)) == ()
+    transport.get_protective_quotes.assert_awaited_once_with(
+        ("AAPL",),
+        active_symbols=("AAPL",),
+    )
+    public_names = {name for name in dir(source) if not name.startswith("_")}
+    assert public_names == {"get_protective_quotes", "is_connected"}
+
+
+@pytest.mark.asyncio
+async def test_quote_source_rejects_copy_wrong_runtime_reconnect_and_cleanup(monkeypatch):
+    provider, transport, runtime = await _factory_provider(monkeypatch)
+    source = provider.issue_protective_quote_source(
+        runtime_contract=runtime.runtime_contract,
+    )
+
+    with pytest.raises(TypeError):
+        copy.copy(source)
+    with pytest.raises(TypeError):
+        copy.deepcopy(source)
+    with pytest.raises(TypeError):
+        pickle.dumps(source)
+    wrong_runtime = SimpleNamespace(fingerprint=RUNTIME_FINGERPRINT)
+    with pytest.raises(BrokerEvidenceError, match="factory-owned"):
+        assert_factory_owned_protective_quote_source(
+            source,
+            runtime_contract=wrong_runtime,
+        )
+
+    replacement = _WorkerGeneration("quote-generation-2", Mock())
+    transport._generation = replacement
+    transport._connection_generation_id = replacement.generation_id
+    with pytest.raises(BrokerEvidenceError, match="generation"):
+        assert_factory_owned_protective_quote_source(
+            source,
+            runtime_contract=runtime.runtime_contract,
+        )
+
+    provider, _, runtime = await _factory_provider(monkeypatch)
+    source = provider.issue_protective_quote_source(
+        runtime_contract=runtime.runtime_contract,
+    )
+    await provider.close()
+    with pytest.raises(BrokerEvidenceError, match="factory-owned"):
+        assert_factory_owned_protective_quote_source(
+            source,
+            runtime_contract=runtime.runtime_contract,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda scope: scope.update(api_only=True),
+        lambda scope: scope.update(client_scope="all_clients"),
+        lambda scope: scope.update(full_history=True),
+        lambda scope: scope.update(retention_scope="full_history"),
+        lambda scope: scope.update(api_method="reqOpenOrders"),
+        lambda scope: scope.update(request_count=1),
+        lambda scope: scope.update(stability_check="none"),
+        lambda scope: scope.update(verification_started_at=scope["request_started_at"]),
+        lambda scope: scope.pop("broker_time_before"),
+    ],
+)
+def test_completed_order_scope_rejects_overclaim_and_bound_tampering(mutate):
+    payload = _payload()
+    scope = next(
+        evidence["scope"]
+        for evidence in payload["collection_evidence"]
+        if evidence["collection"] == "completed_orders"
+    )
+    mutate(scope)
+
+    with pytest.raises(BrokerEvidenceError):
+        normalized_snapshot_from_transport(
+            payload,
+            expected_account=ACCOUNT,
+            account_scope=ACCOUNT_SCOPE,
+            max_age_seconds=30.0,
+            now=NOW + timedelta(seconds=1),
+        )
+
+
+def test_execution_scope_accepts_honest_since_midnight_and_rejects_overclaim():
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    midnight = now.replace(hour=0, minute=0, second=0)
+    scope = BrokerExecutionScope(
+        kind="broker_date_since_midnight",
+        start_at=midnight,
+        end_at=now,
+    )
+    assert scope.start_at == midnight
+
+    invalid = (
+        (midnight + timedelta(seconds=1), now),
+        (midnight, midnight - timedelta(seconds=1)),
+        (midnight, midnight + timedelta(days=1)),
+        (
+            midnight + timedelta(days=1),
+            midnight + timedelta(days=1, seconds=1),
+        ),
+    )
+    for start_at, end_at in invalid:
+        with pytest.raises(BrokerEvidenceError):
+            BrokerExecutionScope(
+                kind="broker_date_since_midnight",
+                start_at=start_at,
+                end_at=end_at,
+            )
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -168,6 +619,9 @@ def test_adapter_accepts_worker_canonical_small_fixed_point_and_rejects_exponent
         lambda payload: payload["positions"][0].update(extra="drift"),
         lambda payload: payload["balances"].append(payload["balances"][0].copy()),
         lambda payload: payload["execution_scope"].update(kind="unbounded"),
+        lambda payload: payload["execution_scope"].update(full_history=True),
+        lambda payload: payload["execution_scope"].update(retention_scope="full_history"),
+        lambda payload: payload["execution_scope"].update(commission_scope="all_history"),
         lambda payload: payload["execution_scope"].update(
             start_at=(NOW - timedelta(days=2)).isoformat()
         ),
@@ -237,6 +691,10 @@ async def test_provider_rejects_changed_expected_account_without_transport_call(
 
 def _runtime():
     return SimpleNamespace(
+        runtime_contract=SimpleNamespace(
+            safety_account_scope=ACCOUNT_SCOPE,
+            fingerprint=RUNTIME_FINGERPRINT,
+        ),
         diagnostic_connection=SimpleNamespace(
             host="127.0.0.1",
             port=4002,

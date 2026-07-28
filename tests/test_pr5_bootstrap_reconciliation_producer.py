@@ -1,0 +1,968 @@
+from __future__ import annotations
+
+import hashlib
+import inspect
+import json
+import os
+import pickle
+import sqlite3
+from contextlib import contextmanager
+from copy import copy, deepcopy
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from pathlib import Path
+from typing import Any, Callable, cast
+from unittest.mock import patch
+
+import pytest
+
+from robo_trader import bootstrap_evidence_receivers as receiver_module
+from robo_trader.bootstrap_evidence_receivers import ReconciliationBundleIdentity
+from robo_trader.config import RuntimeContract
+from robo_trader.financial_state_bootstrap import inspect_legacy_state
+from robo_trader.reconciliation import bootstrap_producer as producer_module
+from robo_trader.reconciliation.bootstrap_producer import (
+    BOOTSTRAP_RECONCILIATION_STATUS,
+    BootstrapReconciliationBlocked,
+    UnsignedBootstrapReconciliation,
+    assert_and_consume_producer_owned_bootstrap_reconciliation,
+    produce_bootstrap_reconciliation,
+)
+from robo_trader.reconciliation.domain import (
+    BrokerCollectionEvidence,
+    BrokerCollectionKind,
+    BrokerEvidenceCompleteness,
+    BrokerOrderCollection,
+    BrokerOrderSide,
+    NormalizedBrokerAccount,
+    NormalizedBrokerExecution,
+    NormalizedBrokerOrder,
+    NormalizedBrokerPosition,
+    NormalizedBrokerSnapshot,
+)
+from robo_trader.reconciliation.policy import ReconciliationStatus
+from robo_trader.safety import (
+    EvidenceStatus,
+    ExposureEvidence,
+    GateContext,
+    OrderIntent,
+    OrderSide,
+    OrderType,
+    PortfolioAllocationEvidence,
+)
+from robo_trader.safety import ReconciliationStatus as SafetyReconciliationStatus
+from robo_trader.safety import (
+    SafetyJournal,
+    SubmissionDescriptor,
+    TimeInForce,
+    TransportState,
+)
+
+NOW = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+ACCOUNT_SCOPE = "acct_v1_" + "0123456789abcdef" * 4
+OTHER_ACCOUNT_SCOPE = "acct_v1_" + "fedcba9876543210" * 4
+BUNDLE_ID = "bootstrap-evidence-bundle-v1-" + "ab" * 32
+OTHER_BUNDLE_ID = "bootstrap-evidence-bundle-v1-" + "cd" * 32
+
+
+def _legacy_database(path: Path) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.executescript("""
+            CREATE TABLE portfolios (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL
+            );
+            CREATE TABLE positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                avg_cost REAL NOT NULL,
+                market_price REAL,
+                timestamp DATETIME
+            );
+            CREATE TABLE trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                price REAL NOT NULL,
+                notional REAL DEFAULT 0,
+                slippage REAL DEFAULT 0,
+                commission REAL DEFAULT 0,
+                pnl REAL DEFAULT NULL,
+                timestamp DATETIME
+            );
+            CREATE TABLE account (
+                portfolio_id TEXT PRIMARY KEY,
+                cash REAL NOT NULL,
+                equity REAL NOT NULL,
+                daily_pnl REAL DEFAULT 0,
+                realized_pnl REAL DEFAULT 0,
+                unrealized_pnl REAL DEFAULT 0,
+                timestamp DATETIME
+            );
+            CREATE TABLE equity_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id TEXT NOT NULL,
+                date TEXT NOT NULL,
+                equity REAL NOT NULL,
+                cash REAL DEFAULT 0,
+                positions_value REAL DEFAULT 0,
+                realized_pnl REAL DEFAULT 0,
+                unrealized_pnl REAL DEFAULT 0,
+                timestamp DATETIME
+            );
+            INSERT INTO portfolios VALUES ('default', 'Default');
+            INSERT INTO account VALUES
+              ('default', 1000, 1200, 0, 0, 200, '2026-07-28T11:59:00+00:00');
+            INSERT INTO positions(portfolio_id,symbol,quantity,avg_cost,market_price,timestamp)
+            VALUES
+              ('default','AAPL',2,100,110,'2026-07-28T11:59:00+00:00'),
+              ('default','MSFT',3,200,210,'2026-07-28T11:59:00+00:00');
+            INSERT INTO trades(portfolio_id,symbol,side,quantity,price,notional,timestamp)
+            VALUES
+              ('default','AAPL','BUY',2,100,200,'2026-07-28T11:58:00+00:00');
+            INSERT INTO equity_history(
+                portfolio_id,date,equity,cash,positions_value,realized_pnl,unrealized_pnl,timestamp
+            ) VALUES
+              ('default','2026-07-28',1200,1000,200,0,200,
+               '2026-07-28T11:59:00+00:00');
+        """)
+
+
+def _runtime(database: Path) -> RuntimeContract:
+    return RuntimeContract(
+        environment="dev",
+        execution_mode="paper",
+        execution_source="paper_simulator",
+        ibkr_host="127.0.0.1",
+        ibkr_port=4002,
+        ibkr_readonly=True,
+        database_path=str(database),
+        account_alias="***1234",
+        account_type="paper",
+        model_artifact_set="test-models",
+        build_id="test-build",
+        state_namespace="paper",
+        safety_account_scope=ACCOUNT_SCOPE,
+        safety_execution_domain_scope="paper-simulator-v1",
+        safety_journal_path=str(database.with_name("safety-journal.db")),
+    )
+
+
+def _seed_unresolved_safety_reservation(
+    journal_path: Path,
+    *,
+    outcome_unknown: bool,
+) -> None:
+    journal = SafetyJournal(journal_path, clock=lambda: NOW)
+    intent = OrderIntent(
+        execution_domain_scope="paper-simulator-v1",
+        account_scope=ACCOUNT_SCOPE,
+        portfolio_id="default",
+        con_id=265598,
+        symbol="AAPL",
+        side=OrderSide.SELL,
+        quantity=Decimal("1"),
+        account_current_quantity=Decimal("2"),
+        target_quantity=Decimal("1"),
+        portfolio_target_quantity=Decimal("1"),
+        portfolio_current_quantity=Decimal("2"),
+        created_at=NOW,
+        reduce_only=True,
+        reason="bootstrap adversarial fixture",
+        strategy="test",
+    )
+    exposure = ExposureEvidence(
+        execution_domain_scope="paper-simulator-v1",
+        account_scope=ACCOUNT_SCOPE,
+        con_id=265598,
+        symbol="AAPL",
+        position_quantity=Decimal("2"),
+        observed_at=NOW,
+        status=EvidenceStatus.AUTHORITATIVE,
+        source="test-account-snapshot",
+        snapshot_id="test-account-snapshot-1",
+    )
+    allocation = PortfolioAllocationEvidence(
+        execution_domain_scope="paper-simulator-v1",
+        account_scope=ACCOUNT_SCOPE,
+        portfolio_id="default",
+        con_id=265598,
+        symbol="AAPL",
+        position_quantity=Decimal("2"),
+        aggregate_allocated_quantity=Decimal("2"),
+        has_offsetting_allocations=False,
+        observed_at=NOW,
+        status=EvidenceStatus.AUTHORITATIVE,
+        source="test-allocation-ledger",
+        snapshot_id="test-allocation-snapshot-1",
+    )
+    gates = GateContext(
+        execution_domain_scope="paper-simulator-v1",
+        account_scope=ACCOUNT_SCOPE,
+        con_id=265598,
+        evaluated_at=NOW,
+        max_evidence_age_seconds=30,
+        transport_state=TransportState.CONNECTED,
+        reconciliation_status=SafetyReconciliationStatus.PASSED,
+        open_orders_complete=True,
+        open_orders_all_clients=True,
+        open_orders_snapshot_stable=True,
+        open_orders_observed_at=NOW,
+        open_orders_snapshot_id="test-open-orders-snapshot-1",
+        active_order_count=0,
+    )
+    descriptor = SubmissionDescriptor(
+        execution_domain_scope="paper-simulator-v1",
+        account_scope=ACCOUNT_SCOPE,
+        con_id=265598,
+        side=OrderSide.SELL,
+        quantity=Decimal("1"),
+        order_type=OrderType.MARKET,
+        limit_price=None,
+        stop_price=None,
+        time_in_force=TimeInForce.DAY,
+        outside_regular_hours=False,
+        order_ref="bootstrap-test-order",
+    )
+    journal.authorize_submission(
+        "bootstrap-test-intent",
+        intent,
+        exposure,
+        allocation,
+        gates,
+        descriptor,
+    )
+    if outcome_unknown:
+        journal.mark_outcome_unknown("bootstrap-test-intent", intent.fingerprint())
+
+
+def _collection_evidence(
+    kind: BrokerCollectionKind,
+    count: int,
+    observed_at: datetime,
+    *,
+    scope: str,
+) -> BrokerCollectionEvidence:
+    digest = hashlib.sha256(
+        f"{scope}:{kind.value}:{count}:{observed_at.isoformat()}".encode()
+    ).hexdigest()
+    return BrokerCollectionEvidence(
+        account_scope=scope,
+        collection=kind,
+        evidence_id="broker-collection-v1-" + digest,
+        result_count=count,
+        observed_at=observed_at,
+    )
+
+
+def _position(*, scope: str = ACCOUNT_SCOPE) -> NormalizedBrokerPosition:
+    return NormalizedBrokerPosition(
+        account_scope=scope,
+        con_id=265598,
+        symbol="AAPL",
+        currency="USD",
+        signed_quantity=Decimal("2"),
+        average_cost=Decimal("210.125"),
+        observed_at=NOW - timedelta(seconds=1),
+    )
+
+
+def _order(
+    *,
+    scope: str = ACCOUNT_SCOPE,
+    collection: BrokerOrderCollection = BrokerOrderCollection.OPEN,
+) -> NormalizedBrokerOrder:
+    completed = collection is BrokerOrderCollection.COMPLETED
+    return NormalizedBrokerOrder(
+        account_scope=scope,
+        collection=collection,
+        broker_order_id=7,
+        client_id=4,
+        con_id=265598,
+        symbol="AAPL",
+        side=BrokerOrderSide.SELL,
+        total_quantity=Decimal("2"),
+        filled_quantity=Decimal("2") if completed else Decimal("1"),
+        remaining_quantity=Decimal("0") if completed else Decimal("1"),
+        status="Filled" if completed else "Submitted",
+        observed_at=NOW - timedelta(seconds=1),
+        permanent_id=70,
+    )
+
+
+def _execution(*, scope: str = ACCOUNT_SCOPE) -> NormalizedBrokerExecution:
+    return NormalizedBrokerExecution(
+        account_scope=scope,
+        execution_id="0001.abc",
+        con_id=265598,
+        symbol="AAPL",
+        side=BrokerOrderSide.SELL,
+        quantity=Decimal("2"),
+        price=Decimal("215.50"),
+        executed_at=NOW - timedelta(seconds=1),
+        broker_order_id=7,
+        permanent_id=70,
+        commission=Decimal("1.23"),
+        commission_currency="USD",
+    )
+
+
+def _snapshot(
+    *,
+    scope: str = ACCOUNT_SCOPE,
+    positions: tuple[NormalizedBrokerPosition, ...] = (),
+    orders: tuple[NormalizedBrokerOrder, ...] = (),
+    executions: tuple[NormalizedBrokerExecution, ...] = (),
+    complete: bool = True,
+    retrieved_at: datetime = NOW - timedelta(seconds=1),
+) -> NormalizedBrokerSnapshot:
+    completeness = BrokerEvidenceCompleteness(
+        account=True,
+        positions=True,
+        open_orders=True,
+        completed_orders=complete,
+        executions=True,
+        commissions=True,
+    )
+    counts = {
+        BrokerCollectionKind.POSITIONS: len(positions),
+        BrokerCollectionKind.OPEN_ORDERS: sum(
+            order.collection is BrokerOrderCollection.OPEN for order in orders
+        ),
+        BrokerCollectionKind.COMPLETED_ORDERS: sum(
+            order.collection is BrokerOrderCollection.COMPLETED for order in orders
+        ),
+        BrokerCollectionKind.EXECUTIONS: len(executions),
+        BrokerCollectionKind.COMMISSIONS: len(executions),
+    }
+    evidence = tuple(
+        _collection_evidence(kind, counts[kind], retrieved_at, scope=scope)
+        for kind in BrokerCollectionKind
+        if complete or kind is not BrokerCollectionKind.COMPLETED_ORDERS
+    )
+    return NormalizedBrokerSnapshot(
+        account=NormalizedBrokerAccount(
+            account_scope=scope,
+            account_alias="***1234",
+            account_type="paper",
+            base_currency="USD",
+            total_cash=Decimal("25000"),
+            buying_power=Decimal("100000"),
+            observed_at=retrieved_at,
+        ),
+        observed_from=retrieved_at - timedelta(seconds=1),
+        observed_through=retrieved_at,
+        retrieved_at=retrieved_at,
+        completeness=completeness,
+        collection_evidence=evidence,
+        positions=positions,
+        orders=orders,
+        executions=executions,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class FakeVerifiedBrokerEnvelope:
+    snapshot: NormalizedBrokerSnapshot
+    snapshot_id: str
+    snapshot_hash: str
+    artifact_hash: str
+    runtime_fingerprint: str
+    account_scope: str
+    receipt_id: str
+    public_key_fingerprint: str
+    issued_at: datetime
+    expires_at: datetime
+
+
+def _envelope(
+    snapshot: NormalizedBrokerSnapshot, runtime: RuntimeContract
+) -> FakeVerifiedBrokerEnvelope:
+    artifact_hash = hashlib.sha256(snapshot.canonical_payload().encode()).hexdigest()
+    return FakeVerifiedBrokerEnvelope(
+        snapshot=snapshot,
+        snapshot_id=snapshot.snapshot_id,
+        snapshot_hash=artifact_hash,
+        artifact_hash="56" * 32,
+        runtime_fingerprint=runtime.fingerprint,
+        account_scope=ACCOUNT_SCOPE,
+        receipt_id="bevr-v2-" + "12" * 32,
+        public_key_fingerprint="34" * 32,
+        issued_at=NOW,
+        expires_at=NOW + timedelta(minutes=5),
+    )
+
+
+class FakeBrokerVerifier:
+    def __init__(self, *envelopes: FakeVerifiedBrokerEnvelope) -> None:
+        self._owned = {id(value): value for value in envelopes}
+
+    def consume(self, value: object) -> FakeVerifiedBrokerEnvelope:
+        owned = self._owned.pop(id(value), None)
+        if owned is not value:
+            raise BootstrapReconciliationBlocked("test envelope is not verifier-owned")
+        return cast(FakeVerifiedBrokerEnvelope, value)
+
+
+class ClaimingReceiver:
+    def __init__(self, *, before_claim=None) -> None:
+        self.results: list[UnsignedBootstrapReconciliation] = []
+        self.published: list[UnsignedBootstrapReconciliation] = []
+        self.aborted: list[object] = []
+        self.before_claim = before_claim
+
+    def stage_unsigned_bootstrap_reconciliation(
+        self,
+        result: UnsignedBootstrapReconciliation,
+    ) -> object:
+        claimed = assert_and_consume_producer_owned_bootstrap_reconciliation(result)
+        if self.before_claim is not None:
+            self.before_claim()
+        self.results.append(claimed)
+        return claimed
+
+    def commit_staged_bootstrap_reconciliation(
+        self, stage: object
+    ) -> UnsignedBootstrapReconciliation:
+        assert stage is self.results[-1]
+        self.published.append(self.results[-1])
+        return self.results[-1]
+
+    def abort_staged_bootstrap_reconciliation(self, stage: object) -> None:
+        self.aborted.append(stage)
+
+
+class BypassReceiver:
+    def __init__(self) -> None:
+        self.results: list[UnsignedBootstrapReconciliation] = []
+
+    def stage_unsigned_bootstrap_reconciliation(
+        self,
+        result: UnsignedBootstrapReconciliation,
+    ) -> object:
+        self.results.append(result)
+        return "bypassed"
+
+    def commit_staged_bootstrap_reconciliation(self, stage: object) -> str:
+        return str(stage)
+
+    def abort_staged_bootstrap_reconciliation(self, stage: object) -> None:
+        del stage
+
+
+class BundleTamperingReceiver(ClaimingReceiver):
+    def stage_unsigned_bootstrap_reconciliation(
+        self,
+        result: UnsignedBootstrapReconciliation,
+    ) -> object:
+        object.__setattr__(result, "bundle_id", OTHER_BUNDLE_ID)
+        return assert_and_consume_producer_owned_bootstrap_reconciliation(result)
+
+
+@pytest.fixture
+def database(tmp_path: Path) -> Path:
+    path = tmp_path / "ledger.db"
+    _legacy_database(path)
+    SafetyJournal(path.with_name("safety-journal.db")).initialize(
+        execution_domain_scope="paper-simulator-v1",
+        account_scope=ACCOUNT_SCOPE,
+    )
+    return path
+
+
+@pytest.fixture(autouse=True)
+def authenticated_test_receiver(monkeypatch: pytest.MonkeyPatch) -> None:
+    def assert_test_receiver(receiver: object) -> ReconciliationBundleIdentity:
+        identity = getattr(receiver, "_test_bundle_identity", None)
+        if type(identity) is not ReconciliationBundleIdentity:
+            raise ValueError("test receiver has no core identity")
+        return identity
+
+    monkeypatch.setattr(
+        receiver_module,
+        "assert_reconciliation_receiver_capability",
+        assert_test_receiver,
+    )
+
+
+def _receiver_identity(
+    receiver: object,
+    runtime: RuntimeContract,
+    *,
+    bundle_id: str = BUNDLE_ID,
+) -> ReconciliationBundleIdentity:
+    return ReconciliationBundleIdentity(
+        receiver_type=type(receiver),
+        bundle_id=bundle_id,
+        runtime_fingerprint=runtime.fingerprint,
+        account_scope=ACCOUNT_SCOPE,
+        database_identity=runtime.database_identity,
+    )
+
+
+def _produce(
+    database: Path,
+    *,
+    snapshot: NormalizedBrokerSnapshot | None = None,
+    envelope: FakeVerifiedBrokerEnvelope | None = None,
+    runtime: RuntimeContract | None = None,
+    receiver: object | None = None,
+    clock: Callable[[], datetime] | None = None,
+    verifier: FakeBrokerVerifier | None = None,
+) -> tuple[
+    producer_module.BootstrapReconciliationDelivery[object],
+    Any,
+    FakeVerifiedBrokerEnvelope,
+]:
+    contract = runtime or _runtime(database)
+    verified = envelope or _envelope(snapshot or _snapshot(), contract)
+    authority = verifier or FakeBrokerVerifier(verified)
+    sink = receiver or ClaimingReceiver()
+    setattr(sink, "_test_bundle_identity", _receiver_identity(sink, contract))
+    with (
+        patch.object(producer_module, "_system_clock", clock or (lambda: NOW)),
+        patch.object(producer_module, "_consume_verified_broker_evidence", authority.consume),
+    ):
+        delivery: producer_module.BootstrapReconciliationDelivery[object] = (
+            produce_bootstrap_reconciliation(
+                verified,
+                contract,
+                sink,  # type: ignore[arg-type]
+            )
+        )
+    return delivery, sink, verified
+
+
+def test_clean_stage_collects_ledger_and_binds_non_authorizing_result(database: Path) -> None:
+    expected_legacy_hash = str(inspect_legacy_state(database)["snapshot_hash"])
+
+    delivery, receiver, envelope = _produce(database)
+
+    assert isinstance(receiver, ClaimingReceiver)
+    result = receiver.results[0]
+    assert delivery.receiver_result is result
+    assert delivery.local_position_identities == (("default", "AAPL"), ("default", "MSFT"))
+    assert result.status == BOOTSTRAP_RECONCILIATION_STATUS
+    assert result.bundle_id == BUNDLE_ID
+    assert result.binding_dict()["bundle_id"] == BUNDLE_ID
+    assert json.loads(result.canonical_payload())["bundle_id"] == BUNDLE_ID
+    assert result.reconciliation_status is ReconciliationStatus.PASSED
+    assert result.broker_snapshot_id == envelope.snapshot_id
+    assert result.broker_snapshot_hash == envelope.snapshot_hash
+    assert result.broker_artifact_hash == envelope.artifact_hash
+    assert result.broker_artifact_hash != result.broker_snapshot_hash
+    assert result.legacy_snapshot_hash == expected_legacy_hash
+    assert result.portfolio_ids == ("default",)
+    assert result.safety_journal_path.endswith("safety-journal.db")
+    assert result.safety_journal_identity.startswith("paper:safety:")
+    assert result.safety_journal_last_sequence == 0
+    assert result.safety_journal_last_chain_hash == "0" * 64
+    assert result.terminal_settlement_count == 0
+    assert result.terminal_fill_count == 0
+    assert result.local_simulator_positions_count == 2
+    assert result.broker_positions_count == 0
+    assert result.broker_open_orders_count == 0
+    assert result.mutated_state is False
+    assert result.authorizes_startup is False
+    assert result.execution_domain_scope == "paper-simulator-v1"
+
+
+def test_public_interface_accepts_no_snapshot_ledger_clock_or_freshness_authority() -> None:
+    parameters = inspect.signature(producer_module.produce_bootstrap_reconciliation).parameters
+    assert set(parameters) == {"verified_broker_evidence", "runtime_contract", "receiver"}
+    assert all(
+        forbidden not in parameters
+        for forbidden in (
+            "snapshot",
+            "ledger_evidence",
+            "now",
+            "clock",
+            "max_age_seconds",
+            "bundle_id",
+        )
+    )
+
+
+def test_local_simulator_positions_are_not_compared_to_zero_ibkr(database: Path) -> None:
+    delivery, receiver, _ = _produce(database)
+    result = receiver.results[0]
+
+    assert result.reconciliation_status is ReconciliationStatus.PASSED
+    assert result.local_simulator_positions_count == 2
+    assert result.broker_positions_count == 0
+    assert delivery.local_position_identities == result.local_position_identities
+
+
+def test_completed_broker_history_remains_diagnostic_not_simulator_equality(
+    database: Path,
+) -> None:
+    snapshot = _snapshot(
+        orders=(_order(collection=BrokerOrderCollection.COMPLETED),),
+        executions=(_execution(),),
+    )
+
+    _, receiver, _ = _produce(database, snapshot=snapshot)
+
+    assert receiver.results[0].reconciliation_status is ReconciliationStatus.PASSED
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        _snapshot(positions=(_position(),)),
+        _snapshot(orders=(_order(),)),
+        _snapshot(complete=False),
+        _snapshot(retrieved_at=NOW - timedelta(minutes=5)),
+        _snapshot(scope=OTHER_ACCOUNT_SCOPE),
+    ],
+)
+def test_exposure_incomplete_stale_or_wrong_account_blocks(
+    database: Path,
+    snapshot: NormalizedBrokerSnapshot,
+) -> None:
+    receiver = ClaimingReceiver()
+
+    with pytest.raises(BootstrapReconciliationBlocked):
+        _produce(database, snapshot=snapshot, receiver=receiver)
+
+    assert receiver.results == []
+
+
+def test_stale_internal_clock_blocks_without_receiver_call(database: Path) -> None:
+    clock_values = iter((NOW, NOW + timedelta(seconds=31)))
+    receiver = ClaimingReceiver()
+
+    with pytest.raises(BootstrapReconciliationBlocked, match="became stale"):
+        _produce(database, receiver=receiver, clock=lambda: next(clock_values))
+
+    assert receiver.results == []
+
+
+def test_forged_or_replayed_verified_envelope_blocks(database: Path) -> None:
+    runtime = _runtime(database)
+    envelope = _envelope(_snapshot(), runtime)
+    verifier = FakeBrokerVerifier(envelope)
+    _produce(database, runtime=runtime, envelope=envelope, verifier=verifier)
+
+    with pytest.raises(BootstrapReconciliationBlocked):
+        _produce(database, runtime=runtime, envelope=envelope, verifier=verifier)
+
+    forged = replace(envelope)
+    with pytest.raises(BootstrapReconciliationBlocked):
+        _produce(database, runtime=runtime, envelope=forged, verifier=verifier)
+
+
+def test_no_shipped_test_capability_can_replace_clock_or_broker_authority() -> None:
+    assert not hasattr(producer_module, "_issue_test_producer_capability")
+    assert not hasattr(producer_module, "_produce_bootstrap_reconciliation_for_test")
+
+
+def test_receiver_must_be_authenticated_before_evidence_collection(
+    database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receiver = ClaimingReceiver()
+
+    def reject_receiver(value: object, *, runtime_contract: RuntimeContract) -> None:
+        del value, runtime_contract
+        raise BootstrapReconciliationBlocked("not core-authenticated")
+
+    monkeypatch.setattr(
+        producer_module,
+        "_assert_core_reconciliation_receiver_capability",
+        reject_receiver,
+    )
+    with pytest.raises(BootstrapReconciliationBlocked, match="core-authenticated"):
+        _produce(database, receiver=receiver)
+    assert receiver.results == []
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        ("receiver_type", object),
+        ("bundle_id", "bootstrap-evidence-bundle-v1-not-a-digest"),
+        ("runtime_fingerprint", "f" * 64),
+        ("account_scope", OTHER_ACCOUNT_SCOPE),
+        ("database_identity", "paper:database:other"),
+    ],
+)
+def test_receiver_bundle_identity_must_exactly_match_runtime_and_receiver(
+    database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_field: str,
+    changed_value: object,
+) -> None:
+    runtime = _runtime(database)
+    receiver = ClaimingReceiver()
+    identity = replace(
+        _receiver_identity(receiver, runtime),
+        **{changed_field: changed_value},
+    )
+    monkeypatch.setattr(
+        receiver_module,
+        "assert_reconciliation_receiver_capability",
+        lambda _receiver: identity,
+    )
+
+    with pytest.raises(BootstrapReconciliationBlocked, match="bundle|runtime binding"):
+        _produce(database, runtime=runtime, receiver=receiver)
+
+    assert receiver.results == []
+
+
+def test_receiver_bundle_change_before_delivery_blocks_cross_bundle_handoff(
+    database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(database)
+    receiver = ClaimingReceiver()
+    identities = iter(
+        (
+            _receiver_identity(receiver, runtime),
+            _receiver_identity(receiver, runtime, bundle_id=OTHER_BUNDLE_ID),
+        )
+    )
+    monkeypatch.setattr(
+        receiver_module,
+        "assert_reconciliation_receiver_capability",
+        lambda _receiver: next(identities),
+    )
+
+    with pytest.raises(BootstrapReconciliationBlocked, match="bundle identity changed"):
+        _produce(database, runtime=runtime, receiver=receiver)
+
+    assert receiver.results == []
+
+
+def test_bundle_id_tamper_invalidates_the_producer_owned_canonical_payload(
+    database: Path,
+) -> None:
+    receiver = BundleTamperingReceiver()
+
+    with pytest.raises(BootstrapReconciliationBlocked, match="not producer-owned"):
+        _produce(database, receiver=receiver)
+
+    assert receiver.results == []
+
+
+def test_forged_typed_ledger_evidence_is_rejected(database: Path, monkeypatch) -> None:
+    forged = object.__new__(producer_module._CollectedLedgerEvidence)
+
+    @contextmanager
+    def forged_collector(*args, **kwargs):
+        del args, kwargs
+        yield type("ForgedSession", (), {"evidence": forged})()
+
+    monkeypatch.setattr(producer_module, "_collect_wal_visible_ledger", forged_collector)
+    receiver = ClaimingReceiver()
+
+    with pytest.raises(BootstrapReconciliationBlocked, match="collector-owned"):
+        _produce(database, receiver=receiver)
+
+    assert receiver.results == []
+
+
+def test_receiver_must_independently_claim_ownership(database: Path) -> None:
+    receiver = BypassReceiver()
+
+    with pytest.raises(BootstrapReconciliationBlocked, match="independently claim"):
+        _produce(database, receiver=receiver)
+
+    assert len(receiver.results) == 1
+    with pytest.raises(BootstrapReconciliationBlocked, match="not producer-owned"):
+        assert_and_consume_producer_owned_bootstrap_reconciliation(receiver.results[0])
+
+
+def test_result_direct_construction_copy_and_replay_fail(database: Path) -> None:
+    _, receiver, _ = _produce(database)
+    assert isinstance(receiver, ClaimingReceiver)
+    result = receiver.results[0]
+    copied = replace(result)
+
+    with pytest.raises(BootstrapReconciliationBlocked, match="not producer-owned"):
+        assert_and_consume_producer_owned_bootstrap_reconciliation(result)
+    with pytest.raises(BootstrapReconciliationBlocked, match="not producer-owned"):
+        assert_and_consume_producer_owned_bootstrap_reconciliation(copied)
+    with pytest.raises(TypeError, match="cannot be copied"):
+        copy(result)
+    with pytest.raises(TypeError, match="cannot be copied"):
+        deepcopy(result)
+    with pytest.raises(TypeError, match="cannot be pickled"):
+        pickle.dumps(result)
+    with pytest.raises((TypeError, BootstrapReconciliationBlocked)):
+        UnsignedBootstrapReconciliation()  # type: ignore[call-arg]
+
+
+def test_wal_visible_commit_is_included_in_snapshot_hash(database: Path) -> None:
+    writer = sqlite3.connect(database)
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute(
+            "INSERT INTO positions(portfolio_id,symbol,quantity,avg_cost,market_price,timestamp) "
+            "VALUES ('default','NVDA',4,300,310,'2026-07-28T11:59:30+00:00')"
+        )
+        writer.commit()
+        wal_path = Path(f"{database}-wal")
+        assert wal_path.exists() and wal_path.stat().st_size > 0
+
+        delivery, receiver, _ = _produce(database)
+
+        result = receiver.results[0]
+        assert ("default", "NVDA") in delivery.local_position_identities
+        assert result.legacy_snapshot_hash == inspect_legacy_state(database)["snapshot_hash"]
+    finally:
+        writer.close()
+
+
+def test_receiver_stage_wal_commit_blocks_and_aborts_before_publication(database: Path) -> None:
+    writer = sqlite3.connect(database)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+
+    def commit_during_receiver() -> None:
+        writer.execute(
+            "INSERT INTO trades(portfolio_id,symbol,side,quantity,price,notional,timestamp) "
+            "VALUES ('default','MSFT','BUY',1,210,210,'2026-07-28T12:00:00+00:00')"
+        )
+        writer.commit()
+
+    receiver = ClaimingReceiver(before_claim=commit_during_receiver)
+    try:
+        with pytest.raises(BootstrapReconciliationBlocked, match="ledger WAL changed"):
+            _produce(database, receiver=receiver)
+        assert len(receiver.results) == 1
+        assert receiver.published == []
+        assert receiver.aborted == receiver.results
+    finally:
+        writer.close()
+
+
+def test_receiver_stage_safety_journal_commit_blocks_and_aborts(
+    database: Path,
+) -> None:
+    journal_path = database.with_name("safety-journal.db")
+    receiver = ClaimingReceiver(
+        before_claim=lambda: _seed_unresolved_safety_reservation(
+            journal_path,
+            outcome_unknown=False,
+        )
+    )
+
+    with pytest.raises(BootstrapReconciliationBlocked, match="safety journal"):
+        _produce(database, receiver=receiver)
+
+    assert len(receiver.results) == 1
+    assert receiver.published == []
+    assert receiver.aborted == receiver.results
+
+
+@pytest.mark.parametrize("outcome_unknown", [False, True])
+def test_unresolved_or_unknown_safety_reservation_blocks(
+    database: Path,
+    outcome_unknown: bool,
+) -> None:
+    _seed_unresolved_safety_reservation(
+        database.with_name("safety-journal.db"),
+        outcome_unknown=outcome_unknown,
+    )
+    receiver = ClaimingReceiver()
+
+    with pytest.raises(
+        BootstrapReconciliationBlocked,
+        match="active, quarantined, or unknown|unresolved",
+    ):
+        _produce(database, receiver=receiver)
+    assert receiver.results == []
+
+
+def test_missing_runtime_bound_safety_journal_blocks(database: Path) -> None:
+    runtime = replace(
+        _runtime(database),
+        safety_journal_path=str(database.with_name("never-initialized-safety.db")),
+    )
+    receiver = ClaimingReceiver()
+
+    with pytest.raises(BootstrapReconciliationBlocked):
+        _produce(database, runtime=runtime, receiver=receiver)
+    assert receiver.results == []
+
+
+def test_tampered_safety_journal_blocks(database: Path) -> None:
+    journal_path = database.with_name("safety-journal.db")
+    with sqlite3.connect(journal_path) as connection:
+        connection.execute("CREATE TABLE hidden_mutable_state(value TEXT)")
+    receiver = ClaimingReceiver()
+
+    with pytest.raises(BootstrapReconciliationBlocked):
+        _produce(database, receiver=receiver)
+    assert receiver.results == []
+
+
+def test_unproven_local_order_coverage_cannot_be_signed(
+    database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        producer_module,
+        "_crosslink_safety_journal_orders",
+        lambda **kwargs: (False, False, 0, 0),
+    )
+    receiver = ClaimingReceiver()
+
+    with pytest.raises(BootstrapReconciliationBlocked):
+        _produce(database, receiver=receiver)
+    assert receiver.results == []
+
+
+@pytest.mark.parametrize("defect", ["non_unique_duplicate", "extra", "missing"])
+def test_account_schema_and_exact_portfolio_cardinality_block_defects(
+    database: Path,
+    defect: str,
+) -> None:
+    with sqlite3.connect(database) as connection:
+        if defect == "non_unique_duplicate":
+            connection.executescript("""
+                ALTER TABLE account RENAME TO account_old;
+                CREATE TABLE account (
+                    portfolio_id TEXT,
+                    cash REAL NOT NULL,
+                    equity REAL NOT NULL,
+                    daily_pnl REAL,
+                    realized_pnl REAL,
+                    unrealized_pnl REAL,
+                    timestamp DATETIME
+                );
+                INSERT INTO account SELECT * FROM account_old;
+                INSERT INTO account SELECT * FROM account_old;
+                DROP TABLE account_old;
+                """)
+        elif defect == "extra":
+            connection.execute(
+                "INSERT INTO account VALUES " "('orphan',100,100,0,0,0,'2026-07-28T11:59:00+00:00')"
+            )
+        else:
+            connection.execute("DELETE FROM account WHERE portfolio_id='default'")
+    receiver = ClaimingReceiver()
+
+    with pytest.raises(BootstrapReconciliationBlocked, match="account"):
+        _produce(database, receiver=receiver)
+    assert receiver.results == []
+
+
+def test_malformed_or_partial_database_blocks_without_delivery(tmp_path: Path) -> None:
+    database = tmp_path / "partial.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE account(portfolio_id TEXT)")
+    receiver = ClaimingReceiver()
+
+    with pytest.raises(BootstrapReconciliationBlocked):
+        _produce(database, receiver=receiver)
+
+    assert receiver.results == []

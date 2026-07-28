@@ -145,6 +145,8 @@ class RuntimeContract:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
     def public_dict(self, *, include_fingerprint: bool = True) -> Dict[str, object]:
+        from .bootstrap_evidence_auth import bootstrap_evidence_trust_public_dict
+
         result: Dict[str, object] = {
             "environment": self.environment,
             "mode": self.execution_mode,
@@ -161,6 +163,7 @@ class RuntimeContract:
             "safety_account_scope": self.safety_account_scope,
             "safety_execution_domain_scope": self.safety_execution_domain_scope,
             "safety_journal_identity": self.safety_journal_identity,
+            "bootstrap_evidence_trust": bootstrap_evidence_trust_public_dict(),
             "live_capability": "disabled",
         }
         if include_fingerprint:

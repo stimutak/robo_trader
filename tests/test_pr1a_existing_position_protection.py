@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from robo_trader.config import RuntimeContract
 from robo_trader.database_validator import ValidationError
 from robo_trader.execution import ExecutionResult
 from robo_trader.paper_reduction_submitter import (
@@ -51,6 +52,22 @@ from robo_trader.stop_loss_monitor import (
 ROOT = Path(__file__).resolve().parents[1]
 WATCHDOG_POLICY = ROOT / "scripts" / "watchdog_restart_policy.py"
 WATCHDOG_GUARD = ROOT / "scripts" / "watchdog_restart_guard.sh"
+TEST_RUNTIME_CONTRACT = RuntimeContract(
+    environment="test",
+    execution_mode="paper",
+    execution_source="paper_simulator",
+    ibkr_host="127.0.0.1",
+    ibkr_port=4002,
+    ibkr_readonly=True,
+    database_path="/tmp/robotrader-existing-position-test.db",
+    account_alias="***PER",
+    account_type="paper",
+    model_artifact_set="test",
+    build_id="test-build",
+    state_namespace="paper",
+    safety_account_scope="acct_v1_" + ("0123456789abcdef" * 4),
+    safety_execution_domain_scope="paper-simulator-v1",
+)
 
 
 class _AliveTask:
@@ -1872,8 +1889,19 @@ async def test_stop_registration_failure_is_fatal() -> None:
     runner = object.__new__(AsyncRunner)
     runner.portfolio_id = "default"
     runner.positions = {}
+    runner.cfg = SimpleNamespace(runtime_contract=TEST_RUNTIME_CONTRACT)
     runner.db = SimpleNamespace(
-        get_account_info=AsyncMock(return_value=None),
+        get_account_info=AsyncMock(
+            return_value={
+                "cash_exact": Decimal("100000"),
+                "realized_pnl_exact": Decimal("0"),
+                "daily_pnl_exact": Decimal("0"),
+                "daily_pnl_baseline_exact": Decimal("0"),
+                "daily_pnl_date_exact": datetime.utcnow().date(),
+                "source_settlement_id": None,
+                "bootstrap_lineage_valid": True,
+            }
+        ),
         get_positions=AsyncMock(
             return_value=[
                 {
@@ -1881,6 +1909,7 @@ async def test_stop_registration_failure_is_fatal() -> None:
                     "quantity": 10,
                     "avg_cost": 100.0,
                     "market_price_exact": Decimal("100"),
+                    "bootstrap_lineage_valid": True,
                 }
             ]
         ),

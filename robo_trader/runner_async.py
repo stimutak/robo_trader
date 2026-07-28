@@ -3588,8 +3588,12 @@ class AsyncRunner:
         try:
             account_daily_pnl = None
             account_daily_pnl_date = None
+            account_bootstrap_lineage_valid = None
+            runtime_contract = getattr(getattr(self, "cfg", None), "runtime_contract", None)
             # Load account state (cash, realized_pnl) from database
-            account_info = await self.db.get_account_info()
+            account_info = await self.db.get_account_info(runtime_contract=runtime_contract)
+            if not account_info:
+                raise RuntimeError("paper simulator account state is unavailable")
             if account_info:
                 exact_cash = account_info.get("cash_exact")
                 exact_realized_pnl = account_info.get("realized_pnl_exact")
@@ -3597,6 +3601,7 @@ class AsyncRunner:
                 exact_daily_pnl_baseline = account_info.get("daily_pnl_baseline_exact")
                 exact_daily_pnl_date = account_info.get("daily_pnl_date_exact")
                 source_settlement_id = account_info.get("source_settlement_id")
+                account_bootstrap_lineage_valid = account_info.get("bootstrap_lineage_valid")
                 exact_values = (
                     exact_cash,
                     exact_realized_pnl,
@@ -3604,6 +3609,10 @@ class AsyncRunner:
                     exact_daily_pnl_baseline,
                     exact_daily_pnl_date,
                 )
+                if account_bootstrap_lineage_valid is not True:
+                    raise RuntimeError("paper simulator has no sealed exact account bootstrap")
+                if any(value is None for value in exact_values):
+                    raise RuntimeError("bootstrapped paper account is missing exact restart state")
                 if source_settlement_id is not None and any(
                     value is None for value in exact_values
                 ):
@@ -3641,7 +3650,7 @@ class AsyncRunner:
                 advanced.reset_positions_for_authoritative_seed()
 
             # Load positions from database
-            positions_data = await self.db.get_positions()
+            positions_data = await self.db.get_positions(runtime_contract=runtime_contract)
             for pos in positions_data:
                 quantity = pos.get("quantity", 0)
                 if quantity == 0:
@@ -3675,6 +3684,8 @@ class AsyncRunner:
                     raise RuntimeError(
                         f"exact restart mark for {symbol} cannot be projected into runtime"
                     )
+                if pos.get("bootstrap_lineage_valid") is not True:
+                    raise RuntimeError(f"nonzero position {symbol} has no sealed bootstrap lineage")
                 self.latest_prices[symbol] = exact_mark_float
                 self.latest_price_sources[symbol] = "paper-position-exact-mark"
 
