@@ -167,6 +167,7 @@ async def test_copy_and_post_production_mutation_are_not_producer_owned() -> Non
         ({"expected_symbol": "MSFT"}, "symbol"),
         ({"expected_con_id": 123}, "contract"),
         ({"expected_transport_generation": "generation-2"}, "transport generation"),
+        ({"expected_source_event_id": "ticker-99"}, "source event"),
     ],
 )
 async def test_strict_revalidation_rejects_expected_identity_mismatch(

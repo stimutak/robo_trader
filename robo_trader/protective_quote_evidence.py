@@ -349,6 +349,7 @@ def assert_current_authoritative_protective_quote(
     expected_symbol: str,
     expected_con_id: int,
     expected_transport_generation: str,
+    expected_source_event_id: str | None = None,
 ) -> ProtectiveQuoteEvidence:
     """Revalidate exact immutable live quote evidence before consumption.
 
@@ -371,6 +372,8 @@ def assert_current_authoritative_protective_quote(
     if type(expected_con_id) is not int or expected_con_id <= 0:
         raise ProtectiveQuoteValidationError("expected_con_id must be a positive integer")
     _text(expected_transport_generation, "expected_transport_generation")
+    if expected_source_event_id is not None:
+        _text(expected_source_event_id, "expected_source_event_id")
 
     if quote.source is not ProtectiveQuoteSource.LIVE_BROKER:
         raise ProtectiveQuoteValidationError("legacy quote is not gateway-authoritative")
@@ -385,6 +388,8 @@ def assert_current_authoritative_protective_quote(
         raise ProtectiveQuoteValidationError("quote contract does not match")
     if quote.transport_generation != expected_transport_generation:
         raise ProtectiveQuoteValidationError("quote transport generation does not match")
+    if expected_source_event_id is not None and quote.source_event_id != expected_source_event_id:
+        raise ProtectiveQuoteValidationError("quote source event does not match")
 
     max_age = producer.max_price_age_seconds
     if isinstance(max_age, bool) or not isinstance(max_age, (int, float)):
