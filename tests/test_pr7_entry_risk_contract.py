@@ -1291,7 +1291,7 @@ def test_replay_tombstones_allow_concurrent_out_of_order_consumption_times() -> 
     )
 
 
-def test_successful_pruning_retires_out_of_order_replay_window() -> None:
+def test_successful_pruning_retains_semantic_replay_identity() -> None:
     tombstones = _DecisionReplayTombstones(2)
     replay_key = ("risk-decision-v1", 1, "portfolio-alpha", "intent-retired")
     tombstones.record(
@@ -1305,11 +1305,11 @@ def test_successful_pruning_retires_out_of_order_replay_window() -> None:
         consumed_at=NOW + timedelta(seconds=3),
     )
 
-    with pytest.raises(EntryRiskContractError, match="retained replay window"):
+    with pytest.raises(EntryRiskContractError, match="semantic replay"):
         tombstones.record(
             replay_key,
-            expires_at=NOW + timedelta(seconds=2),
-            consumed_at=NOW + timedelta(seconds=1),
+            expires_at=NOW + timedelta(seconds=10),
+            consumed_at=NOW + timedelta(seconds=4),
         )
 
 
