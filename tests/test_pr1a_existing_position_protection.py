@@ -24,6 +24,10 @@ from robo_trader.paper_reduction_submitter import (
     LocalPaperTerminalOutcome,
 )
 from robo_trader.portfolio import Portfolio
+from robo_trader.protective_quote_evidence import (
+    ProtectiveQuoteSource,
+    _produce_protective_quote,
+)
 from robo_trader.risk_manager import Position
 from robo_trader.runner_async import (
     AsyncRunner,
@@ -113,34 +117,41 @@ def _protected_runner(
     if status is StopStatus.TRIGGERED:
         stop.trigger_price = 97.0
         stop.triggered_at = now + timedelta(seconds=event_offset_seconds)
-    monitor = SimpleNamespace(
+    monitor = StopLossMonitor(
+        execute_reduction=_unused_reduction,
+        risk_manager=None,
         portfolio_id="default",
-        monitoring_active=True,
-        monitor_task=_AliveTask(),
-        active_stops={"default:AAPL": stop},
-        last_prices={"AAPL": 101.0},
-        price_event_times={"AAPL": now + timedelta(seconds=event_offset_seconds)},
-        price_receipt_monotonic={"AAPL": monotonic_now + receipt_offset_seconds},
-        price_receipt_orders={"AAPL": 1},
-        _price_receipt_order=1,
-        _pending_stop_triggers={},
-        _latched_stop_crossings={},
-        _queued_stop_orders={},
-        _inflight_stop_orders={},
-        pending_drain_timeout_seconds=30.0,
-        queue_timeout_seconds=30.0,
-        broker_attempt_timeout_seconds=30.0,
-        settlement_timeout_seconds=30.0,
-        max_price_age_seconds=10,
-        _utcnow=lambda: now,
-        _monotonic=lambda: monotonic_now,
-        _stop_key=lambda symbol: f"default:{symbol}",
-        _price_crosses_stop=lambda tracked_stop, price: (
-            price <= tracked_stop.stop_price
-            if tracked_stop.position_qty > 0
-            else price >= tracked_stop.stop_price
-        ),
     )
+    monitor.monitoring_active = True
+    monitor.monitor_task = _AliveTask()
+    monitor.pending_drain_timeout_seconds = 30.0
+    monitor.queue_timeout_seconds = 30.0
+    monitor.broker_attempt_timeout_seconds = 30.0
+    monitor.settlement_timeout_seconds = 30.0
+    monitor.active_stops = {"default:AAPL": stop}
+    monitor.last_prices = {"AAPL": 101.0}
+    event_time = now + timedelta(seconds=event_offset_seconds)
+    receipt_time = monotonic_now + receipt_offset_seconds
+    monitor.price_event_times = {"AAPL": event_time}
+    monitor.price_receipt_monotonic = {"AAPL": receipt_time}
+    monitor.price_receipt_orders = {"AAPL": 1}
+    monitor._price_receipt_order = 1
+    monitor._utcnow = lambda: now
+    monitor._monotonic = lambda: monotonic_now
+    if available and live_grade and source == "live_protective":
+        monitor._protective_quote_evidence["AAPL"] = _produce_protective_quote(
+            monitor,
+            portfolio_id="default",
+            symbol="AAPL",
+            price=Decimal("101.0"),
+            source_timestamp=event_time,
+            receipt_monotonic=float(receipt_time),
+            receipt_order=1,
+            source=ProtectiveQuoteSource.LIVE_BROKER,
+            con_id=265598,
+            transport_generation="test-generation-1",
+            source_event_id="protected-runner-event",
+        )
     runner = object.__new__(AsyncRunner)
     runner.portfolio_id = "default"
     runner.positions = {"AAPL": Position("AAPL", quantity, 100.0)}
@@ -150,6 +161,8 @@ def _protected_runner(
             "available": available,
             "live_grade": live_grade,
             "source": source,
+            "con_id": 265598,
+            "transport_generation": "test-generation-1",
         }
     }
     return runner
@@ -607,6 +620,20 @@ def test_profit_protecting_fixed_stop_is_valid_relative_to_current_quote(
     stop.entry_price = entry_price
     stop.stop_price = stop_price
     runner.stop_loss_monitor.last_prices["AAPL"] = current_price
+    previous_quote = runner.stop_loss_monitor.get_protective_quote_evidence("AAPL")
+    runner.stop_loss_monitor._protective_quote_evidence["AAPL"] = _produce_protective_quote(
+        runner.stop_loss_monitor,
+        portfolio_id="default",
+        symbol="AAPL",
+        price=Decimal(str(current_price)),
+        source_timestamp=previous_quote.source_timestamp,
+        receipt_monotonic=previous_quote.receipt_monotonic,
+        receipt_order=previous_quote.receipt_order,
+        source=ProtectiveQuoteSource.LIVE_BROKER,
+        con_id=previous_quote.con_id,
+        transport_generation=previous_quote.transport_generation,
+        source_event_id="profit-protecting-event",
+    )
 
     _assert_protection(runner)
 
@@ -840,6 +867,10 @@ async def test_persistent_fast_path_preserves_exact_broker_inflight_execution() 
         "AAPL",
         97.0,
         source_timestamp=now,
+        source=ProtectiveQuoteSource.LIVE_BROKER,
+        con_id=265598,
+        transport_generation="test-generation-1",
+        source_event_id="inflight-stop-event",
     )
 
     runner = object.__new__(AsyncRunner)
@@ -851,6 +882,8 @@ async def test_persistent_fast_path_preserves_exact_broker_inflight_execution() 
             "available": True,
             "live_grade": True,
             "source": "live_protective",
+            "con_id": 265598,
+            "transport_generation": "test-generation-1",
         }
     }
     runner._setup_complete = True
@@ -899,7 +932,15 @@ async def test_pending_replacement_can_coexist_with_unresolved_old_broker_stop()
     monitor._monotonic = lambda: 1000.0
     position = Position("AAPL", 10, 100.0)
     old_stop = await monitor.add_stop_loss("AAPL", position, stop_percent=0.02)
-    assert await monitor.update_price("AAPL", 97.0, source_timestamp=now)
+    assert await monitor.update_price(
+        "AAPL",
+        97.0,
+        source_timestamp=now,
+        source=ProtectiveQuoteSource.LIVE_BROKER,
+        con_id=265598,
+        transport_generation="test-generation-1",
+        source_event_id="old-stop-event",
+    )
 
     runner = object.__new__(AsyncRunner)
     runner.portfolio_id = "default"
@@ -910,6 +951,8 @@ async def test_pending_replacement_can_coexist_with_unresolved_old_broker_stop()
             "available": True,
             "live_grade": True,
             "source": "live_protective",
+            "con_id": 265598,
+            "transport_generation": "test-generation-1",
         }
     }
     runner._setup_complete = True
@@ -922,7 +965,15 @@ async def test_pending_replacement_can_coexist_with_unresolved_old_broker_stop()
     assert replacement.status is StopStatus.PENDING
     assert monitor.active_stops["default:AAPL"] is replacement
     assert monitor._inflight_stop_orders["default:AAPL"].stop is old_stop
-    assert await monitor.update_price("AAPL", 101.0, source_timestamp=now)
+    assert await monitor.update_price(
+        "AAPL",
+        101.0,
+        source_timestamp=now,
+        source=ProtectiveQuoteSource.LIVE_BROKER,
+        con_id=265598,
+        transport_generation="test-generation-1",
+        source_event_id="replacement-stop-event",
+    )
 
     await runner.setup()
 
@@ -997,6 +1048,8 @@ async def test_persistent_fast_path_accepts_exact_terminal_cleanup_in_progress()
             "available": True,
             "live_grade": True,
             "source": "live_protective",
+            "con_id": 265598,
+            "transport_generation": "test-generation-1",
         }
     }
     stop = await monitor.add_stop_loss(
@@ -1008,6 +1061,10 @@ async def test_persistent_fast_path_accepts_exact_terminal_cleanup_in_progress()
         "AAPL",
         97.0,
         source_timestamp=now,
+        source=ProtectiveQuoteSource.LIVE_BROKER,
+        con_id=265598,
+        transport_generation="test-generation-1",
+        source_event_id="settlement-stop-event",
     )
 
     await monitor.start_monitoring()
@@ -1093,6 +1150,10 @@ async def test_persistent_fast_path_accepts_complete_two_stop_execution_batch() 
             symbol,
             0.97 * float(position.avg_price),
             source_timestamp=now,
+            source=ProtectiveQuoteSource.LIVE_BROKER,
+            con_id=265598 if symbol == "AAPL" else 272093,
+            transport_generation="test-generation-1",
+            source_event_id=f"parallel-stop-{symbol}",
         )
 
     runner = object.__new__(AsyncRunner)
@@ -1104,6 +1165,8 @@ async def test_persistent_fast_path_accepts_complete_two_stop_execution_batch() 
             "available": True,
             "live_grade": True,
             "source": "live_protective",
+            "con_id": 265598 if symbol == "AAPL" else 272093,
+            "transport_generation": "test-generation-1",
         }
         for symbol in positions
     }

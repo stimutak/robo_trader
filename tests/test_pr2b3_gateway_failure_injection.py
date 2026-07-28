@@ -98,6 +98,7 @@ async def _bind_projection(
         apply_callback=apply_callback,
         quarantine_callback=harness.quarantine_reasons.append,
     )
+    harness.gateway.attach_protective_quote_producer("portfolio-a", monitor)
     harness.gateway.register_paper_executor(
         "portfolio-a",
         executor,

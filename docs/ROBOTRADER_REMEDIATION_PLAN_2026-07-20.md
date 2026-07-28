@@ -471,9 +471,8 @@ runtime-integration changes:
   boundary remains hard-disabled.
 - **PR 2B.3 / issue #102:** add exact settlement, ambiguity handling, and
   crash/restart quarantine release, and bind every reduction price to
-  producer-owned fresh protective-quote price, timestamp, and lineage. This
-  implementation and exact-head local review are complete at `14f6b55` on
-  `codex/pr2b3-terminal-settlement`; hosted review and merge remain pending.
+  producer-owned fresh protective-quote price, timestamp, and lineage. PR
+  #107 merged this stage as `017f43e5c31283e6cf5cc630c6fd15acd2af683b`.
   The shared readiness gate remains false.
 
 PR 2A grants no broker connection or submission authority by itself. PR 2B.1
@@ -1514,7 +1513,9 @@ Update after each merge.
   inference with zero input or output tokens; it produced no code verdict and
   was not counted as a pass. The merge grants no order authority or startup
   approval. Gate A remains closed and the trader remains stopped.
-- PR 3: Not started
+- PR 3: In progress on `codex/pr3-market-data-contract`; implementation and
+  adversarial local review are not yet complete. This status does not authorize
+  startup.
 - PR 4: Not started
 - PR 5: Not started
 - PR 6: Not started

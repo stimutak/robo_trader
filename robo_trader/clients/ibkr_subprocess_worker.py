@@ -11,8 +11,10 @@ where API handshakes timeout despite successful TCP connections.
 
 import asyncio
 import atexit
+import hashlib
 import inspect
 import ipaddress
+import itertools
 import json
 import os
 import queue
@@ -34,6 +36,10 @@ from ib_async import IB, ExecutionFilter  # noqa: E402
 
 from robo_trader.broker_account_identity import (  # noqa: E402
     is_supported_paper_account_identifier,
+)
+from robo_trader.market_hours import get_market_session  # noqa: E402
+from robo_trader.protective_quote_evidence import (  # noqa: E402
+    MAX_PROTECTIVE_SOURCE_EVENT_ID_LENGTH,
 )
 from robo_trader.utils.ibkr_safe import safe_disconnect  # noqa: E402
 
@@ -77,6 +83,8 @@ INTRADAY_BAR_SIZES = {
 }
 PROTOCOL_ERROR_STATUS = "protocol_error"
 PROTOCOL_ERROR_TYPE = "TransportProtocolError"
+PROTECTIVE_TICK_TIMEOUT_SECONDS = 6.0
+PROTECTIVE_TICK_REQUEST_PACING_SECONDS = 15.0
 _SYNTHETIC_ACCOUNT_ENVIRONMENT_KEY = "ROBOTRADER_WORKER_SYNTHETIC_ACCOUNT_ENVIRONMENT"
 _FORBIDDEN_AMBIENT_POLICY_KEYS = frozenset(
     {
@@ -90,6 +98,31 @@ _FORBIDDEN_AMBIENT_POLICY_KEYS = frozenset(
         "VIRTUAL_ENV",
     }
 )
+_PROTECTIVE_TICK_SUBSCRIPTIONS: dict[int, tuple[Any, Any]] = {}
+_PROTECTIVE_TICK_CURSORS: dict[int, int] = {}
+_PROTECTIVE_SYMBOL_CON_IDS: dict[str, int] = {}
+_PROTECTIVE_TICK_REQUEST_TIMES: dict[int, float] = {}
+_PROTECTIVE_TICK_EVENT_IDS: dict[int, dict[int, str]] = {}
+_PROTECTIVE_TICK_EVENT_SEQUENCE = itertools.count(1)
+
+
+def _protective_request_monotonic() -> float:
+    """Return the injectable monotonic clock used for IBKR request pacing."""
+
+    return time.monotonic()
+
+
+def _clear_protective_tick_subscriptions() -> None:
+    """Forget subscription state before an IB session is retired."""
+
+    global _PROTECTIVE_TICK_EVENT_SEQUENCE
+
+    _PROTECTIVE_TICK_SUBSCRIPTIONS.clear()
+    _PROTECTIVE_TICK_CURSORS.clear()
+    _PROTECTIVE_SYMBOL_CON_IDS.clear()
+    _PROTECTIVE_TICK_REQUEST_TIMES.clear()
+    _PROTECTIVE_TICK_EVENT_IDS.clear()
+    _PROTECTIVE_TICK_EVENT_SEQUENCE = itertools.count(1)
 
 
 def _worker_environment() -> str:
@@ -510,6 +543,7 @@ def _stdin_reader():
 def _cleanup_on_exit():
     """Atexit handler to ensure we disconnect from IBKR to prevent zombies"""
     global ib
+    _clear_protective_tick_subscriptions()
     if ib is not None:
         print("atexit: Disconnecting from IBKR...", file=sys.stderr, flush=True)
         try:
@@ -601,6 +635,7 @@ async def handle_connect(params: dict) -> dict:
             }
 
         if ib is not None:
+            _clear_protective_tick_subscriptions()
             safe_disconnect(
                 ib,
                 context="diagnostic_worker:replace_connection",
@@ -1623,6 +1658,7 @@ async def handle_disconnect() -> dict:
     global ib, worker_connection_identity
 
     try:
+        _clear_protective_tick_subscriptions()
         if ib:
             # Properly disconnect to avoid zombie connections
             print("Disconnecting from IBKR...", file=sys.stderr, flush=True)
@@ -1804,6 +1840,245 @@ async def handle_get_historical_bars(params: dict) -> dict:
         }
 
 
+async def handle_get_protective_quotes(params: dict) -> dict:
+    """Fetch an independent, live last-trade snapshot for protective use."""
+
+    try:
+        if not ib or not ib.isConnected():
+            raise ConnectionError("Not connected to IBKR")
+        symbols = params.get("symbols")
+        if (
+            not isinstance(symbols, list)
+            or len(symbols) > 64
+            or any(
+                not isinstance(symbol, str) or not BROKER_SAFETY_SYMBOL_RE.fullmatch(symbol)
+                for symbol in symbols
+            )
+            or len(set(symbols)) != len(symbols)
+        ):
+            raise ValueError("protective quote symbols are malformed")
+
+        # One account-wide active set accompanies every bounded fetch chunk.
+        # Subscription retirement must use this full set, not the current
+        # chunk, otherwise adjacent chunks cancel and recreate one another.
+        active_symbols = params.get("active_symbols", symbols)
+        if (
+            not isinstance(active_symbols, list)
+            or len(active_symbols) > 4096
+            or any(
+                not isinstance(symbol, str) or not BROKER_SAFETY_SYMBOL_RE.fullmatch(symbol)
+                for symbol in active_symbols
+            )
+            or len(set(active_symbols)) != len(active_symbols)
+            or not set(symbols).issubset(active_symbols)
+        ):
+            raise ValueError("protective quote active symbols are malformed")
+
+        account_active_symbols = set(active_symbols)
+        cancel = getattr(ib, "cancelTickByTickData", None)
+        if cancel is None:
+            raise RuntimeError("IBKR client has no tick-by-tick cancellation API")
+        for stale_symbol in sorted(set(_PROTECTIVE_SYMBOL_CON_IDS) - account_active_symbols):
+            stale_con_id = _PROTECTIVE_SYMBOL_CON_IDS[stale_symbol]
+            stale = _PROTECTIVE_TICK_SUBSCRIPTIONS.get(stale_con_id)
+            if stale is None:
+                raise RuntimeError("Protective subscription registry is inconsistent")
+            requested_at = _PROTECTIVE_TICK_REQUEST_TIMES.get(stale_con_id)
+            if requested_at is None:
+                raise RuntimeError("Protective subscription pacing registry is inconsistent")
+            request_age = _protective_request_monotonic() - requested_at
+            if request_age < 0:
+                raise RuntimeError("Protective subscription pacing clock moved backwards")
+            # IBKR prohibits a second tick-by-tick request for the same
+            # instrument inside 15 seconds. Retain and reuse a recently
+            # inactive subscription until that window is safely closed.
+            if request_age < PROTECTIVE_TICK_REQUEST_PACING_SECONDS:
+                continue
+            cancelled = cancel(stale[0], "Last")
+            if inspect.isawaitable(cancelled):
+                cancelled = await cancelled
+            # ib_async's cancellation API normally returns None. Only an
+            # exception or explicit False is a failure; retain the registry in
+            # that case so the parent can retire the ambiguous worker session.
+            if cancelled is False:
+                raise RuntimeError("IBKR protective subscription cancellation failed")
+            _PROTECTIVE_TICK_SUBSCRIPTIONS.pop(stale_con_id, None)
+            _PROTECTIVE_TICK_CURSORS.pop(stale_con_id, None)
+            _PROTECTIVE_TICK_REQUEST_TIMES.pop(stale_con_id, None)
+            _PROTECTIVE_TICK_EVENT_IDS.pop(stale_con_id, None)
+            _PROTECTIVE_SYMBOL_CON_IDS.pop(stale_symbol, None)
+
+        from ib_async import Stock
+
+        contracts = []
+        for symbol in symbols:
+            cached_con_id = _PROTECTIVE_SYMBOL_CON_IDS.get(symbol)
+            cached = (
+                _PROTECTIVE_TICK_SUBSCRIPTIONS.get(cached_con_id)
+                if cached_con_id is not None
+                else None
+            )
+            if cached is not None:
+                qualified = cached[0]
+                _validate_stock_identity(qualified, symbol)
+            else:
+                qualified = await _qualify_one_contract(Stock(symbol, "SMART", "USD"))
+                _validate_stock_identity(qualified, symbol)
+                _PROTECTIVE_SYMBOL_CON_IDS[symbol] = int(qualified.conId)
+            contracts.append(qualified)
+
+        broker_time_before = await _request_broker_time()
+        request = getattr(ib, "reqTickByTickData", None)
+        if request is None:
+            raise RuntimeError("IBKR client has no tick-by-tick last-trade API")
+        subscriptions = []
+        for contract in contracts:
+            con_id = int(contract.conId)
+            existing = _PROTECTIVE_TICK_SUBSCRIPTIONS.get(con_id)
+            if existing is None:
+                _PROTECTIVE_TICK_REQUEST_TIMES[con_id] = _protective_request_monotonic()
+                ticker = request(
+                    contract,
+                    "Last",
+                    # Zero requests the unlimited live stream directly. A
+                    # nonzero value asks IBKR to preload that many historical
+                    # ticks before streaming, which is not admissible here.
+                    numberOfTicks=0,
+                    ignoreSize=False,
+                )
+                if inspect.isawaitable(ticker):
+                    ticker = await ticker
+                _PROTECTIVE_TICK_SUBSCRIPTIONS[con_id] = (contract, ticker)
+                _PROTECTIVE_TICK_CURSORS[con_id] = 0
+            else:
+                subscribed_contract, ticker = existing
+                if con_id not in _PROTECTIVE_TICK_REQUEST_TIMES:
+                    raise RuntimeError("Protective subscription pacing registry is inconsistent")
+                _validate_stock_identity(subscribed_contract, contract.symbol)
+                if int(subscribed_contract.conId) != con_id:
+                    raise ContractIdentityProtocolError(
+                        "Protective subscription contract identity changed"
+                    )
+            subscriptions.append((contract, ticker))
+
+        deadline = time.monotonic() + PROTECTIVE_TICK_TIMEOUT_SECONDS
+        while any(
+            not isinstance(getattr(ticker, "tickByTicks", None), list) or not ticker.tickByTicks
+            for _, ticker in subscriptions
+        ):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Timed out waiting for bound last-trade events")
+            await asyncio.sleep(0.05)
+
+        broker_time_after = await _request_broker_time()
+
+        retrieval_time = datetime.now(timezone.utc)
+        quotes = []
+        for contract, ticker in subscriptions:
+            ticker_contract = cast(Any, getattr(ticker, "contract", None))
+            _validate_stock_identity(ticker_contract, contract.symbol)
+            if int(ticker_contract.conId) != int(contract.conId):
+                raise ContractIdentityProtocolError(
+                    "Protective quote does not match its qualified contract"
+                )
+            ticks = getattr(ticker, "tickByTicks", None)
+            if not isinstance(ticks, list) or not ticks:
+                raise RuntimeError("IBKR protective last-trade event is missing")
+            con_id = int(contract.conId)
+            cursor = _PROTECTIVE_TICK_CURSORS.get(con_id, 0)
+            emitted_ticks = list(ticks[cursor:])
+            if not emitted_ticks:
+                emitted_ticks = [ticks[-1]]
+            ordered_ticks = sorted(
+                emitted_ticks,
+                key=lambda item: getattr(item, "time", datetime.min.replace(tzinfo=timezone.utc)),
+            )
+            event_ids = _PROTECTIVE_TICK_EVENT_IDS.setdefault(con_id, {})
+            retained_tick = ordered_ticks[-1]
+            retained_event_id = None
+            for tick in ordered_ticks:
+                source_timestamp = getattr(tick, "time", None)
+                source_timestamp_text = _aware_iso(source_timestamp)
+                session = get_market_session(source_timestamp)
+                if session == "closed":
+                    raise ValueError("Protective quote is outside an admitted market session")
+                price_text = _canonical_decimal(getattr(tick, "price", None))
+                tick_identity = id(tick)
+                source_event_id = event_ids.get(tick_identity)
+                if source_event_id is None:
+                    event_sequence = next(_PROTECTIVE_TICK_EVENT_SEQUENCE)
+                    event_fingerprint = hashlib.sha256(
+                        (
+                            f"v1|{WORKER_GENERATION_ID}|{con_id}|{event_sequence}|"
+                            f"{source_timestamp_text}|{price_text}|"
+                            f"{getattr(tick, 'size', '')}|"
+                            f"{getattr(tick, 'exchange', '')}"
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    # Hash every variable-width component, including the
+                    # sequence, into one fixed-width opaque identity. This
+                    # remains unique per arrival and stable for the retained
+                    # fallback without leaking an unbounded generation ID.
+                    source_event_id = f"protective:v1:{event_fingerprint}"
+                    if len(source_event_id) > MAX_PROTECTIVE_SOURCE_EVENT_ID_LENGTH:
+                        raise RuntimeError("Protective event identity exceeds its bound")
+                    event_ids[tick_identity] = source_event_id
+                if tick is retained_tick:
+                    retained_event_id = source_event_id
+                quotes.append(
+                    {
+                        "schema_version": 1,
+                        "symbol": contract.symbol,
+                        "con_id": con_id,
+                        "exchange": contract.exchange,
+                        "primary_exchange": contract.primaryExchange,
+                        "currency": contract.currency,
+                        "security_type": contract.secType,
+                        "price": price_text,
+                        "source_timestamp": source_timestamp_text,
+                        "retrieval_timestamp": retrieval_time.isoformat(),
+                        "session": session,
+                        "source": "ibkr-live-last-trade",
+                        "source_event_id": source_event_id,
+                        # IBKR does not offer delayed tick-by-tick Last. A
+                        # successfully delivered event is therefore live type 1.
+                        "market_data_type": 1,
+                    }
+                )
+            if retained_event_id is None:
+                raise RuntimeError("IBKR protective event identity was not retained")
+            # Retain one stable fallback event while bounding the long-lived
+            # ib_async ticker list and identity registry. All new events were
+            # copied above before this synchronous mutation, so no crossing
+            # can be discarded.
+            ticker.tickByTicks[:] = [retained_tick]
+            _PROTECTIVE_TICK_CURSORS[con_id] = 1
+            _PROTECTIVE_TICK_EVENT_IDS[con_id] = {id(retained_tick): retained_event_id}
+        return {
+            "status": "success",
+            "data": {
+                "quotes": quotes,
+                "broker_time_before": _aware_iso(broker_time_before),
+                "broker_time_after": _aware_iso(broker_time_after),
+                "retrieval_timestamp": retrieval_time.isoformat(),
+            },
+        }
+    except ContractIdentityProtocolError as error:
+        return {
+            "status": PROTOCOL_ERROR_STATUS,
+            "error": str(error),
+            "error_type": PROTOCOL_ERROR_TYPE,
+            "traceback": traceback.format_exc(),
+        }
+    except Exception as error:
+        return {
+            "status": "error",
+            "error": str(error),
+            "error_type": type(error).__name__,
+            "traceback": traceback.format_exc(),
+        }
+
+
 async def handle_command(command: dict) -> dict:
     """Route command to appropriate handler"""
     cmd = command.get("command")
@@ -1828,6 +2103,8 @@ async def handle_command(command: dict) -> dict:
         return await handle_get_broker_contract_safety_snapshot(command.get("params", {}))
     elif cmd == "get_historical_bars":
         return await handle_get_historical_bars(command.get("params", {}))
+    elif cmd == "get_protective_quotes":
+        return await handle_get_protective_quotes(command.get("params", {}))
     elif cmd == "disconnect":
         return await handle_disconnect()
     elif cmd == "ping":

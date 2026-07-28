@@ -52,6 +52,16 @@ from robo_trader.broker_safety_evidence import (
     assert_producer_owned_broker_contract_safety_snapshot,
     assert_producer_owned_broker_safety_snapshot,
 )
+from robo_trader.market_data_contract import (
+    BrokerProtectiveQuote,
+    CanonicalBarBatch,
+    MarketDataSource,
+    MarketSession,
+    canonicalize_historical_bars,
+)
+from robo_trader.protective_quote_evidence import (
+    MAX_PROTECTIVE_SOURCE_EVENT_ID_LENGTH,
+)
 from robo_trader.reconciliation.identity import (
     RuntimeSafetyContext,
     assert_validated_runtime_safety_context,
@@ -3133,6 +3143,223 @@ class SubprocessIBKRClient:
                 timeout=60.0,  # Historical data can take longer
             )
             return self._validate_historical_response(normalized_symbol, data, generation)
+
+    async def get_canonical_historical_bars(
+        self,
+        symbol: str,
+        duration: str = "2 D",
+        bar_size: str = "5 mins",
+        what_to_show: str = "TRADES",
+        use_rth: bool = True,
+    ) -> CanonicalBarBatch:
+        """Return bars atomically bound to their exact broker lineage."""
+
+        normalized_symbol = self._normalize_historical_symbol(symbol)
+        if what_to_show != "TRADES":
+            raise ValueError("Canonical historical bars require exact what_to_show='TRADES'")
+        if bar_size not in _INTRADAY_BAR_SIZES:
+            raise ValueError(
+                "Subprocess transport supports only intraday datetime bars; "
+                f"unsupported bar_size={bar_size!r}"
+            )
+        async with self._lifecycle_lock:
+            generation = self._generation
+            data = await self._execute_command_unlocked(
+                {
+                    "command": "get_historical_bars",
+                    "params": {
+                        "symbol": normalized_symbol,
+                        "duration": duration,
+                        "bar_size": bar_size,
+                        "what_to_show": what_to_show,
+                        "use_rth": use_rth,
+                    },
+                },
+                timeout=60.0,
+            )
+            bars = self._validate_historical_response(normalized_symbol, data, generation)
+            # The lifecycle lock prevents generation replacement between the
+            # response validation above and this exact lineage read.
+            lineage = self.get_cached_historical_lineage(normalized_symbol)
+            return canonicalize_historical_bars(
+                symbol=normalized_symbol,
+                records=bars,
+                lineage=lineage,
+                bar_size=bar_size,
+                use_rth=use_rth,
+                what_to_show=what_to_show,
+            )
+
+    def _validate_protective_quote_response(
+        self,
+        symbols: tuple[str, ...],
+        data: dict,
+        generation: Optional[_WorkerGeneration],
+    ) -> tuple[BrokerProtectiveQuote, ...]:
+        """Validate live quote snapshots and bind them to one generation."""
+
+        try:
+            if generation is None:
+                raise ValueError("protective quote response has no worker generation")
+            with generation.state_lock:
+                generation_current = (
+                    self._generation is generation and generation.poisoned_reason is None
+                )
+            if not generation_current:
+                raise ValueError("protective quote response belongs to a stale generation")
+            if set(data) != {
+                "quotes",
+                "broker_time_before",
+                "broker_time_after",
+                "retrieval_timestamp",
+            }:
+                raise ValueError("protective quote response schema is invalid")
+            broker_before = self._strict_timestamp(
+                data["broker_time_before"], "protective broker_time_before"
+            )
+            broker_after = self._strict_timestamp(
+                data["broker_time_after"], "protective broker_time_after"
+            )
+            retrieval_time = self._strict_timestamp(
+                data["retrieval_timestamp"], "protective retrieval_timestamp"
+            )
+            if broker_after < broker_before:
+                raise ValueError("protective quote broker times are reversed")
+            now = datetime.now(timezone.utc)
+            if abs((now - retrieval_time).total_seconds()) > 10:
+                raise ValueError("protective quote retrieval time is stale")
+            if any(
+                abs((broker_time - retrieval_time).total_seconds())
+                > _BROKER_SNAPSHOT_MAX_CLOCK_SKEW_SECONDS
+                for broker_time in (broker_before, broker_after)
+            ):
+                raise ValueError("protective quote broker clock skew exceeds safety bound")
+            raw_quotes = data["quotes"]
+            if not isinstance(raw_quotes, list) or len(raw_quotes) < len(symbols):
+                raise ValueError("protective quote response coverage is incomplete")
+            expected_keys = {
+                "schema_version",
+                "symbol",
+                "con_id",
+                "exchange",
+                "primary_exchange",
+                "currency",
+                "security_type",
+                "price",
+                "source_timestamp",
+                "retrieval_timestamp",
+                "session",
+                "source",
+                "source_event_id",
+                "market_data_type",
+            }
+            expected_symbols = set(symbols)
+            quotes = []
+            seen_symbols = set()
+            con_id_by_symbol: dict[str, int] = {}
+            symbol_by_con_id: dict[int, str] = {}
+            last_timestamp_by_symbol: dict[str, datetime] = {}
+            seen_event_ids = set()
+            for raw in raw_quotes:
+                if not isinstance(raw, dict) or set(raw) != expected_keys:
+                    raise ValueError("protective quote record schema is invalid")
+                if (
+                    type(raw["source_event_id"]) is not str
+                    or len(raw["source_event_id"]) > MAX_PROTECTIVE_SOURCE_EVENT_ID_LENGTH
+                ):
+                    raise ValueError("protective quote event identity exceeds its bound")
+                source_timestamp = self._strict_timestamp(
+                    raw["source_timestamp"], "protective source_timestamp"
+                )
+                quote_retrieval = self._strict_timestamp(
+                    raw["retrieval_timestamp"], "protective quote retrieval_timestamp"
+                )
+                if quote_retrieval != retrieval_time:
+                    raise ValueError("protective quote retrieval timestamps disagree")
+                if (now - source_timestamp).total_seconds() < 0:
+                    raise ValueError("protective quote source timestamp is in the future")
+                try:
+                    quote = BrokerProtectiveQuote(
+                        schema_version=raw["schema_version"],
+                        symbol=raw["symbol"],
+                        con_id=raw["con_id"],
+                        exchange=raw["exchange"],
+                        primary_exchange=raw["primary_exchange"],
+                        currency=raw["currency"],
+                        security_type=raw["security_type"],
+                        price=Decimal(str(raw["price"])),
+                        source_timestamp=source_timestamp,
+                        retrieval_timestamp=quote_retrieval,
+                        session=MarketSession(raw["session"]),
+                        source=MarketDataSource(raw["source"]),
+                        source_event_id=raw["source_event_id"],
+                        transport_generation=generation.generation_id,
+                        market_data_type=raw["market_data_type"],
+                    )
+                except (InvalidOperation, TypeError, ValueError) as exc:
+                    raise ValueError(f"protective quote record is invalid: {exc}") from exc
+                if quote.symbol not in expected_symbols:
+                    raise ValueError("protective quote symbol was not requested")
+                prior_con_id = con_id_by_symbol.setdefault(quote.symbol, quote.con_id)
+                prior_symbol = symbol_by_con_id.setdefault(quote.con_id, quote.symbol)
+                if prior_con_id != quote.con_id or prior_symbol != quote.symbol:
+                    raise ValueError("protective quote contract identity changed")
+                previous_timestamp = last_timestamp_by_symbol.get(quote.symbol)
+                if previous_timestamp is not None and quote.source_timestamp < previous_timestamp:
+                    raise ValueError("protective quote events are out of order")
+                if quote.source_event_id in seen_event_ids:
+                    raise ValueError("protective quote event identity is duplicated")
+                seen_symbols.add(quote.symbol)
+                seen_event_ids.add(quote.source_event_id)
+                last_timestamp_by_symbol[quote.symbol] = quote.source_timestamp
+                quotes.append(quote)
+            if seen_symbols != expected_symbols:
+                raise ValueError("protective quote response coverage is incomplete")
+            return tuple(quotes)
+        except (KeyError, TypeError, ValueError) as exc:
+            reason = str(exc)
+            if generation is not None:
+                self._poison_generation(generation, reason)
+            raise IBKRTransportPoisonedError(reason) from exc
+
+    async def get_protective_quotes(
+        self,
+        symbols: list[str] | tuple[str, ...],
+        *,
+        active_symbols: list[str] | tuple[str, ...] | None = None,
+    ) -> tuple[BrokerProtectiveQuote, ...]:
+        """Fetch live protective quotes on this exact read-only generation."""
+
+        if not isinstance(symbols, (list, tuple)) or len(symbols) > 64:
+            raise ValueError("protective quote symbols are malformed")
+        normalized = tuple(self._normalize_historical_symbol(symbol) for symbol in symbols)
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("protective quote symbols are duplicated")
+        if active_symbols is None:
+            normalized_active = normalized
+        else:
+            if not isinstance(active_symbols, (list, tuple)) or len(active_symbols) > 4096:
+                raise ValueError("protective quote active symbols are malformed")
+            normalized_active = tuple(
+                self._normalize_historical_symbol(symbol) for symbol in active_symbols
+            )
+            if len(set(normalized_active)) != len(normalized_active):
+                raise ValueError("protective quote active symbols are duplicated")
+            if not set(normalized).issubset(normalized_active):
+                raise ValueError("protective quote symbols are not account-active")
+        async with self._lifecycle_lock:
+            generation = self._generation
+            data = await self._execute_command_unlocked(
+                {
+                    "command": "get_protective_quotes",
+                    "params": {
+                        "symbols": list(normalized),
+                        "active_symbols": list(normalized_active),
+                    },
+                },
+                timeout=10.0,
+            )
+            return self._validate_protective_quote_response(normalized, data, generation)
 
     async def disconnect(self) -> None:
         """Disconnect from IBKR"""

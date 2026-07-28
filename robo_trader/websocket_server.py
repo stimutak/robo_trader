@@ -458,6 +458,13 @@ class WebSocketManager:
         bid: Optional[float] = None,
         ask: Optional[float] = None,
         volume: Optional[int] = None,
+        *,
+        event_timestamp: Optional[str] = None,
+        retrieval_timestamp: Optional[str] = None,
+        source: Optional[str] = None,
+        session: Optional[str] = None,
+        timeframe: Optional[str] = None,
+        freshness_status: Optional[str] = None,
     ):
         """Queue a market data update for broadcast."""
         if not self.thread or not self.thread.is_alive():
@@ -477,6 +484,16 @@ class WebSocketManager:
             message["ask"] = ask
         if volume is not None:
             message["volume"] = volume
+        for key, value in (
+            ("event_timestamp", event_timestamp),
+            ("retrieval_timestamp", retrieval_timestamp),
+            ("source", source),
+            ("session", session),
+            ("timeframe", timeframe),
+            ("freshness_status", freshness_status),
+        ):
+            if value is not None:
+                message[key] = value
 
         self.message_queue.put(message)
         logger.debug(

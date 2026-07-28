@@ -12,16 +12,18 @@ import asyncio
 import logging
 import os
 import stat
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Awaitable, Callable, Optional
 
 from .broker_safety_evidence import BrokerContractSafetySnapshot
 from .clients.subprocess_ibkr_client import SubprocessIBKRClient
 from .database_async import AsyncTradingDatabase
 from .execution import Order, PaperExecutor
+from .market_data_contract import BrokerProtectiveQuote
 from .paper_reduction_submitter import (
     LocalPaperOrderStatus,
     LocalPaperTerminalOutcome,
@@ -32,6 +34,7 @@ from .paper_runtime_settlement import PaperRuntimeSettlementParticipant
 from .paper_terminal_settlement import PaperTerminalSettlementRequest
 from .protective_quote_evidence import (
     ProtectiveQuoteEvidence,
+    ProtectiveQuoteSource,
     assert_current_authoritative_protective_quote,
 )
 from .reconciliation.identity import (
@@ -75,6 +78,9 @@ class PaperReductionGateway:
         runtime_context: RuntimeSafetyContext,
         coordinator: SafetyRuntimeCoordinator,
         database: AsyncTradingDatabase,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._runtime_context = assert_validated_runtime_safety_context(runtime_context)
         if type(coordinator) is not SafetyRuntimeCoordinator or not coordinator.started:
@@ -127,6 +133,31 @@ class PaperReductionGateway:
         self._started = False
         self._diagnostic_recovery_required = False
         self._terminal_quarantine_reason: str | None = None
+        self._protective_quote_producers: dict[str, object] = {}
+        self._protective_feed_task: asyncio.Task | None = None
+        self._protective_feed_enabled = False
+        self._protective_feed_interval_seconds = 2.0
+        self._protective_feed_max_recovery_attempts = 3
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self._generation_symbol_first_request: dict[str, float] = {}
+        self._generation_subscribed_symbols: set[str] = set()
+        self._resubscribe_not_before = 0.0
+        self._tick_resubscribe_cooldown_seconds = 15.0
+
+    def _ensure_protective_feed_task(self) -> None:
+        """Run exactly one feed loop whenever the broker generation is active."""
+
+        if (
+            self._started
+            and self._protective_feed_enabled
+            and self._protective_quote_producers
+            and (self._protective_feed_task is None or self._protective_feed_task.done())
+        ):
+            self._protective_feed_task = asyncio.create_task(
+                self._protective_feed_loop(),
+                name="paper-gateway-protective-feed",
+            )
 
     @property
     def started(self) -> bool:
@@ -184,6 +215,23 @@ class PaperReductionGateway:
     ) -> None:
         """Drain one client stop through cancellation and preserve the first error."""
 
+        # IBKR forbids requesting tick-by-tick data for the same instrument
+        # more than once in 15 seconds. Retiring a worker loses its local
+        # subscription memory, so preserve a conservative account-wide lower
+        # bound before the generation can disappear.
+        first_requests = getattr(self, "_generation_symbol_first_request", {})
+        if first_requests:
+            cooldown = getattr(self, "_tick_resubscribe_cooldown_seconds", 15.0)
+            previous = getattr(self, "_resubscribe_not_before", 0.0)
+            self._resubscribe_not_before = max(
+                previous,
+                max(requested_at + cooldown for requested_at in first_requests.values()),
+            )
+            first_requests.clear()
+        subscribed = getattr(self, "_generation_subscribed_symbols", None)
+        if subscribed is not None:
+            subscribed.clear()
+
         task = asyncio.create_task(self._client.stop())
         cancellation: asyncio.CancelledError | None = None
         stop_failure: BaseException | None = None
@@ -222,12 +270,220 @@ class PaperReductionGateway:
         if stop_failure is not None:
             raise stop_failure.with_traceback(stop_failure.__traceback__)
 
+    async def _invalidate_protective_quote_producers(self) -> None:
+        for producer in tuple(self._protective_quote_producers.values()):
+            invalidate = getattr(producer, "invalidate_protective_quotes", None)
+            if callable(invalidate):
+                await invalidate()
+
+    def attach_protective_quote_producer(
+        self,
+        portfolio_id: str,
+        producer: object,
+    ) -> None:
+        """Attach a monitor before startup position coverage is asserted."""
+
+        from .stop_loss_monitor import StopLossMonitor
+
+        if (
+            not isinstance(portfolio_id, str)
+            or not portfolio_id
+            or portfolio_id != portfolio_id.strip()
+            or type(producer) is not StopLossMonitor
+            or producer.portfolio_id != portfolio_id
+        ):
+            raise PaperReductionGatewayError("protective quote producer binding is malformed")
+        existing = self._protective_quote_producers.get(portfolio_id)
+        if existing is not None and existing is not producer:
+            raise PaperReductionGatewayError("portfolio quote producer is already attached")
+        self._protective_quote_producers[portfolio_id] = producer
+
+    def start_protective_feed(self) -> None:
+        """Enable continuous quote refresh after runner activation is complete."""
+
+        if not self._started or not self._protective_quote_producers:
+            raise PaperReductionGatewayError("protective quote feed cannot be activated")
+        self._protective_feed_enabled = True
+        self._ensure_protective_feed_task()
+
+    def _protected_symbols(self) -> tuple[str, ...]:
+        symbols = set()
+        for producer in self._protective_quote_producers.values():
+            active_stops = getattr(producer, "active_stops", None)
+            if isinstance(active_stops, dict):
+                for stop in active_stops.values():
+                    symbol = getattr(stop, "symbol", None)
+                    if isinstance(symbol, str) and symbol:
+                        symbols.add(symbol)
+        return tuple(sorted(symbols))
+
+    async def refresh_protective_quotes(
+        self,
+        symbols: list[str] | tuple[str, ...],
+    ) -> tuple[BrokerProtectiveQuote, ...]:
+        """Publish quotes under the account gate using bounded worker requests."""
+
+        requested = tuple(symbols)
+        effective_symbols = tuple(sorted(set(requested).union(self._protected_symbols())))
+        if not set(requested).issubset(effective_symbols):
+            raise PaperReductionGatewayError("protective quote request is malformed")
+        async with self._account_order_gate:
+            await self._ensure_diagnostic_ready_locked()
+            try:
+                quotes = await self._fetch_protective_quotes_locked(
+                    requested,
+                    active_symbols=effective_symbols,
+                )
+                await self._publish_protective_quotes_locked(quotes)
+                requested_set = set(requested)
+                return tuple(quote for quote in quotes if quote.symbol in requested_set)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self._started = False
+                self._diagnostic_recovery_required = True
+                await self._invalidate_protective_quote_producers()
+                try:
+                    await self._stop_client_owned()
+                except Exception as stop_error:
+                    logger.error(
+                        "event=protective_quote_client_stop_failed error_type=%s",
+                        type(stop_error).__name__,
+                    )
+                raise error.with_traceback(error.__traceback__)
+
+    async def _fetch_protective_quotes_locked(
+        self,
+        requested: tuple[str, ...],
+        *,
+        active_symbols: tuple[str, ...],
+    ) -> tuple[BrokerProtectiveQuote, ...]:
+        """Respect the client's 64-symbol request cap without subscription churn."""
+
+        monotonic = getattr(self, "_monotonic", time.monotonic)
+        sleep = getattr(self, "_sleep", asyncio.sleep)
+        not_before = getattr(self, "_resubscribe_not_before", 0.0)
+        remaining = not_before - monotonic()
+        if remaining > 0:
+            await sleep(remaining)
+
+        chunks = [requested[index : index + 64] for index in range(0, len(requested), 64)]
+        if not chunks:
+            # The explicit empty call is the worker protocol for cancelling all
+            # subscriptions when the full effective set is empty.
+            chunks = [tuple()]
+        quotes: list[BrokerProtectiveQuote] = []
+        for chunk in chunks:
+            first_requests = getattr(self, "_generation_symbol_first_request", None)
+            if first_requests is None:
+                first_requests = {}
+                self._generation_symbol_first_request = first_requests
+            subscribed = getattr(self, "_generation_subscribed_symbols", None)
+            if subscribed is None:
+                subscribed = set()
+                self._generation_subscribed_symbols = subscribed
+            # The worker may retire symbols outside the full active set. Treat
+            # any later reactivation as a possible new broker request even if
+            # its worker-side 15-second retention happened to reuse it.
+            subscribed.intersection_update(active_symbols)
+            newly_requested = set(chunk) - subscribed
+            try:
+                response = await self._client.get_protective_quotes(
+                    chunk,
+                    active_symbols=active_symbols,
+                )
+            finally:
+                # Contract qualification and broker-time collection happen
+                # inside the worker command before reqTickByTickData. The
+                # parent completion time is therefore the conservative bound:
+                # it is never earlier than a broker request that may have
+                # succeeded even when the command ultimately failed.
+                completed_at = monotonic()
+                for requested_symbol in newly_requested:
+                    first_requests[requested_symbol] = completed_at
+            if not isinstance(response, tuple):
+                raise PaperReductionGatewayError("broker quote response is malformed")
+            subscribed.update(chunk)
+            quotes.extend(response)
+        observed_symbols = {quote.symbol for quote in quotes}
+        if observed_symbols != set(requested):
+            raise PaperReductionGatewayError("broker quote coverage is incomplete")
+        return tuple(quotes)
+
+    async def _publish_protective_quotes_locked(
+        self,
+        quotes: tuple[BrokerProtectiveQuote, ...],
+    ) -> None:
+        """Publish exact Decimal quotes while the account evidence gate is held."""
+
+        for quote in quotes:
+            if type(quote) is not BrokerProtectiveQuote:
+                raise PaperReductionGatewayError("broker returned a non-canonical quote")
+            for producer in tuple(self._protective_quote_producers.values()):
+                update_price = getattr(producer, "update_price", None)
+                if not callable(update_price):
+                    raise PaperReductionGatewayError("protective quote producer is malformed")
+                accepted = await update_price(
+                    quote.symbol,
+                    quote.price,
+                    source_timestamp=quote.source_timestamp,
+                    source=ProtectiveQuoteSource.LIVE_BROKER,
+                    con_id=quote.con_id,
+                    transport_generation=quote.transport_generation,
+                    source_event_id=quote.source_event_id,
+                )
+                if accepted is not True:
+                    raise PaperReductionGatewayError(
+                        f"protective quote was rejected for {quote.symbol}"
+                    )
+
+    async def _protective_feed_loop(self) -> None:
+        """Continuously refresh every symbol with an active protective stop."""
+
+        consecutive_failures = 0
+        while self._protective_feed_enabled and (
+            self._started or self._diagnostic_recovery_required
+        ):
+            try:
+                symbols = self._protected_symbols()
+                await self.refresh_protective_quotes(symbols)
+                consecutive_failures = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                consecutive_failures += 1
+                logger.error(
+                    "event=protective_quote_refresh_failed error_type=%s "
+                    "consecutive_failures=%d",
+                    type(error).__name__,
+                    consecutive_failures,
+                )
+                if consecutive_failures >= self._protective_feed_max_recovery_attempts:
+                    self._protective_feed_enabled = False
+                    logger.critical(
+                        "event=protective_quote_feed_disabled "
+                        "operator_action_required=true consecutive_failures=%d",
+                        consecutive_failures,
+                    )
+                    break
+            await asyncio.sleep(self._protective_feed_interval_seconds)
+
     async def close(self) -> None:
         """Stop only the gateway-owned diagnostic client."""
 
         async with self._account_order_gate:
             self._started = False
             self._diagnostic_recovery_required = False
+            self._protective_feed_enabled = False
+            feed_task = self._protective_feed_task
+            self._protective_feed_task = None
+            if feed_task is not None and not feed_task.done():
+                feed_task.cancel()
+                try:
+                    await feed_task
+                except asyncio.CancelledError:
+                    pass
+            await self._invalidate_protective_quote_producers()
             try:
                 await self._stop_client_owned()
             finally:
@@ -239,6 +495,7 @@ class PaperReductionGateway:
 
         self._started = False
         self._diagnostic_recovery_required = True
+        await self._invalidate_protective_quote_producers()
         try:
             context = assert_validated_runtime_safety_context(self._runtime_context)
             connection = context.diagnostic_connection
@@ -258,6 +515,7 @@ class PaperReductionGateway:
             raise
         self._started = True
         self._diagnostic_recovery_required = False
+        self._ensure_protective_feed_task()
 
     async def refresh_diagnostic_connection(self) -> None:
         """Replace stale broker state before order admission can resume.
@@ -321,6 +579,7 @@ class PaperReductionGateway:
 
         self._started = False
         self._diagnostic_recovery_required = True
+        await self._invalidate_protective_quote_producers()
         await self._stop_client_owned(error)
 
     def register_paper_executor(
@@ -365,6 +624,11 @@ class PaperReductionGateway:
             ):
                 return
             raise PaperReductionGatewayError("portfolio paper runtime is already registered")
+        attached = self._protective_quote_producers.get(portfolio_id)
+        if attached is not protective_quote_producer:
+            raise PaperReductionGatewayError(
+                "paper runtime quote producer was not provisionally attached"
+            )
         self._bindings[portfolio_id] = _PaperRuntimeBinding(
             submitter=_bind_paper_reduction_submitter(
                 executor,
@@ -375,8 +639,11 @@ class PaperReductionGateway:
         )
 
     @asynccontextmanager
-    async def serialize_entry(self) -> AsyncIterator[None]:
-        """Prevent an entry dispatch from interleaving with reduction evidence."""
+    async def serialize_entry(
+        self,
+        symbol: str | None = None,
+    ) -> AsyncIterator[BrokerProtectiveQuote | None]:
+        """Refresh entry evidence and hold it stable through paper dispatch."""
 
         require_paper_terminal_settlement_ready()
         async with self._account_order_gate:
@@ -397,7 +664,42 @@ class PaperReductionGateway:
                 raise PaperReductionGatewayError(
                     "diagnostic broker is unavailable for entry admission"
                 )
-            yield
+            current_quote: BrokerProtectiveQuote | None = None
+            if symbol is not None:
+                effective_symbols = tuple(sorted(set((symbol,)).union(self._protected_symbols())))
+                try:
+                    quotes = await self._fetch_protective_quotes_locked(
+                        effective_symbols,
+                        active_symbols=effective_symbols,
+                    )
+                    await self._publish_protective_quotes_locked(quotes)
+                    matching = tuple(quote for quote in quotes if quote.symbol == symbol)
+                    if not matching:
+                        raise PaperReductionGatewayError(
+                            "entry quote refresh returned no matching evidence"
+                        )
+                    current_quote = matching[-1]
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    self._started = False
+                    self._diagnostic_recovery_required = True
+                    await self._invalidate_protective_quote_producers()
+                    try:
+                        await self._stop_client_owned()
+                    except Exception as stop_error:
+                        logger.error(
+                            "event=entry_quote_client_stop_failed error_type=%s",
+                            type(stop_error).__name__,
+                        )
+                    raise error.with_traceback(error.__traceback__)
+                for producer in tuple(self._protective_quote_producers.values()):
+                    pending = getattr(producer, "has_pending_reduction", None)
+                    if not callable(pending) or await pending() is not False:
+                        raise PaperReductionGatewayError(
+                            "entry blocked while a protective reduction is pending"
+                        )
+            yield current_quote
 
     async def submit_reduction(
         self,

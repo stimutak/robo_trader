@@ -10,12 +10,22 @@ Hardened for concurrent access with the async trader:
 import os
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from robo_trader.database_validator import ValidationError, validate_portfolio_id
+from robo_trader.market_data_contract import (
+    MarketDataContractError,
+    bar_interval_seconds,
+    market_data_max_age_seconds,
+    validate_canonical_storage_row,
+)
 
 DEFAULT_PORTFOLIO_ID = "default"
+
+
+class MarketDataReadError(RuntimeError):
+    """The dashboard could not prove a trustworthy market-data read."""
 
 
 class SyncDatabaseReader:
@@ -214,9 +224,105 @@ class SyncDatabaseReader:
                 "unrealized_pnl": 0,
             }
 
-    def get_latest_market_data(self, symbol: str, limit: int = 100) -> List[Dict]:
-        """Get latest market data for a symbol"""
+    def get_latest_market_data(
+        self,
+        symbol: str,
+        limit: int = 100,
+        timeframe: Optional[str] = None,
+    ) -> List[Dict]:
+        """Get one deterministic canonical series or raise a typed read error."""
+
+        if type(limit) is not int or not 1 <= limit <= 10_000:
+            raise ValueError("market data limit must be an integer between 1 and 10000")
+        if timeframe is not None:
+            bar_interval_seconds(timeframe)
+        columns = """
+            timestamp, open, high, low, close, volume,
+            schema_version, con_id, exchange, primary_exchange,
+            timeframe, interval_seconds, timezone_name, session_policy,
+            session, source, retrieval_timestamp, broker_timestamp,
+            adjustment_state, quality_flags, transport_generation,
+            timestamp_semantics, use_rth, what_to_show
+        """
         try:
+            try:
+                selector_sql = f"""
+                    SELECT {columns}
+                    FROM canonical_market_data
+                    WHERE symbol = ? {"AND timeframe = ?" if timeframe is not None else ""}
+                    ORDER BY timestamp DESC, interval_seconds ASC,
+                             retrieval_timestamp DESC, con_id DESC
+                    LIMIT 1
+                """
+                selector_params = (symbol, timeframe) if timeframe is not None else (symbol,)
+                selected_rows = self._fetch_all(selector_sql, selector_params)
+                selected = selected_rows[0] if selected_rows else None
+                rows = []
+                if selected is not None:
+                    rows = self._fetch_all(
+                        f"""
+                        SELECT {columns}
+                        FROM canonical_market_data
+                        WHERE symbol = ? AND con_id = ? AND timeframe = ?
+                          AND session_policy = ? AND source = ?
+                          AND adjustment_state = ? AND timestamp_semantics = ?
+                          AND use_rth = ? AND what_to_show = ?
+                        ORDER BY timestamp DESC, retrieval_timestamp DESC
+                        LIMIT ?
+                        """,
+                        (
+                            symbol,
+                            selected["con_id"],
+                            selected["timeframe"],
+                            selected["session_policy"],
+                            selected["source"],
+                            selected["adjustment_state"],
+                            selected["timestamp_semantics"],
+                            selected["use_rth"],
+                            selected["what_to_show"],
+                            limit,
+                        ),
+                    )
+            except sqlite3.OperationalError as error:
+                if "no such table" not in str(error).lower():
+                    raise
+                rows = []
+            if rows:
+                now = datetime.now(timezone.utc)
+                output = []
+                for row in rows:
+                    stored_item = dict(row)
+                    stored_item["symbol"] = symbol
+                    stored_item["use_rth"] = bool(stored_item["use_rth"])
+                    item = validate_canonical_storage_row(stored_item)
+                    event_time = datetime.fromisoformat(
+                        str(item["timestamp"]).replace("Z", "+00:00")
+                    )
+                    if event_time.tzinfo is None or event_time.utcoffset() is None:
+                        raise MarketDataContractError(
+                            "stored canonical timestamp is timezone-naive"
+                        )
+                    event_time = event_time.astimezone(timezone.utc)
+                    age_seconds = (now - event_time).total_seconds()
+                    freshness_limit = market_data_max_age_seconds(item["interval_seconds"])
+                    freshness_status = (
+                        "future"
+                        if age_seconds < 0
+                        else ("fresh" if age_seconds <= freshness_limit else "stale")
+                    )
+                    item["quality_flags"] = tuple(
+                        flag for flag in str(item.get("quality_flags") or "").split(",") if flag
+                    )
+                    item["use_rth"] = bool(item["use_rth"])
+                    item["age_seconds"] = age_seconds
+                    item["freshness_limit_seconds"] = freshness_limit
+                    item["freshness_status"] = freshness_status
+                    output.append(item)
+                return output
+
+            if timeframe is not None:
+                return []
+
             rows = self._fetch_all(
                 """
                 SELECT timestamp, open, high, low, close, volume
@@ -227,10 +333,18 @@ class SyncDatabaseReader:
                 """,
                 (symbol, limit),
             )
-            return [dict(row) for row in rows]
-        except Exception as e:
-            print(f"Error getting market data: {e}")
-            return []
+            return [
+                {
+                    **dict(row),
+                    "source": "legacy-unknown",
+                    "freshness_status": "unknown",
+                    "age_seconds": None,
+                    "freshness_limit_seconds": None,
+                }
+                for row in rows
+            ]
+        except (MarketDataContractError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise MarketDataReadError("market data read is unavailable") from exc
 
     def get_signals(self, hours: int = 1, portfolio_id: str = DEFAULT_PORTFOLIO_ID) -> List[Dict]:
         """Get recent signals for a portfolio."""

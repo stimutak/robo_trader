@@ -481,7 +481,7 @@ async def test_fresh_historical_close_is_never_rewarmed_as_live_protection(caplo
     await runner._rewarm_stop_loss_prices_after_recovery()
 
     assert monitor.last_prices == {}
-    assert "reason=non_protective_source source='historical_bar'" in caplog.text
+    assert "event=stop_loss_prices_rewarmed count=0 skipped=1" in caplog.text
 
 
 @pytest.mark.asyncio

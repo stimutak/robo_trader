@@ -641,6 +641,7 @@ async def _bind_runtime(
     generation: str = "gateway-generation",
 ) -> None:
     monitor, participant = _runtime_components(harness, portfolio_id)
+    harness.gateway.attach_protective_quote_producer(portfolio_id, monitor)
     harness.gateway.register_paper_executor(
         portfolio_id,
         executor,
@@ -719,6 +720,7 @@ def test_gateway_requires_exact_runtime_coordinator_database_and_executor_bindin
 
     executor = PaperExecutor()
     monitor_a, participant_a = _runtime_components(harness, "portfolio-a")
+    harness.gateway.attach_protective_quote_producer("portfolio-a", monitor_a)
     harness.gateway.register_paper_executor(
         "portfolio-a",
         executor,

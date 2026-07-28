@@ -275,6 +275,7 @@ async def test_one_shot_run_activates_recovery_pending_gateway_before_cycle() ->
     gateway._started = False
     gateway._diagnostic_recovery_required = True
     gateway.register_paper_executor = MagicMock()
+    gateway.start_protective_feed = MagicMock()
     runner.paper_reduction_gateway = gateway
 
     activate = runner._activate_after_setup
@@ -298,6 +299,7 @@ async def test_one_shot_run_activates_recovery_pending_gateway_before_cycle() ->
         protective_quote_producer=runner.stop_loss_monitor,
         settlement_participant=runner._paper_settlement_participant,
     )
+    gateway.start_protective_feed.assert_called_once_with()
     runner.cleanup.assert_awaited_once_with()
     assert runner._setup_complete is False
 

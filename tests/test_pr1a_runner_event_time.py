@@ -6,9 +6,11 @@ import asyncio
 import inspect
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pandas as pd
 import pytest
@@ -16,7 +18,18 @@ import pytest
 import robo_trader.runner_async as runner_module
 from robo_trader.clients.subprocess_ibkr_client import IBKRTimeoutError
 from robo_trader.connection_health import HealthStatus
-from robo_trader.execution import Order
+from robo_trader.execution import ExecutionResult, Order
+from robo_trader.market_data_contract import (
+    AdjustmentState,
+    BarTimestampSemantics,
+    BrokerProtectiveQuote,
+    CanonicalBar,
+    CanonicalBarBatch,
+    HistoricalBarContract,
+    MarketDataSource,
+    MarketSession,
+    MarketSessionPolicy,
+)
 from robo_trader.monitoring.performance import PerformanceMonitor
 from robo_trader.paper_reduction_gateway import PaperReductionGateway
 from robo_trader.protective_quote_evidence import (
@@ -328,7 +341,7 @@ async def test_bad_event_time_has_no_downstream_side_effects() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("bar_age_seconds", [5, 11, 30, 59])
 @pytest.mark.parametrize("monitor_enabled", [True, False])
-async def test_historical_bar_is_observational_and_always_blocks_trading(
+async def test_unsealed_historical_frame_never_reaches_trading_state(
     bar_age_seconds: int,
     monitor_enabled: bool,
 ) -> None:
@@ -356,14 +369,11 @@ async def test_historical_bar_is_observational_and_always_blocks_trading(
     result = await runner.process_symbol("AAPL")
 
     assert result.executed is False
-    assert result.message.startswith("Protective feed unavailable")
-    assert runner._protective_feed_status["AAPL"]["available"] is False
-    assert runner._protective_feed_status["AAPL"]["source"] == "historical_bar"
-    assert runner._protective_feed_status["AAPL"]["live_grade"] is False
-    assert runner.market_data_cache["AAPL"] is frame
-    assert runner.latest_prices == {"AAPL": 101.0}
-    assert runner.latest_price_sources == {"AAPL": "historical_bar"}
-    runner.advanced_risk.update_market_prices.assert_called_once_with({"AAPL": 101.0})
+    assert result.message == "Execution blocked: canonical market-data evidence unavailable"
+    assert runner.market_data_cache == {}
+    assert runner.latest_prices == {}
+    assert runner.latest_price_times == {}
+    runner.advanced_risk.update_market_prices.assert_not_called()
     if runner.stop_loss_monitor:
         runner.stop_loss_monitor.update_price.assert_not_awaited()
     runner.ml_enhanced_strategy.analyze.assert_not_awaited()
@@ -483,10 +493,8 @@ async def test_process_symbol_normalizes_aware_latest_timestamp_to_utc() -> None
     result = await runner.process_symbol("AAPL")
 
     assert result.executed is False
-    assert runner.latest_price_times["AAPL"] == datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc)
-    assert runner._protective_feed_status["AAPL"]["source_timestamp"] == (
-        "2026-07-23T15:00:00+00:00"
-    )
+    assert result.message == "Execution blocked: canonical market-data evidence unavailable"
+    assert runner.latest_price_times == {}
     runner.stop_loss_monitor.update_price.assert_not_awaited()
 
 
@@ -577,8 +585,10 @@ async def _configure_order_runtime(runner: AsyncRunner, executor_result=None) ->
             "available": True,
             "live_grade": True,
             "source": "live_protective",
+            "con_id": 265_000 + index,
+            "transport_generation": "test-generation-1",
         }
-        for symbol in ("AAPL", "MSFT", "TSLA", "NVDA")
+        for index, symbol in enumerate(("AAPL", "MSFT", "TSLA", "NVDA"), start=1)
     }
     runner._test_protective_clock = protective_clock
     runner.stop_loss_monitor = StopLossMonitor(
@@ -599,6 +609,68 @@ async def _configure_order_runtime(runner: AsyncRunner, executor_result=None) ->
             source_event_id=f"event-{index}",
         )
     runner.risk = MagicMock(emergency_shutdown_triggered=False)
+    runner.risk.validate_order.return_value = (True, "ok")
+    runner.portfolio = MagicMock()
+    runner.portfolio.equity = AsyncMock(return_value=Decimal("100000"))
+    runner.positions = {}
+    runner.latest_prices = {"AAPL": 100.0}
+    runner.latest_price_times = {"AAPL": accepted_at}
+    runner.latest_price_sources = {"AAPL": "live_protective"}
+    runner.daily_pnl = 0.0
+    runner.daily_executed_notional = 0.0
+    contract = HistoricalBarContract(
+        schema_version=1,
+        symbol="AAPL",
+        con_id=265001,
+        exchange="SMART",
+        primary_exchange="NASDAQ",
+        timezone_name="UTC",
+        timeframe="1 min",
+        session_policy=MarketSessionPolicy.REGULAR_ONLY,
+        source=MarketDataSource.IBKR_HISTORICAL_TRADES,
+        retrieval_time=accepted_at,
+        broker_time=accepted_at,
+        adjustment_state=AdjustmentState.RAW,
+        transport_generation="test-generation-1",
+        timestamp_semantics=BarTimestampSemantics.BAR_START,
+        use_rth=True,
+        what_to_show="TRADES",
+    )
+    batch = CanonicalBarBatch(
+        contract=contract,
+        bars=(
+            CanonicalBar(
+                contract=contract,
+                timestamp=accepted_at - timedelta(seconds=30),
+                open=Decimal("99"),
+                high=Decimal("101"),
+                low=Decimal("98"),
+                close=Decimal("100"),
+                volume=100,
+                session=MarketSession.REGULAR,
+            ),
+        ),
+    )
+    frame = batch.to_frame()
+    runner._canonical_bar_batches = {"AAPL": (batch, frame)}
+    broker_quote = BrokerProtectiveQuote(
+        schema_version=1,
+        symbol="AAPL",
+        con_id=265001,
+        exchange="SMART",
+        primary_exchange="NASDAQ",
+        currency="USD",
+        security_type="STK",
+        price=Decimal("100.0"),
+        source_timestamp=accepted_at,
+        retrieval_timestamp=accepted_at,
+        session=MarketSession.REGULAR,
+        source=MarketDataSource.IBKR_LIVE_LAST_TRADE,
+        source_event_id="event-1",
+        transport_generation="test-generation-1",
+        market_data_type=1,
+    )
+    runner._broker_protective_quotes = {"AAPL": broker_quote}
     runner.advanced_risk = None
     runner.circuit_breaker = MagicMock()
     runner.circuit_breaker.can_proceed = AsyncMock(return_value=True)
@@ -617,8 +689,8 @@ async def _configure_order_runtime(runner: AsyncRunner, executor_result=None) ->
     gateway._started = True
 
     @asynccontextmanager
-    async def serialize_entry():
-        yield
+    async def serialize_entry(symbol=None):
+        yield broker_quote if symbol == "AAPL" else None
 
     gateway.serialize_entry = serialize_entry
     gateway.submit_reduction = AsyncMock(
@@ -639,7 +711,7 @@ async def _configure_order_runtime(runner: AsyncRunner, executor_result=None) ->
         {"available": True, "live_grade": True, "source": "historical_bar"},
     ],
 )
-async def test_central_order_admission_requires_exact_live_protection(
+async def test_dashboard_status_cannot_revoke_exact_live_protection(
     side: str,
     status: dict | None,
 ) -> None:
@@ -651,9 +723,11 @@ async def test_central_order_admission_requires_exact_live_protection(
         Order(symbol="AAPL", quantity=1, side=side, price=100.0)
     )
 
-    assert result.ok is False
-    assert "live protective feed unavailable" in result.message.lower()
-    runner.executor.place_order.assert_not_called()
+    assert result.ok is True
+    if side in {"BUY", "SELL_SHORT"}:
+        runner.executor.place_order.assert_called_once()
+    else:
+        runner.paper_reduction_gateway.submit_reduction.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -709,8 +783,83 @@ async def test_order_admission_rechecks_monitor_owned_protective_freshness(
 
     assert runner._has_live_protective_feed("AAPL") is False
     assert result.ok is False
-    assert "live protective feed unavailable" in result.message.lower()
+    assert any(
+        phrase in result.message.lower()
+        for phrase in ("live protective feed unavailable", "not authoritative")
+    )
     runner.executor.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_entry_quote_aging_during_equity_await_never_touches_executor() -> None:
+    runner = AsyncRunner.__new__(AsyncRunner)
+    await _configure_order_runtime(runner)
+
+    async def age_quote_during_equity(_prices):
+        runner._test_protective_clock["monotonic"] += 11
+        return Decimal("100000")
+
+    runner.portfolio.equity = AsyncMock(side_effect=age_quote_during_equity)
+
+    result = await runner._place_order_with_circuit_breaker(
+        Order(symbol="AAPL", quantity=1, side="BUY", price=100.0)
+    )
+
+    assert result.ok is False
+    assert result.message == "Entry blocked: protective quote expired during final admission"
+    runner.executor.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_entry_fill_accounting_uses_exact_fills_for_cumulative_risk_and_marks() -> None:
+    runner = AsyncRunner.__new__(AsyncRunner)
+    runner.daily_executed_notional = 0.0
+    runner.positions = {
+        "AAPL": SimpleNamespace(quantity=2, avg_price=Decimal("400")),
+        "MSFT": SimpleNamespace(quantity=-3, avg_price=Decimal("350")),
+    }
+    runner.db = SimpleNamespace(
+        record_trade=AsyncMock(),
+        update_position=AsyncMock(),
+    )
+    buy_fill = runner._exact_entry_fill_price(
+        ExecutionResult(
+            True,
+            "filled",
+            100.0,
+            exact_fill_price=Decimal("400"),
+        )
+    )
+    short_fill = runner._exact_entry_fill_price(
+        ExecutionResult(
+            True,
+            "filled",
+            100.0,
+            exact_fill_price=Decimal("350"),
+        )
+    )
+
+    await runner._record_entry_fill_accounting(
+        symbol="AAPL",
+        side="BUY",
+        quantity=2,
+        fill_price=buy_fill,
+        strategy_reference_price=100.0,
+    )
+    await runner._record_entry_fill_accounting(
+        symbol="MSFT",
+        side="SELL_SHORT",
+        quantity=3,
+        fill_price=short_fill,
+        strategy_reference_price=100.0,
+    )
+
+    assert runner.daily_executed_notional == 1850.0
+    assert runner.daily_executed_notional > 500.0
+    assert runner.db.update_position.await_args_list == [
+        call("AAPL", 2, Decimal("400"), Decimal("400")),
+        call("MSFT", -3, Decimal("350"), Decimal("350")),
+    ]
 
 
 def test_pairs_historical_cache_cannot_mutate_strategy_state() -> None:
@@ -1500,6 +1649,76 @@ async def test_extended_hours_blocks_entry_sides_but_not_exit() -> None:
         )
         is quote
     )
+    runner.executor.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_extended_hours_entry_requires_and_accepts_matching_exact_session() -> None:
+    runner = AsyncRunner.__new__(AsyncRunner)
+    await _configure_order_runtime(runner)
+    regular_batch, _ = runner._canonical_bar_batches["AAPL"]
+    extended_contract = replace(
+        regular_batch.contract,
+        session_policy=MarketSessionPolicy.EXTENDED,
+        use_rth=False,
+    )
+    extended_bar = replace(
+        regular_batch.bars[-1],
+        contract=extended_contract,
+        session=MarketSession.PRE_MARKET,
+    )
+    extended_batch = CanonicalBarBatch(extended_contract, (extended_bar,))
+    extended_frame = extended_batch.to_frame()
+    runner._canonical_bar_batches["AAPL"] = (extended_batch, extended_frame)
+    quote = replace(
+        runner._broker_protective_quotes["AAPL"],
+        session=MarketSession.PRE_MARKET,
+    )
+
+    @asynccontextmanager
+    async def serialize_entry(symbol=None):
+        yield quote if symbol == "AAPL" else None
+
+    runner.paper_reduction_gateway.serialize_entry = serialize_entry
+    with (
+        patch("robo_trader.runner_async.is_extended_hours", return_value=True),
+        patch("robo_trader.runner_async.get_market_session", return_value="pre-market"),
+    ):
+        result = await runner._place_order_with_circuit_breaker(
+            Order(symbol="AAPL", quantity=1, side="BUY", price=Decimal("1"))
+        )
+
+    assert result.ok is True
+    submitted = runner.executor.place_order.call_args.args[0]
+    assert submitted.price == Decimal("100.0")
+
+
+@pytest.mark.asyncio
+async def test_final_entry_admission_rejects_stale_canonical_bar_batch() -> None:
+    runner = AsyncRunner.__new__(AsyncRunner)
+    await _configure_order_runtime(runner)
+    current_batch, _ = runner._canonical_bar_batches["AAPL"]
+    stale_time = datetime.now(timezone.utc) - timedelta(hours=1)
+    stale_contract = replace(
+        current_batch.contract,
+        retrieval_time=stale_time,
+        broker_time=stale_time,
+    )
+    stale_bar = replace(
+        current_batch.bars[-1],
+        contract=stale_contract,
+        timestamp=stale_time - timedelta(minutes=1),
+    )
+    stale_batch = CanonicalBarBatch(stale_contract, (stale_bar,))
+    stale_frame = stale_batch.to_frame()
+    runner._canonical_bar_batches["AAPL"] = (stale_batch, stale_frame)
+
+    result = await runner._place_order_with_circuit_breaker(
+        Order(symbol="AAPL", quantity=1, side="BUY", price=Decimal("100"))
+    )
+
+    assert result.ok is False
+    assert "canonical session evidence unavailable" in result.message.lower()
     runner.executor.place_order.assert_not_called()
 
 

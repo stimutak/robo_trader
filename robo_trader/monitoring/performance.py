@@ -8,6 +8,7 @@ This implements Phase 1 F5: Add Basic Performance Monitoring
 """
 
 import asyncio
+import itertools
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -17,6 +18,8 @@ from typing import Dict, List, Optional
 from robo_trader.logger import get_logger
 
 logger = get_logger(__name__)
+
+_TIMER_INSTANCE_IDS = itertools.count()
 
 
 @dataclass
@@ -106,11 +109,11 @@ class PerformanceMonitor:
         """
         return Timer(operation, self)
 
-    def start_timer(self, operation: str) -> None:
+    def start_timer(self, operation: str, *, timer_id: Optional[str] = None) -> None:
         """Start timing an operation."""
-        self._timers[operation] = time.perf_counter()
+        self._timers[timer_id or operation] = time.perf_counter()
 
-    def end_timer(self, operation: str) -> float:
+    def end_timer(self, operation: str, *, timer_id: Optional[str] = None) -> float:
         """
         End timing an operation and return duration in milliseconds.
 
@@ -120,12 +123,13 @@ class PerformanceMonitor:
         Returns:
             Duration in milliseconds
         """
-        if operation not in self._timers:
-            logger.warning(f"Timer for {operation} was not started")
+        key = timer_id or operation
+        if key not in self._timers:
+            logger.warning(f"Timer for {key} was not started")
             return 0.0
 
-        duration_ms = (time.perf_counter() - self._timers[operation]) * 1000
-        del self._timers[operation]
+        duration_ms = (time.perf_counter() - self._timers[key]) * 1000
+        del self._timers[key]
 
         # Record the sample based on operation type
         if operation == "data_fetch":
@@ -350,15 +354,23 @@ def get_monitor() -> PerformanceMonitor:
 class Timer:
     """Context manager for timing operations."""
 
-    def __init__(self, operation: str, monitor: Optional[PerformanceMonitor] = None):
+    def __init__(
+        self,
+        operation: str,
+        monitor: Optional[PerformanceMonitor] = None,
+        *,
+        instance: Optional[str] = None,
+    ):
         self.operation = operation
         self.monitor = monitor or get_monitor()
+        suffix = "" if instance is None else f":{instance}"
+        self.timer_id = f"{operation}{suffix}:{next(_TIMER_INSTANCE_IDS)}"
 
     def __enter__(self):
-        self.monitor.start_timer(self.operation)
+        self.monitor.start_timer(self.operation, timer_id=self.timer_id)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        duration = self.monitor.end_timer(self.operation)
+        duration = self.monitor.end_timer(self.operation, timer_id=self.timer_id)
         if duration > 1000:  # Log slow operations (> 1 second)
             logger.warning(f"Slow operation: {self.operation} took {duration:.1f}ms")

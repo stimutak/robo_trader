@@ -12,6 +12,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from robo_trader.connection_health import HealthStatus
+from robo_trader.market_data_contract import (
+    BrokerProtectiveQuote,
+    MarketDataSource,
+    MarketSession,
+)
 from robo_trader.paper_reduction_gateway import PaperReductionGateway
 from robo_trader.protective_quote_evidence import ProtectiveQuoteSource
 from robo_trader.risk_manager import Position
@@ -356,6 +361,33 @@ async def test_recovery_accepts_exact_fresh_event_already_owned_by_monitor():
         Position("AAPL", 10, Decimal("100")),
     )
     runner.stop_loss_monitor = monitor
+
+    gateway = object.__new__(PaperReductionGateway)
+    gateway._started = True
+    gateway._diagnostic_recovery_required = False
+    gateway.refresh_diagnostic_connection = AsyncMock()
+    gateway.refresh_protective_quotes = AsyncMock(
+        return_value=(
+            BrokerProtectiveQuote(
+                schema_version=1,
+                symbol="AAPL",
+                con_id=265598,
+                exchange="SMART",
+                primary_exchange="NASDAQ",
+                currency="USD",
+                security_type="STK",
+                price=Decimal("150.0"),
+                source_timestamp=event_time,
+                retrieval_timestamp=event_time,
+                session=MarketSession.REGULAR,
+                source=MarketDataSource.IBKR_LIVE_LAST_TRADE,
+                source_event_id="recovery-ticker-1",
+                transport_generation="recovered-generation",
+                market_data_type=1,
+            ),
+        )
+    )
+    runner.paper_reduction_gateway = gateway
 
     async def initialize_with_new_transport_quote() -> None:
         assert await monitor.update_price(

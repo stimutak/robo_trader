@@ -4299,7 +4299,14 @@ HTML_TEMPLATE = """
         function handleRealtimeUpdate(data) {
             switch(data.type) {
                 case 'market_data':
-                    updateMarketPrice(data.symbol, data.price, data.bid, data.ask, data.volume);
+                    updateMarketPrice(
+                        data.symbol,
+                        data.price,
+                        data.bid,
+                        data.ask,
+                        data.volume,
+                        data
+                    );
                     break;
                 case 'trade':
                     handleTradeUpdate(data);
@@ -4367,7 +4374,7 @@ HTML_TEMPLATE = """
             }
         }
 
-        function updateMarketPrice(symbol, price, bid, ask, volume) {
+        function updateMarketPrice(symbol, price, bid, ask, volume, lineage = {}) {
             console.log('updateMarketPrice called:', symbol, price);
             // Update watchlist prices in real-time
             const rows = document.querySelectorAll('#watchlist-table tr');
@@ -4380,6 +4387,15 @@ HTML_TEMPLATE = """
                     if (priceCell) {
                         const oldPrice = parseFloat(priceCell.textContent.replace('$', ''));
                         priceCell.textContent = `$${price.toFixed(2)}`;
+                        priceCell.dataset.marketDataSource = lineage.source || 'unknown';
+                        priceCell.dataset.marketDataFreshness = lineage.freshness_status || 'unknown';
+                        priceCell.dataset.marketDataEventTime = lineage.event_timestamp || '';
+                        priceCell.title = [
+                            `Source: ${lineage.source || 'unknown'}`,
+                            `Freshness: ${lineage.freshness_status || 'unknown'}`,
+                            `Event: ${lineage.event_timestamp || 'unknown'}`,
+                            `Retrieved: ${lineage.retrieval_timestamp || 'unknown'}`
+                        ].join('\n');
                         
                         // Flash color based on price change
                         if (oldPrice && oldPrice !== price) {
@@ -5406,6 +5422,39 @@ def market_status():
     return jsonify(result)
 
 
+@app.route("/api/market-data/<symbol>")
+@requires_auth
+def latest_market_data(symbol):
+    """Expose one observation with explicit event, source, and freshness lineage."""
+
+    from robo_trader.database_validator import DatabaseValidator, ValidationError
+    from robo_trader.market_data_contract import MarketDataContractError, bar_interval_seconds
+    from sync_db_reader import MarketDataReadError, SyncDatabaseReader
+
+    try:
+        normalized = DatabaseValidator.validate_symbol(symbol)
+    except ValidationError:
+        return jsonify({"error": "invalid symbol"}), 400
+    timeframe = request.args.get("timeframe")
+    if timeframe is not None:
+        try:
+            bar_interval_seconds(timeframe)
+        except MarketDataContractError:
+            return jsonify({"error": "invalid timeframe"}), 400
+    try:
+        rows = SyncDatabaseReader().get_latest_market_data(
+            normalized,
+            limit=1,
+            timeframe=timeframe,
+        )
+    except MarketDataReadError:
+        logger.exception("market-data API read failed for symbol=%s", normalized)
+        return jsonify({"error": "market_data_unavailable"}), 503
+    if not rows:
+        return jsonify({"symbol": normalized, "observation": None}), 404
+    return jsonify({"symbol": normalized, "observation": rows[0]})
+
+
 def _resolve_lsof_binary():
     """Resolve lsof without relying on the reduced launchd/container PATH."""
     discovered = shutil.which("lsof")
@@ -6355,6 +6404,7 @@ def get_watchlist():
             # Get latest market data
             market_data = db.get_latest_market_data(symbol, limit=1)
             current_price = market_data[0]["close"] if market_data else 0
+            market_observation = market_data[0] if market_data else {}
 
             # Check if we have a position
             position = position_map.get(symbol)
@@ -6373,6 +6423,13 @@ def get_watchlist():
                     "pnl": pnl,
                     "notes": "Active" if position else "Watching",
                     "has_position": position is not None,
+                    "market_data_source": market_observation.get("source", "unavailable"),
+                    "market_data_event_time": market_observation.get("timestamp"),
+                    "market_data_retrieval_time": market_observation.get("retrieval_timestamp"),
+                    "market_data_freshness": market_observation.get(
+                        "freshness_status", "unavailable"
+                    ),
+                    "market_data_age_seconds": market_observation.get("age_seconds"),
                 }
             )
 
