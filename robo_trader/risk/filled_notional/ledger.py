@@ -303,6 +303,14 @@ _PROTECTED_TABLES = (
     "daily_filled_notional_checkpoints",
 )
 
+_CHECKPOINT_INTEGER_COLUMNS = (
+    "event_sequence",
+    "database_device",
+    "database_inode",
+    "fill_count",
+    "conflict_count",
+)
+
 
 class FilledNotionalError(RuntimeError):
     """Base error for the filled-notional safety boundary."""
@@ -698,13 +706,12 @@ class DailyFilledNotional:
                     connection.execute("BEGIN")
                     state = self._validate_ledger(connection)
                     anchor = self._require_exact_anchor(state)
-                    self._verify_monotonic_state(state)
                     self._ledger_id = state.ledger_id
                     current_day = self._current_trading_date()
                     total = self._total_for_date(connection, current_day)
                     anchor = self._require_exact_anchor(state)
-                    self._verify_monotonic_state(state)
                     connection.commit()
+                self._verify_monotonic_state(state)
             else:
                 database_was_missing = self._database_path_is_missing()
                 if database_was_missing:
@@ -729,15 +736,20 @@ class DailyFilledNotional:
                         state = self._validate_ledger(connection)
                         if created:
                             anchor = self._create_initial_anchor(state)
+                        elif not self._anchor_artifact_exists(self._anchor_name):
+                            if not self._is_authenticated_empty_initial_state(state):
+                                raise FilledNotionalIntegrityError(
+                                    "missing anchor cannot authenticate a non-empty ledger"
+                                )
+                            anchor = self._create_initial_anchor(state)
                         else:
                             anchor = self._reconcile_anchor(state)
-                        self._verify_monotonic_state(state)
                         self._ledger_id = state.ledger_id
                         current_day = self._current_trading_date()
                         total = self._total_for_date(connection, current_day)
                         anchor = self._require_exact_anchor(state)
-                        self._verify_monotonic_state(state)
                         connection.commit()
+                    self._verify_monotonic_state(state)
         except FilledNotionalError:
             raise
         except DecimalException as exc:
@@ -1097,20 +1109,41 @@ class DailyFilledNotional:
         try:
             trading_day = self._trading_date(as_of if as_of is not None else self._clock())
             pending_attempts = 0
+            snapshot_attempts = 0
             while True:
                 try:
-                    with self._connection(readonly=True) as connection:
-                        connection.execute("BEGIN")
-                        state = self._validate_checkpointed_state(connection)
-                        self._anchor = self._require_exact_anchor(state)
-                        self._assert_no_conflicts(state)
+                    # Serialize participating readers and writers at the
+                    # database/anchor transition boundary. The independently
+                    # operated monotonic authority runs only after the SQLite
+                    # read transaction closes, so a slow verifier cannot make
+                    # a writer time out after publishing a pending anchor.
+                    with self._anchor_transition_lock():
+                        with self._connection(readonly=True) as connection:
+                            connection.execute("BEGIN")
+                            state = self._validate_checkpointed_state(connection)
+                            self._anchor = self._require_exact_anchor(state)
+                            self._assert_no_conflicts(state)
+                            total = self._total_for_date(connection, trading_day)
+                            self._anchor = self._require_exact_anchor(state)
+                            connection.commit()
                         self._verify_monotonic_state(state)
-                        total = self._total_for_date(connection, trading_day)
-                        self._anchor = self._require_exact_anchor(state)
-                        self._verify_monotonic_state(state)
-                        connection.commit()
-                        self._state = state
-                        return total
+                        with self._connection(readonly=True) as connection:
+                            connection.execute("BEGIN")
+                            final_state = self._validate_checkpointed_state(connection)
+                            self._anchor = self._require_exact_anchor(final_state)
+                            self._assert_no_conflicts(final_state)
+                            final_total = self._total_for_date(connection, trading_day)
+                            self._anchor = self._require_exact_anchor(final_state)
+                            connection.commit()
+                    if final_state != state or final_total != total:
+                        snapshot_attempts += 1
+                        if snapshot_attempts > 3:
+                            raise FilledNotionalUnavailable(
+                                "filled-notional snapshot kept advancing during verification"
+                            )
+                        continue
+                    self._state = state
+                    return total
                 except _PendingAnchorInProgress:
                     pending_attempts += 1
                     if pending_attempts > 3:
@@ -1164,7 +1197,6 @@ class DailyFilledNotional:
                 connection.execute("BEGIN")
                 state = reviewer._validate_checkpointed_state(connection)
                 reviewer._require_exact_anchor(state)
-                reviewer._verify_monotonic_state(state)
                 rows = connection.execute(
                     "SELECT * FROM daily_filled_notional_conflicts ORDER BY sequence"
                 ).fetchall()
@@ -1182,9 +1214,9 @@ class DailyFilledNotional:
                     for row in rows
                 )
                 reviewer._require_exact_anchor(state)
-                reviewer._verify_monotonic_state(state)
                 connection.commit()
-                return evidence
+            reviewer._verify_monotonic_state(state)
+            return evidence
         except _PendingAnchorInProgress as exc:
             raise FilledNotionalUnavailable(
                 "quarantine review unavailable during pending anchor transition"
@@ -1778,8 +1810,14 @@ class DailyFilledNotional:
         fill_count, fill_head = self._validate_fills(connection, ledger_id)
         conflict_count, conflict_head = self._validate_conflicts(connection, ledger_id)
         metadata = os.lstat(self._path)
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-            raise FilledNotionalIntegrityError("ledger path identity is invalid")
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+        ):
+            raise FilledNotionalIntegrityError(
+                "ledger path must be an exclusive non-symlink regular file"
+            )
         checkpoint_sequence, checkpoint_head = self._validate_checkpoints(
             connection,
             ledger_id=ledger_id,
@@ -1812,14 +1850,7 @@ class DailyFilledNotional:
         ).fetchone()
         if row is None:
             raise FilledNotionalIntegrityError("checkpoint state is missing")
-        integer_names = (
-            "event_sequence",
-            "database_device",
-            "database_inode",
-            "fill_count",
-            "conflict_count",
-        )
-        if any(type(row[name]) is not int or row[name] < 0 for name in integer_names):
+        if any(type(row[name]) is not int or row[name] < 0 for name in _CHECKPOINT_INTEGER_COLUMNS):
             raise FilledNotionalIntegrityError("checkpoint counters are invalid")
         checkpoint_ledger_id = str(row["ledger_id"])
         database_device = int(row["database_device"])
@@ -1858,6 +1889,7 @@ class DailyFilledNotional:
         if (
             stat.S_ISLNK(metadata.st_mode)
             or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
             or (metadata.st_dev, metadata.st_ino) != (database_device, database_inode)
         ):
             raise FilledNotionalIntegrityError("checkpoint database identity changed")
@@ -2047,15 +2079,19 @@ class DailyFilledNotional:
         for row in connection.execute(
             "SELECT * FROM daily_filled_notional_checkpoints ORDER BY event_sequence"
         ):
-            if int(row["event_sequence"]) != expected_sequence:
+            if any(
+                type(row[name]) is not int or row[name] < 0 for name in _CHECKPOINT_INTEGER_COLUMNS
+            ):
+                raise FilledNotionalIntegrityError("checkpoint counters are invalid")
+            if row["event_sequence"] != expected_sequence:
                 raise FilledNotionalIntegrityError("checkpoint sequence is not contiguous")
             if str(row["ledger_id"]) != ledger_id:
                 raise FilledNotionalIntegrityError("checkpoint ledger identity changed")
-            checkpoint_database_device = int(row["database_device"])
-            checkpoint_database_inode = int(row["database_inode"])
-            checkpoint_fill_count = int(row["fill_count"])
+            checkpoint_database_device = row["database_device"]
+            checkpoint_database_inode = row["database_inode"]
+            checkpoint_fill_count = row["fill_count"]
             checkpoint_fill_head = str(row["fill_head"])
-            checkpoint_conflict_count = int(row["conflict_count"])
+            checkpoint_conflict_count = row["conflict_count"]
             checkpoint_conflict_head = str(row["conflict_head"])
             if str(row["previous_checkpoint_hash"]) != previous_hash:
                 raise FilledNotionalIntegrityError("checkpoint hash chain is broken")
@@ -2080,11 +2116,11 @@ class DailyFilledNotional:
         if final_row is None:
             raise FilledNotionalIntegrityError("initial checkpoint is missing")
         final_values = (
-            int(final_row["database_device"]),
-            int(final_row["database_inode"]),
-            int(final_row["fill_count"]),
+            final_row["database_device"],
+            final_row["database_inode"],
+            final_row["fill_count"],
             str(final_row["fill_head"]),
-            int(final_row["conflict_count"]),
+            final_row["conflict_count"],
             str(final_row["conflict_head"]),
         )
         if final_values != (
@@ -2116,6 +2152,18 @@ class DailyFilledNotional:
             "fill_head": state.fill_head,
             "ledger_id": state.ledger_id,
         }
+
+    @staticmethod
+    def _is_authenticated_empty_initial_state(state: _LedgerState) -> bool:
+        """Recognize only the fully audited zero-event initialization state."""
+
+        return (
+            state.fill_count == 0
+            and state.fill_head == _ZERO_HASH
+            and state.conflict_count == 0
+            and state.conflict_head == _ZERO_HASH
+            and state.checkpoint_sequence == 0
+        )
 
     def _unsigned_anchor_payload(
         self,

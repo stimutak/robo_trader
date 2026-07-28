@@ -544,6 +544,39 @@ def test_record_fill_verifies_uncommitted_append_advanced_before_anchor_publicat
         ).fetchone() == (1,)
 
 
+def test_checkpoint_text_in_integer_column_fails_closed_with_typed_error(tmp_path):
+    ledger = _service(tmp_path / "notional.db")
+    malformed_row = {
+        "event_sequence": 0,
+        "ledger_id": ledger._ledger_id,
+        "database_device": "oops",
+        "database_inode": 1,
+        "fill_count": 0,
+        "fill_head": "0" * 64,
+        "conflict_count": 0,
+        "conflict_head": "0" * 64,
+        "previous_checkpoint_hash": "0" * 64,
+        "checkpoint_hash": "0" * 64,
+    }
+
+    class MalformedCheckpointConnection:
+        @staticmethod
+        def execute(_statement):
+            return (malformed_row,)
+
+    with pytest.raises(FilledNotionalIntegrityError, match="checkpoint counters"):
+        ledger._validate_checkpoints(
+            MalformedCheckpointConnection(),  # type: ignore[arg-type]
+            ledger_id=ledger._ledger_id,
+            database_device=1,
+            database_inode=1,
+            fill_count=0,
+            fill_head="0" * 64,
+            conflict_count=0,
+            conflict_head="0" * 64,
+        )
+
+
 def test_service_connection_has_no_update_delete_or_schema_authority(tmp_path):
     ledger = _service(tmp_path / "notional.db")
     ledger.record_fill(_fill("immutable"))
@@ -849,6 +882,25 @@ def test_hardlinked_rollback_journal_is_rejected_without_mutation(tmp_path):
     )
 
 
+def test_hardlinked_main_ledger_is_rejected_before_fill_mutation(tmp_path):
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+    preserved_alias = tmp_path / "preserved-ledger.db"
+    os.link(path, preserved_alias)
+    database_before = _file_snapshot(path)
+    alias_before = _file_snapshot(preserved_alias)
+    anchor_before = _file_snapshot(ledger.anchor_path)
+    paths_before = _path_inventory(tmp_path)
+
+    with pytest.raises(FilledNotionalIntegrityError, match="checkpoint database identity"):
+        ledger.record_fill(_fill("must-not-mutate-hardlinked-ledger"))
+
+    assert _file_snapshot(path) == database_before
+    assert _file_snapshot(preserved_alias) == alias_before
+    assert _file_snapshot(ledger.anchor_path) == anchor_before
+    assert _path_inventory(tmp_path) == paths_before
+
+
 def test_anchor_write_crash_window_recovers_one_authenticated_fill(tmp_path, monkeypatch):
     path = tmp_path / "notional.db"
     ledger = _service(path)
@@ -890,17 +942,115 @@ def test_crash_before_database_commit_resolves_pending_anchor_to_old_state(tmp_p
         ).fetchone() == (0,)
 
 
+def test_empty_initialized_database_recovers_when_initial_anchor_creation_failed(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "notional.db"
+    original_create = DailyFilledNotional._create_initial_anchor
+
+    def fail_initial_anchor(self, state):
+        del self, state
+        raise OSError("injected failure after initial database commit")
+
+    monkeypatch.setattr(DailyFilledNotional, "_create_initial_anchor", fail_initial_anchor)
+    with pytest.raises(FilledNotionalUnavailable, match="startup failed closed"):
+        _service(path)
+
+    assert path.is_file()
+    assert not _anchor_path(path).exists()
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM daily_filled_notional_records"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT count(*) FROM daily_filled_notional_conflicts"
+        ).fetchone() == (0,)
+
+    monkeypatch.setattr(DailyFilledNotional, "_create_initial_anchor", original_create)
+    restarted = _service(path)
+
+    assert restarted.restored_gross_filled_notional == Decimal("0")
+    assert restarted.anchor_path.is_file()
+
+
+def test_missing_anchor_never_reinitializes_nonempty_ledger(tmp_path):
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+    ledger.record_fill(_fill("durable-before-anchor-loss"))
+    database_before = _file_snapshot(path)
+    ledger.anchor_path.unlink()
+    paths_before = _path_inventory(tmp_path)
+
+    with pytest.raises(
+        FilledNotionalIntegrityError, match="cannot authenticate a non-empty ledger"
+    ):
+        _service(path)
+
+    assert _file_snapshot(path) == database_before
+    assert not ledger.anchor_path.exists()
+    assert _path_inventory(tmp_path) == paths_before
+
+
+def test_slow_monotonic_read_verifier_serializes_writer_without_sqlite_timeout(tmp_path):
+    path = tmp_path / "notional.db"
+    writer = _service(path)
+    reader = _service(path)
+    verifier_started = threading.Event()
+    release_verifier = threading.Event()
+    verification_state = TestMonotonicVerifier()
+    read_results: list[object] = []
+    write_results: list[object] = []
+
+    def slow_verifier(state):
+        verifier_started.set()
+        if not release_verifier.wait(timeout=5):
+            raise RuntimeError("test timed out releasing monotonic verifier")
+        return verification_state(state)
+
+    reader._monotonic_verifier = slow_verifier
+
+    def read() -> None:
+        try:
+            read_results.append(reader.current_gross_filled_notional())
+        except BaseException as exc:  # pragma: no cover - asserted below
+            read_results.append(exc)
+
+    def write() -> None:
+        try:
+            write_results.append(writer.record_fill(_fill("during-slow-verification")))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            write_results.append(exc)
+
+    reader_thread = threading.Thread(target=read)
+    writer_thread = threading.Thread(target=write)
+    reader_thread.start()
+    assert verifier_started.wait(timeout=5)
+    writer_thread.start()
+    writer_thread.join(timeout=0.2)
+
+    try:
+        assert writer_thread.is_alive(), "writer bypassed the transition-boundary lock"
+        assert write_results == []
+    finally:
+        release_verifier.set()
+        reader_thread.join(timeout=5)
+        writer_thread.join(timeout=5)
+
+    assert not reader_thread.is_alive()
+    assert not writer_thread.is_alive()
+    assert read_results == [Decimal("0")]
+    assert len(write_results) == 1
+    assert not isinstance(write_results[0], BaseException)
+    assert reader.current_gross_filled_notional() == Decimal("20.5")
+
+
 def test_reader_waits_for_concurrent_pending_writer_without_latching(tmp_path, monkeypatch):
     path = tmp_path / "notional.db"
     writer = _service(path)
     reader = _service(path)
     pending_ready = threading.Event()
-    reader_reconciling = threading.Event()
-    reader_retrying = threading.Event()
     release_writer = threading.Event()
     original_commit = writer._commit_database
-    original_resolve = reader._resolve_pending_anchor
-    resolve_attempts = 0
     results: list[object] = []
 
     def gated_commit(connection):
@@ -909,17 +1059,7 @@ def test_reader_waits_for_concurrent_pending_writer_without_latching(tmp_path, m
             raise sqlite3.OperationalError("test timed out waiting to release writer")
         original_commit(connection)
 
-    def observed_resolve():
-        nonlocal resolve_attempts
-        resolve_attempts += 1
-        reader_reconciling.set()
-        if resolve_attempts == 1:
-            raise sqlite3.OperationalError("database is locked")
-        reader_retrying.set()
-        original_resolve()
-
     monkeypatch.setattr(writer, "_commit_database", gated_commit)
-    monkeypatch.setattr(reader, "_resolve_pending_anchor", observed_resolve)
 
     def write() -> None:
         try:
@@ -938,8 +1078,9 @@ def test_reader_waits_for_concurrent_pending_writer_without_latching(tmp_path, m
     writer_thread.start()
     assert pending_ready.wait(timeout=5)
     reader_thread.start()
-    assert reader_reconciling.wait(timeout=5)
-    assert reader_retrying.wait(timeout=5)
+    reader_thread.join(timeout=0.2)
+    assert reader_thread.is_alive(), "reader bypassed the writer transition lock"
+    assert len(results) == 0
     release_writer.set()
     writer_thread.join(timeout=5)
     reader_thread.join(timeout=5)
@@ -947,7 +1088,6 @@ def test_reader_waits_for_concurrent_pending_writer_without_latching(tmp_path, m
     assert not writer_thread.is_alive()
     assert not reader_thread.is_alive()
     assert not any(isinstance(result, BaseException) for result in results)
-    assert resolve_attempts >= 2
     assert Decimal("20.5") in results
     assert reader.current_gross_filled_notional() == Decimal("20.5")
 
@@ -957,9 +1097,8 @@ def test_reader_snapshot_rechecks_anchor_before_returning_during_writer_race(tmp
     writer = _service(path)
     reader = _service(path)
     snapshot_total_ready = threading.Event()
-    writer_pending = threading.Event()
+    release_reader = threading.Event()
     original_total = reader._total_for_date
-    original_commit = writer._commit_database
     total_calls = 0
     results: dict[str, object] = {}
 
@@ -969,16 +1108,11 @@ def test_reader_snapshot_rechecks_anchor_before_returning_during_writer_race(tmp
         total_calls += 1
         if total_calls == 1:
             snapshot_total_ready.set()
-            if not writer_pending.wait(timeout=5):
-                raise sqlite3.OperationalError("test writer did not reach pending state")
+            if not release_reader.wait(timeout=5):
+                raise sqlite3.OperationalError("test timed out releasing reader snapshot")
         return total
 
-    def observed_commit(connection):
-        writer_pending.set()
-        original_commit(connection)
-
     monkeypatch.setattr(reader, "_total_for_date", gated_total)
-    monkeypatch.setattr(writer, "_commit_database", observed_commit)
 
     def read() -> None:
         try:
@@ -997,6 +1131,10 @@ def test_reader_snapshot_rechecks_anchor_before_returning_during_writer_race(tmp
     reader_thread.start()
     assert snapshot_total_ready.wait(timeout=5)
     writer_thread.start()
+    writer_thread.join(timeout=0.2)
+    assert writer_thread.is_alive(), "writer bypassed the reader transition lock"
+    assert "write" not in results
+    release_reader.set()
     reader_thread.join(timeout=5)
     writer_thread.join(timeout=5)
 
@@ -1004,9 +1142,10 @@ def test_reader_snapshot_rechecks_anchor_before_returning_during_writer_race(tmp
     assert not writer_thread.is_alive()
     assert not isinstance(results.get("read"), BaseException)
     assert not isinstance(results.get("write"), BaseException)
-    assert results["read"] == Decimal("20.5")
+    assert results["read"] == Decimal("0")
     assert total_calls >= 2
     assert reader._failed_reason is None
+    assert reader.current_gross_filled_notional() == Decimal("20.5")
 
 
 def test_concurrent_writers_serialize_through_stable_anchor_publication(tmp_path, monkeypatch):
