@@ -142,9 +142,19 @@ async def test_returns_false_after_exhausted_attempts():
 async def test_backoff_schedule_is_15_30_60_120_300():
     runner = make_runner_for_recovery(initialize_succeeds_on=999)
     sleeps = []
+    test_task = asyncio.current_task()
+    real_sleep = asyncio.sleep
 
     async def record_sleep(seconds):
-        sleeps.append(seconds)
+        # Patching runner_async.asyncio.sleep replaces the attribute on the
+        # shared asyncio module.  A reconciliation task left alive by an
+        # earlier test may therefore call this side effect while this test is
+        # running.  Record only the recovery coroutine under test and preserve
+        # real scheduling for unrelated tasks.
+        if asyncio.current_task() is test_task:
+            sleeps.append(seconds)
+            return
+        await real_sleep(seconds)
 
     with patch(
         "robo_trader.runner_async.restart_gateway_for_zombies_async",
