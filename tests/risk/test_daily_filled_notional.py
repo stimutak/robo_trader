@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, getcontext, setcontext
@@ -35,7 +36,7 @@ from robo_trader.risk.filled_notional import (
 UTC = timezone.utc
 NEW_YORK = ZoneInfo("America/New_York")
 ANCHOR_KEY = b"test-only-independent-anchor-key-32-bytes-minimum"
-_MONOTONIC_VERIFIERS = {}
+_MONOTONIC_VERIFIERS: dict[str, "TestMonotonicVerifier"] = {}
 
 
 class TestMonotonicVerifier:
@@ -243,6 +244,48 @@ def test_restart_restores_same_day_total_from_append_only_ledger(tmp_path):
     assert restarted.current_gross_filled_notional() == Decimal("30")
 
 
+def test_hot_path_uses_authenticated_checkpoints_without_history_rescans(tmp_path, monkeypatch):
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+
+    def forbid_history_scan(*args, **kwargs):
+        pytest.fail("hot accounting path performed an unbounded history scan")
+
+    monkeypatch.setattr(ledger, "_validate_fills", forbid_history_scan)
+    monkeypatch.setattr(ledger, "_validate_conflicts", forbid_history_scan)
+    for index in range(400):
+        ledger.record_fill(_fill(f"bounded-{index}"))
+
+    assert ledger.current_gross_filled_notional() == Decimal("8200")
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM daily_filled_notional_checkpoints"
+        ).fetchone() == (401,)
+
+    monkeypatch.undo()
+    assert _service(path).restored_gross_filled_notional == Decimal("8200")
+
+
+def test_daily_scope_limit_rejects_append_before_any_durable_mutation(tmp_path, monkeypatch):
+    path = tmp_path / "notional.db"
+    monkeypatch.setattr(ledger_module, "_MAX_DAILY_FILL_ROWS", 2)
+    ledger = _service(path)
+    ledger.record_fill(_fill("bounded-one"))
+    ledger.record_fill(_fill("bounded-two"))
+
+    with pytest.raises(FilledNotionalUnavailable, match="bounded accounting limit"):
+        ledger.record_fill(_fill("must-not-persist"))
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM daily_filled_notional_records"
+        ).fetchone() == (2,)
+        assert connection.execute(
+            "SELECT count(*) FROM daily_filled_notional_checkpoints"
+        ).fetchone() == (3,)
+    assert ledger.current_gross_filled_notional() == Decimal("41")
+
+
 def test_scope_isolated_by_account_and_portfolio(tmp_path):
     path = tmp_path / "notional.db"
     default = _service(path)
@@ -338,7 +381,8 @@ def test_database_triggers_deny_update_and_delete(tmp_path):
                 INSERT OR REPLACE INTO daily_filled_notional_records
                 SELECT sequence, account_id, portfolio_id, broker_execution_id,
                        side, quantity_text, '1', currency, executed_at_utc,
-                       trading_date, notional_text, previous_hash, record_hash
+                       trading_date, notional_text, scope_fill_count, scope_total_text,
+                       previous_hash, record_hash
                 FROM daily_filled_notional_records WHERE sequence = 1
                 """)
 
@@ -528,6 +572,63 @@ def test_reader_waits_for_concurrent_pending_writer_without_latching(tmp_path, m
     assert reader.current_gross_filled_notional() == Decimal("20.5")
 
 
+def test_reader_snapshot_rechecks_anchor_before_returning_during_writer_race(tmp_path, monkeypatch):
+    path = tmp_path / "notional.db"
+    writer = _service(path)
+    reader = _service(path)
+    snapshot_total_ready = threading.Event()
+    writer_pending = threading.Event()
+    original_total = reader._total_for_date
+    original_commit = writer._commit_database
+    total_calls = 0
+    results: dict[str, object] = {}
+
+    def gated_total(connection, trading_day):
+        nonlocal total_calls
+        total = original_total(connection, trading_day)
+        total_calls += 1
+        if total_calls == 1:
+            snapshot_total_ready.set()
+            if not writer_pending.wait(timeout=5):
+                raise sqlite3.OperationalError("test writer did not reach pending state")
+        return total
+
+    def observed_commit(connection):
+        writer_pending.set()
+        original_commit(connection)
+
+    monkeypatch.setattr(reader, "_total_for_date", gated_total)
+    monkeypatch.setattr(writer, "_commit_database", observed_commit)
+
+    def read() -> None:
+        try:
+            results["read"] = reader.current_gross_filled_notional()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            results["read"] = exc
+
+    def write() -> None:
+        try:
+            results["write"] = writer.record_fill(_fill("snapshot-race"))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            results["write"] = exc
+
+    reader_thread = threading.Thread(target=read)
+    writer_thread = threading.Thread(target=write)
+    reader_thread.start()
+    assert snapshot_total_ready.wait(timeout=5)
+    writer_thread.start()
+    reader_thread.join(timeout=5)
+    writer_thread.join(timeout=5)
+
+    assert not reader_thread.is_alive()
+    assert not writer_thread.is_alive()
+    assert not isinstance(results.get("read"), BaseException)
+    assert not isinstance(results.get("write"), BaseException)
+    assert results["read"] == Decimal("20.5")
+    assert total_calls >= 2
+    assert reader._failed_reason is None
+
+
 def test_invalid_pending_anchor_identity_still_fails_closed(tmp_path):
     path = tmp_path / "notional.db"
     ledger = _service(path)
@@ -699,6 +800,40 @@ def test_coordinated_old_database_and_anchor_replay_requires_monotonic_rejection
         _service(path, monotonic_verifier=verifier)
 
 
+def test_review_reverifies_monotonic_state_after_constructor_before_return(tmp_path, monkeypatch):
+    path = tmp_path / "notional.db"
+    verifier = TestMonotonicVerifier()
+    ledger = _service(path, monotonic_verifier=verifier)
+    ledger.record_fill(_fill("older"))
+    old_database = path.read_bytes()
+    old_anchor = ledger.anchor_path.read_bytes()
+    ledger.record_fill(_fill("newer"))
+    original_connection = DailyFilledNotional._connection
+    authoritative_read_count = 0
+
+    @contextmanager
+    def restore_before_review(self, *, readonly, immutable=False):
+        nonlocal authoritative_read_count
+        if readonly and not immutable:
+            authoritative_read_count += 1
+            if authoritative_read_count == 2:
+                path.write_bytes(old_database)
+                ledger.anchor_path.write_bytes(old_anchor)
+                os.chmod(ledger.anchor_path, 0o600)
+        with original_connection(self, readonly=readonly, immutable=immutable) as connection:
+            yield connection
+
+    monkeypatch.setattr(DailyFilledNotional, "_connection", restore_before_review)
+
+    with pytest.raises(FilledNotionalIntegrityError, match="monotonic authority rejected"):
+        DailyFilledNotional.review_quarantine(
+            path,
+            anchor_path=ledger.anchor_path,
+            anchor_key=ANCHOR_KEY,
+            monotonic_verifier=verifier,
+        )
+
+
 def test_authoritative_service_requires_independent_monotonic_verifier(tmp_path):
     path = tmp_path / "notional.db"
     anchor_directory = tmp_path / "protected-anchor"
@@ -862,8 +997,11 @@ def test_decimal_exception_is_typed_and_latches_unavailable(tmp_path, monkeypatc
         ledger.current_gross_filled_notional()
 
 
-def test_schema_v1_requires_explicit_copy_migration_without_anchor_creation(tmp_path):
-    path = tmp_path / "legacy-v1.db"
+@pytest.mark.parametrize("schema_version", [1, 2])
+def test_legacy_schema_requires_explicit_copy_migration_without_anchor_creation(
+    tmp_path, schema_version
+):
+    path = tmp_path / f"legacy-v{schema_version}.db"
     with sqlite3.connect(path) as connection:
         connection.execute("""
             CREATE TABLE daily_filled_notional_schema (
@@ -871,10 +1009,12 @@ def test_schema_v1_requires_explicit_copy_migration_without_anchor_creation(tmp_
                 schema_version INTEGER NOT NULL
             )
             """)
-        connection.execute("INSERT INTO daily_filled_notional_schema VALUES (1, 1)")
+        connection.execute(
+            "INSERT INTO daily_filled_notional_schema VALUES (1, ?)", (schema_version,)
+        )
     before = hashlib.sha256(path.read_bytes()).hexdigest()
 
-    with pytest.raises(FilledNotionalMigrationRequired, match="reviewed copy migration"):
+    with pytest.raises(FilledNotionalMigrationRequired, match="reviewed copy migration to v3"):
         _service(path)
 
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before
@@ -932,7 +1072,88 @@ signal.pause()
     database_stat_before = path.stat()
     journal_stat_before = journal.stat()
 
-    with pytest.raises(FilledNotionalMigrationRequired, match="reviewed copy migration"):
+    with pytest.raises(
+        FilledNotionalUnavailable, match="authenticated current-schema recovery anchor"
+    ):
+        _service(path)
+
+    assert path.read_bytes() == database_before
+    assert journal.read_bytes() == journal_before
+    assert (path.stat().st_ino, path.stat().st_mtime_ns) == (
+        database_stat_before.st_ino,
+        database_stat_before.st_mtime_ns,
+    )
+    assert (journal.stat().st_ino, journal.stat().st_mtime_ns) == (
+        journal_stat_before.st_ino,
+        journal_stat_before.st_mtime_ns,
+    )
+    assert not _anchor_path(path).exists()
+
+
+def test_spilled_uncommitted_current_version_cannot_authorize_legacy_recovery(tmp_path):
+    if not hasattr(signal, "SIGKILL"):
+        pytest.skip("SIGKILL unavailable on this host")
+    path = tmp_path / "legacy-spilled-current-version.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("""
+            CREATE TABLE daily_filled_notional_schema (
+                singleton INTEGER PRIMARY KEY,
+                schema_version INTEGER NOT NULL
+            )
+            """)
+        connection.execute("INSERT INTO daily_filled_notional_schema VALUES (1, 1)")
+        connection.execute("CREATE TABLE legacy_payload (id INTEGER PRIMARY KEY, value BLOB)")
+        connection.executemany(
+            "INSERT INTO legacy_payload VALUES (?, ?)",
+            ((index, b"a" * 4096) for index in range(1, 257)),
+        )
+    script = f"""
+import signal
+import sqlite3
+
+connection = sqlite3.connect({str(path)!r}, isolation_level=None)
+connection.execute('PRAGMA journal_mode=DELETE')
+connection.execute('PRAGMA synchronous=FULL')
+connection.execute('PRAGMA cache_size=1')
+connection.execute('PRAGMA cache_spill=ON')
+connection.execute('BEGIN IMMEDIATE')
+connection.execute('UPDATE daily_filled_notional_schema SET schema_version = 3')
+connection.execute("UPDATE legacy_payload SET value = randomblob(4096)")
+print('READY', flush=True)
+signal.pause()
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "READY"
+        os.kill(child.pid, signal.SIGKILL)
+        child.wait(timeout=10)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+
+    journal = Path(f"{path}-journal")
+    assert journal.exists() and journal.stat().st_size > 0
+    with sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True) as connection:
+        assert connection.execute(
+            "SELECT schema_version FROM daily_filled_notional_schema"
+        ).fetchone() == (3,)
+    database_before = path.read_bytes()
+    journal_before = journal.read_bytes()
+    database_stat_before = path.stat()
+    journal_stat_before = journal.stat()
+
+    with pytest.raises(
+        FilledNotionalUnavailable, match="authenticated current-schema recovery anchor"
+    ):
         _service(path)
 
     assert path.read_bytes() == database_before

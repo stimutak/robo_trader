@@ -8,11 +8,12 @@ Durability boundary
 The SQLite ledger is checked against an atomic HMAC-protected anchor file in a
 different directory. The caller must obtain the 32-byte-or-longer HMAC key from
 an independent secret authority; the key is never stored in the database or
-anchor. The anchor binds the ledger UUID, database device/inode, fill count and
-head, and quarantine count and head. This detects ledger rollback, replacement,
-and tail deletion. One authenticated database event ahead of the anchor is the
-only recoverable crash window (SQLite committed and the atomic anchor replace
-did not finish).
+anchor. The anchor binds the ledger UUID, database device/inode, fill and
+quarantine heads/counts, and the latest append-only checkpoint. Each fill also
+contains an authenticated cumulative count and total for its accounting scope
+and New York trading date. Startup streams and audits the complete history;
+later operations validate bounded checkpoint, tail, and indexed scope state.
+This detects ledger rollback, replacement, tail deletion, and forged totals.
 
 An HMAC does not prove freshness: an attacker who replays an older valid
 database and matching older valid anchor can pass all local checks while the
@@ -36,7 +37,7 @@ import sqlite3
 import stat
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from decimal import (
     MAX_EMAX,
@@ -63,8 +64,9 @@ from robo_trader.safety.sqlite_identity import (
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _ZERO_HASH = "0" * 64
-_SCHEMA_VERSION = 2
-_ANCHOR_VERSION = 1
+_SCHEMA_VERSION = 3
+_ANCHOR_VERSION = 2
+_MAX_DAILY_FILL_ROWS = 100_000
 _IDENTIFIER_RE = re.compile(r"[\x21-\x7e]{1,128}\Z")
 _CURRENCY_RE = re.compile(r"[A-Z]{3}\Z")
 _LEDGER_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
@@ -105,7 +107,7 @@ _DENIED_SQLITE_ACTIONS = frozenset(
 _SCHEMA_TABLE_SQL = """
 CREATE TABLE daily_filled_notional_schema (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    schema_version INTEGER NOT NULL CHECK (schema_version = 2),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 3),
     ledger_id TEXT NOT NULL CHECK (length(ledger_id) = 32)
 )
 """
@@ -125,6 +127,8 @@ CREATE TABLE daily_filled_notional_records (
     executed_at_utc TEXT NOT NULL,
     trading_date TEXT NOT NULL,
     notional_text TEXT NOT NULL,
+    scope_fill_count INTEGER NOT NULL CHECK (scope_fill_count > 0),
+    scope_total_text TEXT NOT NULL,
     previous_hash TEXT NOT NULL CHECK (length(previous_hash) = 64),
     record_hash TEXT NOT NULL CHECK (length(record_hash) = 64)
 )
@@ -145,6 +149,21 @@ CREATE TABLE daily_filled_notional_conflicts (
 )
 """
 
+_CHECKPOINTS_TABLE_SQL = """
+CREATE TABLE daily_filled_notional_checkpoints (
+    event_sequence INTEGER PRIMARY KEY,
+    ledger_id TEXT NOT NULL CHECK (length(ledger_id) = 32),
+    database_device INTEGER NOT NULL CHECK (database_device >= 0),
+    database_inode INTEGER NOT NULL CHECK (database_inode >= 0),
+    fill_count INTEGER NOT NULL CHECK (fill_count >= 0),
+    fill_head TEXT NOT NULL CHECK (length(fill_head) = 64),
+    conflict_count INTEGER NOT NULL CHECK (conflict_count >= 0),
+    conflict_head TEXT NOT NULL CHECK (length(conflict_head) = 64),
+    previous_checkpoint_hash TEXT NOT NULL CHECK (length(previous_checkpoint_hash) = 64),
+    checkpoint_hash TEXT NOT NULL CHECK (length(checkpoint_hash) = 64)
+)
+"""
+
 _UNIQUE_EXECUTION_SQL = """
 CREATE UNIQUE INDEX daily_filled_notional_execution_identity
 ON daily_filled_notional_records(account_id, broker_execution_id)
@@ -152,7 +171,9 @@ ON daily_filled_notional_records(account_id, broker_execution_id)
 
 _SCOPE_DATE_SQL = """
 CREATE INDEX daily_filled_notional_scope_date
-ON daily_filled_notional_records(account_id, portfolio_id, currency, trading_date)
+ON daily_filled_notional_records(
+    account_id, portfolio_id, currency, trading_date, sequence DESC
+)
 """
 
 _TRIGGER_SQL = {
@@ -238,6 +259,37 @@ _TRIGGER_SQL = {
         WHEN EXISTS (SELECT 1 FROM daily_filled_notional_schema)
         BEGIN
             SELECT RAISE(ABORT, 'filled-notional schema is immutable');
+        END
+    """,
+    "daily_filled_notional_checkpoints_insert_guard": """
+        CREATE TRIGGER daily_filled_notional_checkpoints_insert_guard
+        BEFORE INSERT ON daily_filled_notional_checkpoints
+        WHEN NEW.event_sequence != COALESCE(
+                 (SELECT MAX(event_sequence) + 1 FROM daily_filled_notional_checkpoints), 0
+             )
+          OR NEW.previous_checkpoint_hash != COALESCE(
+                 (
+                     SELECT checkpoint_hash
+                     FROM daily_filled_notional_checkpoints
+                     ORDER BY event_sequence DESC LIMIT 1
+                 ), '0000000000000000000000000000000000000000000000000000000000000000'
+             )
+        BEGIN
+            SELECT RAISE(ABORT, 'filled-notional checkpoints must append to the chain');
+        END
+    """,
+    "daily_filled_notional_checkpoints_no_update": """
+        CREATE TRIGGER daily_filled_notional_checkpoints_no_update
+        BEFORE UPDATE ON daily_filled_notional_checkpoints
+        BEGIN
+            SELECT RAISE(ABORT, 'filled-notional checkpoints are append-only');
+        END
+    """,
+    "daily_filled_notional_checkpoints_no_delete": """
+        CREATE TRIGGER daily_filled_notional_checkpoints_no_delete
+        BEFORE DELETE ON daily_filled_notional_checkpoints
+        BEGIN
+            SELECT RAISE(ABORT, 'filled-notional checkpoints are append-only');
         END
     """,
 }
@@ -356,6 +408,8 @@ class _LedgerState:
     fill_head: str
     conflict_count: int
     conflict_head: str
+    checkpoint_sequence: int
+    checkpoint_head: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,6 +474,11 @@ def _canonical_nonzero_decimal_magnitude(value: object, field_name: str) -> str:
 def _exact_multiply(left: Decimal, right: Decimal) -> Decimal:
     with _isolated_decimal_context() as context:
         return context.multiply(left, right)
+
+
+def _exact_add(left: Decimal, right: Decimal) -> Decimal:
+    with _isolated_decimal_context() as context:
+        return context.add(left, right)
 
 
 def _parse_canonical_positive_decimal(
@@ -514,6 +573,8 @@ def _fill_hash(
     account_id: str,
     portfolio_id: str,
     fill: _CanonicalFill,
+    scope_fill_count: int,
+    scope_total_text: str,
     previous_hash: str,
 ) -> str:
     return _keyed_hash(
@@ -524,6 +585,8 @@ def _fill_hash(
             "ledger_id": ledger_id,
             "portfolio_id": portfolio_id,
             "previous_hash": previous_hash,
+            "scope_fill_count": scope_fill_count,
+            "scope_total_text": scope_total_text,
             "sequence": sequence,
         },
     )
@@ -531,6 +594,37 @@ def _fill_hash(
 
 def _conflict_hash(key: bytes, ledger_id: str, payload: dict[str, object]) -> str:
     return _keyed_hash(key, {"conflict": payload, "ledger_id": ledger_id})
+
+
+def _checkpoint_hash(
+    key: bytes,
+    *,
+    ledger_id: str,
+    database_device: int,
+    database_inode: int,
+    fill_count: int,
+    fill_head: str,
+    conflict_count: int,
+    conflict_head: str,
+    event_sequence: int,
+    previous_checkpoint_hash: str,
+) -> str:
+    return _keyed_hash(
+        key,
+        {
+            "checkpoint": {
+                "conflict_count": conflict_count,
+                "conflict_head": conflict_head,
+                "database_device": database_device,
+                "database_inode": database_inode,
+                "event_sequence": event_sequence,
+                "fill_count": fill_count,
+                "fill_head": fill_head,
+                "ledger_id": ledger_id,
+                "previous_checkpoint_hash": previous_checkpoint_hash,
+            }
+        },
+    )
 
 
 def _append_only_authorizer(
@@ -590,17 +684,23 @@ class DailyFilledNotional:
         try:
             created = self._initialize_if_missing()
             if not created:
-                self._preflight_existing_schema()
-            self._recover_hot_journal()
+                recovery_required = self._preflight_existing_schema()
+                if recovery_required:
+                    self._recover_hot_journal()
             with self._connection(readonly=True) as connection:
+                connection.execute("BEGIN")
                 state = self._validate_ledger(connection)
                 if created:
                     anchor = self._create_initial_anchor(state)
                 else:
                     anchor = self._reconcile_anchor(state)
                 self._verify_monotonic_state(state)
+                self._ledger_id = state.ledger_id
                 current_day = self._current_trading_date()
                 total = self._total_for_date(connection, current_day)
+                anchor = self._require_exact_anchor(state)
+                self._verify_monotonic_state(state)
+                connection.commit()
         except FilledNotionalError:
             raise
         except DecimalException as exc:
@@ -611,6 +711,7 @@ class DailyFilledNotional:
             raise FilledNotionalUnavailable("filled-notional ledger startup failed closed") from exc
 
         self._ledger_id = state.ledger_id
+        self._state = state
         self._anchor = anchor
         self._restored_trading_date = current_day
         self._restored_total = total
@@ -727,7 +828,7 @@ class DailyFilledNotional:
         try:
             with self._connection(readonly=False) as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                before = self._validate_ledger(connection)
+                before = self._validate_checkpointed_state(connection)
                 anchor = self._reconcile_anchor(before)
                 self._assert_no_conflicts(before)
                 self._verify_monotonic_state(before)
@@ -742,6 +843,7 @@ class DailyFilledNotional:
                 ).fetchone()
                 recorded = existing is None
                 mutated = recorded
+                raw_after = before
                 if existing is not None:
                     stored = tuple(str(value) for value in existing[:8])
                     expected = (
@@ -755,7 +857,7 @@ class DailyFilledNotional:
                         canonical.notional_text,
                     )
                     if stored != expected:
-                        self._append_conflict(
+                        conflict_head = self._append_conflict(
                             connection,
                             before,
                             canonical,
@@ -766,12 +868,45 @@ class DailyFilledNotional:
                         conflict = FilledNotionalConflict(
                             "broker execution identity has durable conflicting evidence"
                         )
+                        raw_after = replace(
+                            before,
+                            conflict_count=before.conflict_count + 1,
+                            conflict_head=conflict_head,
+                        )
                         mutated = True
                 else:
-                    self._append_fill(connection, before, canonical)
+                    prior_count, prior_total = self._scope_total_for_date(
+                        connection, date.fromisoformat(canonical.trading_date)
+                    )
+                    if prior_count >= _MAX_DAILY_FILL_ROWS:
+                        raise FilledNotionalUnavailable(
+                            "daily fill count exceeds the bounded accounting limit"
+                        )
+                    scope_fill_count = prior_count + 1
+                    scope_total = _exact_add(prior_total, canonical.notional)
+                    scope_total_text = _canonical_positive_decimal(
+                        scope_total,
+                        "scope_total",
+                        max_digits=96,
+                        max_abs_exponent=54,
+                    )
+                    fill_head = self._append_fill(
+                        connection,
+                        before,
+                        canonical,
+                        scope_fill_count=scope_fill_count,
+                        scope_total_text=scope_total_text,
+                    )
+                    raw_after = replace(
+                        before,
+                        fill_count=before.fill_count + 1,
+                        fill_head=fill_head,
+                    )
+                after = (
+                    self._append_checkpoint(connection, before, raw_after) if mutated else before
+                )
                 trading_day = date.fromisoformat(canonical.trading_date)
                 total = self._total_for_date(connection, trading_day)
-                after = self._validate_ledger(connection)
                 if mutated:
                     pending = self._replace_anchor(
                         self._anchor_for_state(before, pending_state=after),
@@ -816,11 +951,17 @@ class DailyFilledNotional:
             while True:
                 try:
                     with self._connection(readonly=True) as connection:
-                        state = self._validate_ledger(connection)
+                        connection.execute("BEGIN")
+                        state = self._validate_checkpointed_state(connection)
                         self._anchor = self._require_exact_anchor(state)
                         self._assert_no_conflicts(state)
                         self._verify_monotonic_state(state)
-                        return self._total_for_date(connection, trading_day)
+                        total = self._total_for_date(connection, trading_day)
+                        self._anchor = self._require_exact_anchor(state)
+                        self._verify_monotonic_state(state)
+                        connection.commit()
+                        self._state = state
+                        return total
                 except _PendingAnchorInProgress:
                     pending_attempts += 1
                     if pending_attempts > 3:
@@ -870,12 +1011,14 @@ class DailyFilledNotional:
         )
         try:
             with reviewer._connection(readonly=True) as connection:
-                state = reviewer._validate_ledger(connection)
+                connection.execute("BEGIN")
+                state = reviewer._validate_checkpointed_state(connection)
                 reviewer._require_exact_anchor(state)
+                reviewer._verify_monotonic_state(state)
                 rows = connection.execute(
                     "SELECT * FROM daily_filled_notional_conflicts ORDER BY sequence"
                 ).fetchall()
-                return tuple(
+                evidence = tuple(
                     ConflictEvidence(
                         sequence=int(row["sequence"]),
                         account_id=str(row["account_id"]),
@@ -888,6 +1031,10 @@ class DailyFilledNotional:
                     )
                     for row in rows
                 )
+                reviewer._require_exact_anchor(state)
+                reviewer._verify_monotonic_state(state)
+                connection.commit()
+                return evidence
         finally:
             reviewer._latch_failure("review-only instance cannot perform accounting")
 
@@ -896,7 +1043,10 @@ class DailyFilledNotional:
         connection: sqlite3.Connection,
         state: _LedgerState,
         fill: _CanonicalFill,
-    ) -> None:
+        *,
+        scope_fill_count: int,
+        scope_total_text: str,
+    ) -> str:
         sequence = state.fill_count + 1
         digest = _fill_hash(
             self._key,
@@ -905,6 +1055,8 @@ class DailyFilledNotional:
             self._account_id,
             self._portfolio_id,
             fill,
+            scope_fill_count,
+            scope_total_text,
             state.fill_head,
         )
         connection.execute(
@@ -912,8 +1064,9 @@ class DailyFilledNotional:
             INSERT INTO daily_filled_notional_records (
                 sequence, account_id, portfolio_id, broker_execution_id,
                 side, quantity_text, price_text, currency, executed_at_utc,
-                trading_date, notional_text, previous_hash, record_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                trading_date, notional_text, scope_fill_count, scope_total_text,
+                previous_hash, record_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 sequence,
@@ -927,10 +1080,13 @@ class DailyFilledNotional:
                 fill.executed_at_utc,
                 fill.trading_date,
                 fill.notional_text,
+                scope_fill_count,
+                scope_total_text,
                 state.fill_head,
                 digest,
             ),
         )
+        return digest
 
     def _append_conflict(
         self,
@@ -941,7 +1097,7 @@ class DailyFilledNotional:
         existing_portfolio_id: str,
         existing_record_hash: str,
         observed_at_utc: str,
-    ) -> None:
+    ) -> str:
         sequence = state.conflict_count + 1
         claimed_fill_json = _canonical_json(fill.as_dict())
         payload: dict[str, object] = {
@@ -977,6 +1133,55 @@ class DailyFilledNotional:
                 state.conflict_head,
                 digest,
             ),
+        )
+        return digest
+
+    def _append_checkpoint(
+        self,
+        connection: sqlite3.Connection,
+        before: _LedgerState,
+        after: _LedgerState,
+    ) -> _LedgerState:
+        event_sequence = before.checkpoint_sequence + 1
+        if event_sequence != after.fill_count + after.conflict_count:
+            raise FilledNotionalIntegrityError("checkpoint event sequence is invalid")
+        digest = _checkpoint_hash(
+            self._key,
+            ledger_id=after.ledger_id,
+            database_device=after.database_device,
+            database_inode=after.database_inode,
+            fill_count=after.fill_count,
+            fill_head=after.fill_head,
+            conflict_count=after.conflict_count,
+            conflict_head=after.conflict_head,
+            event_sequence=event_sequence,
+            previous_checkpoint_hash=before.checkpoint_head,
+        )
+        connection.execute(
+            """
+            INSERT INTO daily_filled_notional_checkpoints (
+                event_sequence, ledger_id, database_device, database_inode,
+                fill_count, fill_head, conflict_count, conflict_head,
+                previous_checkpoint_hash, checkpoint_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_sequence,
+                after.ledger_id,
+                after.database_device,
+                after.database_inode,
+                after.fill_count,
+                after.fill_head,
+                after.conflict_count,
+                after.conflict_head,
+                before.checkpoint_head,
+                digest,
+            ),
+        )
+        return replace(
+            after,
+            checkpoint_sequence=event_sequence,
+            checkpoint_head=digest,
         )
 
     @staticmethod
@@ -1051,13 +1256,43 @@ class DailyFilledNotional:
             connection.execute(_SCHEMA_TABLE_SQL)
             connection.execute(_RECORDS_TABLE_SQL)
             connection.execute(_CONFLICTS_TABLE_SQL)
+            connection.execute(_CHECKPOINTS_TABLE_SQL)
             connection.execute(_UNIQUE_EXECUTION_SQL)
             connection.execute(_SCOPE_DATE_SQL)
             for statement in _TRIGGER_SQL.values():
                 connection.execute(statement)
+            ledger_id = uuid.uuid4().hex
             connection.execute(
                 "INSERT INTO daily_filled_notional_schema VALUES (1, ?, ?)",
-                (_SCHEMA_VERSION, uuid.uuid4().hex),
+                (_SCHEMA_VERSION, ledger_id),
+            )
+            initial_checkpoint = _checkpoint_hash(
+                self._key,
+                ledger_id=ledger_id,
+                database_device=bound.device,
+                database_inode=bound.inode,
+                fill_count=0,
+                fill_head=_ZERO_HASH,
+                conflict_count=0,
+                conflict_head=_ZERO_HASH,
+                event_sequence=0,
+                previous_checkpoint_hash=_ZERO_HASH,
+            )
+            connection.execute(
+                """
+                INSERT INTO daily_filled_notional_checkpoints VALUES (
+                    0, ?, ?, ?, 0, ?, 0, ?, ?, ?
+                )
+                """,
+                (
+                    ledger_id,
+                    bound.device,
+                    bound.inode,
+                    _ZERO_HASH,
+                    _ZERO_HASH,
+                    _ZERO_HASH,
+                    initial_checkpoint,
+                ),
             )
             connection.commit()
             bound.assert_connection_identity(sqlite_connection_file_identity(connection))
@@ -1079,7 +1314,7 @@ class DailyFilledNotional:
             connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
             connection.commit()
 
-    def _preflight_existing_schema(self) -> None:
+    def _preflight_existing_schema(self) -> bool:
         """Identify legacy state without permitting SQLite journal recovery."""
 
         journal = Path(f"{self._path}-journal")
@@ -1092,6 +1327,21 @@ class DailyFilledNotional:
                 raise FilledNotionalUnavailable(
                     "SQLite journal prevents safe read-only schema detection"
                 )
+            try:
+                anchor = self._load_anchor()
+                database_metadata = os.lstat(self._path)
+            except (FilledNotionalError, OSError) as exc:
+                raise FilledNotionalUnavailable(
+                    "hot journal lacks an authenticated current-schema recovery anchor"
+                ) from exc
+            if (
+                anchor.state.database_device != database_metadata.st_dev
+                or anchor.state.database_inode != database_metadata.st_ino
+            ):
+                raise FilledNotionalUnavailable(
+                    "hot journal recovery anchor does not bind this database"
+                )
+            return True
         try:
             with self._connection(readonly=True, immutable=True) as connection:
                 self._schema_version(connection)
@@ -1103,6 +1353,7 @@ class DailyFilledNotional:
             raise FilledNotionalUnavailable(
                 "existing schema cannot be detected without SQLite recovery"
             ) from exc
+        return False
 
     @contextmanager
     def _connection(
@@ -1159,7 +1410,7 @@ class DailyFilledNotional:
         version = int(rows[0][0])
         if version < _SCHEMA_VERSION:
             raise FilledNotionalMigrationRequired(
-                f"filled-notional schema v{version} requires reviewed copy migration to v2"
+                f"filled-notional schema v{version} requires reviewed copy migration to v3"
             )
         if version > _SCHEMA_VERSION:
             raise FilledNotionalIntegrityError(
@@ -1167,15 +1418,13 @@ class DailyFilledNotional:
             )
         return version
 
-    def _validate_ledger(self, connection: sqlite3.Connection) -> _LedgerState:
-        integrity = connection.execute("PRAGMA integrity_check").fetchall()
-        if len(integrity) != 1 or str(integrity[0][0]) != "ok":
-            raise FilledNotionalIntegrityError("SQLite integrity_check failed")
+    def _validate_schema(self, connection: sqlite3.Connection) -> str:
         self._schema_version(connection)
         expected_sql = {
             ("table", "daily_filled_notional_schema"): _SCHEMA_TABLE_SQL,
             ("table", "daily_filled_notional_records"): _RECORDS_TABLE_SQL,
             ("table", "daily_filled_notional_conflicts"): _CONFLICTS_TABLE_SQL,
+            ("table", "daily_filled_notional_checkpoints"): _CHECKPOINTS_TABLE_SQL,
             ("index", "daily_filled_notional_execution_identity"): _UNIQUE_EXECUTION_SQL,
             ("index", "daily_filled_notional_scope_date"): _SCOPE_DATE_SQL,
             **{("trigger", name): sql for name, sql in _TRIGGER_SQL.items()},
@@ -1201,13 +1450,26 @@ class DailyFilledNotional:
         ledger_id = str(schema_rows[0][2])
         if _LEDGER_ID_RE.fullmatch(ledger_id) is None:
             raise FilledNotionalIntegrityError("filled-notional ledger identity is invalid")
+        return ledger_id
+
+    def _validate_ledger(self, connection: sqlite3.Connection) -> _LedgerState:
+        integrity = connection.execute("PRAGMA integrity_check")
+        first_integrity = integrity.fetchone()
+        if (
+            first_integrity is None
+            or str(first_integrity[0]) != "ok"
+            or integrity.fetchone() is not None
+        ):
+            raise FilledNotionalIntegrityError("SQLite integrity_check failed")
+        ledger_id = self._validate_schema(connection)
 
         fill_count, fill_head = self._validate_fills(connection, ledger_id)
         conflict_count, conflict_head = self._validate_conflicts(connection, ledger_id)
         metadata = os.lstat(self._path)
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise FilledNotionalIntegrityError("ledger path identity is invalid")
-        return _LedgerState(
+        checkpoint_sequence, checkpoint_head = self._validate_checkpoints(
+            connection,
             ledger_id=ledger_id,
             database_device=metadata.st_dev,
             database_inode=metadata.st_ino,
@@ -1216,14 +1478,124 @@ class DailyFilledNotional:
             conflict_count=conflict_count,
             conflict_head=conflict_head,
         )
+        return _LedgerState(
+            ledger_id=ledger_id,
+            database_device=metadata.st_dev,
+            database_inode=metadata.st_ino,
+            fill_count=fill_count,
+            fill_head=fill_head,
+            conflict_count=conflict_count,
+            conflict_head=conflict_head,
+            checkpoint_sequence=checkpoint_sequence,
+            checkpoint_head=checkpoint_head,
+        )
+
+    def _validate_checkpointed_state(self, connection: sqlite3.Connection) -> _LedgerState:
+        """Validate bounded authenticated state after the startup full audit."""
+
+        ledger_id = self._validate_schema(connection)
+        row = connection.execute(
+            "SELECT * FROM daily_filled_notional_checkpoints "
+            "ORDER BY event_sequence DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            raise FilledNotionalIntegrityError("checkpoint state is missing")
+        integer_names = (
+            "event_sequence",
+            "database_device",
+            "database_inode",
+            "fill_count",
+            "conflict_count",
+        )
+        if any(type(row[name]) is not int or row[name] < 0 for name in integer_names):
+            raise FilledNotionalIntegrityError("checkpoint counters are invalid")
+        checkpoint_ledger_id = str(row["ledger_id"])
+        database_device = int(row["database_device"])
+        database_inode = int(row["database_inode"])
+        fill_count = int(row["fill_count"])
+        fill_head = str(row["fill_head"])
+        conflict_count = int(row["conflict_count"])
+        conflict_head = str(row["conflict_head"])
+        event_sequence = int(row["event_sequence"])
+        previous_checkpoint_hash = str(row["previous_checkpoint_hash"])
+        if (
+            checkpoint_ledger_id != ledger_id
+            or event_sequence != fill_count + conflict_count
+            or conflict_count > 1
+            or _HASH_RE.fullmatch(fill_head) is None
+            or _HASH_RE.fullmatch(conflict_head) is None
+            or _HASH_RE.fullmatch(previous_checkpoint_hash) is None
+        ):
+            raise FilledNotionalIntegrityError("checkpoint state is inconsistent")
+        expected_hash = _checkpoint_hash(
+            self._key,
+            ledger_id=checkpoint_ledger_id,
+            database_device=database_device,
+            database_inode=database_inode,
+            fill_count=fill_count,
+            fill_head=fill_head,
+            conflict_count=conflict_count,
+            conflict_head=conflict_head,
+            event_sequence=event_sequence,
+            previous_checkpoint_hash=previous_checkpoint_hash,
+        )
+        checkpoint_head = str(row["checkpoint_hash"])
+        if not hmac.compare_digest(checkpoint_head, expected_hash):
+            raise FilledNotionalIntegrityError("checkpoint HMAC is invalid")
+        metadata = os.lstat(self._path)
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino) != (database_device, database_inode)
+        ):
+            raise FilledNotionalIntegrityError("checkpoint database identity changed")
+        fill_tail = connection.execute(
+            "SELECT sequence, record_hash FROM daily_filled_notional_records "
+            "ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        conflict_tail = connection.execute(
+            "SELECT sequence, conflict_hash FROM daily_filled_notional_conflicts "
+            "ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        if fill_count == 0:
+            fill_matches = fill_tail is None and fill_head == _ZERO_HASH
+        else:
+            fill_matches = (
+                fill_tail is not None
+                and type(fill_tail[0]) is int
+                and int(fill_tail[0]) == fill_count
+                and str(fill_tail[1]) == fill_head
+            )
+        if conflict_count == 0:
+            conflict_matches = conflict_tail is None and conflict_head == _ZERO_HASH
+        else:
+            conflict_matches = (
+                conflict_tail is not None
+                and type(conflict_tail[0]) is int
+                and int(conflict_tail[0]) == conflict_count
+                and str(conflict_tail[1]) == conflict_head
+            )
+        if not fill_matches or not conflict_matches:
+            raise FilledNotionalIntegrityError("checkpoint tails do not match ledger rows")
+        return _LedgerState(
+            ledger_id=ledger_id,
+            database_device=database_device,
+            database_inode=database_inode,
+            fill_count=fill_count,
+            fill_head=fill_head,
+            conflict_count=conflict_count,
+            conflict_head=conflict_head,
+            checkpoint_sequence=event_sequence,
+            checkpoint_head=checkpoint_head,
+        )
 
     def _validate_fills(self, connection: sqlite3.Connection, ledger_id: str) -> tuple[int, str]:
         previous_hash = _ZERO_HASH
         expected_sequence = 1
-        identities: set[tuple[str, str]] = set()
+        scope_states: dict[tuple[str, str, str, str], tuple[int, Decimal]] = {}
         for row in connection.execute(
             "SELECT * FROM daily_filled_notional_records ORDER BY sequence"
-        ).fetchall():
+        ):
             if int(row["sequence"]) != expected_sequence:
                 raise FilledNotionalIntegrityError("filled-notional sequence is not contiguous")
             account_id = _validate_stored_identifier(row["account_id"], "account_id")
@@ -1231,10 +1603,6 @@ class DailyFilledNotional:
             execution_id = _validate_stored_identifier(
                 row["broker_execution_id"], "broker_execution_id"
             )
-            identity = (account_id, execution_id)
-            if identity in identities:
-                raise FilledNotionalIntegrityError("duplicate account execution identity")
-            identities.add(identity)
             side = str(row["side"])
             if side not in {candidate.value for candidate in FillSide}:
                 raise FilledNotionalIntegrityError("stored fill side is invalid")
@@ -1266,6 +1634,24 @@ class DailyFilledNotional:
                 trading_date=str(row["trading_date"]),
                 notional_text=str(row["notional_text"]),
             )
+            scope_key = (account_id, portfolio_id, currency, str(row["trading_date"]))
+            prior_scope_count, prior_scope_total = scope_states.get(scope_key, (0, Decimal("0")))
+            scope_fill_count = int(row["scope_fill_count"])
+            if (
+                type(row["scope_fill_count"]) is not int
+                or scope_fill_count != prior_scope_count + 1
+                or scope_fill_count > _MAX_DAILY_FILL_ROWS
+            ):
+                raise FilledNotionalIntegrityError("stored scope fill count is invalid")
+            scope_total = _parse_canonical_positive_decimal(
+                row["scope_total_text"],
+                "scope total",
+                max_digits=96,
+                max_abs_exponent=54,
+            )
+            expected_scope_total = _exact_add(prior_scope_total, notional)
+            if scope_total != expected_scope_total:
+                raise FilledNotionalIntegrityError("stored scope total is inconsistent")
             expected_hash = _fill_hash(
                 self._key,
                 ledger_id,
@@ -1273,12 +1659,15 @@ class DailyFilledNotional:
                 account_id,
                 portfolio_id,
                 canonical,
+                scope_fill_count,
+                str(row["scope_total_text"]),
                 previous_hash,
             )
             stored_hash = str(row["record_hash"])
             if not hmac.compare_digest(stored_hash, expected_hash):
                 raise FilledNotionalIntegrityError("filled-notional record HMAC is invalid")
             previous_hash = stored_hash
+            scope_states[scope_key] = (scope_fill_count, scope_total)
             expected_sequence += 1
         return expected_sequence - 1, previous_hash
 
@@ -1289,7 +1678,7 @@ class DailyFilledNotional:
         expected_sequence = 1
         for row in connection.execute(
             "SELECT * FROM daily_filled_notional_conflicts ORDER BY sequence"
-        ).fetchall():
+        ):
             if int(row["sequence"]) != expected_sequence:
                 raise FilledNotionalIntegrityError("conflict sequence is not contiguous")
             payload: dict[str, object] = {
@@ -1328,9 +1717,85 @@ class DailyFilledNotional:
             expected_sequence += 1
         return expected_sequence - 1, previous_hash
 
+    def _validate_checkpoints(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        ledger_id: str,
+        database_device: int,
+        database_inode: int,
+        fill_count: int,
+        fill_head: str,
+        conflict_count: int,
+        conflict_head: str,
+    ) -> tuple[int, str]:
+        expected_sequence = 0
+        previous_hash = _ZERO_HASH
+        final_row: Optional[sqlite3.Row] = None
+        for row in connection.execute(
+            "SELECT * FROM daily_filled_notional_checkpoints ORDER BY event_sequence"
+        ):
+            if int(row["event_sequence"]) != expected_sequence:
+                raise FilledNotionalIntegrityError("checkpoint sequence is not contiguous")
+            if str(row["ledger_id"]) != ledger_id:
+                raise FilledNotionalIntegrityError("checkpoint ledger identity changed")
+            checkpoint_database_device = int(row["database_device"])
+            checkpoint_database_inode = int(row["database_inode"])
+            checkpoint_fill_count = int(row["fill_count"])
+            checkpoint_fill_head = str(row["fill_head"])
+            checkpoint_conflict_count = int(row["conflict_count"])
+            checkpoint_conflict_head = str(row["conflict_head"])
+            if str(row["previous_checkpoint_hash"]) != previous_hash:
+                raise FilledNotionalIntegrityError("checkpoint hash chain is broken")
+            expected_hash = _checkpoint_hash(
+                self._key,
+                ledger_id=ledger_id,
+                database_device=checkpoint_database_device,
+                database_inode=checkpoint_database_inode,
+                fill_count=checkpoint_fill_count,
+                fill_head=checkpoint_fill_head,
+                conflict_count=checkpoint_conflict_count,
+                conflict_head=checkpoint_conflict_head,
+                event_sequence=expected_sequence,
+                previous_checkpoint_hash=previous_hash,
+            )
+            stored_hash = str(row["checkpoint_hash"])
+            if not hmac.compare_digest(stored_hash, expected_hash):
+                raise FilledNotionalIntegrityError("checkpoint HMAC is invalid")
+            previous_hash = stored_hash
+            expected_sequence += 1
+            final_row = row
+        if final_row is None:
+            raise FilledNotionalIntegrityError("initial checkpoint is missing")
+        final_values = (
+            int(final_row["database_device"]),
+            int(final_row["database_inode"]),
+            int(final_row["fill_count"]),
+            str(final_row["fill_head"]),
+            int(final_row["conflict_count"]),
+            str(final_row["conflict_head"]),
+        )
+        if final_values != (
+            database_device,
+            database_inode,
+            fill_count,
+            fill_head,
+            conflict_count,
+            conflict_head,
+        ):
+            raise FilledNotionalIntegrityError(
+                "checkpoint does not match audited ledger state; rollback, tail deletion, "
+                "or tamper detected"
+            )
+        if expected_sequence - 1 != fill_count + conflict_count:
+            raise FilledNotionalIntegrityError("checkpoint event count is inconsistent")
+        return expected_sequence - 1, previous_hash
+
     @staticmethod
     def _state_payload(state: _LedgerState) -> dict[str, object]:
         return {
+            "checkpoint_head": state.checkpoint_head,
+            "checkpoint_sequence": state.checkpoint_sequence,
             "conflict_count": state.conflict_count,
             "conflict_head": state.conflict_head,
             "database_device": state.database_device,
@@ -1454,6 +1919,8 @@ class DailyFilledNotional:
     @staticmethod
     def _parse_anchor_state(value: object) -> _LedgerState:
         names = {
+            "checkpoint_head",
+            "checkpoint_sequence",
             "conflict_count",
             "conflict_head",
             "database_device",
@@ -1466,11 +1933,18 @@ class DailyFilledNotional:
             raise FilledNotionalIntegrityError("anchor state shape is invalid")
         if any(
             type(value[name]) is not int or value[name] < 0
-            for name in ("conflict_count", "database_device", "database_inode", "fill_count")
+            for name in (
+                "checkpoint_sequence",
+                "conflict_count",
+                "database_device",
+                "database_inode",
+                "fill_count",
+            )
         ):
             raise FilledNotionalIntegrityError("anchor counters or identity are invalid")
         if _LEDGER_ID_RE.fullmatch(str(value["ledger_id"])) is None or any(
-            _HASH_RE.fullmatch(str(value[name])) is None for name in ("fill_head", "conflict_head")
+            _HASH_RE.fullmatch(str(value[name])) is None
+            for name in ("checkpoint_head", "fill_head", "conflict_head")
         ):
             raise FilledNotionalIntegrityError("anchor identifiers are invalid")
         return _LedgerState(
@@ -1481,6 +1955,8 @@ class DailyFilledNotional:
             fill_head=str(value["fill_head"]),
             conflict_count=int(value["conflict_count"]),
             conflict_head=str(value["conflict_head"]),
+            checkpoint_sequence=int(value["checkpoint_sequence"]),
+            checkpoint_head=str(value["checkpoint_head"]),
         )
 
     def _reconcile_anchor(self, state: _LedgerState) -> _Anchor:
@@ -1616,13 +2092,15 @@ class DailyFilledNotional:
             raise FilledNotionalIntegrityError("atomic anchor verification failed")
         return loaded
 
-    def _total_for_date(self, connection: sqlite3.Connection, trading_day: date) -> Decimal:
-        rows = connection.execute(
+    def _scope_total_for_date(
+        self, connection: sqlite3.Connection, trading_day: date
+    ) -> tuple[int, Decimal]:
+        row = connection.execute(
             """
-            SELECT notional_text FROM daily_filled_notional_records
+            SELECT * FROM daily_filled_notional_records
             WHERE account_id = ? AND portfolio_id = ?
               AND currency = ? AND trading_date = ?
-            ORDER BY sequence
+            ORDER BY sequence DESC LIMIT 1
             """,
             (
                 self._account_id,
@@ -1630,15 +2108,58 @@ class DailyFilledNotional:
                 self._currency,
                 trading_day.isoformat(),
             ),
-        ).fetchall()
-        with _isolated_decimal_context() as context:
-            total = Decimal("0")
-            for row in rows:
-                total = context.add(
-                    total,
-                    _parse_canonical_positive_decimal(row[0], "notional"),
-                )
-            return total
+        ).fetchone()
+        if row is None:
+            return 0, Decimal("0")
+        sequence = int(row["sequence"])
+        scope_fill_count = int(row["scope_fill_count"])
+        if (
+            type(row["sequence"]) is not int
+            or type(row["scope_fill_count"]) is not int
+            or sequence < 1
+            or scope_fill_count < 1
+            or scope_fill_count > _MAX_DAILY_FILL_ROWS
+        ):
+            raise FilledNotionalIntegrityError("stored scope fill count is invalid")
+        account_id = _validate_stored_identifier(row["account_id"], "account_id")
+        portfolio_id = _validate_stored_identifier(row["portfolio_id"], "portfolio_id")
+        execution_id = _validate_stored_identifier(
+            row["broker_execution_id"], "broker_execution_id"
+        )
+        canonical = _CanonicalFill(
+            broker_execution_id=execution_id,
+            side=str(row["side"]),
+            quantity_text=str(row["quantity_text"]),
+            price_text=str(row["price_text"]),
+            currency=str(row["currency"]),
+            executed_at_utc=str(row["executed_at_utc"]),
+            trading_date=str(row["trading_date"]),
+            notional_text=str(row["notional_text"]),
+        )
+        scope_total_text = str(row["scope_total_text"])
+        total = _parse_canonical_positive_decimal(
+            scope_total_text,
+            "scope total",
+            max_digits=96,
+            max_abs_exponent=54,
+        )
+        expected_hash = _fill_hash(
+            self._key,
+            self._ledger_id,
+            sequence,
+            account_id,
+            portfolio_id,
+            canonical,
+            scope_fill_count,
+            scope_total_text,
+            str(row["previous_hash"]),
+        )
+        if not hmac.compare_digest(str(row["record_hash"]), expected_hash):
+            raise FilledNotionalIntegrityError("scope-total record HMAC is invalid")
+        return scope_fill_count, total
+
+    def _total_for_date(self, connection: sqlite3.Connection, trading_day: date) -> Decimal:
+        return self._scope_total_for_date(connection, trading_day)[1]
 
 
 def _validate_stored_identifier(value: object, field_name: str) -> str:
