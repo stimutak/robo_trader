@@ -128,7 +128,7 @@ class OrderManager:
         }
 
         # Statistics
-        self.stats = {
+        self.stats: Dict[str, float] = {
             "total_orders": 0,
             "successful_fills": 0,
             "partial_fills": 0,
@@ -238,6 +238,20 @@ class OrderManager:
     async def _submit_with_retry(self, order: OrderDetails, executor) -> bool:
         """Submit order with exponential backoff retry."""
 
+        from .execution import PaperExecutor
+
+        if type(executor) is not PaperExecutor:
+            order.status = OrderStatus.ERROR
+            order.error_message = (
+                "Gate-A order manager requires the exact contained PaperExecutor; "
+                "simulated or alternate submission is disabled"
+            )
+            order.last_update = datetime.now()
+            self.pending_orders.discard(order.id)
+            self.stats["errors"] += 1
+            await self._trigger_callbacks("error", order)
+            return False
+
         for attempt in range(self.max_retries):
             try:
                 # Update retry count
@@ -269,14 +283,6 @@ class OrderManager:
                     else:
                         order.error_message = result.message
                         logger.warning(f"Order submission failed: {result.message}")
-                else:
-                    # Simulate submission for testing
-                    order.status = OrderStatus.SUBMITTED
-                    order.submitted_at = datetime.now()
-                    self.pending_orders.discard(order.id)
-                    self.active_orders.add(order.id)
-                    return True
-
             except Exception as e:
                 order.error_message = str(e)
                 logger.error(

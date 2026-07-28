@@ -568,6 +568,8 @@ def _runner_for_parallel(process_symbol) -> AsyncRunner:
 
 async def _configure_order_runtime(runner: AsyncRunner, executor_result=None) -> None:
     runner.portfolio_id = "default"
+    runner._baseline_entry_handle = object()
+    runner._baseline_entry_intent = object()
     accepted_at = datetime.now(timezone.utc)
     accepted_monotonic = 1000.0
     protective_clock = {
@@ -689,19 +691,33 @@ async def _configure_order_runtime(runner: AsyncRunner, executor_result=None) ->
     gateway._started = True
 
     @asynccontextmanager
-    async def serialize_entry(symbol=None):
+    async def serialize_entry(symbol=None, *, portfolio_id=None):
+        assert portfolio_id == "default"
         yield broker_quote if symbol == "AAPL" else None
 
     gateway.serialize_entry = serialize_entry
     gateway.submit_reduction = AsyncMock(
         return_value=runner.executor.place_order.return_value,
     )
+    gateway.submit_baseline_entry = MagicMock(
+        return_value=runner.executor.place_order.return_value,
+    )
+    gateway.issue_baseline_entry_intent = MagicMock(
+        return_value=runner._baseline_entry_intent,
+    )
     runner.paper_reduction_gateway = gateway
     runner.monitor = PerformanceMonitor()
 
 
+async def _place_order(runner: AsyncRunner, order: Order):
+    return await runner._place_order_with_circuit_breaker(
+        order,
+        _entry_intent=(runner._baseline_entry_intent if order.side == "BUY" else None),
+    )
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("side", ["BUY", "SELL", "SELL_SHORT", "BUY_TO_COVER"])
+@pytest.mark.parametrize("side", ["BUY", "SELL", "BUY_TO_COVER"])
 @pytest.mark.parametrize(
     "status",
     [
@@ -719,25 +735,38 @@ async def test_dashboard_status_cannot_revoke_exact_live_protection(
     await _configure_order_runtime(runner)
     runner._protective_feed_status = {} if status is None else {"AAPL": status}
 
-    result = await runner._place_order_with_circuit_breaker(
-        Order(symbol="AAPL", quantity=1, side=side, price=100.0)
+    result = await _place_order(
+        runner,
+        Order(
+            symbol="AAPL",
+            quantity=1,
+            side=side,
+            price=100.0,
+        ),
     )
 
     assert result.ok is True
-    if side in {"BUY", "SELL_SHORT"}:
-        runner.executor.place_order.assert_called_once()
+    if side == "BUY":
+        runner.paper_reduction_gateway.submit_baseline_entry.assert_called_once()
+        runner.executor.place_order.assert_not_called()
     else:
         runner.paper_reduction_gateway.submit_reduction.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("side", ["BUY", "SELL", "SELL_SHORT", "BUY_TO_COVER"])
+@pytest.mark.parametrize("side", ["BUY", "SELL", "BUY_TO_COVER"])
 async def test_central_order_admission_accepts_exact_live_protection(side: str) -> None:
     runner = AsyncRunner.__new__(AsyncRunner)
     await _configure_order_runtime(runner)
 
-    result = await runner._place_order_with_circuit_breaker(
-        Order(symbol="AAPL", quantity=1, side=side, price=100.0)
+    result = await _place_order(
+        runner,
+        Order(
+            symbol="AAPL",
+            quantity=1,
+            side=side,
+            price=100.0,
+        ),
     )
 
     assert result.ok is True
@@ -757,12 +786,13 @@ async def test_central_order_admission_accepts_exact_live_protection(side: str) 
         )
         runner.executor.place_order.assert_not_called()
     else:
-        runner.executor.place_order.assert_called_once()
+        runner.paper_reduction_gateway.submit_baseline_entry.assert_called_once()
+        runner.executor.place_order.assert_not_called()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("aged_clock", ["event", "receipt"])
-@pytest.mark.parametrize("side", ["BUY", "SELL_SHORT", "SELL", "BUY_TO_COVER"])
+@pytest.mark.parametrize("side", ["BUY", "SELL", "BUY_TO_COVER"])
 async def test_order_admission_rechecks_monitor_owned_protective_freshness(
     aged_clock: str,
     side: str,
@@ -777,8 +807,14 @@ async def test_order_admission_rechecks_monitor_owned_protective_freshness(
     else:
         runner._test_protective_clock["monotonic"] += 11
 
-    result = await runner._place_order_with_circuit_breaker(
-        Order(symbol="AAPL", quantity=1, side=side, price=100.0)
+    result = await _place_order(
+        runner,
+        Order(
+            symbol="AAPL",
+            quantity=1,
+            side=side,
+            price=100.0,
+        ),
     )
 
     assert runner._has_live_protective_feed("AAPL") is False
@@ -801,8 +837,14 @@ async def test_entry_quote_aging_during_equity_await_never_touches_executor() ->
 
     runner.portfolio.equity = AsyncMock(side_effect=age_quote_during_equity)
 
-    result = await runner._place_order_with_circuit_breaker(
-        Order(symbol="AAPL", quantity=1, side="BUY", price=100.0)
+    result = await _place_order(
+        runner,
+        Order(
+            symbol="AAPL",
+            quantity=1,
+            side="BUY",
+            price=100.0,
+        ),
     )
 
     assert result.ok is False
@@ -1048,8 +1090,14 @@ async def test_transport_abort_drains_running_sibling_and_blocks_its_order() -> 
         sibling_started.set()
         while not runner._symbol_cycle_abort_event.is_set():
             await asyncio.sleep(0)
-        result = await runner._place_order_with_circuit_breaker(
-            Order(symbol="MSFT", quantity=1, side="BUY", price=100.0)
+        result = await _place_order(
+            runner,
+            Order(
+                symbol="MSFT",
+                quantity=1,
+                side="BUY",
+                price=100.0,
+            ),
         )
         assert result.ok is False
         sibling_settled.set()
@@ -1133,8 +1181,14 @@ async def test_abort_before_order_admission_has_no_fill() -> None:
     abort_task = asyncio.create_task(runner._latch_symbol_cycle_abort())
     await asyncio.sleep(0)
     order_task = asyncio.create_task(
-        runner._place_order_with_circuit_breaker(
-            Order(symbol="AAPL", quantity=1, side="BUY", price=100.0)
+        _place_order(
+            runner,
+            Order(
+                symbol="AAPL",
+                quantity=1,
+                side="BUY",
+                price=100.0,
+            ),
         )
     )
     runner._order_admission_lock.release()
@@ -1153,8 +1207,14 @@ async def test_queued_order_cannot_beat_abort_intent_to_admission_lock() -> None
 
     # Queue the order first so it is the lock's oldest waiter.
     order_task = asyncio.create_task(
-        runner._place_order_with_circuit_breaker(
-            Order(symbol="AAPL", quantity=1, side="BUY", price=100.0)
+        _place_order(
+            runner,
+            Order(
+                symbol="AAPL",
+                quantity=1,
+                side="BUY",
+                price=100.0,
+            ),
         )
     )
     await asyncio.sleep(0)
@@ -1187,8 +1247,14 @@ async def test_fill_then_sibling_abort_drains_accounting() -> None:
         if symbol == "MSFT":
             await fill_happened.wait()
             raise SymbolCycleAbortError("poisoned generation")
-        result = await runner._place_order_with_circuit_breaker(
-            Order(symbol="AAPL", quantity=1, side="BUY", price=100.0)
+        result = await _place_order(
+            runner,
+            Order(
+                symbol="AAPL",
+                quantity=1,
+                side="BUY",
+                price=100.0,
+            ),
         )
         assert result.ok
         assert runner._symbol_cycle_abort_event.is_set()
@@ -1201,11 +1267,14 @@ async def test_fill_then_sibling_abort_drains_accounting() -> None:
     runner.max_concurrent_symbols = 2
     await _configure_order_runtime(runner)
 
-    def fill(_order):
+    def fill(*, order, portfolio_id, intent):
+        assert order.symbol == "AAPL"
+        assert portfolio_id == "default"
+        assert intent is runner._baseline_entry_intent
         fill_happened.set()
         return SimpleNamespace(ok=True, fill_price=100.0, msg="filled", message="filled")
 
-    runner.executor.place_order.side_effect = fill
+    runner.paper_reduction_gateway.submit_baseline_entry.side_effect = fill
 
     async def hold_after_fill_until_abort():
         await runner._symbol_cycle_abort_event.wait()
@@ -1218,7 +1287,8 @@ async def test_fill_then_sibling_abort_drains_accounting() -> None:
     with pytest.raises(SymbolCycleAbortError, match="poisoned generation"):
         await cycle
 
-    runner.executor.place_order.assert_called_once()
+    runner.paper_reduction_gateway.submit_baseline_entry.assert_called_once()
+    runner.executor.place_order.assert_not_called()
     accounting.assert_awaited_once_with("AAPL", 100.0)
     runner.update_position_market_prices.assert_not_awaited()
 
@@ -1230,8 +1300,14 @@ async def test_parent_cancel_after_fill_waits_for_accounting() -> None:
     accounting_done = asyncio.Event()
 
     async def process(_symbol: str):
-        result = await runner._place_order_with_circuit_breaker(
-            Order(symbol="AAPL", quantity=1, side="BUY", price=100.0)
+        result = await _place_order(
+            runner,
+            Order(
+                symbol="AAPL",
+                quantity=1,
+                side="BUY",
+                price=100.0,
+            ),
         )
         fill_happened.set()
         await release_accounting.wait()
@@ -1264,8 +1340,14 @@ async def test_parent_cancel_during_abort_drain_preserves_cancellation() -> None
         if symbol == "MSFT":
             await fill_happened.wait()
             raise SymbolCycleAbortError("originating transport poison")
-        result = await runner._place_order_with_circuit_breaker(
-            Order(symbol="AAPL", quantity=1, side="BUY", price=100.0)
+        result = await _place_order(
+            runner,
+            Order(
+                symbol="AAPL",
+                quantity=1,
+                side="BUY",
+                price=100.0,
+            ),
         )
         fill_happened.set()
         await release_accounting.wait()
@@ -1629,12 +1711,18 @@ async def test_extended_hours_blocks_entry_sides_but_not_exit() -> None:
     await _configure_order_runtime(runner)
     with patch("robo_trader.runner_async.is_extended_hours", return_value=True):
         for side in ("BUY", "SELL_SHORT"):
-            result = await runner._place_order_with_circuit_breaker(
-                Order(symbol="AAPL", quantity=1, side=side, price=100.0)
+            result = await _place_order(
+                runner,
+                Order(
+                    symbol="AAPL",
+                    quantity=1,
+                    side=side,
+                    price=100.0,
+                ),
             )
             assert result.ok is False
-        exit_result = await runner._place_order_with_circuit_breaker(
-            Order(symbol="AAPL", quantity=1, side="SELL", price=100.0)
+        exit_result = await _place_order(
+            runner, Order(symbol="AAPL", quantity=1, side="SELL", price=100.0)
         )
     assert exit_result.ok is True
     runner.paper_reduction_gateway.submit_reduction.assert_awaited_once()
@@ -1676,7 +1764,8 @@ async def test_extended_hours_entry_requires_and_accepts_matching_exact_session(
     )
 
     @asynccontextmanager
-    async def serialize_entry(symbol=None):
+    async def serialize_entry(symbol=None, *, portfolio_id=None):
+        assert portfolio_id == "default"
         yield quote if symbol == "AAPL" else None
 
     runner.paper_reduction_gateway.serialize_entry = serialize_entry
@@ -1684,12 +1773,18 @@ async def test_extended_hours_entry_requires_and_accepts_matching_exact_session(
         patch("robo_trader.runner_async.is_extended_hours", return_value=True),
         patch("robo_trader.runner_async.get_market_session", return_value="pre-market"),
     ):
-        result = await runner._place_order_with_circuit_breaker(
-            Order(symbol="AAPL", quantity=1, side="BUY", price=Decimal("1"))
+        result = await _place_order(
+            runner,
+            Order(
+                symbol="AAPL",
+                quantity=1,
+                side="BUY",
+                price=Decimal("1"),
+            ),
         )
 
     assert result.ok is True
-    submitted = runner.executor.place_order.call_args.args[0]
+    submitted = runner.paper_reduction_gateway.submit_baseline_entry.call_args.kwargs["order"]
     assert submitted.price == Decimal("100.0")
 
 
@@ -1713,8 +1808,14 @@ async def test_final_entry_admission_rejects_stale_canonical_bar_batch() -> None
     stale_frame = stale_batch.to_frame()
     runner._canonical_bar_batches["AAPL"] = (stale_batch, stale_frame)
 
-    result = await runner._place_order_with_circuit_breaker(
-        Order(symbol="AAPL", quantity=1, side="BUY", price=Decimal("100"))
+    result = await _place_order(
+        runner,
+        Order(
+            symbol="AAPL",
+            quantity=1,
+            side="BUY",
+            price=Decimal("100"),
+        ),
     )
 
     assert result.ok is False
@@ -1727,8 +1828,15 @@ async def test_regular_hours_entry_reaches_executor() -> None:
     runner = AsyncRunner.__new__(AsyncRunner)
     await _configure_order_runtime(runner)
     with patch("robo_trader.runner_async.is_extended_hours", return_value=False):
-        result = await runner._place_order_with_circuit_breaker(
-            Order(symbol="AAPL", quantity=1, side="BUY", price=100.0)
+        result = await _place_order(
+            runner,
+            Order(
+                symbol="AAPL",
+                quantity=1,
+                side="BUY",
+                price=100.0,
+            ),
         )
     assert result.ok is True
-    runner.executor.place_order.assert_called_once()
+    runner.paper_reduction_gateway.submit_baseline_entry.assert_called_once()
+    runner.executor.place_order.assert_not_called()

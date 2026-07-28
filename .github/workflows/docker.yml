@@ -174,7 +174,7 @@ jobs:
           MODEL_ARTIFACT_SET: ci-fixtures
           BUILD_ID: github-actions
           TRADING_SYMBOLS: AAPL
-          STRATEGY_ENABLED_STRATEGIES: momentum
+          STRATEGY_ENABLED_STRATEGIES: baseline_sma
           RISK_MAX_POSITION_SIZE: "1000"
           RISK_STOP_LOSS_PERCENT: "0.02"
           RISK_MAX_DAILY_LOSS: "100"
@@ -261,7 +261,7 @@ jobs:
           MODEL_ARTIFACT_SET: ci-fixtures
           BUILD_ID: github-actions
           TRADING_SYMBOLS: AAPL
-          STRATEGY_ENABLED_STRATEGIES: momentum
+          STRATEGY_ENABLED_STRATEGIES: baseline_sma
           RISK_MAX_POSITION_SIZE: "1000"
           RISK_STOP_LOSS_PERCENT: "0.02"
           RISK_MAX_DAILY_LOSS: "100"
