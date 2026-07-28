@@ -317,6 +317,16 @@ class ReconciliationService:
                 eligible_until=eligible_until,
             )
             assert_runtime_reconciliation_evidence_sources_current(runtime_evidence)
+            publication_at = self._clock_value("post-persistence clock")
+            if publication_at < completed_at:
+                raise ReconciliationServiceBlocked("post-persistence clock moved backwards")
+            if (
+                verdict.status in {ReconciliationStatus.PASSED, ReconciliationStatus.DEGRADED}
+                and publication_at > eligible_until
+            ):
+                raise ReconciliationServiceBlocked(
+                    "post-persistence eligibility expired before outcome publication"
+                )
         except BaseException as exc:
             self._quarantine()
             if isinstance(exc, asyncio.CancelledError):

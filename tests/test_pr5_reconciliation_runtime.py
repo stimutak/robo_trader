@@ -1387,6 +1387,76 @@ async def test_post_commit_replacement_blocks_outcome(tmp_path, replacement_kind
 
 
 @pytest.mark.asyncio
+async def test_post_persistence_timing_proof_deadline_blocks_positive_outcome(tmp_path) -> None:
+    clock = _Clock()
+    snapshot = _snapshot()
+    broker_event_id = "broker-event-v1-" + "e5" * 32
+    lag = ReconciliationDifference(
+        kind=DifferenceKind.EXPECTED_TIMING_LAG,
+        materiality=DifferenceMateriality.INFORMATIONAL,
+        reason_code="BROKER_ORDER_EVENT_PENDING",
+        subject="AAPL",
+        evidence_ids=(broker_event_id,),
+    )
+    proof = ExpectedTimingLagProof.from_trusted_producer(
+        broker_snapshot_id=snapshot.snapshot_id,
+        reason_code=lag.reason_code,
+        subject=lag.subject,
+        broker_event_id=broker_event_id,
+        started_at=NOW - timedelta(seconds=1),
+        expires_at=NOW + timedelta(seconds=5),
+    )
+    service, _, persistence = await _service(
+        tmp_path,
+        snapshot=snapshot,
+        comparison=_comparison((lag,), timing_lag_proofs=(proof,)),
+        clock=clock,
+    )
+
+    class _AdvancePastDeadlineAfterPersistence:
+        async def initialize(self) -> None:
+            await persistence.initialize()
+
+        async def append_reconciliation(self, **kwargs):
+            result = await persistence.append_reconciliation(**kwargs)
+            clock.current = proof.expires_at + timedelta(microseconds=1)
+            return result
+
+    service._persistence = _AdvancePastDeadlineAfterPersistence()  # type: ignore[assignment]
+
+    with pytest.raises(ReconciliationServiceBlocked, match="eligibility expired"):
+        await service.reconcile_startup()
+
+    assert service.state is ReconciliationServiceState.QUARANTINED
+    assert service.latest_outcome is None
+    assert service.entry_eligible(at=clock.current) is False
+
+
+@pytest.mark.asyncio
+async def test_post_persistence_clock_rollback_blocks_positive_outcome(tmp_path) -> None:
+    clock = _Clock()
+    service, _, persistence = await _service(tmp_path, clock=clock)
+
+    class _RollBackClockAfterPersistence:
+        async def initialize(self) -> None:
+            await persistence.initialize()
+
+        async def append_reconciliation(self, **kwargs):
+            result = await persistence.append_reconciliation(**kwargs)
+            clock.current = kwargs["completed_at"] - timedelta(microseconds=1)
+            return result
+
+    service._persistence = _RollBackClockAfterPersistence()  # type: ignore[assignment]
+
+    with pytest.raises(ReconciliationServiceBlocked, match="clock moved backwards"):
+        await service.reconcile_startup()
+
+    assert service.state is ReconciliationServiceState.QUARANTINED
+    assert service.latest_outcome is None
+    assert service.entry_eligible(at=NOW) is False
+
+
+@pytest.mark.asyncio
 async def test_comparison_substitution_and_capability_reuse_are_rejected(tmp_path) -> None:
     service, source, _ = await _service(tmp_path)
     evidence = _registered_evidence(tmp_path / "reconciliation.sqlite3")
