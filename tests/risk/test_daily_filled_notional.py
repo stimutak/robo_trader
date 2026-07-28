@@ -1621,6 +1621,23 @@ def test_ledger_tail_deletion_is_detected_against_independent_anchor(tmp_path):
         _service(path)
 
 
+def test_long_lived_service_rejects_middle_fill_deletion_before_total_read(tmp_path):
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+    ledger.record_fill(_fill("scope-one"))
+    ledger.record_fill(_fill("scope-two"))
+    other_portfolio = _service(path, portfolio_id="other")
+    other_portfolio.record_fill(_fill("other-scope-tail"))
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TRIGGER daily_filled_notional_records_no_delete")
+        connection.execute("DELETE FROM daily_filled_notional_records WHERE sequence = 2")
+        connection.execute(ledger_module._TRIGGER_SQL["daily_filled_notional_records_no_delete"])
+
+    with pytest.raises(FilledNotionalIntegrityError, match="row counts or sequence spans"):
+        ledger.current_gross_filled_notional()
+
+
 def test_conflict_quarantine_tail_deletion_is_detected_by_anchor(tmp_path):
     path = tmp_path / "notional.db"
     ledger = _service(path)

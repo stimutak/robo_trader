@@ -2167,6 +2167,33 @@ class DailyFilledNotional:
             "SELECT sequence, conflict_hash FROM daily_filled_notional_conflicts "
             "ORDER BY sequence DESC LIMIT 1"
         ).fetchone()
+        fill_span = connection.execute(
+            "SELECT COUNT(*) AS row_count, MIN(sequence) AS first_sequence, "
+            "MAX(sequence) AS last_sequence FROM daily_filled_notional_records"
+        ).fetchone()
+        conflict_span = connection.execute(
+            "SELECT COUNT(*) AS row_count, MIN(sequence) AS first_sequence, "
+            "MAX(sequence) AS last_sequence FROM daily_filled_notional_conflicts"
+        ).fetchone()
+
+        def span_matches(span: sqlite3.Row, expected_count: int) -> bool:
+            if type(span["row_count"]) is not int or int(span["row_count"]) != expected_count:
+                return False
+            if expected_count == 0:
+                return span["first_sequence"] is None and span["last_sequence"] is None
+            return (
+                type(span["first_sequence"]) is int
+                and type(span["last_sequence"]) is int
+                and int(span["first_sequence"]) == 1
+                and int(span["last_sequence"]) == expected_count
+            )
+
+        if not span_matches(fill_span, fill_count) or not span_matches(
+            conflict_span, conflict_count
+        ):
+            raise FilledNotionalIntegrityError(
+                "checkpoint row counts or sequence spans do not match ledger state"
+            )
         if fill_count == 0:
             fill_matches = fill_tail is None and fill_head == _ZERO_HASH
         else:
