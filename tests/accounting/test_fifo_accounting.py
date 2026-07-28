@@ -138,7 +138,7 @@ def test_fixture_migration_is_exact_idempotent_and_foreign_keys_are_on(connectio
     assert connection.execute("PRAGMA foreign_keys").fetchone() == (1,)
     assert connection.execute(
         "SELECT version FROM fifo_schema_migrations WHERE component='fifo_accounting'"
-    ).fetchall() == [(1,)]
+    ).fetchall() == [(1,), (2,)]
 
 
 def test_fixture_migration_rejects_production_style_filename(tmp_path):
@@ -366,7 +366,7 @@ def test_integer_minor_units_reject_fractional_real_storage(connection, ledger):
         connection.execute(
             """
             INSERT INTO fifo_lot_openings VALUES(
-                ?, ?, ?, 0, ?, ?, 'LONG', '1', '10', 1.5, 1, ?
+                ?, ?, ?, NULL, 0, ?, ?, 'LONG', '1', '10', 1.5, 1, ?
             )
             """,
             (
@@ -785,7 +785,7 @@ def test_integrity_verifier_binds_opening_direction_to_source_fill(connection, l
     connection.execute(
         """
         INSERT INTO fifo_lot_openings VALUES(
-            ?, ?, ?, 0, ?, ?, 'SHORT', '2', '10', 0, 1, ?
+            ?, ?, ?, NULL, 0, ?, ?, 'SHORT', '2', '10', 0, 1, ?
         )
         """,
         (

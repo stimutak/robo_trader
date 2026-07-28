@@ -27,6 +27,11 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import aiosqlite
 
+from robo_trader.accounting.fifo_bootstrap import (
+    FifoBootstrapError,
+    append_legacy_fifo_bootstrap_in_transaction,
+    prepare_fifo_accounting_schema_in_transaction,
+)
 from robo_trader.database_migrations import (
     apply_exact_state_migrations,
     assert_exact_state_schema,
@@ -1770,6 +1775,10 @@ class AsyncTradingDatabase:
         """)
         await apply_exact_state_migrations(connection)
         await assert_exact_state_schema(connection)
+        await prepare_fifo_accounting_schema_in_transaction(
+            connection,
+            applied_at=utc_to_text(datetime.now(timezone.utc)),
+        )
 
     async def apply_exact_state_bootstrap_offline_atomic(
         self,
@@ -1933,6 +1942,7 @@ class AsyncTradingDatabase:
                 "bootstrap database identity does not match the runtime contract"
             )
         assert_exact_state_bootstrap_evidence(candidate, evidence, runtime_contract)
+        fifo_plan = candidate.fifo_bootstrap_plan()
         if journal_guard is None:
             raise ExactStateBootstrapError("bootstrap requires a held exact safety-journal guard")
         journal_guard.assert_unchanged()
@@ -1964,6 +1974,7 @@ class AsyncTradingDatabase:
                         )
                 else:
                     await conn.execute("BEGIN IMMEDIATE")
+                    await self._prepare_exact_bootstrap_schema(conn)
                 journal_guard.assert_unchanged()
                 for authentication in evidence.authentication_receipts:
                     replay = await conn.execute(
@@ -2190,6 +2201,17 @@ class AsyncTradingDatabase:
                         utc_to_text(committed_at),
                     ),
                 )
+                self._paper_settlement_fault("BEFORE_FIFO_LEGACY_BOOTSTRAP")
+                try:
+                    await append_legacy_fifo_bootstrap_in_transaction(
+                        conn,
+                        plan=fifo_plan,
+                        operator_action_id=action_id,
+                        recorded_at=utc_to_text(committed_at),
+                    )
+                except FifoBootstrapError as exc:
+                    raise ExactStateBootstrapError(str(exc)) from exc
+                self._paper_settlement_fault("AFTER_FIFO_LEGACY_BOOTSTRAP")
                 for authentication in evidence.authentication_receipts:
                     await conn.execute(
                         """

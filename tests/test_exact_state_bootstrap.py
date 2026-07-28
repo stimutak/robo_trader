@@ -20,6 +20,8 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 import robo_trader.bootstrap_evidence_auth as evidence_auth
+from robo_trader.accounting.fifo import FifoLedger, FillEvent, FillSide
+from robo_trader.accounting.fifo_bootstrap import prepare_fifo_accounting_schema_in_transaction
 from robo_trader.config import RuntimeContract, _derive_safety_account_scope
 from robo_trader.database_async import AsyncTradingDatabase
 from robo_trader.financial_state_bootstrap import (
@@ -38,6 +40,7 @@ from robo_trader.financial_state_bootstrap import (
 )
 from robo_trader.reconciliation.domain import fingerprint
 from robo_trader.safety.journal import SafetyJournal
+from scripts.bootstrap_exact_paper_state import preview
 
 ACCOUNT_SCOPE = _derive_safety_account_scope("0123456789abcdef" * 4, "DU_TEST_PAPER")
 _TEST_PRIVATE_KEYS: dict[str, Path] = {}
@@ -549,6 +552,7 @@ def _candidate_bundle(
             else (
                 ExactBootstrapPosition(
                     symbol="NVDA",
+                    con_id=123,
                     quantity=9,
                     cost_basis=Decimal("210.96"),
                     mark_price=Decimal("326.70"),
@@ -557,6 +561,7 @@ def _candidate_bundle(
                 ),
                 ExactBootstrapPosition(
                     symbol="TSLA",
+                    con_id=456,
                     quantity=2,
                     cost_basis=Decimal("370.81"),
                     # The known-bad legacy 203.45 mark is deliberately not adopted.
@@ -679,6 +684,240 @@ async def test_offline_atomic_bootstrap_migrates_raw_legacy_schema_in_one_commit
         assert connection.execute(
             "SELECT COUNT(*) FROM exact_bootstrap_evidence_consumptions"
         ).fetchone() == (4,)
+        epoch_id = candidate.fifo_bootstrap_plan().epoch_id
+        assert connection.execute(
+            "SELECT origin_kind,source_fingerprint FROM fifo_accounting_epochs"
+        ).fetchone() == (
+            "LEGACY_AGGREGATE_OPENING_BALANCE",
+            candidate.fingerprint(),
+        )
+        assert connection.execute(
+            "SELECT bootstrap_id,candidate_fingerprint,legacy_snapshot_hash "
+            "FROM fifo_legacy_bootstrap_lineage WHERE epoch_id=?",
+            (epoch_id,),
+        ).fetchone() == (
+            candidate.bootstrap_id,
+            candidate.fingerprint(),
+            candidate.legacy_snapshot_hash,
+        )
+        assert connection.execute(
+            "SELECT cash_text,realized_pnl_text,daily_pnl_text,"
+            "daily_pnl_baseline_text,daily_pnl_date "
+            "FROM fifo_epoch_account_baselines WHERE epoch_id=?",
+            (epoch_id,),
+        ).fetchone() == (
+            "96739.16",
+            "0",
+            "0",
+            "1039.18",
+            candidate.effective_at.date().isoformat(),
+        )
+        assert connection.execute(
+            "SELECT con_id,symbol,direction,opened_quantity_text,cost_basis_text,"
+            "mark_price_text FROM fifo_opening_balances ORDER BY symbol"
+        ).fetchall() == [
+            (123, "NVDA", "LONG", "9", "210.96", "326.7"),
+            (456, "TSLA", "LONG", "2", "370.81", "369.57"),
+        ]
+        assert connection.execute("SELECT COUNT(*) FROM fifo_fills").fetchone() == (0,)
+        assert connection.execute("SELECT COUNT(*) FROM fifo_commissions").fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM fifo_lot_openings "
+            "WHERE opening_fill_id IS NOT NULL OR opening_commission_minor <> 0"
+        ).fetchone() == (0,)
+
+
+def test_fifo_candidate_preview_is_read_only_and_non_authorizing(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    candidate, evidence, runtime_contract = _candidate_bundle(path, tmp_path)
+    before = path.read_bytes()
+
+    report = preview(candidate, path, evidence, runtime_contract)
+
+    assert path.read_bytes() == before
+    assert report["authorizes_startup"] is False
+    assert report["candidate_fingerprint"] == candidate.fingerprint()
+    assert report["fifo"] == candidate.fifo_bootstrap_plan().public_dict()
+    assert report["fifo"]["synthetic_fill_count"] == 0
+    assert report["fifo"]["pre_epoch_history_reconstructed"] is False
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'fifo_%'"
+        ).fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_fifo_bootstrap_supports_truthful_post_epoch_fifo_without_synthetic_fill(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    candidate, evidence, runtime_contract = _candidate_bundle(path, tmp_path)
+    backup_receipt = _backup_receipt(path, tmp_path / "backup.db", candidate)
+    database = AsyncTradingDatabase(path, pool_size=1)
+    try:
+        await database.apply_exact_state_bootstrap_offline_atomic(
+            candidate,
+            evidence=evidence,
+            backup_receipt=backup_receipt,
+            operator_reason="Seal explicit aggregate openings before prospective FIFO fills.",
+            runtime_contract=runtime_contract,
+        )
+    finally:
+        await database.close()
+
+    plan = candidate.fifo_bootstrap_plan()
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        ledger = FifoLedger(connection, allow_other_objects=True)
+        ledger.verify_epoch_integrity(plan.epoch_id)
+        event = FillEvent(
+            epoch_id=plan.epoch_id,
+            fill_id="ffill-" + "1" * 32,
+            commission_id="fcomm-" + "2" * 32,
+            event_sequence=1,
+            execution_id="post-epoch-execution-1",
+            idempotency_key="post-epoch-idempotency-1",
+            con_id=123,
+            symbol="NVDA",
+            side=FillSide.SELL,
+            quantity=Decimal("2"),
+            price=Decimal("326.7"),
+            commission_minor=5,
+            occurred_at=candidate.effective_at + timedelta(seconds=1),
+            recorded_at=candidate.effective_at + timedelta(seconds=1),
+        )
+        result = ledger.record_fill(event)
+        assert result.snapshot.signed_quantity == Decimal("7")
+        assert result.snapshot.open_cost == Decimal("1476.72")
+        assert result.snapshot.cumulative_realized_pnl == Decimal("231.43")
+        ledger.verify_epoch_integrity(plan.epoch_id)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM fifo_fills WHERE epoch_id=?",
+            (plan.epoch_id,),
+        ).fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+async def test_authenticated_mark_con_id_mismatch_blocks_before_fifo_mutation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    candidate, evidence, runtime_contract = _candidate_bundle(path, tmp_path)
+    positions = (replace(candidate.positions[0], con_id=999), candidate.positions[1])
+    mismatched = replace(candidate, positions=positions)
+    backup_receipt = _backup_receipt(path, tmp_path / "backup.db", mismatched)
+    database = AsyncTradingDatabase(path, pool_size=1)
+    await database.initialize()
+    try:
+        with pytest.raises(ExactStateBootstrapError, match="candidate mark"):
+            await database.apply_exact_state_bootstrap(
+                mismatched,
+                evidence=evidence,
+                backup_receipt=backup_receipt,
+                operator_reason="Reject a candidate with unbound contract identity.",
+                runtime_contract=runtime_contract,
+            )
+    finally:
+        await database.close()
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='fifo_accounting_epochs'"
+        ).fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_fifo_bootstrap_records_short_as_opening_balance_not_sell_fill(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE positions SET quantity=-2 WHERE portfolio_id='default' AND symbol='TSLA'"
+        )
+        connection.commit()
+    candidate, evidence, runtime_contract = _candidate_bundle(path, tmp_path)
+    short_position = replace(candidate.positions[1], quantity=-2)
+    candidate = replace(
+        candidate,
+        account=replace(candidate.account, daily_pnl_baseline=Decimal("1044.14")),
+        positions=(candidate.positions[0], short_position),
+    )
+    backup_receipt = _backup_receipt(path, tmp_path / "backup.db", candidate)
+    database = AsyncTradingDatabase(path, pool_size=1)
+    try:
+        await database.apply_exact_state_bootstrap_offline_atomic(
+            candidate,
+            evidence=evidence,
+            backup_receipt=backup_receipt,
+            operator_reason="Seal the reviewed signed short as an aggregate opening balance.",
+            runtime_contract=runtime_contract,
+        )
+    finally:
+        await database.close()
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT direction,opened_quantity_text,cost_basis_text "
+            "FROM fifo_opening_balances WHERE symbol='TSLA'"
+        ).fetchone() == ("SHORT", "2", "370.81")
+        assert connection.execute(
+            "SELECT COUNT(*) FROM fifo_fills WHERE symbol='TSLA'"
+        ).fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_existing_fifo_epoch_for_scope_blocks_whole_exact_bootstrap(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    async with aiosqlite.connect(path) as connection:
+        await connection.execute("PRAGMA foreign_keys=ON")
+        await connection.execute("BEGIN IMMEDIATE")
+        await prepare_fifo_accounting_schema_in_transaction(
+            connection,
+            applied_at="2026-07-28T14:00:00.000000Z",
+        )
+        await connection.execute(
+            """
+            INSERT INTO fifo_accounting_epochs(
+                epoch_id,schema_version,execution_domain_scope,account_scope,
+                portfolio_id,origin_kind,source_fingerprint,effective_at,created_at
+            ) VALUES (?,1,'paper-simulator-v1',?,'default','EMPTY_LEDGER',?,?,?)
+            """,
+            (
+                "fepoch-" + "1" * 32,
+                ACCOUNT_SCOPE,
+                "2" * 64,
+                "2026-07-28T14:00:00.000000Z",
+                "2026-07-28T14:00:00.000000Z",
+            ),
+        )
+        await connection.commit()
+    candidate, evidence, runtime_contract = _candidate_bundle(path, tmp_path)
+    backup_receipt = _backup_receipt(path, tmp_path / "backup.db", candidate)
+    database = AsyncTradingDatabase(path, pool_size=1)
+    try:
+        with pytest.raises(ExactStateBootstrapError, match="already has a sealed epoch"):
+            await database.apply_exact_state_bootstrap_offline_atomic(
+                candidate,
+                evidence=evidence,
+                backup_receipt=backup_receipt,
+                operator_reason="Reject a second FIFO epoch for the same portfolio scope.",
+                runtime_contract=runtime_contract,
+            )
+    finally:
+        await database.close()
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM fifo_accounting_epochs").fetchone() == (1,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='paper_state_bootstraps'"
+        ).fetchone() == (0,)
 
 
 @pytest.mark.asyncio
@@ -828,6 +1067,44 @@ async def test_offline_schema_failure_rolls_back_to_byte_identical_raw_legacy_da
 
 
 @pytest.mark.asyncio
+async def test_offline_fifo_append_failure_rolls_back_schema_and_every_bootstrap_row(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    candidate, evidence, runtime_contract = _candidate_bundle(path, tmp_path)
+    backup_receipt = _backup_receipt(path, tmp_path / "backup.db", candidate)
+    before = path.read_bytes()
+    database = AsyncTradingDatabase(path, pool_size=1)
+
+    def fail_after_fifo(step: str) -> None:
+        if step == "AFTER_FIFO_LEGACY_BOOTSTRAP":
+            raise ExactStateBootstrapError("injected post-FIFO failure")
+
+    database._paper_settlement_fault_hook = fail_after_fifo
+    try:
+        with pytest.raises(ExactStateBootstrapError, match="post-FIFO failure"):
+            await database.apply_exact_state_bootstrap_offline_atomic(
+                candidate,
+                evidence=evidence,
+                backup_receipt=backup_receipt,
+                operator_reason="Reject after transactional FIFO opening append.",
+                runtime_contract=runtime_contract,
+            )
+    finally:
+        await database.close()
+
+    assert path.read_bytes() == before
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'fifo_%'"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='paper_state_bootstraps'"
+        ).fetchone() == (0,)
+
+
+@pytest.mark.asyncio
 async def test_bootstrap_is_insert_only_exact_and_receipt_replay_is_rejected(
     tmp_path: Path,
 ) -> None:
@@ -936,6 +1213,20 @@ def test_candidate_rejects_broker_exposure_and_stale_marks(tmp_path: Path) -> No
     ).isoformat()
     with pytest.raises(ExactStateBootstrapError, match="future or stale"):
         ExactStateBootstrapCandidate.from_mapping(values)
+
+    values = base.canonical_dict()
+    del values["positions"][0]["con_id"]
+    with pytest.raises(ExactStateBootstrapError, match="incomplete or unknown"):
+        ExactStateBootstrapCandidate.from_mapping(values)
+
+    with pytest.raises(ExactStateBootstrapError, match="unique authenticated con_id"):
+        replace(
+            base,
+            positions=(
+                base.positions[0],
+                replace(base.positions[1], con_id=base.positions[0].con_id),
+            ),
+        )
 
     values = base.canonical_dict()
     values["account"]["cash_text"] = 96739.16

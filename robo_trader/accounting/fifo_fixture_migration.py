@@ -14,7 +14,12 @@ from pathlib import Path
 from typing import Optional
 
 FIFO_ACCOUNTING_COMPONENT = "fifo_accounting"
-FIFO_ACCOUNTING_SCHEMA_VERSION = 1
+FIFO_ACCOUNTING_SCHEMA_VERSION = 2
+FIFO_ACCOUNTING_MIGRATIONS = (
+    (1, "dormant exact append-only FIFO accounting foundation"),
+    (2, "sealed legacy aggregate opening balances"),
+)
+FIFO_ACCOUNTING_SCHEMA_VERSIONS = tuple(version for version, _ in FIFO_ACCOUNTING_MIGRATIONS)
 FIXTURE_DATABASE_SUFFIX = ".fifo-fixture.sqlite3"
 
 
@@ -76,6 +81,106 @@ _TABLE_SQL = {
             effective_at TEXT NOT NULL CHECK (effective_at LIKE '%Z'),
             created_at TEXT NOT NULL CHECK (created_at LIKE '%Z'),
             UNIQUE(execution_domain_scope, account_scope, portfolio_id)
+        )
+    """,
+    "fifo_legacy_bootstrap_lineage": """
+        CREATE TABLE fifo_legacy_bootstrap_lineage (
+            epoch_id TEXT PRIMARY KEY,
+            bootstrap_id TEXT NOT NULL UNIQUE CHECK (
+                length(bootstrap_id) = 38 AND substr(bootstrap_id, 1, 6) = 'pboot-'
+                AND substr(bootstrap_id, 7) NOT GLOB '*[^0-9a-f]*'
+            ),
+            candidate_fingerprint TEXT NOT NULL UNIQUE CHECK (
+                length(candidate_fingerprint) = 64
+                AND candidate_fingerprint = lower(candidate_fingerprint)
+                AND candidate_fingerprint NOT GLOB '*[^0-9a-f]*'
+            ),
+            reconciliation_snapshot_id TEXT NOT NULL CHECK (
+                length(trim(reconciliation_snapshot_id)) > 0
+            ),
+            reconciliation_report_hash TEXT NOT NULL CHECK (
+                length(reconciliation_report_hash) = 64
+                AND reconciliation_report_hash = lower(reconciliation_report_hash)
+                AND reconciliation_report_hash NOT GLOB '*[^0-9a-f]*'
+            ),
+            broker_snapshot_hash TEXT NOT NULL CHECK (
+                length(broker_snapshot_hash) = 64
+                AND broker_snapshot_hash = lower(broker_snapshot_hash)
+                AND broker_snapshot_hash NOT GLOB '*[^0-9a-f]*'
+            ),
+            legacy_snapshot_hash TEXT NOT NULL CHECK (
+                length(legacy_snapshot_hash) = 64
+                AND legacy_snapshot_hash = lower(legacy_snapshot_hash)
+                AND legacy_snapshot_hash NOT GLOB '*[^0-9a-f]*'
+            ),
+            operator_action_id TEXT NOT NULL UNIQUE CHECK (
+                length(trim(operator_action_id)) > 0
+            ),
+            recorded_at TEXT NOT NULL CHECK (recorded_at LIKE '%Z'),
+            FOREIGN KEY(epoch_id) REFERENCES fifo_accounting_epochs(epoch_id)
+        )
+    """,
+    "fifo_epoch_account_baselines": f"""
+        CREATE TABLE fifo_epoch_account_baselines (
+            epoch_id TEXT PRIMARY KEY,
+            cash_text TEXT NOT NULL CHECK (
+                length(cash_text) BETWEEN 1 AND 96
+                AND ({_signed_decimal_check('cash_text')})
+            ),
+            realized_pnl_text TEXT NOT NULL CHECK (
+                length(realized_pnl_text) BETWEEN 1 AND 96
+                AND ({_signed_decimal_check('realized_pnl_text')})
+            ),
+            daily_pnl_text TEXT NOT NULL CHECK (
+                length(daily_pnl_text) BETWEEN 1 AND 96
+                AND ({_signed_decimal_check('daily_pnl_text')})
+            ),
+            daily_pnl_baseline_text TEXT NOT NULL CHECK (
+                length(daily_pnl_baseline_text) BETWEEN 1 AND 96
+                AND ({_signed_decimal_check('daily_pnl_baseline_text')})
+            ),
+            daily_pnl_date TEXT NOT NULL CHECK (
+                length(daily_pnl_date) = 10
+                AND daily_pnl_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+            ),
+            recorded_at TEXT NOT NULL CHECK (recorded_at LIKE '%Z'),
+            FOREIGN KEY(epoch_id) REFERENCES fifo_accounting_epochs(epoch_id)
+        )
+    """,
+    "fifo_opening_balances": f"""
+        CREATE TABLE fifo_opening_balances (
+            opening_balance_id TEXT PRIMARY KEY CHECK (
+                length(opening_balance_id) = 38
+                AND substr(opening_balance_id, 1, 6) = 'fobal-'
+                AND substr(opening_balance_id, 7) NOT GLOB '*[^0-9a-f]*'
+            ),
+            epoch_id TEXT NOT NULL,
+            con_id INTEGER NOT NULL CHECK (typeof(con_id) = 'integer' AND con_id > 0),
+            symbol TEXT NOT NULL CHECK (length(symbol) BETWEEN 1 AND 32),
+            direction TEXT NOT NULL CHECK (direction IN ('LONG', 'SHORT')),
+            opened_quantity_text TEXT NOT NULL CHECK (
+                length(opened_quantity_text) BETWEEN 1 AND 64
+                AND ({_positive_decimal_check('opened_quantity_text')})
+            ),
+            cost_basis_text TEXT NOT NULL CHECK (
+                length(cost_basis_text) BETWEEN 1 AND 64
+                AND ({_positive_decimal_check('cost_basis_text')})
+            ),
+            mark_price_text TEXT NOT NULL CHECK (
+                length(mark_price_text) BETWEEN 1 AND 64
+                AND ({_positive_decimal_check('mark_price_text')})
+            ),
+            mark_observed_at TEXT NOT NULL CHECK (mark_observed_at LIKE '%Z'),
+            mark_evidence_fingerprint TEXT NOT NULL CHECK (
+                length(mark_evidence_fingerprint) = 64
+                AND mark_evidence_fingerprint = lower(mark_evidence_fingerprint)
+                AND mark_evidence_fingerprint NOT GLOB '*[^0-9a-f]*'
+            ),
+            recorded_at TEXT NOT NULL CHECK (recorded_at LIKE '%Z'),
+            UNIQUE(epoch_id, opening_balance_id),
+            UNIQUE(epoch_id, con_id),
+            UNIQUE(epoch_id, symbol),
+            FOREIGN KEY(epoch_id) REFERENCES fifo_accounting_epochs(epoch_id)
         )
     """,
     "fifo_fills": f"""
@@ -142,7 +247,8 @@ _TABLE_SQL = {
                 AND substr(lot_id, 6) NOT GLOB '*[^0-9a-f]*'
             ),
             epoch_id TEXT NOT NULL,
-            opening_fill_id TEXT NOT NULL,
+            opening_fill_id TEXT,
+            opening_balance_id TEXT,
             lot_ordinal INTEGER NOT NULL CHECK (
                 typeof(lot_ordinal) = 'integer' AND lot_ordinal >= 0
             ),
@@ -162,13 +268,24 @@ _TABLE_SQL = {
                 AND opening_commission_minor BETWEEN -1000000000000 AND 1000000000000
             ),
             opened_sequence INTEGER NOT NULL CHECK (
-                typeof(opened_sequence) = 'integer' AND opened_sequence > 0
+                typeof(opened_sequence) = 'integer' AND opened_sequence >= 0
             ),
             opened_at TEXT NOT NULL CHECK (opened_at LIKE '%Z'),
             UNIQUE(epoch_id, lot_id),
             UNIQUE(epoch_id, opening_fill_id, lot_ordinal),
+            UNIQUE(epoch_id, opening_balance_id),
             FOREIGN KEY(epoch_id, opening_fill_id)
-                REFERENCES fifo_fills(epoch_id, fill_id)
+                REFERENCES fifo_fills(epoch_id, fill_id),
+            FOREIGN KEY(epoch_id, opening_balance_id)
+                REFERENCES fifo_opening_balances(epoch_id, opening_balance_id),
+            CHECK (
+                (opening_fill_id IS NOT NULL AND opening_balance_id IS NULL
+                    AND opened_sequence > 0)
+                OR
+                (opening_fill_id IS NULL AND opening_balance_id IS NOT NULL
+                    AND lot_ordinal = 0 AND opening_commission_minor = 0
+                    AND opened_sequence = 0)
+            )
         )
     """,
     "fifo_lot_matches": f"""
@@ -300,6 +417,13 @@ _INSERT_CONFLICT_PREDICATES = {
             AND portfolio_id = NEW.portfolio_id
         )
     """,
+    "fifo_legacy_bootstrap_lineage": "epoch_id = NEW.epoch_id OR bootstrap_id = NEW.bootstrap_id OR candidate_fingerprint = NEW.candidate_fingerprint OR operator_action_id = NEW.operator_action_id",
+    "fifo_epoch_account_baselines": "epoch_id = NEW.epoch_id",
+    "fifo_opening_balances": """
+        opening_balance_id = NEW.opening_balance_id
+        OR (epoch_id = NEW.epoch_id AND con_id = NEW.con_id)
+        OR (epoch_id = NEW.epoch_id AND symbol = NEW.symbol)
+    """,
     "fifo_fills": """
         fill_id = NEW.fill_id
         OR (epoch_id = NEW.epoch_id AND event_sequence = NEW.event_sequence)
@@ -314,6 +438,7 @@ _INSERT_CONFLICT_PREDICATES = {
             AND opening_fill_id = NEW.opening_fill_id
             AND lot_ordinal = NEW.lot_ordinal
         )
+        OR (epoch_id = NEW.epoch_id AND opening_balance_id = NEW.opening_balance_id)
     """,
     "fifo_lot_matches": """
         match_id = NEW.match_id
@@ -410,8 +535,17 @@ def _pragma_foreign_keys_enabled(connection: sqlite3.Connection) -> bool:
     return row is not None and type(row[0]) is int and row[0] == 1
 
 
-def assert_fifo_accounting_schema(connection: sqlite3.Connection) -> None:
-    """Fail closed unless the complete PR4A fixture schema is exact."""
+def assert_fifo_accounting_schema(
+    connection: sqlite3.Connection,
+    *,
+    allow_other_objects: bool = False,
+) -> None:
+    """Fail closed unless every FIFO object is exact.
+
+    Fixture callers retain the original closed-world check.  PR4B's reviewed
+    bootstrap may validate the same objects inside a legacy ledger containing
+    unrelated pre-existing tables.
+    """
 
     _assert_no_temp_fifo_objects(connection)
     if not _pragma_foreign_keys_enabled(connection):
@@ -428,7 +562,7 @@ def assert_fifo_accounting_schema(connection: sqlite3.Connection) -> None:
         raise FifoFixtureMigrationError(
             f"FIFO accounting table {sorted(missing_tables)[0]} is missing"
         )
-    if unexpected_tables:
+    if unexpected_tables and not allow_other_objects:
         raise FifoFixtureMigrationError(
             f"FIFO fixture contains unexpected table {sorted(unexpected_tables)[0]}"
         )
@@ -446,7 +580,7 @@ def assert_fifo_accounting_schema(connection: sqlite3.Connection) -> None:
         raise FifoFixtureMigrationError(
             f"FIFO accounting trigger {sorted(missing_triggers)[0]} is missing"
         )
-    if unexpected_triggers:
+    if unexpected_triggers and not allow_other_objects:
         raise FifoFixtureMigrationError(
             f"FIFO fixture contains unexpected trigger {sorted(unexpected_triggers)[0]}"
         )
@@ -458,16 +592,17 @@ def assert_fifo_accounting_schema(connection: sqlite3.Connection) -> None:
         "SELECT type, name FROM main.sqlite_master "
         "WHERE type IN ('view','index') AND name NOT LIKE 'sqlite_%'"
     ).fetchall()
-    if unexpected_schema:
+    if unexpected_schema and not allow_other_objects:
         raise FifoFixtureMigrationError("FIFO fixture contains unexpected schema objects")
 
     version_rows = connection.execute(
-        "SELECT version FROM main.fifo_schema_migrations WHERE component = ? ORDER BY version",
+        "SELECT version,description FROM main.fifo_schema_migrations "
+        "WHERE component = ? ORDER BY version",
         (FIFO_ACCOUNTING_COMPONENT,),
     ).fetchall()
-    versions = [row[0] for row in version_rows]
-    if versions != [FIFO_ACCOUNTING_SCHEMA_VERSION] or any(
-        type(version) is not int for version in versions
+    migrations = [(row[0], row[1]) for row in version_rows]
+    if migrations != list(FIFO_ACCOUNTING_MIGRATIONS) or any(
+        type(version) is not int for version, _ in migrations
     ):
         raise FifoFixtureMigrationError("FIFO accounting migration evidence is incomplete")
     if connection.execute("PRAGMA main.foreign_key_check").fetchone() is not None:
@@ -510,15 +645,14 @@ def migrate_fifo_fixture_database(
             )
         for statement in _TABLE_SQL.values():
             connection.execute(statement)
-        connection.execute(
+        connection.executemany(
             """
             INSERT INTO main.fifo_schema_migrations(component, version, description, applied_at)
             VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
             """,
-            (
-                FIFO_ACCOUNTING_COMPONENT,
-                FIFO_ACCOUNTING_SCHEMA_VERSION,
-                "dormant exact append-only FIFO accounting foundation",
+            tuple(
+                (FIFO_ACCOUNTING_COMPONENT, version, description)
+                for version, description in FIFO_ACCOUNTING_MIGRATIONS
             ),
         )
         for statement in _TRIGGER_SQL.values():

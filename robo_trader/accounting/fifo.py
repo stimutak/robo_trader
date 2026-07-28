@@ -1,4 +1,4 @@
-"""Deterministic, exact FIFO projection for the dormant PR4A ledger.
+"""Deterministic, exact FIFO projection for the dormant PR4 ledger.
 
 The projector records one complete fill, its commission, derived lot openings
 and matches, and a chained position snapshot in one SQLite transaction.  It
@@ -387,12 +387,20 @@ class _ProjectionLot:
 
 
 class FifoLedger:
-    """Append exact fill events to a previously migrated fixture ledger."""
+    """Append exact fill events to a previously verified FIFO ledger."""
 
-    def __init__(self, connection: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        allow_other_objects: bool = False,
+    ) -> None:
         if type(connection) is not sqlite3.Connection:
             raise TypeError("connection must be sqlite3.Connection")
-        assert_fifo_accounting_schema(connection)
+        assert_fifo_accounting_schema(
+            connection,
+            allow_other_objects=allow_other_objects,
+        )
         self._connection = connection
 
     def create_epoch(self, epoch: AccountingEpoch) -> AccountingEpoch:
@@ -843,6 +851,30 @@ class FifoLedger:
 
     def _verify_fifo_projection_structure(self, events: Sequence[FillEvent]) -> None:
         active_by_asset: dict[tuple[int, str], list[_ProjectionLot]] = {}
+        if events:
+            epoch_id = events[0].epoch_id
+            opening_rows = self._connection.execute(
+                """
+                SELECT lot_id, con_id, symbol, direction, opened_quantity_text,
+                       open_price_text
+                FROM fifo_lot_openings
+                WHERE epoch_id = ? AND opening_balance_id IS NOT NULL
+                ORDER BY con_id, symbol, lot_id
+                """,
+                (epoch_id,),
+            ).fetchall()
+            for row in opening_rows:
+                asset = (_stored_int(row[1], "opening con_id"), str(row[2]))
+                active_by_asset.setdefault(asset, []).append(
+                    _ProjectionLot(
+                        lot_id=str(row[0]),
+                        direction=str(row[3]),
+                        remaining_quantity=_parse_decimal(
+                            row[4], "opening quantity", positive=True
+                        ),
+                        open_price=_parse_decimal(row[5], "opening price", positive=True),
+                    )
+                )
         for event in events:
             asset = (event.con_id, event.symbol)
             active = active_by_asset.setdefault(asset, [])
@@ -933,11 +965,74 @@ class FifoLedger:
         ).fetchone()
         if row is None:
             raise FifoAccountingValidationError("unknown accounting epoch")
-        if row[0] != "EMPTY_LEDGER":
-            raise FifoAccountingValidationError(
-                "PR4A cannot project an adopted legacy accounting epoch"
-            )
+        if row[0] == "LEGACY_AGGREGATE_OPENING_BALANCE":
+            self._verify_legacy_epoch_shape(epoch_id)
+        elif row[0] != "EMPTY_LEDGER":
+            raise FifoAccountingValidationError("accounting epoch origin is unsupported")
         return _parse_utc(row[1], "epoch effective_at")
+
+    def _verify_legacy_epoch_shape(self, epoch_id: str) -> None:
+        lineage_rows = self._connection.execute(
+            """
+            SELECT e.source_fingerprint,l.candidate_fingerprint,e.effective_at
+            FROM fifo_accounting_epochs e
+            JOIN fifo_legacy_bootstrap_lineage l ON l.epoch_id=e.epoch_id
+            WHERE e.epoch_id=?
+            """,
+            (epoch_id,),
+        ).fetchall()
+        baseline_count = self._connection.execute(
+            "SELECT COUNT(*) FROM fifo_epoch_account_baselines WHERE epoch_id = ?",
+            (epoch_id,),
+        ).fetchone()
+        if (
+            len(lineage_rows) != 1
+            or lineage_rows[0][0] != lineage_rows[0][1]
+            or baseline_count != (1,)
+        ):
+            raise FifoAccountingValidationError(
+                "legacy epoch lacks one sealed lineage and account baseline"
+            )
+        effective_at = _parse_utc(lineage_rows[0][2], "legacy epoch effective_at")
+        balances = self._connection.execute(
+            """
+            SELECT b.opening_balance_id,b.con_id,b.symbol,b.direction,
+                   b.opened_quantity_text,b.cost_basis_text,l.opening_balance_id,
+                   l.con_id,l.symbol,l.direction,l.opened_quantity_text,l.open_price_text,
+                   l.opening_commission_minor,l.opened_sequence,l.opened_at,
+                   b.mark_observed_at
+            FROM fifo_opening_balances b
+            LEFT JOIN fifo_lot_openings l
+              ON l.epoch_id=b.epoch_id AND l.opening_balance_id=b.opening_balance_id
+            WHERE b.epoch_id=? ORDER BY b.symbol
+            """,
+            (epoch_id,),
+        ).fetchall()
+        lot_count = self._connection.execute(
+            """
+            SELECT COUNT(*) FROM fifo_lot_openings
+            WHERE epoch_id=? AND opening_balance_id IS NOT NULL
+            """,
+            (epoch_id,),
+        ).fetchone()
+        if lot_count != (len(balances),):
+            raise FifoAccountingValidationError(
+                "legacy opening balances do not map one-to-one to opening lots"
+            )
+        for row in balances:
+            if row[6] is None or tuple(row[1:6]) != tuple(row[7:12]):
+                raise FifoAccountingValidationError(
+                    "legacy opening balance differs from its exact opening lot"
+                )
+            if (
+                _stored_int(row[12], "legacy opening commission") != 0
+                or _stored_int(row[13], "legacy opened_sequence") != 0
+                or _parse_utc(row[14], "legacy opened_at") != effective_at
+                or _parse_utc(row[15], "legacy mark_observed_at") > effective_at
+            ):
+                raise FifoAccountingValidationError(
+                    "legacy opening lot must not reconstruct pre-epoch commissions"
+                )
 
     def _existing_fill(self, event: FillEvent) -> Optional[FillResult]:
         rows = self._connection.execute(
@@ -1017,10 +1112,20 @@ class FifoLedger:
     def _assert_instrument_identity(self, event: FillEvent) -> None:
         rows = self._connection.execute(
             """
-            SELECT DISTINCT con_id, symbol FROM fifo_fills
+            SELECT con_id,symbol FROM fifo_fills
+            WHERE epoch_id = ? AND (con_id = ? OR symbol = ?)
+            UNION
+            SELECT con_id,symbol FROM fifo_opening_balances
             WHERE epoch_id = ? AND (con_id = ? OR symbol = ?)
             """,
-            (event.epoch_id, event.con_id, event.symbol),
+            (
+                event.epoch_id,
+                event.con_id,
+                event.symbol,
+                event.epoch_id,
+                event.con_id,
+                event.symbol,
+            ),
         ).fetchall()
         if any(
             (_stored_int(row[0], "fill con_id"), str(row[1])) != (event.con_id, event.symbol)
@@ -1201,10 +1306,11 @@ class FifoLedger:
             self._connection.execute(
                 """
                 INSERT INTO fifo_lot_openings(
-                    lot_id, epoch_id, opening_fill_id, lot_ordinal, con_id, symbol,
+                    lot_id, epoch_id, opening_fill_id, opening_balance_id,
+                    lot_ordinal, con_id, symbol,
                     direction, opened_quantity_text, open_price_text,
                     opening_commission_minor, opened_sequence, opened_at
-                ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, NULL, 0, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     opened_lot_id,
