@@ -195,7 +195,7 @@ def test_interrupted_fixture_migration_rolls_back_all_schema_objects(tmp_path):
     connection.set_authorizer(reject_triggers)
     with pytest.raises(sqlite3.DatabaseError):
         migrate_fifo_fixture_database(connection, expected_path=path)
-    connection.set_authorizer(None)
+    connection.set_authorizer(lambda *_args: sqlite3.SQLITE_OK)
     assert connection.in_transaction is False
     assert connection.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'fifo_%'"
