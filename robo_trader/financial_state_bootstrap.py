@@ -27,7 +27,7 @@ from .bootstrap_evidence_auth import (
     AUTH_SUFFIX,
     AuthenticatedEvidenceReceipt,
     BootstrapEvidenceAuthenticationError,
-    public_key_paths_from_consumer_environment,
+    bootstrap_evidence_trust_public_dict,
     verify_receipt,
 )
 from .runtime_contract_constants import PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
@@ -383,7 +383,6 @@ def _verify_artifact_authentication(
     artifact_hash: str,
     runtime_fingerprint: str,
     account_scope: str,
-    public_key_path: Path,
 ) -> AuthenticatedEvidenceReceipt:
     """Verify a detached producer receipt; plain JSON never grants authority."""
 
@@ -396,7 +395,6 @@ def _verify_artifact_authentication(
             artifact_sha256=artifact_hash,
             runtime_fingerprint=runtime_fingerprint,
             account_scope=account_scope,
-            public_key_path=public_key_path,
         )
     except BootstrapEvidenceAuthenticationError as exc:
         raise ExactStateBootstrapError(str(exc)) from exc
@@ -494,7 +492,7 @@ def load_exact_state_bootstrap_evidence(
     """Load and cross-check the actual offline artifacts used by a bootstrap."""
 
     try:
-        public_key_paths = public_key_paths_from_consumer_environment()
+        bootstrap_evidence_trust_public_dict()
     except BootstrapEvidenceAuthenticationError as exc:
         raise ExactStateBootstrapError(str(exc)) from exc
     database_path, database_identity, runtime_fingerprint, account_scope = _runtime_contract_values(
@@ -577,7 +575,6 @@ def load_exact_state_bootstrap_evidence(
         artifact_hash=broker_hash,
         runtime_fingerprint=runtime_fingerprint,
         account_scope=account_scope,
-        public_key_path=public_key_paths["broker_snapshot"],
     )
 
     reconciliation, reconciliation_hash = _verified_json(
@@ -675,7 +672,6 @@ def load_exact_state_bootstrap_evidence(
         artifact_hash=reconciliation_hash,
         runtime_fingerprint=runtime_fingerprint,
         account_scope=account_scope,
-        public_key_path=public_key_paths["reconciliation_report"],
     )
 
     if not isinstance(protective_mark_paths, Sequence) or isinstance(
@@ -742,7 +738,6 @@ def load_exact_state_bootstrap_evidence(
                 artifact_hash=mark_hash,
                 runtime_fingerprint=runtime_fingerprint,
                 account_scope=account_scope,
-                public_key_path=public_key_paths["protective_mark"],
             )
         )
     mark_keys = [(mark.portfolio_id, mark.symbol) for mark in marks]

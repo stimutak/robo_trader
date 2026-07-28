@@ -1,18 +1,17 @@
-"""Producer-only Ed25519 receipts for exact-state bootstrap evidence.
+"""Verification-only trust boundary for exact-state evidence receipts.
 
-The bootstrap consumer receives only three pinned public keys.  Private key
-paths are accepted solely by the producer entry points in this module and the
-standalone producer CLI; the bootstrap loader refuses to run if any signing
-key capability is advertised in its environment.
+The bootstrap consumer has three immutable, pairwise-distinct verification
+roots.  It deliberately contains no signing API and rejects both verification-
+root overrides and signing-key capability in its environment.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import os
-import secrets
 import stat
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -21,10 +20,7 @@ from typing import Mapping
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-    Ed25519PrivateKey,
-    Ed25519PublicKey,
-)
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 AUTH_SUFFIX = ".auth.json"
 AUTH_SCHEMA_VERSION = 2
@@ -36,11 +32,14 @@ _KINDS = {
     "reconciliation_report": "robotrader-reconciliation-producer-v1",
     "protective_mark": "robotrader-protective-mark-producer-v1",
 }
-PUBLIC_KEY_ENV = {
-    "broker_snapshot": "BOOTSTRAP_BROKER_EVIDENCE_PUBLIC_KEY_PATH",
-    "reconciliation_report": "BOOTSTRAP_RECONCILIATION_EVIDENCE_PUBLIC_KEY_PATH",
-    "protective_mark": "BOOTSTRAP_MARK_EVIDENCE_PUBLIC_KEY_PATH",
-}
+_REJECTED_PUBLIC_KEY_ENV = frozenset(
+    {
+        "BOOTSTRAP_BROKER_EVIDENCE_PUBLIC_KEY_PATH",
+        "BOOTSTRAP_RECONCILIATION_EVIDENCE_PUBLIC_KEY_PATH",
+        "BOOTSTRAP_MARK_EVIDENCE_PUBLIC_KEY_PATH",
+        "BOOTSTRAP_EVIDENCE_PUBLIC_KEY_PATH",
+    }
+)
 FORBIDDEN_SIGNING_ENV = frozenset(
     {
         "BOOTSTRAP_BROKER_EVIDENCE_PRIVATE_KEY_PATH",
@@ -50,6 +49,22 @@ FORBIDDEN_SIGNING_ENV = frozenset(
         "BOOTSTRAP_EVIDENCE_SIGNING_KEY",
     }
 )
+_TRUST_ROOT = Path(__file__).with_name("bootstrap_evidence_trust")
+_PINNED_PUBLIC_KEYS: dict[str, tuple[Path, str]] = {
+    "broker_snapshot": (
+        _TRUST_ROOT / "broker_snapshot_ed25519_public.pem",
+        "f07b78427afc1c9ac34008de0d22da47636c3f2c04cb34783cbb34caa0c394e2",
+    ),
+    "reconciliation_report": (
+        _TRUST_ROOT / "reconciliation_report_ed25519_public.pem",
+        "48c087ce23c8bdc95cca3c11c1372631420b2a11f6ef062c126736dd05b59c13",
+    ),
+    "protective_mark": (
+        _TRUST_ROOT / "protective_mark_ed25519_public.pem",
+        "fa8963176466eb433593799177bea797cf63d8d2a34858afb48732374b2c5743",
+    ),
+}
+_PINNED_TRUST_SET_DIGEST = "d9269d1cd24431ae691b6736c59842d4cc69733588ad995dd943a5f5ead3311a"
 _MAX_FILE_BYTES = 2 * 1024 * 1024
 
 
@@ -70,7 +85,12 @@ class AuthenticatedEvidenceReceipt:
     public_key_fingerprint: str
 
 
-def _safe_file_bytes(path: Path, label: str, *, exact_mode: int | None = None) -> bytes:
+def _safe_file_bytes(
+    path: Path,
+    label: str,
+    *,
+    allow_public_read: bool = False,
+) -> bytes:
     protected = Path(path)
     if (
         not protected.is_absolute()
@@ -87,8 +107,7 @@ def _safe_file_bytes(path: Path, label: str, *, exact_mode: int | None = None) -
             not stat.S_ISREG(before.st_mode)
             or before.st_nlink != 1
             or before.st_uid != os.geteuid()
-            or stat.S_IMODE(before.st_mode) & 0o077
-            or (exact_mode is not None and stat.S_IMODE(before.st_mode) != exact_mode)
+            or (stat.S_IMODE(before.st_mode) & (0o022 if allow_public_read else 0o077))
             or before.st_size > _MAX_FILE_BYTES
         ):
             raise BootstrapEvidenceAuthenticationError(f"{label} is not a sealed owner file")
@@ -164,19 +183,8 @@ def _public_fingerprint(public_key: Ed25519PublicKey) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def _load_private_key(path: Path) -> Ed25519PrivateKey:
-    payload = _safe_file_bytes(path, "producer private key", exact_mode=0o400)
-    try:
-        key = serialization.load_pem_private_key(payload, password=None)
-    except (TypeError, ValueError) as exc:
-        raise BootstrapEvidenceAuthenticationError("producer private key is invalid") from exc
-    if not isinstance(key, Ed25519PrivateKey):
-        raise BootstrapEvidenceAuthenticationError("producer private key must be Ed25519")
-    return key
-
-
 def _load_public_key(path: Path) -> Ed25519PublicKey:
-    payload = _safe_file_bytes(path, "producer public key", exact_mode=0o400)
+    payload = _safe_file_bytes(path, "pinned producer public key", allow_public_read=True)
     try:
         key = serialization.load_pem_public_key(payload)
     except (TypeError, ValueError) as exc:
@@ -186,109 +194,57 @@ def _load_public_key(path: Path) -> Ed25519PublicKey:
     return key
 
 
-def public_key_paths_from_consumer_environment() -> dict[str, Path]:
-    """Return pinned verification keys while refusing signing capability."""
+def _pinned_public_keys() -> dict[str, Ed25519PublicKey]:
+    """Load the tracked trust set and reject every environment override surface."""
 
-    present = sorted(name for name in FORBIDDEN_SIGNING_ENV if os.environ.get(name))
+    rejected = _REJECTED_PUBLIC_KEY_ENV | FORBIDDEN_SIGNING_ENV
+    present = sorted(name for name in rejected if name in os.environ)
     if present:
         raise BootstrapEvidenceAuthenticationError(
-            "bootstrap consumer refuses producer signing-key presence: " + ",".join(present)
+            "bootstrap consumer refuses evidence trust/signing overrides: " + ",".join(present)
         )
-    paths: dict[str, Path] = {}
+    keys: dict[str, Ed25519PublicKey] = {}
     fingerprints: dict[str, str] = {}
-    for kind, name in PUBLIC_KEY_ENV.items():
-        raw = os.environ.get(name, "")
-        path = Path(raw)
-        if not raw or not path.is_absolute():
-            raise BootstrapEvidenceAuthenticationError(f"{name} must be an absolute public key")
-        fingerprints[kind] = _public_fingerprint(_load_public_key(path))
-        paths[kind] = path
+    for kind, (path, expected_fingerprint) in _PINNED_PUBLIC_KEYS.items():
+        key = _load_public_key(path)
+        actual_fingerprint = _public_fingerprint(key)
+        if not hmac.compare_digest(actual_fingerprint, expected_fingerprint):
+            raise BootstrapEvidenceAuthenticationError(
+                f"tracked {kind} verification key does not match its immutable fingerprint"
+            )
+        fingerprints[kind] = actual_fingerprint
+        keys[kind] = key
     if len(set(fingerprints.values())) != len(_KINDS):
         raise BootstrapEvidenceAuthenticationError(
             "bootstrap evidence producers must use three distinct public keys"
         )
-    return paths
+    return keys
 
 
-def _write_receipt(path: Path, payload: bytes) -> None:
-    if not path.is_absolute() or path.parent.resolve(strict=True) / path.name != path:
-        raise BootstrapEvidenceAuthenticationError("authentication receipt path is unsafe")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    descriptor: int | None = None
-    try:
-        descriptor = os.open(path, flags, 0o600)
-        if os.write(descriptor, payload) != len(payload):
-            raise BootstrapEvidenceAuthenticationError("authentication receipt write was partial")
-        os.fsync(descriptor)
-        os.fchmod(descriptor, 0o400)
-        metadata = os.fstat(descriptor)
-        current = os.lstat(path)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or (metadata.st_dev, metadata.st_ino) != (current.st_dev, current.st_ino)
-            or current.st_nlink != 1
-            or stat.S_IMODE(current.st_mode) != 0o400
-        ):
-            raise BootstrapEvidenceAuthenticationError("authentication receipt is not single-link")
-    except OSError as exc:
-        raise BootstrapEvidenceAuthenticationError(
-            "authentication receipt must be a new exclusive file"
-        ) from exc
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
+def bootstrap_evidence_trust_public_dict() -> dict[str, object]:
+    """Return reviewable trust facts included in every RuntimeContract fingerprint."""
 
-
-def _emit_receipt(
-    *,
-    artifact_path: Path,
-    private_key_path: Path,
-    artifact_kind: str,
-    runtime_fingerprint: str,
-    account_scope: str,
-    issued_at: datetime | None = None,
-    lifetime: timedelta = MAX_RECEIPT_LIFETIME,
-) -> Path:
-    if artifact_kind not in _KINDS:
-        raise BootstrapEvidenceAuthenticationError("artifact kind has no authorized producer")
-    if lifetime <= timedelta(0) or lifetime > MAX_RECEIPT_LIFETIME:
-        raise BootstrapEvidenceAuthenticationError("receipt lifetime is outside its safety bound")
-    artifact = _safe_file_bytes(Path(artifact_path), f"{artifact_kind} artifact")
-    key = _load_private_key(Path(private_key_path))
-    now = (issued_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    values: dict[str, object] = {
-        "schema_version": AUTH_SCHEMA_VERSION,
-        "receipt_id": _RECEIPT_ID + secrets.token_hex(32),
-        "artifact_kind": artifact_kind,
-        "producer_id": _KINDS[artifact_kind],
-        "artifact_sha256": hashlib.sha256(artifact).hexdigest(),
-        "runtime_fingerprint": runtime_fingerprint,
-        "account_scope": account_scope,
-        "issued_at": _utc_text(now),
-        "expires_at": _utc_text(now + lifetime),
-        "public_key_fingerprint": _public_fingerprint(key.public_key()),
-    }
-    signature = key.sign(_receipt_payload(values))
-    values["signature_ed25519"] = base64.b64encode(signature).decode("ascii")
-    receipt_path = Path(artifact_path).with_name(Path(artifact_path).name + AUTH_SUFFIX)
-    _write_receipt(
-        receipt_path,
-        json.dumps(values, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+    keys = _pinned_public_keys()
+    fingerprints = {kind: _public_fingerprint(keys[kind]) for kind in sorted(_KINDS)}
+    canonical = json.dumps(
+        {
+            "producer_ids": {kind: _KINDS[kind] for kind in sorted(_KINDS)},
+            "public_key_fingerprints": fingerprints,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
     )
-    return receipt_path
-
-
-def emit_broker_snapshot_receipt(**kwargs: object) -> Path:
-    return _emit_receipt(artifact_kind="broker_snapshot", **kwargs)
-
-
-def emit_reconciliation_report_receipt(**kwargs: object) -> Path:
-    return _emit_receipt(artifact_kind="reconciliation_report", **kwargs)
-
-
-def emit_protective_mark_receipt(**kwargs: object) -> Path:
-    return _emit_receipt(artifact_kind="protective_mark", **kwargs)
+    trust_set_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(trust_set_digest, _PINNED_TRUST_SET_DIGEST):
+        raise BootstrapEvidenceAuthenticationError(
+            "bootstrap evidence trust-set manifest does not match its immutable digest"
+        )
+    return {
+        "schema_version": 1,
+        "producer_ids": {kind: _KINDS[kind] for kind in sorted(_KINDS)},
+        "public_key_fingerprints": fingerprints,
+        "trust_set_digest": trust_set_digest,
+    }
 
 
 def verify_receipt(
@@ -298,7 +254,6 @@ def verify_receipt(
     artifact_sha256: str,
     runtime_fingerprint: str,
     account_scope: str,
-    public_key_path: Path,
     now: datetime | None = None,
 ) -> AuthenticatedEvidenceReceipt:
     expected_fields = {
@@ -344,7 +299,7 @@ def verify_receipt(
         or expires_at - issued_at > MAX_RECEIPT_LIFETIME
     ):
         raise BootstrapEvidenceAuthenticationError("authentication receipt is expired or future")
-    public_key = _load_public_key(Path(public_key_path))
+    public_key = _pinned_public_keys()[artifact_kind]
     fingerprint = _public_fingerprint(public_key)
     if raw["public_key_fingerprint"] != fingerprint:
         raise BootstrapEvidenceAuthenticationError("authentication receipt uses the wrong key")

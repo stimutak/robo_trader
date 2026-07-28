@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import sqlite3
 from dataclasses import replace
@@ -16,13 +18,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from robo_trader.bootstrap_evidence_auth import (
-    PUBLIC_KEY_ENV,
-    BootstrapEvidenceAuthenticationError,
-    emit_broker_snapshot_receipt,
-    emit_protective_mark_receipt,
-    emit_reconciliation_report_receipt,
-)
+import robo_trader.bootstrap_evidence_auth as evidence_auth
 from robo_trader.config import RuntimeContract, _derive_safety_account_scope
 from robo_trader.database_async import AsyncTradingDatabase
 from robo_trader.financial_state_bootstrap import (
@@ -45,6 +41,7 @@ _TEST_PRIVATE_KEYS: dict[str, Path] = {}
 @pytest.fixture(autouse=True)
 def _bootstrap_evidence_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     producers = ("broker_snapshot", "reconciliation_report", "protective_mark")
+    pinned: dict[str, tuple[Path, str]] = {}
     for kind in producers:
         private_key = Ed25519PrivateKey.generate()
         private_path = tmp_path / f"{kind}.private.pem"
@@ -63,10 +60,63 @@ def _bootstrap_evidence_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
             )
         )
         private_path.chmod(0o400)
-        public_path.chmod(0o400)
+        public_path.chmod(0o444)
         _TEST_PRIVATE_KEYS[kind] = private_path
-        monkeypatch.setenv(PUBLIC_KEY_ENV[kind], str(public_path))
+        pinned[kind] = (public_path, evidence_auth._public_fingerprint(private_key.public_key()))
+    monkeypatch.setattr(evidence_auth, "_PINNED_PUBLIC_KEYS", pinned)
+    canonical = json.dumps(
+        {
+            "producer_ids": {kind: evidence_auth._KINDS[kind] for kind in sorted(producers)},
+            "public_key_fingerprints": {kind: pinned[kind][1] for kind in sorted(producers)},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    monkeypatch.setattr(
+        evidence_auth,
+        "_PINNED_TRUST_SET_DIGEST",
+        hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    )
     monkeypatch.delenv("SAFETY_ACCOUNT_SCOPE_KEY", raising=False)
+
+
+def _emit_test_receipt(
+    *,
+    artifact_path: Path,
+    artifact_kind: str,
+    runtime_fingerprint: str,
+    account_scope: str,
+    issued_at: datetime | None = None,
+    signing_kind: str | None = None,
+) -> Path:
+    """Test-only signer; production bootstrap exposes verification only."""
+
+    artifact = artifact_path.read_bytes()
+    private_key = serialization.load_pem_private_key(
+        _TEST_PRIVATE_KEYS[signing_kind or artifact_kind].read_bytes(),
+        password=None,
+    )
+    assert isinstance(private_key, Ed25519PrivateKey)
+    now = (issued_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    values: dict[str, object] = {
+        "schema_version": evidence_auth.AUTH_SCHEMA_VERSION,
+        "receipt_id": "bevr-v2-" + secrets.token_hex(32),
+        "artifact_kind": artifact_kind,
+        "producer_id": evidence_auth._KINDS[artifact_kind],
+        "artifact_sha256": hashlib.sha256(artifact).hexdigest(),
+        "runtime_fingerprint": runtime_fingerprint,
+        "account_scope": account_scope,
+        "issued_at": evidence_auth._utc_text(now),
+        "expires_at": evidence_auth._utc_text(now + evidence_auth.MAX_RECEIPT_LIFETIME),
+        "public_key_fingerprint": evidence_auth._public_fingerprint(private_key.public_key()),
+    }
+    values["signature_ed25519"] = base64.b64encode(
+        private_key.sign(evidence_auth._receipt_payload(values))
+    ).decode("ascii")
+    receipt_path = artifact_path.with_name(artifact_path.name + evidence_auth.AUTH_SUFFIX)
+    receipt_path.write_text(json.dumps(values, sort_keys=True, separators=(",", ":")))
+    receipt_path.chmod(0o400)
+    return receipt_path
 
 
 def _legacy_database(path: Path) -> None:
@@ -185,14 +235,9 @@ def _write_artifact(
     receipt_path = path.with_name(path.name + ".auth.json")
     if receipt_path.exists():
         receipt_path.unlink()
-    producer = {
-        "broker_snapshot": emit_broker_snapshot_receipt,
-        "reconciliation_report": emit_reconciliation_report_receipt,
-        "protective_mark": emit_protective_mark_receipt,
-    }[artifact_kind]
-    producer(
+    _emit_test_receipt(
         artifact_path=path,
-        private_key_path=_TEST_PRIVATE_KEYS[artifact_kind],
+        artifact_kind=artifact_kind,
         runtime_fingerprint=str(payload["runtime_fingerprint"]),
         account_scope=str(payload["account_scope"]),
         issued_at=issued_at,
@@ -955,7 +1000,7 @@ def test_fabricated_current_authentication_receipt_is_rejected(
         )
 
 
-def test_production_emitters_bind_all_three_distinct_producers(tmp_path: Path) -> None:
+def test_verifier_accepts_only_three_distinct_producer_identities(tmp_path: Path) -> None:
     path = tmp_path / "legacy.db"
     _legacy_database(path)
     _, evidence, _ = _candidate_bundle(path, tmp_path)
@@ -979,13 +1024,49 @@ def test_bootstrap_consumer_refuses_private_signing_capability(
         "BOOTSTRAP_BROKER_EVIDENCE_PRIVATE_KEY_PATH",
         str(_TEST_PRIVATE_KEYS["broker_snapshot"]),
     )
-    with pytest.raises(ExactStateBootstrapError, match="refuses producer signing-key presence"):
+    with pytest.raises(ExactStateBootstrapError, match="refuses evidence trust/signing overrides"):
         load_exact_state_bootstrap_evidence(
             reconciliation_path=tmp_path / "reconciliation.json",
             broker_snapshot_path=tmp_path / "broker.json",
             protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
             expected_runtime_contract=runtime,
         )
+
+
+def test_bootstrap_consumer_refuses_public_trust_root_substitution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    _, _, runtime = _candidate_bundle(path, tmp_path)
+    monkeypatch.setenv(
+        "BOOTSTRAP_BROKER_EVIDENCE_PUBLIC_KEY_PATH",
+        str(evidence_auth._PINNED_PUBLIC_KEYS["protective_mark"][0]),
+    )
+    with pytest.raises(ExactStateBootstrapError, match="refuses evidence trust/signing overrides"):
+        load_exact_state_bootstrap_evidence(
+            reconciliation_path=tmp_path / "reconciliation.json",
+            broker_snapshot_path=tmp_path / "broker.json",
+            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            expected_runtime_contract=runtime,
+        )
+
+
+def test_runtime_fingerprint_commits_to_distinct_pinned_trust_set(tmp_path: Path) -> None:
+    runtime = _runtime_contract(tmp_path / "legacy.db")
+    public = runtime.public_dict()
+    trust = public["bootstrap_evidence_trust"]
+    assert isinstance(trust, dict)
+    fingerprints = trust["public_key_fingerprints"]
+    assert isinstance(fingerprints, dict)
+    assert set(fingerprints) == {
+        "broker_snapshot",
+        "reconciliation_report",
+        "protective_mark",
+    }
+    assert len(set(fingerprints.values())) == 3
+    assert len(trust["trust_set_digest"]) == 64
+    assert public["fingerprint"] == runtime.fingerprint
 
 
 @pytest.mark.parametrize("attack", ["wrong_key", "wrong_kind"])
@@ -996,16 +1077,17 @@ def test_wrong_producer_key_or_kind_cannot_authenticate_broker(tmp_path: Path, a
     receipt_path = tmp_path / "broker.json.auth.json"
     receipt_path.unlink()
     if attack == "wrong_key":
-        emit_broker_snapshot_receipt(
+        _emit_test_receipt(
             artifact_path=tmp_path / "broker.json",
-            private_key_path=_TEST_PRIVATE_KEYS["protective_mark"],
+            artifact_kind="broker_snapshot",
+            signing_kind="protective_mark",
             runtime_fingerprint=runtime.fingerprint,
             account_scope=ACCOUNT_SCOPE,
         )
     else:
-        emit_protective_mark_receipt(
+        _emit_test_receipt(
             artifact_path=tmp_path / "broker.json",
-            private_key_path=_TEST_PRIVATE_KEYS["protective_mark"],
+            artifact_kind="protective_mark",
             runtime_fingerprint=runtime.fingerprint,
             account_scope=ACCOUNT_SCOPE,
         )
@@ -1018,19 +1100,21 @@ def test_wrong_producer_key_or_kind_cannot_authenticate_broker(tmp_path: Path, a
         )
 
 
-@pytest.mark.parametrize("attack", ["writable", "hardlink"])
-def test_public_verification_key_permissions_and_identity_are_strict(
-    tmp_path: Path, attack: str
-) -> None:
+@pytest.mark.parametrize("attack", ["tamper", "hardlink"])
+def test_pinned_public_verification_key_identity_is_strict(tmp_path: Path, attack: str) -> None:
     path = tmp_path / "legacy.db"
     _legacy_database(path)
     _, _, runtime = _candidate_bundle(path, tmp_path)
-    public_path = Path(os.environ[PUBLIC_KEY_ENV["broker_snapshot"]])
-    if attack == "writable":
+    public_path = evidence_auth._PINNED_PUBLIC_KEYS["broker_snapshot"][0]
+    if attack == "tamper":
         public_path.chmod(0o600)
+        public_path.write_bytes(
+            evidence_auth._PINNED_PUBLIC_KEYS["protective_mark"][0].read_bytes()
+        )
+        public_path.chmod(0o444)
     else:
         os.link(public_path, tmp_path / "broker-public-alias.pem")
-    with pytest.raises(ExactStateBootstrapError, match="sealed owner file"):
+    with pytest.raises(ExactStateBootstrapError, match="immutable fingerprint|sealed owner file"):
         load_exact_state_bootstrap_evidence(
             reconciliation_path=tmp_path / "reconciliation.json",
             broker_snapshot_path=tmp_path / "broker.json",
@@ -1039,20 +1123,13 @@ def test_public_verification_key_permissions_and_identity_are_strict(
         )
 
 
-def test_producer_private_key_must_be_sealed_owner_readonly(tmp_path: Path) -> None:
-    path = tmp_path / "legacy.db"
-    _legacy_database(path)
-    _, _, runtime = _candidate_bundle(path, tmp_path)
-    private_path = _TEST_PRIVATE_KEYS["broker_snapshot"]
-    private_path.chmod(0o600)
-    (tmp_path / "broker.json.auth.json").unlink()
-    with pytest.raises(BootstrapEvidenceAuthenticationError, match="sealed owner file"):
-        emit_broker_snapshot_receipt(
-            artifact_path=tmp_path / "broker.json",
-            private_key_path=private_path,
-            runtime_fingerprint=runtime.fingerprint,
-            account_scope=ACCOUNT_SCOPE,
-        )
+def test_bootstrap_verifier_exports_no_private_key_or_signing_api() -> None:
+    exported = set(dir(evidence_auth))
+    assert "_load_private_key" not in exported
+    assert "_emit_receipt" not in exported
+    assert "emit_broker_snapshot_receipt" not in exported
+    assert "emit_reconciliation_report_receipt" not in exported
+    assert "emit_protective_mark_receipt" not in exported
 
 
 @pytest.mark.asyncio
