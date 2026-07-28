@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import os
+import pickle
 import sqlite3
+import weakref
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -12,6 +16,7 @@ import aiosqlite
 import pytest
 
 from robo_trader import bootstrap_evidence_receivers as receiver_module
+from robo_trader import reconciliation_migrations as migrations_module
 from robo_trader.bootstrap_evidence_receivers import (
     ProtectiveMarkBundleIdentity,
     VerifiedBrokerEvidenceEnvelope,
@@ -48,7 +53,6 @@ from robo_trader.reconciliation.runtime_evidence import (
     bind_verified_runtime_reconciliation_evidence,
 )
 from robo_trader.reconciliation.service import (
-    ReconciliationComparison,
     ReconciliationService,
     ReconciliationServiceBlocked,
     ReconciliationServiceState,
@@ -141,6 +145,9 @@ def _registered_evidence(
     *,
     snapshot: NormalizedBrokerSnapshot | None = None,
     expires_at: datetime = NOW + timedelta(seconds=29),
+    coverage: ReconciliationCoverage | None = None,
+    differences: tuple[ReconciliationDifference, ...] = (),
+    timing_lag_proofs: tuple[ExpectedTimingLagProof, ...] = (),
 ) -> VerifiedRuntimeReconciliationEvidence:
     path = database_path.resolve()
     path.touch(exist_ok=True)
@@ -169,6 +176,9 @@ def _registered_evidence(
             snapshot=broker_snapshot,
             snapshot_id=broker_snapshot.snapshot_id,
             snapshot_hash=snapshot_hash,
+            comparison_coverage=coverage or _coverage(),
+            differences=differences,
+            timing_lag_proofs=timing_lag_proofs,
             bundle_id="bootstrap-evidence-bundle-v1-" + "a1" * 32,
             runtime_fingerprint=contract.fingerprint,
             account_scope=ACCOUNT_SCOPE,
@@ -180,6 +190,15 @@ def _registered_evidence(
             broker_artifact_hash="b2" * 32,
             broker_receipt_id="receipt-v1-" + "c3" * 32,
             broker_public_key_fingerprint="d4" * 32,
+            broker_evidence_expires_at=expires_at,
+            reconciliation_snapshot_id="bootstrap-reconciliation-v1-" + "e5" * 32,
+            reconciliation_artifact_path=str(path.parent / "reconciliation_report.json"),
+            reconciliation_artifact_hash="f6" * 32,
+            reconciliation_receipt_id="bevr-v2-" + "a7" * 32,
+            reconciliation_public_key_fingerprint="b8" * 32,
+            reconciliation_signature_ed25519="c2lnbmF0dXJl",
+            reconciliation_evidence_issued_at=NOW - timedelta(microseconds=1),
+            reconciliation_evidence_expires_at=expires_at,
             issued_at=NOW - timedelta(microseconds=1),
             expires_at=expires_at,
             _runtime_context=context,
@@ -189,7 +208,7 @@ def _registered_evidence(
 
 
 class _EvidenceSource:
-    def __init__(self, database_path, snapshot: NormalizedBrokerSnapshot) -> None:
+    def __init__(self, database_path, snapshot: NormalizedBrokerSnapshot, comparison) -> None:
         self.database_path = database_path
         self.snapshot = snapshot
         self.calls = 0
@@ -200,6 +219,7 @@ class _EvidenceSource:
         self.close_release = None
         self.expires_at = NOW + timedelta(seconds=29)
         self.prepared_evidence: object | None = None
+        self.comparison = comparison
 
     async def collect_verified_evidence(
         self, *, max_age_seconds: float
@@ -216,6 +236,9 @@ class _EvidenceSource:
             self.database_path,
             snapshot=self.snapshot,
             expires_at=self.expires_at,
+            coverage=self.comparison.coverage,
+            differences=self.comparison.differences,
+            timing_lag_proofs=self.comparison.timing_lag_proofs,
         )
 
     async def close(self) -> None:
@@ -245,19 +268,11 @@ def _comparison(
     coverage: ReconciliationCoverage | None = None,
     timing_lag_proofs: tuple[ExpectedTimingLagProof, ...] = (),
 ):
-    def compare(
-        snapshot: NormalizedBrokerSnapshot,
-        trigger: ReconciliationTrigger,
-    ) -> ReconciliationComparison:
-        assert snapshot.account.account_scope == ACCOUNT_SCOPE
-        assert type(trigger) is ReconciliationTrigger
-        return ReconciliationComparison(
-            coverage or _coverage(),
-            differences,
-            timing_lag_proofs,
-        )
-
-    return compare
+    return SimpleNamespace(
+        coverage=coverage or _coverage(),
+        differences=differences,
+        timing_lag_proofs=timing_lag_proofs,
+    )
 
 
 def _difference(kind: DifferenceKind) -> ReconciliationDifference:
@@ -282,11 +297,10 @@ async def _service(
     clock: _Clock | None = None,
 ) -> tuple[ReconciliationService, _EvidenceSource, ReconciliationPersistence]:
     database_path = (tmp_path / "reconciliation.sqlite3").resolve()
-    source = _EvidenceSource(database_path, snapshot or _snapshot())
+    source = _EvidenceSource(database_path, snapshot or _snapshot(), comparison or _comparison())
     persistence = ReconciliationPersistence(database_path)
     service = ReconciliationService(
         evidence_source=source,
-        comparison_source=comparison or _comparison(),
         persistence=persistence,
         expected_account_scope=ACCOUNT_SCOPE,
         max_age_seconds=30,
@@ -310,7 +324,7 @@ async def test_clean_startup_is_durable_and_entry_eligible(tmp_path) -> None:
     with sqlite3.connect(tmp_path / "reconciliation.sqlite3") as connection:
         assert connection.execute(
             "SELECT component, version FROM rt_schema_migrations"
-        ).fetchall() == [(RECONCILIATION_COMPONENT, 1)]
+        ).fetchall() == [(RECONCILIATION_COMPONENT, 1), (RECONCILIATION_COMPONENT, 2)]
         assert connection.execute(
             "SELECT trigger_type, status, entry_eligible FROM rt_reconciliation_runs"
         ).fetchall() == [("startup", "passed", 1)]
@@ -341,7 +355,113 @@ async def test_component_migration_preserves_unrelated_schema_and_rows(tmp_path)
         ]
         assert connection.execute(
             "SELECT component, version FROM rt_schema_migrations"
-        ).fetchall() == [(RECONCILIATION_COMPONENT, 1)]
+        ).fetchall() == [(RECONCILIATION_COMPONENT, 1), (RECONCILIATION_COMPONENT, 2)]
+
+
+@pytest.mark.asyncio
+async def test_exact_old_v1_schema_upgrades_additively_without_row_loss(tmp_path) -> None:
+    database_path = (tmp_path / "reconciliation.sqlite3").resolve()
+    account_scope = ACCOUNT_SCOPE
+    payload = "{}"
+    digest = hashlib.sha256(payload.encode()).hexdigest()
+    async with aiosqlite.connect(database_path) as connection:
+        await connection.execute("PRAGMA foreign_keys = ON")
+        await connection.execute("BEGIN IMMEDIATE")
+        await migrations_module._migration_v1(connection)
+        await connection.execute("""
+            CREATE TABLE rt_schema_migrations (
+                component TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                description TEXT NOT NULL,
+                applied_at TEXT NOT NULL,
+                PRIMARY KEY(component, version)
+            )
+        """)
+        await connection.execute(
+            "INSERT INTO rt_schema_migrations VALUES (?, 1, 'old-v1', ?)",
+            (RECONCILIATION_COMPONENT, canonical_timestamp(NOW)),
+        )
+        await connection.execute(
+            "INSERT INTO rt_reconciliation_snapshots VALUES (?, 1, ?, ?, ?, ?, 1, ?, ?, ?)",
+            (
+                "snapshot-old-v1",
+                account_scope,
+                canonical_timestamp(NOW),
+                canonical_timestamp(NOW),
+                canonical_timestamp(NOW),
+                payload,
+                digest,
+                canonical_timestamp(NOW),
+            ),
+        )
+        await connection.execute(
+            """
+            INSERT INTO rt_reconciliation_runs VALUES (
+                ?, 1, 'startup', ?, ?, ?, ?, ?, 'quarantined',
+                1, 1, 1, 0, ?, ?, ?
+            )
+            """,
+            (
+                "run-old-v1",
+                "snapshot-old-v1",
+                "verdict-old-v1",
+                account_scope,
+                canonical_timestamp(NOW),
+                canonical_timestamp(NOW),
+                payload,
+                payload,
+                digest,
+            ),
+        )
+        await connection.execute(
+            """
+            INSERT INTO rt_reconciliation_differences VALUES (
+                ?, ?, 0, 'unknown', 'unknown', 'OLD_V1_UNKNOWN',
+                'AAPL', '[]', ?, ?, ?
+            )
+            """,
+            (
+                "difference-old-v1",
+                "run-old-v1",
+                payload,
+                digest,
+                canonical_timestamp(NOW),
+            ),
+        )
+        await connection.execute(
+            "INSERT INTO rt_reconciliation_operator_resolutions VALUES (?, 1, ?, ?, ?, ?, ?, NULL, ?)",
+            (
+                "resolution-old-v1",
+                "run-old-v1",
+                "difference-old-v1",
+                "investigation_note",
+                "operator",
+                "preserve exact old v1 evidence",
+                canonical_timestamp(NOW),
+            ),
+        )
+        await connection.commit()
+
+    await ReconciliationPersistence(database_path).initialize()
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT snapshot_id FROM rt_reconciliation_snapshots"
+        ).fetchall() == [("snapshot-old-v1",)]
+        assert connection.execute("SELECT run_id FROM rt_reconciliation_runs").fetchall() == [
+            ("run-old-v1",)
+        ]
+        assert connection.execute(
+            "SELECT difference_id FROM rt_reconciliation_differences"
+        ).fetchall() == [("difference-old-v1",)]
+        assert connection.execute(
+            "SELECT resolution_id, run_id, difference_id "
+            "FROM rt_reconciliation_operator_resolution_bindings"
+        ).fetchall() == [("resolution-old-v1", "run-old-v1", "difference-old-v1")]
+        assert connection.execute(
+            "SELECT version FROM rt_schema_migrations WHERE component=? ORDER BY version",
+            (RECONCILIATION_COMPONENT,),
+        ).fetchall() == [(1,), (2,)]
 
 
 @pytest.mark.asyncio
@@ -452,10 +572,9 @@ async def test_partial_migration_fails_closed_without_using_runtime_state(tmp_pa
             (RECONCILIATION_COMPONENT, "2026-07-28T14:00:00Z"),
         )
         await connection.commit()
-    source = _EvidenceSource(database_path, _snapshot())
+    source = _EvidenceSource(database_path, _snapshot(), _comparison())
     service = ReconciliationService(
         evidence_source=source,
-        comparison_source=_comparison(),
         persistence=ReconciliationPersistence(database_path),
         expected_account_scope=ACCOUNT_SCOPE,
     )
@@ -612,7 +731,7 @@ def test_core_broker_and_bundle_assertions_issue_one_shot_runtime_evidence(
     bundle = ProtectiveMarkBundleIdentity(
         receiver_type=object,
         bundle_id="bootstrap-evidence-bundle-v1-" + "a1" * 32,
-        reconciliation_snapshot_id="reconciliation-v1-" + "f6" * 32,
+        reconciliation_snapshot_id="bootstrap-reconciliation-v1-" + "e5" * 32,
         broker_snapshot_id=snapshot.snapshot_id,
         broker_snapshot_hash=snapshot_hash,
         broker_artifact_hash=broker.artifact_hash,
@@ -625,6 +744,35 @@ def test_core_broker_and_bundle_assertions_issue_one_shot_runtime_evidence(
         database_inode=metadata.st_ino,
     )
     asserted = []
+    reconciliation_receipt = SimpleNamespace(
+        artifact_kind="reconciliation_report",
+        artifact_sha256="f6" * 32,
+        runtime_fingerprint=contract.fingerprint,
+        account_scope=ACCOUNT_SCOPE,
+        issued_at=NOW - timedelta(microseconds=1),
+        expires_at=NOW + timedelta(seconds=29),
+        receipt_id="bevr-v2-" + "a7" * 32,
+        public_key_fingerprint="b8" * 32,
+        signature_ed25519="c2lnbmF0dXJl",
+    )
+    exact_state = SimpleNamespace(
+        authentication_receipts=(reconciliation_receipt,),
+        reconciliation_status=ReconciliationStatus.PASSED,
+        reconciliation_coverage=_coverage(),
+        reconciliation_snapshot_id=bundle.reconciliation_snapshot_id,
+        reconciliation_artifact_path=str(database_path.parent / "reconciliation_report.json"),
+        reconciliation_report_hash=reconciliation_receipt.artifact_sha256,
+        reconciliation_generated_at=NOW - timedelta(microseconds=2),
+        bundle_id=bundle.bundle_id,
+        runtime_fingerprint=contract.fingerprint,
+        account_scope=ACCOUNT_SCOPE,
+        database_path=str(database_path),
+        database_identity=contract.database_identity,
+        database_device=metadata.st_dev,
+        database_inode=metadata.st_ino,
+        broker_snapshot_id=broker.snapshot_id,
+        broker_snapshot_hash=broker.artifact_hash,
+    )
 
     def assert_broker(value):
         asserted.append("broker")
@@ -637,6 +785,12 @@ def test_core_broker_and_bundle_assertions_issue_one_shot_runtime_evidence(
         assert runtime_contract is contract
         return bundle
 
+    def assert_exact(value, runtime_contract):
+        asserted.append("reconciliation")
+        assert value is exact_state
+        assert runtime_contract is contract
+        return exact_state
+
     marker = object()
     monkeypatch.setattr(
         runtime_evidence_module,
@@ -648,15 +802,67 @@ def test_core_broker_and_bundle_assertions_issue_one_shot_runtime_evidence(
         "assert_protective_mark_receiver_capability",
         assert_bundle,
     )
+    monkeypatch.setattr(
+        runtime_evidence_module,
+        "assert_verified_exact_state_reconciliation_evidence",
+        assert_exact,
+    )
+    monkeypatch.setattr(
+        runtime_evidence_module,
+        "ExactStateBootstrapEvidence",
+        SimpleNamespace,
+    )
 
-    evidence = bind_verified_runtime_reconciliation_evidence(broker, context, marker)
+    evidence = bind_verified_runtime_reconciliation_evidence(
+        broker,
+        exact_state,
+        context,
+        marker,
+    )
 
-    assert asserted == ["broker", "bundle"]
+    assert asserted == ["broker", "reconciliation", "bundle"]
     assert evidence.database_device == metadata.st_dev
     assert evidence.database_inode == metadata.st_ino
+    with pytest.raises(RuntimeReconciliationEvidenceError, match="already consumed"):
+        bind_verified_runtime_reconciliation_evidence(
+            broker,
+            exact_state,
+            context,
+            marker,
+        )
     assert assert_and_consume_verified_runtime_reconciliation_evidence(evidence) is evidence
     with pytest.raises(RuntimeReconciliationEvidenceError, match="already consumed"):
         assert_and_consume_verified_runtime_reconciliation_evidence(evidence)
+
+
+def test_runtime_capability_is_python310_compatible_immutable_and_nonserializable(
+    tmp_path,
+) -> None:
+    evidence = _registered_evidence(tmp_path / "reconciliation.sqlite3")
+
+    assert weakref.ref(evidence)() is evidence
+    assert not hasattr(evidence, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        evidence.bundle_id = "changed"  # type: ignore[misc]
+    with pytest.raises(TypeError, match="cannot be copied"):
+        copy.copy(evidence)
+    with pytest.raises(TypeError, match="cannot be copied"):
+        copy.deepcopy(evidence)
+    with pytest.raises(TypeError, match="cannot be pickled"):
+        pickle.dumps(evidence)
+
+
+@pytest.mark.asyncio
+async def test_public_comparison_callable_is_not_an_accepted_service_boundary(tmp_path) -> None:
+    database_path = (tmp_path / "reconciliation.sqlite3").resolve()
+    source = _EvidenceSource(database_path, _snapshot(), _comparison())
+    with pytest.raises(TypeError, match="comparison_source"):
+        ReconciliationService(  # type: ignore[call-arg]
+            evidence_source=source,
+            comparison_source=lambda *_: _comparison(),
+            persistence=ReconciliationPersistence(database_path),
+            expected_account_scope=ACCOUNT_SCOPE,
+        )
 
 
 @pytest.mark.asyncio
@@ -676,6 +882,42 @@ async def test_replaced_database_blocks_exact_prepared_evidence(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_entry_eligibility_revalidates_database_inode_every_time(tmp_path) -> None:
+    service, _, _ = await _service(tmp_path)
+    await service.reconcile_startup()
+    assert service.entry_eligible(at=NOW) is True
+    database_path = tmp_path / "reconciliation.sqlite3"
+    replacement = tmp_path / "replacement-after-reconcile.sqlite3"
+    sqlite3.connect(replacement).close()
+    os.replace(replacement, database_path)
+
+    assert service.entry_eligible(at=NOW) is False
+    assert service.state is ReconciliationServiceState.QUARANTINED
+
+
+@pytest.mark.asyncio
+async def test_comparison_substitution_and_capability_reuse_are_rejected(tmp_path) -> None:
+    service, source, _ = await _service(tmp_path)
+    evidence = _registered_evidence(tmp_path / "reconciliation.sqlite3")
+    object.__setattr__(evidence, "comparison_coverage", _coverage(ledger_cash=False))
+    source.prepared_evidence = evidence
+
+    with pytest.raises(ReconciliationServiceBlocked, match="failed closed"):
+        await service.reconcile_startup()
+    assert service.state is ReconciliationServiceState.QUARANTINED
+
+    replay_directory = tmp_path / "replay"
+    replay_directory.mkdir()
+    replay_service, replay_source, _ = await _service(replay_directory)
+    replay = _registered_evidence(replay_directory / "reconciliation.sqlite3")
+    replay_source.prepared_evidence = replay
+    await replay_service.reconcile_startup()
+    replay_source.prepared_evidence = replay
+    with pytest.raises(ReconciliationServiceBlocked, match="failed closed"):
+        await replay_service.reconcile_reconnect()
+
+
+@pytest.mark.asyncio
 async def test_persisted_snapshot_contains_full_runtime_and_broker_binding(tmp_path) -> None:
     service, _, _ = await _service(tmp_path)
     outcome = await service.reconcile_startup()
@@ -686,8 +928,14 @@ async def test_persisted_snapshot_contains_full_runtime_and_broker_binding(tmp_p
             SELECT runtime_fingerprint, account_scope, account_alias,
                    database_identity, database_device, database_inode,
                    broker_artifact_hash, broker_receipt_id,
-                   broker_public_key_fingerprint, bundle_id, snapshot_hash
-            FROM rt_reconciliation_snapshots WHERE snapshot_id = ?
+                   broker_public_key_fingerprint, bundle_id, snapshot_hash,
+                   reconciliation_snapshot_id, reconciliation_artifact_hash,
+                   reconciliation_receipt_id,
+                   reconciliation_public_key_fingerprint,
+                   reconciliation_signature_ed25519
+            FROM rt_reconciliation_snapshots AS snapshots
+            JOIN rt_reconciliation_snapshot_lineage AS lineage USING(snapshot_id)
+            WHERE snapshot_id = ?
             """,
             (outcome.persisted.snapshot_id,),
         ).fetchone()
@@ -702,6 +950,11 @@ async def test_persisted_snapshot_contains_full_runtime_and_broker_binding(tmp_p
     assert row[8] == "d4" * 32
     assert row[9].startswith("bootstrap-evidence-bundle-v1-")
     assert len(row[10]) == 64
+    assert row[11].startswith("bootstrap-reconciliation-v1-")
+    assert row[12] == "f6" * 32
+    assert row[13] == "bevr-v2-" + "a7" * 32
+    assert row[14] == "b8" * 32
+    assert row[15] == "c2lnbmF0dXJl"
 
 
 @pytest.mark.asyncio

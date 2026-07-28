@@ -31,6 +31,7 @@ from .bootstrap_evidence_auth import (
     verify_receipt,
 )
 from .reconciliation.domain import IBKR_READ_ONLY_SCOPE, canonical_json, fingerprint
+from .reconciliation.policy import ReconciliationCoverage, ReconciliationStatus
 from .runtime_contract_constants import PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
 from .safety.journal import SafetyJournal
 from .safety.models import decimal_to_fixed, utc_to_text
@@ -165,8 +166,12 @@ class ExactStateBootstrapEvidence:
     """Cross-linked offline evidence verified from regular owner-only files."""
 
     reconciliation_snapshot_id: str
+    reconciliation_artifact_path: str
     bundle_id: str
     reconciliation_report_hash: str
+    reconciliation_coverage: ReconciliationCoverage
+    reconciliation_status: ReconciliationStatus
+    broker_snapshot_id: str
     broker_snapshot_hash: str
     legacy_snapshot_hash: str
     runtime_fingerprint: str
@@ -217,6 +222,7 @@ def _evidence_object_digest(evidence: ExactStateBootstrapEvidence) -> str:
                 "public_key_fingerprint": receipt.public_key_fingerprint,
                 "receipt_id": receipt.receipt_id,
                 "runtime_fingerprint": receipt.runtime_fingerprint,
+                "signature_ed25519": receipt.signature_ed25519,
             }
             for receipt in evidence.authentication_receipts
         ],
@@ -246,8 +252,12 @@ def _evidence_object_digest(evidence: ExactStateBootstrapEvidence) -> str:
         ],
         "portfolio_ids": list(evidence.portfolio_ids),
         "reconciliation_generated_at": utc_to_text(evidence.reconciliation_generated_at),
+        "reconciliation_artifact_path": evidence.reconciliation_artifact_path,
+        "reconciliation_coverage": evidence.reconciliation_coverage.canonical_dict(),
         "reconciliation_report_hash": evidence.reconciliation_report_hash,
         "reconciliation_snapshot_id": evidence.reconciliation_snapshot_id,
+        "reconciliation_status": evidence.reconciliation_status.value,
+        "broker_snapshot_id": evidence.broker_snapshot_id,
         "runtime_fingerprint": evidence.runtime_fingerprint,
         "safety_journal_device": evidence.safety_journal_device,
         "safety_journal_identity": evidence.safety_journal_identity,
@@ -1150,6 +1160,15 @@ def load_exact_state_bootstrap_evidence(
         raise ExactStateBootstrapError(
             "reconciliation snapshot identity is not bound to its canonical payload"
         )
+    reconciliation_coverage = ReconciliationCoverage(
+        **{
+            field_name: _json_bool(coverage[field_name], f"coverage {field_name}")
+            for field_name in sorted(expected_coverage)
+        }
+    )
+    reconciliation_status = ReconciliationStatus(
+        _json_string(reconciliation["reconciliation_status"], "reconciliation status")
+    )
     reconciliation_authenticated_at = _verify_artifact_authentication(
         artifact_path=Path(reconciliation_path),
         artifact_kind="reconciliation_report",
@@ -1330,8 +1349,12 @@ def load_exact_state_bootstrap_evidence(
 
     evidence = ExactStateBootstrapEvidence(
         reconciliation_snapshot_id=reconciliation_snapshot_id,
+        reconciliation_artifact_path=str(Path(reconciliation_path)),
         bundle_id=bundle_id,
         reconciliation_report_hash=reconciliation_hash,
+        reconciliation_coverage=reconciliation_coverage,
+        reconciliation_status=reconciliation_status,
+        broker_snapshot_id=broker_snapshot_id,
         broker_snapshot_hash=broker_hash,
         legacy_snapshot_hash=legacy_snapshot_hash,
         runtime_fingerprint=runtime_fingerprint,
@@ -1359,6 +1382,84 @@ def load_exact_state_bootstrap_evidence(
         _producer_marker=_EVIDENCE_PRODUCER_MARKER,
     )
     object.__setattr__(evidence, "_producer_digest", _evidence_object_digest(evidence))
+    return evidence
+
+
+def assert_verified_exact_state_reconciliation_evidence(
+    evidence: object,
+    runtime_contract: object,
+) -> ExactStateBootstrapEvidence:
+    """Revalidate one loader-owned signed reconciliation artifact and runtime inode."""
+
+    if type(evidence) is not ExactStateBootstrapEvidence:
+        raise ExactStateBootstrapError("exact-state reconciliation evidence has the wrong type")
+    if evidence._producer_marker is not _EVIDENCE_PRODUCER_MARKER or not hmac.compare_digest(
+        evidence._producer_digest,
+        _evidence_object_digest(evidence),
+    ):
+        raise ExactStateBootstrapError("exact-state reconciliation evidence is not loader-owned")
+    database_path, database_identity, runtime_fingerprint, account_scope = _runtime_contract_values(
+        runtime_contract
+    )
+    try:
+        database_metadata = os.lstat(database_path)
+    except OSError as exc:
+        raise ExactStateBootstrapError("runtime database cannot be revalidated") from exc
+    if (
+        stat.S_ISLNK(database_metadata.st_mode)
+        or not stat.S_ISREG(database_metadata.st_mode)
+        or database_metadata.st_nlink != 1
+        or evidence.database_path != str(database_path)
+        or evidence.database_identity != database_identity
+        or evidence.runtime_fingerprint != runtime_fingerprint
+        or not hmac.compare_digest(evidence.account_scope, account_scope)
+        or (evidence.database_device, evidence.database_inode)
+        != (database_metadata.st_dev, database_metadata.st_ino)
+    ):
+        raise ExactStateBootstrapError("exact-state reconciliation runtime binding changed")
+
+    artifact_path = Path(evidence.reconciliation_artifact_path)
+    reconciliation, artifact_hash = _verified_canonical_json(
+        artifact_path,
+        "reconciliation report",
+    )
+    if (
+        artifact_hash != evidence.reconciliation_report_hash
+        or _safe_id(reconciliation.get("snapshot_id"), "reconciliation snapshot_id")
+        != evidence.reconciliation_snapshot_id
+        or _safe_id(reconciliation.get("bundle_id"), "reconciliation bundle_id")
+        != evidence.bundle_id
+        or _safe_id(reconciliation.get("broker_snapshot_id"), "broker snapshot_id")
+        != evidence.broker_snapshot_id
+        or _json_string(
+            reconciliation.get("runtime_fingerprint"),
+            "reconciliation runtime_fingerprint",
+        )
+        != runtime_fingerprint
+        or not hmac.compare_digest(
+            _json_string(reconciliation.get("account_scope"), "reconciliation account_scope"),
+            account_scope,
+        )
+        or reconciliation.get("comparison_coverage")
+        != evidence.reconciliation_coverage.canonical_dict()
+        or reconciliation.get("reconciliation_status") != evidence.reconciliation_status.value
+    ):
+        raise ExactStateBootstrapError("signed reconciliation artifact lineage changed")
+    verified_receipt = _verify_artifact_authentication(
+        artifact_path=artifact_path,
+        artifact_kind="reconciliation_report",
+        artifact_hash=artifact_hash,
+        runtime_fingerprint=runtime_fingerprint,
+        account_scope=account_scope,
+    )
+    reconciliation_receipts = tuple(
+        receipt
+        for receipt in evidence.authentication_receipts
+        if receipt.artifact_kind == "reconciliation_report"
+    )
+    if len(reconciliation_receipts) != 1 or reconciliation_receipts[0] != verified_receipt:
+        raise ExactStateBootstrapError("reconciliation signature receipt lineage changed")
+    _assert_authentication_receipts_unconsumed(database_path, evidence.authentication_receipts)
     return evidence
 
 

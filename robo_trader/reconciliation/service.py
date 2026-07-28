@@ -3,20 +3,19 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Awaitable, Callable, Protocol
+from pathlib import Path
+from typing import Callable, Protocol
 
-from .domain import NormalizedBrokerSnapshot, ReconciliationDomainError, _timestamp
+from robo_trader.safety.sqlite_identity import SQLitePathBinding
+
+from .domain import ReconciliationDomainError, _timestamp
 from .ibkr_adapter import await_cleanup_required
 from .persistence import PersistedReconciliation, ReconciliationPersistence
 from .policy import (
-    ExpectedTimingLagProof,
-    ReconciliationCoverage,
-    ReconciliationDifference,
     ReconciliationStatus,
     ReconciliationVerdict,
     evaluate_paper_simulator_reconciliation,
@@ -51,21 +50,6 @@ class ReconciliationServiceState(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
-class ReconciliationComparison:
-    coverage: ReconciliationCoverage
-    differences: tuple[ReconciliationDifference, ...] = ()
-    timing_lag_proofs: tuple[ExpectedTimingLagProof, ...] = ()
-
-    def __post_init__(self) -> None:
-        if type(self.coverage) is not ReconciliationCoverage:
-            raise ReconciliationServiceBlocked("comparison coverage is not normalized")
-        if any(type(value) is not ReconciliationDifference for value in self.differences):
-            raise ReconciliationServiceBlocked("comparison differences are not normalized")
-        if any(type(value) is not ExpectedTimingLagProof for value in self.timing_lag_proofs):
-            raise ReconciliationServiceBlocked("comparison timing proofs are not normalized")
-
-
-@dataclass(frozen=True, slots=True)
 class ReconciliationServiceOutcome:
     trigger: ReconciliationTrigger
     verdict: ReconciliationVerdict
@@ -92,15 +76,6 @@ class VerifiedEvidenceSource(Protocol):
         """Close only the diagnostic read-only transport."""
 
 
-class ReconciliationComparisonSource(Protocol):
-    def __call__(
-        self,
-        snapshot: NormalizedBrokerSnapshot,
-        trigger: ReconciliationTrigger,
-    ) -> ReconciliationComparison | Awaitable[ReconciliationComparison]:
-        """Compare immutable local evidence without repairing or replacing it."""
-
-
 def _system_clock() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -117,7 +92,6 @@ class ReconciliationService:
         self,
         *,
         evidence_source: VerifiedEvidenceSource,
-        comparison_source: ReconciliationComparisonSource,
         persistence: ReconciliationPersistence,
         expected_account_scope: str,
         max_age_seconds: float = 30.0,
@@ -144,10 +118,7 @@ class ReconciliationService:
             raise ReconciliationServiceBlocked("verified evidence source is unavailable")
         if not callable(getattr(evidence_source, "close", None)):
             raise ReconciliationServiceBlocked("evidence source cleanup is unavailable")
-        if not callable(comparison_source):
-            raise ReconciliationServiceBlocked("comparison source is unavailable")
         self._evidence_source = evidence_source
-        self._comparison_source = comparison_source
         self._persistence = persistence
         self._expected_account_scope = expected_account_scope
         self._max_age_seconds = float(max_age_seconds)
@@ -158,6 +129,7 @@ class ReconciliationService:
         self._state = ReconciliationServiceState.UNINITIALIZED
         self._latest_outcome: ReconciliationServiceOutcome | None = None
         self._last_completed_at: datetime | None = None
+        self._latest_database_binding: tuple[str, int, int] | None = None
 
     @property
     def state(self) -> ReconciliationServiceState:
@@ -191,8 +163,29 @@ class ReconciliationService:
             self._quarantine()
             return False
         if checked_at > outcome.eligible_until:
-            self._state = ReconciliationServiceState.QUARANTINED
+            self._quarantine()
             return False
+        database_binding = self._latest_database_binding
+        if database_binding is None:
+            self._quarantine()
+            return False
+        path, expected_device, expected_inode = database_binding
+        binding: SQLitePathBinding | None = None
+        try:
+            binding = SQLitePathBinding.open_readonly(Path(path))
+            binding.assert_path_identity()
+            if (binding.device, binding.inode) != (expected_device, expected_inode):
+                raise ReconciliationServiceBlocked("runtime database identity changed")
+        except Exception:
+            self._quarantine()
+            return False
+        finally:
+            if binding is not None:
+                try:
+                    binding.close()
+                except Exception:
+                    self._quarantine()
+                    return False
         return True
 
     async def initialize(self) -> None:
@@ -231,6 +224,7 @@ class ReconciliationService:
                 return
             self._latest_outcome = None
             self._last_completed_at = None
+            self._latest_database_binding = None
             self._state = ReconciliationServiceState.CLOSING
             try:
                 cancellation_received = await await_cleanup_required(self._evidence_source.close())
@@ -275,19 +269,14 @@ class ReconciliationService:
             )
             runtime_evidence = assert_and_consume_verified_runtime_reconciliation_evidence(produced)
             snapshot = runtime_evidence.snapshot
-            comparison_result = self._comparison_source(snapshot, trigger)
-            if inspect.isawaitable(comparison_result):
-                comparison_result = await comparison_result
-            if type(comparison_result) is not ReconciliationComparison:
-                raise ReconciliationServiceBlocked("comparison source returned invalid evidence")
             checked_at = self._clock_value("policy clock")
             if checked_at < started_at:
                 raise ReconciliationServiceBlocked("policy clock moved backwards")
             verdict = evaluate_paper_simulator_reconciliation(
                 snapshot,
-                comparison_result.coverage,
-                comparison_result.differences,
-                comparison_result.timing_lag_proofs,
+                runtime_evidence.comparison_coverage,
+                runtime_evidence.differences,
+                runtime_evidence.timing_lag_proofs,
                 expected_account_scope=self._expected_account_scope,
                 now=checked_at,
                 max_age_seconds=self._max_age_seconds,
@@ -297,7 +286,7 @@ class ReconciliationService:
                 raise ReconciliationServiceBlocked("completion clock moved backwards")
             relied_on_proof_expiries = []
             proofs_by_key = {
-                proof.binding_key: proof for proof in comparison_result.timing_lag_proofs
+                proof.binding_key: proof for proof in runtime_evidence.timing_lag_proofs
             }
             for difference in verdict.differences:
                 if difference.kind.value != "expected_timing_lag":
@@ -350,6 +339,11 @@ class ReconciliationService:
         self._state = state
         self._latest_outcome = outcome
         self._last_completed_at = completed_at
+        self._latest_database_binding = (
+            runtime_evidence.database_path,
+            runtime_evidence.database_device,
+            runtime_evidence.database_inode,
+        )
         return outcome
 
     def _clock_value(self, label: str) -> datetime:
@@ -361,6 +355,7 @@ class ReconciliationService:
     def _quarantine(self) -> None:
         self._latest_outcome = None
         self._last_completed_at = None
+        self._latest_database_binding = None
         self._state = ReconciliationServiceState.QUARANTINED
 
     def _assert_not_closed(self) -> None:

@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable
 import aiosqlite
 
 RECONCILIATION_COMPONENT = "broker_reconciliation"
-RECONCILIATION_SCHEMA_VERSION = 1
+RECONCILIATION_SCHEMA_VERSION = 2
 
 _TABLES = (
     "rt_reconciliation_snapshots",
@@ -16,6 +16,12 @@ _TABLES = (
     "rt_reconciliation_differences",
     "rt_reconciliation_operator_resolutions",
 )
+_V2_TABLES = (
+    "rt_reconciliation_snapshot_lineage",
+    "rt_reconciliation_run_eligibility",
+    "rt_reconciliation_operator_resolution_bindings",
+)
+_ALL_TABLES = _TABLES + _V2_TABLES
 
 
 async def _migration_v1(connection: aiosqlite.Connection) -> None:
@@ -28,26 +34,6 @@ async def _migration_v1(connection: aiosqlite.Connection) -> None:
                 AND substr(account_scope, 1, 8) = 'acct_v1_'
                 AND substr(account_scope, 9) NOT GLOB '*[^0-9a-f]*'
             ),
-            account_alias TEXT NOT NULL,
-            snapshot_hash TEXT NOT NULL CHECK (
-                length(snapshot_hash) = 64 AND snapshot_hash = lower(snapshot_hash)
-            ),
-            bundle_id TEXT NOT NULL,
-            runtime_fingerprint TEXT NOT NULL,
-            database_path TEXT NOT NULL,
-            database_identity TEXT NOT NULL,
-            database_device INTEGER NOT NULL,
-            database_inode INTEGER NOT NULL,
-            broker_artifact_hash TEXT NOT NULL CHECK (
-                length(broker_artifact_hash) = 64
-                AND broker_artifact_hash = lower(broker_artifact_hash)
-            ),
-            broker_receipt_id TEXT NOT NULL,
-            broker_public_key_fingerprint TEXT NOT NULL CHECK (
-                length(broker_public_key_fingerprint) = 64
-                AND broker_public_key_fingerprint = lower(broker_public_key_fingerprint)
-            ),
-            broker_evidence_expires_at TEXT NOT NULL,
             observed_from TEXT NOT NULL,
             observed_through TEXT NOT NULL,
             retrieved_at TEXT NOT NULL,
@@ -76,7 +62,6 @@ async def _migration_v1(connection: aiosqlite.Connection) -> None:
             ),
             started_at TEXT NOT NULL,
             completed_at TEXT NOT NULL,
-            eligible_until TEXT NOT NULL,
             status TEXT NOT NULL CHECK (status IN ('passed', 'degraded', 'quarantined')),
             evidence_fresh INTEGER NOT NULL CHECK (evidence_fresh IN (0, 1)),
             comparison_complete INTEGER NOT NULL CHECK (comparison_complete IN (0, 1)),
@@ -124,7 +109,6 @@ async def _migration_v1(connection: aiosqlite.Connection) -> None:
                     AND materiality = 'material')
             ),
             UNIQUE(run_id, ordinal),
-            UNIQUE(run_id, difference_id),
             FOREIGN KEY(run_id) REFERENCES rt_reconciliation_runs(run_id)
         )
     """)
@@ -143,8 +127,7 @@ async def _migration_v1(connection: aiosqlite.Connection) -> None:
             evidence_reference TEXT,
             created_at TEXT NOT NULL,
             FOREIGN KEY(run_id) REFERENCES rt_reconciliation_runs(run_id),
-            FOREIGN KEY(run_id, difference_id)
-                REFERENCES rt_reconciliation_differences(run_id, difference_id)
+            FOREIGN KEY(difference_id) REFERENCES rt_reconciliation_differences(difference_id)
         )
     """)
     for table in _TABLES:
@@ -164,8 +147,112 @@ async def _migration_v1(connection: aiosqlite.Connection) -> None:
         """)
 
 
+async def _migration_v2(connection: aiosqlite.Connection) -> None:
+    """Add exact runtime lineage without rewriting any v1 table or row."""
+
+    await connection.execute("""
+        CREATE TABLE IF NOT EXISTS rt_reconciliation_snapshot_lineage (
+            snapshot_id TEXT PRIMARY KEY,
+            schema_version INTEGER NOT NULL CHECK (schema_version = 2),
+            account_alias TEXT NOT NULL,
+            snapshot_hash TEXT NOT NULL CHECK (
+                length(snapshot_hash) = 64 AND snapshot_hash = lower(snapshot_hash)
+            ),
+            bundle_id TEXT NOT NULL,
+            runtime_fingerprint TEXT NOT NULL,
+            database_path TEXT NOT NULL,
+            database_identity TEXT NOT NULL,
+            database_device INTEGER NOT NULL,
+            database_inode INTEGER NOT NULL,
+            broker_artifact_hash TEXT NOT NULL CHECK (
+                length(broker_artifact_hash) = 64
+                AND broker_artifact_hash = lower(broker_artifact_hash)
+            ),
+            broker_receipt_id TEXT NOT NULL,
+            broker_public_key_fingerprint TEXT NOT NULL CHECK (
+                length(broker_public_key_fingerprint) = 64
+                AND broker_public_key_fingerprint = lower(broker_public_key_fingerprint)
+            ),
+            broker_evidence_expires_at TEXT NOT NULL,
+            reconciliation_snapshot_id TEXT NOT NULL,
+            reconciliation_artifact_path TEXT NOT NULL,
+            reconciliation_artifact_hash TEXT NOT NULL CHECK (
+                length(reconciliation_artifact_hash) = 64
+                AND reconciliation_artifact_hash = lower(reconciliation_artifact_hash)
+            ),
+            reconciliation_receipt_id TEXT NOT NULL,
+            reconciliation_public_key_fingerprint TEXT NOT NULL CHECK (
+                length(reconciliation_public_key_fingerprint) = 64
+                AND reconciliation_public_key_fingerprint =
+                    lower(reconciliation_public_key_fingerprint)
+            ),
+            reconciliation_signature_ed25519 TEXT NOT NULL,
+            reconciliation_evidence_issued_at TEXT NOT NULL,
+            reconciliation_evidence_expires_at TEXT NOT NULL,
+            persisted_at TEXT NOT NULL,
+            FOREIGN KEY(snapshot_id) REFERENCES rt_reconciliation_snapshots(snapshot_id)
+        )
+    """)
+    await connection.execute("""
+        CREATE TABLE IF NOT EXISTS rt_reconciliation_run_eligibility (
+            run_id TEXT PRIMARY KEY,
+            schema_version INTEGER NOT NULL CHECK (schema_version = 2),
+            eligible_until TEXT NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES rt_reconciliation_runs(run_id)
+        )
+    """)
+    await connection.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS
+            rt_reconciliation_differences_run_difference_uq
+        ON rt_reconciliation_differences(run_id, difference_id)
+    """)
+    await connection.execute("""
+        CREATE TABLE IF NOT EXISTS rt_reconciliation_operator_resolution_bindings (
+            resolution_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            difference_id TEXT NOT NULL,
+            FOREIGN KEY(resolution_id)
+                REFERENCES rt_reconciliation_operator_resolutions(resolution_id),
+            FOREIGN KEY(run_id, difference_id)
+                REFERENCES rt_reconciliation_differences(run_id, difference_id)
+        )
+    """)
+    await connection.execute("""
+        INSERT INTO rt_reconciliation_operator_resolution_bindings(
+            resolution_id, run_id, difference_id
+        )
+        SELECT resolution_id, run_id, difference_id
+        FROM rt_reconciliation_operator_resolutions
+    """)
+    await connection.execute("""
+        CREATE TRIGGER IF NOT EXISTS rt_reconciliation_operator_resolution_bind
+        AFTER INSERT ON rt_reconciliation_operator_resolutions
+        BEGIN
+            INSERT INTO rt_reconciliation_operator_resolution_bindings(
+                resolution_id, run_id, difference_id
+            ) VALUES (NEW.resolution_id, NEW.run_id, NEW.difference_id);
+        END
+    """)
+    for table in _V2_TABLES:
+        await connection.execute(f"""
+            CREATE TRIGGER IF NOT EXISTS {table}_no_update
+            BEFORE UPDATE ON {table}
+            BEGIN
+                SELECT RAISE(ABORT, 'reconciliation evidence is append-only');
+            END
+        """)
+        await connection.execute(f"""
+            CREATE TRIGGER IF NOT EXISTS {table}_no_delete
+            BEFORE DELETE ON {table}
+            BEGIN
+                SELECT RAISE(ABORT, 'reconciliation evidence is append-only');
+            END
+        """)
+
+
 _MIGRATIONS: tuple[tuple[int, Callable[[aiosqlite.Connection], Awaitable[None]]], ...] = (
     (1, _migration_v1),
+    (2, _migration_v2),
 )
 
 _EXPECTED_COLUMNS = {
@@ -173,18 +260,6 @@ _EXPECTED_COLUMNS = {
         "snapshot_id",
         "schema_version",
         "account_scope",
-        "account_alias",
-        "snapshot_hash",
-        "bundle_id",
-        "runtime_fingerprint",
-        "database_path",
-        "database_identity",
-        "database_device",
-        "database_inode",
-        "broker_artifact_hash",
-        "broker_receipt_id",
-        "broker_public_key_fingerprint",
-        "broker_evidence_expires_at",
         "observed_from",
         "observed_through",
         "retrieved_at",
@@ -202,7 +277,6 @@ _EXPECTED_COLUMNS = {
         "expected_account_scope",
         "started_at",
         "completed_at",
-        "eligible_until",
         "status",
         "evidence_fresh",
         "comparison_complete",
@@ -236,22 +310,53 @@ _EXPECTED_COLUMNS = {
         "evidence_reference",
         "created_at",
     },
+    "rt_reconciliation_snapshot_lineage": {
+        "snapshot_id",
+        "schema_version",
+        "account_alias",
+        "snapshot_hash",
+        "bundle_id",
+        "runtime_fingerprint",
+        "database_path",
+        "database_identity",
+        "database_device",
+        "database_inode",
+        "broker_artifact_hash",
+        "broker_receipt_id",
+        "broker_public_key_fingerprint",
+        "broker_evidence_expires_at",
+        "reconciliation_snapshot_id",
+        "reconciliation_artifact_path",
+        "reconciliation_artifact_hash",
+        "reconciliation_receipt_id",
+        "reconciliation_public_key_fingerprint",
+        "reconciliation_signature_ed25519",
+        "reconciliation_evidence_issued_at",
+        "reconciliation_evidence_expires_at",
+        "persisted_at",
+    },
+    "rt_reconciliation_run_eligibility": {
+        "run_id",
+        "schema_version",
+        "eligible_until",
+    },
+    "rt_reconciliation_operator_resolution_bindings": {
+        "resolution_id",
+        "run_id",
+        "difference_id",
+    },
 }
 
 _REQUIRED_TABLE_SQL = {
     "rt_reconciliation_snapshots": (
         "schema_version integer not null check (schema_version = 1)",
         "length(account_scope) = 72",
-        "length(snapshot_hash) = 64 and snapshot_hash = lower(snapshot_hash)",
-        "length(broker_artifact_hash) = 64 and broker_artifact_hash = "
-        "lower(broker_artifact_hash)",
         "check (json_valid(payload_json))",
         "length(payload_sha256) = 64 and payload_sha256 = lower(payload_sha256)",
     ),
     "rt_reconciliation_runs": (
         "trigger_type in ('startup', 'reconnect', 'periodic', 'before_live', " "'ambiguous_order')",
         "status in ('passed', 'degraded', 'quarantined')",
-        "eligible_until text not null",
         "status = 'quarantined' and quarantine_required = 1 and entry_eligible = 0",
         "foreign key(snapshot_id) references rt_reconciliation_snapshots(snapshot_id)",
     ),
@@ -259,7 +364,6 @@ _REQUIRED_TABLE_SQL = {
         "kind = 'expected_timing_lag' and materiality = 'informational'",
         "kind = 'unknown' and materiality = 'unknown'",
         "unique(run_id, ordinal)",
-        "unique(run_id, difference_id)",
         "foreign key(run_id) references rt_reconciliation_runs(run_id)",
     ),
     "rt_reconciliation_operator_resolutions": (
@@ -267,6 +371,20 @@ _REQUIRED_TABLE_SQL = {
         "'investigation_note')",
         "length(trim(reason)) >= 10",
         "foreign key(run_id) references rt_reconciliation_runs(run_id)",
+        "foreign key(difference_id) references rt_reconciliation_differences(difference_id)",
+    ),
+    "rt_reconciliation_snapshot_lineage": (
+        "schema_version integer not null check (schema_version = 2)",
+        "foreign key(snapshot_id) references rt_reconciliation_snapshots(snapshot_id)",
+        "length(reconciliation_artifact_hash) = 64",
+    ),
+    "rt_reconciliation_run_eligibility": (
+        "schema_version integer not null check (schema_version = 2)",
+        "foreign key(run_id) references rt_reconciliation_runs(run_id)",
+    ),
+    "rt_reconciliation_operator_resolution_bindings": (
+        "foreign key(resolution_id) references "
+        "rt_reconciliation_operator_resolutions(resolution_id)",
         "foreign key(run_id, difference_id) references "
         "rt_reconciliation_differences(run_id, difference_id)",
     ),
@@ -361,16 +479,17 @@ async def assert_reconciliation_schema(connection: aiosqlite.Connection) -> None
         if any(_normalized_sql(fragment) not in table_sql.get(table, "") for fragment in fragments):
             raise RuntimeError(f"reconciliation table {table} constraints are malformed")
     trigger_rows = await connection.execute(
-        "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name IN (?, ?, ?, ?)",
-        _TABLES,
+        "SELECT name, sql FROM sqlite_master "
+        "WHERE type = 'trigger' AND tbl_name LIKE 'rt_reconciliation_%'"
     )
     triggers = {str(row[0]): _canonical_schema_sql(row[1]) for row in await trigger_rows.fetchall()}
     expected_names = {
-        f"{table}_{suffix}" for table in _TABLES for suffix in ("no_update", "no_delete")
+        f"{table}_{suffix}" for table in _ALL_TABLES for suffix in ("no_update", "no_delete")
     }
+    expected_names.add("rt_reconciliation_operator_resolution_bind")
     if set(triggers) != expected_names:
         raise RuntimeError("reconciliation append-only trigger set is malformed")
-    for table in _TABLES:
+    for table in _ALL_TABLES:
         for suffix, operation in (("no_update", "update"), ("no_delete", "delete")):
             name = f"{table}_{suffix}"
             expected_trigger = _normalized_sql(f"""
@@ -382,6 +501,40 @@ async def assert_reconciliation_schema(connection: aiosqlite.Connection) -> None
                 """)
             if triggers[name] != expected_trigger:
                 raise RuntimeError(f"reconciliation trigger {name} is malformed")
+    expected_bind_trigger = _normalized_sql("""
+        CREATE TRIGGER rt_reconciliation_operator_resolution_bind
+        AFTER INSERT ON rt_reconciliation_operator_resolutions
+        BEGIN
+            INSERT INTO rt_reconciliation_operator_resolution_bindings(
+                resolution_id, run_id, difference_id
+            ) VALUES (NEW.resolution_id, NEW.run_id, NEW.difference_id);
+        END
+        """)
+    if triggers["rt_reconciliation_operator_resolution_bind"] != expected_bind_trigger:
+        raise RuntimeError("reconciliation resolution binding trigger is malformed")
+    index = await connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' "
+        "AND name='rt_reconciliation_differences_run_difference_uq'"
+    )
+    index_row = await index.fetchone()
+    expected_index = _normalized_sql("""
+        CREATE UNIQUE INDEX rt_reconciliation_differences_run_difference_uq
+        ON rt_reconciliation_differences(run_id, difference_id)
+        """)
+    if index_row is None or _canonical_schema_sql(index_row[0]) != expected_index:
+        raise RuntimeError("reconciliation composite identity index is malformed")
     violations = await connection.execute("PRAGMA foreign_key_check")
     if await violations.fetchone() is not None:
         raise RuntimeError("reconciliation schema contains foreign-key violations")
+    unbound_resolutions = await connection.execute("""
+        SELECT 1
+        FROM rt_reconciliation_operator_resolutions AS resolution
+        LEFT JOIN rt_reconciliation_operator_resolution_bindings AS binding
+          ON binding.resolution_id = resolution.resolution_id
+         AND binding.run_id = resolution.run_id
+         AND binding.difference_id = resolution.difference_id
+        WHERE binding.resolution_id IS NULL
+        LIMIT 1
+        """)
+    if await unbound_resolutions.fetchone() is not None:
+        raise RuntimeError("reconciliation resolution lacks composite run binding")

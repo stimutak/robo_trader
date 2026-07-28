@@ -279,10 +279,7 @@ class ReconciliationPersistence:
             await assert_reconciliation_schema(connection)
             existing = await connection.execute(
                 """
-                SELECT payload_sha256, payload_json, runtime_fingerprint,
-                       database_identity, database_device, database_inode,
-                       broker_artifact_hash, broker_receipt_id,
-                       broker_public_key_fingerprint, bundle_id, snapshot_hash
+                SELECT payload_sha256, payload_json
                 FROM rt_reconciliation_snapshots WHERE snapshot_id = ?
                 """,
                 (snapshot.snapshot_id,),
@@ -292,31 +289,15 @@ class ReconciliationPersistence:
                 await connection.execute(
                     """
                     INSERT INTO rt_reconciliation_snapshots(
-                        snapshot_id, schema_version, account_scope, account_alias,
-                        snapshot_hash, bundle_id, runtime_fingerprint, database_path,
-                        database_identity, database_device, database_inode,
-                        broker_artifact_hash, broker_receipt_id,
-                        broker_public_key_fingerprint, broker_evidence_expires_at,
-                        observed_from, observed_through, retrieved_at, complete,
-                        payload_json, payload_sha256, persisted_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        snapshot_id, schema_version, account_scope, observed_from,
+                        observed_through, retrieved_at, complete, payload_json,
+                        payload_sha256, persisted_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         snapshot.snapshot_id,
                         snapshot.schema_version,
                         runtime_evidence.account_scope,
-                        runtime_evidence.account_alias,
-                        runtime_evidence.snapshot_hash,
-                        runtime_evidence.bundle_id,
-                        runtime_evidence.runtime_fingerprint,
-                        runtime_evidence.database_path,
-                        runtime_evidence.database_identity,
-                        runtime_evidence.database_device,
-                        runtime_evidence.database_inode,
-                        runtime_evidence.broker_artifact_hash,
-                        runtime_evidence.broker_receipt_id,
-                        runtime_evidence.broker_public_key_fingerprint,
-                        canonical_timestamp(runtime_evidence.expires_at),
                         canonical_timestamp(snapshot.observed_from),
                         canonical_timestamp(snapshot.observed_through),
                         canonical_timestamp(snapshot.retrieved_at),
@@ -326,28 +307,81 @@ class ReconciliationPersistence:
                         canonical_timestamp(completed),
                     ),
                 )
-            elif tuple(existing_row) != (
-                _sha256(snapshot_payload),
-                snapshot_payload,
+            elif tuple(existing_row) != (_sha256(snapshot_payload), snapshot_payload):
+                raise ReconciliationPersistenceError(
+                    "stored snapshot identity has conflicting evidence"
+                )
+            lineage_values = (
+                snapshot.snapshot_id,
+                2,
+                runtime_evidence.account_alias,
+                runtime_evidence.snapshot_hash,
+                runtime_evidence.bundle_id,
                 runtime_evidence.runtime_fingerprint,
+                runtime_evidence.database_path,
                 runtime_evidence.database_identity,
                 runtime_evidence.database_device,
                 runtime_evidence.database_inode,
                 runtime_evidence.broker_artifact_hash,
                 runtime_evidence.broker_receipt_id,
                 runtime_evidence.broker_public_key_fingerprint,
-                runtime_evidence.bundle_id,
-                runtime_evidence.snapshot_hash,
-            ):
+                canonical_timestamp(runtime_evidence.broker_evidence_expires_at),
+                runtime_evidence.reconciliation_snapshot_id,
+                runtime_evidence.reconciliation_artifact_path,
+                runtime_evidence.reconciliation_artifact_hash,
+                runtime_evidence.reconciliation_receipt_id,
+                runtime_evidence.reconciliation_public_key_fingerprint,
+                runtime_evidence.reconciliation_signature_ed25519,
+                canonical_timestamp(runtime_evidence.reconciliation_evidence_issued_at),
+                canonical_timestamp(runtime_evidence.reconciliation_evidence_expires_at),
+            )
+            existing_lineage = await connection.execute(
+                """
+                SELECT snapshot_id, schema_version, account_alias, snapshot_hash,
+                       bundle_id, runtime_fingerprint, database_path, database_identity,
+                       database_device, database_inode, broker_artifact_hash,
+                       broker_receipt_id, broker_public_key_fingerprint,
+                       broker_evidence_expires_at, reconciliation_snapshot_id,
+                       reconciliation_artifact_path, reconciliation_artifact_hash,
+                       reconciliation_receipt_id,
+                       reconciliation_public_key_fingerprint,
+                       reconciliation_signature_ed25519,
+                       reconciliation_evidence_issued_at,
+                       reconciliation_evidence_expires_at
+                FROM rt_reconciliation_snapshot_lineage WHERE snapshot_id = ?
+                """,
+                (snapshot.snapshot_id,),
+            )
+            existing_lineage_row = await existing_lineage.fetchone()
+            if existing_lineage_row is None:
+                await connection.execute(
+                    """
+                    INSERT INTO rt_reconciliation_snapshot_lineage(
+                        snapshot_id, schema_version, account_alias, snapshot_hash,
+                        bundle_id, runtime_fingerprint, database_path, database_identity,
+                        database_device, database_inode, broker_artifact_hash,
+                        broker_receipt_id, broker_public_key_fingerprint,
+                        broker_evidence_expires_at, reconciliation_snapshot_id,
+                        reconciliation_artifact_path, reconciliation_artifact_hash,
+                        reconciliation_receipt_id,
+                        reconciliation_public_key_fingerprint,
+                        reconciliation_signature_ed25519,
+                        reconciliation_evidence_issued_at,
+                        reconciliation_evidence_expires_at, persisted_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (*lineage_values, canonical_timestamp(completed)),
+                )
+            elif tuple(existing_lineage_row) != lineage_values:
                 raise ReconciliationPersistenceError(
-                    "stored snapshot identity has conflicting evidence"
+                    "stored snapshot lineage has conflicting evidence"
                 )
 
             entry_eligible = not verdict.quarantine_required
             existing_run = await connection.execute(
                 """
                 SELECT snapshot_id, trigger_type, verdict_id, verdict_payload_json,
-                       verdict_sha256, entry_eligible, eligible_until
+                       verdict_sha256, entry_eligible
                 FROM rt_reconciliation_runs WHERE run_id = ?
                 """,
                 (run_id,),
@@ -361,7 +395,6 @@ class ReconciliationPersistence:
                     verdict_payload,
                     _sha256(verdict_payload),
                     int(entry_eligible),
-                    canonical_timestamp(eligibility_expiry),
                 )
                 if tuple(existing_run_row) != expected_run_row:
                     raise ReconciliationPersistenceError(
@@ -380,6 +413,20 @@ class ReconciliationPersistence:
                     raise ReconciliationPersistenceError(
                         "stored reconciliation differences are incomplete"
                     )
+                existing_eligibility = await connection.execute(
+                    """
+                    SELECT schema_version, eligible_until
+                    FROM rt_reconciliation_run_eligibility WHERE run_id = ?
+                    """,
+                    (run_id,),
+                )
+                if await existing_eligibility.fetchone() != (
+                    2,
+                    canonical_timestamp(eligibility_expiry),
+                ):
+                    raise ReconciliationPersistenceError(
+                        "stored reconciliation eligibility has conflicting evidence"
+                    )
                 await self._assert_binding(connection, binding, runtime_evidence)
                 await connection.execute("COMMIT")
                 return PersistedReconciliation(
@@ -394,10 +441,9 @@ class ReconciliationPersistence:
                 INSERT INTO rt_reconciliation_runs(
                     run_id, schema_version, trigger_type, snapshot_id, verdict_id,
                     expected_account_scope, started_at, completed_at, status,
-                    eligible_until,
                     evidence_fresh, comparison_complete, quarantine_required,
                     entry_eligible, coverage_json, verdict_payload_json, verdict_sha256
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -409,7 +455,6 @@ class ReconciliationPersistence:
                     canonical_timestamp(started),
                     canonical_timestamp(completed),
                     verdict.status.value,
-                    canonical_timestamp(eligibility_expiry),
                     int(verdict.evidence_fresh),
                     int(verdict.comparison_complete),
                     int(verdict.quarantine_required),
@@ -418,6 +463,14 @@ class ReconciliationPersistence:
                     verdict_payload,
                     _sha256(verdict_payload),
                 ),
+            )
+            await connection.execute(
+                """
+                INSERT INTO rt_reconciliation_run_eligibility(
+                    run_id, schema_version, eligible_until
+                ) VALUES (?, ?, ?)
+                """,
+                (run_id, 2, canonical_timestamp(eligibility_expiry)),
             )
             for ordinal, (difference_id, difference, payload) in enumerate(difference_rows):
                 await connection.execute(

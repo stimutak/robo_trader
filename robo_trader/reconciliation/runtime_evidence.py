@@ -7,9 +7,10 @@ import hmac
 import secrets
 import threading
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import SupportsIndex
 
 from robo_trader.bootstrap_evidence_receivers import (
     ProtectiveMarkBundleIdentity,
@@ -18,6 +19,10 @@ from robo_trader.bootstrap_evidence_receivers import (
     assert_protective_mark_receiver_capability,
 )
 from robo_trader.config import RuntimeContract
+from robo_trader.financial_state_bootstrap import (
+    ExactStateBootstrapEvidence,
+    assert_verified_exact_state_reconciliation_evidence,
+)
 from robo_trader.safety.sqlite_identity import SQLitePathBinding
 
 from .domain import (
@@ -28,6 +33,12 @@ from .domain import (
     canonical_timestamp,
 )
 from .identity import RuntimeSafetyContext, assert_validated_runtime_safety_context
+from .policy import (
+    ExpectedTimingLagProof,
+    ReconciliationCoverage,
+    ReconciliationDifference,
+    ReconciliationStatus,
+)
 
 _CAPABILITY_MARKER = object()
 _CAPABILITY_KEY = secrets.token_bytes(32)
@@ -36,6 +47,8 @@ _CAPABILITIES: dict[
     int,
     tuple[weakref.ReferenceType["VerifiedRuntimeReconciliationEvidence"], str],
 ] = {}
+_COMPARISON_CONSUMPTION_LOCK = threading.Lock()
+_CONSUMED_COMPARISON_LINEAGES: set[tuple[str, str, str]] = set()
 
 
 class RuntimeReconciliationEvidenceError(ReconciliationDomainError):
@@ -65,13 +78,53 @@ def _strict_text(value: object, field_name: str) -> str:
     return value
 
 
-@dataclass(frozen=True, slots=True, weakref_slot=True, repr=False)
+@dataclass(frozen=True, repr=False)
 class VerifiedRuntimeReconciliationEvidence:
     """One exact core-authenticated broker generation and runtime ledger binding."""
+
+    # Python 3.10 predates dataclass(weakref_slot=True). Explicit slots keep the
+    # capability immutable, dictionary-free, and weak-referenceable throughout
+    # the supported 3.10+ interpreter range.
+    __slots__ = (
+        "snapshot",
+        "snapshot_id",
+        "snapshot_hash",
+        "comparison_coverage",
+        "differences",
+        "timing_lag_proofs",
+        "bundle_id",
+        "runtime_fingerprint",
+        "account_scope",
+        "account_alias",
+        "database_path",
+        "database_identity",
+        "database_device",
+        "database_inode",
+        "broker_artifact_hash",
+        "broker_receipt_id",
+        "broker_public_key_fingerprint",
+        "broker_evidence_expires_at",
+        "reconciliation_snapshot_id",
+        "reconciliation_artifact_path",
+        "reconciliation_artifact_hash",
+        "reconciliation_receipt_id",
+        "reconciliation_public_key_fingerprint",
+        "reconciliation_signature_ed25519",
+        "reconciliation_evidence_issued_at",
+        "reconciliation_evidence_expires_at",
+        "issued_at",
+        "expires_at",
+        "_runtime_context",
+        "_marker",
+        "__weakref__",
+    )
 
     snapshot: NormalizedBrokerSnapshot
     snapshot_id: str
     snapshot_hash: str
+    comparison_coverage: ReconciliationCoverage
+    differences: tuple[ReconciliationDifference, ...]
+    timing_lag_proofs: tuple[ExpectedTimingLagProof, ...]
     bundle_id: str
     runtime_fingerprint: str
     account_scope: str
@@ -83,10 +136,19 @@ class VerifiedRuntimeReconciliationEvidence:
     broker_artifact_hash: str
     broker_receipt_id: str
     broker_public_key_fingerprint: str
+    broker_evidence_expires_at: datetime
+    reconciliation_snapshot_id: str
+    reconciliation_artifact_path: str
+    reconciliation_artifact_hash: str
+    reconciliation_receipt_id: str
+    reconciliation_public_key_fingerprint: str
+    reconciliation_signature_ed25519: str
+    reconciliation_evidence_issued_at: datetime
+    reconciliation_evidence_expires_at: datetime
     issued_at: datetime
     expires_at: datetime
-    _runtime_context: RuntimeSafetyContext = field(repr=False, compare=False)
-    _marker: object = field(repr=False, compare=False)
+    _runtime_context: RuntimeSafetyContext
+    _marker: object
 
     def __post_init__(self) -> None:
         if self._marker is not _CAPABILITY_MARKER:
@@ -101,13 +163,29 @@ class VerifiedRuntimeReconciliationEvidence:
             "broker_artifact_hash": self.broker_artifact_hash,
             "broker_public_key_fingerprint": self.broker_public_key_fingerprint,
             "broker_receipt_id": self.broker_receipt_id,
+            "broker_evidence_expires_at": canonical_timestamp(self.broker_evidence_expires_at),
             "bundle_id": self.bundle_id,
+            "comparison_coverage": self.comparison_coverage.canonical_dict(),
             "database_device": self.database_device,
             "database_identity": self.database_identity,
             "database_inode": self.database_inode,
             "database_path": self.database_path,
             "expires_at": canonical_timestamp(self.expires_at),
             "issued_at": canonical_timestamp(self.issued_at),
+            "differences": [value.canonical_dict() for value in self.differences],
+            "timing_lag_proofs": [value.canonical_dict() for value in self.timing_lag_proofs],
+            "reconciliation_artifact_hash": self.reconciliation_artifact_hash,
+            "reconciliation_artifact_path": self.reconciliation_artifact_path,
+            "reconciliation_evidence_expires_at": canonical_timestamp(
+                self.reconciliation_evidence_expires_at
+            ),
+            "reconciliation_evidence_issued_at": canonical_timestamp(
+                self.reconciliation_evidence_issued_at
+            ),
+            "reconciliation_public_key_fingerprint": (self.reconciliation_public_key_fingerprint),
+            "reconciliation_receipt_id": self.reconciliation_receipt_id,
+            "reconciliation_signature_ed25519": self.reconciliation_signature_ed25519,
+            "reconciliation_snapshot_id": self.reconciliation_snapshot_id,
             "runtime_fingerprint": self.runtime_fingerprint,
             "snapshot_hash": self.snapshot_hash,
             "snapshot_id": self.snapshot_id,
@@ -121,6 +199,10 @@ class VerifiedRuntimeReconciliationEvidence:
         raise TypeError("runtime reconciliation evidence cannot be copied")
 
     def __reduce__(self) -> str:
+        raise TypeError("runtime reconciliation evidence cannot be pickled")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str:
+        del protocol
         raise TypeError("runtime reconciliation evidence cannot be pickled")
 
 
@@ -166,6 +248,7 @@ def _database_binding(runtime_contract: RuntimeContract) -> SQLitePathBinding:
 
 def bind_verified_runtime_reconciliation_evidence(
     verified_broker_evidence: object,
+    verified_exact_state_evidence: object,
     runtime_context: object,
     protective_mark_receiver: object,
 ) -> VerifiedRuntimeReconciliationEvidence:
@@ -182,6 +265,10 @@ def bind_verified_runtime_reconciliation_evidence(
         raise RuntimeReconciliationEvidenceError("exact RuntimeContract is required")
     try:
         broker = assert_and_consume_verified_broker_evidence(verified_broker_evidence)
+        exact_state = assert_verified_exact_state_reconciliation_evidence(
+            verified_exact_state_evidence,
+            contract,
+        )
         bundle = assert_protective_mark_receiver_capability(
             protective_mark_receiver,
             runtime_contract=contract,
@@ -193,8 +280,31 @@ def bind_verified_runtime_reconciliation_evidence(
     if (
         type(broker) is not VerifiedBrokerEvidenceEnvelope
         or type(bundle) is not ProtectiveMarkBundleIdentity
+        or type(exact_state) is not ExactStateBootstrapEvidence
     ):
         raise RuntimeReconciliationEvidenceError("core evidence types are not exact")
+
+    reconciliation_receipts = tuple(
+        receipt
+        for receipt in exact_state.authentication_receipts
+        if receipt.artifact_kind == "reconciliation_report"
+    )
+    if len(reconciliation_receipts) != 1:
+        raise RuntimeReconciliationEvidenceError(
+            "signed reconciliation receipt lineage is incomplete"
+        )
+    reconciliation_receipt = reconciliation_receipts[0]
+    comparison_lineage = (
+        exact_state.reconciliation_snapshot_id,
+        reconciliation_receipt.receipt_id,
+        reconciliation_receipt.signature_ed25519,
+    )
+    with _COMPARISON_CONSUMPTION_LOCK:
+        if comparison_lineage in _CONSUMED_COMPARISON_LINEAGES:
+            raise RuntimeReconciliationEvidenceError(
+                "signed reconciliation comparison was already consumed"
+            )
+        _CONSUMED_COMPARISON_LINEAGES.add(comparison_lineage)
 
     snapshot = broker.snapshot
     snapshot_hash = hashlib.sha256(snapshot.canonical_payload().encode("utf-8")).hexdigest()
@@ -216,11 +326,40 @@ def bind_verified_runtime_reconciliation_evidence(
             bundle.broker_public_key_fingerprint,
             broker.public_key_fingerprint,
         )
+        or exact_state.reconciliation_status is not ReconciliationStatus.PASSED
+        or type(exact_state.reconciliation_coverage) is not ReconciliationCoverage
+        or exact_state.reconciliation_snapshot_id != bundle.reconciliation_snapshot_id
+        or exact_state.bundle_id != bundle.bundle_id
+        or exact_state.runtime_fingerprint != contract.fingerprint
+        or exact_state.account_scope != broker.account_scope
+        or exact_state.database_path != contract.database_path
+        or exact_state.database_identity != contract.database_identity
+        or (exact_state.database_device, exact_state.database_inode)
+        != (bundle.database_device, bundle.database_inode)
+        or exact_state.broker_snapshot_id != broker.snapshot_id
+        or not hmac.compare_digest(exact_state.broker_snapshot_hash, broker.artifact_hash)
+        or reconciliation_receipt.artifact_sha256 != exact_state.reconciliation_report_hash
+        or reconciliation_receipt.runtime_fingerprint != contract.fingerprint
+        or reconciliation_receipt.account_scope != broker.account_scope
     ):
         raise RuntimeReconciliationEvidenceError("core evidence bindings disagree")
     issued_at = _timestamp(broker.issued_at, "broker evidence issued_at")
-    expires_at = _timestamp(broker.expires_at, "broker evidence expires_at")
-    if not snapshot.retrieved_at <= issued_at <= expires_at:
+    broker_expires_at = _timestamp(broker.expires_at, "broker evidence expires_at")
+    reconciliation_issued_at = _timestamp(
+        reconciliation_receipt.issued_at,
+        "reconciliation evidence issued_at",
+    )
+    reconciliation_expires_at = _timestamp(
+        reconciliation_receipt.expires_at,
+        "reconciliation evidence expires_at",
+    )
+    expires_at = min(broker_expires_at, reconciliation_expires_at)
+    if (
+        not snapshot.retrieved_at <= issued_at <= broker_expires_at
+        or not exact_state.reconciliation_generated_at
+        <= reconciliation_issued_at
+        <= reconciliation_expires_at
+    ):
         raise RuntimeReconciliationEvidenceError("broker evidence chronology is invalid")
     binding = _database_binding(contract)
     try:
@@ -236,6 +375,11 @@ def bind_verified_runtime_reconciliation_evidence(
         (broker.artifact_hash, "broker artifact hash"),
         (broker.public_key_fingerprint, "broker public-key fingerprint"),
         (broker.snapshot_hash, "broker snapshot hash"),
+        (exact_state.reconciliation_report_hash, "reconciliation artifact hash"),
+        (
+            reconciliation_receipt.public_key_fingerprint,
+            "reconciliation public-key fingerprint",
+        ),
     ):
         _hash(value, field_name)
     for value, field_name in (
@@ -243,6 +387,9 @@ def bind_verified_runtime_reconciliation_evidence(
         (broker.receipt_id, "broker receipt_id"),
         (contract.database_identity, "database_identity"),
         (contract.fingerprint, "runtime_fingerprint"),
+        (exact_state.reconciliation_snapshot_id, "reconciliation_snapshot_id"),
+        (reconciliation_receipt.receipt_id, "reconciliation receipt_id"),
+        (reconciliation_receipt.signature_ed25519, "reconciliation signature"),
     ):
         _strict_text(value, field_name)
     if type(bundle.database_device) is not int or type(bundle.database_inode) is not int:
@@ -253,6 +400,9 @@ def bind_verified_runtime_reconciliation_evidence(
             snapshot=snapshot,
             snapshot_id=snapshot.snapshot_id,
             snapshot_hash=snapshot_hash,
+            comparison_coverage=exact_state.reconciliation_coverage,
+            differences=(),
+            timing_lag_proofs=(),
             bundle_id=bundle.bundle_id,
             runtime_fingerprint=contract.fingerprint,
             account_scope=broker.account_scope,
@@ -264,6 +414,15 @@ def bind_verified_runtime_reconciliation_evidence(
             broker_artifact_hash=broker.artifact_hash,
             broker_receipt_id=broker.receipt_id,
             broker_public_key_fingerprint=broker.public_key_fingerprint,
+            broker_evidence_expires_at=broker_expires_at,
+            reconciliation_snapshot_id=exact_state.reconciliation_snapshot_id,
+            reconciliation_artifact_path=exact_state.reconciliation_artifact_path,
+            reconciliation_artifact_hash=exact_state.reconciliation_report_hash,
+            reconciliation_receipt_id=reconciliation_receipt.receipt_id,
+            reconciliation_public_key_fingerprint=(reconciliation_receipt.public_key_fingerprint),
+            reconciliation_signature_ed25519=reconciliation_receipt.signature_ed25519,
+            reconciliation_evidence_issued_at=reconciliation_issued_at,
+            reconciliation_evidence_expires_at=reconciliation_expires_at,
             issued_at=issued_at,
             expires_at=expires_at,
             _runtime_context=context,
