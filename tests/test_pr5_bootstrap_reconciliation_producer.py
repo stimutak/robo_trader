@@ -614,14 +614,11 @@ def test_completed_broker_history_remains_diagnostic_not_simulator_equality(
 @pytest.mark.parametrize(
     "snapshot",
     [
-        _snapshot(positions=(_position(),)),
-        _snapshot(orders=(_order(),)),
         _snapshot(complete=False),
-        _snapshot(retrieved_at=NOW - timedelta(minutes=5)),
         _snapshot(scope=OTHER_ACCOUNT_SCOPE),
     ],
 )
-def test_exposure_incomplete_stale_or_wrong_account_blocks(
+def test_incomplete_or_wrong_account_blocks(
     database: Path,
     snapshot: NormalizedBrokerSnapshot,
 ) -> None:
@@ -631,6 +628,39 @@ def test_exposure_incomplete_stale_or_wrong_account_blocks(
         _produce(database, snapshot=snapshot, receiver=receiver)
 
     assert receiver.results == []
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "reason_code"),
+    [
+        (
+            _snapshot(positions=(_position(),)),
+            "UNEXPECTED_IBKR_POSITION_IN_PAPER_SIMULATOR",
+        ),
+        (
+            _snapshot(orders=(_order(),)),
+            "UNEXPECTED_IBKR_OPEN_ORDER_IN_PAPER_SIMULATOR",
+        ),
+        (
+            _snapshot(retrieved_at=NOW - timedelta(minutes=5)),
+            "BROKER_EVIDENCE_STALE",
+        ),
+    ],
+)
+def test_authenticated_mismatch_is_signed_for_quarantine_persistence(
+    database: Path,
+    snapshot: NormalizedBrokerSnapshot,
+    reason_code: str,
+) -> None:
+    _, receiver, _ = _produce(database, snapshot=snapshot)
+
+    result = receiver.results[0]
+    assert result.reconciliation_status is ReconciliationStatus.QUARANTINED
+    assert reason_code in {
+        difference.reason_code for difference in result.reconciliation_differences
+    }
+    assert result.authorizes_startup is False
+    assert result.mutated_state is False
 
 
 def test_stale_internal_clock_blocks_without_receiver_call(database: Path) -> None:
