@@ -216,7 +216,15 @@ def test_validate_order_rejects_nan_quantity() -> None:
 
 def test_paper_executor_rejects_nan_price() -> None:
     px = PaperExecutor()
-    res = px._place_simple_order(Order("AAPL", quantity=1, side="BUY", price=float("nan")))
+    res = px._place_simple_order(
+        Order(
+            "AAPL",
+            quantity=1,
+            side="BUY",
+            price=float("nan"),
+            intent_source="baseline_sma",
+        )
+    )
     assert not res.ok
     assert "non-finite" in res.message.lower() or "invalid" in res.message.lower()
 
@@ -332,7 +340,9 @@ def test_pairs_buy_calls_validate_order() -> None:
 def test_paper_executor_rejects_stale_cached_price(monkeypatch: pytest.MonkeyPatch) -> None:
     px = PaperExecutor()
     # Seed cache with a price ~ now
-    res = px._place_simple_order(Order("AAPL", quantity=1, side="BUY", price=100.0))
+    res = px._place_simple_order(
+        Order("AAPL", quantity=1, side="BUY", price=100.0, intent_source="baseline_sma")
+    )
     assert res.ok
 
     # Force the cache timestamp to be very old
@@ -341,7 +351,9 @@ def test_paper_executor_rejects_stale_cached_price(monkeypatch: pytest.MonkeyPat
     px._execution_cache_ts["AAPL"] = dt.datetime.utcnow() - dt.timedelta(seconds=120)
 
     # Now a market order (price=None) should fail with a staleness error
-    res = px._place_simple_order(Order("AAPL", quantity=1, side="BUY", price=None))
+    res = px._place_simple_order(
+        Order("AAPL", quantity=1, side="BUY", price=None, intent_source="baseline_sma")
+    )
     assert not res.ok
     assert "stale" in res.message.lower()
 

@@ -248,6 +248,7 @@ def _order(side: str) -> Order:
         side=side,
         price=100.0,
         order_ref=f"routing-{side.lower()}",
+        intent_source="baseline_sma" if side == "BUY" else "",
     )
 
 
@@ -305,7 +306,7 @@ def test_runner_database_fallback_uses_validated_contract_path() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("side", ["BUY", "SELL_SHORT"])
+@pytest.mark.parametrize("side", ["BUY"])
 @pytest.mark.parametrize(
     ("blocker", "expected_message"),
     [
@@ -466,7 +467,7 @@ async def test_transport_abort_blocks_reduction_before_gateway(side: str) -> Non
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("side", ["BUY", "SELL_SHORT"])
+@pytest.mark.parametrize("side", ["BUY"])
 async def test_entry_dispatch_occurs_inside_gateway_serialization(
     side: str,
     monkeypatch,
@@ -494,7 +495,21 @@ async def test_entry_dispatch_occurs_inside_gateway_serialization(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("side", ["BUY", "SELL_SHORT"])
+async def test_new_short_rejects_before_gateway_or_executor() -> None:
+    gateway, _ = _exact_gateway()
+    runner = _runner(gateway)
+
+    result = await runner._place_order_with_circuit_breaker(_order("SELL_SHORT"))
+
+    assert result.ok is False
+    assert "blocks new short exposure" in result.message
+    gateway.submit_reduction.assert_not_awaited()
+    gateway.serialize_entry.assert_not_called()
+    runner.executor.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["BUY"])
 @pytest.mark.parametrize("gateway_kind", ["missing", "wrong_type", "stopped"])
 async def test_entries_require_exact_started_account_gateway(
     side: str,
@@ -524,7 +539,7 @@ async def test_entries_require_exact_started_account_gateway(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("side", ["BUY", "SELL_SHORT"])
+@pytest.mark.parametrize("side", ["BUY"])
 async def test_entries_reach_gateway_when_diagnostic_recovery_is_pending(
     side: str,
     monkeypatch,

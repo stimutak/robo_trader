@@ -39,6 +39,12 @@ from .config import RuntimeContract, load_config
 from .correlation import CorrelationTracker
 from .database_async import AsyncTradingDatabase
 from .execution import ExecutionResult, Order, PaperExecutor
+from .gatea_containment import (
+    GateAContainmentError,
+    assert_gate_a_config,
+    assert_gate_a_runner_options,
+    validate_gate_a_order,
+)
 from .logger import get_logger
 from .market_data_contract import (
     BrokerProtectiveQuote,
@@ -489,6 +495,12 @@ class AsyncRunner:
         shared_database: Optional[AsyncTradingDatabase] = None,
         paper_reduction_gateway: Optional[PaperReductionGateway] = None,
     ):
+        assert_gate_a_runner_options(
+            use_ml_strategy=use_ml_strategy,
+            use_ml_enhanced=use_ml_enhanced,
+            use_smart_execution=use_smart_execution,
+            env=os.environ,
+        )
         if safety_runtime is not None and (
             type(safety_runtime) is not SafetyRuntimeCoordinator or not safety_runtime.started
         ):
@@ -518,19 +530,9 @@ class AsyncRunner:
         self.max_concurrent_symbols = max_concurrent_symbols
         self.use_correlation_sizing = use_correlation_sizing
         self.max_correlation = max_correlation
-        self.use_ml_strategy = use_ml_strategy
-        # Auto-detect ML enhanced if not explicitly set
-        if use_ml_enhanced is None:
-            self.use_ml_enhanced = os.getenv("ML_ENHANCED_ENABLED", "true").lower() == "true"
-        else:
-            self.use_ml_enhanced = use_ml_enhanced
-        # Auto-detect smart execution if not explicitly set
-        if use_smart_execution is None:
-            self.use_smart_execution = (
-                os.getenv("SMART_EXECUTION_ENABLED", "true").lower() == "true"
-            )
-        else:
-            self.use_smart_execution = use_smart_execution
+        self.use_ml_strategy = False
+        self.use_ml_enhanced = False
+        self.use_smart_execution = False
 
         # Auto-detect advanced risk management if not explicitly set
         if use_advanced_risk is None:
@@ -664,7 +666,7 @@ class AsyncRunner:
 
         # AI Analyst for news-driven trading
         self.ai_analyst = None
-        self.use_ai_trading = os.getenv("AI_TRADING_ENABLED", "true").lower() == "true"
+        self.use_ai_trading = False
         self.news_cache = {}  # Cache recent news to avoid re-fetching
         self.last_news_fetch = None
         self._ai_opportunities = {}  # AI-identified buying opportunities
@@ -1496,6 +1498,14 @@ class AsyncRunner:
         if not is_reduction and side not in {"BUY", "SELL_SHORT"}:
             return self._rejected_order_result("Unsupported order side")
 
+        contained, containment_reason = validate_gate_a_order(
+            side=side,
+            intent_source=order.intent_source,
+            take_profit=order.take_profit,
+        )
+        if not contained:
+            return self._rejected_order_result(containment_reason)
+
         # Semantic reductions bypass entry-only soft stops, but only after the
         # account-wide gateway proves the exact broker contract/read-only
         # transport and the complete local simulator allocation. The gateway
@@ -1656,6 +1666,8 @@ class AsyncRunner:
                         side=side,
                         price=broker_quote.price,
                         order_ref=order.order_ref,
+                        intent_source=order.intent_source,
+                        take_profit=order.take_profit,
                     )
                     portfolio = getattr(self, "portfolio", None)
                     risk = getattr(self, "risk", None)
@@ -2237,6 +2249,10 @@ class AsyncRunner:
                     return
 
         self.cfg = load_config()
+        try:
+            assert_gate_a_config(self.cfg)
+        except GateAContainmentError as exc:
+            raise RuntimeError(f"Gate-A containment contradiction: {exc}") from exc
 
         # B-12 (branch audit, HIGH): belt-and-suspenders on top of
         # config.py's gating — if anything is overriding config to set
@@ -4503,9 +4519,14 @@ class AsyncRunner:
                 df,
             )
 
+        # Provenance is carried to the central order sink. Only the baseline
+        # branch below can produce the one Gate-A entry source.
+        entry_intent_source = "unclassified"
+
         # Generate trading signal
         with Timer("signal_generation", self.monitor, instance=symbol):
             if self.use_ml_enhanced and self.ml_enhanced_strategy:
+                entry_intent_source = "ml_enhanced"
                 # Use ML Enhanced strategy for signal generation
                 signal_obj = await self.ml_enhanced_strategy.analyze(symbol, df)
 
@@ -4585,6 +4606,7 @@ class AsyncRunner:
                             confidence = 0.5
                         else:
                             signal_value = 1  # BUY
+                            entry_intent_source = "ai_discovery"
                             confidence = opp_conf
                             logger.info(
                                 f"🎯 AI OPPORTUNITY BUY for {symbol}: "
@@ -4674,6 +4696,7 @@ class AsyncRunner:
                                     # default to HOLD; do NOT escalate to BUY
                                 elif ai_buy and ai_conf_ok:
                                     signal_value = 1
+                                    entry_intent_source = "ai_analyst"
                                     confidence = analysis.confidence
                                     logger.info(
                                         f"AI BUY signal for {symbol} "
@@ -4750,6 +4773,7 @@ class AsyncRunner:
                             int(sma_signals["signal"].iloc[-1]) if len(sma_signals) > 0 else 0
                         )
                         if signal_value != 0:
+                            entry_intent_source = "baseline_sma"
                             confidence = 0.6
                             logger.info(f"SMA crossover signal for {symbol}: {signal_value}")
 
@@ -4764,6 +4788,7 @@ class AsyncRunner:
                     index=[df.index[-1]] if len(df) > 0 else [pd.Timestamp.now()],
                 )
             elif self.use_ml_strategy and self.ml_strategy:
+                entry_intent_source = "ml_selector"
                 # Use ML strategy for signal generation
                 # Prepare market data in the format expected by ML strategy
                 market_data_dict = {
@@ -4799,6 +4824,7 @@ class AsyncRunner:
                 )
             else:
                 # Use traditional SMA crossover strategy
+                entry_intent_source = "baseline_sma"
                 signals = sma_crossover_signals(
                     pd.DataFrame({"close": df["close"]}),
                     fast=self.sma_fast,
@@ -4856,6 +4882,7 @@ class AsyncRunner:
 
                         # Override signal if mean reversion is stronger
                         if mr_signal.strength > 0.7:
+                            entry_intent_source = "mean_reversion"
                             signal_value = 1 if mr_signal.signal_type.value == "BUY" else -1
                             signals.iloc[-1]["signal"] = signal_value
 
@@ -5192,7 +5219,13 @@ class AsyncRunner:
                         # _place_order_with_circuit_breaker via _trading_blocked().
 
                         res = await self._place_order_with_circuit_breaker(
-                            Order(symbol=symbol, quantity=qty, side="BUY", price=price)
+                            Order(
+                                symbol=symbol,
+                                quantity=qty,
+                                side="BUY",
+                                price=price,
+                                intent_source=entry_intent_source,
+                            )
                         )
                         if res.ok:
                             exact_fill_price = self._exact_entry_fill_price(res)

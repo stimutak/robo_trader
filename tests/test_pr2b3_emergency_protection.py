@@ -88,7 +88,13 @@ async def test_entry_waiting_at_final_admission_is_rejected_after_freeze():
     await runner._order_admission_lock.acquire()
     order_task = asyncio.create_task(
         runner._place_order_with_circuit_breaker(
-            Order(symbol="NVDA", quantity=1, side="BUY", price=100.0)
+            Order(
+                symbol="NVDA",
+                quantity=1,
+                side="BUY",
+                price=100.0,
+                intent_source="baseline_sma",
+            )
         )
     )
     await asyncio.sleep(0)

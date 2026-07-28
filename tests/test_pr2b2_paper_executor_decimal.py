@@ -18,6 +18,7 @@ def _order(*, side: str = "BUY", price: float | Decimal = Decimal("123.45")) -> 
         side=side,
         price=price,
         order_ref="decimal-paper-test",
+        intent_source="baseline_sma" if side == "BUY" else "",
     )
 
 
@@ -131,7 +132,7 @@ def test_decimal_nonfinite_or_nonpositive_fill_fails_closed(
 
 @pytest.mark.parametrize(
     ("side", "expected"),
-    [("BUY", 100.1), ("SELL", 99.9), ("BUY_TO_COVER", 100.1), ("SELL_SHORT", 99.9)],
+    [("BUY", 100.1), ("SELL", 99.9), ("BUY_TO_COVER", 100.1)],
 )
 def test_legacy_float_price_behavior_is_unchanged(side: str, expected: float) -> None:
     order = _order(side=side, price=100.0)
@@ -143,6 +144,16 @@ def test_legacy_float_price_behavior_is_unchanged(side: str, expected: float) ->
     assert result.fill_price == pytest.approx(expected)
     assert type(order.price) is float
     assert next(iter(executor.fills.values()))[1] is order
+
+
+def test_private_simple_sink_cannot_open_short_exposure() -> None:
+    executor = PaperExecutor(slippage_bps=10.0)
+
+    result = executor._place_simple_order(_order(side="SELL_SHORT", price=100.0))
+
+    assert result.ok is False
+    assert "blocks new short exposure" in result.message
+    assert executor.fills == {}
 
 
 def test_public_kill_switch_gate_blocks_while_private_sink_remains_narrowly_callable(
