@@ -45,7 +45,13 @@ _CAPABILITY_KEY = secrets.token_bytes(32)
 _CAPABILITY_LOCK = threading.Lock()
 _CAPABILITIES: dict[
     int,
-    tuple[weakref.ReferenceType["VerifiedRuntimeReconciliationEvidence"], str],
+    tuple[
+        weakref.ReferenceType["VerifiedRuntimeReconciliationEvidence"],
+        str,
+        ExactStateBootstrapEvidence,
+        str,
+        bool,
+    ],
 ] = {}
 _COMPARISON_CONSUMPTION_LOCK = threading.Lock()
 _MAX_CONSUMED_COMPARISON_LINEAGES = 1024
@@ -155,7 +161,7 @@ class VerifiedRuntimeReconciliationEvidence:
     issued_at: datetime
     expires_at: datetime
     _runtime_context: RuntimeSafetyContext
-    _exact_state_evidence: ExactStateBootstrapEvidence | None
+    _exact_state_evidence: ExactStateBootstrapEvidence
     _marker: object
 
     def __post_init__(self) -> None:
@@ -214,11 +220,34 @@ class VerifiedRuntimeReconciliationEvidence:
         raise TypeError("runtime reconciliation evidence cannot be pickled")
 
 
+def _exact_state_source_binding(
+    evidence: VerifiedRuntimeReconciliationEvidence,
+) -> tuple[ExactStateBootstrapEvidence, str]:
+    source = evidence._exact_state_evidence
+    if type(source) is not ExactStateBootstrapEvidence:
+        raise RuntimeReconciliationEvidenceError(
+            "runtime reconciliation exact-state source is missing or substituted"
+        )
+    try:
+        producer_digest = _hash(source._producer_digest, "exact-state producer digest")
+    except (AttributeError, RuntimeReconciliationEvidenceError) as exc:
+        raise RuntimeReconciliationEvidenceError(
+            "runtime reconciliation exact-state source is not producer-sealed"
+        ) from exc
+    return source, producer_digest
+
+
 def _digest(evidence: VerifiedRuntimeReconciliationEvidence) -> str:
     payload = canonical_json(evidence.canonical_dict())
+    source, source_digest = _exact_state_source_binding(evidence)
+    source_binding = f"{id(source):x}:{source_digest}".encode("ascii")
     return hmac.new(
         _CAPABILITY_KEY,
-        payload.encode("utf-8") + b"\0" + evidence.snapshot.canonical_payload().encode("utf-8"),
+        payload.encode("utf-8")
+        + b"\0"
+        + evidence.snapshot.canonical_payload().encode("utf-8")
+        + b"\0"
+        + source_binding,
         hashlib.sha256,
     ).hexdigest()
 
@@ -227,6 +256,7 @@ def _register(
     evidence: VerifiedRuntimeReconciliationEvidence,
 ) -> VerifiedRuntimeReconciliationEvidence:
     object_id = id(evidence)
+    source, source_digest = _exact_state_source_binding(evidence)
 
     def discard(reference: weakref.ReferenceType[VerifiedRuntimeReconciliationEvidence]) -> None:
         with _CAPABILITY_LOCK:
@@ -238,7 +268,13 @@ def _register(
     with _CAPABILITY_LOCK:
         if object_id in _CAPABILITIES:
             raise RuntimeReconciliationEvidenceError("runtime evidence registration collided")
-        _CAPABILITIES[object_id] = (reference, _digest(evidence))
+        _CAPABILITIES[object_id] = (
+            reference,
+            _digest(evidence),
+            source,
+            source_digest,
+            False,
+        )
     return evidence
 
 
@@ -252,6 +288,31 @@ def _database_binding(runtime_contract: RuntimeContract) -> SQLitePathBinding:
         raise RuntimeReconciliationEvidenceError(
             "runtime database identity cannot be bound"
         ) from exc
+
+
+def _assert_consumed_source_binding(
+    evidence: VerifiedRuntimeReconciliationEvidence,
+    *,
+    changed_message: str,
+) -> ExactStateBootstrapEvidence:
+    try:
+        source, source_digest = _exact_state_source_binding(evidence)
+        current_digest = _digest(evidence)
+    except RuntimeReconciliationEvidenceError as exc:
+        raise RuntimeReconciliationEvidenceError(changed_message) from exc
+    with _CAPABILITY_LOCK:
+        registered = _CAPABILITIES.get(id(evidence))
+    if (
+        registered is None
+        or registered[0]() is not evidence
+        or evidence._marker is not _CAPABILITY_MARKER
+        or not registered[4]
+        or not hmac.compare_digest(registered[1], current_digest)
+        or registered[2] is not source
+        or not hmac.compare_digest(registered[3], source_digest)
+    ):
+        raise RuntimeReconciliationEvidenceError(changed_message)
+    return source
 
 
 def _consume_comparison_lineage(
@@ -469,26 +530,19 @@ def bind_verified_runtime_reconciliation_evidence(
     )
 
 
-def assert_and_consume_verified_runtime_reconciliation_evidence(
-    evidence: object,
-) -> VerifiedRuntimeReconciliationEvidence:
-    """Consume one exact capability and revalidate its runtime database inode."""
+def assert_runtime_reconciliation_evidence_sources_current(
+    evidence: VerifiedRuntimeReconciliationEvidence,
+) -> None:
+    """Revalidate one consumed capability's sealed sources and database inode."""
 
     if type(evidence) is not VerifiedRuntimeReconciliationEvidence:
         raise RuntimeReconciliationEvidenceError(
             "exact verified runtime reconciliation evidence is required"
         )
-    with _CAPABILITY_LOCK:
-        registered = _CAPABILITIES.pop(id(evidence), None)
-    if (
-        registered is None
-        or registered[0]() is not evidence
-        or evidence._marker is not _CAPABILITY_MARKER
-        or not hmac.compare_digest(registered[1], _digest(evidence))
-    ):
-        raise RuntimeReconciliationEvidenceError(
-            "runtime reconciliation evidence is forged, changed, or already consumed"
-        )
+    source = _assert_consumed_source_binding(
+        evidence,
+        changed_message="consumed runtime reconciliation binding changed",
+    )
     try:
         context = assert_validated_runtime_safety_context(evidence._runtime_context)
     except Exception as exc:
@@ -502,16 +556,12 @@ def assert_and_consume_verified_runtime_reconciliation_evidence(
         or contract.safety_account_scope != evidence.account_scope
     ):
         raise RuntimeReconciliationEvidenceError("runtime binding changed after production")
-    if evidence._exact_state_evidence is not None:
-        try:
-            assert_exact_state_runtime_sources_unchanged(
-                evidence._exact_state_evidence,
-                contract,
-            )
-        except Exception as exc:
-            raise RuntimeReconciliationEvidenceError(
-                "signed reconciliation source state changed before comparison"
-            ) from exc
+    try:
+        assert_exact_state_runtime_sources_unchanged(source, contract)
+    except Exception as exc:
+        raise RuntimeReconciliationEvidenceError(
+            "signed reconciliation source state changed before comparison"
+        ) from exc
     binding = _database_binding(contract)
     try:
         if (binding.device, binding.inode) != (
@@ -523,6 +573,50 @@ def assert_and_consume_verified_runtime_reconciliation_evidence(
             )
     finally:
         binding.close()
+    _assert_consumed_source_binding(
+        evidence,
+        changed_message=("consumed runtime reconciliation binding changed during revalidation"),
+    )
+
+
+def assert_and_consume_verified_runtime_reconciliation_evidence(
+    evidence: object,
+) -> VerifiedRuntimeReconciliationEvidence:
+    """Consume one exact capability and revalidate all sealed runtime sources."""
+
+    if type(evidence) is not VerifiedRuntimeReconciliationEvidence:
+        raise RuntimeReconciliationEvidenceError(
+            "exact verified runtime reconciliation evidence is required"
+        )
+    try:
+        source, source_digest = _exact_state_source_binding(evidence)
+        current_digest = _digest(evidence)
+    except RuntimeReconciliationEvidenceError as exc:
+        raise RuntimeReconciliationEvidenceError(
+            "runtime reconciliation evidence is forged, changed, or already consumed"
+        ) from exc
+    with _CAPABILITY_LOCK:
+        registered = _CAPABILITIES.get(id(evidence))
+        if (
+            registered is None
+            or registered[0]() is not evidence
+            or evidence._marker is not _CAPABILITY_MARKER
+            or registered[4]
+            or not hmac.compare_digest(registered[1], current_digest)
+            or registered[2] is not source
+            or not hmac.compare_digest(registered[3], source_digest)
+        ):
+            raise RuntimeReconciliationEvidenceError(
+                "runtime reconciliation evidence is forged, changed, or already consumed"
+            )
+        _CAPABILITIES[id(evidence)] = (
+            registered[0],
+            registered[1],
+            registered[2],
+            registered[3],
+            True,
+        )
+    assert_runtime_reconciliation_evidence_sources_current(evidence)
     return evidence
 
 
@@ -530,5 +624,6 @@ __all__ = [
     "RuntimeReconciliationEvidenceError",
     "VerifiedRuntimeReconciliationEvidence",
     "assert_and_consume_verified_runtime_reconciliation_evidence",
+    "assert_runtime_reconciliation_evidence_sources_current",
     "bind_verified_runtime_reconciliation_evidence",
 ]

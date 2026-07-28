@@ -139,9 +139,20 @@ def _accept_registered_test_runtime_context(monkeypatch) -> None:
         lambda context: context,
     )
     monkeypatch.setattr(runtime_evidence_module, "_comparison_clock", lambda: NOW)
+    monkeypatch.setattr(
+        runtime_evidence_module,
+        "assert_exact_state_runtime_sources_unchanged",
+        lambda evidence, runtime_contract: None,
+    )
     with runtime_evidence_module._COMPARISON_CONSUMPTION_LOCK:
         runtime_evidence_module._CONSUMED_COMPARISON_LINEAGES.clear()
         runtime_evidence_module._COMPARISON_LAST_CLOCK = None
+
+
+def _exact_state_source() -> runtime_evidence_module.ExactStateBootstrapEvidence:
+    source = object.__new__(runtime_evidence_module.ExactStateBootstrapEvidence)
+    object.__setattr__(source, "_producer_digest", "91" * 32)
+    return source
 
 
 def _registered_evidence(
@@ -206,7 +217,7 @@ def _registered_evidence(
             issued_at=NOW - timedelta(microseconds=1),
             expires_at=expires_at,
             _runtime_context=context,
-            _exact_state_evidence=None,
+            _exact_state_evidence=_exact_state_source(),
             _marker=runtime_evidence_module._CAPABILITY_MARKER,
         )
     )
@@ -1096,6 +1107,7 @@ async def test_authenticated_mismatch_is_persisted_with_timing_expiry(
         )
         signed_status = ReconciliationStatus.DEGRADED
     exact_state = SimpleNamespace(
+        _producer_digest="91" * 32,
         authentication_receipts=(reconciliation_receipt,),
         reconciliation_status=signed_status,
         reconciliation_coverage=_coverage(),
@@ -1190,7 +1202,7 @@ async def test_authenticated_mismatch_is_persisted_with_timing_expiry(
     )
     assert outcome.state is expected_state
     assert outcome.entry_eligible is (mismatch_kind == "timing_lag")
-    assert revalidated == [(exact_state, contract)]
+    assert revalidated == [(exact_state, contract), (exact_state, contract)]
     with sqlite3.connect(database_path) as connection:
         persisted_rows = connection.execute(
             "SELECT kind, materiality, reason_code FROM rt_reconciliation_differences"
@@ -1225,6 +1237,31 @@ def test_runtime_capability_is_python310_compatible_immutable_and_nonserializabl
         copy.deepcopy(evidence)
     with pytest.raises(TypeError, match="cannot be pickled"):
         pickle.dumps(evidence)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "substituted"])
+def test_runtime_capability_rejects_raw_exact_state_reference_mutation(
+    tmp_path,
+    monkeypatch,
+    mutation: str,
+) -> None:
+    evidence = _registered_evidence(tmp_path / "reconciliation.sqlite3")
+    revalidated = []
+    monkeypatch.setattr(
+        runtime_evidence_module,
+        "assert_exact_state_runtime_sources_unchanged",
+        lambda source, contract: revalidated.append((source, contract)),
+    )
+    replacement = None if mutation == "missing" else _exact_state_source()
+
+    object.__setattr__(evidence, "_exact_state_evidence", replacement)
+
+    with pytest.raises(
+        RuntimeReconciliationEvidenceError,
+        match="forged, changed, or already consumed",
+    ):
+        assert_and_consume_verified_runtime_reconciliation_evidence(evidence)
+    assert revalidated == []
 
 
 def test_consumed_comparison_cache_is_bounded_and_evicts_only_expired(
@@ -1313,6 +1350,40 @@ async def test_entry_eligibility_revalidates_database_inode_every_time(tmp_path)
 
     assert service.entry_eligible(at=NOW) is False
     assert service.state is ReconciliationServiceState.QUARANTINED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement_kind", ["database", "exact_state"])
+async def test_post_commit_replacement_blocks_outcome(tmp_path, replacement_kind: str) -> None:
+    service, _, persistence = await _service(tmp_path)
+    database_path = (tmp_path / "reconciliation.sqlite3").resolve()
+
+    class _ReplaceAfterCommitPersistence:
+        async def initialize(self) -> None:
+            await persistence.initialize()
+
+        async def append_reconciliation(self, **kwargs):
+            result = await persistence.append_reconciliation(**kwargs)
+            if replacement_kind == "database":
+                replacement = tmp_path / "replacement-after-commit.sqlite3"
+                sqlite3.connect(replacement).close()
+                os.replace(replacement, database_path)
+            else:
+                object.__setattr__(
+                    kwargs["runtime_evidence"],
+                    "_exact_state_evidence",
+                    _exact_state_source(),
+                )
+            return result
+
+    service._persistence = _ReplaceAfterCommitPersistence()  # type: ignore[assignment]
+
+    with pytest.raises(ReconciliationServiceBlocked, match="failed closed"):
+        await service.reconcile_startup()
+
+    assert service.state is ReconciliationServiceState.QUARANTINED
+    assert service.latest_outcome is None
+    assert service.entry_eligible(at=NOW) is False
 
 
 @pytest.mark.asyncio

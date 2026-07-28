@@ -23,6 +23,7 @@ from .policy import (
 from .runtime_evidence import (
     VerifiedRuntimeReconciliationEvidence,
     assert_and_consume_verified_runtime_reconciliation_evidence,
+    assert_runtime_reconciliation_evidence_sources_current,
 )
 
 
@@ -315,6 +316,7 @@ class ReconciliationService:
                 completed_at=completed_at,
                 eligible_until=eligible_until,
             )
+            assert_runtime_reconciliation_evidence_sources_current(runtime_evidence)
         except BaseException as exc:
             self._quarantine()
             if isinstance(exc, asyncio.CancelledError):
