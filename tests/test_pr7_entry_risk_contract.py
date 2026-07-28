@@ -1230,6 +1230,18 @@ def test_more_than_replay_limit_sequential_expired_decisions_continue() -> None:
         )
 
 
+def test_many_unique_decisions_never_false_positive_as_semantic_replays() -> None:
+    tombstones = _DecisionReplayTombstones(4096)
+
+    for index in range(55_000):
+        consumed_at = NOW + timedelta(seconds=index)
+        tombstones.record(
+            ("risk-decision-v1", 1, "portfolio-alpha", f"intent-{index}"),
+            expires_at=consumed_at + timedelta(seconds=1),
+            consumed_at=consumed_at,
+        )
+
+
 def test_live_replay_tombstones_exhaust_only_when_every_entry_remains_live() -> None:
     tombstones = _DecisionReplayTombstones(4096)
     live_expiry = NOW + timedelta(days=1)
@@ -1276,7 +1288,7 @@ def test_duplicate_rejects_before_and_after_its_tombstone_expires() -> None:
         )
 
 
-def test_replay_tombstones_allow_concurrent_out_of_order_consumption_times() -> None:
+def test_replay_tombstones_reject_out_of_order_consumption_times() -> None:
     tombstones = _DecisionReplayTombstones(2)
     tombstones.record(
         ("risk-decision-v1", 1, "portfolio-alpha", "intent-newer"),
@@ -1284,11 +1296,12 @@ def test_replay_tombstones_allow_concurrent_out_of_order_consumption_times() -> 
         consumed_at=NOW + timedelta(seconds=2),
     )
 
-    tombstones.record(
-        ("risk-decision-v1", 1, "portfolio-alpha", "intent-older"),
-        expires_at=NOW + timedelta(seconds=10),
-        consumed_at=NOW + timedelta(seconds=1),
-    )
+    with pytest.raises(EntryRiskContractError, match="not monotonic"):
+        tombstones.record(
+            ("risk-decision-v1", 1, "portfolio-alpha", "intent-older"),
+            expires_at=NOW + timedelta(seconds=10),
+            consumed_at=NOW + timedelta(seconds=1),
+        )
 
 
 def test_successful_pruning_retains_semantic_replay_identity() -> None:

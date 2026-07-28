@@ -9,8 +9,6 @@ boundary.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 import threading
 import weakref
@@ -41,32 +39,21 @@ _BROKER_IDENTITY = re.compile(r"^[A-Z0-9][A-Z0-9._:/-]{0,63}$")
 
 
 class _DecisionReplayTombstones:
-    """Bounded live-window semantic replay records."""
+    """Collision-free semantic replay records retained for a bounded window."""
 
-    __slots__ = ("_entries", "_limit", "_seen_bits")
+    __slots__ = ("_entries", "_limit", "_retention", "_watermark")
 
-    _SEEN_BIT_COUNT = 1 << 20
-    _SEEN_HASH_COUNT = 8
+    _DEFAULT_RETENTION = timedelta(minutes=5)
 
-    def __init__(self, limit: int) -> None:
+    def __init__(self, limit: int, *, retention: timedelta = _DEFAULT_RETENTION) -> None:
         if type(limit) is not int or limit <= 0:
             raise ValueError("decision replay tombstone limit must be positive")
+        if type(retention) is not timedelta or retention <= timedelta(0):
+            raise ValueError("decision replay retention must be a positive timedelta")
         self._entries: dict[tuple[object, ...], datetime] = {}
         self._limit = limit
-        self._seen_bits = 0
-
-    @classmethod
-    def _seen_indices(cls, replay_key: tuple[object, ...]) -> tuple[int, ...]:
-        encoded = json.dumps(
-            replay_key,
-            ensure_ascii=True,
-            separators=(",", ":"),
-        ).encode("ascii")
-        digest = hashlib.sha256(encoded).digest()
-        return tuple(
-            int.from_bytes(digest[offset : offset + 4], "big") % cls._SEEN_BIT_COUNT
-            for offset in range(0, cls._SEEN_HASH_COUNT * 4, 4)
-        )
+        self._retention = retention
+        self._watermark: Optional[datetime] = None
 
     def record(
         self,
@@ -81,22 +68,22 @@ class _DecisionReplayTombstones:
         if consumed_at >= expires_at:
             raise EntryRiskContractError("RiskDecision expired before consumption")
 
-        seen_indices = self._seen_indices(replay_key)
-        if replay_key in self._entries or all(
-            self._seen_bits & (1 << index) for index in seen_indices
-        ):
-            raise EntryRiskContractError("RiskDecision semantic replay detected")
-
         # A rejected call must not weaken replay protection for any other
         # decision.  Derive the next registry state without mutating the live
         # tombstones, then commit it only after every validation succeeds.
-        survivors = {key: expiry for key, expiry in self._entries.items() if expiry > consumed_at}
+        watermark = max(consumed_at, self._watermark or consumed_at)
+        if consumed_at < watermark:
+            raise EntryRiskContractError("RiskDecision consumption time is not monotonic")
+        survivors = {
+            key: retirement for key, retirement in self._entries.items() if retirement > watermark
+        }
+        if replay_key in survivors:
+            raise EntryRiskContractError("RiskDecision semantic replay detected")
         if len(survivors) >= self._limit:
             raise EntryRiskContractError("RiskDecision live replay registry capacity exhausted")
-        survivors[replay_key] = expires_at
+        survivors[replay_key] = expires_at + self._retention
         self._entries = survivors
-        for index in seen_indices:
-            self._seen_bits |= 1 << index
+        self._watermark = watermark
 
 
 def _build_capability_authority():
