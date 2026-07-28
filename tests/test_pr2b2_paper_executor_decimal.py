@@ -9,6 +9,7 @@ import pytest
 
 import robo_trader.execution as execution_module
 from robo_trader.execution import ExecutionResult, Order, PaperExecutor
+from robo_trader.paper_execution_capability import _bind_paper_execution_authority
 
 
 def _order(*, side: str = "BUY", price: float | Decimal = Decimal("123.45")) -> Order:
@@ -18,8 +19,24 @@ def _order(*, side: str = "BUY", price: float | Decimal = Decimal("123.45")) -> 
         side=side,
         price=price,
         order_ref="decimal-paper-test",
-        intent_source="baseline_sma" if side == "BUY" else "",
     )
+
+
+def _submit(executor: PaperExecutor, order: Order) -> ExecutionResult:
+    authority = _bind_paper_execution_authority(executor, "test")
+    if order.side == "BUY":
+        return authority._submit_baseline_once(order)
+    if order.side == "SELL":
+        return authority._submit_reduction_once(
+            order,
+            pre_position_quantity=Decimal(order.quantity),
+        )
+    if order.side == "BUY_TO_COVER":
+        return authority._submit_reduction_once(
+            order,
+            pre_position_quantity=Decimal(-order.quantity),
+        )
+    return executor._place_simple_order(order)
 
 
 def _patch_execution_path_exists(monkeypatch, exists) -> None:
@@ -37,7 +54,8 @@ def test_public_place_order_preserves_exact_decimal_into_simple_sink(monkeypatch
 
     _patch_execution_path_exists(monkeypatch, lambda _path: False)
 
-    def simple_sink(order: Order) -> ExecutionResult:
+    def simple_sink(order: Order, *, _capability: object) -> ExecutionResult:
+        assert _capability is not None
         captured.append(order)
         return ExecutionResult(True, "captured", fill_price=float(order.price))
 
@@ -45,7 +63,7 @@ def test_public_place_order_preserves_exact_decimal_into_simple_sink(monkeypatch
     exact_price = Decimal("123.4500")
     order = _order(price=exact_price)
 
-    result = executor.place_order(order)
+    result = _submit(executor, order)
 
     assert result.ok is True
     assert captured == [order]
@@ -64,8 +82,10 @@ def test_common_decimal_price_has_deterministic_finite_fill(slippage_bps: float)
         )
     )
 
-    first = PaperExecutor(slippage_bps=slippage_bps)._place_simple_order(_order(price=exact_price))
-    second = PaperExecutor(slippage_bps=slippage_bps)._place_simple_order(_order(price=exact_price))
+    first_executor = PaperExecutor(slippage_bps=slippage_bps)
+    second_executor = PaperExecutor(slippage_bps=slippage_bps)
+    first = _submit(first_executor, _order(price=exact_price))
+    second = _submit(second_executor, _order(price=exact_price))
 
     assert first.ok is True
     assert second.ok is True
@@ -88,9 +108,8 @@ def test_decimal_slippage_direction_for_reducing_sides(side: str, direction: int
         )
     )
 
-    result = PaperExecutor(slippage_bps=float(slippage_bps))._place_simple_order(
-        _order(side=side, price=price)
-    )
+    executor = PaperExecutor(slippage_bps=float(slippage_bps))
+    result = _submit(executor, _order(side=side, price=price))
 
     assert result.ok is True
     assert result.fill_price == expected
@@ -98,9 +117,8 @@ def test_decimal_slippage_direction_for_reducing_sides(side: str, direction: int
 
 
 def test_arbitrary_finite_slippage_is_normalized_before_float_compatibility_view() -> None:
-    result = PaperExecutor(slippage_bps=0.3333333333333333)._place_simple_order(
-        _order(side="SELL", price=Decimal("123.4567"))
-    )
+    executor = PaperExecutor(slippage_bps=0.3333333333333333)
+    result = _submit(executor, _order(side="SELL", price=Decimal("123.4567")))
 
     assert result.ok is True
     assert result.exact_fill_price == Decimal("123.4526")
@@ -122,7 +140,7 @@ def test_decimal_nonfinite_or_nonpositive_fill_fails_closed(
 ) -> None:
     executor = PaperExecutor(slippage_bps=slippage_bps)
 
-    result = executor._place_simple_order(_order(side=side))
+    result = _submit(executor, _order(side=side))
 
     assert result.ok is False
     assert result.fill_price is None
@@ -138,7 +156,7 @@ def test_legacy_float_price_behavior_is_unchanged(side: str, expected: float) ->
     order = _order(side=side, price=100.0)
     executor = PaperExecutor(slippage_bps=10.0)
 
-    result = executor._place_simple_order(order)
+    result = _submit(executor, order)
 
     assert result.ok is True
     assert result.fill_price == pytest.approx(expected)
@@ -178,7 +196,11 @@ def test_public_kill_switch_gate_blocks_while_private_sink_remains_narrowly_call
 
     private_result = executor._place_simple_order(order)
 
-    assert private_result.ok is True
-    assert private_result.fill_price == 123.45
-    assert len(executor.fills) == 1
+    assert private_result.ok is False
+    assert "submission capability" in private_result.message
+    assert executor.fills == {}
     assert probes == ["data/kill_switch.lock"]
+
+    authorized_result = _submit(executor, order)
+    assert authorized_result.ok is True
+    assert authorized_result.fill_price == 123.45

@@ -46,20 +46,29 @@ def _make_runner_with_triggered_kill_switch():
     runner.rate_limiter = MagicMock()
     runner.executor = MagicMock()
     runner.monitor = MagicMock()
+    runner._baseline_entry_handle = object()
+    runner._baseline_entry_intent = object()
     return runner
+
+
+async def _place(runner: AsyncRunner, order: Order):
+    return await runner._place_order_with_circuit_breaker(
+        order,
+        _entry_intent=(runner._baseline_entry_intent if order.side == "BUY" else None),
+    )
 
 
 @pytest.mark.asyncio
 async def test_kill_switch_log_fires_once_then_throttles():
     """10 rapid blocked calls for the same (symbol, action) → log fires exactly once."""
     runner = _make_runner_with_triggered_kill_switch()
-    order = Order(symbol="AAPL", quantity=10, side="BUY", price=150.0, intent_source="baseline_sma")
+    order = Order(symbol="AAPL", quantity=10, side="BUY", price=150.0)
 
     # Freeze monotonic time so all 10 calls fall in the same throttle window.
     with patch("robo_trader.runner_async.time.monotonic", return_value=1000.0):
         with patch("robo_trader.runner_async.logger") as mock_logger:
             for _ in range(10):
-                result = await runner._place_order_with_circuit_breaker(order)
+                result = await _place(runner, order)
                 # Order MUST be blocked on every call (functionality preserved)
                 assert result.ok is False
                 assert "Trading blocked" in result.message
@@ -80,12 +89,12 @@ async def test_kill_switch_log_fires_once_then_throttles():
 async def test_kill_switch_log_fires_again_after_throttle_window():
     """After 61s elapses, the log should fire again for the same (symbol, action)."""
     runner = _make_runner_with_triggered_kill_switch()
-    order = Order(symbol="AAPL", quantity=10, side="BUY", price=150.0, intent_source="baseline_sma")
+    order = Order(symbol="AAPL", quantity=10, side="BUY", price=150.0)
 
     # First call at t=1000 fires the log
     with patch("robo_trader.runner_async.time.monotonic", return_value=1000.0):
         with patch("robo_trader.runner_async.logger") as mock_logger_1:
-            result1 = await runner._place_order_with_circuit_breaker(order)
+            result1 = await _place(runner, order)
     assert result1.ok is False
     first_log_count = sum(
         1
@@ -98,7 +107,7 @@ async def test_kill_switch_log_fires_again_after_throttle_window():
     with patch("robo_trader.runner_async.time.monotonic", return_value=1030.0):
         with patch("robo_trader.runner_async.logger") as mock_logger_2:
             for _ in range(10):
-                result = await runner._place_order_with_circuit_breaker(order)
+                result = await _place(runner, order)
                 assert result.ok is False
     suppressed_log_count = sum(
         1
@@ -110,7 +119,7 @@ async def test_kill_switch_log_fires_again_after_throttle_window():
     # 61s after first log → throttle window elapsed → must log again
     with patch("robo_trader.runner_async.time.monotonic", return_value=1061.0):
         with patch("robo_trader.runner_async.logger") as mock_logger_3:
-            result3 = await runner._place_order_with_circuit_breaker(order)
+            result3 = await _place(runner, order)
     assert result3.ok is False
     third_log_count = sum(
         1
@@ -127,14 +136,12 @@ async def test_short_containment_precedes_kill_switch_log_throttle():
     """A disabled short never enters the kill-switch logging path."""
     runner = _make_runner_with_triggered_kill_switch()
     sell_order = Order(symbol="AAPL", quantity=10, side="SELL_SHORT", price=150.0)
-    buy_order = Order(
-        symbol="AAPL", quantity=10, side="BUY", price=150.0, intent_source="baseline_sma"
-    )
+    buy_order = Order(symbol="AAPL", quantity=10, side="BUY", price=150.0)
 
     with patch("robo_trader.runner_async.time.monotonic", return_value=1000.0):
         with patch("robo_trader.runner_async.logger") as mock_logger:
-            sell_res = await runner._place_order_with_circuit_breaker(sell_order)
-            buy_res = await runner._place_order_with_circuit_breaker(buy_order)
+            sell_res = await _place(runner, sell_order)
+            buy_res = await _place(runner, buy_order)
 
     # Both blocked
     assert sell_res.ok is False
@@ -153,17 +160,13 @@ async def test_short_containment_precedes_kill_switch_log_throttle():
 async def test_kill_switch_log_keyed_by_symbol_distinct_symbols_both_log():
     """Distinct entry symbols receive independent throttled logs."""
     runner = _make_runner_with_triggered_kill_switch()
-    aapl_order = Order(
-        symbol="AAPL", quantity=10, side="BUY", price=150.0, intent_source="baseline_sma"
-    )
-    tsla_order = Order(
-        symbol="TSLA", quantity=10, side="BUY", price=200.0, intent_source="baseline_sma"
-    )
+    aapl_order = Order(symbol="AAPL", quantity=10, side="BUY", price=150.0)
+    tsla_order = Order(symbol="TSLA", quantity=10, side="BUY", price=200.0)
 
     with patch("robo_trader.runner_async.time.monotonic", return_value=1000.0):
         with patch("robo_trader.runner_async.logger") as mock_logger:
-            await runner._place_order_with_circuit_breaker(aapl_order)
-            await runner._place_order_with_circuit_breaker(tsla_order)
+            await _place(runner, aapl_order)
+            await _place(runner, tsla_order)
 
     gate_log_calls = [
         c
@@ -177,11 +180,11 @@ async def test_kill_switch_log_keyed_by_symbol_distinct_symbols_both_log():
 async def test_order_blocked_on_every_call_even_when_log_suppressed():
     """Functionality preserved: every call returns ok=False even if log suppressed."""
     runner = _make_runner_with_triggered_kill_switch()
-    order = Order(symbol="AAPL", quantity=10, side="BUY", price=150.0, intent_source="baseline_sma")
+    order = Order(symbol="AAPL", quantity=10, side="BUY", price=150.0)
 
     with patch("robo_trader.runner_async.time.monotonic", return_value=1000.0):
         for i in range(50):
-            result = await runner._place_order_with_circuit_breaker(order)
+            result = await _place(runner, order)
             assert result.ok is False, f"Call {i} should be blocked, got {result}"
             assert "Trading blocked" in result.message
             assert result.fill_price is None

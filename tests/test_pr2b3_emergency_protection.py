@@ -28,6 +28,8 @@ def _minimal_runner() -> AsyncRunner:
     runner.advanced_risk = None
     runner.running = True
     runner.stop_loss_monitor = None
+    runner._baseline_entry_handle = object()
+    runner._baseline_entry_intent = object()
     return runner
 
 
@@ -93,8 +95,8 @@ async def test_entry_waiting_at_final_admission_is_rejected_after_freeze():
                 quantity=1,
                 side="BUY",
                 price=100.0,
-                intent_source="baseline_sma",
-            )
+            ),
+            _entry_intent=runner._baseline_entry_intent,
         )
     )
     await asyncio.sleep(0)

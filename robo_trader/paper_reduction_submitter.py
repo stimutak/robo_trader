@@ -15,6 +15,7 @@ from enum import Enum
 from typing import Optional
 
 from .execution import ExecutionResult, Order, PaperExecutor
+from .paper_execution_capability import PaperExecutionAuthority
 from .runtime_contract_constants import PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
 from .safety.models import (
     EvidenceStatus,
@@ -196,12 +197,14 @@ class LocalPaperTerminalOutcome:
 class PaperReductionSubmitter:
     """Capability-narrow adapter for exactly one simple paper submission."""
 
-    __slots__ = ("__coordinator", "__executor", "__sealed")
+    __slots__ = ("__authority", "__coordinator", "__executor", "__sealed")
 
     def __init__(
         self,
         executor: PaperExecutor,
         coordinator: SafetyRuntimeCoordinator,
+        execution_authority: PaperExecutionAuthority,
+        portfolio_id: str,
         *,
         _token: Optional[object] = None,
     ) -> None:
@@ -217,8 +220,15 @@ class PaperReductionSubmitter:
             )
         if not coordinator.started:
             raise PaperReductionSubmissionError("coordinator must be started before binding")
+        if type(
+            execution_authority
+        ) is not PaperExecutionAuthority or not execution_authority._is_bound_to(
+            executor, portfolio_id
+        ):
+            raise PaperReductionSubmissionError("execution authority is malformed")
         self.__executor = executor
         self.__coordinator = coordinator
+        self.__authority = execution_authority
         self.__sealed = True
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -230,14 +240,21 @@ class PaperReductionSubmitter:
         self,
         executor: PaperExecutor,
         coordinator: SafetyRuntimeCoordinator,
+        execution_authority: PaperExecutionAuthority,
     ) -> bool:
         """Support idempotent reconnect registration without exposing authority."""
 
-        return self.__executor is executor and self.__coordinator is coordinator
+        return (
+            self.__executor is executor
+            and self.__coordinator is coordinator
+            and self.__authority is execution_authority
+        )
 
     def _submit_once(
         self,
         envelope: ConsumedPaperSubmissionEnvelope,
+        *,
+        pre_position_quantity: Decimal,
     ) -> LocalPaperTerminalOutcome:
         """Claim and submit one exact coordinator-consumed envelope."""
 
@@ -265,17 +282,38 @@ class PaperReductionSubmitter:
         # This is deliberately the adapter's sole execution call. It bypasses
         # legacy soft gates only after final safety revalidation and durable
         # permit consumption; there is no validation, smart, fallback, or retry.
-        result = executor._place_simple_order(order)
+        result = self.__authority._submit_reduction_once(
+            order,
+            pre_position_quantity=pre_position_quantity,
+        )
         return _terminal_outcome(result, safe_descriptor)
 
 
 def _bind_paper_reduction_submitter(
     executor: PaperExecutor,
     coordinator: SafetyRuntimeCoordinator,
+    execution_authority: PaperExecutionAuthority,
+    portfolio_id: str,
 ) -> PaperReductionSubmitter:
     """Bind the private one-shot adapter to exact executor and coordinator."""
 
-    return PaperReductionSubmitter(executor, coordinator, _token=_BIND_TOKEN)
+    if type(executor) is not PaperExecutor:
+        raise PaperReductionSubmissionError("executor must be exactly PaperExecutor")
+    if type(coordinator) is not SafetyRuntimeCoordinator:
+        raise PaperReductionSubmissionError("coordinator must be exactly SafetyRuntimeCoordinator")
+    if type(
+        execution_authority
+    ) is not PaperExecutionAuthority or not execution_authority._is_bound_to(
+        executor, portfolio_id
+    ):
+        raise PaperReductionSubmissionError("execution authority binding does not match")
+    return PaperReductionSubmitter(
+        executor,
+        coordinator,
+        execution_authority,
+        portfolio_id,
+        _token=_BIND_TOKEN,
+    )
 
 
 def _validate_executor_configuration(executor: PaperExecutor) -> None:

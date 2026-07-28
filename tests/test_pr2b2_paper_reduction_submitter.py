@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from robo_trader.execution import ExecutionResult, Order, PaperExecutor
+from robo_trader.paper_execution_capability import _bind_paper_execution_authority
 from robo_trader.paper_reduction_submitter import (
     LocalPaperOrderStatus,
     LocalPaperOutcomeProvenance,
@@ -202,7 +203,13 @@ def _make_case(
         portfolio_quantity=starting_quantity,
     )
     executor = PaperExecutor()
-    submitter = _bind_paper_reduction_submitter(executor, coordinator)
+    authority = _bind_paper_execution_authority(executor, "portfolio-a")
+    submitter = _bind_paper_reduction_submitter(
+        executor,
+        coordinator,
+        authority,
+        "portfolio-a",
+    )
     return RuntimeCase(
         coordinator,
         executor,
@@ -240,18 +247,36 @@ def _envelope(
     )
 
 
+def _submit(case: RuntimeCase, envelope):
+    pre_position = Decimal("-10") if case.request.side is OrderSide.BUY_TO_COVER else Decimal("10")
+    return case.submitter._submit_once(
+        envelope,
+        pre_position_quantity=pre_position,
+    )
+
+
 def test_binding_is_private_sealed_and_exact(tmp_path: Path) -> None:
     case = _make_case(tmp_path)
     with pytest.raises(PaperReductionSubmissionError, match="private bind"):
-        PaperReductionSubmitter(case.executor, case.coordinator)
+        PaperReductionSubmitter(case.executor, case.coordinator, object(), "portfolio-a")
 
     class PaperExecutorSubclass(PaperExecutor):
         pass
 
     with pytest.raises(PaperReductionSubmissionError, match="exactly PaperExecutor"):
-        _bind_paper_reduction_submitter(PaperExecutorSubclass(), case.coordinator)
+        _bind_paper_reduction_submitter(
+            PaperExecutorSubclass(),
+            case.coordinator,
+            object(),
+            "portfolio-a",
+        )
     with pytest.raises(PaperReductionSubmissionError, match="exactly SafetyRuntime"):
-        _bind_paper_reduction_submitter(case.executor, object())  # type: ignore[arg-type]
+        _bind_paper_reduction_submitter(
+            case.executor,
+            object(),
+            object(),
+            "portfolio-a",
+        )  # type: ignore[arg-type]
 
     assert not hasattr(case.submitter, "executor")
     with pytest.raises(AttributeError, match="sealed"):
@@ -289,12 +314,13 @@ def test_exact_mapping_and_one_execution_call(
     received: list[Order] = []
     expected = _filled_result()
 
-    def simple(order: Order) -> ExecutionResult:
+    def simple(order: Order, *, _capability: object) -> ExecutionResult:
+        assert _capability is not None
         received.append(order)
         return expected
 
     monkeypatch.setattr(case.executor, "_place_simple_order", simple)
-    outcome = case.submitter._submit_once(_envelope(case))
+    outcome = _submit(case, _envelope(case))
     assert type(outcome) is LocalPaperTerminalOutcome
     assert outcome.order_ref == "paper-submit-one"
     assert outcome.status is LocalPaperOrderStatus.FILLED
@@ -325,7 +351,8 @@ def test_replay_rejects_after_every_execution_outcome(
     envelope = _envelope(case)
     calls: list[Order] = []
 
-    def simple(order: Order) -> ExecutionResult:
+    def simple(order: Order, *, _capability: object) -> ExecutionResult:
+        assert _capability is not None
         calls.append(order)
         if outcome == "exception":
             raise LookupError("injected paper failure")
@@ -336,11 +363,11 @@ def test_replay_rejects_after_every_execution_outcome(
     monkeypatch.setattr(case.executor, "_place_simple_order", simple)
     if outcome == "exception":
         with pytest.raises(LookupError, match="injected"):
-            case.submitter._submit_once(envelope)
+            _submit(case, envelope)
     else:
-        case.submitter._submit_once(envelope)
+        _submit(case, envelope)
     with pytest.raises(PaperReductionSubmissionError, match="claim failed"):
-        case.submitter._submit_once(envelope)
+        _submit(case, envelope)
     assert len(calls) == 1
 
 
@@ -354,7 +381,8 @@ def test_concurrent_envelope_claim_allows_exactly_one_call(
     call_lock = threading.Lock()
     calls = 0
 
-    def simple(order: Order) -> ExecutionResult:
+    def simple(order: Order, *, _capability: object) -> ExecutionResult:
+        assert _capability is not None
         nonlocal calls
         with call_lock:
             calls += 1
@@ -363,7 +391,7 @@ def test_concurrent_envelope_claim_allows_exactly_one_call(
     def submit() -> object:
         barrier.wait()
         try:
-            return case.submitter._submit_once(envelope)
+            return _submit(case, envelope)
         except PaperReductionSubmissionError as exc:
             return exc
 
@@ -408,7 +436,7 @@ def test_proof_and_envelope_copies_forgery_and_replay_reject(
         copy.copy(envelope)
     envelope_clone = replace(envelope)
     with pytest.raises(PaperReductionSubmissionError, match="claim failed"):
-        case.submitter._submit_once(envelope_clone)
+        _submit(case, envelope_clone)
 
     values = {
         definition.name: getattr(envelope, definition.name) for definition in fields(envelope)
@@ -470,10 +498,10 @@ def test_tampered_envelope_scope_identity_and_fingerprint_reject_before_fill(
     monkeypatch.setattr(
         case.executor,
         "_place_simple_order",
-        lambda order: pytest.fail("execution must not be reached"),
+        lambda order, **kwargs: pytest.fail("execution must not be reached"),
     )
     with pytest.raises(PaperReductionSubmissionError, match="claim failed"):
-        case.submitter._submit_once(envelope)
+        _submit(case, envelope)
 
 
 def test_cross_account_coordinator_cannot_claim_envelope(tmp_path: Path) -> None:
@@ -486,9 +514,14 @@ def test_cross_account_coordinator_cannot_claim_envelope(tmp_path: Path) -> None
     foreign_submitter = _bind_paper_reduction_submitter(
         second.executor,
         second.coordinator,
+        _bind_paper_execution_authority(second.executor, "portfolio-a"),
+        "portfolio-a",
     )
     with pytest.raises(PaperReductionSubmissionError, match="claim failed"):
-        foreign_submitter._submit_once(_envelope(first))
+        foreign_submitter._submit_once(
+            _envelope(first),
+            pre_position_quantity=Decimal("10"),
+        )
 
 
 def test_final_smaller_exposure_rejects_and_invalidates_authorization(
@@ -649,12 +682,12 @@ def test_nonfinite_or_out_of_bounds_slippage_rejects_before_execution(
     monkeypatch.setattr(
         case.executor,
         "_place_simple_order",
-        lambda order: pytest.fail("execution must not be reached"),
+        lambda order, **kwargs: pytest.fail("execution must not be reached"),
     )
     with pytest.raises(PaperReductionSubmissionError, match="slippage"):
-        case.submitter._submit_once(envelope)
+        _submit(case, envelope)
     with pytest.raises(PaperReductionSubmissionError, match="claim failed"):
-        case.submitter._submit_once(envelope)
+        _submit(case, envelope)
 
 
 @pytest.mark.parametrize(
@@ -679,16 +712,17 @@ def test_malformed_execution_result_fails_closed_after_one_call(
     envelope = _envelope(case)
     calls = 0
 
-    def simple(order: Order) -> object:
+    def simple(order: Order, *, _capability: object) -> object:
+        assert _capability is not None
         nonlocal calls
         calls += 1
         return bad_result
 
     monkeypatch.setattr(case.executor, "_place_simple_order", simple)
     with pytest.raises(PaperReductionSubmissionError):
-        case.submitter._submit_once(envelope)
+        _submit(case, envelope)
     with pytest.raises(PaperReductionSubmissionError, match="claim failed"):
-        case.submitter._submit_once(envelope)
+        _submit(case, envelope)
     assert calls == 1
 
 
@@ -706,7 +740,7 @@ def test_unsafe_decimal_price_rejects(
 ) -> None:
     case = _make_case(tmp_path, limit_price=price)
     with pytest.raises(PaperReductionSubmissionError, match=message):
-        case.submitter._submit_once(_envelope(case))
+        _submit(case, _envelope(case))
 
 
 @pytest.mark.parametrize("price", [Decimal("NaN"), Decimal("Infinity")])
@@ -722,14 +756,15 @@ def test_limit_price_reaches_executor_as_exact_decimal(
     case = _make_case(tmp_path, limit_price=Decimal("123.45"))
     received: list[Order] = []
 
-    def simple(order: Order) -> ExecutionResult:
+    def simple(order: Order, *, _capability: object) -> ExecutionResult:
+        assert _capability is not None
         received.append(order)
         assert type(order.price) is Decimal
         assert order.price == Decimal("123.45")
         return _filled_result(Decimal("123.45"))
 
     monkeypatch.setattr(case.executor, "_place_simple_order", simple)
-    case.submitter._submit_once(_envelope(case))
+    _submit(case, _envelope(case))
     assert len(received) == 1
 
 
@@ -747,7 +782,7 @@ def test_legacy_soft_gate_is_bypassed_only_after_consumed_authority(
     assert normal.ok is False
     assert case.executor.fills == {}
 
-    result = case.submitter._submit_once(_envelope(case))
+    result = _submit(case, _envelope(case))
     assert result.ok is True
     assert result.fill_price == 187.25
     assert len(case.executor.fills) == 1
@@ -759,7 +794,7 @@ def test_arbitrary_finite_slippage_returns_one_normalized_exact_terminal_fill(
     case = _make_case(tmp_path)
     case.executor.slippage_bps = 0.3333333333333333
 
-    outcome = case.submitter._submit_once(_envelope(case))
+    outcome = _submit(case, _envelope(case))
 
     assert outcome.ok is True
     assert outcome.exact_fill_price is not None
@@ -776,10 +811,10 @@ def test_rejection_returns_exact_terminal_zero_fill_metadata(
     monkeypatch.setattr(
         case.executor,
         "_place_simple_order",
-        lambda order: ExecutionResult(False, "rejected"),
+        lambda order, **kwargs: ExecutionResult(False, "rejected"),
     )
 
-    outcome = case.submitter._submit_once(_envelope(case))
+    outcome = _submit(case, _envelope(case))
 
     assert outcome.status is LocalPaperOrderStatus.REJECTED
     assert outcome.ok is False
@@ -799,7 +834,8 @@ def test_exact_fill_mismatch_fails_closed_after_single_submission(
     envelope = _envelope(case)
     calls = 0
 
-    def mismatched(order: Order) -> ExecutionResult:
+    def mismatched(order: Order, *, _capability: object) -> ExecutionResult:
+        assert _capability is not None
         nonlocal calls
         calls += 1
         return ExecutionResult(
@@ -811,13 +847,13 @@ def test_exact_fill_mismatch_fails_closed_after_single_submission(
 
     monkeypatch.setattr(case.executor, "_place_simple_order", mismatched)
     with pytest.raises(PaperReductionSubmissionError, match="matching exact Decimal"):
-        case.submitter._submit_once(envelope)
+        _submit(case, envelope)
     with pytest.raises(PaperReductionSubmissionError, match="claim failed"):
-        case.submitter._submit_once(envelope)
+        _submit(case, envelope)
     assert calls == 1
 
 
-def test_adapter_has_one_simple_call_and_no_forbidden_route() -> None:
+def test_adapter_has_one_capability_call_and_no_forbidden_route() -> None:
     module_path = Path(__file__).parents[1] / "robo_trader" / "paper_reduction_submitter.py"
     tree = ast.parse(module_path.read_text(encoding="utf-8"))
     calls = [
@@ -825,7 +861,8 @@ def test_adapter_has_one_simple_call_and_no_forbidden_route() -> None:
         for node in ast.walk(tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     ]
-    assert sum(node.func.attr == "_place_simple_order" for node in calls) == 1
+    assert sum(node.func.attr == "_submit_reduction_once" for node in calls) == 1
+    assert not any(node.func.attr == "_place_simple_order" for node in calls)
     forbidden = {
         "place_order",
         "place_order_async",

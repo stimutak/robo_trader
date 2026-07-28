@@ -518,6 +518,7 @@ class AsyncRunner:
         self._shared_database = shared_database
         self._owns_database = shared_database is None
         self.paper_reduction_gateway = paper_reduction_gateway
+        self._baseline_entry_handle = None
         self.portfolio_id = portfolio_id
         self.duration = duration
         self.bar_size = bar_size
@@ -1470,6 +1471,7 @@ class AsyncRunner:
         order: Order,
         *,
         protective_quote: Optional[ProtectiveQuoteEvidence] = None,
+        _entry_intent: object | None = None,
     ):
         """
         Execute order with circuit breaker protection.
@@ -1500,11 +1502,16 @@ class AsyncRunner:
 
         contained, containment_reason = validate_gate_a_order(
             side=side,
-            intent_source=order.intent_source,
             take_profit=order.take_profit,
         )
         if not contained:
             return self._rejected_order_result(containment_reason)
+        if side == "BUY":
+            registered_entry_handle = getattr(self, "_baseline_entry_handle", None)
+            if registered_entry_handle is None or _entry_intent is None:
+                return self._rejected_order_result(
+                    "Gate-A entry lacks canonical baseline runtime authority"
+                )
 
         # Semantic reductions bypass entry-only soft stops, but only after the
         # account-wide gateway proves the exact broker contract/read-only
@@ -1644,7 +1651,10 @@ class AsyncRunner:
                 # Hold the same account-wide lock used by reductions. This
                 # prevents an entry from changing the simulator allocation
                 # between a reduction's initial and final evidence snapshots.
-                async with gateway.serialize_entry(order.symbol) as broker_quote:
+                async with gateway.serialize_entry(
+                    order.symbol,
+                    portfolio_id=self.portfolio_id,
+                ) as broker_quote:
                     if type(broker_quote) is not BrokerProtectiveQuote:
                         return self._rejected_order_result(
                             "Entry blocked: refreshed broker quote unavailable"
@@ -1666,7 +1676,6 @@ class AsyncRunner:
                         side=side,
                         price=broker_quote.price,
                         order_ref=order.order_ref,
-                        intent_source=order.intent_source,
                         take_profit=order.take_profit,
                     )
                     portfolio = getattr(self, "portfolio", None)
@@ -1713,7 +1722,11 @@ class AsyncRunner:
                             "Entry blocked: canonical session evidence expired during final admission"
                         )
                     with Timer("order_execution", self.monitor):
-                        result = self.executor.place_order(exact_order)
+                        result = gateway.submit_baseline_entry(
+                            order=exact_order,
+                            portfolio_id=self.portfolio_id,
+                            intent=_entry_intent,
+                        )
 
             # Record success/failure with circuit breaker
             if result.ok:
@@ -2812,7 +2825,7 @@ class AsyncRunner:
             self._paper_settlement_participant = participant
         if type(participant) is not PaperRuntimeSettlementParticipant:
             raise RuntimeError("active paper runtime settlement participant is malformed")
-        gateway.register_paper_executor(
+        self._baseline_entry_handle = gateway.register_paper_executor(
             self.portfolio_id,
             self.executor,
             protective_quote_producer=self.stop_loss_monitor,
@@ -4519,14 +4532,13 @@ class AsyncRunner:
                 df,
             )
 
-        # Provenance is carried to the central order sink. Only the baseline
-        # branch below can produce the one Gate-A entry source.
-        entry_intent_source = "unclassified"
+        # Only the canonical baseline branch below can mint an opaque entry
+        # intent. Alternate producers never receive reusable terminal authority.
+        baseline_entry_intent = None
 
         # Generate trading signal
         with Timer("signal_generation", self.monitor, instance=symbol):
             if self.use_ml_enhanced and self.ml_enhanced_strategy:
-                entry_intent_source = "ml_enhanced"
                 # Use ML Enhanced strategy for signal generation
                 signal_obj = await self.ml_enhanced_strategy.analyze(symbol, df)
 
@@ -4606,7 +4618,6 @@ class AsyncRunner:
                             confidence = 0.5
                         else:
                             signal_value = 1  # BUY
-                            entry_intent_source = "ai_discovery"
                             confidence = opp_conf
                             logger.info(
                                 f"🎯 AI OPPORTUNITY BUY for {symbol}: "
@@ -4696,7 +4707,6 @@ class AsyncRunner:
                                     # default to HOLD; do NOT escalate to BUY
                                 elif ai_buy and ai_conf_ok:
                                     signal_value = 1
-                                    entry_intent_source = "ai_analyst"
                                     confidence = analysis.confidence
                                     logger.info(
                                         f"AI BUY signal for {symbol} "
@@ -4773,7 +4783,6 @@ class AsyncRunner:
                             int(sma_signals["signal"].iloc[-1]) if len(sma_signals) > 0 else 0
                         )
                         if signal_value != 0:
-                            entry_intent_source = "baseline_sma"
                             confidence = 0.6
                             logger.info(f"SMA crossover signal for {symbol}: {signal_value}")
 
@@ -4788,7 +4797,6 @@ class AsyncRunner:
                     index=[df.index[-1]] if len(df) > 0 else [pd.Timestamp.now()],
                 )
             elif self.use_ml_strategy and self.ml_strategy:
-                entry_intent_source = "ml_selector"
                 # Use ML strategy for signal generation
                 # Prepare market data in the format expected by ML strategy
                 market_data_dict = {
@@ -4824,11 +4832,24 @@ class AsyncRunner:
                 )
             else:
                 # Use traditional SMA crossover strategy
-                entry_intent_source = "baseline_sma"
                 signals = sma_crossover_signals(
                     pd.DataFrame({"close": df["close"]}),
                     fast=self.sma_fast,
                     slow=self.sma_slow,
+                )
+                entry_gateway = self.paper_reduction_gateway
+                if entry_gateway is None:
+                    return self._blocked_result(
+                        symbol,
+                        0,
+                        latest_price,
+                        "Execution blocked: paper entry gateway unavailable",
+                        df,
+                    )
+                baseline_entry_intent = entry_gateway.issue_baseline_entry_intent(
+                    portfolio_id=self.portfolio_id,
+                    symbol=symbol,
+                    handle=self._baseline_entry_handle,
                 )
 
         # Generate mean reversion signals if enabled
@@ -4882,7 +4903,7 @@ class AsyncRunner:
 
                         # Override signal if mean reversion is stronger
                         if mr_signal.strength > 0.7:
-                            entry_intent_source = "mean_reversion"
+                            baseline_entry_intent = None
                             signal_value = 1 if mr_signal.signal_type.value == "BUY" else -1
                             signals.iloc[-1]["signal"] = signal_value
 
@@ -5224,8 +5245,8 @@ class AsyncRunner:
                                 quantity=qty,
                                 side="BUY",
                                 price=price,
-                                intent_source=entry_intent_source,
-                            )
+                            ),
+                            _entry_intent=baseline_entry_intent,
                         )
                         if res.ok:
                             exact_fill_price = self._exact_entry_fill_price(res)
@@ -7875,20 +7896,9 @@ async def run_continuous(
                 )
 
                 # Load portfolio configurations
-                from .multiuser.portfolio_config import PortfolioConfig, load_portfolio_configs
+                from .multiuser.portfolio_config import load_portfolio_configs
 
-                try:
-                    portfolio_configs = load_portfolio_configs()
-                except Exception as pc_err:
-                    logger.warning(f"Failed to load portfolio configs: {pc_err}, using default")
-                    portfolio_configs = [
-                        PortfolioConfig(
-                            id="default",
-                            name="Default Portfolio",
-                            starting_cash=default_cash or 100000,
-                            symbols=symbols or [],
-                        )
-                    ]
+                portfolio_configs = load_portfolio_configs()
 
                 active_portfolios = [pc for pc in portfolio_configs if pc.active]
                 logger.info(

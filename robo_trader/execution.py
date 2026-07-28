@@ -11,8 +11,12 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 if TYPE_CHECKING:
     from .smart_execution.smart_executor import ExecutionAlgorithm, SmartExecutor
 
-from robo_trader.logger import get_logger
 from robo_trader.gatea_containment import validate_gate_a_order
+from robo_trader.logger import get_logger
+from robo_trader.paper_execution_capability import (
+    PaperExecutionCapabilityError,
+    consume_paper_execution_capability,
+)
 
 logger = get_logger(__name__)
 
@@ -31,7 +35,6 @@ class Order:
     side: str  # "BUY" or "SELL"
     price: Optional[float | Decimal] = None  # None implies market
     order_ref: Optional[str] = None
-    intent_source: str = ""
     take_profit: Optional[float | Decimal] = None
 
 
@@ -91,7 +94,6 @@ class BaseExecutor(AbstractExecutor):
 
         admitted, reason = validate_gate_a_order(
             side=side,
-            intent_source=order.intent_source,
             take_profit=order.take_profit,
         )
         if not admitted:
@@ -190,15 +192,23 @@ class PaperExecutor(BaseExecutor):
         # Standard paper execution
         return self._place_simple_order(order)
 
-    def _place_simple_order(self, order: Order) -> ExecutionResult:
+    def _place_simple_order(
+        self,
+        order: Order,
+        *,
+        _capability: object | None = None,
+    ) -> ExecutionResult:
         """Place order with simple paper execution."""
         admitted, reason = validate_gate_a_order(
             side=order.side,
-            intent_source=order.intent_source,
             take_profit=order.take_profit,
         )
         if not admitted:
             return ExecutionResult(False, reason)
+        try:
+            consume_paper_execution_capability(self, order, _capability)
+        except PaperExecutionCapabilityError as exc:
+            return ExecutionResult(False, str(exc))
 
         base: Optional[float]
         exact_base: Optional[Decimal] = None

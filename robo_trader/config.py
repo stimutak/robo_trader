@@ -25,7 +25,6 @@ from .gatea_containment import (
     assert_gate_a_config,
     validate_gate_a_environment,
 )
-
 from .logger import get_logger
 from .runtime_contract_constants import PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
 from .utils.config_validator import ConfigValidator, EnhancedTradingConfig
@@ -1081,23 +1080,16 @@ def load_config_from_env() -> Config:
     config = Config(**config_dict)
 
     # Load multi-portfolio configurations
-    try:
-        from .multiuser.portfolio_config import load_portfolio_configs
+    from .multiuser.portfolio_config import load_portfolio_configs
 
+    try:
         portfolio_configs = load_portfolio_configs()
         config.portfolio_configs = [pc.to_dict() for pc in portfolio_configs]
-    except Exception as e:
-        logger.warning(f"Could not load portfolio configs: {e}")
-        # Fall back to single default portfolio
-        config.portfolio_configs = [
-            {
-                "id": "default",
-                "name": "Default Portfolio",
-                "starting_cash": config.default_cash,
-                "symbols": ",".join(config.symbols),
-                "active": True,
-            }
-        ]
+        assert_gate_a_config(config)
+    except (GateAContainmentError, TypeError, ValueError) as exc:
+        raise ConfigValidationError(
+            f"Explicit portfolio configuration violates Gate-A containment: {exc}"
+        ) from exc
 
     return config
 

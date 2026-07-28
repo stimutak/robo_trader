@@ -25,6 +25,11 @@ from robo_trader.database_async import (
     SafetyAllocationSnapshotError,
 )
 from robo_trader.execution import Order, PaperExecutor
+from robo_trader.market_data_contract import (
+    BrokerProtectiveQuote,
+    MarketDataSource,
+    MarketSession,
+)
 from robo_trader.paper_reduction_gateway import (
     PaperReductionGateway,
     PaperReductionGatewayError,
@@ -639,10 +644,10 @@ async def _bind_runtime(
     *,
     price: Decimal = Decimal("123.4500"),
     generation: str = "gateway-generation",
-) -> None:
+) -> object:
     monitor, participant = _runtime_components(harness, portfolio_id)
     harness.gateway.attach_protective_quote_producer(portfolio_id, monitor)
-    harness.gateway.register_paper_executor(
+    entry_handle = harness.gateway.register_paper_executor(
         portfolio_id,
         executor,
         protective_quote_producer=monitor,
@@ -659,6 +664,83 @@ async def _bind_runtime(
     )
     assert accepted is True
     harness.runtime_monitors[portfolio_id] = monitor
+    return entry_handle
+
+
+@pytest.mark.asyncio
+async def test_baseline_entry_intent_is_exact_session_scoped_and_one_shot(
+    harness: GatewayHarness,
+) -> None:
+    executor_a = PaperExecutor()
+    executor_b = PaperExecutor()
+    handle_a = await _bind_runtime(harness, "portfolio-a", executor_a)
+    handle_b = await _bind_runtime(harness, "portfolio-b", executor_b)
+    intent_a = harness.gateway.issue_baseline_entry_intent(
+        portfolio_id="portfolio-a",
+        symbol=SYMBOL,
+        handle=handle_a,
+    )
+    intent_b = harness.gateway.issue_baseline_entry_intent(
+        portfolio_id="portfolio-b",
+        symbol=SYMBOL,
+        handle=handle_b,
+    )
+    now = datetime.now(timezone.utc)
+    quote = BrokerProtectiveQuote(
+        schema_version=1,
+        symbol=SYMBOL,
+        con_id=CON_ID,
+        exchange="SMART",
+        primary_exchange="NASDAQ",
+        currency="USD",
+        security_type="STK",
+        price=Decimal("123.4500"),
+        source_timestamp=now,
+        retrieval_timestamp=now,
+        session=MarketSession.REGULAR,
+        source=MarketDataSource.IBKR_LIVE_LAST_TRADE,
+        source_event_id="entry-capability-test",
+        transport_generation="gateway-generation",
+        market_data_type=1,
+    )
+    harness.gateway._fetch_protective_quotes_locked = AsyncMock(return_value=(quote,))
+    order = Order(SYMBOL, 1, "BUY", quote.price, order_ref="baseline-entry-test")
+
+    async with harness.gateway.serialize_entry(SYMBOL, portfolio_id="portfolio-a"):
+        with pytest.raises(PaperReductionGatewayError, match="does not match runtime"):
+            harness.gateway.submit_baseline_entry(
+                order=order,
+                portfolio_id="portfolio-a",
+                intent=intent_b,
+            )
+        with pytest.raises(PaperReductionGatewayError, match="already consumed"):
+            harness.gateway.submit_baseline_entry(
+                order=order,
+                portfolio_id="portfolio-b",
+                intent=intent_b,
+            )
+        result = harness.gateway.submit_baseline_entry(
+            order=order,
+            portfolio_id="portfolio-a",
+            intent=intent_a,
+        )
+        with pytest.raises(PaperReductionGatewayError, match="already consumed"):
+            harness.gateway.submit_baseline_entry(
+                order=order,
+                portfolio_id="portfolio-a",
+                intent=intent_a,
+            )
+
+    assert result.ok is True
+    assert result.exact_fill_price == quote.price
+    assert len(executor_a.fills) == 1
+    assert executor_b.fills == {}
+    with pytest.raises(PaperReductionGatewayError, match="already consumed"):
+        harness.gateway.submit_baseline_entry(
+            order=order,
+            portfolio_id="portfolio-a",
+            intent=intent_a,
+        )
 
 
 def test_gateway_requires_exact_runtime_coordinator_database_and_executor_binding(

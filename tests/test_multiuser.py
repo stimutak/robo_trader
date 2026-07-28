@@ -45,7 +45,7 @@ class TestPortfolioConfig:
             starting_cash=75000,
             symbols=["NVDA", "TSLA"],
             max_position_pct=0.04,
-            enabled_strategies=["momentum", "ml_enhanced"],
+            enabled_strategies=["baseline_sma"],
         )
         d = original.to_dict()
         restored = PortfolioConfig.from_dict(d)
@@ -1196,16 +1196,16 @@ class TestPortfolioConfigEdgeCases:
         assert cfg.use_trailing_stop is True
         assert cfg.min_confidence == 0.6
 
-    def test_from_dict_strategy_string_split(self):
-        """enabled_strategies as comma-separated string is split correctly."""
+    def test_from_dict_strategy_string_normalized(self):
+        """The sole Gate-A strategy is normalized from explicit string input."""
         cfg = PortfolioConfig.from_dict(
             {
                 "id": "test",
                 "name": "T",
-                "enabled_strategies": "momentum, ml_enhanced , pairs",
+                "enabled_strategies": " BASELINE_SMA ",
             }
         )
-        assert cfg.enabled_strategies == ["momentum", "ml_enhanced", "pairs"]
+        assert cfg.enabled_strategies == ["baseline_sma"]
 
     def test_from_dict_extra_fields_ignored(self):
         """Unknown fields in dict don't cause errors."""

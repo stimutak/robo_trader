@@ -8,7 +8,7 @@ and evidence gates are implemented.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 GATE_A_PROFILE = "gate-a-simple-long-only-v1"
@@ -48,6 +48,32 @@ def _strategy_list(raw: str, name: str) -> tuple[str, ...]:
     strategies = tuple(item.strip().casefold() for item in raw.split(",") if item.strip())
     if not strategies or len(strategies) != len(set(strategies)):
         raise GateAContainmentError(f"{name} must contain unique nonempty strategies")
+    return strategies
+
+
+def validate_gate_a_portfolio_strategies(
+    value: object,
+    *,
+    name: str,
+) -> tuple[str, ...]:
+    """Validate an explicitly supplied per-portfolio strategy override."""
+
+    if type(value) is str:
+        strategies = _strategy_list(value, name)
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        if any(type(item) is not str for item in value):
+            raise GateAContainmentError(f"{name} must contain only strings")
+        strategies = tuple(item.strip().casefold() for item in value)
+        if (
+            not strategies
+            or any(not item for item in strategies)
+            or len(strategies) != len(set(strategies))
+        ):
+            raise GateAContainmentError(f"{name} must contain unique nonempty strategies")
+    else:
+        raise GateAContainmentError(f"{name} must be a string or sequence")
+    if strategies != ALLOWED_STRATEGIES:
+        raise GateAContainmentError(f"{name} requires exactly baseline_sma")
     return strategies
 
 
@@ -107,6 +133,20 @@ def assert_gate_a_config(config: object) -> None:
         contradictions.append("ML selectors must be disabled")
     if getattr(risk, "enable_take_profit", None) is not False:
         contradictions.append("take-profit execution must be disabled")
+    portfolio_configs = getattr(config, "portfolio_configs", ())
+    for index, portfolio in enumerate(portfolio_configs):
+        if not isinstance(portfolio, Mapping):
+            contradictions.append(f"portfolio_configs[{index}] must be a mapping")
+            continue
+        if "enabled_strategies" not in portfolio or portfolio["enabled_strategies"] is None:
+            continue
+        try:
+            validate_gate_a_portfolio_strategies(
+                portfolio["enabled_strategies"],
+                name=f"portfolio_configs[{index}].enabled_strategies",
+            )
+        except GateAContainmentError as exc:
+            contradictions.append(str(exc))
     if contradictions:
         raise GateAContainmentError("; ".join(contradictions))
 
@@ -129,17 +169,12 @@ def assert_gate_a_runner_options(
         raise GateAContainmentError("smart execution is disabled by Gate A")
 
 
-def normalize_entry_source(source: object) -> str:
-    return str(source or "").strip().casefold()
-
-
 def validate_gate_a_order(
     *,
     side: object,
-    intent_source: object,
     take_profit: object,
 ) -> tuple[bool, str]:
-    """Admit one simple long entry shape or a semantic reduction."""
+    """Validate Gate-A order shape before capability-backed submission."""
 
     normalized_side = str(side or "").strip().upper()
     if take_profit is not None:
@@ -150,9 +185,7 @@ def validate_gate_a_order(
         return False, "Gate-A profile blocks new short exposure"
     if normalized_side != "BUY":
         return False, "Gate-A profile rejects unsupported order side"
-    if normalize_entry_source(intent_source) != BASELINE_ENTRY_SOURCE:
-        return False, "Gate-A entry source is not the baseline SMA strategy"
-    return True, "Gate-A simple long entry"
+    return True, "Gate-A simple long candidate requires terminal capability"
 
 
 def assert_quarantined_alternate_engine(component: str) -> None:

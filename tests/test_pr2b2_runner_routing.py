@@ -71,6 +71,9 @@ def _exact_gateway(
     gateway.submit_reduction = AsyncMock(
         return_value=reduction_result or ExecutionResult(True, "gateway reduction filled", 100.0)
     )
+    gateway.submit_baseline_entry = MagicMock(
+        return_value=ExecutionResult(True, "entry filled", 100.0)
+    )
     now = datetime.now(timezone.utc)
     probe = _EntrySerializationProbe(
         BrokerProtectiveQuote(
@@ -106,6 +109,8 @@ def _runner(
 ) -> AsyncRunner:
     runner = AsyncRunner.__new__(AsyncRunner)
     runner.portfolio_id = "default"
+    runner._baseline_entry_handle = object()
+    runner._baseline_entry_intent = object()
     runner.paper_reduction_gateway = gateway
     runner._order_admission_lock = asyncio.Lock()
     runner._symbol_cycle_abort_event = asyncio.Event()
@@ -248,7 +253,13 @@ def _order(side: str) -> Order:
         side=side,
         price=100.0,
         order_ref=f"routing-{side.lower()}",
-        intent_source="baseline_sma" if side == "BUY" else "",
+    )
+
+
+async def _place(runner: AsyncRunner, order: Order):
+    return await runner._place_order_with_circuit_breaker(
+        order,
+        _entry_intent=(runner._baseline_entry_intent if order.side == "BUY" else None),
     )
 
 
@@ -330,7 +341,7 @@ async def test_entries_remain_blocked_before_gateway_or_executor(
         circuit_allows=blocker != "circuit",
     )
 
-    result = await runner._place_order_with_circuit_breaker(_order(side))
+    result = await _place(runner, _order(side))
 
     assert result.ok is False
     assert expected_message in result.message
@@ -355,7 +366,7 @@ async def test_reductions_bypass_entry_soft_blocks_through_gateway_once(
         circuit_allows=False,
     )
 
-    result = await runner._place_order_with_circuit_breaker(_order(side))
+    result = await _place(runner, _order(side))
 
     assert result is expected
     gateway.submit_reduction.assert_awaited_once_with(
@@ -387,7 +398,7 @@ async def test_reductions_require_exact_started_account_gateway(
         gateway, _ = _exact_gateway(started=False)
     runner = _runner(gateway)
 
-    result = await runner._place_order_with_circuit_breaker(_order(side))
+    result = await _place(runner, _order(side))
 
     assert result.ok is False
     assert "safety gateway unavailable" in result.message.lower()
@@ -408,7 +419,7 @@ async def test_reductions_reach_gateway_when_diagnostic_recovery_is_pending(side
     )
     runner = _runner(gateway)
 
-    result = await runner._place_order_with_circuit_breaker(_order(side))
+    result = await _place(runner, _order(side))
 
     assert result is expected
     gateway.submit_reduction.assert_awaited_once_with(
@@ -425,7 +436,7 @@ async def test_reductions_require_live_protective_feed(side: str) -> None:
     gateway, _ = _exact_gateway()
     runner = _runner(gateway, live_feed=False)
 
-    result = await runner._place_order_with_circuit_breaker(_order(side))
+    result = await _place(runner, _order(side))
 
     assert result.ok is False
     assert "live protective feed unavailable" in result.message.lower()
@@ -445,7 +456,7 @@ async def test_reduction_gateway_failure_fails_closed() -> None:
         PaperReductionGatewayError,
         match="final evidence no longer authorizes reduction",
     ):
-        await runner._place_order_with_circuit_breaker(_order("SELL"))
+        await _place(runner, _order("SELL"))
 
     gateway.submit_reduction.assert_awaited_once()
     runner.executor.place_order.assert_not_called()
@@ -458,7 +469,7 @@ async def test_transport_abort_blocks_reduction_before_gateway(side: str) -> Non
     runner = _runner(gateway)
     runner._symbol_cycle_abort_event.set()
 
-    result = await runner._place_order_with_circuit_breaker(_order(side))
+    result = await _place(runner, _order(side))
 
     assert result.ok is False
     assert "broker transport unavailable" in result.message.lower()
@@ -476,22 +487,31 @@ async def test_entry_dispatch_occurs_inside_gateway_serialization(
     gateway, probe = _exact_gateway()
     runner = _runner(gateway)
 
-    def place_order(order: Order) -> ExecutionResult:
-        assert order == _order(side)
+    def submit_baseline_entry(**kwargs) -> ExecutionResult:
         assert probe.active is True
+        assert kwargs["portfolio_id"] == "default"
+        assert kwargs["intent"] is runner._baseline_entry_intent
+        assert kwargs["order"] == Order(
+            symbol="AAPL",
+            quantity=2,
+            side="BUY",
+            price=Decimal("100.0"),
+            order_ref="routing-buy",
+        )
         return ExecutionResult(True, "entry filled", 100.0)
 
-    runner.executor.place_order.side_effect = place_order
+    gateway.submit_baseline_entry.side_effect = submit_baseline_entry
 
-    result = await runner._place_order_with_circuit_breaker(_order(side))
+    result = await _place(runner, _order(side))
 
     assert result.ok is True
     assert probe.active is False
     assert probe.enter_count == 1
     assert probe.exit_count == 1
-    gateway.serialize_entry.assert_called_once_with("AAPL")
+    gateway.serialize_entry.assert_called_once_with("AAPL", portfolio_id="default")
     gateway.submit_reduction.assert_not_awaited()
-    runner.executor.place_order.assert_called_once_with(_order(side))
+    gateway.submit_baseline_entry.assert_called_once()
+    runner.executor.place_order.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -499,7 +519,7 @@ async def test_new_short_rejects_before_gateway_or_executor() -> None:
     gateway, _ = _exact_gateway()
     runner = _runner(gateway)
 
-    result = await runner._place_order_with_circuit_breaker(_order("SELL_SHORT"))
+    result = await _place(runner, _order("SELL_SHORT"))
 
     assert result.ok is False
     assert "blocks new short exposure" in result.message
@@ -528,7 +548,7 @@ async def test_entries_require_exact_started_account_gateway(
         gateway, _ = _exact_gateway(started=False)
     runner = _runner(gateway)
 
-    result = await runner._place_order_with_circuit_breaker(_order(side))
+    result = await _place(runner, _order(side))
 
     assert result.ok is False
     assert "safety gateway unavailable" in result.message.lower()
@@ -548,13 +568,14 @@ async def test_entries_reach_gateway_when_diagnostic_recovery_is_pending(
     gateway, probe = _exact_gateway(started=False, recovery_required=True)
     runner = _runner(gateway)
 
-    result = await runner._place_order_with_circuit_breaker(_order(side))
+    result = await _place(runner, _order(side))
 
     assert result.ok is True
-    gateway.serialize_entry.assert_called_once_with("AAPL")
+    gateway.serialize_entry.assert_called_once_with("AAPL", portfolio_id="default")
     assert probe.enter_count == 1
     assert probe.exit_count == 1
-    runner.executor.place_order.assert_called_once_with(_order(side))
+    gateway.submit_baseline_entry.assert_called_once()
+    runner.executor.place_order.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -563,7 +584,7 @@ async def test_unsupported_sides_reject_before_any_dispatch(side: str) -> None:
     gateway, _ = _exact_gateway()
     runner = _runner(gateway)
 
-    result = await runner._place_order_with_circuit_breaker(_order(side))
+    result = await _place(runner, _order(side))
 
     assert result.ok is False
     assert result.message == "Unsupported order side"
