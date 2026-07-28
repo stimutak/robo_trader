@@ -27,6 +27,7 @@ The package is dormant: it grants no order, broker, runner, or startup authority
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import hmac
 import json
@@ -685,22 +686,25 @@ class DailyFilledNotional:
             created = self._initialize_if_missing()
             if not created:
                 recovery_required = self._preflight_existing_schema()
+            else:
+                recovery_required = False
+            with self._anchor_transition_lock():
                 if recovery_required:
                     self._recover_hot_journal()
-            with self._connection(readonly=True) as connection:
-                connection.execute("BEGIN")
-                state = self._validate_ledger(connection)
-                if created:
-                    anchor = self._create_initial_anchor(state)
-                else:
-                    anchor = self._reconcile_anchor(state)
-                self._verify_monotonic_state(state)
-                self._ledger_id = state.ledger_id
-                current_day = self._current_trading_date()
-                total = self._total_for_date(connection, current_day)
-                anchor = self._require_exact_anchor(state)
-                self._verify_monotonic_state(state)
-                connection.commit()
+                with self._connection(readonly=True) as connection:
+                    connection.execute("BEGIN")
+                    state = self._validate_ledger(connection)
+                    if created:
+                        anchor = self._create_initial_anchor(state)
+                    else:
+                        anchor = self._reconcile_anchor(state)
+                    self._verify_monotonic_state(state)
+                    self._ledger_id = state.ledger_id
+                    current_day = self._current_trading_date()
+                    total = self._total_for_date(connection, current_day)
+                    anchor = self._require_exact_anchor(state)
+                    self._verify_monotonic_state(state)
+                    connection.commit()
         except FilledNotionalError:
             raise
         except DecimalException as exc:
@@ -753,6 +757,7 @@ class DailyFilledNotional:
         ):
             raise FilledNotionalError("anchor directory is not safely bindable")
         self._anchor_name = self._anchor_path.name
+        self._anchor_lock_name = f".{self._anchor_name}.lock"
         self._anchor_directory_device = metadata.st_dev
         self._anchor_directory_inode = metadata.st_ino
 
@@ -775,6 +780,17 @@ class DailyFilledNotional:
                 path_metadata.st_ino,
             ) != expected:
                 raise FilledNotionalIntegrityError("anchor directory identity changed")
+        except FilledNotionalError:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise
+        except OSError as exc:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise FilledNotionalIntegrityError(
+                "anchor directory cannot be accessed safely"
+            ) from exc
+        try:
             yield descriptor
             metadata = os.fstat(descriptor)
             path_metadata = os.lstat(self._anchor_path.parent)
@@ -785,15 +801,72 @@ class DailyFilledNotional:
                 raise FilledNotionalIntegrityError(
                     "anchor directory identity changed during operation"
                 )
-        except FilledNotionalError:
-            raise
-        except OSError as exc:
-            raise FilledNotionalIntegrityError(
-                "anchor directory cannot be accessed safely"
-            ) from exc
         finally:
             if descriptor is not None:
                 os.close(descriptor)
+
+    @contextmanager
+    def _anchor_transition_lock(self) -> Iterator[None]:
+        """Serialize database commits through stable-anchor publication."""
+
+        descriptor: Optional[int] = None
+        with self._anchor_directory_descriptor() as directory_descriptor:
+            try:
+                descriptor = os.open(
+                    self._anchor_lock_name,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+                metadata = os.fstat(descriptor)
+                path_metadata = os.stat(
+                    self._anchor_lock_name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_mode & 0o077
+                    or metadata.st_nlink != 1
+                    or (metadata.st_dev, metadata.st_ino)
+                    != (path_metadata.st_dev, path_metadata.st_ino)
+                ):
+                    raise FilledNotionalIntegrityError(
+                        "anchor transition lock is not safely bindable"
+                    )
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            except FilledNotionalError:
+                if descriptor is not None:
+                    os.close(descriptor)
+                raise
+            except OSError as exc:
+                if descriptor is not None:
+                    os.close(descriptor)
+                raise FilledNotionalIntegrityError(
+                    "anchor transition lock cannot be used safely"
+                ) from exc
+            try:
+                yield
+                final_metadata = os.fstat(descriptor)
+                final_path_metadata = os.stat(
+                    self._anchor_lock_name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                if final_metadata.st_nlink != 1 or (
+                    final_metadata.st_dev,
+                    final_metadata.st_ino,
+                ) != (final_path_metadata.st_dev, final_path_metadata.st_ino):
+                    raise FilledNotionalIntegrityError("anchor transition lock identity changed")
+            finally:
+                if descriptor is not None:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    finally:
+                        os.close(descriptor)
 
     @property
     def database_path(self) -> Path:
@@ -826,101 +899,106 @@ class DailyFilledNotional:
 
         conflict: Optional[FilledNotionalConflict] = None
         try:
-            with self._connection(readonly=False) as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                before = self._validate_checkpointed_state(connection)
-                anchor = self._reconcile_anchor(before)
-                self._assert_no_conflicts(before)
-                self._verify_monotonic_state(before)
-                existing = connection.execute(
-                    """
-                    SELECT portfolio_id, side, quantity_text, price_text, currency,
-                           executed_at_utc, trading_date, notional_text, record_hash
-                    FROM daily_filled_notional_records
-                    WHERE account_id = ? AND broker_execution_id = ?
-                    """,
-                    (self._account_id, canonical.broker_execution_id),
-                ).fetchone()
-                recorded = existing is None
-                mutated = recorded
-                raw_after = before
-                if existing is not None:
-                    stored = tuple(str(value) for value in existing[:8])
-                    expected = (
-                        self._portfolio_id,
-                        canonical.side,
-                        canonical.quantity_text,
-                        canonical.price_text,
-                        canonical.currency,
-                        canonical.executed_at_utc,
-                        canonical.trading_date,
-                        canonical.notional_text,
-                    )
-                    if stored != expected:
-                        conflict_head = self._append_conflict(
+            with self._anchor_transition_lock():
+                with self._connection(readonly=False) as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    before = self._validate_checkpointed_state(connection)
+                    anchor = self._reconcile_anchor(before)
+                    self._assert_no_conflicts(before)
+                    self._verify_monotonic_state(before)
+                    existing = connection.execute(
+                        """
+                        SELECT portfolio_id, side, quantity_text, price_text, currency,
+                               executed_at_utc, trading_date, notional_text, record_hash
+                        FROM daily_filled_notional_records
+                        WHERE account_id = ? AND broker_execution_id = ?
+                        """,
+                        (self._account_id, canonical.broker_execution_id),
+                    ).fetchone()
+                    recorded = existing is None
+                    mutated = recorded
+                    raw_after = before
+                    if existing is not None:
+                        stored = tuple(str(value) for value in existing[:8])
+                        expected = (
+                            self._portfolio_id,
+                            canonical.side,
+                            canonical.quantity_text,
+                            canonical.price_text,
+                            canonical.currency,
+                            canonical.executed_at_utc,
+                            canonical.trading_date,
+                            canonical.notional_text,
+                        )
+                        if stored != expected:
+                            conflict_head = self._append_conflict(
+                                connection,
+                                before,
+                                canonical,
+                                existing_portfolio_id=str(existing[0]),
+                                existing_record_hash=str(existing[8]),
+                                observed_at_utc=observed_at_utc,
+                            )
+                            conflict = FilledNotionalConflict(
+                                "broker execution identity has durable conflicting evidence"
+                            )
+                            raw_after = replace(
+                                before,
+                                conflict_count=before.conflict_count + 1,
+                                conflict_head=conflict_head,
+                            )
+                            mutated = True
+                    else:
+                        prior_count, prior_total = self._scope_total_for_date(
+                            connection, date.fromisoformat(canonical.trading_date)
+                        )
+                        if prior_count >= _MAX_DAILY_FILL_ROWS:
+                            raise FilledNotionalUnavailable(
+                                "daily fill count exceeds the bounded accounting limit"
+                            )
+                        scope_fill_count = prior_count + 1
+                        scope_total = _exact_add(prior_total, canonical.notional)
+                        scope_total_text = _canonical_positive_decimal(
+                            scope_total,
+                            "scope_total",
+                            max_digits=96,
+                            max_abs_exponent=54,
+                        )
+                        fill_head = self._append_fill(
                             connection,
                             before,
                             canonical,
-                            existing_portfolio_id=str(existing[0]),
-                            existing_record_hash=str(existing[8]),
-                            observed_at_utc=observed_at_utc,
-                        )
-                        conflict = FilledNotionalConflict(
-                            "broker execution identity has durable conflicting evidence"
+                            scope_fill_count=scope_fill_count,
+                            scope_total_text=scope_total_text,
                         )
                         raw_after = replace(
                             before,
-                            conflict_count=before.conflict_count + 1,
-                            conflict_head=conflict_head,
+                            fill_count=before.fill_count + 1,
+                            fill_head=fill_head,
                         )
-                        mutated = True
-                else:
-                    prior_count, prior_total = self._scope_total_for_date(
-                        connection, date.fromisoformat(canonical.trading_date)
+                    after = (
+                        self._append_checkpoint(connection, before, raw_after)
+                        if mutated
+                        else before
                     )
-                    if prior_count >= _MAX_DAILY_FILL_ROWS:
-                        raise FilledNotionalUnavailable(
-                            "daily fill count exceeds the bounded accounting limit"
+                    trading_day = date.fromisoformat(canonical.trading_date)
+                    total = self._total_for_date(connection, trading_day)
+                    if mutated:
+                        pending = self._replace_anchor(
+                            self._anchor_for_state(before, pending_state=after),
+                            expected=anchor,
                         )
-                    scope_fill_count = prior_count + 1
-                    scope_total = _exact_add(prior_total, canonical.notional)
-                    scope_total_text = _canonical_positive_decimal(
-                        scope_total,
-                        "scope_total",
-                        max_digits=96,
-                        max_abs_exponent=54,
-                    )
-                    fill_head = self._append_fill(
-                        connection,
-                        before,
-                        canonical,
-                        scope_fill_count=scope_fill_count,
-                        scope_total_text=scope_total_text,
-                    )
-                    raw_after = replace(
-                        before,
-                        fill_count=before.fill_count + 1,
-                        fill_head=fill_head,
-                    )
-                after = (
-                    self._append_checkpoint(connection, before, raw_after) if mutated else before
-                )
-                trading_day = date.fromisoformat(canonical.trading_date)
-                total = self._total_for_date(connection, trading_day)
-                if mutated:
-                    pending = self._replace_anchor(
-                        self._anchor_for_state(before, pending_state=after),
-                        expected=anchor,
-                    )
-                    self._commit_database(connection)
-                    self._anchor = self._replace_anchor(
-                        self._anchor_for_state(after),
-                        expected=pending,
-                    )
-                    self._verify_monotonic_state(after)
-                else:
-                    self._commit_database(connection)
-                    self._anchor = anchor
+                        self._commit_database(connection)
+                        self._anchor = self._replace_anchor(
+                            self._anchor_for_state(after),
+                            expected=pending,
+                        )
+                        self._anchor = self._require_exact_anchor(after)
+                        self._verify_monotonic_state(after)
+                    else:
+                        self._commit_database(connection)
+                        self._anchor = self._require_exact_anchor(before)
+                        self._verify_monotonic_state(before)
         except FilledNotionalIntegrityError as exc:
             self._latch_failure(str(exc))
             raise
@@ -1314,16 +1392,92 @@ class DailyFilledNotional:
             connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
             connection.commit()
 
+    def _reject_wal_sidecars(self) -> None:
+        """Reject WAL state before SQLite can open or mutate WAL/SHM artifacts."""
+
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{self._path}{suffix}")
+            try:
+                os.lstat(sidecar)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise FilledNotionalUnavailable(
+                    "SQLite sidecar identity cannot be inspected safely"
+                ) from exc
+            raise FilledNotionalUnavailable(
+                "WAL/SHM sidecars are unsupported; preserve them for reviewed recovery"
+            )
+
+    def _validate_existing_rollback_journal(self) -> None:
+        """Ensure a rollback journal cannot redirect mutations through another inode name."""
+
+        journal = Path(f"{self._path}-journal")
+        try:
+            metadata = os.lstat(journal)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise FilledNotionalUnavailable(
+                "SQLite rollback-journal identity cannot be inspected safely"
+            ) from exc
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+        ):
+            raise FilledNotionalUnavailable(
+                "SQLite rollback journal is not an exclusive regular file"
+            )
+        try:
+            anchor = self._load_anchor()
+            database_metadata = os.lstat(self._path)
+        except (FilledNotionalError, OSError) as exc:
+            raise FilledNotionalUnavailable(
+                "hot journal lacks an authenticated current-schema recovery anchor"
+            ) from exc
+        if (
+            stat.S_ISLNK(database_metadata.st_mode)
+            or not stat.S_ISREG(database_metadata.st_mode)
+            or anchor.state.database_device != database_metadata.st_dev
+            or anchor.state.database_inode != database_metadata.st_ino
+        ):
+            raise FilledNotionalUnavailable(
+                "hot journal recovery anchor does not bind this database"
+            )
+
+    @staticmethod
+    def _require_rollback_journal_header(binding: SQLitePathBinding) -> None:
+        try:
+            header = os.pread(binding.guardian_file_descriptor, 20, 0)
+        except OSError as exc:
+            raise FilledNotionalUnavailable(
+                "SQLite journal mode cannot be inspected safely"
+            ) from exc
+        if len(header) != 20 or header[:16] != b"SQLite format 3\x00":
+            raise FilledNotionalUnavailable(
+                "existing schema cannot be detected without SQLite recovery"
+            )
+        if header[18:20] != b"\x01\x01":
+            raise FilledNotionalUnavailable(
+                "SQLite ledger must use rollback-journal mode; WAL is unsupported"
+            )
+
     def _preflight_existing_schema(self) -> bool:
         """Identify legacy state without permitting SQLite journal recovery."""
 
+        self._reject_wal_sidecars()
         journal = Path(f"{self._path}-journal")
         try:
             journal_metadata = os.lstat(journal)
         except FileNotFoundError:
             journal_metadata = None
         if journal_metadata is not None:
-            if stat.S_ISLNK(journal_metadata.st_mode) or not stat.S_ISREG(journal_metadata.st_mode):
+            if (
+                stat.S_ISLNK(journal_metadata.st_mode)
+                or not stat.S_ISREG(journal_metadata.st_mode)
+                or journal_metadata.st_nlink != 1
+            ):
                 raise FilledNotionalUnavailable(
                     "SQLite journal prevents safe read-only schema detection"
                 )
@@ -1366,6 +1520,9 @@ class DailyFilledNotional:
         connection: Optional[sqlite3.Connection] = None
         try:
             binding = SQLitePathBinding.open_for_initialization(self._path, create=False)
+            self._require_rollback_journal_header(binding)
+            self._reject_wal_sidecars()
+            self._validate_existing_rollback_journal()
             mode = "ro" if readonly else "rw"
             immutable_query = "&immutable=1" if immutable else ""
             connection = sqlite3.connect(
@@ -1376,6 +1533,9 @@ class DailyFilledNotional:
             )
             connection.row_factory = sqlite3.Row
             bound = binding.bind_sqlite_connection(sqlite_connection_file_identity(connection))
+            journal_mode = connection.execute("PRAGMA journal_mode").fetchone()
+            if journal_mode is None or str(journal_mode[0]).lower() != "delete":
+                raise FilledNotionalUnavailable("SQLite ledger journal mode changed while opening")
             connection.execute("PRAGMA busy_timeout=1000")
             connection.execute("PRAGMA foreign_keys=ON")
             connection.set_authorizer(_append_only_authorizer)
@@ -2008,11 +2168,12 @@ class DailyFilledNotional:
     def _resolve_pending_anchor(self) -> None:
         """Serialize behind a writer and reconcile only authenticated endpoints."""
 
-        with self._connection(readonly=False) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            state = self._validate_ledger(connection)
-            self._anchor = self._reconcile_anchor(state)
-            connection.commit()
+        with self._anchor_transition_lock():
+            with self._connection(readonly=False) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                state = self._validate_ledger(connection)
+                self._anchor = self._reconcile_anchor(state)
+                connection.commit()
 
     def _replace_anchor(self, desired: _Anchor, *, expected: _Anchor) -> _Anchor:
         current = self._load_anchor()

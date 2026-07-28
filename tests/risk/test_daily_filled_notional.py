@@ -179,6 +179,32 @@ def test_exact_execution_replay_is_idempotent(tmp_path):
         ).fetchone() == (1,)
 
 
+def test_exact_replay_rechecks_monotonic_authority_at_return_boundary(tmp_path):
+    ledger = _service(tmp_path / "notional.db")
+    fill = _fill("broker.exec.return-boundary")
+    ledger.record_fill(fill)
+
+    class RejectSecondVerification:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, state) -> bool:
+            del state
+            self.calls += 1
+            return self.calls == 1
+
+    verifier = RejectSecondVerification()
+    ledger._monotonic_verifier = verifier
+
+    with pytest.raises(FilledNotionalIntegrityError, match="monotonic authority rejected"):
+        ledger.record_fill(fill)
+    assert verifier.calls == 2
+    with sqlite3.connect(ledger.database_path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM daily_filled_notional_records"
+        ).fetchone() == (1,)
+
+
 def test_conflicting_duplicate_fails_closed_and_latches_instance(tmp_path):
     ledger = _service(tmp_path / "notional.db")
     original = _fill("broker.exec.1")
@@ -469,6 +495,76 @@ def test_current_query_is_read_only(tmp_path):
     assert not Path(f"{ledger.database_path}-wal").exists()
 
 
+def test_wal_shm_hardlinks_are_rejected_without_mutating_targets(tmp_path):
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+    with sqlite3.connect(path, isolation_level=None) as connection:
+        assert connection.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+
+    wal_target = tmp_path / "preserved.wal"
+    shm_target = tmp_path / "preserved.shm"
+    wal_target.write_bytes(b"preserve WAL evidence")
+    shm_target.write_bytes(b"preserve SHM evidence")
+    wal_path = Path(f"{path}-wal")
+    shm_path = Path(f"{path}-shm")
+    os.link(wal_target, wal_path)
+    os.link(shm_target, shm_path)
+    wal_before = wal_target.read_bytes()
+    shm_before = shm_target.read_bytes()
+    wal_stat = wal_target.stat()
+    shm_stat = shm_target.stat()
+
+    with pytest.raises(FilledNotionalUnavailable, match="WAL/SHM sidecars are unsupported"):
+        _service(path)
+
+    assert wal_target.read_bytes() == wal_before
+    assert shm_target.read_bytes() == shm_before
+    assert (wal_target.stat().st_ino, wal_target.stat().st_size) == (
+        wal_stat.st_ino,
+        wal_stat.st_size,
+    )
+    assert (shm_target.stat().st_ino, shm_target.stat().st_size) == (
+        shm_stat.st_ino,
+        shm_stat.st_size,
+    )
+
+
+def test_clean_wal_mode_is_rejected_before_sqlite_creates_sidecars(tmp_path):
+    path = tmp_path / "notional.db"
+    _service(path)
+    with sqlite3.connect(path, isolation_level=None) as connection:
+        assert connection.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+    assert not Path(f"{path}-wal").exists()
+    assert not Path(f"{path}-shm").exists()
+
+    with pytest.raises(FilledNotionalUnavailable, match="rollback-journal mode"):
+        _service(path)
+
+    assert not Path(f"{path}-wal").exists()
+    assert not Path(f"{path}-shm").exists()
+
+
+def test_hardlinked_rollback_journal_is_rejected_without_mutation(tmp_path):
+    path = tmp_path / "notional.db"
+    _service(path)
+    target = tmp_path / "preserved.journal"
+    target.write_bytes(b"preserve rollback evidence")
+    journal_path = Path(f"{path}-journal")
+    os.link(target, journal_path)
+    before = target.read_bytes()
+    target_stat = target.stat()
+
+    with pytest.raises(FilledNotionalUnavailable, match="journal prevents safe"):
+        _service(path)
+
+    assert target.read_bytes() == before
+    assert (target.stat().st_ino, target.stat().st_size, target.stat().st_nlink) == (
+        target_stat.st_ino,
+        target_stat.st_size,
+        target_stat.st_nlink,
+    )
+
+
 def test_anchor_write_crash_window_recovers_one_authenticated_fill(tmp_path, monkeypatch):
     path = tmp_path / "notional.db"
     ledger = _service(path)
@@ -627,6 +723,63 @@ def test_reader_snapshot_rechecks_anchor_before_returning_during_writer_race(tmp
     assert results["read"] == Decimal("20.5")
     assert total_calls >= 2
     assert reader._failed_reason is None
+
+
+def test_concurrent_writers_serialize_through_stable_anchor_publication(tmp_path, monkeypatch):
+    path = tmp_path / "notional.db"
+    first = _service(path)
+    second = _service(path)
+    first_reached_post_commit = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    second_done = threading.Event()
+    results: dict[str, object] = {}
+    original_replace = first._replace_anchor
+
+    def gate_final_anchor(desired, *, expected):
+        if expected.pending_state is not None and desired.pending_state is None:
+            first_reached_post_commit.set()
+            if not release_first.wait(timeout=5):
+                raise sqlite3.OperationalError("test timed out releasing first writer")
+        return original_replace(desired, expected=expected)
+
+    monkeypatch.setattr(first, "_replace_anchor", gate_final_anchor)
+
+    def write_first() -> None:
+        try:
+            results["first"] = first.record_fill(_fill("writer-one"))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            results["first"] = exc
+
+    def write_second() -> None:
+        second_started.set()
+        try:
+            results["second"] = second.record_fill(_fill("writer-two"))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            results["second"] = exc
+        finally:
+            second_done.set()
+
+    first_thread = threading.Thread(target=write_first)
+    second_thread = threading.Thread(target=write_second)
+    first_thread.start()
+    assert first_reached_post_commit.wait(timeout=5)
+    second_thread.start()
+    assert second_started.wait(timeout=5)
+    assert not second_done.wait(timeout=0.1)
+    release_first.set()
+    first_thread.join(timeout=5)
+    second_thread.join(timeout=5)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert not isinstance(results.get("first"), BaseException)
+    assert not isinstance(results.get("second"), BaseException)
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT broker_execution_id FROM daily_filled_notional_records ORDER BY sequence"
+        ).fetchall() == [("writer-one",), ("writer-two",)]
+    assert _service(path).restored_gross_filled_notional == Decimal("41")
 
 
 def test_invalid_pending_anchor_identity_still_fails_closed(tmp_path):

@@ -44,6 +44,14 @@ state; a stable anchor is never advanced heuristically. Authoritative reads and
 reviews use one SQLite snapshot and re-check both the exact anchor and external
 monotonic state immediately before returning.
 
+Writers also hold an owner-only, inode-checked transition lock in the protected
+anchor directory from checkpoint validation through stable-anchor publication
+and the final monotonic verification. This closes the post-commit interval in
+which a second writer could otherwise advance the anchor and cause the first
+writer to report failure after its fill was already durable. Exact execution
+replays perform the same return-boundary anchor and monotonic checks even though
+they do not append a row.
+
 The hot path is deliberately bounded: the latest cumulative scope total is
 found through the scope/date/sequence index, each append adds one checkpoint,
 and no scope may exceed 100,000 fills for one New York trading date. Exceeding
@@ -65,3 +73,11 @@ This is required because SQLite cache spill can place an uncommitted future
 schema marker in the main database while the rollback journal still contains
 the authoritative legacy image; trusting that marker and recovering would
 destroy migration evidence.
+
+Version 3 requires SQLite rollback-journal mode (header read/write versions
+`1/1`) and does not accept WAL mode. Existing `-wal` or `-shm` files are
+preserved and rejected before SQLite opens them. A rollback `-journal` is
+eligible for authenticated recovery only when it is a non-symlink regular file
+with one link; hardlinked journals are preserved and rejected. These checks
+prevent read-only construction and accounting writes from following or
+mutating unbound SQLite sidecar targets.
