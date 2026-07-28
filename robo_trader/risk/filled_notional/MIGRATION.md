@@ -75,9 +75,9 @@ cannot be trusted, reconstruct on a reviewed copy or restart to force the full
 audit before relying on the ledger.
 
 Schema validation inventories every trigger whose target is a protected ledger
-table, regardless of the trigger's name, and rejects anything beyond the exact
-versioned trigger set. This prevents a foreign trigger such as
-`RAISE(IGNORE)` from silently suppressing an append.
+table, regardless of the trigger's name or the target identifier's ASCII case,
+and rejects anything beyond the exact versioned trigger set. This prevents a
+foreign trigger such as `RAISE(IGNORE)` from silently suppressing an append.
 
 For an existing database, schema version detection is immutable and read-only
 before any read-write recovery. Read-write recovery of a hot rollback journal

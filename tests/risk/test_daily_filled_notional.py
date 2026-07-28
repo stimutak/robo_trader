@@ -436,36 +436,65 @@ def test_trigger_removal_and_row_tamper_fail_closed_on_restart(tmp_path):
         _service(path)
 
 
-def test_foreign_raise_ignore_trigger_on_protected_table_fails_closed_without_mutation(tmp_path):
+@pytest.mark.parametrize(
+    "protected_table",
+    [
+        "daily_filled_notional_schema",
+        "daily_filled_notional_records",
+        "daily_filled_notional_conflicts",
+        "daily_filled_notional_checkpoints",
+    ],
+)
+@pytest.mark.parametrize("target_case", ["mixed", "uppercase"])
+def test_case_variant_foreign_trigger_on_every_protected_table_fails_closed_without_mutation(
+    tmp_path, protected_table, target_case
+):
     path = tmp_path / "notional.db"
     ledger = _service(path)
+    target_identifier = (
+        protected_table.upper()
+        if target_case == "uppercase"
+        else "".join(
+            character.upper() if index % 2 == 0 else character.lower()
+            for index, character in enumerate(protected_table)
+        )
+    )
+    trigger_name = f"foreign_suppress_{target_case}_{protected_table}"
     with sqlite3.connect(path) as connection:
-        connection.execute("""
-            CREATE TRIGGER foreign_suppress_filled_notional_insert
-            BEFORE INSERT ON daily_filled_notional_records
+        connection.execute(f"""
+            CREATE TRIGGER "{trigger_name}"
+            BEFORE INSERT ON "{target_identifier}"
             BEGIN
                 SELECT RAISE(IGNORE);
             END
             """)
+        assert connection.execute(
+            "SELECT tbl_name FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            (trigger_name,),
+        ).fetchone() == (target_identifier,)
 
-    database_before = path.read_bytes()
-    database_identity = (os.lstat(path).st_dev, os.lstat(path).st_ino)
-    anchor_before = ledger.anchor_path.read_bytes()
-    anchor_identity = (
-        os.lstat(ledger.anchor_path).st_dev,
-        os.lstat(ledger.anchor_path).st_ino,
-    )
+    database_before = _file_snapshot(path)
+    anchor_before = _file_snapshot(ledger.anchor_path)
+    paths_before = _path_inventory(tmp_path)
 
     with pytest.raises(FilledNotionalIntegrityError, match="schema objects do not match"):
-        ledger.record_fill(_fill("must-not-be-ignored"))
+        ledger.record_fill(_fill(f"must-not-be-ignored-{target_case}-{protected_table}"))
 
-    assert path.read_bytes() == database_before
-    assert (os.lstat(path).st_dev, os.lstat(path).st_ino) == database_identity
-    assert ledger.anchor_path.read_bytes() == anchor_before
-    assert (
-        os.lstat(ledger.anchor_path).st_dev,
-        os.lstat(ledger.anchor_path).st_ino,
-    ) == anchor_identity
+    assert _file_snapshot(path) == database_before
+    assert _file_snapshot(ledger.anchor_path) == anchor_before
+    assert _path_inventory(tmp_path) == paths_before
+
+    with pytest.raises(FilledNotionalIntegrityError, match="schema objects do not match"):
+        DailyFilledNotional.review_quarantine(
+            path,
+            anchor_path=ledger.anchor_path,
+            anchor_key=ANCHOR_KEY,
+            monotonic_verifier=_MONOTONIC_VERIFIERS[str(path)],
+        )
+
+    assert _file_snapshot(path) == database_before
+    assert _file_snapshot(ledger.anchor_path) == anchor_before
+    assert _path_inventory(tmp_path) == paths_before
 
 
 @pytest.mark.parametrize("suppressed_append", ["fill", "checkpoint"])

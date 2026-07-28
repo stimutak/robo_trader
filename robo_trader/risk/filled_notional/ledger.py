@@ -1671,7 +1671,7 @@ class DailyFilledNotional:
             WHERE name LIKE 'daily_filled_notional_%'
                OR (
                    type = 'trigger'
-                   AND tbl_name IN (?, ?, ?, ?)
+                   AND lower(tbl_name) IN (?, ?, ?, ?)
                )
             ORDER BY type, name
             """,
