@@ -7,10 +7,28 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from robo_trader.config import RuntimeContract
 from robo_trader.paper_runtime_settlement import bounded_float_projection_matches
 from robo_trader.portfolio import Portfolio
 from robo_trader.risk.advanced_risk import AdvancedRiskManager
 from robo_trader.runner_async import AsyncRunner, UnprotectedExistingPositionsError
+
+TEST_RUNTIME_CONTRACT = RuntimeContract(
+    environment="test",
+    execution_mode="paper",
+    execution_source="paper_simulator",
+    ibkr_host="127.0.0.1",
+    ibkr_port=4002,
+    ibkr_readonly=True,
+    database_path="/tmp/robotrader-advanced-risk-test.db",
+    account_alias="***PER",
+    account_type="paper",
+    model_artifact_set="test",
+    build_id="test-build",
+    state_namespace="paper",
+    safety_account_scope="acct_v1_" + ("0123456789abcdef" * 4),
+    safety_execution_domain_scope="paper-simulator-v1",
+)
 
 
 def _risk_manager() -> AdvancedRiskManager:
@@ -81,6 +99,7 @@ async def test_restart_seeds_long_short_cost_basis_and_account_pnl() -> None:
     runner = object.__new__(AsyncRunner)
     runner.portfolio_id = "default"
     runner.positions = {}
+    runner.cfg = SimpleNamespace(runtime_contract=TEST_RUNTIME_CONTRACT)
     runner.db = SimpleNamespace(
         get_account_info=AsyncMock(
             return_value={
@@ -93,6 +112,7 @@ async def test_restart_seeds_long_short_cost_basis_and_account_pnl() -> None:
                 "daily_pnl_baseline_exact": Decimal("18.75"),
                 "daily_pnl_date_exact": datetime.utcnow().date(),
                 "source_settlement_id": "pset-" + ("7" * 32),
+                "bootstrap_lineage_valid": True,
             }
         ),
         get_positions=AsyncMock(
@@ -102,12 +122,14 @@ async def test_restart_seeds_long_short_cost_basis_and_account_pnl() -> None:
                     "quantity": 3,
                     "avg_cost": 190.25,
                     "market_price_exact": Decimal("191.25"),
+                    "bootstrap_lineage_valid": True,
                 },
                 {
                     "symbol": "TSLA",
                     "quantity": -4,
                     "avg_cost": 251.75,
                     "market_price_exact": Decimal("250.75"),
+                    "bootstrap_lineage_valid": True,
                 },
             ]
         ),
@@ -149,6 +171,7 @@ def _restart_runner(*, account_date, exact_mark):
     runner = object.__new__(AsyncRunner)
     runner.portfolio_id = "default"
     runner.positions = {}
+    runner.cfg = SimpleNamespace(runtime_contract=TEST_RUNTIME_CONTRACT)
     runner.db = SimpleNamespace(
         get_account_info=AsyncMock(
             return_value={
@@ -158,6 +181,7 @@ def _restart_runner(*, account_date, exact_mark):
                 "daily_pnl_baseline_exact": Decimal("15.5"),
                 "daily_pnl_date_exact": account_date,
                 "source_settlement_id": "pset-" + ("8" * 32),
+                "bootstrap_lineage_valid": True,
             }
         ),
         get_positions=AsyncMock(
@@ -167,6 +191,7 @@ def _restart_runner(*, account_date, exact_mark):
                     "quantity": 2,
                     "avg_cost": 100.0,
                     "market_price_exact": exact_mark,
+                    "bootstrap_lineage_valid": True,
                 }
             ]
         ),

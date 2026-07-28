@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import os
+import sqlite3
 import stat
 import threading
 import uuid
@@ -32,10 +33,16 @@ from robo_trader.database_migrations import (
 )
 from robo_trader.database_validator import DatabaseValidator, ValidationError
 from robo_trader.financial_state_bootstrap import (
+    ExactStateBootstrapBackupReceipt,
     ExactStateBootstrapCandidate,
     ExactStateBootstrapError,
+    ExactStateBootstrapEvidence,
     ExactStateBootstrapReceipt,
     _canonical_legacy_rows,
+    assert_exact_state_bootstrap_evidence,
+    inspect_legacy_state,
+    sqlite_table_evidence,
+    verified_file_sha256,
 )
 from robo_trader.logger import get_logger
 from robo_trader.market_data_contract import (
@@ -1557,12 +1564,97 @@ class AsyncTradingDatabase:
         if hook is not None:
             hook(step)
 
+    def _verify_exact_state_backup(
+        self,
+        candidate: ExactStateBootstrapCandidate,
+        evidence: ExactStateBootstrapEvidence,
+        receipt: ExactStateBootstrapBackupReceipt,
+        descriptor: SQLiteDescriptorIdentity,
+    ) -> None:
+        """Re-open the independently created backup and prove it matches this apply."""
+
+        if type(receipt) is not ExactStateBootstrapBackupReceipt:
+            raise ExactStateBootstrapError("bootstrap requires an exact backup receipt")
+        if (
+            receipt.schema_version != 1
+            or receipt.source_path != str(self.db_path)
+            or (receipt.source_device, receipt.source_inode)
+            != (descriptor.device, descriptor.inode)
+            or (evidence.database_device, evidence.database_inode)
+            != (descriptor.device, descriptor.inode)
+            or receipt.source_snapshot_hash != candidate.legacy_snapshot_hash
+            or receipt.candidate_fingerprint != candidate.fingerprint()
+        ):
+            raise ExactStateBootstrapError("backup receipt is not bound to this bootstrap source")
+        backup_path = Path(receipt.backup_path)
+        if backup_path == self.db_path:
+            raise ExactStateBootstrapError("backup path must differ from the source ledger")
+        backup_hash, backup_metadata = verified_file_sha256(
+            backup_path,
+            "bootstrap backup",
+        )
+        if not hmac.compare_digest(backup_hash, receipt.backup_content_hash) or (
+            backup_metadata.st_dev,
+            backup_metadata.st_ino,
+        ) != (receipt.backup_device, receipt.backup_inode):
+            raise ExactStateBootstrapError("bootstrap backup identity or hash changed")
+        backup_state = inspect_legacy_state(backup_path)
+        backup_binding: Optional[SQLitePathBinding] = None
+        backup_connection: Optional[sqlite3.Connection] = None
+        try:
+            backup_binding = SQLitePathBinding.open_for_initialization(
+                backup_path,
+                create=False,
+            )
+            if (backup_binding.device, backup_binding.inode) != (
+                receipt.backup_device,
+                receipt.backup_inode,
+            ):
+                raise ExactStateBootstrapError("bootstrap backup descriptor changed")
+            backup_connection = sqlite3.connect(
+                backup_path.as_uri() + "?mode=ro",
+                uri=True,
+            )
+            bound = backup_binding.bind_sqlite_connection(
+                sqlite_connection_file_identity(backup_connection)
+            )
+            bound.assert_connection_identity(sqlite_connection_file_identity(backup_connection))
+            backup_connection.execute("BEGIN")
+            integrity_rows = backup_connection.execute("PRAGMA integrity_check").fetchall()
+            if integrity_rows != [(receipt.integrity_check,)]:
+                raise ExactStateBootstrapError("bootstrap backup integrity proof changed")
+            backup_counts, backup_hashes = sqlite_table_evidence(backup_connection)
+            bound.assert_connection_identity(sqlite_connection_file_identity(backup_connection))
+            backup_binding.assert_path_identity()
+            backup_connection.rollback()
+        except (OSError, sqlite3.Error, SQLiteIdentityError) as exc:
+            raise ExactStateBootstrapError("bootstrap backup cannot be verified safely") from exc
+        finally:
+            if backup_connection is not None:
+                backup_connection.close()
+            if backup_binding is not None:
+                backup_binding.close()
+        final_hash, final_metadata = verified_file_sha256(backup_path, "bootstrap backup")
+        if (
+            backup_state["snapshot_hash"] != candidate.legacy_snapshot_hash
+            or backup_counts != receipt.row_counts
+            or backup_hashes != receipt.table_hashes
+            or (backup_state["database_device"], backup_state["database_inode"])
+            != (receipt.backup_device, receipt.backup_inode)
+            or (final_metadata.st_dev, final_metadata.st_ino)
+            != (receipt.backup_device, receipt.backup_inode)
+            or not hmac.compare_digest(final_hash, receipt.backup_content_hash)
+        ):
+            raise ExactStateBootstrapError("bootstrap backup does not restore the reviewed ledger")
+
     async def apply_exact_state_bootstrap(
         self,
         candidate: ExactStateBootstrapCandidate,
         *,
+        evidence: ExactStateBootstrapEvidence,
+        backup_receipt: ExactStateBootstrapBackupReceipt,
         operator_reason: str,
-        runtime_contract: Optional[object] = None,
+        runtime_contract: object,
     ) -> ExactStateBootstrapReceipt:
         """Insert one sealed exact accounting epoch without rewriting legacy rows.
 
@@ -1583,36 +1675,26 @@ class AsyncTradingDatabase:
             )
         if Path(candidate.database_path) != self.db_path:
             raise ExactStateBootstrapError("bootstrap database path does not match this ledger")
-        expected_identity = candidate.database_identity
-        if runtime_contract is not None:
-            expected_path, runtime_identity = self._expected_safety_database(
-                runtime_contract=runtime_contract
+        expected_path, runtime_identity = self._expected_safety_database(
+            runtime_contract=runtime_contract
+        )
+        if expected_path != self.db_path or runtime_identity != candidate.database_identity:
+            raise ExactStateBootstrapError(
+                "bootstrap database identity does not match the runtime contract"
             )
-            if expected_path != self.db_path or runtime_identity != expected_identity:
-                raise ExactStateBootstrapError(
-                    "bootstrap database identity does not match the runtime contract"
-                )
-            if (
-                getattr(runtime_contract, "safety_execution_domain_scope", None)
-                != candidate.execution_domain_scope
-                or getattr(runtime_contract, "safety_account_scope", None)
-                != candidate.account_scope
-            ):
-                raise ExactStateBootstrapError(
-                    "bootstrap safety scope does not match the runtime contract"
-                )
-        else:
-            digest = hashlib.sha256(
-                str(self.db_path.resolve(strict=False)).encode("utf-8")
-            ).hexdigest()[:12]
-            if expected_identity != f"paper:{digest}":
-                raise ExactStateBootstrapError("bootstrap database identity is inconsistent")
+        assert_exact_state_bootstrap_evidence(candidate, evidence, runtime_contract)
 
         async with self.get_connection() as conn:
             descriptor = await self._sqlite_descriptor_identity(conn)
             expected_file_identity = self._expected_database_file_identity
             if expected_file_identity != (descriptor.device, descriptor.inode):
                 raise ExactStateBootstrapError("bootstrap database descriptor changed")
+            self._verify_exact_state_backup(
+                candidate,
+                evidence,
+                backup_receipt,
+                descriptor,
+            )
             try:
                 await conn.execute("BEGIN IMMEDIATE")
                 cursor = await conn.execute(
@@ -1657,16 +1739,20 @@ class AsyncTradingDatabase:
                     """)
                 position_rows = await cursor.fetchall()
                 cursor = await conn.execute("""
-                    SELECT COUNT(*),COALESCE(MIN(id),0),COALESCE(MAX(id),0),
-                           COALESCE(SUM(quantity),0) FROM trades
+                    SELECT id,portfolio_id,symbol,side,quantity,price,notional,slippage,
+                           commission,pnl,timestamp FROM trades ORDER BY id
                     """)
-                trade_summary = await cursor.fetchone()
-                if trade_summary is None:
-                    raise ExactStateBootstrapError("legacy trade summary is unavailable")
+                trade_rows = await cursor.fetchall()
+                cursor = await conn.execute("""
+                    SELECT id,portfolio_id,date,equity,cash,positions_value,realized_pnl,
+                           unrealized_pnl,timestamp FROM equity_history ORDER BY id
+                    """)
+                equity_history_rows = await cursor.fetchall()
                 legacy_payload = _canonical_legacy_rows(
                     account_rows,
                     position_rows,
-                    trade_summary,
+                    trade_rows,
+                    equity_history_rows,
                 )
                 actual_legacy_hash = hashlib.sha256(legacy_payload.encode("utf-8")).hexdigest()
                 if actual_legacy_hash != candidate.legacy_snapshot_hash:
@@ -2526,13 +2612,22 @@ class AsyncTradingDatabase:
                             """
                             INSERT INTO paper_position_settlement_state (
                                 portfolio_id, symbol, cost_basis_text,
-                                mark_price_text, source_settlement_id, updated_at
-                            ) VALUES (?, ?, ?, ?, NULL, ?)
+                                mark_price_text, source_settlement_id, updated_at,
+                                origin_bootstrap_id
+                            ) VALUES (?, ?, ?, ?, NULL, ?, (
+                                SELECT origin_bootstrap_id
+                                FROM paper_account_settlement_state
+                                WHERE portfolio_id = ?
+                            ))
                             ON CONFLICT(portfolio_id, symbol) DO UPDATE SET
                                 cost_basis_text = excluded.cost_basis_text,
                                 mark_price_text = excluded.mark_price_text,
                                 source_settlement_id = NULL,
-                                updated_at = excluded.updated_at
+                                updated_at = excluded.updated_at,
+                                origin_bootstrap_id = COALESCE(
+                                    paper_position_settlement_state.origin_bootstrap_id,
+                                    excluded.origin_bootstrap_id
+                                )
                             """,
                             (
                                 portfolio_id,
@@ -2544,6 +2639,7 @@ class AsyncTradingDatabase:
                                     else decimal_to_fixed(exact_market_price)
                                 ),
                                 utc_to_text(datetime.now(timezone.utc)),
+                                portfolio_id,
                             ),
                         )
 
@@ -3204,7 +3300,47 @@ class AsyncTradingDatabase:
                 }
             return None
 
-    async def get_positions(self, portfolio_id: str = DEFAULT_PORTFOLIO_ID) -> List[Dict]:
+    def _bootstrap_lineage_matches_runtime(
+        self,
+        *,
+        runtime_contract: Optional[object],
+        descriptor: SQLiteDescriptorIdentity,
+        portfolio_id: str,
+        bootstrap_id: object,
+        bootstrap_portfolio_id: object,
+        execution_domain_scope: object,
+        account_scope: object,
+        database_path: object,
+        database_identity: object,
+        database_device: object,
+        database_inode: object,
+    ) -> bool:
+        """Return true only for lineage sealed to this exact runtime ledger."""
+
+        try:
+            expected_path, expected_identity = self._expected_safety_database(
+                runtime_contract=runtime_contract
+            )
+        except SafetyAllocationSnapshotError:
+            return False
+        return not (
+            bootstrap_id is None
+            or bootstrap_portfolio_id != portfolio_id
+            or execution_domain_scope
+            != getattr(runtime_contract, "safety_execution_domain_scope", None)
+            or account_scope != getattr(runtime_contract, "safety_account_scope", None)
+            or database_path != str(expected_path)
+            or database_identity != expected_identity
+            or database_device != descriptor.device
+            or database_inode != descriptor.inode
+        )
+
+    async def get_positions(
+        self,
+        portfolio_id: str = DEFAULT_PORTFOLIO_ID,
+        *,
+        runtime_contract: Optional[object] = None,
+    ) -> List[Dict]:
         """Get all current positions for a portfolio."""
         portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
         async with self.get_connection() as conn:
@@ -3215,7 +3351,9 @@ class AsyncTradingDatabase:
                        s.origin_bootstrap_id,
                        settled.settlement_id, settled.portfolio_id, settled.symbol,
                        bootstrap.bootstrap_id, bootstrap.portfolio_id,
-                       bootstrap.execution_domain_scope
+                       bootstrap.execution_domain_scope, bootstrap.account_scope,
+                       bootstrap.database_path, bootstrap.database_identity,
+                       bootstrap.database_device, bootstrap.database_inode
                 FROM positions AS p
                 LEFT JOIN paper_position_settlement_state AS s
                   ON s.portfolio_id = p.portfolio_id AND s.symbol = p.symbol
@@ -3228,6 +3366,7 @@ class AsyncTradingDatabase:
                 (portfolio_id,),
             )
             rows = await cursor.fetchall()
+            descriptor = await self._sqlite_descriptor_identity(conn)
             positions = []
             for row in rows:
                 exact_mark = (
@@ -3241,11 +3380,21 @@ class AsyncTradingDatabase:
                     raise PaperTerminalSettlementError(
                         "paper position mark settlement lineage cannot be resolved"
                     )
-                bootstrap_lineage_valid = exact_mark is not None and not (
-                    row[6] is None
-                    or row[10] != row[6]
-                    or row[11] != portfolio_id
-                    or row[12] != "paper-simulator-v1"
+                bootstrap_lineage_valid = (
+                    exact_mark is not None
+                    and self._bootstrap_lineage_matches_runtime(
+                        runtime_contract=runtime_contract,
+                        descriptor=descriptor,
+                        portfolio_id=portfolio_id,
+                        bootstrap_id=row[10],
+                        bootstrap_portfolio_id=row[11],
+                        execution_domain_scope=row[12],
+                        account_scope=row[13],
+                        database_path=row[14],
+                        database_identity=row[15],
+                        database_device=row[16],
+                        database_inode=row[17],
+                    )
                 )
                 positions.append(
                     {
@@ -3815,7 +3964,12 @@ class AsyncTradingDatabase:
                 for row in rows
             ]
 
-    async def get_account_info(self, portfolio_id: str = DEFAULT_PORTFOLIO_ID) -> Dict:
+    async def get_account_info(
+        self,
+        portfolio_id: str = DEFAULT_PORTFOLIO_ID,
+        *,
+        runtime_contract: Optional[object] = None,
+    ) -> Dict:
         """Get current account information for a portfolio."""
         portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
         async with self.get_connection() as conn:
@@ -3828,7 +3982,9 @@ class AsyncTradingDatabase:
                        s.daily_pnl_date, s.origin_bootstrap_id,
                        settled.settlement_id, settled.portfolio_id,
                        bootstrap.bootstrap_id, bootstrap.portfolio_id,
-                       bootstrap.execution_domain_scope
+                       bootstrap.execution_domain_scope, bootstrap.account_scope,
+                       bootstrap.database_path, bootstrap.database_identity,
+                       bootstrap.database_device, bootstrap.database_inode
                 FROM account AS a
                 LEFT JOIN paper_account_settlement_state AS s
                   ON s.portfolio_id = a.portfolio_id
@@ -3842,6 +3998,7 @@ class AsyncTradingDatabase:
             )
             row = await cursor.fetchone()
             if row:
+                descriptor = await self._sqlite_descriptor_identity(conn)
                 exact_values = row[6:10]
                 source_settlement_id = row[10]
                 exact_daily_pnl_date_text = row[11]
@@ -3897,11 +4054,20 @@ class AsyncTradingDatabase:
                     raise PaperTerminalSettlementError(
                         "paper account settlement lineage belongs to another portfolio"
                     )
-                bootstrap_lineage_valid = all(value is not None for value in exact_values) and not (
-                    origin_bootstrap_id is None
-                    or row[15] != origin_bootstrap_id
-                    or row[16] != portfolio_id
-                    or row[17] != "paper-simulator-v1"
+                bootstrap_lineage_valid = all(
+                    value is not None for value in exact_values
+                ) and self._bootstrap_lineage_matches_runtime(
+                    runtime_contract=runtime_contract,
+                    descriptor=descriptor,
+                    portfolio_id=portfolio_id,
+                    bootstrap_id=row[15],
+                    bootstrap_portfolio_id=row[16],
+                    execution_domain_scope=row[17],
+                    account_scope=row[18],
+                    database_path=row[19],
+                    database_identity=row[20],
+                    database_device=row[21],
+                    database_inode=row[22],
                 )
                 return {
                     "cash": row[0],

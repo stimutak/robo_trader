@@ -100,3 +100,100 @@ async def test_append_only_bootstrap_triggers_reject_update_and_delete(tmp_path:
             "paper_state_bootstraps_no_delete",
             "paper_state_bootstraps_no_update",
         ]
+
+
+@pytest.mark.asyncio
+async def test_recorded_migration_does_not_hide_malformed_trigger(tmp_path: Path) -> None:
+    path = tmp_path / "malformed-trigger.db"
+    database = AsyncTradingDatabase(path, pool_size=1)
+    await database.initialize()
+    await database.close()
+
+    with sqlite3.connect(path) as connection:
+        connection.executescript("""
+            DROP TRIGGER paper_state_bootstraps_no_update;
+            CREATE TRIGGER paper_state_bootstraps_no_update
+            BEFORE UPDATE ON paper_state_bootstraps
+            BEGIN
+                SELECT 1;
+            END;
+        """)
+        assert connection.execute(
+            "SELECT version FROM rt_schema_migrations WHERE component='paper_exact_state'"
+        ).fetchone() == (1,)
+
+    reopened = AsyncTradingDatabase(path, pool_size=1)
+    with pytest.raises(RuntimeError, match="trigger .* malformed"):
+        await reopened.initialize()
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_recorded_migration_does_not_hide_missing_foreign_key(tmp_path: Path) -> None:
+    path = tmp_path / "missing-foreign-key.db"
+    database = AsyncTradingDatabase(path, pool_size=1)
+    await database.initialize()
+    await database.close()
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.executescript("""
+            ALTER TABLE paper_account_settlement_state
+            RENAME TO paper_account_settlement_state_original;
+            CREATE TABLE paper_account_settlement_state (
+                portfolio_id TEXT PRIMARY KEY,
+                cash_text TEXT NOT NULL,
+                realized_pnl_text TEXT NOT NULL,
+                daily_pnl_text TEXT NOT NULL,
+                daily_pnl_baseline_text TEXT NOT NULL,
+                daily_pnl_date TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                source_settlement_id TEXT,
+                origin_bootstrap_id TEXT
+            );
+            INSERT INTO paper_account_settlement_state
+            SELECT * FROM paper_account_settlement_state_original;
+            DROP TABLE paper_account_settlement_state_original;
+        """)
+        assert connection.execute(
+            "SELECT version FROM rt_schema_migrations WHERE component='paper_exact_state'"
+        ).fetchone() == (1,)
+
+    reopened = AsyncTradingDatabase(path, pool_size=1)
+    with pytest.raises(RuntimeError, match="foreign keys are malformed"):
+        await reopened.initialize()
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_recorded_migration_does_not_hide_weakened_check_constraint(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "weakened-check.db"
+    database = AsyncTradingDatabase(path, pool_size=1)
+    await database.initialize()
+    await database.close()
+
+    with sqlite3.connect(path) as connection:
+        schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
+        connection.execute("PRAGMA writable_schema = ON")
+        connection.execute("""
+            UPDATE sqlite_master
+            SET sql = replace(
+                sql,
+                'CHECK (length(trim(reason)) >= 10)',
+                'CHECK (1)'
+            )
+            WHERE type='table' AND name='administrator_actions'
+            """)
+        connection.execute("PRAGMA writable_schema = OFF")
+        connection.execute(f"PRAGMA schema_version = {schema_version + 1}")
+        connection.commit()
+        assert connection.execute(
+            "SELECT version FROM rt_schema_migrations WHERE component='paper_exact_state'"
+        ).fetchone() == (1,)
+
+    reopened = AsyncTradingDatabase(path, pool_size=1)
+    with pytest.raises(RuntimeError, match="constraints are malformed"):
+        await reopened.initialize()
+    await reopened.close()
