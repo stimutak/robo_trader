@@ -217,6 +217,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
     environment: staging
     steps:
       - uses: actions/checkout@v4
@@ -238,9 +240,7 @@ jobs:
       - name: Notify deployment
         # TODO(R2-CFG-H1.4): pin to specific commit SHA
         uses: 8398a7/action-slack@v3
-        if: always()
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+        if: always() && env.SLACK_WEBHOOK_URL != ''
         with:
           status: ${{ job.status }}
           text: 'Staging deployment ${{ job.status }}'
@@ -319,6 +319,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
     steps:
       - name: Trigger rollback
         run: |
@@ -331,8 +333,7 @@ jobs:
       - name: Notify rollback
         # TODO(R2-CFG-H1.4): pin to specific commit SHA
         uses: 8398a7/action-slack@v3
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+        if: env.SLACK_WEBHOOK_URL != ''
         with:
           status: 'warning'
           text: 'Rollback initiated for failed deployment'
