@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import json
 import threading
@@ -128,11 +129,8 @@ class _FakeIB:
             )
         ]
 
-    async def reqAccountSummaryAsync(self):
-        self.calls.append("reqAccountSummaryAsync")
-
-    def accountValues(self, account):
-        self.calls.append("accountValues")
+    async def accountSummaryAsync(self, account):
+        self.calls.append("accountSummaryAsync")
         assert account == ACCOUNT
         return [
             SimpleNamespace(
@@ -146,6 +144,30 @@ class _FakeIB:
                 tag="TotalCashValue",
                 currency="USD",
                 value="25000.500",
+            ),
+            SimpleNamespace(
+                account=ACCOUNT,
+                tag="BuyingPower",
+                currency="USD",
+                value="999999",
+            ),
+        ]
+
+    def accountValues(self, account):
+        self.calls.append("accountValues")
+        assert account == ACCOUNT
+        return [
+            SimpleNamespace(
+                account=ACCOUNT,
+                tag="NetLiquidation",
+                currency="USD",
+                value="1.00",
+            ),
+            SimpleNamespace(
+                account=ACCOUNT,
+                tag="TotalCashValue",
+                currency="USD",
+                value="2.00",
             ),
             SimpleNamespace(
                 account=ACCOUNT,
@@ -211,14 +233,15 @@ async def test_worker_snapshot_is_fresh_atomic_read_only_and_precise(fake_ib):
         "reqPositionsAsync",
         "reqAllOpenOrdersAsync",
         "reqExecutionsAsync",
-        "reqAccountSummaryAsync",
-        "accountValues",
+        "accountSummaryAsync",
         "qualifyContractsAsync",
     }
     assert set(fake_ib.calls) <= allowed
     assert "reqPositionsAsync" in fake_ib.calls
     assert "reqAllOpenOrdersAsync" in fake_ib.calls
     assert "reqExecutionsAsync" in fake_ib.calls
+    assert "accountSummaryAsync" in fake_ib.calls
+    assert "accountValues" not in fake_ib.calls
     execution_request_index = fake_ib.calls.index("reqExecutionsAsync")
     assert fake_ib.calls[execution_request_index - 1] == "reqCurrentTimeAsync"
     assert not any(
@@ -256,7 +279,8 @@ async def test_worker_wrong_expected_account_performs_zero_data_reads(fake_ib):
     assert result["status"] == "error"
     assert result["error_type"] == "BrokerSnapshotAccountMismatchError"
     assert not any(
-        call.startswith("req") or call in {"accountValues", "qualifyContractsAsync"}
+        call.startswith("req")
+        or call in {"accountSummaryAsync", "accountValues", "qualifyContractsAsync"}
         for call in fake_ib.calls
     )
 
@@ -603,8 +627,10 @@ async def test_worker_snapshot_timeout_preserves_parent_timeout_poison(fake_ib, 
         "status": "error",
         "error": "Broker snapshot collection timed out",
         "error_type": "TimeoutError",
+        "detail": "Broker snapshot stage timed out: positions_initial",
     }
     assert ACCOUNT not in worker_response["error"]
+    assert "sensitive diagnostic context" not in json.dumps(worker_response)
 
     client, generation = _transport_response_client(worker_response)
     with pytest.raises(IBKRTimeoutError, match="Broker snapshot collection timed out"):
@@ -613,6 +639,59 @@ async def test_worker_snapshot_timeout_preserves_parent_timeout_poison(fake_ib, 
     assert generation.poisoned_reason is not None
     assert "worker-reported broker timeout" in generation.poisoned_reason
     assert "get_broker_snapshot" in generation.poisoned_reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", sorted(worker.BROKER_SNAPSHOT_REQUEST_STAGES))
+async def test_worker_snapshot_stage_deadlines_are_bounded_and_sanitized(stage, monkeypatch):
+    sensitive_detail = "DU_SECRET_ACCOUNT raw broker exception"
+
+    async def never_finishes():
+        await asyncio.Future()
+        raise AssertionError(sensitive_detail)
+
+    monkeypatch.setattr(worker, "BROKER_SNAPSHOT_STAGE_TIMEOUT_SECONDS", 0.001)
+
+    with pytest.raises(worker.BrokerSnapshotStageTimeout) as exc_info:
+        await worker._await_broker_snapshot_stage(stage, never_finishes())
+
+    assert exc_info.value.stage == stage
+    assert str(exc_info.value) == f"Broker snapshot stage timed out: {stage}"
+    assert sensitive_detail not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_worker_snapshot_routes_every_broker_await_through_stage_deadline(
+    fake_ib, monkeypatch
+):
+    observed = []
+
+    async def record_stage(stage, request):
+        observed.append(stage)
+        return await request
+
+    monkeypatch.setattr(worker, "_await_broker_snapshot_stage", record_stage)
+
+    result = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert result["status"] == "success"
+    assert observed == [
+        "broker_time_before",
+        "positions_initial",
+        "positions_initial_identity",
+        "position_identity",
+        "open_orders_initial",
+        "open_order_identity",
+        "broker_time_execution_cutoff",
+        "executions",
+        "execution_identity",
+        "account_summary",
+        "positions_final",
+        "positions_final_identity",
+        "open_orders_final",
+        "open_orders_final_identity",
+        "broker_time_after",
+    ]
 
 
 @pytest.mark.asyncio
