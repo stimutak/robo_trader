@@ -30,6 +30,7 @@ from robo_trader.financial_state_bootstrap import (
     ExactStateBootstrapCommittedBackupInvalid,
     ExactStateBootstrapError,
     acquire_exact_state_safety_journal_guard,
+    assert_exact_state_runtime_sources_unchanged,
     inspect_legacy_state,
     load_exact_state_bootstrap_evidence,
     sqlite_table_evidence,
@@ -477,6 +478,8 @@ def _candidate_bundle(
         "mutated_state": False,
         "portfolio_ids": ["default"],
         "reconciliation_status": "passed",
+        "reconciliation_differences": [],
+        "reconciliation_timing_lag_proofs": [],
         "runtime_fingerprint": runtime_contract.fingerprint,
         "safety_journal_device": journal_metadata.st_dev,
         "safety_journal_identity": runtime_contract.safety_journal_identity,
@@ -735,6 +738,58 @@ def test_safety_journal_guard_blocks_mutation_and_releases_writer_lock(
         writer.close()
 
 
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+def test_runtime_source_revalidation_rejects_same_inode_ledger_content_change(
+    tmp_path: Path,
+    journal_mode: str,
+) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    _candidate, evidence, runtime_contract = _candidate_bundle(path, tmp_path)
+    original_inode = path.stat().st_ino
+    writer = sqlite3.connect(path)
+    try:
+        assert writer.execute(f"PRAGMA journal_mode={journal_mode}").fetchone()[0].upper() == (
+            journal_mode
+        )
+        writer.execute("UPDATE account SET cash = cash + 1 WHERE portfolio_id='default'")
+        writer.commit()
+        assert path.stat().st_ino == original_inode
+        with pytest.raises(ExactStateBootstrapError, match="ledger content changed"):
+            assert_exact_state_runtime_sources_unchanged(evidence, runtime_contract)
+    finally:
+        writer.close()
+
+
+def test_runtime_source_revalidation_rejects_same_inode_safety_journal_change(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    _candidate, evidence, runtime_contract = _candidate_bundle(path, tmp_path)
+    journal_path = Path(str(runtime_contract.safety_journal_path))
+    original_inode = journal_path.stat().st_ino
+    with sqlite3.connect(journal_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO safety_journal_events(
+                sequence, event_id, event_type, occurred_at, idempotency_key,
+                execution_domain_scope, account_scope, portfolio_id, con_id,
+                intent_fingerprint, claim_id, payload_json, previous_chain_hash,
+                payload_hash, chain_hash, schema_version
+            ) VALUES (1, 'tampered-event', 'RESERVED', '2026-07-28T14:00:00Z',
+                      'tampered-key', 'paper-simulator-v1', ?, 'default', 1,
+                      'tampered-intent', NULL, '{}', ?, ?, ?, 1)
+            """,
+            (ACCOUNT_SCOPE, "0" * 64, "1" * 64, "2" * 64),
+        )
+        connection.commit()
+    assert journal_path.stat().st_ino == original_inode
+
+    with pytest.raises(ExactStateBootstrapError, match="journal"):
+        assert_exact_state_runtime_sources_unchanged(evidence, runtime_contract)
+
+
 @pytest.mark.asyncio
 async def test_offline_schema_failure_rolls_back_to_byte_identical_raw_legacy_database(
     tmp_path: Path,
@@ -989,7 +1044,7 @@ def test_evidence_loader_rejects_tampered_broker_and_wrong_runtime_scope(
         account_scope=ACCOUNT_SCOPE,
     )
 
-    with pytest.raises(ExactStateBootstrapError, match="zero paper exposure"):
+    with pytest.raises(ExactStateBootstrapError, match="collection evidence counts"):
         load_exact_state_bootstrap_evidence(
             reconciliation_path=tmp_path / "reconciliation.json",
             broker_snapshot_path=broker_path,
