@@ -11,12 +11,15 @@ from robo_trader.clients.subprocess_ibkr_client import SubprocessIBKRClient
 from robo_trader.reconciliation.broker import assert_read_only_provider_surface
 from robo_trader.reconciliation.errors import BrokerEvidenceError
 from robo_trader.reconciliation.ibkr_adapter import (
+    BrokerSnapshotProducerResult,
     IBKRDiagnosticSnapshotProvider,
     build_diagnostic_provider,
+    normalized_snapshot_from_transport,
     snapshot_from_transport,
 )
 
 ACCOUNT = "DU_TEST_4567"
+ACCOUNT_SCOPE = "acct_v1_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 NOW = datetime.now(timezone.utc).replace(microsecond=0)
 
 
@@ -35,8 +38,14 @@ def _contract():
 
 def _payload():
     return {
-        "snapshot_schema_version": 1,
+        "snapshot_schema_version": 2,
         "account": ACCOUNT,
+        "account_type": "paper",
+        "account_structure": "INDIVIDUAL",
+        "base_currency": "USD",
+        "total_cash": "25000.5",
+        "buying_power": "999999",
+        "account_observed_at": NOW.isoformat(),
         "broker_time_before": (NOW - timedelta(seconds=2)).isoformat(),
         "broker_time_after": NOW.isoformat(),
         "retrieved_at": NOW.isoformat(),
@@ -51,6 +60,7 @@ def _payload():
         "balances": [
             {"tag": "NetLiquidation", "currency": "USD", "value": "100000"},
             {"tag": "TotalCashValue", "currency": "USD", "value": "25000.5"},
+            {"tag": "BuyingPower", "currency": "USD", "value": "999999"},
         ],
         "open_orders": [
             {
@@ -76,6 +86,7 @@ def _payload():
                 },
             }
         ],
+        "completed_orders": [],
         "executions": [
             {
                 "account": ACCOUNT,
@@ -90,15 +101,37 @@ def _payload():
                 "average_price": "120.25",
                 "executed_at": (NOW - timedelta(minutes=1)).isoformat(),
                 "execution_exchange": "NASDAQ",
-                "commission": None,
-                "commission_currency": None,
-                "realized_pnl": None,
-                "unavailable": {
-                    "commission": "not returned by the bounded execution request",
-                    "commission_currency": "not returned by the bounded execution request",
-                    "realized_pnl": "not returned by the bounded execution request",
-                },
+                "commission": "1.23",
+                "commission_currency": "USD",
+                "realized_pnl": "4.56",
+                "unavailable": {},
             }
+        ],
+        "completeness": {
+            "account": True,
+            "positions": True,
+            "open_orders": True,
+            "completed_orders": True,
+            "executions": True,
+            "commissions": True,
+        },
+        "collection_evidence": [
+            {
+                "collection": collection,
+                "evidence_id": f"broker-collection-v1-{index:064x}",
+                "observed_at": NOW.isoformat(),
+                "result_count": count,
+            }
+            for index, (collection, count) in enumerate(
+                (
+                    ("positions", 1),
+                    ("open_orders", 1),
+                    ("completed_orders", 0),
+                    ("executions", 1),
+                    ("commissions", 1),
+                ),
+                start=1,
+            )
         ],
         "execution_scope": {
             "kind": "bounded_execution_filter",
@@ -122,6 +155,7 @@ def test_transport_payload_maps_to_immutable_reconciliation_models():
     assert snapshot.balances == {
         "NetLiquidation:USD": Decimal("100000"),
         "TotalCashValue:USD": Decimal("25000.5"),
+        "BuyingPower:USD": Decimal("999999"),
     }
     assert isinstance(snapshot.balances, MappingProxyType)
     assert snapshot.open_orders[0].order_id == "101"
@@ -135,12 +169,8 @@ def test_transport_payload_maps_to_immutable_reconciliation_models():
     }
     assert isinstance(snapshot.open_orders[0].unavailable, MappingProxyType)
     assert snapshot.recent_executions[0].execution_id == "0001.01"
-    assert snapshot.recent_executions[0].commission is None
-    assert snapshot.recent_executions[0].unavailable == {
-        "commission": "not returned by the bounded execution request",
-        "commission_currency": "not returned by the bounded execution request",
-        "realized_pnl": "not returned by the bounded execution request",
-    }
+    assert snapshot.recent_executions[0].commission == Decimal("1.23")
+    assert snapshot.recent_executions[0].unavailable == {}
 
     with pytest.raises(TypeError):
         snapshot.balances["BuyingPower:USD"] = Decimal("1")
@@ -158,6 +188,148 @@ def test_adapter_accepts_worker_canonical_small_fixed_point_and_rejects_exponent
     payload["positions"][0]["quantity"] = "1E-8"
     with pytest.raises(BrokerEvidenceError):
         snapshot_from_transport(payload, expected_account=ACCOUNT)
+
+
+def test_complete_transport_maps_to_normalized_unsigned_producer_payload():
+    snapshot = normalized_snapshot_from_transport(
+        _payload(),
+        expected_account=ACCOUNT,
+        account_scope=ACCOUNT_SCOPE,
+        max_age_seconds=30.0,
+        now=NOW + timedelta(seconds=1),
+    )
+    result = BrokerSnapshotProducerResult(snapshot=snapshot)
+
+    assert snapshot.account.account_type == "paper"
+    assert snapshot.account.base_currency == "USD"
+    assert snapshot.account.total_cash == Decimal("25000.5")
+    assert snapshot.account.buying_power == Decimal("999999")
+    assert snapshot.completeness.complete is True
+    assert snapshot.completed_orders == ()
+    assert snapshot.executions[0].commission == Decimal("1.23")
+    assert result.snapshot_id == snapshot.snapshot_id
+    assert result.canonical_payload == snapshot.canonical_payload()
+    assert ACCOUNT not in result.canonical_payload
+
+
+def test_zero_broker_collections_require_positive_zero_count_evidence():
+    payload = _payload()
+    payload["positions"] = []
+    payload["open_orders"] = []
+    for evidence in payload["collection_evidence"]:
+        if evidence["collection"] in {"positions", "open_orders"}:
+            evidence["result_count"] = 0
+
+    snapshot = normalized_snapshot_from_transport(
+        payload,
+        expected_account=ACCOUNT,
+        account_scope=ACCOUNT_SCOPE,
+        max_age_seconds=30.0,
+        now=NOW + timedelta(seconds=1),
+    )
+    assert snapshot.positions == ()
+    assert snapshot.open_orders == ()
+
+    payload["collection_evidence"] = [
+        evidence
+        for evidence in payload["collection_evidence"]
+        if evidence["collection"] != "positions"
+    ]
+    with pytest.raises(BrokerEvidenceError, match="incomplete"):
+        normalized_snapshot_from_transport(
+            payload,
+            expected_account=ACCOUNT,
+            account_scope=ACCOUNT_SCOPE,
+            max_age_seconds=30.0,
+            now=NOW + timedelta(seconds=1),
+        )
+
+
+def test_completed_order_transport_maps_to_completed_domain_collection():
+    payload = _payload()
+    completed = payload["open_orders"][0].copy()
+    completed.update(
+        broker_order_id=202,
+        permanent_id=602,
+        status="Filled",
+        filled_quantity="2",
+        remaining_quantity="0",
+        avg_fill_price="120.25",
+        unavailable={"stop_price": "not supplied for this order type"},
+    )
+    payload["completed_orders"] = [completed]
+    for evidence in payload["collection_evidence"]:
+        if evidence["collection"] == "completed_orders":
+            evidence["result_count"] = 1
+
+    snapshot = normalized_snapshot_from_transport(
+        payload,
+        expected_account=ACCOUNT,
+        account_scope=ACCOUNT_SCOPE,
+        max_age_seconds=30.0,
+        now=NOW + timedelta(seconds=1),
+    )
+
+    assert len(snapshot.completed_orders) == 1
+    assert snapshot.completed_orders[0].broker_order_id == 202
+    assert snapshot.completed_orders[0].status == "Filled"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload["completeness"].update(commissions=False),
+        lambda payload: payload["executions"][0].update(commission=None),
+        lambda payload: payload["collection_evidence"][0].update(result_count=0),
+        lambda payload: payload.update(account="DU_OTHER_0000"),
+    ],
+)
+def test_normalized_mapper_rejects_partial_or_wrong_account_evidence(mutate):
+    payload = _payload()
+    mutate(payload)
+
+    with pytest.raises(BrokerEvidenceError):
+        normalized_snapshot_from_transport(
+            payload,
+            expected_account=ACCOUNT,
+            account_scope=ACCOUNT_SCOPE,
+            max_age_seconds=30.0,
+            now=NOW + timedelta(seconds=1),
+        )
+
+
+def test_normalized_mapper_rejects_stale_transport_evidence():
+    with pytest.raises(BrokerEvidenceError, match="stale"):
+        normalized_snapshot_from_transport(
+            _payload(),
+            expected_account=ACCOUNT,
+            account_scope=ACCOUNT_SCOPE,
+            max_age_seconds=30.0,
+            now=NOW + timedelta(minutes=5),
+        )
+
+
+@pytest.mark.asyncio
+async def test_provider_exposes_typed_unsigned_normalized_producer_result():
+    transport = SimpleNamespace(
+        get_broker_snapshot=AsyncMock(return_value=_payload()),
+        stop=AsyncMock(),
+    )
+    provider = IBKRDiagnosticSnapshotProvider(
+        transport,
+        expected_account=ACCOUNT,
+        account_scope=ACCOUNT_SCOPE,
+    )
+
+    result = await provider.produce_normalized_snapshot(max_age_seconds=30.0)
+
+    assert type(result) is BrokerSnapshotProducerResult
+    assert result.snapshot.account.account_scope == ACCOUNT_SCOPE
+    assert result.canonical_payload == result.snapshot.canonical_payload()
+    transport.get_broker_snapshot.assert_awaited_once_with(
+        ACCOUNT,
+        max_age_seconds=30.0,
+    )
 
 
 @pytest.mark.parametrize(
@@ -237,6 +409,7 @@ async def test_provider_rejects_changed_expected_account_without_transport_call(
 
 def _runtime():
     return SimpleNamespace(
+        runtime_contract=SimpleNamespace(safety_account_scope=ACCOUNT_SCOPE),
         diagnostic_connection=SimpleNamespace(
             host="127.0.0.1",
             port=4002,

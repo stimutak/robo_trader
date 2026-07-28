@@ -88,6 +88,11 @@ PROTECTIVE_TICK_REQUEST_PACING_SECONDS = 15.0
 _SYNTHETIC_ACCOUNT_ENVIRONMENT_KEY = "ROBOTRADER_WORKER_SYNTHETIC_ACCOUNT_ENVIRONMENT"
 _FORBIDDEN_AMBIENT_POLICY_KEYS = frozenset(
     {
+        "BOOTSTRAP_BROKER_EVIDENCE_PRIVATE_KEY_PATH",
+        "BOOTSTRAP_EVIDENCE_PRIVATE_KEY_PATH",
+        "BOOTSTRAP_EVIDENCE_SIGNING_KEY",
+        "BOOTSTRAP_MARK_EVIDENCE_PRIVATE_KEY_PATH",
+        "BOOTSTRAP_RECONCILIATION_EVIDENCE_PRIVATE_KEY_PATH",
         "DASHBOARD_PASSWORD_HASH",
         "DATABASE_URL",
         "ENVIRONMENT",
@@ -156,7 +161,7 @@ class _RequestScopedAccountSummaryValue(NamedTuple):
     currency: str
 
 
-BROKER_SNAPSHOT_SCHEMA_VERSION = 1
+BROKER_SNAPSHOT_SCHEMA_VERSION = 2
 BROKER_SAFETY_SNAPSHOT_SCHEMA_VERSION = 1
 BROKER_CONTRACT_SAFETY_SNAPSHOT_SCHEMA_VERSION = 1
 BROKER_SAFETY_SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
@@ -194,6 +199,7 @@ BROKER_SAFETY_ORDER_TYPES = frozenset(
 BROKER_SAFETY_TIME_IN_FORCE = frozenset({"DAY", "GTC", "IOC", "GTD", "OPG", "FOK", "DTC"})
 BROKER_SNAPSHOT_BALANCE_TAGS = frozenset(
     {
+        "BuyingPower",
         "NetLiquidation",
         "TotalCashValue",
         "SettledCash",
@@ -202,9 +208,23 @@ BROKER_SNAPSHOT_BALANCE_TAGS = frozenset(
         "UnrealizedPnL",
     }
 )
-BROKER_SNAPSHOT_REQUIRED_BALANCE_TAGS = frozenset({"NetLiquidation", "TotalCashValue"})
+BROKER_SNAPSHOT_REQUIRED_BALANCE_TAGS = frozenset(
+    {"BuyingPower", "NetLiquidation", "TotalCashValue"}
+)
+BROKER_SNAPSHOT_ACCOUNT_SUMMARY_TAGS = frozenset(
+    set(BROKER_SNAPSHOT_BALANCE_TAGS) | {"AccountType"}
+)
+BROKER_SNAPSHOT_COLLECTIONS = (
+    "positions",
+    "open_orders",
+    "completed_orders",
+    "executions",
+    "commissions",
+)
 BROKER_SNAPSHOT_STAGE_TIMEOUT_SECONDS = 5.0
-BROKER_SNAPSHOT_ACCOUNT_SUMMARY_TAGS = ",".join(sorted(BROKER_SNAPSHOT_BALANCE_TAGS))
+BROKER_SNAPSHOT_ACCOUNT_SUMMARY_REQUEST_TAGS = ",".join(
+    sorted(BROKER_SNAPSHOT_ACCOUNT_SUMMARY_TAGS)
+)
 BROKER_SNAPSHOT_REQUEST_STAGES = frozenset(
     {
         "broker_time_before",
@@ -213,14 +233,19 @@ BROKER_SNAPSHOT_REQUEST_STAGES = frozenset(
         "position_identity",
         "open_orders_initial",
         "open_order_identity",
+        "completed_orders_initial",
+        "completed_order_identity",
         "broker_time_execution_cutoff",
         "executions",
+        "commissions",
         "execution_identity",
         "account_summary",
         "positions_final",
         "positions_final_identity",
         "open_orders_final",
         "open_orders_final_identity",
+        "completed_orders_final",
+        "completed_orders_final_identity",
         "broker_time_after",
     }
 )
@@ -306,7 +331,11 @@ async def _request_fresh_broker_account_summary(account: str) -> list[Any]:
             value=str(value),
             currency=str(currency).strip(),
         )
-        captured[(owned_value.account, owned_value.tag, owned_value.currency)] = owned_value
+        identity = (owned_value.account, owned_value.tag, owned_value.currency)
+        previous = captured.get(identity)
+        if previous is not None and previous != owned_value:
+            callback_failed = True
+        captured[identity] = owned_value
 
     request: Any = None
     callback_overridden = False
@@ -325,7 +354,7 @@ async def _request_fresh_broker_account_summary(account: str) -> list[Any]:
         request_summary(
             request_id,
             "All",
-            BROKER_SNAPSHOT_ACCOUNT_SUMMARY_TAGS,
+            BROKER_SNAPSHOT_ACCOUNT_SUMMARY_REQUEST_TAGS,
         )
         await request
     finally:
@@ -349,9 +378,7 @@ async def _request_fresh_broker_account_summary(account: str) -> list[Any]:
         raise RuntimeError("IBKR account-summary callback provenance cannot be proven")
 
     return [
-        value
-        for value in captured.values()
-        if value.account == account and value.tag in BROKER_SNAPSHOT_BALANCE_TAGS
+        value for value in captured.values() if value.tag in BROKER_SNAPSHOT_ACCOUNT_SUMMARY_TAGS
     ]
 
 
@@ -999,6 +1026,98 @@ async def _open_order_evidence(trade: Any, account: str) -> dict:
     }
 
 
+async def _completed_order_evidence(trade: Any, account: str) -> dict:
+    """Build exact completed-order terms from the dedicated IBKR collection."""
+
+    order = trade.order
+    order_status = trade.orderStatus
+    if str(getattr(order, "account", "")).strip() != account:
+        raise ValueError("Broker completed-order account is inconsistent")
+
+    order_id = _required_int(order.orderId, "completed broker order ID")
+    client_id = _required_int(order.clientId, "completed order client ID", allow_zero=True)
+    side = str(getattr(order, "action", "")).upper()
+    if side not in {"BUY", "SELL"}:
+        raise ValueError("Broker completed-order side is unsupported")
+    status = str(getattr(order_status, "status", "")).strip()
+    if status not in {"ApiCancelled", "Cancelled", "Filled", "Inactive"}:
+        raise ValueError("Broker completed-order status is not terminal")
+    contract_identity = await _qualified_stock_identity(trade.contract)
+
+    unavailable = {}
+    permanent_id, reason = _optional_identifier(
+        order.permId,
+        "IBKR returned no permanent order ID",
+    )
+    if reason:
+        unavailable["permanent_id"] = reason
+    limit_price, reason = _optional_decimal(
+        getattr(order, "lmtPrice", None),
+        "not supplied for this order type",
+    )
+    if reason:
+        unavailable["limit_price"] = reason
+    elif limit_price is not None and Decimal(limit_price) <= 0:
+        limit_price = None
+        unavailable["limit_price"] = "order has no positive limit price"
+    stop_price, reason = _optional_decimal(
+        getattr(order, "auxPrice", None),
+        "not supplied for this order type",
+    )
+    if reason:
+        unavailable["stop_price"] = reason
+    elif stop_price is not None and Decimal(stop_price) <= 0:
+        stop_price = None
+        unavailable["stop_price"] = "order has no positive stop price"
+
+    total_quantity = _canonical_decimal(order.totalQuantity)
+    filled_quantity = _canonical_decimal(getattr(order, "filledQuantity", None))
+    total = Decimal(total_quantity)
+    filled = Decimal(filled_quantity)
+    if total <= 0 or filled < 0 or filled > total:
+        raise ValueError("Broker completed-order quantities are invalid")
+    remaining_quantity = _canonical_decimal(total - filled)
+
+    avg_fill_price, reason = _optional_decimal(
+        getattr(order_status, "avgFillPrice", None),
+        "IBKR completed-order response has no average fill price",
+    )
+    if filled == 0:
+        avg_fill_price = None
+        reason = "completed order has no fills"
+    elif avg_fill_price is not None and Decimal(avg_fill_price) <= 0:
+        avg_fill_price = None
+        reason = "completed order has no positive average fill price"
+    if reason:
+        unavailable["avg_fill_price"] = reason
+    last_status_at, reason = _optional_aware_time(
+        trade.log[-1].time if getattr(trade, "log", None) else None,
+        "IBKR completed-order response has no status timestamp",
+    )
+    if reason:
+        unavailable["last_status_at"] = reason
+
+    return {
+        "account": account,
+        "broker_order_id": order_id,
+        "permanent_id": permanent_id,
+        "client_id": client_id,
+        "contract": contract_identity,
+        "side": side,
+        "status": status,
+        "order_type": str(order.orderType),
+        "time_in_force": str(order.tif),
+        "total_quantity": total_quantity,
+        "filled_quantity": filled_quantity,
+        "remaining_quantity": remaining_quantity,
+        "limit_price": limit_price,
+        "stop_price": stop_price,
+        "avg_fill_price": avg_fill_price,
+        "last_status_at": last_status_at,
+        "unavailable": unavailable,
+    }
+
+
 def _order_evidence_signature(orders: list[dict]) -> tuple[str, ...]:
     """Freeze every emitted term so any between-read change is detected."""
     return tuple(
@@ -1019,6 +1138,70 @@ async def _order_state_signature(trades: Any, account: str) -> tuple[str, ...]:
     return _order_evidence_signature(
         [await _open_order_evidence(trade, account) for trade in trades]
     )
+
+
+async def _completed_order_state_signature(trades: Any, account: str) -> tuple[str, ...]:
+    return _order_evidence_signature(
+        [await _completed_order_evidence(trade, account) for trade in trades]
+    )
+
+
+def _commission_report_complete(fill: Any) -> bool:
+    execution_id = str(getattr(getattr(fill, "execution", None), "execId", "")).strip()
+    report = getattr(fill, "commissionReport", None)
+    report_execution_id = str(getattr(report, "execId", "")).strip()
+    currency = str(getattr(report, "currency", "")).strip()
+    if not execution_id or report_execution_id != execution_id or not currency:
+        return False
+    try:
+        _canonical_decimal(getattr(report, "commission", None))
+    except ValueError:
+        return False
+    return True
+
+
+async def _await_complete_commission_reports(fills: Any) -> None:
+    """Wait until every bounded execution has its matching commission callback."""
+
+    while any(not _commission_report_complete(fill) for fill in fills):
+        if ib is None or not ib.isConnected():
+            raise ConnectionError("Broker disconnected while awaiting commission evidence")
+        await asyncio.sleep(0.01)
+
+
+def _collection_evidence(
+    *,
+    account: str,
+    observed_at: datetime,
+    counts: dict[str, int],
+) -> list[dict[str, Any]]:
+    """Emit deterministic proof that every required collection completed."""
+
+    evidence = []
+    for collection in BROKER_SNAPSHOT_COLLECTIONS:
+        result_count = counts[collection]
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "account": account,
+                    "collection": collection,
+                    "generation": WORKER_GENERATION_ID,
+                    "observed_at": _aware_iso(observed_at),
+                    "result_count": result_count,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        evidence.append(
+            {
+                "collection": collection,
+                "evidence_id": f"broker-collection-v1-{fingerprint}",
+                "observed_at": _aware_iso(observed_at),
+                "result_count": result_count,
+            }
+        )
+    return evidence
 
 
 async def handle_get_broker_snapshot(params: dict) -> dict:
@@ -1053,6 +1236,13 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
         if account != expected_account:
             raise BrokerSnapshotAccountMismatchError(
                 "Broker snapshot managed account does not match expectation"
+            )
+        if not is_supported_paper_account_identifier(
+            account,
+            environment=_worker_environment(),
+        ):
+            raise BrokerSnapshotAccountMismatchError(
+                "Broker snapshot account is not an admitted paper identity"
             )
 
         broker_time_before = await _await_broker_snapshot_stage(
@@ -1117,6 +1307,31 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
             open_orders_data.append(order_evidence)
         initial_order_signature = _order_evidence_signature(open_orders_data)
 
+        completed_trades = await _await_broker_snapshot_stage(
+            "completed_orders_initial",
+            ib.reqCompletedOrdersAsync(False),
+        )
+        if not ib.isConnected():
+            raise ConnectionError("Broker disconnected during snapshot collection")
+        completed_orders_data = []
+        seen_completed_order_ids: set[tuple[int, int]] = set()
+        for trade in completed_trades:
+            order_evidence = await _await_broker_snapshot_stage(
+                "completed_order_identity",
+                _completed_order_evidence(trade, account),
+            )
+            order_identity = (
+                order_evidence["client_id"],
+                order_evidence["broker_order_id"],
+            )
+            if order_identity in seen_completed_order_ids:
+                raise ValueError("Broker snapshot contains duplicate completed-order identity")
+            if order_identity in seen_order_ids:
+                raise ValueError("Broker order appears in open and completed collections")
+            seen_completed_order_ids.add(order_identity)
+            completed_orders_data.append(order_evidence)
+        initial_completed_order_signature = _order_evidence_signature(completed_orders_data)
+
         # IBKR's ExecutionFilter carries a lower bound only, serialized to
         # whole seconds. Derive that exact wire value from authoritative broker
         # time and expose the identical instant in the snapshot.
@@ -1136,6 +1351,10 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
         )
         fills = await _await_broker_snapshot_stage(
             "executions", ib.reqExecutionsAsync(execution_filter)
+        )
+        await _await_broker_snapshot_stage(
+            "commissions",
+            _await_complete_commission_reports(fills),
         )
         if not ib.isConnected():
             raise ConnectionError("Broker disconnected during snapshot collection")
@@ -1173,36 +1392,19 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
             )
             if reason:
                 unavailable["permanent_id"] = reason
-            commission_report = getattr(fill, "commissionReport", None)
-            if commission_report is None:
-                commission = None
-                commission_currency = None
-                realized_pnl = None
-                unavailable.update(
-                    {
-                        "commission": "IBKR returned no commission report",
-                        "commission_currency": "IBKR returned no commission report",
-                        "realized_pnl": "IBKR returned no commission report",
-                    }
-                )
-            else:
-                commission, reason = _optional_decimal(
-                    getattr(commission_report, "commission", None),
-                    "IBKR returned no commission value",
-                )
-                if reason:
-                    unavailable["commission"] = reason
-                commission_currency = (
-                    str(getattr(commission_report, "currency", "")).strip() or None
-                )
-                if commission_currency is None:
-                    unavailable["commission_currency"] = "IBKR returned no commission currency"
-                realized_pnl, reason = _optional_decimal(
-                    getattr(commission_report, "realizedPNL", None),
-                    "IBKR returned no realized PnL",
-                )
-                if reason:
-                    unavailable["realized_pnl"] = reason
+            commission_report = fill.commissionReport
+            if str(getattr(commission_report, "execId", "")).strip() != execution_id:
+                raise ValueError("Broker commission report identity is inconsistent")
+            commission = _canonical_decimal(commission_report.commission)
+            commission_currency = str(commission_report.currency).strip().upper()
+            if not re.fullmatch(r"[A-Z]{3}", commission_currency):
+                raise ValueError("Broker commission currency is invalid")
+            realized_pnl, reason = _optional_decimal(
+                getattr(commission_report, "realizedPNL", None),
+                "IBKR returned no realized PnL",
+            )
+            if reason:
+                unavailable["realized_pnl"] = reason
 
             quantity = _canonical_decimal(execution.shares)
             price = _canonical_decimal(execution.price)
@@ -1241,6 +1443,18 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
         if not ib.isConnected():
             raise ConnectionError("Broker disconnected during snapshot collection")
 
+        account_type_values = [
+            value for value in account_values if str(getattr(value, "tag", "")) == "AccountType"
+        ]
+        if len(account_type_values) != 1:
+            raise ValueError("Broker snapshot account type evidence is incomplete")
+        account_type_value = account_type_values[0]
+        if str(getattr(account_type_value, "account", "")).strip() != account:
+            raise ValueError("Broker account type account is inconsistent")
+        account_structure = str(getattr(account_type_value, "value", "")).strip().upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9 _-]{0,63}", account_structure):
+            raise ValueError("Broker snapshot account type evidence is malformed")
+
         balances = []
         seen_balances: set[tuple[str, str]] = set()
         present_tags: set[str] = set()
@@ -1267,6 +1481,22 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
             )
         if not BROKER_SNAPSHOT_REQUIRED_BALANCE_TAGS.issubset(present_tags):
             raise ValueError("Broker snapshot is missing required balance evidence")
+        net_liquidation_currencies = {
+            item["currency"] for item in balances if item["tag"] == "NetLiquidation"
+        }
+        if len(net_liquidation_currencies) != 1:
+            raise ValueError("Broker snapshot base currency evidence is ambiguous")
+        base_currency = next(iter(net_liquidation_currencies))
+        if not re.fullmatch(r"[A-Z]{3}", base_currency):
+            raise ValueError("Broker snapshot base currency evidence is malformed")
+        balances_by_identity = {(item["tag"], item["currency"]): item["value"] for item in balances}
+        try:
+            total_cash = balances_by_identity[("TotalCashValue", base_currency)]
+            buying_power = balances_by_identity[("BuyingPower", base_currency)]
+        except KeyError as exc:
+            raise ValueError("Broker snapshot base-currency balances are incomplete") from exc
+        if Decimal(buying_power) < 0:
+            raise ValueError("Broker snapshot buying power is negative")
 
         final_positions = await _await_broker_snapshot_stage(
             "positions_final", ib.reqPositionsAsync()
@@ -1280,9 +1510,18 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
         final_order_signature = await _await_broker_snapshot_stage(
             "open_orders_final_identity", _order_state_signature(final_open_trades, account)
         )
+        final_completed_trades = await _await_broker_snapshot_stage(
+            "completed_orders_final",
+            ib.reqCompletedOrdersAsync(False),
+        )
+        final_completed_order_signature = await _await_broker_snapshot_stage(
+            "completed_orders_final_identity",
+            _completed_order_state_signature(final_completed_trades, account),
+        )
         if (
             final_position_signature != initial_position_signature
             or final_order_signature != initial_order_signature
+            or final_completed_order_signature != initial_completed_order_signature
         ):
             raise ValueError("Broker critical state changed during snapshot collection")
 
@@ -1302,21 +1541,49 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
             )
         )
         open_orders_data.sort(key=lambda item: (item["client_id"], item["broker_order_id"]))
+        completed_orders_data.sort(key=lambda item: (item["client_id"], item["broker_order_id"]))
         executions_data.sort(key=lambda item: cast(str, item["execution_id"]))
         balances.sort(key=lambda item: (item["tag"], item["currency"]))
         retrieved_at = datetime.now(timezone.utc)
+        collection_evidence = _collection_evidence(
+            account=account,
+            observed_at=broker_time_after,
+            counts={
+                "positions": len(positions_data),
+                "open_orders": len(open_orders_data),
+                "completed_orders": len(completed_orders_data),
+                "executions": len(executions_data),
+                "commissions": len(executions_data),
+            },
+        )
         return {
             "status": "success",
             "data": {
                 "snapshot_schema_version": BROKER_SNAPSHOT_SCHEMA_VERSION,
                 "account": account,
+                "account_type": "paper",
+                "account_structure": account_structure,
+                "base_currency": base_currency,
+                "total_cash": total_cash,
+                "buying_power": buying_power,
+                "account_observed_at": _aware_iso(broker_time_after),
                 "broker_time_before": _aware_iso(broker_time_before),
                 "broker_time_after": _aware_iso(broker_time_after),
                 "retrieved_at": retrieved_at.isoformat(),
                 "positions": positions_data,
                 "balances": balances,
                 "open_orders": open_orders_data,
+                "completed_orders": completed_orders_data,
                 "executions": executions_data,
+                "completeness": {
+                    "account": True,
+                    "positions": True,
+                    "open_orders": True,
+                    "completed_orders": True,
+                    "executions": True,
+                    "commissions": True,
+                },
+                "collection_evidence": collection_evidence,
                 "execution_scope": {
                     "kind": "bounded_execution_filter",
                     "start_at": execution_window_start.isoformat(),

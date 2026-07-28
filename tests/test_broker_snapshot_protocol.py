@@ -21,7 +21,7 @@ from robo_trader.clients.subprocess_ibkr_client import (
 )
 from robo_trader.utils import ibkr_safe
 
-ACCOUNT = "DU_TEST_ACCOUNT"
+ACCOUNT = "DU1234567"
 NOW = datetime.now(timezone.utc)
 
 
@@ -38,8 +38,40 @@ def _contract(symbol="AAPL", con_id=265598):
     )
 
 
+def _completed_trade(*, filled="2"):
+    order = SimpleNamespace(
+        account=ACCOUNT,
+        orderId=202,
+        permId=602,
+        clientId=0,
+        action="SELL",
+        orderType="LMT",
+        tif="DAY",
+        totalQuantity="2",
+        filledQuantity=filled,
+        lmtPrice="125.00",
+        auxPrice="1.7976931348623157e+308",
+    )
+    status = SimpleNamespace(
+        status="Filled",
+        avgFillPrice="125.00",
+    )
+    return SimpleNamespace(
+        order=order,
+        orderStatus=status,
+        contract=_contract(),
+        log=[],
+    )
+
+
 def _account_summary_values(net_liquidation="100000.00", total_cash="25000.500"):
     return [
+        SimpleNamespace(
+            account=ACCOUNT,
+            tag="AccountType",
+            currency="",
+            value="INDIVIDUAL",
+        ),
         SimpleNamespace(
             account=ACCOUNT,
             tag="NetLiquidation",
@@ -172,7 +204,7 @@ class _FakeIB:
         # Broker clock evidence is captured when the worker call runs.  Using
         # the module-import timestamp makes this otherwise valid fake expire
         # when the full suite takes longer than the safety skew window.
-        return datetime.now(timezone.utc) + timedelta(seconds=len(self.calls))
+        return datetime.now(timezone.utc)
 
     async def reqPositionsAsync(self):
         self.calls.append("reqPositionsAsync")
@@ -214,6 +246,11 @@ class _FakeIB:
             )
         ]
 
+    async def reqCompletedOrdersAsync(self, api_only):
+        self.calls.append("reqCompletedOrdersAsync")
+        assert api_only is False
+        return []
+
     async def reqExecutionsAsync(self, execution_filter):
         self.calls.append("reqExecutionsAsync")
         self.execution_filters.append(execution_filter)
@@ -236,7 +273,12 @@ class _FakeIB:
             SimpleNamespace(
                 execution=execution,
                 contract=self.contract,
-                commissionReport=None,
+                commissionReport=SimpleNamespace(
+                    execId="0001.01",
+                    commission="1.23",
+                    currency="USD",
+                    realizedPNL="4.56",
+                ),
                 time=NOW,
             )
         ]
@@ -288,21 +330,33 @@ async def test_worker_snapshot_is_fresh_atomic_read_only_and_precise(fake_ib):
 
     assert result["status"] == "success"
     data = result["data"]
-    assert data["snapshot_schema_version"] == 1
+    assert data["snapshot_schema_version"] == 2
     assert data["account"] == ACCOUNT
     assert data["positions"][0]["quantity"] == "10.5"
     assert data["positions"][0]["avg_cost"] == "123.45"
     assert {item["tag"] for item in data["balances"]} == {
+        "BuyingPower",
         "NetLiquidation",
         "TotalCashValue",
     }
     assert data["open_orders"][0]["stop_price"] is None
     assert "stop_price" in data["open_orders"][0]["unavailable"]
-    assert data["executions"][0]["commission"] is None
-    assert set(data["executions"][0]["unavailable"]) == {
-        "commission",
-        "commission_currency",
-        "realized_pnl",
+    assert data["executions"][0]["commission"] == "1.23"
+    assert data["executions"][0]["commission_currency"] == "USD"
+    assert data["executions"][0]["unavailable"] == {}
+    assert data["account_type"] == "paper"
+    assert data["account_structure"] == "INDIVIDUAL"
+    assert data["base_currency"] == "USD"
+    assert data["total_cash"] == "25000.5"
+    assert data["buying_power"] == "999999"
+    assert data["completed_orders"] == []
+    assert all(data["completeness"].values())
+    assert {item["collection"]: item["result_count"] for item in data["collection_evidence"]} == {
+        "commissions": 1,
+        "completed_orders": 0,
+        "executions": 1,
+        "open_orders": 1,
+        "positions": 1,
     }
     assert data["execution_scope"]["kind"] == "bounded_execution_filter"
     broker_before = datetime.fromisoformat(data["broker_time_before"])
@@ -320,6 +374,7 @@ async def test_worker_snapshot_is_fresh_atomic_read_only_and_precise(fake_ib):
         "reqCurrentTimeAsync",
         "reqPositionsAsync",
         "reqAllOpenOrdersAsync",
+        "reqCompletedOrdersAsync",
         "reqExecutionsAsync",
         "reqAccountSummary",
         "cancelAccountSummary",
@@ -360,6 +415,59 @@ async def test_worker_snapshot_rechecks_account_and_suppresses_sensitive_errors(
     }
     assert ACCOUNT not in result["error"]
     assert "DU_WRONG_ACCOUNT" not in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_worker_positively_evidences_zero_positions_and_orders(fake_ib, monkeypatch):
+    monkeypatch.setattr(fake_ib, "reqPositionsAsync", AsyncMock(return_value=[]))
+    monkeypatch.setattr(fake_ib, "reqAllOpenOrdersAsync", AsyncMock(return_value=[]))
+
+    result = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert result["status"] == "success"
+    assert result["data"]["positions"] == []
+    assert result["data"]["open_orders"] == []
+    assert result["data"]["completed_orders"] == []
+    counts = {
+        evidence["collection"]: evidence["result_count"]
+        for evidence in result["data"]["collection_evidence"]
+    }
+    assert counts["positions"] == 0
+    assert counts["open_orders"] == 0
+    assert counts["completed_orders"] == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_collects_and_stability_checks_completed_orders(fake_ib, monkeypatch):
+    monkeypatch.setattr(
+        fake_ib,
+        "reqCompletedOrdersAsync",
+        AsyncMock(return_value=[_completed_trade()]),
+    )
+
+    result = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert result["status"] == "success"
+    completed = result["data"]["completed_orders"][0]
+    assert completed["broker_order_id"] == 202
+    assert completed["status"] == "Filled"
+    assert completed["filled_quantity"] == "2"
+    assert completed["remaining_quantity"] == "0"
+    assert fake_ib.reqCompletedOrdersAsync.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_worker_rejects_completed_order_mutation(fake_ib, monkeypatch):
+    monkeypatch.setattr(
+        fake_ib,
+        "reqCompletedOrdersAsync",
+        AsyncMock(side_effect=[[_completed_trade(filled="2")], [_completed_trade(filled="1")]]),
+    )
+
+    result = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert result["status"] == worker.PROTOCOL_ERROR_STATUS
+    assert result["error_type"] == worker.PROTOCOL_ERROR_TYPE
 
 
 @pytest.mark.asyncio
@@ -407,6 +515,41 @@ async def test_worker_account_summary_ignores_foreign_request_cache_interleaving
     assert fake_ib.wrapper.acctSummary[(ACCOUNT, "NetLiquidation", "USD")].value == "1.00"
     assert fake_ib.wrapper.acctSummary[(ACCOUNT, "TotalCashValue", "USD")].value == "2.00"
     assert "accountSummary" not in fake_ib.wrapper.__dict__
+
+
+@pytest.mark.asyncio
+async def test_worker_same_request_wrong_account_summary_callback_blocks(fake_ib):
+    fake_ib.account_summary_batches[0].append(
+        SimpleNamespace(
+            account="DU7654321",
+            tag="BuyingPower",
+            currency="USD",
+            value="1",
+        )
+    )
+
+    result = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert result["status"] == worker.PROTOCOL_ERROR_STATUS
+    assert result["error_type"] == worker.PROTOCOL_ERROR_TYPE
+    assert "DU7654321" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_worker_conflicting_duplicate_account_summary_callback_blocks(fake_ib):
+    fake_ib.account_summary_batches[0].append(
+        SimpleNamespace(
+            account=ACCOUNT,
+            tag="BuyingPower",
+            currency="USD",
+            value="1",
+        )
+    )
+
+    result = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert result["status"] == worker.PROTOCOL_ERROR_STATUS
+    assert result["error_type"] == worker.PROTOCOL_ERROR_TYPE
 
 
 @pytest.mark.asyncio
@@ -580,6 +723,7 @@ async def test_worker_emits_available_commission_evidence_canonically(fake_ib, m
     async def with_commission(execution_filter):
         fills = await original(execution_filter)
         fills[0].commissionReport = SimpleNamespace(
+            execId="0001.01",
             commission="1.2300",
             currency="USD",
             realizedPNL="-2.500",
@@ -594,6 +738,28 @@ async def test_worker_emits_available_commission_evidence_canonically(fake_ib, m
     assert execution["commission_currency"] == "USD"
     assert execution["realized_pnl"] == "-2.5"
     assert execution["unavailable"] == {}
+
+
+@pytest.mark.asyncio
+async def test_worker_partial_commission_callback_times_out_and_blocks(fake_ib, monkeypatch):
+    original = fake_ib.reqExecutionsAsync
+
+    async def without_matching_commission(execution_filter):
+        fills = await original(execution_filter)
+        fills[0].commissionReport.execId = ""
+        return fills
+
+    monkeypatch.setattr(fake_ib, "reqExecutionsAsync", without_matching_commission)
+    monkeypatch.setattr(worker, "BROKER_SNAPSHOT_STAGE_TIMEOUT_SECONDS", 0.001)
+
+    result = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert result == {
+        "status": "error",
+        "error": "Broker snapshot collection timed out",
+        "error_type": "TimeoutError",
+        "detail": "Broker snapshot stage timed out: commissions",
+    }
 
 
 @pytest.mark.asyncio
@@ -894,14 +1060,18 @@ async def test_worker_snapshot_routes_every_broker_await_through_stage_deadline(
         "position_identity",
         "open_orders_initial",
         "open_order_identity",
+        "completed_orders_initial",
         "broker_time_execution_cutoff",
         "executions",
+        "commissions",
         "execution_identity",
         "account_summary",
         "positions_final",
         "positions_final_identity",
         "open_orders_final",
         "open_orders_final_identity",
+        "completed_orders_final",
+        "completed_orders_final_identity",
         "broker_time_after",
     ]
 
@@ -1321,7 +1491,7 @@ async def test_client_wrong_account_exception_is_masked(fake_ib, monkeypatch):
     assert "DU_EXPECTED_SECRET" not in message
     assert ACCOUNT not in message
     assert "***CRET" in message
-    assert "***OUNT" in message
+    assert "***4567" in message
 
 
 @pytest.mark.asyncio
@@ -1404,7 +1574,7 @@ async def test_client_poison_after_snapshot_validation_never_returns_data(fake_i
 @pytest.mark.parametrize(
     "mutation",
     [
-        lambda data: data.update(snapshot_schema_version=2),
+        lambda data: data.update(snapshot_schema_version=1),
         lambda data: data["positions"][0].update(quantity="10.50"),
         lambda data: data["positions"][0]["contract"].update(con_id=True),
         lambda data: data["positions"][0]["contract"].update(local_symbol="AAPL ALIAS"),
@@ -1420,7 +1590,7 @@ async def test_client_poison_after_snapshot_validation_never_returns_data(fake_i
             broker_time_after=(NOW - timedelta(minutes=9)).isoformat(),
         ),
         lambda data: data["open_orders"][0]["unavailable"].pop("stop_price"),
-        lambda data: data["executions"][0]["unavailable"].pop("commission"),
+        lambda data: data["executions"][0].update(commission=None),
         lambda data: data["executions"][0].update(executed_at="2026-01-01T00:00:00"),
         lambda data: data["executions"][0].update(
             executed_at=(
@@ -1440,6 +1610,12 @@ async def test_client_poison_after_snapshot_validation_never_returns_data(fake_i
         lambda data: data["open_orders"][0].update(filled_quantity="1"),
         lambda data: data["balances"].append(copy.deepcopy(data["balances"][0])),
         lambda data: data.pop("execution_scope"),
+        lambda data: data.update(account_type="live"),
+        lambda data: data.update(buying_power="1"),
+        lambda data: data["completeness"].update(completed_orders=False),
+        lambda data: data["collection_evidence"].pop(),
+        lambda data: data["collection_evidence"][0].update(result_count=0),
+        lambda data: data["executions"][0].update(commission_currency=None),
     ],
 )
 async def test_client_poison_fails_closed_on_malformed_snapshot(fake_ib, monkeypatch, mutation):
@@ -1456,7 +1632,7 @@ async def test_client_poison_fails_closed_on_malformed_snapshot(fake_ib, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_client_requires_explicit_unavailable_commission_reason(fake_ib, monkeypatch):
+async def test_client_rejects_incomplete_commission_evidence(fake_ib, monkeypatch):
     payload = await _worker_payload(fake_ib)
     execution = payload["executions"][0]
     execution["commission"] = None
@@ -1464,5 +1640,15 @@ async def test_client_requires_explicit_unavailable_commission_reason(fake_ib, m
     client, _ = _connected_client(monkeypatch, payload)
     monkeypatch.setattr(client, "_poison_generation", Mock())
 
-    with pytest.raises(IBKRTransportPoisonedError, match="silently omitted"):
+    with pytest.raises(IBKRTransportPoisonedError, match="canonical decimal"):
         await client.get_broker_snapshot(ACCOUNT, max_age_seconds=60)
+
+
+def test_broker_worker_environment_never_inherits_signing_authority(monkeypatch):
+    for name in client_module._WORKER_FORBIDDEN_SIGNING_ENV:
+        monkeypatch.setenv(name, f"secret-for-{name}")
+
+    child_env = client_module._build_worker_environment("generation-1")
+
+    assert not client_module._WORKER_FORBIDDEN_SIGNING_ENV.intersection(child_env)
+    assert not any("PRIVATE_KEY" in name or "SIGNING_KEY" in name for name in child_env)
