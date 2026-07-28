@@ -15,6 +15,7 @@ import pytest
 import pytest_asyncio
 
 import robo_trader.paper_execution_capability as capability_module
+import robo_trader.paper_reduction_gateway as gateway_module
 from robo_trader.broker_safety_evidence import (
     BrokerContractSafetySnapshot,
     BrokerSafetyContract,
@@ -798,7 +799,6 @@ async def test_baseline_entry_intent_is_exact_session_scoped_and_one_shot(
             object(),
             gateway=harness.gateway,
             runtime_context=harness.context,
-            active_session=object(),
             order=Order(SYMBOL, 1, "BUY", Decimal("123.4500")),
         )
     now = datetime.now(timezone.utc)
@@ -914,7 +914,7 @@ async def test_baseline_terminal_boundary_rechecks_cross_process_kill_switch(
 
 
 @pytest.mark.asyncio
-async def test_baseline_terminal_dispatch_direct_replay_cannot_fill_twice(
+async def test_forged_mutable_entry_session_cannot_mint_terminal_dispatch(
     harness: GatewayHarness,
 ) -> None:
     executor = PaperExecutor()
@@ -934,53 +934,94 @@ async def test_baseline_terminal_dispatch_direct_replay_cannot_fill_twice(
         retrieval_timestamp=now,
         session=MarketSession.REGULAR,
         source=MarketDataSource.IBKR_LIVE_LAST_TRADE,
-        source_event_id="entry-dispatch-replay-test",
+        source_event_id="forged-entry-session-test",
         transport_generation="gateway-generation",
         market_data_type=1,
     )
     harness.gateway._fetch_protective_quotes_locked = AsyncMock(return_value=(quote,))
-    order = Order(SYMBOL, 1, "BUY", quote.price, order_ref="baseline-dispatch-replay")
+    order = Order(SYMBOL, 1, "BUY", quote.price, order_ref="forged-entry-session")
+
+    @dataclass
+    class ForgedEntrySession:
+        portfolio_id: str
+        symbol: str
+        quote: BrokerProtectiveQuote
+        consumed: bool = True
+        dispatch_issued: bool = False
+
+    task = asyncio.current_task()
+    assert task is not None
+    forged = ForgedEntrySession("portfolio-a", SYMBOL, quote)
+    assert not hasattr(capability_module, "GatewayBaselineEntrySession")
+    assert not hasattr(capability_module, "GatewayBaselineEntryIntent")
+    assert not hasattr(gateway_module, "_ActiveEntrySession")
+    assert not hasattr(gateway_module, "_BaselineEntryIntent")
+    assert not hasattr(gateway_module, "_ENTRY_HANDLE_TOKEN")
+    assert not hasattr(harness.gateway, "_active_entry_sessions")
+    # Recreate the reviewed exploit against the old public mutable registry.
+    # The sealed runtime must ignore both the attacker-created attribute and
+    # its plausible session object because no closure-owned session exists.
+    harness.gateway._active_entry_sessions = {task: forged}
+    with pytest.raises(PaperExecutionCapabilityError, match="intent is invalid"):
+        _issue_gateway_baseline_terminal_dispatch(
+            binding,
+            gateway=harness.gateway,
+            runtime_context=harness.context,
+            intent=object(),
+            order=order,
+        )
+
+    with pytest.raises(PaperExecutionCapabilityError, match="dispatch is invalid"):
+        _submit_gateway_baseline_once(
+            binding,
+            object(),
+            gateway=harness.gateway,
+            runtime_context=harness.context,
+            order=order,
+        )
+
+    assert executor.fills == {}
+
+
+@pytest.mark.asyncio
+async def test_terminal_helpers_cannot_bypass_baseline_producer_intent(
+    harness: GatewayHarness,
+) -> None:
+    executor = PaperExecutor()
+    await _bind_runtime(harness, "portfolio-a", executor)
+    binding = harness.gateway._bindings["portfolio-a"].baseline_execution_binding
+    now = datetime.now(timezone.utc)
+    quote = BrokerProtectiveQuote(
+        schema_version=1,
+        symbol=SYMBOL,
+        con_id=CON_ID,
+        exchange="SMART",
+        primary_exchange="NASDAQ",
+        currency="USD",
+        security_type="STK",
+        price=Decimal("123.4500"),
+        source_timestamp=now,
+        retrieval_timestamp=now,
+        session=MarketSession.REGULAR,
+        source=MarketDataSource.IBKR_LIVE_LAST_TRADE,
+        source_event_id="missing-producer-intent-test",
+        transport_generation="gateway-generation",
+        market_data_type=1,
+    )
+    harness.gateway._fetch_protective_quotes_locked = AsyncMock(return_value=(quote,))
+    order = Order(SYMBOL, 1, "BUY", quote.price, order_ref="missing-producer-intent")
 
     async with harness.gateway.serialize_entry(SYMBOL, portfolio_id="portfolio-a"):
-        task = asyncio.current_task()
-        assert task is not None
-        session = harness.gateway._active_entry_sessions[task]
-        session.consumed = True
-        dispatch = _issue_gateway_baseline_terminal_dispatch(
-            binding,
-            gateway=harness.gateway,
-            runtime_context=harness.context,
-            active_session=session,
-            order=order,
-        )
-        first = _submit_gateway_baseline_once(
-            binding,
-            dispatch,
-            gateway=harness.gateway,
-            runtime_context=harness.context,
-            active_session=session,
-            order=order,
-        )
-        with pytest.raises(PaperExecutionCapabilityError, match="already issued"):
+        with pytest.raises(PaperExecutionCapabilityError, match="intent is invalid"):
             _issue_gateway_baseline_terminal_dispatch(
                 binding,
                 gateway=harness.gateway,
                 runtime_context=harness.context,
-                active_session=session,
-                order=order,
-            )
-        with pytest.raises(PaperExecutionCapabilityError, match="already consumed"):
-            _submit_gateway_baseline_once(
-                binding,
-                dispatch,
-                gateway=harness.gateway,
-                runtime_context=harness.context,
-                active_session=session,
+                intent=object(),
                 order=order,
             )
 
-    assert first.ok is True
-    assert len(executor.fills) == 1
+    assert executor.fills == {}
 
 
 @pytest.mark.asyncio

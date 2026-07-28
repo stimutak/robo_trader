@@ -14,7 +14,6 @@ import logging
 import os
 import stat
 import time
-import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
@@ -27,10 +26,15 @@ from .database_async import AsyncTradingDatabase
 from .execution import ExecutionResult, Order, PaperExecutor
 from .market_data_contract import BrokerProtectiveQuote
 from .paper_execution_capability import (
+    PaperBaselineAdmissionError,
     PaperReductionExecutionAuthority,
+    _begin_gateway_baseline_entry_session,
     _bind_gateway_baseline_execution,
     _bind_gateway_reduction_execution,
+    _end_gateway_baseline_entry_session,
     _GatewayBaselineExecutionBinding,
+    _get_gateway_baseline_entry_handle,
+    _issue_gateway_baseline_entry_intent,
     _issue_gateway_baseline_terminal_dispatch,
     _issue_gateway_execution_binding_capability,
     _issue_gateway_reduction_binding_capability,
@@ -80,51 +84,9 @@ class _PaperRuntimeBinding:
     submitter: PaperReductionSubmitter
     reduction_execution_authority: PaperReductionExecutionAuthority
     baseline_execution_binding: _GatewayBaselineExecutionBinding
-    baseline_entry_handle: "_BaselineEntryHandle"
+    baseline_entry_handle: object
     protective_quote_producer: object
     settlement_participant: PaperRuntimeSettlementParticipant
-
-
-_ENTRY_HANDLE_TOKEN = object()
-
-
-class _BaselineEntryHandle:
-    """Opaque identity returned only when a canonical runtime is registered."""
-
-    __slots__ = ()
-
-    def __new__(cls, *, _token: object | None = None):
-        if _token is not _ENTRY_HANDLE_TOKEN:
-            raise PaperReductionGatewayError("baseline entry handles are gateway-issued")
-        return super().__new__(cls)
-
-
-class _BaselineEntryIntent:
-    """Immutable opaque identity minted for one baseline producer result."""
-
-    __slots__ = ("__weakref__",)
-
-    def __new__(cls, *, _token: object | None = None):
-        if _token is not _ENTRY_HANDLE_TOKEN:
-            raise PaperReductionGatewayError("baseline entry intents are gateway-issued")
-        return super().__new__(cls)
-
-
-@dataclass(slots=True)
-class _BaselineEntryIntentRecord:
-    portfolio_id: str
-    symbol: str
-    handle: _BaselineEntryHandle
-    consumed: bool = False
-
-
-@dataclass(slots=True)
-class _ActiveEntrySession:
-    portfolio_id: str
-    symbol: str
-    quote: BrokerProtectiveQuote
-    consumed: bool = False
-    dispatch_issued: bool = False
 
 
 @dataclass(slots=True)
@@ -198,10 +160,6 @@ class PaperReductionGateway:
         self._account_order_gate = asyncio.Lock()
         self._bindings: dict[str, _PaperRuntimeBinding] = {}
         self._active_runtime_binding_session: _PaperRuntimeBindingSession | None = None
-        self._baseline_entry_intents: weakref.WeakKeyDictionary[
-            _BaselineEntryIntent, _BaselineEntryIntentRecord
-        ] = weakref.WeakKeyDictionary()
-        self._active_entry_sessions: dict[asyncio.Task, _ActiveEntrySession] = {}
         self._started = False
         self._diagnostic_recovery_required = False
         self._terminal_quarantine_reason: str | None = None
@@ -717,7 +675,7 @@ class PaperReductionGateway:
         *,
         protective_quote_producer: object,
         settlement_participant: PaperRuntimeSettlementParticipant,
-    ) -> _BaselineEntryHandle:
+    ) -> object:
         """Bind one portfolio's executor, quote producer, and projection owner."""
 
         if (
@@ -810,7 +768,11 @@ class PaperReductionGateway:
         finally:
             if self._active_runtime_binding_session is binding_session:
                 self._active_runtime_binding_session = None
-        baseline_entry_handle = _BaselineEntryHandle(_token=_ENTRY_HANDLE_TOKEN)
+        baseline_entry_handle = _get_gateway_baseline_entry_handle(
+            baseline_execution_binding,
+            gateway=self,
+            runtime_context=self._runtime_context,
+        )
         self._bindings[portfolio_id] = _PaperRuntimeBinding(
             submitter=_bind_paper_reduction_submitter(
                 executor,
@@ -832,25 +794,23 @@ class PaperReductionGateway:
         portfolio_id: str,
         symbol: str,
         handle: object,
-    ) -> _BaselineEntryIntent:
+    ) -> object:
         """Mint one opaque intent at the canonical baseline producer branch."""
 
         binding = self._bindings.get(portfolio_id)
-        if (
-            type(binding) is not _PaperRuntimeBinding
-            or handle is not binding.baseline_entry_handle
-            or type(symbol) is not str
-            or not symbol
-            or symbol.strip() != symbol
-        ):
+        if type(binding) is not _PaperRuntimeBinding:
             raise PaperReductionGatewayError("baseline entry intent request is malformed")
-        intent = _BaselineEntryIntent(_token=_ENTRY_HANDLE_TOKEN)
-        self._baseline_entry_intents[intent] = _BaselineEntryIntentRecord(
-            portfolio_id=portfolio_id,
-            symbol=symbol,
-            handle=binding.baseline_entry_handle,
-        )
-        return intent
+        try:
+            return _issue_gateway_baseline_entry_intent(
+                binding.baseline_execution_binding,
+                gateway=self,
+                runtime_context=self._runtime_context,
+                portfolio_id=portfolio_id,
+                symbol=symbol,
+                handle=handle,
+            )
+        except PaperBaselineAdmissionError as exc:
+            raise PaperReductionGatewayError(str(exc)) from exc
 
     @asynccontextmanager
     async def serialize_entry(
@@ -916,7 +876,8 @@ class PaperReductionGateway:
                             "entry blocked while a protective reduction is pending"
                         )
             task = asyncio.current_task()
-            session: _ActiveEntrySession | None = None
+            session: object | None = None
+            session_binding: object | None = None
             if portfolio_id is not None:
                 binding = self._bindings.get(portfolio_id)
                 if type(binding) is not _PaperRuntimeBinding:
@@ -925,20 +886,25 @@ class PaperReductionGateway:
                     )
                 if type(task) is not asyncio.Task or symbol is None or current_quote is None:
                     raise PaperReductionGatewayError("entry serialization scope is malformed")
-                sessions = getattr(self, "_active_entry_sessions", None)
-                if not isinstance(sessions, dict):
-                    raise PaperReductionGatewayError("entry session registry is unavailable")
-                if task in sessions:
-                    raise PaperReductionGatewayError("nested entry serialization is forbidden")
-                session = _ActiveEntrySession(portfolio_id, symbol, current_quote)
-                sessions[task] = session
+                session_binding = binding.baseline_execution_binding
+                session = _begin_gateway_baseline_entry_session(
+                    session_binding,
+                    gateway=self,
+                    runtime_context=self._runtime_context,
+                    portfolio_id=portfolio_id,
+                    symbol=symbol,
+                    quote=current_quote,
+                )
             try:
                 yield current_quote
             finally:
-                if session is not None and task is not None:
-                    sessions = getattr(self, "_active_entry_sessions", {})
-                    if sessions.get(task) is session:
-                        sessions.pop(task, None)
+                if session is not None and session_binding is not None:
+                    _end_gateway_baseline_entry_session(
+                        session_binding,
+                        session,
+                        gateway=self,
+                        runtime_context=self._runtime_context,
+                    )
 
     def submit_baseline_entry(
         self,
@@ -950,54 +916,26 @@ class PaperReductionGateway:
         """Derive one terminal capability inside an active entry session."""
 
         binding = self._bindings.get(portfolio_id)
-        record = (
-            self._baseline_entry_intents.get(intent)
-            if type(intent) is _BaselineEntryIntent
-            else None
-        )
-        if type(record) is not _BaselineEntryIntentRecord or record.consumed:
-            raise PaperReductionGatewayError("baseline entry intent is invalid or already consumed")
-        # Burn first: substitution and malformed session/order probes cannot
-        # reuse a recognized producer intent.
-        record.consumed = True
-        if (
-            type(binding) is not _PaperRuntimeBinding
-            or record.portfolio_id != portfolio_id
-            or record.handle is not binding.baseline_entry_handle
-        ):
+        if type(binding) is not _PaperRuntimeBinding:
             raise PaperReductionGatewayError("baseline entry intent does not match runtime")
-        task = asyncio.current_task()
-        sessions = getattr(self, "_active_entry_sessions", None)
-        session = sessions.get(task) if isinstance(sessions, dict) and task is not None else None
-        if type(session) is not _ActiveEntrySession or session.consumed:
-            raise PaperReductionGatewayError("no active one-shot entry serialization session")
-        # Burn the session before validating caller-controlled order data.
-        session.consumed = True
-        if (
-            type(order) is not Order
-            or order.side != "BUY"
-            or type(order.quantity) is not int
-            or order.quantity <= 0
-            or order.symbol != record.symbol
-            or order.symbol != session.symbol
-            or type(order.price) is not Decimal
-            or order.price != session.quote.price
-            or order.take_profit is not None
-        ):
-            raise PaperReductionGatewayError("baseline entry order does not match session evidence")
-        terminal_dispatch = _issue_gateway_baseline_terminal_dispatch(
-            binding.baseline_execution_binding,
-            gateway=self,
-            runtime_context=self._runtime_context,
-            active_session=session,
-            order=order,
-        )
+        # The sealed issuer burns the task-bound session before it validates
+        # any caller-controlled order field. Keep order validation there so a
+        # malformed probe cannot preserve terminal entry authority.
+        try:
+            terminal_dispatch = _issue_gateway_baseline_terminal_dispatch(
+                binding.baseline_execution_binding,
+                gateway=self,
+                runtime_context=self._runtime_context,
+                intent=intent,
+                order=order,
+            )
+        except PaperBaselineAdmissionError as exc:
+            raise PaperReductionGatewayError(str(exc)) from exc
         return _submit_gateway_baseline_once(
             binding.baseline_execution_binding,
             terminal_dispatch,
             gateway=self,
             runtime_context=self._runtime_context,
-            active_session=session,
             order=order,
         )
 

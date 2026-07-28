@@ -28,6 +28,10 @@ class PaperExecutionCapabilityError(RuntimeError):
     """A terminal paper submission lacked exact one-shot authority."""
 
 
+class PaperBaselineAdmissionError(PaperExecutionCapabilityError):
+    """Baseline intent, session, or order admission failed closed."""
+
+
 _PAPER_FILL_PRICE_TICK = Decimal("0.0001")
 
 
@@ -170,7 +174,10 @@ def _build_sealed_capability_runtime():
     reduction_bind_capability_token = object()
     reduction_authority_token = object()
     baseline_bind_token = object()
+    baseline_handle_token = object()
+    baseline_intent_token = object()
     terminal_dispatch_token = object()
+    baseline_session_token = object()
     capability_token = object()
     registry_lock = threading.Lock()
 
@@ -202,6 +209,17 @@ def _build_sealed_capability_runtime():
         runtime_context: object
         executor: object
         portfolio_id: str
+        entry_handle: object
+
+    @dataclass(frozen=True, slots=True)
+    class BaselineIntentRecord:
+        binding: object
+        gateway: object
+        runtime_context: object
+        portfolio_id: str
+        symbol: str
+        handle: object
+        consumed: bool = False
 
     @dataclass(frozen=True, slots=True)
     class ReductionBindingRecord(GatewayBindingRecord):
@@ -230,6 +248,19 @@ def _build_sealed_capability_runtime():
         pre_position_quantity: Decimal | None
         consumed: bool = False
 
+    @dataclass(frozen=True, slots=True)
+    class BaselineSessionRecord:
+        binding: object
+        gateway: object
+        runtime_context: object
+        portfolio_id: str
+        symbol: str
+        quote: object
+        task: asyncio.Task
+        consumed: bool = False
+        dispatch_issued: bool = False
+        closed: bool = False
+
     capabilities: weakref.WeakKeyDictionary[object, CapabilityRecord] = weakref.WeakKeyDictionary()
     gateway_bindings: weakref.WeakKeyDictionary[object, GatewayBindingRecord] = (
         weakref.WeakKeyDictionary()
@@ -249,6 +280,66 @@ def _build_sealed_capability_runtime():
     reduction_dispatches: weakref.WeakKeyDictionary[object, TerminalDispatchRecord] = (
         weakref.WeakKeyDictionary()
     )
+    baseline_sessions: weakref.WeakKeyDictionary[object, BaselineSessionRecord] = (
+        weakref.WeakKeyDictionary()
+    )
+    baseline_intents: weakref.WeakKeyDictionary[object, BaselineIntentRecord] = (
+        weakref.WeakKeyDictionary()
+    )
+    active_baseline_sessions: dict[tuple[object, asyncio.Task], object] = {}
+
+    class GatewayBaselineEntrySession:
+        """Opaque one-shot entry scope whose authority remains closure-owned."""
+
+        __slots__ = ("__weakref__",)
+
+        def __new__(cls, *, _token: object | None = None):
+            if _token is not baseline_session_token:
+                raise PaperExecutionCapabilityError("baseline entry session is gateway-only")
+            return super().__new__(cls)
+
+        def __copy__(self):
+            raise PaperExecutionCapabilityError("baseline entry session cannot copy")
+
+        def __deepcopy__(self, _memo):
+            return self.__copy__()
+
+        def __reduce__(self):
+            raise PaperExecutionCapabilityError("baseline entry session cannot serialize")
+
+    class GatewayBaselineEntryHandle:
+        __slots__ = ("__weakref__",)
+
+        def __new__(cls, *, _token: object | None = None):
+            if _token is not baseline_handle_token:
+                raise PaperExecutionCapabilityError("baseline entry handle is gateway-only")
+            return super().__new__(cls)
+
+        def __copy__(self):
+            raise PaperExecutionCapabilityError("baseline entry handle cannot copy")
+
+        def __deepcopy__(self, _memo):
+            return self.__copy__()
+
+        def __reduce__(self):
+            raise PaperExecutionCapabilityError("baseline entry handle cannot serialize")
+
+    class GatewayBaselineEntryIntent:
+        __slots__ = ("__weakref__",)
+
+        def __new__(cls, *, _token: object | None = None):
+            if _token is not baseline_intent_token:
+                raise PaperExecutionCapabilityError("baseline entry intent is gateway-only")
+            return super().__new__(cls)
+
+        def __copy__(self):
+            raise PaperExecutionCapabilityError("baseline entry intent cannot copy")
+
+        def __deepcopy__(self, _memo):
+            return self.__copy__()
+
+        def __reduce__(self):
+            raise PaperExecutionCapabilityError("baseline entry intent cannot serialize")
 
     class PaperExecutionCapability:
         __slots__ = ("__weakref__",)
@@ -465,9 +556,10 @@ def _build_sealed_capability_runtime():
                 "gateway execution binding capability does not match runtime"
             )
         binding = GatewayBaselineExecutionBinding(_token=baseline_bind_token)
+        entry_handle = GatewayBaselineEntryHandle(_token=baseline_handle_token)
         with registry_lock:
             baseline_bindings[binding] = BaselineBindingRecord(
-                gateway, runtime_context, executor, portfolio_id
+                gateway, runtime_context, executor, portfolio_id, entry_handle
             )
         return binding
 
@@ -580,32 +672,40 @@ def _build_sealed_capability_runtime():
                 and record.portfolio_id == portfolio_id
             )
 
-    def issue_gateway_baseline_terminal_dispatch(
-        binding, *, gateway, runtime_context, active_session, order
-    ):
-        from .paper_reduction_gateway import PaperReductionGateway, _ActiveEntrySession
+    def get_gateway_baseline_entry_handle(binding, *, gateway, runtime_context):
+        with registry_lock:
+            record = (
+                baseline_bindings.get(binding)
+                if type(binding) is GatewayBaselineExecutionBinding
+                else None
+            )
+            if (
+                type(record) is not BaselineBindingRecord
+                or record.gateway is not gateway
+                or record.runtime_context is not runtime_context
+                or type(record.entry_handle) is not GatewayBaselineEntryHandle
+            ):
+                raise PaperExecutionCapabilityError("baseline entry handle binding is invalid")
+            return record.entry_handle
 
-        task = asyncio.current_task()
-        sessions = getattr(gateway, "_active_entry_sessions", None)
-        fingerprint = fingerprint_order(order)
+    def issue_gateway_baseline_entry_intent(
+        binding,
+        *,
+        gateway,
+        runtime_context,
+        portfolio_id,
+        symbol,
+        handle,
+    ):
         if (
-            type(gateway) is not PaperReductionGateway
-            or gateway.started is not True
-            or getattr(gateway, "_runtime_context", None) is not runtime_context
-            or type(active_session) is not _ActiveEntrySession
-            or not isinstance(sessions, dict)
-            or task is None
-            or sessions.get(task) is not active_session
-            or active_session.consumed is not True
+            type(portfolio_id) is not str
+            or not portfolio_id
+            or portfolio_id.strip() != portfolio_id
+            or type(symbol) is not str
+            or not symbol
+            or symbol.strip() != symbol
         ):
-            raise PaperExecutionCapabilityError("baseline gateway session does not match binding")
-        if (
-            fingerprint.side != "BUY"
-            or fingerprint.take_profit is not None
-            or fingerprint.symbol != active_session.symbol
-            or fingerprint.price != active_session.quote.price
-        ):
-            raise PaperExecutionCapabilityError("baseline order does not match gateway session")
+            raise PaperBaselineAdmissionError("baseline entry intent request is malformed")
         with registry_lock:
             binding_record = (
                 baseline_bindings.get(binding)
@@ -616,19 +716,186 @@ def _build_sealed_capability_runtime():
                 type(binding_record) is not BaselineBindingRecord
                 or binding_record.gateway is not gateway
                 or binding_record.runtime_context is not runtime_context
-                or active_session.portfolio_id != binding_record.portfolio_id
-                or active_session.dispatch_issued is True
+                or binding_record.portfolio_id != portfolio_id
+                or type(handle) is not GatewayBaselineEntryHandle
+                or handle is not binding_record.entry_handle
             ):
+                raise PaperBaselineAdmissionError("baseline entry intent request is malformed")
+            intent = GatewayBaselineEntryIntent(_token=baseline_intent_token)
+            baseline_intents[intent] = BaselineIntentRecord(
+                binding,
+                gateway,
+                runtime_context,
+                portfolio_id,
+                symbol,
+                handle,
+            )
+        return intent
+
+    def begin_gateway_baseline_entry_session(
+        binding, *, gateway, runtime_context, portfolio_id, symbol, quote
+    ):
+        """Mint one task-bound session without exposing its registry or record type."""
+
+        from .market_data_contract import BrokerProtectiveQuote
+        from .paper_reduction_gateway import PaperReductionGateway
+
+        task = asyncio.current_task()
+        if (
+            type(gateway) is not PaperReductionGateway
+            or gateway.started is not True
+            or getattr(gateway, "_runtime_context", None) is not runtime_context
+            or type(task) is not asyncio.Task
+            or type(portfolio_id) is not str
+            or not portfolio_id
+            or portfolio_id.strip() != portfolio_id
+            or type(symbol) is not str
+            or not symbol
+            or symbol.strip() != symbol
+            or type(quote) is not BrokerProtectiveQuote
+            or quote.symbol != symbol
+        ):
+            raise PaperExecutionCapabilityError("baseline entry session scope is malformed")
+        key = (gateway, task)
+        with registry_lock:
+            binding_record = (
+                baseline_bindings.get(binding)
+                if type(binding) is GatewayBaselineExecutionBinding
+                else None
+            )
+            if (
+                type(binding_record) is not BaselineBindingRecord
+                or binding_record.gateway is not gateway
+                or binding_record.runtime_context is not runtime_context
+                or binding_record.portfolio_id != portfolio_id
+                or key in active_baseline_sessions
+            ):
+                raise PaperExecutionCapabilityError(
+                    "baseline entry session does not match binding or is nested"
+                )
+            session = GatewayBaselineEntrySession(_token=baseline_session_token)
+            baseline_sessions[session] = BaselineSessionRecord(
+                binding,
+                gateway,
+                runtime_context,
+                portfolio_id,
+                symbol,
+                quote,
+                task,
+            )
+            active_baseline_sessions[key] = session
+        return session
+
+    def end_gateway_baseline_entry_session(binding, session, *, gateway, runtime_context) -> None:
+        """Close the exact session and remove all task-addressable authority."""
+
+        task = asyncio.current_task()
+        key = (gateway, task) if type(task) is asyncio.Task else None
+        with registry_lock:
+            record = (
+                baseline_sessions.get(session)
+                if type(session) is GatewayBaselineEntrySession
+                else None
+            )
+            if (
+                type(record) is not BaselineSessionRecord
+                or record.binding is not binding
+                or record.gateway is not gateway
+                or record.runtime_context is not runtime_context
+                or record.task is not task
+                or record.closed
+                or key is None
+                or active_baseline_sessions.get(key) is not session
+            ):
+                raise PaperExecutionCapabilityError("baseline entry session close is invalid")
+            baseline_sessions[session] = replace_record(record, closed=True)
+            active_baseline_sessions.pop(key, None)
+
+    def issue_gateway_baseline_terminal_dispatch(
+        binding, *, gateway, runtime_context, intent, order
+    ):
+        from .paper_reduction_gateway import PaperReductionGateway
+
+        task = asyncio.current_task()
+        key = (gateway, task) if type(task) is asyncio.Task else None
+        # Locate and burn the sealed session before inspecting caller-controlled
+        # order fields. A malformed probe cannot preserve submission authority.
+        with registry_lock:
+            session = active_baseline_sessions.get(key) if key is not None else None
+            session_record = (
+                baseline_sessions.get(session)
+                if type(session) is GatewayBaselineEntrySession
+                else None
+            )
+            binding_record = (
+                baseline_bindings.get(binding)
+                if type(binding) is GatewayBaselineExecutionBinding
+                else None
+            )
+            intent_record = (
+                baseline_intents.get(intent) if type(intent) is GatewayBaselineEntryIntent else None
+            )
+            if type(intent_record) is not BaselineIntentRecord or intent_record.consumed:
+                raise PaperBaselineAdmissionError(
+                    "baseline entry intent is invalid or already consumed"
+                )
+            # Burn recognized producer authority before testing any caller-
+            # selected runtime, session, or order association.
+            baseline_intents[intent] = replace_record(intent_record, consumed=True)
+            if (
+                type(binding_record) is not BaselineBindingRecord
+                or intent_record.binding is not binding
+                or intent_record.gateway is not gateway
+                or intent_record.runtime_context is not runtime_context
+                or intent_record.portfolio_id != binding_record.portfolio_id
+                or intent_record.handle is not binding_record.entry_handle
+            ):
+                raise PaperBaselineAdmissionError("baseline entry intent does not match runtime")
+            if (
+                type(gateway) is not PaperReductionGateway
+                or gateway.started is not True
+                or getattr(gateway, "_runtime_context", None) is not runtime_context
+                or type(session_record) is not BaselineSessionRecord
+                or session_record.binding is not binding
+                or session_record.gateway is not gateway
+                or session_record.runtime_context is not runtime_context
+                or session_record.task is not task
+                or session_record.consumed
+                or session_record.closed
+                or type(binding_record) is not BaselineBindingRecord
+                or binding_record.gateway is not gateway
+                or binding_record.runtime_context is not runtime_context
+                or session_record.portfolio_id != binding_record.portfolio_id
+                or intent_record.portfolio_id != session_record.portfolio_id
+                or intent_record.symbol != session_record.symbol
+            ):
+                raise PaperBaselineAdmissionError("baseline gateway session does not match binding")
+            burned_record = replace_record(session_record, consumed=True)
+            baseline_sessions[session] = burned_record
+        fingerprint = fingerprint_order(order)
+        if (
+            fingerprint.side != "BUY"
+            or fingerprint.take_profit is not None
+            or fingerprint.symbol != burned_record.symbol
+            or fingerprint.price != burned_record.quote.price
+        ):
+            raise PaperBaselineAdmissionError("baseline order does not match gateway session")
+        with registry_lock:
+            current = baseline_sessions.get(session)
+            if current is not burned_record or burned_record.dispatch_issued:
                 raise PaperExecutionCapabilityError(
                     "baseline gateway session does not match binding or already issued"
                 )
-            active_session.dispatch_issued = True
+            baseline_sessions[session] = replace_record(
+                burned_record,
+                dispatch_issued=True,
+            )
             dispatch = BaselineTerminalDispatch(_token=terminal_dispatch_token)
             baseline_dispatches[dispatch] = TerminalDispatchRecord(
                 binding,
                 gateway,
                 runtime_context,
-                active_session,
+                session,
                 None,
                 None,
                 binding_record.executor,
@@ -781,7 +1048,6 @@ def _build_sealed_capability_runtime():
         *,
         gateway,
         runtime_context,
-        active_session,
         order,
     ):
         if type(dispatch) is not BaselineTerminalDispatch:
@@ -807,6 +1073,14 @@ def _build_sealed_capability_runtime():
                 runtime_context=None,
                 active_session=None,
             )
+            task = asyncio.current_task()
+            key = (gateway, task) if type(task) is asyncio.Task else None
+            active_session = active_baseline_sessions.get(key) if key is not None else None
+            session_record = (
+                baseline_sessions.get(active_session)
+                if type(active_session) is GatewayBaselineEntrySession
+                else None
+            )
         fingerprint = fingerprint_order(order)
         if (
             type(binding) is not GatewayBaselineExecutionBinding
@@ -814,6 +1088,14 @@ def _build_sealed_capability_runtime():
             or expected_gateway is not gateway
             or expected_context is not runtime_context
             or expected_session is not active_session
+            or type(session_record) is not BaselineSessionRecord
+            or session_record.binding is not binding
+            or session_record.gateway is not gateway
+            or session_record.runtime_context is not runtime_context
+            or session_record.task is not task
+            or session_record.consumed is not True
+            or session_record.dispatch_issued is not True
+            or session_record.closed
             or fingerprint != expected_fingerprint
         ):
             raise PaperExecutionCapabilityError("baseline terminal dispatch does not match attempt")
@@ -1015,6 +1297,10 @@ def _build_sealed_capability_runtime():
         bind_gateway_reduction_execution,
         attach_gateway_reduction_submitter,
         reduction_authority_matches,
+        get_gateway_baseline_entry_handle,
+        issue_gateway_baseline_entry_intent,
+        begin_gateway_baseline_entry_session,
+        end_gateway_baseline_entry_session,
         issue_gateway_baseline_terminal_dispatch,
         _submit_gateway_baseline_once,
         issue_gateway_reduction_terminal_dispatch,
@@ -1039,6 +1325,10 @@ def _build_sealed_capability_runtime():
     _bind_gateway_reduction_execution,
     _attach_gateway_reduction_submitter,
     _reduction_authority_matches,
+    _get_gateway_baseline_entry_handle,
+    _issue_gateway_baseline_entry_intent,
+    _begin_gateway_baseline_entry_session,
+    _end_gateway_baseline_entry_session,
     _issue_gateway_baseline_terminal_dispatch,
     _submit_gateway_baseline_once,
     _issue_gateway_reduction_terminal_dispatch,
