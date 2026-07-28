@@ -309,6 +309,8 @@ def _assert_fixture_target(
     resolved = expected.resolve(strict=True)
     if actual_path != resolved:
         raise FifoFixtureMigrationError("fixture connection does not match expected_path")
+    if resolved.stat().st_nlink != 1:
+        raise FifoFixtureMigrationError("fixture database must not have hard link aliases")
 
 
 def assert_fifo_accounting_schema(connection: sqlite3.Connection) -> None:

@@ -8,7 +8,8 @@ broker, dashboard, startup script, or `trading_data.db`.
 
 The only migration entry point is named `migrate_fifo_fixture_database`. It
 accepts an in-memory database or a database whose filename ends in
-`.fifo-fixture.sqlite3`; an ordinary production-style filename is rejected.
+`.fifo-fixture.sqlite3`; an ordinary production-style filename, symlink, or
+multiply linked file is rejected before migration or schema recovery.
 Production migration, backup/restore, legacy adoption, and runtime settlement
 belong to later PR4 slices and require separate review.
 
@@ -65,7 +66,8 @@ Primary keys, scope-local sequence/idempotency/execution uniqueness, composite
 foreign keys, direction/state checks, and no-update/no-delete triggers are
 enforced by SQLite. `FifoLedger.verify_epoch_integrity()` recomputes fill
 fingerprints, sequence/time ordering, commission conservation, lot quantities,
-gross/net P&L, complete opening-commission allocation, and snapshot chains.
+gross/net P&L, complete opening-commission allocation, source-fill participation,
+the exact FIFO lot/match projection, and snapshot chains.
 
 One `record_fill` transaction appends the fill, commission, derived lots and
 matches, and snapshot atomically. Any exception rolls back the entire event.

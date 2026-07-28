@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import sqlite3
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -91,6 +93,42 @@ def _table_count(connection, table: str) -> int:
     return int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
 
 
+def _utc_text(value: datetime) -> str:
+    return value.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _insert_fill_row(connection: sqlite3.Connection, event: FillEvent) -> None:
+    connection.execute(
+        """
+        INSERT INTO fifo_fills(
+            fill_id, epoch_id, event_sequence, execution_id, idempotency_key,
+            con_id, symbol, side, quantity_text, price_text, occurred_at,
+            recorded_at, payload_fingerprint
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event.fill_id,
+            event.epoch_id,
+            event.event_sequence,
+            event.execution_id,
+            event.idempotency_key,
+            event.con_id,
+            event.symbol,
+            event.side.value,
+            format(event.quantity, "f"),
+            format(event.price, "f"),
+            _utc_text(event.occurred_at),
+            _utc_text(event.recorded_at),
+            event.fingerprint(),
+        ),
+    )
+
+
+def _snapshot_fingerprint(payload: dict[str, object]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def test_fixture_migration_is_exact_idempotent_and_foreign_keys_are_on(connection):
     assert_fifo_accounting_schema(connection)
     migrate_fifo_fixture_database(
@@ -122,6 +160,29 @@ def test_fixture_migration_rejects_mismatched_connection(tmp_path):
     with pytest.raises(FifoFixtureMigrationError, match="does not match"):
         migrate_fifo_fixture_database(connection, expected_path=expected)
     connection.close()
+
+
+def test_fixture_migration_rejects_hard_link_alias_before_mutation(tmp_path):
+    production_path = tmp_path / "trading_data.db"
+    production = sqlite3.connect(production_path)
+    production.execute("CREATE TABLE sentinel(value TEXT NOT NULL)")
+    production.execute("INSERT INTO sentinel VALUES ('preserve')")
+    production.commit()
+    production.close()
+
+    alias_path = tmp_path / "alias.fifo-fixture.sqlite3"
+    os.link(production_path, alias_path)
+    connection = sqlite3.connect(alias_path)
+    with pytest.raises(FifoFixtureMigrationError, match="hard link"):
+        migrate_fifo_fixture_database(connection, expected_path=alias_path)
+    connection.close()
+
+    production = sqlite3.connect(production_path)
+    assert production.execute("SELECT value FROM sentinel").fetchone() == ("preserve",)
+    assert production.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'fifo_%'"
+    ).fetchone() == (0,)
+    production.close()
 
 
 def test_interrupted_fixture_migration_rolls_back_all_schema_objects(tmp_path):
@@ -300,6 +361,16 @@ def test_fill_sequence_and_event_time_are_strict(connection, ledger):
     assert _table_count(connection, "fifo_fills") == 1
 
 
+def test_fill_cannot_precede_epoch_effective_time(connection, ledger):
+    event = replace(
+        _fill(1, FillSide.BUY, "1", "10"),
+        occurred_at=NOW - timedelta(microseconds=1),
+    )
+    with pytest.raises(FifoAccountingOrderingError, match="epoch effective_at"):
+        ledger.record_fill(event)
+    assert _table_count(connection, "fifo_fills") == 0
+
+
 @pytest.mark.parametrize(
     "second",
     [
@@ -462,6 +533,141 @@ def test_snapshot_chain_is_per_asset_and_globally_sequenced(connection, ledger):
         )
     ] == [1, 2, 3]
     ledger.verify_epoch_integrity(EPOCH_ID)
+
+
+def test_integrity_verifier_rejects_fill_without_commission_and_snapshot(connection, ledger):
+    _insert_fill_row(connection, _fill(1, FillSide.BUY, "2", "10"))
+    connection.commit()
+
+    with pytest.raises(FifoAccountingValidationError, match="commission and one snapshot"):
+        ledger.verify_epoch_integrity(EPOCH_ID)
+
+
+def test_integrity_verifier_binds_opening_direction_to_source_fill(connection, ledger):
+    event = _fill(1, FillSide.BUY, "2", "10")
+    _insert_fill_row(connection, event)
+    connection.execute(
+        "INSERT INTO fifo_commissions VALUES (?, ?, ?, 0, 'USD', 2, ?)",
+        (event.commission_id, event.epoch_id, event.fill_id, _utc_text(event.recorded_at)),
+    )
+    lot_id = _identifier("flot", 1)
+    connection.execute(
+        """
+        INSERT INTO fifo_lot_openings VALUES(
+            ?, ?, ?, 0, ?, ?, 'SHORT', '2', '10', 0, 1, ?
+        )
+        """,
+        (
+            lot_id,
+            event.epoch_id,
+            event.fill_id,
+            event.con_id,
+            event.symbol,
+            _utc_text(event.occurred_at),
+        ),
+    )
+    snapshot_id = _identifier("fsnap", 1)
+    payload = {
+        "con_id": event.con_id,
+        "cumulative_commission_minor": 0,
+        "cumulative_realized_pnl": "0",
+        "epoch_id": event.epoch_id,
+        "event_sequence": 1,
+        "open_cost": "20",
+        "open_lot_count": 1,
+        "previous_snapshot_id": None,
+        "previous_state_fingerprint": None,
+        "signed_quantity": "-2",
+        "snapshot_id": snapshot_id,
+        "source_fill_id": event.fill_id,
+        "symbol": event.symbol,
+    }
+    connection.execute(
+        """
+        INSERT INTO fifo_position_snapshots VALUES(
+            ?, ?, ?, 1, ?, ?, '-2', '20', 1, '0', 0, NULL, NULL, ?, ?
+        )
+        """,
+        (
+            snapshot_id,
+            event.epoch_id,
+            event.fill_id,
+            event.con_id,
+            event.symbol,
+            _snapshot_fingerprint(payload),
+            _utc_text(event.recorded_at),
+        ),
+    )
+    connection.commit()
+
+    with pytest.raises(FifoAccountingValidationError, match="FIFO projection structure"):
+        ledger.verify_epoch_integrity(EPOCH_ID)
+
+
+def test_integrity_verifier_rejects_non_fifo_match_structure(connection, ledger):
+    first = ledger.record_fill(_fill(1, FillSide.BUY, "1", "10"))
+    second = ledger.record_fill(_fill(2, FillSide.BUY, "1", "20"))
+    assert first.opened_lot_id is not None
+    assert second.opened_lot_id is not None
+
+    event = _fill(3, FillSide.SELL, "1", "30")
+    _insert_fill_row(connection, event)
+    connection.execute(
+        "INSERT INTO fifo_commissions VALUES (?, ?, ?, 0, 'USD', 2, ?)",
+        (event.commission_id, event.epoch_id, event.fill_id, _utc_text(event.recorded_at)),
+    )
+    connection.execute(
+        """
+        INSERT INTO fifo_lot_matches VALUES(
+            ?, ?, ?, ?, 0, '1', '20', '30', 0, 0, '10', '10', ?
+        )
+        """,
+        (
+            _identifier("fmatch", 3),
+            event.epoch_id,
+            event.fill_id,
+            second.opened_lot_id,
+            _utc_text(event.occurred_at),
+        ),
+    )
+    snapshot_id = _identifier("fsnap", 3)
+    payload = {
+        "con_id": event.con_id,
+        "cumulative_commission_minor": 0,
+        "cumulative_realized_pnl": "10",
+        "epoch_id": event.epoch_id,
+        "event_sequence": 3,
+        "open_cost": "10",
+        "open_lot_count": 1,
+        "previous_snapshot_id": second.snapshot.snapshot_id,
+        "previous_state_fingerprint": second.snapshot.state_fingerprint,
+        "signed_quantity": "1",
+        "snapshot_id": snapshot_id,
+        "source_fill_id": event.fill_id,
+        "symbol": event.symbol,
+    }
+    connection.execute(
+        """
+        INSERT INTO fifo_position_snapshots VALUES(
+            ?, ?, ?, 3, ?, ?, '1', '10', 1, '10', 0, ?, ?, ?, ?
+        )
+        """,
+        (
+            snapshot_id,
+            event.epoch_id,
+            event.fill_id,
+            event.con_id,
+            event.symbol,
+            second.snapshot.snapshot_id,
+            second.snapshot.state_fingerprint,
+            _snapshot_fingerprint(payload),
+            _utc_text(event.recorded_at),
+        ),
+    )
+    connection.commit()
+
+    with pytest.raises(FifoAccountingValidationError, match="FIFO projection structure"):
+        ledger.verify_epoch_integrity(EPOCH_ID)
 
 
 def test_failed_snapshot_insert_rolls_back_fill_commission_matches_and_lots(connection, ledger):

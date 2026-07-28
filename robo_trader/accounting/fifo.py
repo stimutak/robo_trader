@@ -362,6 +362,14 @@ class _OpenLot:
     allocated_opening_commission_minor: int
 
 
+@dataclass(slots=True)
+class _ProjectionLot:
+    lot_id: str
+    direction: str
+    remaining_quantity: Decimal
+    open_price: Decimal
+
+
 class FifoLedger:
     """Append exact fill events to a previously migrated fixture ledger."""
 
@@ -448,7 +456,9 @@ class FifoLedger:
             raise FifoAccountingError("fill recording requires an idle connection")
         try:
             self._connection.execute("BEGIN IMMEDIATE")
-            self._require_epoch(event.epoch_id)
+            effective_at = self._require_epoch(event.epoch_id)
+            if event.occurred_at < effective_at:
+                raise FifoAccountingOrderingError("fill event time precedes epoch effective_at")
             replay = self._existing_fill(event)
             if replay is not None:
                 self._connection.rollback()
@@ -506,21 +516,35 @@ class FifoLedger:
         """Recompute immutable relationships and hash-chain evidence for an epoch."""
 
         _identifier(epoch_id, "epoch_id")
-        self._require_epoch(epoch_id)
+        effective_at = self._require_epoch(epoch_id)
+        fill_count, commission_count, snapshot_count = self._connection.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM fifo_fills WHERE epoch_id = ?),
+                (SELECT COUNT(*) FROM fifo_commissions WHERE epoch_id = ?),
+                (SELECT COUNT(*) FROM fifo_position_snapshots WHERE epoch_id = ?)
+            """,
+            (epoch_id, epoch_id, epoch_id),
+        ).fetchone()
+        if not (int(fill_count) == int(commission_count) == int(snapshot_count)):
+            raise FifoAccountingValidationError(
+                "every fill must have exactly one commission and one snapshot"
+            )
         rows = self._connection.execute(
             """
             SELECT f.fill_id, c.commission_id, f.event_sequence, f.execution_id,
                    f.idempotency_key, f.con_id, f.symbol, f.side, f.quantity_text,
                    f.price_text, c.amount_minor, f.occurred_at, f.recorded_at,
-                   f.payload_fingerprint
+                   f.payload_fingerprint, c.recorded_at
             FROM fifo_fills f
             JOIN fifo_commissions c ON c.epoch_id = f.epoch_id AND c.fill_id = f.fill_id
             WHERE f.epoch_id = ? ORDER BY f.event_sequence
             """,
             (epoch_id,),
         ).fetchall()
-        prior_time: Optional[datetime] = None
+        prior_time: Optional[datetime] = effective_at
         last_event_by_asset: dict[tuple[int, str], FillEvent] = {}
+        events: list[FillEvent] = []
         for expected_sequence, row in enumerate(rows, start=1):
             event = FillEvent(
                 epoch_id=epoch_id,
@@ -543,9 +567,12 @@ class FifoLedger:
             if prior_time is not None and event.occurred_at < prior_time:
                 raise FifoAccountingValidationError("fill event time is not monotonic")
             prior_time = event.occurred_at
+            events.append(event)
             last_event_by_asset[(event.con_id, event.symbol)] = event
             if event.fingerprint() != row[13]:
                 raise FifoAccountingValidationError("fill payload fingerprint mismatch")
+            if _parse_utc(row[14], "commission recorded_at") != event.recorded_at:
+                raise FifoAccountingValidationError("commission does not match its source fill")
             allocations = self._connection.execute(
                 """
                 SELECT match_ordinal, matched_quantity_text,
@@ -583,6 +610,8 @@ class FifoLedger:
                 )
             if sum(int(allocation[2]) for allocation in allocations) != event.commission_minor:
                 raise FifoAccountingValidationError("fill commission allocation is incomplete")
+
+        self._verify_fifo_projection_structure(events)
 
         lot_rows = self._connection.execute(
             """
@@ -665,14 +694,29 @@ class FifoLedger:
             SELECT snapshot_id, source_fill_id, event_sequence, con_id, symbol,
                    signed_quantity_text, open_cost_text, open_lot_count,
                    cumulative_realized_pnl_text, cumulative_commission_minor,
-                   previous_snapshot_id, previous_state_fingerprint, state_fingerprint
+                   previous_snapshot_id, previous_state_fingerprint, state_fingerprint,
+                   created_at
             FROM fifo_position_snapshots WHERE epoch_id = ? ORDER BY event_sequence
             """,
             (epoch_id,),
         ).fetchall()
         if len(snapshots) != len(rows):
             raise FifoAccountingValidationError("every fill must have exactly one snapshot")
+        events_by_fill = {event.fill_id: event for event in events}
         for row in snapshots:
+            source_event = events_by_fill.get(str(row[1]))
+            if source_event is None or (
+                int(row[2]),
+                int(row[3]),
+                str(row[4]),
+                _parse_utc(row[13], "snapshot created_at"),
+            ) != (
+                source_event.event_sequence,
+                source_event.con_id,
+                source_event.symbol,
+                source_event.recorded_at,
+            ):
+                raise FifoAccountingValidationError("snapshot does not match its source fill")
             asset = (int(row[3]), str(row[4]))
             previous = previous_by_asset.get(asset)
             expected_previous_id = None if previous is None else previous[0]
@@ -761,16 +805,103 @@ class FifoLedger:
                     "latest position snapshot diverges from immutable events"
                 )
 
-    def _require_epoch(self, epoch_id: str) -> None:
+    def _verify_fifo_projection_structure(self, events: Sequence[FillEvent]) -> None:
+        active_by_asset: dict[tuple[int, str], list[_ProjectionLot]] = {}
+        for event in events:
+            asset = (event.con_id, event.symbol)
+            active = active_by_asset.setdefault(asset, [])
+            fill_direction = "LONG" if event.side is FillSide.BUY else "SHORT"
+            opposite = "SHORT" if fill_direction == "LONG" else "LONG"
+            remaining = event.quantity
+            expected_matches: list[tuple[_ProjectionLot, Decimal]] = []
+            if active and active[0].direction == opposite:
+                for lot in active:
+                    if remaining == 0:
+                        break
+                    quantity = min(remaining, lot.remaining_quantity)
+                    expected_matches.append((lot, quantity))
+                    remaining = _subtract(remaining, quantity, "verified unmatched fill quantity")
+
+            matches = self._connection.execute(
+                """
+                SELECT match_id, opening_lot_id, match_ordinal, matched_quantity_text,
+                       opening_price_text, closing_price_text, matched_at
+                FROM fifo_lot_matches
+                WHERE epoch_id = ? AND closing_fill_id = ?
+                ORDER BY match_ordinal
+                """,
+                (event.epoch_id, event.fill_id),
+            ).fetchall()
+            if len(matches) != len(expected_matches):
+                raise FifoAccountingValidationError("FIFO projection structure diverges")
+            for ordinal, (row, (lot, quantity)) in enumerate(zip(matches, expected_matches)):
+                expected = (
+                    _derived_id("fmatch", event.epoch_id, event.fill_id, ordinal),
+                    lot.lot_id,
+                    ordinal,
+                    _decimal_text(quantity),
+                    _decimal_text(lot.open_price),
+                    _decimal_text(event.price),
+                    _utc_text(event.occurred_at),
+                )
+                if tuple(row) != expected:
+                    raise FifoAccountingValidationError("FIFO projection structure diverges")
+                lot.remaining_quantity = _subtract(
+                    lot.remaining_quantity,
+                    quantity,
+                    "verified remaining lot quantity",
+                )
+            active[:] = [lot for lot in active if lot.remaining_quantity > 0]
+
+            openings = self._connection.execute(
+                """
+                SELECT lot_id, lot_ordinal, con_id, symbol, direction,
+                       opened_quantity_text, open_price_text, opened_sequence, opened_at
+                FROM fifo_lot_openings
+                WHERE epoch_id = ? AND opening_fill_id = ?
+                ORDER BY lot_ordinal
+                """,
+                (event.epoch_id, event.fill_id),
+            ).fetchall()
+            if remaining == 0:
+                if openings:
+                    raise FifoAccountingValidationError("FIFO projection structure diverges")
+                continue
+            expected_lot_id = _derived_id("flot", event.epoch_id, event.fill_id, 0)
+            expected_opening = (
+                expected_lot_id,
+                0,
+                event.con_id,
+                event.symbol,
+                fill_direction,
+                _decimal_text(remaining),
+                _decimal_text(event.price),
+                event.event_sequence,
+                _utc_text(event.occurred_at),
+            )
+            if len(openings) != 1 or tuple(openings[0]) != expected_opening:
+                raise FifoAccountingValidationError("FIFO projection structure diverges")
+            active.append(
+                _ProjectionLot(
+                    lot_id=expected_lot_id,
+                    direction=fill_direction,
+                    remaining_quantity=remaining,
+                    open_price=event.price,
+                )
+            )
+
+    def _require_epoch(self, epoch_id: str) -> datetime:
         row = self._connection.execute(
-            "SELECT origin_kind FROM fifo_accounting_epochs WHERE epoch_id = ?", (epoch_id,)
+            "SELECT origin_kind, effective_at FROM fifo_accounting_epochs WHERE epoch_id = ?",
+            (epoch_id,),
         ).fetchone()
         if row is None:
             raise FifoAccountingValidationError("unknown accounting epoch")
-        if row != ("EMPTY_LEDGER",):
+        if row[0] != "EMPTY_LEDGER":
             raise FifoAccountingValidationError(
                 "PR4A cannot project an adopted legacy accounting epoch"
             )
+        return _parse_utc(row[1], "epoch effective_at")
 
     def _existing_fill(self, event: FillEvent) -> Optional[FillResult]:
         rows = self._connection.execute(
