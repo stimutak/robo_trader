@@ -48,7 +48,7 @@ _TABLE_SQL = {
     "fifo_schema_migrations": """
         CREATE TABLE fifo_schema_migrations (
             component TEXT NOT NULL,
-            version INTEGER NOT NULL CHECK (version > 0),
+            version INTEGER NOT NULL CHECK (typeof(version) = 'integer' AND version > 0),
             description TEXT NOT NULL CHECK (length(trim(description)) > 0),
             applied_at TEXT NOT NULL CHECK (applied_at LIKE '%Z'),
             PRIMARY KEY(component, version)
@@ -60,7 +60,9 @@ _TABLE_SQL = {
                 length(epoch_id) = 39 AND substr(epoch_id, 1, 7) = 'fepoch-'
                 AND substr(epoch_id, 8) NOT GLOB '*[^0-9a-f]*'
             ),
-            schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+            schema_version INTEGER NOT NULL CHECK (
+                typeof(schema_version) = 'integer' AND schema_version = 1
+            ),
             execution_domain_scope TEXT NOT NULL CHECK (length(trim(execution_domain_scope)) > 0),
             account_scope TEXT NOT NULL CHECK (length(trim(account_scope)) > 0),
             portfolio_id TEXT NOT NULL CHECK (length(trim(portfolio_id)) > 0),
@@ -83,10 +85,12 @@ _TABLE_SQL = {
                 AND substr(fill_id, 7) NOT GLOB '*[^0-9a-f]*'
             ),
             epoch_id TEXT NOT NULL,
-            event_sequence INTEGER NOT NULL CHECK (event_sequence > 0),
+            event_sequence INTEGER NOT NULL CHECK (
+                typeof(event_sequence) = 'integer' AND event_sequence > 0
+            ),
             execution_id TEXT NOT NULL CHECK (length(trim(execution_id)) > 0),
             idempotency_key TEXT NOT NULL CHECK (length(trim(idempotency_key)) > 0),
-            con_id INTEGER NOT NULL CHECK (con_id > 0),
+            con_id INTEGER NOT NULL CHECK (typeof(con_id) = 'integer' AND con_id > 0),
             symbol TEXT NOT NULL CHECK (length(symbol) BETWEEN 1 AND 32),
             side TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
             quantity_text TEXT NOT NULL CHECK (
@@ -119,10 +123,13 @@ _TABLE_SQL = {
             epoch_id TEXT NOT NULL,
             fill_id TEXT NOT NULL UNIQUE,
             amount_minor INTEGER NOT NULL CHECK (
-                amount_minor BETWEEN -1000000000000 AND 1000000000000
+                typeof(amount_minor) = 'integer'
+                AND amount_minor BETWEEN -1000000000000 AND 1000000000000
             ),
             currency TEXT NOT NULL CHECK (currency = 'USD'),
-            minor_unit_exponent INTEGER NOT NULL CHECK (minor_unit_exponent = 2),
+            minor_unit_exponent INTEGER NOT NULL CHECK (
+                typeof(minor_unit_exponent) = 'integer' AND minor_unit_exponent = 2
+            ),
             recorded_at TEXT NOT NULL CHECK (recorded_at LIKE '%Z'),
             UNIQUE(epoch_id, commission_id),
             FOREIGN KEY(epoch_id, fill_id) REFERENCES fifo_fills(epoch_id, fill_id)
@@ -136,8 +143,10 @@ _TABLE_SQL = {
             ),
             epoch_id TEXT NOT NULL,
             opening_fill_id TEXT NOT NULL,
-            lot_ordinal INTEGER NOT NULL CHECK (lot_ordinal >= 0),
-            con_id INTEGER NOT NULL CHECK (con_id > 0),
+            lot_ordinal INTEGER NOT NULL CHECK (
+                typeof(lot_ordinal) = 'integer' AND lot_ordinal >= 0
+            ),
+            con_id INTEGER NOT NULL CHECK (typeof(con_id) = 'integer' AND con_id > 0),
             symbol TEXT NOT NULL CHECK (length(symbol) BETWEEN 1 AND 32),
             direction TEXT NOT NULL CHECK (direction IN ('LONG', 'SHORT')),
             opened_quantity_text TEXT NOT NULL CHECK (
@@ -149,9 +158,12 @@ _TABLE_SQL = {
                 AND ({_positive_decimal_check('open_price_text')})
             ),
             opening_commission_minor INTEGER NOT NULL CHECK (
-                opening_commission_minor BETWEEN -1000000000000 AND 1000000000000
+                typeof(opening_commission_minor) = 'integer'
+                AND opening_commission_minor BETWEEN -1000000000000 AND 1000000000000
             ),
-            opened_sequence INTEGER NOT NULL CHECK (opened_sequence > 0),
+            opened_sequence INTEGER NOT NULL CHECK (
+                typeof(opened_sequence) = 'integer' AND opened_sequence > 0
+            ),
             opened_at TEXT NOT NULL CHECK (opened_at LIKE '%Z'),
             UNIQUE(epoch_id, lot_id),
             UNIQUE(epoch_id, opening_fill_id, lot_ordinal),
@@ -168,7 +180,9 @@ _TABLE_SQL = {
             epoch_id TEXT NOT NULL,
             closing_fill_id TEXT NOT NULL,
             opening_lot_id TEXT NOT NULL,
-            match_ordinal INTEGER NOT NULL CHECK (match_ordinal >= 0),
+            match_ordinal INTEGER NOT NULL CHECK (
+                typeof(match_ordinal) = 'integer' AND match_ordinal >= 0
+            ),
             matched_quantity_text TEXT NOT NULL CHECK (
                 length(matched_quantity_text) BETWEEN 1 AND 64
                 AND ({_positive_decimal_check('matched_quantity_text')})
@@ -182,10 +196,12 @@ _TABLE_SQL = {
                 AND ({_positive_decimal_check('closing_price_text')})
             ),
             opening_commission_minor INTEGER NOT NULL CHECK (
-                opening_commission_minor BETWEEN -1000000000000 AND 1000000000000
+                typeof(opening_commission_minor) = 'integer'
+                AND opening_commission_minor BETWEEN -1000000000000 AND 1000000000000
             ),
             closing_commission_minor INTEGER NOT NULL CHECK (
-                closing_commission_minor BETWEEN -1000000000000 AND 1000000000000
+                typeof(closing_commission_minor) = 'integer'
+                AND closing_commission_minor BETWEEN -1000000000000 AND 1000000000000
             ),
             gross_pnl_text TEXT NOT NULL CHECK (
                 length(gross_pnl_text) BETWEEN 1 AND 96
@@ -212,8 +228,10 @@ _TABLE_SQL = {
             ),
             epoch_id TEXT NOT NULL,
             source_fill_id TEXT NOT NULL UNIQUE,
-            event_sequence INTEGER NOT NULL CHECK (event_sequence > 0),
-            con_id INTEGER NOT NULL CHECK (con_id > 0),
+            event_sequence INTEGER NOT NULL CHECK (
+                typeof(event_sequence) = 'integer' AND event_sequence > 0
+            ),
+            con_id INTEGER NOT NULL CHECK (typeof(con_id) = 'integer' AND con_id > 0),
             symbol TEXT NOT NULL CHECK (length(symbol) BETWEEN 1 AND 32),
             signed_quantity_text TEXT NOT NULL CHECK (
                 length(signed_quantity_text) BETWEEN 1 AND 64
@@ -225,13 +243,16 @@ _TABLE_SQL = {
                     AND ({_positive_decimal_check('open_cost_text')})
                 )
             ),
-            open_lot_count INTEGER NOT NULL CHECK (open_lot_count >= 0),
+            open_lot_count INTEGER NOT NULL CHECK (
+                typeof(open_lot_count) = 'integer' AND open_lot_count >= 0
+            ),
             cumulative_realized_pnl_text TEXT NOT NULL CHECK (
                 length(cumulative_realized_pnl_text) BETWEEN 1 AND 96
                 AND ({_signed_decimal_check('cumulative_realized_pnl_text')})
             ),
             cumulative_commission_minor INTEGER NOT NULL CHECK (
-                cumulative_commission_minor BETWEEN -1000000000000000 AND 1000000000000000
+                typeof(cumulative_commission_minor) = 'integer'
+                AND cumulative_commission_minor BETWEEN -1000000000000000 AND 1000000000000000
             ),
             previous_snapshot_id TEXT,
             previous_state_fingerprint TEXT,
@@ -268,11 +289,71 @@ def _trigger_sql(table: str, operation: str) -> str:
     """
 
 
+_INSERT_CONFLICT_PREDICATES = {
+    "fifo_schema_migrations": "component = NEW.component AND version = NEW.version",
+    "fifo_accounting_epochs": """
+        epoch_id = NEW.epoch_id
+        OR source_fingerprint = NEW.source_fingerprint
+        OR (
+            execution_domain_scope = NEW.execution_domain_scope
+            AND account_scope = NEW.account_scope
+            AND portfolio_id = NEW.portfolio_id
+        )
+    """,
+    "fifo_fills": """
+        fill_id = NEW.fill_id
+        OR (epoch_id = NEW.epoch_id AND event_sequence = NEW.event_sequence)
+        OR (epoch_id = NEW.epoch_id AND execution_id = NEW.execution_id)
+        OR (epoch_id = NEW.epoch_id AND idempotency_key = NEW.idempotency_key)
+    """,
+    "fifo_commissions": "commission_id = NEW.commission_id OR fill_id = NEW.fill_id",
+    "fifo_lot_openings": """
+        lot_id = NEW.lot_id
+        OR (
+            epoch_id = NEW.epoch_id
+            AND opening_fill_id = NEW.opening_fill_id
+            AND lot_ordinal = NEW.lot_ordinal
+        )
+    """,
+    "fifo_lot_matches": """
+        match_id = NEW.match_id
+        OR (
+            epoch_id = NEW.epoch_id
+            AND closing_fill_id = NEW.closing_fill_id
+            AND match_ordinal = NEW.match_ordinal
+        )
+    """,
+    "fifo_position_snapshots": """
+        snapshot_id = NEW.snapshot_id
+        OR source_fill_id = NEW.source_fill_id
+        OR (epoch_id = NEW.epoch_id AND event_sequence = NEW.event_sequence)
+    """,
+}
+
+
+def _insert_conflict_guard_sql(table: str) -> str:
+    # Every interpolated identifier and predicate comes from the closed constants above.
+    return f"""
+        CREATE TRIGGER {table}_no_replace
+        BEFORE INSERT ON {table}
+        WHEN EXISTS (
+            SELECT 1 FROM {table}
+            WHERE {_INSERT_CONFLICT_PREDICATES[table]}
+        )
+        BEGIN
+            SELECT RAISE(ABORT, '{table} identity is append-only');
+        END
+    """
+
+
 _TRIGGER_SQL = {
     f"{table}_no_{operation.lower()}": _trigger_sql(table, operation)
     for table in _APPEND_ONLY_TABLES
     for operation in ("UPDATE", "DELETE")
 }
+_TRIGGER_SQL.update(
+    {f"{table}_no_replace": _insert_conflict_guard_sql(table) for table in _APPEND_ONLY_TABLES}
+)
 
 
 def _normalize_sql(value: object) -> str:
@@ -313,20 +394,31 @@ def _assert_fixture_target(
         raise FifoFixtureMigrationError("fixture database must not have hard link aliases")
 
 
+def _assert_no_temp_fifo_objects(connection: sqlite3.Connection) -> None:
+    shadows = connection.execute(
+        "SELECT type, name FROM temp.sqlite_master WHERE name LIKE 'fifo_%' ORDER BY type, name"
+    ).fetchall()
+    if shadows:
+        raise FifoFixtureMigrationError("temporary FIFO objects cannot shadow durable main state")
+
+
 def assert_fifo_accounting_schema(connection: sqlite3.Connection) -> None:
     """Fail closed unless the complete PR4A fixture schema is exact."""
 
+    _assert_no_temp_fifo_objects(connection)
     if connection.execute("PRAGMA foreign_keys").fetchone() != (1,):
         raise FifoFixtureMigrationError("FIFO accounting requires foreign-key enforcement")
 
-    rows = connection.execute("SELECT name, sql FROM sqlite_master WHERE type = 'table'").fetchall()
+    rows = connection.execute(
+        "SELECT name, sql FROM main.sqlite_master WHERE type = 'table'"
+    ).fetchall()
     actual_tables = {str(name): _normalize_sql(sql) for name, sql in rows}
     for name, statement in _TABLE_SQL.items():
         if actual_tables.get(name) != _normalize_sql(statement):
             raise FifoFixtureMigrationError(f"FIFO accounting table {name} is malformed")
 
     rows = connection.execute(
-        "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
+        "SELECT name, sql FROM main.sqlite_master WHERE type = 'trigger'"
     ).fetchall()
     actual_triggers = {str(name): _normalize_sql(sql) for name, sql in rows}
     for name, statement in _TRIGGER_SQL.items():
@@ -334,12 +426,12 @@ def assert_fifo_accounting_schema(connection: sqlite3.Connection) -> None:
             raise FifoFixtureMigrationError(f"FIFO accounting trigger {name} is malformed")
 
     versions = connection.execute(
-        "SELECT version FROM fifo_schema_migrations WHERE component = ? ORDER BY version",
+        "SELECT version FROM main.fifo_schema_migrations WHERE component = ? ORDER BY version",
         (FIFO_ACCOUNTING_COMPONENT,),
     ).fetchall()
     if versions != [(FIFO_ACCOUNTING_SCHEMA_VERSION,)]:
         raise FifoFixtureMigrationError("FIFO accounting migration evidence is incomplete")
-    if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+    if connection.execute("PRAGMA main.foreign_key_check").fetchone() is not None:
         raise FifoFixtureMigrationError("FIFO accounting schema has foreign-key violations")
 
 
@@ -355,6 +447,7 @@ def migrate_fifo_fixture_database(
     """
 
     _assert_fixture_target(connection, expected_path)
+    _assert_no_temp_fifo_objects(connection)
     if connection.in_transaction:
         raise FifoFixtureMigrationError("fixture migration requires an idle connection")
     connection.execute("PRAGMA foreign_keys = ON")
@@ -362,7 +455,8 @@ def migrate_fifo_fixture_database(
         raise FifoFixtureMigrationError("could not enable fixture foreign keys")
 
     existing = connection.execute(
-        "SELECT name FROM sqlite_master WHERE type IN ('table','trigger') " "AND name LIKE 'fifo_%'"
+        "SELECT name FROM main.sqlite_master WHERE type IN ('table','trigger') "
+        "AND name LIKE 'fifo_%'"
     ).fetchall()
     if existing:
         assert_fifo_accounting_schema(connection)
@@ -374,7 +468,7 @@ def migrate_fifo_fixture_database(
             connection.execute(statement)
         connection.execute(
             """
-            INSERT INTO fifo_schema_migrations(component, version, description, applied_at)
+            INSERT INTO main.fifo_schema_migrations(component, version, description, applied_at)
             VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
             """,
             (

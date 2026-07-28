@@ -17,7 +17,7 @@ from decimal import Decimal, InvalidOperation, localcontext
 from enum import Enum
 from typing import Optional, Sequence
 
-from .fifo_fixture_migration import assert_fifo_accounting_schema
+from .fifo_fixture_migration import _assert_no_temp_fifo_objects, assert_fifo_accounting_schema
 
 _ID_PATTERNS = {
     "epoch_id": re.compile(r"^fepoch-[0-9a-f]{32}$"),
@@ -107,9 +107,16 @@ def _decimal(value: object, field: str, *, positive: bool = False) -> Decimal:
 
 def _input_decimal(value: object, field: str, *, positive: bool = False) -> Decimal:
     exact = _decimal(value, field, positive=positive)
-    _, digits, decimal_exponent = exact.as_tuple()
+    _, coefficient, decimal_exponent = exact.as_tuple()
     exponent = int(decimal_exponent)
-    if len(digits) > _MAX_INPUT_DECIMAL_DIGITS or exponent < -_MAX_INPUT_DECIMAL_SCALE:
+    significant_digits = list(coefficient)
+    while len(significant_digits) > 1 and significant_digits[-1] == 0:
+        significant_digits.pop()
+        exponent += 1
+    integer_digits = max(len(significant_digits) + exponent, 0)
+    fractional_digits = max(-exponent, 0)
+    expanded_digits = integer_digits + fractional_digits
+    if expanded_digits > _MAX_INPUT_DECIMAL_DIGITS or exponent < -_MAX_INPUT_DECIMAL_SCALE:
         raise FifoAccountingValidationError(f"{field} exceeds input precision")
     return exact
 
@@ -158,7 +165,16 @@ def _multiply(left: Decimal, right: Decimal, field: str) -> Decimal:
 def _money_from_minor(value: int) -> Decimal:
     if type(value) is not int or abs(value) > _MAX_COMMISSION_MINOR:
         raise FifoAccountingValidationError("commission_minor is outside the allowed range")
-    return Decimal(value).scaleb(-2)
+    magnitude = str(abs(value))
+    return Decimal((1 if value < 0 else 0, tuple(int(digit) for digit in magnitude), -2))
+
+
+def _stored_int(value: object, field: str) -> int:
+    """Read an SQLite INTEGER without silently truncating REAL or TEXT storage."""
+
+    if type(value) is not int:
+        raise FifoAccountingValidationError(f"{field} is not stored as an exact integer")
+    return value
 
 
 def _fingerprint(payload: dict[str, object]) -> str:
@@ -380,6 +396,7 @@ class FifoLedger:
         self._connection = connection
 
     def create_epoch(self, epoch: AccountingEpoch) -> AccountingEpoch:
+        _assert_no_temp_fifo_objects(self._connection)
         if type(epoch) is not AccountingEpoch:
             raise TypeError("epoch must be AccountingEpoch")
         if self._connection.in_transaction:
@@ -450,6 +467,7 @@ class FifoLedger:
         }
 
     def record_fill(self, event: FillEvent) -> FillResult:
+        _assert_no_temp_fifo_objects(self._connection)
         if type(event) is not FillEvent:
             raise TypeError("event must be FillEvent")
         if self._connection.in_transaction:
@@ -515,6 +533,7 @@ class FifoLedger:
     def verify_epoch_integrity(self, epoch_id: str) -> None:
         """Recompute immutable relationships and hash-chain evidence for an epoch."""
 
+        _assert_no_temp_fifo_objects(self._connection)
         _identifier(epoch_id, "epoch_id")
         effective_at = self._require_epoch(epoch_id)
         fill_count, commission_count, snapshot_count = self._connection.execute(
@@ -526,7 +545,11 @@ class FifoLedger:
             """,
             (epoch_id, epoch_id, epoch_id),
         ).fetchone()
-        if not (int(fill_count) == int(commission_count) == int(snapshot_count)):
+        if not (
+            _stored_int(fill_count, "fill count")
+            == _stored_int(commission_count, "commission count")
+            == _stored_int(snapshot_count, "snapshot count")
+        ):
             raise FifoAccountingValidationError(
                 "every fill must have exactly one commission and one snapshot"
             )
@@ -549,15 +572,15 @@ class FifoLedger:
                 epoch_id=epoch_id,
                 fill_id=str(row[0]),
                 commission_id=str(row[1]),
-                event_sequence=int(row[2]),
+                event_sequence=_stored_int(row[2], "fill event_sequence"),
                 execution_id=str(row[3]),
                 idempotency_key=str(row[4]),
-                con_id=int(row[5]),
+                con_id=_stored_int(row[5], "fill con_id"),
                 symbol=str(row[6]),
                 side=FillSide(str(row[7])),
                 quantity=_parse_decimal(row[8], "fill quantity", positive=True),
                 price=_parse_decimal(row[9], "fill price", positive=True),
-                commission_minor=int(row[10]),
+                commission_minor=_stored_int(row[10], "commission amount_minor"),
                 occurred_at=_parse_utc(row[11], "fill occurred_at"),
                 recorded_at=_parse_utc(row[12], "fill recorded_at"),
             )
@@ -602,11 +625,14 @@ class FifoLedger:
                 )
             if allocated_quantity != event.quantity:
                 raise FifoAccountingValidationError("fill quantity allocation is incomplete")
-            if [int(allocation[2]) for allocation in allocations] != exact_allocations:
+            stored_allocations = [
+                _stored_int(allocation[2], "commission allocation") for allocation in allocations
+            ]
+            if stored_allocations != exact_allocations:
                 raise FifoAccountingValidationError(
                     "fill commission allocation is not deterministic"
                 )
-            if sum(int(allocation[2]) for allocation in allocations) != event.commission_minor:
+            if sum(stored_allocations) != event.commission_minor:
                 raise FifoAccountingValidationError("fill commission allocation is incomplete")
 
         self._verify_fifo_projection_structure(events)
@@ -641,8 +667,8 @@ class FifoLedger:
                 if _parse_decimal(match[1], "recorded open price", positive=True) != open_price:
                     raise FifoAccountingValidationError("lot match open price diverges")
                 close_price = _parse_decimal(match[2], "closing price", positive=True)
-                opening_allocation = int(match[3])
-                closing_allocation = int(match[4])
+                opening_allocation = _stored_int(match[3], "opening commission allocation")
+                closing_allocation = _stored_int(match[4], "closing commission allocation")
                 lot_state = _OpenLot(
                     lot_id=str(lot_id),
                     opened_sequence=0,
@@ -650,7 +676,9 @@ class FifoLedger:
                     opened_quantity=opened,
                     remaining_quantity=_subtract(opened, matched, "remaining lot quantity"),
                     open_price=open_price,
-                    opening_commission_minor=int(commission_minor),
+                    opening_commission_minor=_stored_int(
+                        commission_minor, "lot opening commission"
+                    ),
                     allocated_opening_commission_minor=allocated_opening,
                 )
                 if self._opening_commission_for_match(lot_state, quantity) != opening_allocation:
@@ -680,7 +708,9 @@ class FifoLedger:
                 allocated_opening += opening_allocation
             if matched > opened:
                 raise FifoAccountingValidationError("lot is over-matched")
-            if matched == opened and allocated_opening != int(commission_minor):
+            if matched == opened and allocated_opening != _stored_int(
+                commission_minor, "lot opening commission"
+            ):
                 raise FifoAccountingValidationError(
                     "closed lot opening commission is not fully allocated"
                 )
@@ -704,8 +734,8 @@ class FifoLedger:
         for row in snapshots:
             source_event = events_by_fill.get(str(row[1]))
             if source_event is None or (
-                int(row[2]),
-                int(row[3]),
+                _stored_int(row[2], "snapshot event_sequence"),
+                _stored_int(row[3], "snapshot con_id"),
                 str(row[4]),
                 _parse_utc(row[13], "snapshot created_at"),
             ) != (
@@ -715,26 +745,28 @@ class FifoLedger:
                 source_event.recorded_at,
             ):
                 raise FifoAccountingValidationError("snapshot does not match its source fill")
-            asset = (int(row[3]), str(row[4]))
+            asset = (_stored_int(row[3], "snapshot con_id"), str(row[4]))
             previous = previous_by_asset.get(asset)
             expected_previous_id = None if previous is None else previous[0]
             expected_previous_hash = None if previous is None else previous[1]
             if row[10] != expected_previous_id or row[11] != expected_previous_hash:
                 raise FifoAccountingValidationError("snapshot chain is discontinuous")
             payload = {
-                "con_id": int(row[3]),
-                "cumulative_commission_minor": int(row[9]),
+                "con_id": _stored_int(row[3], "snapshot con_id"),
+                "cumulative_commission_minor": _stored_int(
+                    row[9], "snapshot cumulative commission"
+                ),
                 "cumulative_realized_pnl": _decimal_text(
                     _parse_decimal(row[8], "cumulative realized P&L")
                 ),
                 "epoch_id": epoch_id,
-                "event_sequence": int(row[2]),
+                "event_sequence": _stored_int(row[2], "snapshot event_sequence"),
                 "open_cost": (
                     None
                     if row[6] is None
                     else _decimal_text(_parse_decimal(row[6], "open cost", positive=True))
                 ),
-                "open_lot_count": int(row[7]),
+                "open_lot_count": _stored_int(row[7], "snapshot open_lot_count"),
                 "previous_snapshot_id": expected_previous_id,
                 "previous_state_fingerprint": expected_previous_hash,
                 "signed_quantity": _decimal_text(_parse_decimal(row[5], "signed quantity")),
@@ -790,7 +822,10 @@ class FifoLedger:
                 """,
                 (epoch_id, asset[0], asset[1], event.event_sequence),
             ).fetchall()
-            expected_commission = sum(int(commission_row[0]) for commission_row in commission_rows)
+            expected_commission = sum(
+                _stored_int(commission_row[0], "commission amount_minor")
+                for commission_row in commission_rows
+            )
             snapshot = snapshot_by_fill[event.fill_id]
             expected_open_cost_text = (
                 None if expected_quantity == 0 else _decimal_text(expected_open_cost)
@@ -798,9 +833,9 @@ class FifoLedger:
             if (
                 _parse_decimal(snapshot[5], "snapshot signed quantity") != expected_quantity
                 or snapshot[6] != expected_open_cost_text
-                or int(str(snapshot[7])) != len(lots)
+                or _stored_int(snapshot[7], "snapshot open_lot_count") != len(lots)
                 or _parse_decimal(snapshot[8], "snapshot realized P&L") != expected_realized
-                or int(str(snapshot[9])) != expected_commission
+                or _stored_int(snapshot[9], "snapshot cumulative commission") != expected_commission
             ):
                 raise FifoAccountingValidationError(
                     "position snapshot diverges from immutable events"
@@ -973,7 +1008,7 @@ class FifoLedger:
             """,
             (event.epoch_id,),
         ).fetchone()
-        expected = 1 if row is None else int(row[0]) + 1
+        expected = 1 if row is None else _stored_int(row[0], "fill event_sequence") + 1
         if event.event_sequence != expected:
             raise FifoAccountingOrderingError(f"event_sequence must extend the epoch at {expected}")
         if row is not None and event.occurred_at < _parse_utc(row[1], "prior occurred_at"):
@@ -987,7 +1022,10 @@ class FifoLedger:
             """,
             (event.epoch_id, event.con_id, event.symbol),
         ).fetchall()
-        if any((int(row[0]), str(row[1])) != (event.con_id, event.symbol) for row in rows):
+        if any(
+            (_stored_int(row[0], "fill con_id"), str(row[1])) != (event.con_id, event.symbol)
+            for row in rows
+        ):
             raise FifoAccountingConflict("contract identifier and symbol binding changed")
 
     def _open_lots(
@@ -1036,12 +1074,12 @@ class FifoLedger:
                     _parse_decimal(matched_text, "matched_quantity", positive=True),
                     "matched quantity",
                 )
-                allocated += int(allocated_minor)
+                allocated += _stored_int(allocated_minor, "opening commission allocation")
             remaining = _subtract(opened, matched, "remaining lot quantity")
             if remaining < 0:
                 raise FifoAccountingValidationError("persisted lot is over-matched")
             if remaining == 0:
-                if allocated != int(row[5]):
+                if allocated != _stored_int(row[5], "lot opening commission"):
                     raise FifoAccountingValidationError(
                         "closed lot did not allocate its complete opening commission"
                     )
@@ -1049,12 +1087,12 @@ class FifoLedger:
             result.append(
                 _OpenLot(
                     lot_id=str(row[0]),
-                    opened_sequence=int(row[1]),
+                    opened_sequence=_stored_int(row[1], "lot opened_sequence"),
                     direction=str(row[2]),
                     opened_quantity=opened,
                     remaining_quantity=remaining,
                     open_price=_parse_decimal(row[4], "open_price", positive=True),
-                    opening_commission_minor=int(row[5]),
+                    opening_commission_minor=_stored_int(row[5], "lot opening commission"),
                     allocated_opening_commission_minor=allocated,
                 )
             )
@@ -1320,16 +1358,16 @@ class FifoLedger:
             snapshot_id=str(row[0]),
             epoch_id=str(row[1]),
             source_fill_id=str(row[2]),
-            event_sequence=int(row[3]),
-            con_id=int(row[4]),
+            event_sequence=_stored_int(row[3], "snapshot event_sequence"),
+            con_id=_stored_int(row[4], "snapshot con_id"),
             symbol=str(row[5]),
             signed_quantity=_parse_decimal(row[6], "signed quantity"),
             open_cost=(
                 None if row[7] is None else _parse_decimal(row[7], "open cost basis", positive=True)
             ),
-            open_lot_count=int(row[8]),
+            open_lot_count=_stored_int(row[8], "snapshot open_lot_count"),
             cumulative_realized_pnl=_parse_decimal(row[9], "cumulative realized P&L"),
-            cumulative_commission_minor=int(row[10]),
+            cumulative_commission_minor=_stored_int(row[10], "snapshot cumulative commission"),
             previous_snapshot_id=None if row[11] is None else str(row[11]),
             previous_state_fingerprint=None if row[12] is None else str(row[12]),
             state_fingerprint=str(row[13]),

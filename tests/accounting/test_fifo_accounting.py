@@ -6,7 +6,7 @@ import os
 import sqlite3
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 import pytest
 
@@ -226,6 +226,52 @@ def test_financial_tables_are_append_only(connection, ledger):
     connection.rollback()
 
 
+def test_insert_or_replace_cannot_rewrite_any_append_only_identity(connection, ledger):
+    ledger.record_fill(_fill(1, FillSide.BUY, "2", "10", 1))
+    ledger.record_fill(_fill(2, FillSide.SELL, "1", "11", 1))
+    for table in (
+        "fifo_schema_migrations",
+        "fifo_accounting_epochs",
+        "fifo_fills",
+        "fifo_commissions",
+        "fifo_lot_openings",
+        "fifo_lot_matches",
+        "fifo_position_snapshots",
+    ):
+        with pytest.raises(sqlite3.IntegrityError, match="identity is append-only"):
+            connection.execute(f"INSERT OR REPLACE INTO {table} SELECT * FROM {table} LIMIT 1")
+        connection.rollback()
+
+    alternate_identity_rows = {
+        "fifo_accounting_epochs": "fepoch-" + "2" * 32,
+        "fifo_fills": _identifier("ffill", 99),
+        "fifo_commissions": _identifier("fcomm", 99),
+        "fifo_lot_openings": _identifier("flot", 99),
+        "fifo_lot_matches": _identifier("fmatch", 99),
+        "fifo_position_snapshots": _identifier("fsnap", 99),
+    }
+    for table, replacement_primary_key in alternate_identity_rows.items():
+        row = list(connection.execute(f"SELECT * FROM {table} LIMIT 1").fetchone())
+        row[0] = replacement_primary_key
+        placeholders = ",".join("?" for _ in row)
+        with pytest.raises(sqlite3.IntegrityError, match="identity is append-only"):
+            connection.execute(
+                f"INSERT OR REPLACE INTO {table} VALUES ({placeholders})",
+                row,
+            )
+        connection.rollback()
+
+    with pytest.raises(sqlite3.IntegrityError, match="identity is append-only"):
+        connection.execute("""
+            INSERT INTO fifo_schema_migrations(component, version, description, applied_at)
+            SELECT component, version, 'forged', applied_at FROM fifo_schema_migrations
+            WHERE true
+            ON CONFLICT(component, version) DO UPDATE SET description='forged'
+            """)
+    connection.rollback()
+    ledger.verify_epoch_integrity(EPOCH_ID)
+
+
 def test_schema_constraints_reject_bad_ids_and_orphan_fills(connection):
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute(
@@ -257,6 +303,76 @@ def test_schema_constraints_reject_bad_ids_and_orphan_fills(connection):
             """,
             (_identifier("ffill", 1), _identifier("fepoch", 2), _digest("payload")),
         )
+
+
+def test_integer_minor_units_reject_fractional_real_storage(connection, ledger):
+    event = _fill(1, FillSide.BUY, "1", "10")
+    _insert_fill_row(connection, event)
+    connection.commit()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "INSERT INTO fifo_commissions VALUES (?, ?, ?, 1.5, 'USD', 2, ?)",
+            (event.commission_id, event.epoch_id, event.fill_id, _utc_text(event.recorded_at)),
+        )
+    connection.rollback()
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            """
+            INSERT INTO fifo_lot_openings VALUES(
+                ?, ?, ?, 0, ?, ?, 'LONG', '1', '10', 1.5, 1, ?
+            )
+            """,
+            (
+                _identifier("flot", 1),
+                event.epoch_id,
+                event.fill_id,
+                event.con_id,
+                event.symbol,
+                _utc_text(event.occurred_at),
+            ),
+        )
+    connection.rollback()
+
+
+def test_temp_fifo_shadows_created_after_ledger_init_fail_every_operation(connection, ledger):
+    tables = (
+        "fifo_schema_migrations",
+        "fifo_accounting_epochs",
+        "fifo_fills",
+        "fifo_commissions",
+        "fifo_lot_openings",
+        "fifo_lot_matches",
+        "fifo_position_snapshots",
+    )
+    before = {
+        table: connection.execute(f"SELECT COUNT(*) FROM main.{table}").fetchone()[0]
+        for table in tables
+    }
+    for table in tables:
+        connection.execute(f"CREATE TEMP TABLE {table} AS SELECT * FROM main.{table}")
+
+    with pytest.raises(FifoFixtureMigrationError, match="temporary FIFO"):
+        ledger.record_fill(_fill(1, FillSide.BUY, "1", "10"))
+    with pytest.raises(FifoFixtureMigrationError, match="temporary FIFO"):
+        ledger.verify_epoch_integrity(EPOCH_ID)
+    with pytest.raises(FifoFixtureMigrationError, match="temporary FIFO"):
+        ledger.create_epoch(
+            AccountingEpoch(
+                epoch_id="fepoch-" + "2" * 32,
+                execution_domain_scope="paper-simulator-v2",
+                account_scope="acct_v1_test_fixture",
+                portfolio_id="other",
+                source_fingerprint=_digest("shadowed epoch"),
+                effective_at=NOW,
+                created_at=NOW,
+            )
+        )
+
+    assert {
+        table: connection.execute(f"SELECT COUNT(*) FROM main.{table}").fetchone()[0]
+        for table in tables
+    } == before
 
 
 @pytest.mark.parametrize("bad_decimal", ["abc", "01", "1.0", "0", "-1", "1e2", ".5", "5."])
@@ -767,6 +883,28 @@ def test_validation_rejects_float_non_utc_and_nonpositive_values():
         replace(base, quantity=Decimal("0"))
     with pytest.raises(FifoAccountingValidationError, match="UTC"):
         replace(base, occurred_at=datetime(2026, 7, 28, 16, 0))
+
+
+def test_input_precision_counts_expanded_integer_digits():
+    base = _fill(1, FillSide.BUY, "1", "10")
+    assert replace(base, quantity=Decimal("1E+37")).quantity == Decimal("1E+37")
+    for field in ("quantity", "price"):
+        with pytest.raises(FifoAccountingValidationError, match="input precision"):
+            replace(base, **{field: Decimal("1E+38")})
+        with pytest.raises(FifoAccountingValidationError, match="input precision"):
+            replace(base, **{field: Decimal("1E+100")})
+        with pytest.raises(FifoAccountingValidationError, match="input precision"):
+            replace(base, **{field: Decimal("1E+100000000")})
+
+
+def test_minor_unit_conversion_is_exact_under_low_ambient_decimal_precision(ledger):
+    with localcontext() as context:
+        context.prec = 2
+        ledger.record_fill(_fill(1, FillSide.BUY, "1", "10", 1_000_000_000_000))
+        result = ledger.record_fill(_fill(2, FillSide.SELL, "1", "11", -999_999_999_999))
+        assert result.snapshot.cumulative_realized_pnl == Decimal("0.99")
+        assert result.snapshot.cumulative_commission_minor == 1
+        ledger.verify_epoch_integrity(EPOCH_ID)
 
 
 def test_schema_drift_is_rejected_before_ledger_use(connection):
