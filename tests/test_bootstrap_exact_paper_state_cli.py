@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sqlite3
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -218,6 +219,10 @@ def test_candidate_binding_detects_in_place_content_change_with_restored_mtime(
 
 
 @pytest.mark.parametrize("active_kind", ["module-runner", "paper-listener", "live-listener"])
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="authoritative bootstrap lifecycle checks use macOS pgrep and lsof paths",
+)
 def test_assert_stopped_rejects_module_runner_and_broker_listeners(
     active_kind: str,
     monkeypatch: pytest.MonkeyPatch,
