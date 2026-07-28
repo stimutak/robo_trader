@@ -8,7 +8,7 @@ import secrets
 import threading
 import weakref
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import SupportsIndex
 
@@ -21,6 +21,7 @@ from robo_trader.bootstrap_evidence_receivers import (
 from robo_trader.config import RuntimeContract
 from robo_trader.financial_state_bootstrap import (
     ExactStateBootstrapEvidence,
+    assert_exact_state_runtime_sources_unchanged,
     assert_verified_exact_state_reconciliation_evidence,
 )
 from robo_trader.safety.sqlite_identity import SQLitePathBinding
@@ -37,7 +38,6 @@ from .policy import (
     ExpectedTimingLagProof,
     ReconciliationCoverage,
     ReconciliationDifference,
-    ReconciliationStatus,
 )
 
 _CAPABILITY_MARKER = object()
@@ -48,7 +48,13 @@ _CAPABILITIES: dict[
     tuple[weakref.ReferenceType["VerifiedRuntimeReconciliationEvidence"], str],
 ] = {}
 _COMPARISON_CONSUMPTION_LOCK = threading.Lock()
-_CONSUMED_COMPARISON_LINEAGES: set[tuple[str, str, str]] = set()
+_MAX_CONSUMED_COMPARISON_LINEAGES = 1024
+_CONSUMED_COMPARISON_LINEAGES: dict[tuple[str, str, str], datetime] = {}
+_COMPARISON_LAST_CLOCK: datetime | None = None
+
+
+def _comparison_clock() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class RuntimeReconciliationEvidenceError(ReconciliationDomainError):
@@ -115,6 +121,7 @@ class VerifiedRuntimeReconciliationEvidence:
         "issued_at",
         "expires_at",
         "_runtime_context",
+        "_exact_state_evidence",
         "_marker",
         "__weakref__",
     )
@@ -148,6 +155,7 @@ class VerifiedRuntimeReconciliationEvidence:
     issued_at: datetime
     expires_at: datetime
     _runtime_context: RuntimeSafetyContext
+    _exact_state_evidence: ExactStateBootstrapEvidence | None
     _marker: object
 
     def __post_init__(self) -> None:
@@ -246,6 +254,39 @@ def _database_binding(runtime_contract: RuntimeContract) -> SQLitePathBinding:
         ) from exc
 
 
+def _consume_comparison_lineage(
+    lineage: tuple[str, str, str],
+    *,
+    expires_at: datetime,
+) -> None:
+    global _COMPARISON_LAST_CLOCK
+
+    checked_at = _timestamp(_comparison_clock(), "comparison replay clock")
+    expiry = _timestamp(expires_at, "comparison replay expires_at")
+    with _COMPARISON_CONSUMPTION_LOCK:
+        if _COMPARISON_LAST_CLOCK is not None and checked_at < _COMPARISON_LAST_CLOCK:
+            raise RuntimeReconciliationEvidenceError("comparison replay clock moved backwards")
+        _COMPARISON_LAST_CLOCK = checked_at
+        expired = tuple(
+            key
+            for key, cached_expiry in _CONSUMED_COMPARISON_LINEAGES.items()
+            if cached_expiry < checked_at
+        )
+        for key in expired:
+            _CONSUMED_COMPARISON_LINEAGES.pop(key, None)
+        if expiry < checked_at:
+            raise RuntimeReconciliationEvidenceError("signed reconciliation comparison expired")
+        if lineage in _CONSUMED_COMPARISON_LINEAGES:
+            raise RuntimeReconciliationEvidenceError(
+                "signed reconciliation comparison was already consumed"
+            )
+        if len(_CONSUMED_COMPARISON_LINEAGES) >= _MAX_CONSUMED_COMPARISON_LINEAGES:
+            raise RuntimeReconciliationEvidenceError(
+                "signed reconciliation replay cache is at its safety bound"
+            )
+        _CONSUMED_COMPARISON_LINEAGES[lineage] = expiry
+
+
 def bind_verified_runtime_reconciliation_evidence(
     verified_broker_evidence: object,
     verified_exact_state_evidence: object,
@@ -294,18 +335,6 @@ def bind_verified_runtime_reconciliation_evidence(
             "signed reconciliation receipt lineage is incomplete"
         )
     reconciliation_receipt = reconciliation_receipts[0]
-    comparison_lineage = (
-        exact_state.reconciliation_snapshot_id,
-        reconciliation_receipt.receipt_id,
-        reconciliation_receipt.signature_ed25519,
-    )
-    with _COMPARISON_CONSUMPTION_LOCK:
-        if comparison_lineage in _CONSUMED_COMPARISON_LINEAGES:
-            raise RuntimeReconciliationEvidenceError(
-                "signed reconciliation comparison was already consumed"
-            )
-        _CONSUMED_COMPARISON_LINEAGES.add(comparison_lineage)
-
     snapshot = broker.snapshot
     snapshot_hash = hashlib.sha256(snapshot.canonical_payload().encode("utf-8")).hexdigest()
     if (
@@ -326,7 +355,6 @@ def bind_verified_runtime_reconciliation_evidence(
             bundle.broker_public_key_fingerprint,
             broker.public_key_fingerprint,
         )
-        or exact_state.reconciliation_status is not ReconciliationStatus.PASSED
         or type(exact_state.reconciliation_coverage) is not ReconciliationCoverage
         or exact_state.reconciliation_snapshot_id != bundle.reconciliation_snapshot_id
         or exact_state.bundle_id != bundle.bundle_id
@@ -395,14 +423,23 @@ def bind_verified_runtime_reconciliation_evidence(
     if type(bundle.database_device) is not int or type(bundle.database_inode) is not int:
         raise RuntimeReconciliationEvidenceError("database identity numbers are malformed")
 
+    _consume_comparison_lineage(
+        (
+            exact_state.reconciliation_snapshot_id,
+            reconciliation_receipt.receipt_id,
+            reconciliation_receipt.signature_ed25519,
+        ),
+        expires_at=reconciliation_expires_at,
+    )
+
     return _register(
         VerifiedRuntimeReconciliationEvidence(
             snapshot=snapshot,
             snapshot_id=snapshot.snapshot_id,
             snapshot_hash=snapshot_hash,
             comparison_coverage=exact_state.reconciliation_coverage,
-            differences=(),
-            timing_lag_proofs=(),
+            differences=exact_state.reconciliation_differences,
+            timing_lag_proofs=exact_state.reconciliation_timing_lag_proofs,
             bundle_id=bundle.bundle_id,
             runtime_fingerprint=contract.fingerprint,
             account_scope=broker.account_scope,
@@ -426,6 +463,7 @@ def bind_verified_runtime_reconciliation_evidence(
             issued_at=issued_at,
             expires_at=expires_at,
             _runtime_context=context,
+            _exact_state_evidence=exact_state,
             _marker=_CAPABILITY_MARKER,
         )
     )
@@ -464,6 +502,16 @@ def assert_and_consume_verified_runtime_reconciliation_evidence(
         or contract.safety_account_scope != evidence.account_scope
     ):
         raise RuntimeReconciliationEvidenceError("runtime binding changed after production")
+    if evidence._exact_state_evidence is not None:
+        try:
+            assert_exact_state_runtime_sources_unchanged(
+                evidence._exact_state_evidence,
+                contract,
+            )
+        except Exception as exc:
+            raise RuntimeReconciliationEvidenceError(
+                "signed reconciliation source state changed before comparison"
+            ) from exc
     binding = _database_binding(contract)
     try:
         if (binding.device, binding.inode) != (

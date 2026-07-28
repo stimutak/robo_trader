@@ -69,7 +69,9 @@ from .domain import (
 from .errors import LedgerSafetyError
 from .ledger import ImmutableLedgerReader, validate_portfolio_ids
 from .policy import (
+    ExpectedTimingLagProof,
     ReconciliationCoverage,
+    ReconciliationDifference,
     ReconciliationStatus,
     evaluate_paper_simulator_reconciliation,
 )
@@ -405,7 +407,8 @@ def _strict_ledger_timestamp(value: object, field_name: str) -> None:
 
 def _parsed_ledger_timestamp(value: object, field_name: str) -> datetime:
     _strict_ledger_timestamp(value, field_name)
-    assert isinstance(value, str)
+    if not isinstance(value, str):  # pragma: no cover - validated immediately above
+        raise BootstrapReconciliationBlocked(f"ledger {field_name} is malformed")
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
@@ -1003,6 +1006,8 @@ class UnsignedBootstrapReconciliation:
     broker_verdict_hash: str
     comparison_coverage: ReconciliationCoverage
     reconciliation_status: ReconciliationStatus
+    reconciliation_differences: tuple[ReconciliationDifference, ...]
+    reconciliation_timing_lag_proofs: tuple[ExpectedTimingLagProof, ...]
     broker_positions_count: int
     broker_open_orders_count: int
     _producer_marker: object = field(repr=False, compare=False)
@@ -1040,14 +1045,9 @@ class UnsignedBootstrapReconciliation:
             "terminal_fill_count",
         ):
             _exact_nonnegative_int(getattr(self, field_name), field_name)
-        if (
-            self.database_inode == 0
-            or self.broker_positions_count != 0
-            or self.broker_open_orders_count != 0
-            or self.managed_account_count != 1
-        ):
+        if self.database_inode == 0 or self.managed_account_count != 1:
             raise BootstrapReconciliationBlocked(
-                "unsigned result does not prove one zero-exposure paper account"
+                "unsigned result does not prove one paper diagnostic account"
             )
         _canonical_portfolios(self.portfolio_ids, "portfolio_ids")
         _canonical_position_identities(self.local_position_identities)
@@ -1081,11 +1081,36 @@ class UnsignedBootstrapReconciliation:
             raise BootstrapReconciliationBlocked("comparison coverage is malformed")
         if not self.comparison_coverage.complete:
             raise BootstrapReconciliationBlocked("comparison coverage is incomplete")
-        if self.reconciliation_status not in {
-            ReconciliationStatus.PASSED,
-            ReconciliationStatus.DEGRADED,
-        }:
-            raise BootstrapReconciliationBlocked("reconciliation result is quarantined")
+        if type(self.reconciliation_status) is not ReconciliationStatus:
+            raise BootstrapReconciliationBlocked("reconciliation status is malformed")
+        differences = tuple(self.reconciliation_differences)
+        if any(type(value) is not ReconciliationDifference for value in differences):
+            raise BootstrapReconciliationBlocked("reconciliation differences are malformed")
+        ordered_differences = tuple(sorted(differences, key=lambda value: value.identity))
+        if differences != ordered_differences or len(
+            {item.identity for item in differences}
+        ) != len(differences):
+            raise BootstrapReconciliationBlocked(
+                "reconciliation differences must be unique and sorted"
+            )
+        proofs = tuple(self.reconciliation_timing_lag_proofs)
+        if any(type(value) is not ExpectedTimingLagProof for value in proofs):
+            raise BootstrapReconciliationBlocked("reconciliation timing proofs are malformed")
+        ordered_proofs = tuple(sorted(proofs, key=lambda value: value.binding_key))
+        if proofs != ordered_proofs or len({item.binding_key for item in proofs}) != len(proofs):
+            raise BootstrapReconciliationBlocked(
+                "reconciliation timing proofs must be unique and sorted"
+            )
+        materialities = {item.materiality.value for item in differences}
+        expected_status = (
+            ReconciliationStatus.QUARANTINED
+            if materialities & {"material", "unknown"}
+            else ReconciliationStatus.DEGRADED if materialities else ReconciliationStatus.PASSED
+        )
+        if self.reconciliation_status is not expected_status:
+            raise BootstrapReconciliationBlocked(
+                "reconciliation status contradicts authenticated differences"
+            )
         if self.status != BOOTSTRAP_RECONCILIATION_STATUS:
             raise BootstrapReconciliationBlocked("bootstrap reconciliation status is invalid")
         if not _HEX_64.fullmatch(self._producer_nonce):
@@ -1150,6 +1175,12 @@ class UnsignedBootstrapReconciliation:
             "mutated_state": False,
             "portfolio_ids": list(self.portfolio_ids),
             "reconciliation_status": self.reconciliation_status.value,
+            "reconciliation_differences": [
+                value.canonical_dict() for value in self.reconciliation_differences
+            ],
+            "reconciliation_timing_lag_proofs": [
+                value.canonical_dict() for value in self.reconciliation_timing_lag_proofs
+            ],
             "runtime_fingerprint": self.runtime_fingerprint,
             "safety_journal_device": self.safety_journal_device,
             "safety_journal_identity": self.safety_journal_identity,
@@ -1394,14 +1425,6 @@ def produce_bootstrap_reconciliation(
                 now=checked_at,
                 max_age_seconds=BOOTSTRAP_RECONCILIATION_MAX_AGE.total_seconds(),
             )
-            if verdict.quarantine_required:
-                raise BootstrapReconciliationBlocked(
-                    "reconciliation contains stale, incomplete, unknown, or material differences"
-                )
-            if snapshot.positions or snapshot.open_orders:
-                raise BootstrapReconciliationBlocked(
-                    "IBKR diagnostic account does not have zero exposure and open orders"
-                )
             evidence_by_kind = {item.collection: item for item in snapshot.collection_evidence}
             if not snapshot.completeness.complete or set(evidence_by_kind) != set(
                 BrokerCollectionKind
@@ -1441,6 +1464,8 @@ def produce_bootstrap_reconciliation(
                 ).hexdigest(),
                 comparison_coverage=collected.coverage,
                 reconciliation_status=verdict.status,
+                reconciliation_differences=verdict.differences,
+                reconciliation_timing_lag_proofs=(),
                 broker_positions_count=len(snapshot.positions),
                 broker_open_orders_count=len(snapshot.open_orders),
                 _producer_marker=_RESULT_PRODUCER_MARKER,

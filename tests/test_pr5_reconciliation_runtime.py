@@ -138,6 +138,10 @@ def _accept_registered_test_runtime_context(monkeypatch) -> None:
         "assert_validated_runtime_safety_context",
         lambda context: context,
     )
+    monkeypatch.setattr(runtime_evidence_module, "_comparison_clock", lambda: NOW)
+    with runtime_evidence_module._COMPARISON_CONSUMPTION_LOCK:
+        runtime_evidence_module._CONSUMED_COMPARISON_LINEAGES.clear()
+        runtime_evidence_module._COMPARISON_LAST_CLOCK = None
 
 
 def _registered_evidence(
@@ -202,6 +206,7 @@ def _registered_evidence(
             issued_at=NOW - timedelta(microseconds=1),
             expires_at=expires_at,
             _runtime_context=context,
+            _exact_state_evidence=None,
             _marker=runtime_evidence_module._CAPABILITY_MARKER,
         )
     )
@@ -578,6 +583,95 @@ async def test_v2_constraint_mutation_matrix_fails_closed(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("table", "old", "new"),
+    [
+        (
+            "rt_reconciliation_snapshots",
+            "schema_version INTEGER NOT NULL CHECK (schema_version = 1)",
+            "schema_version INTEGER NOT NULL",
+        ),
+        (
+            "rt_reconciliation_snapshots",
+            "payload_json TEXT NOT NULL CHECK (json_valid(payload_json))",
+            "payload_json TEXT NOT NULL",
+        ),
+        (
+            "rt_reconciliation_runs",
+            "evidence_fresh INTEGER NOT NULL CHECK (evidence_fresh IN (0, 1))",
+            "evidence_fresh INTEGER NOT NULL",
+        ),
+        (
+            "rt_reconciliation_runs",
+            "FOREIGN KEY(snapshot_id) REFERENCES rt_reconciliation_snapshots(snapshot_id)",
+            "FOREIGN KEY(snapshot_id) REFERENCES rt_reconciliation_snapshots(snapshot_id) "
+            "ON DELETE CASCADE",
+        ),
+        (
+            "rt_reconciliation_differences",
+            "ordinal INTEGER NOT NULL CHECK (ordinal >= 0)",
+            "ordinal INTEGER NOT NULL",
+        ),
+        (
+            "rt_reconciliation_differences",
+            "UNIQUE(run_id, ordinal)",
+            "UNIQUE(ordinal, run_id)",
+        ),
+        (
+            "rt_reconciliation_operator_resolutions",
+            "reason TEXT NOT NULL CHECK (length(trim(reason)) >= 10)",
+            "reason TEXT NOT NULL",
+        ),
+        (
+            "rt_reconciliation_operator_resolutions",
+            "evidence_reference TEXT,",
+            "evidence_reference TEXT, unexpected_column TEXT,",
+        ),
+    ],
+)
+async def test_v1_constraint_mutation_matrix_fails_closed(
+    tmp_path,
+    table: str,
+    old: str,
+    new: str,
+) -> None:
+    database_path = (tmp_path / "reconciliation.sqlite3").resolve()
+    persistence = ReconciliationPersistence(database_path)
+    await persistence.initialize()
+    _rewrite_table_definition(database_path, table, old, new)
+
+    with pytest.raises((RuntimeError, sqlite3.DatabaseError), match="malformed"):
+        await persistence.initialize()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "table",
+    [
+        "rt_reconciliation_snapshots",
+        "rt_reconciliation_runs",
+        "rt_reconciliation_differences",
+        "rt_reconciliation_operator_resolutions",
+    ],
+)
+async def test_every_v1_append_only_trigger_is_exact(tmp_path, table: str) -> None:
+    database_path = (tmp_path / "reconciliation.sqlite3").resolve()
+    persistence = ReconciliationPersistence(database_path)
+    await persistence.initialize()
+    trigger = f"{table}_no_delete"
+    _rewrite_schema_definition(
+        database_path,
+        "trigger",
+        trigger,
+        "BEFORE DELETE",
+        "AFTER DELETE",
+    )
+
+    with pytest.raises(RuntimeError, match=f"trigger {trigger} is malformed"):
+        await persistence.initialize()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "table",
     [
         "rt_reconciliation_snapshot_lineage",
@@ -628,7 +722,7 @@ async def test_v2_composite_identity_index_mutation_fails_closed(tmp_path) -> No
         )
         connection.commit()
 
-    with pytest.raises(RuntimeError, match="composite identity index is malformed"):
+    with pytest.raises(RuntimeError, match="indexes are malformed"):
         await persistence.initialize()
 
 
@@ -908,9 +1002,12 @@ async def test_fabricated_snapshot_source_is_rejected_before_comparison(tmp_path
     assert service.entry_eligible(at=NOW) is False
 
 
-def test_core_broker_and_bundle_assertions_issue_one_shot_runtime_evidence(
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch_kind", ["material", "timing_lag"])
+async def test_authenticated_mismatch_is_persisted_with_timing_expiry(
     tmp_path,
     monkeypatch,
+    mismatch_kind: str,
 ) -> None:
     database_path = (tmp_path / "reconciliation.sqlite3").resolve()
     sqlite3.connect(database_path).close()
@@ -974,9 +1071,33 @@ def test_core_broker_and_bundle_assertions_issue_one_shot_runtime_evidence(
         public_key_fingerprint="b8" * 32,
         signature_ed25519="c2lnbmF0dXJl",
     )
+    if mismatch_kind == "material":
+        signed_difference = _difference(DifferenceKind.QUANTITY_MISMATCH)
+        signed_proofs: tuple[ExpectedTimingLagProof, ...] = ()
+        signed_status = ReconciliationStatus.QUARANTINED
+    else:
+        broker_event_id = "broker-event-v1-" + "e5" * 32
+        signed_difference = ReconciliationDifference(
+            kind=DifferenceKind.EXPECTED_TIMING_LAG,
+            materiality=DifferenceMateriality.INFORMATIONAL,
+            reason_code="BROKER_ORDER_EVENT_PENDING",
+            subject="AAPL",
+            evidence_ids=(broker_event_id,),
+        )
+        signed_proofs = (
+            ExpectedTimingLagProof.from_trusted_producer(
+                broker_snapshot_id=snapshot.snapshot_id,
+                reason_code=signed_difference.reason_code,
+                subject=signed_difference.subject,
+                broker_event_id=broker_event_id,
+                started_at=NOW - timedelta(seconds=1),
+                expires_at=NOW + timedelta(seconds=5),
+            ),
+        )
+        signed_status = ReconciliationStatus.DEGRADED
     exact_state = SimpleNamespace(
         authentication_receipts=(reconciliation_receipt,),
-        reconciliation_status=ReconciliationStatus.PASSED,
+        reconciliation_status=signed_status,
         reconciliation_coverage=_coverage(),
         reconciliation_snapshot_id=bundle.reconciliation_snapshot_id,
         reconciliation_artifact_path=str(database_path.parent / "reconciliation_report.json"),
@@ -991,6 +1112,8 @@ def test_core_broker_and_bundle_assertions_issue_one_shot_runtime_evidence(
         database_inode=metadata.st_ino,
         broker_snapshot_id=broker.snapshot_id,
         broker_snapshot_hash=broker.artifact_hash,
+        reconciliation_differences=(signed_difference,),
+        reconciliation_timing_lag_proofs=signed_proofs,
     )
 
     def assert_broker(value):
@@ -1031,6 +1154,12 @@ def test_core_broker_and_bundle_assertions_issue_one_shot_runtime_evidence(
         "ExactStateBootstrapEvidence",
         SimpleNamespace,
     )
+    revalidated = []
+    monkeypatch.setattr(
+        runtime_evidence_module,
+        "assert_exact_state_runtime_sources_unchanged",
+        lambda evidence, runtime_contract: revalidated.append((evidence, runtime_contract)),
+    )
 
     evidence = bind_verified_runtime_reconciliation_evidence(
         broker,
@@ -1042,6 +1171,7 @@ def test_core_broker_and_bundle_assertions_issue_one_shot_runtime_evidence(
     assert asserted == ["broker", "reconciliation", "bundle"]
     assert evidence.database_device == metadata.st_dev
     assert evidence.database_inode == metadata.st_ino
+    assert evidence.differences == (signed_difference,)
     with pytest.raises(RuntimeReconciliationEvidenceError, match="already consumed"):
         bind_verified_runtime_reconciliation_evidence(
             broker,
@@ -1049,7 +1179,33 @@ def test_core_broker_and_bundle_assertions_issue_one_shot_runtime_evidence(
             context,
             marker,
         )
-    assert assert_and_consume_verified_runtime_reconciliation_evidence(evidence) is evidence
+    service, source, _ = await _service(tmp_path)
+    source.prepared_evidence = evidence
+    outcome = await service.reconcile_startup()
+
+    expected_state = (
+        ReconciliationServiceState.QUARANTINED
+        if mismatch_kind == "material"
+        else ReconciliationServiceState.DEGRADED
+    )
+    assert outcome.state is expected_state
+    assert outcome.entry_eligible is (mismatch_kind == "timing_lag")
+    assert revalidated == [(exact_state, contract)]
+    with sqlite3.connect(database_path) as connection:
+        persisted_rows = connection.execute(
+            "SELECT kind, materiality, reason_code FROM rt_reconciliation_differences"
+        ).fetchall()
+    assert persisted_rows == [
+        (
+            signed_difference.kind.value,
+            signed_difference.materiality.value,
+            signed_difference.reason_code,
+        )
+    ]
+    if mismatch_kind == "timing_lag":
+        assert service.entry_eligible(at=NOW + timedelta(seconds=5)) is True
+        assert service.entry_eligible(at=NOW + timedelta(seconds=5, microseconds=1)) is False
+        assert service.state is ReconciliationServiceState.QUARANTINED
     with pytest.raises(RuntimeReconciliationEvidenceError, match="already consumed"):
         assert_and_consume_verified_runtime_reconciliation_evidence(evidence)
 
@@ -1069,6 +1225,51 @@ def test_runtime_capability_is_python310_compatible_immutable_and_nonserializabl
         copy.deepcopy(evidence)
     with pytest.raises(TypeError, match="cannot be pickled"):
         pickle.dumps(evidence)
+
+
+def test_consumed_comparison_cache_is_bounded_and_evicts_only_expired(
+    monkeypatch,
+) -> None:
+    current = [NOW]
+    monkeypatch.setattr(runtime_evidence_module, "_MAX_CONSUMED_COMPARISON_LINEAGES", 3)
+    monkeypatch.setattr(runtime_evidence_module, "_comparison_clock", lambda: current[0])
+    for ordinal in range(3):
+        runtime_evidence_module._consume_comparison_lineage(
+            (f"snapshot-{ordinal}", f"receipt-{ordinal}", f"signature-{ordinal}"),
+            expires_at=NOW + timedelta(seconds=10),
+        )
+    with pytest.raises(RuntimeReconciliationEvidenceError, match="safety bound"):
+        runtime_evidence_module._consume_comparison_lineage(
+            ("snapshot-full", "receipt-full", "signature-full"),
+            expires_at=NOW + timedelta(seconds=10),
+        )
+    assert len(runtime_evidence_module._CONSUMED_COMPARISON_LINEAGES) == 3
+
+    current[0] = NOW + timedelta(seconds=11)
+    runtime_evidence_module._consume_comparison_lineage(
+        ("snapshot-new", "receipt-new", "signature-new"),
+        expires_at=NOW + timedelta(seconds=20),
+    )
+    assert runtime_evidence_module._CONSUMED_COMPARISON_LINEAGES == {
+        ("snapshot-new", "receipt-new", "signature-new"): NOW + timedelta(seconds=20)
+    }
+
+
+def test_consumed_comparison_cache_fails_closed_on_clock_rollback(monkeypatch) -> None:
+    current = [NOW]
+    monkeypatch.setattr(runtime_evidence_module, "_comparison_clock", lambda: current[0])
+    runtime_evidence_module._consume_comparison_lineage(
+        ("snapshot-first", "receipt-first", "signature-first"),
+        expires_at=NOW + timedelta(seconds=10),
+    )
+    current[0] = NOW - timedelta(microseconds=1)
+
+    with pytest.raises(RuntimeReconciliationEvidenceError, match="clock moved backwards"):
+        runtime_evidence_module._consume_comparison_lineage(
+            ("snapshot-rollback", "receipt-rollback", "signature-rollback"),
+            expires_at=NOW + timedelta(seconds=10),
+        )
+    assert len(runtime_evidence_module._CONSUMED_COMPARISON_LINEAGES) == 1
 
 
 @pytest.mark.asyncio

@@ -147,6 +147,115 @@ async def _migration_v1(connection: aiosqlite.Connection) -> None:
         """)
 
 
+_V1_TABLE_SQL = {
+    "rt_reconciliation_snapshots": """
+        CREATE TABLE rt_reconciliation_snapshots (
+            snapshot_id TEXT PRIMARY KEY,
+            schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+            account_scope TEXT NOT NULL CHECK (
+                length(account_scope) = 72
+                AND substr(account_scope, 1, 8) = 'acct_v1_'
+                AND substr(account_scope, 9) NOT GLOB '*[^0-9a-f]*'
+            ),
+            observed_from TEXT NOT NULL,
+            observed_through TEXT NOT NULL,
+            retrieved_at TEXT NOT NULL,
+            complete INTEGER NOT NULL CHECK (complete IN (0, 1)),
+            payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+            payload_sha256 TEXT NOT NULL CHECK (
+                length(payload_sha256) = 64 AND payload_sha256 = lower(payload_sha256)
+            ),
+            persisted_at TEXT NOT NULL
+        )
+    """,
+    "rt_reconciliation_runs": """
+        CREATE TABLE rt_reconciliation_runs (
+            run_id TEXT PRIMARY KEY,
+            schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+            trigger_type TEXT NOT NULL CHECK (
+                trigger_type IN ('startup', 'reconnect', 'periodic',
+                                 'before_live', 'ambiguous_order')
+            ),
+            snapshot_id TEXT NOT NULL,
+            verdict_id TEXT NOT NULL,
+            expected_account_scope TEXT NOT NULL CHECK (
+                length(expected_account_scope) = 72
+                AND substr(expected_account_scope, 1, 8) = 'acct_v1_'
+                AND substr(expected_account_scope, 9) NOT GLOB '*[^0-9a-f]*'
+            ),
+            started_at TEXT NOT NULL,
+            completed_at TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('passed', 'degraded', 'quarantined')),
+            evidence_fresh INTEGER NOT NULL CHECK (evidence_fresh IN (0, 1)),
+            comparison_complete INTEGER NOT NULL CHECK (comparison_complete IN (0, 1)),
+            quarantine_required INTEGER NOT NULL CHECK (quarantine_required IN (0, 1)),
+            entry_eligible INTEGER NOT NULL CHECK (entry_eligible IN (0, 1)),
+            coverage_json TEXT NOT NULL CHECK (json_valid(coverage_json)),
+            verdict_payload_json TEXT NOT NULL CHECK (json_valid(verdict_payload_json)),
+            verdict_sha256 TEXT NOT NULL CHECK (
+                length(verdict_sha256) = 64 AND verdict_sha256 = lower(verdict_sha256)
+            ),
+            CHECK (completed_at >= started_at),
+            CHECK (
+                (status = 'quarantined' AND quarantine_required = 1 AND entry_eligible = 0)
+                OR
+                (status != 'quarantined' AND quarantine_required = 0 AND entry_eligible = 1)
+            ),
+            FOREIGN KEY(snapshot_id) REFERENCES rt_reconciliation_snapshots(snapshot_id)
+        )
+    """,
+    "rt_reconciliation_differences": """
+        CREATE TABLE rt_reconciliation_differences (
+            difference_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+            kind TEXT NOT NULL CHECK (
+                kind IN ('expected_timing_lag', 'recoverable_missing_event',
+                         'duplicate_event', 'account_mismatch', 'quantity_mismatch',
+                         'cash_mismatch', 'unknown')
+            ),
+            materiality TEXT NOT NULL CHECK (
+                materiality IN ('informational', 'material', 'unknown')
+            ),
+            reason_code TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            evidence_ids_json TEXT NOT NULL CHECK (json_valid(evidence_ids_json)),
+            payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+            payload_sha256 TEXT NOT NULL CHECK (
+                length(payload_sha256) = 64 AND payload_sha256 = lower(payload_sha256)
+            ),
+            persisted_at TEXT NOT NULL,
+            CHECK (
+                (kind = 'expected_timing_lag' AND materiality = 'informational')
+                OR (kind = 'unknown' AND materiality = 'unknown')
+                OR (kind NOT IN ('expected_timing_lag', 'unknown')
+                    AND materiality = 'material')
+            ),
+            UNIQUE(run_id, ordinal),
+            FOREIGN KEY(run_id) REFERENCES rt_reconciliation_runs(run_id)
+        )
+    """,
+    "rt_reconciliation_operator_resolutions": """
+        CREATE TABLE rt_reconciliation_operator_resolutions (
+            resolution_id TEXT PRIMARY KEY,
+            schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+            run_id TEXT NOT NULL,
+            difference_id TEXT NOT NULL,
+            resolution_kind TEXT NOT NULL CHECK (
+                resolution_kind IN ('acknowledged', 'external_remediation_recorded',
+                                    'investigation_note')
+            ),
+            operator_id TEXT NOT NULL CHECK (length(trim(operator_id)) BETWEEN 1 AND 64),
+            reason TEXT NOT NULL CHECK (length(trim(reason)) >= 10),
+            evidence_reference TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES rt_reconciliation_runs(run_id),
+            FOREIGN KEY(difference_id) REFERENCES rt_reconciliation_differences(difference_id)
+        )
+    """,
+}
+
+
 _V2_TABLE_SQL = {
     "rt_reconciliation_snapshot_lineage": """
         CREATE TABLE IF NOT EXISTS rt_reconciliation_snapshot_lineage (
@@ -352,6 +461,96 @@ _EXPECTED_COLUMNS = {
         "run_id",
         "difference_id",
     },
+}
+
+_V1_INTEGER_COLUMNS = {
+    "rt_reconciliation_snapshots": {"schema_version", "complete"},
+    "rt_reconciliation_runs": {
+        "schema_version",
+        "evidence_fresh",
+        "comparison_complete",
+        "quarantine_required",
+        "entry_eligible",
+    },
+    "rt_reconciliation_differences": {"ordinal"},
+    "rt_reconciliation_operator_resolutions": {"schema_version"},
+}
+_V1_PRIMARY_KEYS = {
+    "rt_reconciliation_snapshots": "snapshot_id",
+    "rt_reconciliation_runs": "run_id",
+    "rt_reconciliation_differences": "difference_id",
+    "rt_reconciliation_operator_resolutions": "resolution_id",
+}
+_EXPECTED_V1_COLUMN_SHAPES = {
+    table: {
+        column: (
+            "INTEGER" if column in _V1_INTEGER_COLUMNS[table] else "TEXT",
+            int(
+                column != _V1_PRIMARY_KEYS[table]
+                and not (
+                    table == "rt_reconciliation_operator_resolutions"
+                    and column == "evidence_reference"
+                )
+            ),
+            None,
+            int(column == _V1_PRIMARY_KEYS[table]),
+        )
+        for column in _EXPECTED_COLUMNS[table]
+    }
+    for table in _TABLES
+}
+
+_EXPECTED_V1_FOREIGN_KEYS = {
+    "rt_reconciliation_snapshots": set(),
+    "rt_reconciliation_runs": {
+        (
+            "rt_reconciliation_snapshots",
+            ("snapshot_id",),
+            ("snapshot_id",),
+            "NO ACTION",
+            "NO ACTION",
+            "NONE",
+        )
+    },
+    "rt_reconciliation_differences": {
+        (
+            "rt_reconciliation_runs",
+            ("run_id",),
+            ("run_id",),
+            "NO ACTION",
+            "NO ACTION",
+            "NONE",
+        )
+    },
+    "rt_reconciliation_operator_resolutions": {
+        (
+            "rt_reconciliation_runs",
+            ("run_id",),
+            ("run_id",),
+            "NO ACTION",
+            "NO ACTION",
+            "NONE",
+        ),
+        (
+            "rt_reconciliation_differences",
+            ("difference_id",),
+            ("difference_id",),
+            "NO ACTION",
+            "NO ACTION",
+            "NONE",
+        ),
+    },
+}
+
+_EXPECTED_V1_INDEXES = {
+    "rt_reconciliation_snapshots": {(1, "pk", 0, ("snapshot_id",))},
+    "rt_reconciliation_runs": {(1, "pk", 0, ("run_id",))},
+    "rt_reconciliation_differences": {
+        (1, "pk", 0, ("difference_id",)),
+        (1, "u", 0, ("run_id", "ordinal")),
+        (1, "c", 0, ("run_id", "difference_id")),
+    },
+    "rt_reconciliation_operator_resolutions": {(1, "pk", 0, ("resolution_id",))},
 }
 
 _REQUIRED_TABLE_SQL = {
@@ -599,6 +798,15 @@ async def assert_reconciliation_schema(connection: aiosqlite.Connection) -> None
         "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
     )
     table_sql = {str(row[0]): _canonical_schema_sql(row[1]) for row in await table_rows.fetchall()}
+    for table, expected_sql in _V1_TABLE_SQL.items():
+        if table_sql.get(table) != _canonical_schema_sql(expected_sql):
+            raise RuntimeError(f"reconciliation table {table} definition is malformed")
+        if await _table_shape(connection, table) != _EXPECTED_V1_COLUMN_SHAPES[table]:
+            raise RuntimeError(f"reconciliation table {table} column shape is malformed")
+        if await _foreign_key_shape(connection, table) != _EXPECTED_V1_FOREIGN_KEYS[table]:
+            raise RuntimeError(f"reconciliation table {table} foreign keys are malformed")
+        if await _index_shape(connection, table) != _EXPECTED_V1_INDEXES[table]:
+            raise RuntimeError(f"reconciliation table {table} indexes are malformed")
     for table, fragments in _REQUIRED_TABLE_SQL.items():
         if any(_normalized_sql(fragment) not in table_sql.get(table, "") for fragment in fragments):
             raise RuntimeError(f"reconciliation table {table} constraints are malformed")
