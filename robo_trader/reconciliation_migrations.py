@@ -147,12 +147,10 @@ async def _migration_v1(connection: aiosqlite.Connection) -> None:
         """)
 
 
-async def _migration_v2(connection: aiosqlite.Connection) -> None:
-    """Add exact runtime lineage without rewriting any v1 table or row."""
-
-    await connection.execute("""
+_V2_TABLE_SQL = {
+    "rt_reconciliation_snapshot_lineage": """
         CREATE TABLE IF NOT EXISTS rt_reconciliation_snapshot_lineage (
-            snapshot_id TEXT PRIMARY KEY,
+            snapshot_id TEXT PRIMARY KEY NOT NULL,
             schema_version INTEGER NOT NULL CHECK (schema_version = 2),
             account_alias TEXT NOT NULL,
             snapshot_hash TEXT NOT NULL CHECK (
@@ -192,23 +190,18 @@ async def _migration_v2(connection: aiosqlite.Connection) -> None:
             persisted_at TEXT NOT NULL,
             FOREIGN KEY(snapshot_id) REFERENCES rt_reconciliation_snapshots(snapshot_id)
         )
-    """)
-    await connection.execute("""
+    """,
+    "rt_reconciliation_run_eligibility": """
         CREATE TABLE IF NOT EXISTS rt_reconciliation_run_eligibility (
-            run_id TEXT PRIMARY KEY,
+            run_id TEXT PRIMARY KEY NOT NULL,
             schema_version INTEGER NOT NULL CHECK (schema_version = 2),
             eligible_until TEXT NOT NULL,
             FOREIGN KEY(run_id) REFERENCES rt_reconciliation_runs(run_id)
         )
-    """)
-    await connection.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS
-            rt_reconciliation_differences_run_difference_uq
-        ON rt_reconciliation_differences(run_id, difference_id)
-    """)
-    await connection.execute("""
+    """,
+    "rt_reconciliation_operator_resolution_bindings": """
         CREATE TABLE IF NOT EXISTS rt_reconciliation_operator_resolution_bindings (
-            resolution_id TEXT PRIMARY KEY,
+            resolution_id TEXT PRIMARY KEY NOT NULL,
             run_id TEXT NOT NULL,
             difference_id TEXT NOT NULL,
             FOREIGN KEY(resolution_id)
@@ -216,7 +209,21 @@ async def _migration_v2(connection: aiosqlite.Connection) -> None:
             FOREIGN KEY(run_id, difference_id)
                 REFERENCES rt_reconciliation_differences(run_id, difference_id)
         )
+    """,
+}
+
+
+async def _migration_v2(connection: aiosqlite.Connection) -> None:
+    """Add exact runtime lineage without rewriting any v1 table or row."""
+
+    await connection.execute(_V2_TABLE_SQL["rt_reconciliation_snapshot_lineage"])
+    await connection.execute(_V2_TABLE_SQL["rt_reconciliation_run_eligibility"])
+    await connection.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS
+            rt_reconciliation_differences_run_difference_uq
+        ON rt_reconciliation_differences(run_id, difference_id)
     """)
+    await connection.execute(_V2_TABLE_SQL["rt_reconciliation_operator_resolution_bindings"])
     await connection.execute("""
         INSERT INTO rt_reconciliation_operator_resolution_bindings(
             resolution_id, run_id, difference_id
@@ -373,21 +380,86 @@ _REQUIRED_TABLE_SQL = {
         "foreign key(run_id) references rt_reconciliation_runs(run_id)",
         "foreign key(difference_id) references rt_reconciliation_differences(difference_id)",
     ),
-    "rt_reconciliation_snapshot_lineage": (
-        "schema_version integer not null check (schema_version = 2)",
-        "foreign key(snapshot_id) references rt_reconciliation_snapshots(snapshot_id)",
-        "length(reconciliation_artifact_hash) = 64",
-    ),
-    "rt_reconciliation_run_eligibility": (
-        "schema_version integer not null check (schema_version = 2)",
-        "foreign key(run_id) references rt_reconciliation_runs(run_id)",
-    ),
-    "rt_reconciliation_operator_resolution_bindings": (
-        "foreign key(resolution_id) references "
-        "rt_reconciliation_operator_resolutions(resolution_id)",
-        "foreign key(run_id, difference_id) references "
-        "rt_reconciliation_differences(run_id, difference_id)",
-    ),
+}
+
+_EXPECTED_V2_COLUMN_SHAPES = {
+    table: {
+        column: (
+            (
+                "INTEGER"
+                if column in {"schema_version", "database_device", "database_inode"}
+                else "TEXT"
+            ),
+            1,
+            None,
+            int(column == primary_key),
+        )
+        for column in columns
+    }
+    for table, columns, primary_key in (
+        (
+            "rt_reconciliation_snapshot_lineage",
+            _EXPECTED_COLUMNS["rt_reconciliation_snapshot_lineage"],
+            "snapshot_id",
+        ),
+        (
+            "rt_reconciliation_run_eligibility",
+            _EXPECTED_COLUMNS["rt_reconciliation_run_eligibility"],
+            "run_id",
+        ),
+        (
+            "rt_reconciliation_operator_resolution_bindings",
+            _EXPECTED_COLUMNS["rt_reconciliation_operator_resolution_bindings"],
+            "resolution_id",
+        ),
+    )
+}
+
+_EXPECTED_V2_FOREIGN_KEYS = {
+    "rt_reconciliation_snapshot_lineage": {
+        (
+            "rt_reconciliation_snapshots",
+            ("snapshot_id",),
+            ("snapshot_id",),
+            "NO ACTION",
+            "NO ACTION",
+            "NONE",
+        )
+    },
+    "rt_reconciliation_run_eligibility": {
+        (
+            "rt_reconciliation_runs",
+            ("run_id",),
+            ("run_id",),
+            "NO ACTION",
+            "NO ACTION",
+            "NONE",
+        )
+    },
+    "rt_reconciliation_operator_resolution_bindings": {
+        (
+            "rt_reconciliation_operator_resolutions",
+            ("resolution_id",),
+            ("resolution_id",),
+            "NO ACTION",
+            "NO ACTION",
+            "NONE",
+        ),
+        (
+            "rt_reconciliation_differences",
+            ("run_id", "difference_id"),
+            ("run_id", "difference_id"),
+            "NO ACTION",
+            "NO ACTION",
+            "NONE",
+        ),
+    },
+}
+
+_EXPECTED_V2_INDEXES = {
+    "rt_reconciliation_snapshot_lineage": {(1, "pk", 0, ("snapshot_id",))},
+    "rt_reconciliation_run_eligibility": {(1, "pk", 0, ("run_id",))},
+    "rt_reconciliation_operator_resolution_bindings": {(1, "pk", 0, ("resolution_id",))},
 }
 
 
@@ -404,6 +476,58 @@ def _canonical_schema_sql(value: object) -> str:
 async def _table_columns(connection: aiosqlite.Connection, table: str) -> set[str]:
     cursor = await connection.execute(f"PRAGMA table_info({table})")
     return {str(row[1]) for row in await cursor.fetchall()}
+
+
+async def _table_shape(
+    connection: aiosqlite.Connection, table: str
+) -> dict[str, tuple[str, int, object, int]]:
+    cursor = await connection.execute(f"PRAGMA table_info({table})")
+    return {
+        str(row[1]): (str(row[2]).upper(), int(row[3]), row[4], int(row[5]))
+        for row in await cursor.fetchall()
+    }
+
+
+async def _foreign_key_shape(
+    connection: aiosqlite.Connection, table: str
+) -> set[tuple[str, tuple[str, ...], tuple[str, ...], str, str, str]]:
+    def sequence(row: tuple[object, ...]) -> int:
+        value = row[1]
+        if type(value) is not int:
+            raise RuntimeError(f"reconciliation table {table} foreign keys are malformed")
+        return value
+
+    cursor = await connection.execute(f"PRAGMA foreign_key_list({table})")
+    grouped: dict[int, list[tuple[object, ...]]] = {}
+    for row in await cursor.fetchall():
+        grouped.setdefault(int(row[0]), []).append(row)
+    return {
+        (
+            str(rows[0][2]),
+            tuple(str(row[3]) for row in sorted(rows, key=sequence)),
+            tuple(str(row[4]) for row in sorted(rows, key=sequence)),
+            str(rows[0][5]).upper(),
+            str(rows[0][6]).upper(),
+            str(rows[0][7]).upper(),
+        )
+        for rows in grouped.values()
+    }
+
+
+async def _index_shape(
+    connection: aiosqlite.Connection, table: str
+) -> set[tuple[int, str, int, tuple[str, ...]]]:
+    cursor = await connection.execute(f"PRAGMA index_list({table})")
+    result: set[tuple[int, str, int, tuple[str, ...]]] = set()
+    for row in await cursor.fetchall():
+        index_name = str(row[1])
+        columns = await connection.execute(
+            "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
+            (index_name,),
+        )
+        column_names = tuple(str(item[0]) for item in await columns.fetchall())
+        result.add((int(row[2]), str(row[3]), int(row[4]), column_names))
+    return result
 
 
 async def apply_reconciliation_migrations(connection: aiosqlite.Connection) -> None:
@@ -478,6 +602,15 @@ async def assert_reconciliation_schema(connection: aiosqlite.Connection) -> None
     for table, fragments in _REQUIRED_TABLE_SQL.items():
         if any(_normalized_sql(fragment) not in table_sql.get(table, "") for fragment in fragments):
             raise RuntimeError(f"reconciliation table {table} constraints are malformed")
+    for table, expected_sql in _V2_TABLE_SQL.items():
+        if table_sql.get(table) != _canonical_schema_sql(expected_sql):
+            raise RuntimeError(f"reconciliation table {table} definition is malformed")
+        if await _table_shape(connection, table) != _EXPECTED_V2_COLUMN_SHAPES[table]:
+            raise RuntimeError(f"reconciliation table {table} column shape is malformed")
+        if await _foreign_key_shape(connection, table) != _EXPECTED_V2_FOREIGN_KEYS[table]:
+            raise RuntimeError(f"reconciliation table {table} foreign keys are malformed")
+        if await _index_shape(connection, table) != _EXPECTED_V2_INDEXES[table]:
+            raise RuntimeError(f"reconciliation table {table} indexes are malformed")
     trigger_rows = await connection.execute(
         "SELECT name, sql FROM sqlite_master "
         "WHERE type = 'trigger' AND tbl_name LIKE 'rt_reconciliation_%'"
@@ -538,3 +671,35 @@ async def assert_reconciliation_schema(connection: aiosqlite.Connection) -> None
         """)
     if await unbound_resolutions.fetchone() is not None:
         raise RuntimeError("reconciliation resolution lacks composite run binding")
+    for table, query in (
+        (
+            "rt_reconciliation_snapshot_lineage",
+            """
+            SELECT 1 FROM rt_reconciliation_snapshot_lineage
+            GROUP BY snapshot_id
+            HAVING snapshot_id IS NULL OR COUNT(*) > 1
+            LIMIT 1
+            """,
+        ),
+        (
+            "rt_reconciliation_run_eligibility",
+            """
+            SELECT 1 FROM rt_reconciliation_run_eligibility
+            GROUP BY run_id
+            HAVING run_id IS NULL OR COUNT(*) > 1
+            LIMIT 1
+            """,
+        ),
+        (
+            "rt_reconciliation_operator_resolution_bindings",
+            """
+            SELECT 1 FROM rt_reconciliation_operator_resolution_bindings
+            GROUP BY resolution_id
+            HAVING resolution_id IS NULL OR COUNT(*) > 1
+            LIMIT 1
+            """,
+        ),
+    ):
+        invalid_identity = await connection.execute(query)
+        if await invalid_identity.fetchone() is not None:
+            raise RuntimeError(f"reconciliation table {table} identity is malformed")

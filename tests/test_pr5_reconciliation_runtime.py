@@ -464,6 +464,225 @@ async def test_exact_old_v1_schema_upgrades_additively_without_row_loss(tmp_path
         ).fetchall() == [(1,), (2,)]
 
 
+def _rewrite_schema_definition(
+    database_path,
+    object_type: str,
+    name: str,
+    old: str,
+    new: str,
+) -> None:
+    assert object_type in {"table", "trigger"}
+    with sqlite3.connect(database_path) as connection:
+        definition = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type=? AND name=?",
+            (object_type, name),
+        ).fetchone()
+        assert definition is not None
+        assert definition[0].count(old) == 1
+        replacement = definition[0].replace(old, new, 1)
+        schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
+        connection.execute("PRAGMA writable_schema = ON")
+        connection.execute(
+            "UPDATE sqlite_master SET sql=? WHERE type=? AND name=?",
+            (replacement, object_type, name),
+        )
+        connection.execute(f"PRAGMA schema_version = {schema_version + 1}")
+        connection.execute("PRAGMA writable_schema = OFF")
+        connection.commit()
+
+
+def _rewrite_table_definition(
+    database_path,
+    table: str,
+    old: str,
+    new: str,
+) -> None:
+    _rewrite_schema_definition(database_path, "table", table, old, new)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("table", "old", "new"),
+    [
+        (
+            "rt_reconciliation_snapshot_lineage",
+            "snapshot_id TEXT PRIMARY KEY NOT NULL",
+            "snapshot_id TEXT UNIQUE NOT NULL",
+        ),
+        (
+            "rt_reconciliation_snapshot_lineage",
+            "schema_version INTEGER NOT NULL CHECK (schema_version = 2)",
+            "schema_version INTEGER NOT NULL",
+        ),
+        (
+            "rt_reconciliation_snapshot_lineage",
+            "length(snapshot_hash) = 64",
+            "length(snapshot_hash) >= 1",
+        ),
+        (
+            "rt_reconciliation_snapshot_lineage",
+            "broker_receipt_id TEXT NOT NULL",
+            "broker_receipt_id TEXT",
+        ),
+        (
+            "rt_reconciliation_snapshot_lineage",
+            "broker_public_key_fingerprint TEXT NOT NULL",
+            "broker_public_key_fingerprint TEXT",
+        ),
+        (
+            "rt_reconciliation_snapshot_lineage",
+            "REFERENCES rt_reconciliation_snapshots(snapshot_id)",
+            "REFERENCES rt_reconciliation_snapshots(snapshot_id) ON DELETE CASCADE",
+        ),
+        (
+            "rt_reconciliation_snapshot_lineage",
+            "persisted_at TEXT NOT NULL,",
+            "persisted_at TEXT NOT NULL, unexpected_column TEXT,",
+        ),
+        (
+            "rt_reconciliation_run_eligibility",
+            "run_id TEXT PRIMARY KEY NOT NULL",
+            "run_id TEXT PRIMARY KEY",
+        ),
+        (
+            "rt_reconciliation_run_eligibility",
+            "eligible_until TEXT NOT NULL",
+            "eligible_until TEXT",
+        ),
+        (
+            "rt_reconciliation_operator_resolution_bindings",
+            "resolution_id TEXT PRIMARY KEY NOT NULL",
+            "resolution_id TEXT PRIMARY KEY",
+        ),
+        (
+            "rt_reconciliation_operator_resolution_bindings",
+            "FOREIGN KEY(run_id, difference_id)",
+            "FOREIGN KEY(difference_id, run_id)",
+        ),
+    ],
+)
+async def test_v2_constraint_mutation_matrix_fails_closed(
+    tmp_path,
+    table: str,
+    old: str,
+    new: str,
+) -> None:
+    database_path = (tmp_path / "reconciliation.sqlite3").resolve()
+    persistence = ReconciliationPersistence(database_path)
+    await persistence.initialize()
+    _rewrite_table_definition(database_path, table, old, new)
+
+    with pytest.raises((RuntimeError, sqlite3.DatabaseError), match="malformed"):
+        await persistence.initialize()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "table",
+    [
+        "rt_reconciliation_snapshot_lineage",
+        "rt_reconciliation_run_eligibility",
+        "rt_reconciliation_operator_resolution_bindings",
+    ],
+)
+@pytest.mark.parametrize(
+    ("suffix", "old", "new"),
+    [
+        ("no_update", "BEFORE UPDATE", "AFTER UPDATE"),
+        ("no_delete", "BEFORE DELETE", "AFTER DELETE"),
+    ],
+)
+async def test_every_v2_append_only_trigger_is_exact(
+    tmp_path,
+    table: str,
+    suffix: str,
+    old: str,
+    new: str,
+) -> None:
+    database_path = (tmp_path / "reconciliation.sqlite3").resolve()
+    persistence = ReconciliationPersistence(database_path)
+    await persistence.initialize()
+    trigger = f"{table}_{suffix}"
+    _rewrite_schema_definition(
+        database_path,
+        "trigger",
+        trigger,
+        old,
+        new,
+    )
+
+    with pytest.raises(RuntimeError, match=f"trigger {trigger} is malformed"):
+        await persistence.initialize()
+
+
+@pytest.mark.asyncio
+async def test_v2_composite_identity_index_mutation_fails_closed(tmp_path) -> None:
+    database_path = (tmp_path / "reconciliation.sqlite3").resolve()
+    persistence = ReconciliationPersistence(database_path)
+    await persistence.initialize()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP INDEX rt_reconciliation_differences_run_difference_uq")
+        connection.execute(
+            "CREATE UNIQUE INDEX rt_reconciliation_differences_run_difference_uq "
+            "ON rt_reconciliation_differences(difference_id, run_id)"
+        )
+        connection.commit()
+
+    with pytest.raises(RuntimeError, match="composite identity index is malformed"):
+        await persistence.initialize()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("table", "identity_column"),
+    [
+        ("rt_reconciliation_snapshot_lineage", "snapshot_id"),
+        ("rt_reconciliation_run_eligibility", "run_id"),
+    ],
+)
+async def test_v2_duplicate_null_identity_probe_fails_closed(
+    tmp_path,
+    table: str,
+    identity_column: str,
+) -> None:
+    database_path = (tmp_path / "reconciliation.sqlite3").resolve()
+    persistence = ReconciliationPersistence(database_path)
+    await persistence.initialize()
+    constrained = f"{identity_column} TEXT PRIMARY KEY NOT NULL"
+    nullable = f"{identity_column} TEXT PRIMARY KEY"
+    _rewrite_table_definition(database_path, table, constrained, nullable)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = connection.execute(f"PRAGMA table_info({table})").fetchall()
+        names = [str(row[1]) for row in columns]
+        values = []
+        for row in columns:
+            name = str(row[1])
+            if name == identity_column:
+                values.append(None)
+            elif name == "schema_version":
+                values.append(2)
+            elif str(row[2]).upper() == "INTEGER":
+                values.append(1)
+            elif name.endswith("hash") or name.endswith("fingerprint"):
+                values.append("a" * 64)
+            else:
+                values.append("probe")
+        placeholders = ", ".join("?" for _ in names)
+        connection.executemany(
+            f"INSERT INTO {table} ({', '.join(names)}) VALUES ({placeholders})",
+            (values, values),
+        )
+        connection.commit()
+        assert connection.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE {identity_column} IS NULL"
+        ).fetchone() == (2,)
+
+    _rewrite_table_definition(database_path, table, nullable, constrained)
+    with pytest.raises(RuntimeError, match="identity is malformed"):
+        await persistence.initialize()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("snapshot", "comparison", "reason_code"),
