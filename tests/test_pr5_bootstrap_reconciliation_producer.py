@@ -2,23 +2,29 @@ from __future__ import annotations
 
 import hashlib
 import inspect
-import json
 import os
-from dataclasses import FrozenInstanceError, replace
+import pickle
+import sqlite3
+from contextlib import contextmanager
+from copy import copy, deepcopy
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from typing import Any, Callable, cast
 
 import pytest
 
 from robo_trader.config import RuntimeContract
+from robo_trader.financial_state_bootstrap import inspect_legacy_state
 from robo_trader.reconciliation import bootstrap_producer as producer_module
 from robo_trader.reconciliation.bootstrap_producer import (
     BOOTSTRAP_RECONCILIATION_STATUS,
-    BootstrapLedgerEvidence,
     BootstrapReconciliationBlocked,
     UnsignedBootstrapReconciliation,
-    produce_bootstrap_reconciliation,
+    _issue_test_producer_capability,
+    _produce_bootstrap_reconciliation_for_test,
+    assert_and_consume_producer_owned_bootstrap_reconciliation,
 )
 from robo_trader.reconciliation.domain import (
     BrokerCollectionEvidence,
@@ -26,24 +32,84 @@ from robo_trader.reconciliation.domain import (
     BrokerEvidenceCompleteness,
     BrokerOrderCollection,
     BrokerOrderSide,
-    ExecutionDomainScope,
     NormalizedBrokerAccount,
     NormalizedBrokerExecution,
     NormalizedBrokerOrder,
     NormalizedBrokerPosition,
     NormalizedBrokerSnapshot,
 )
-from robo_trader.reconciliation.policy import (
-    DifferenceKind,
-    DifferenceMateriality,
-    ReconciliationCoverage,
-    ReconciliationDifference,
-    ReconciliationStatus,
-)
+from robo_trader.reconciliation.policy import ReconciliationStatus
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
 ACCOUNT_SCOPE = "acct_v1_" + "0123456789abcdef" * 4
 OTHER_ACCOUNT_SCOPE = "acct_v1_" + "fedcba9876543210" * 4
+
+
+def _legacy_database(path: Path) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.executescript("""
+            CREATE TABLE portfolios (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL
+            );
+            CREATE TABLE positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                avg_cost REAL NOT NULL,
+                market_price REAL,
+                timestamp DATETIME
+            );
+            CREATE TABLE trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                price REAL NOT NULL,
+                notional REAL DEFAULT 0,
+                slippage REAL DEFAULT 0,
+                commission REAL DEFAULT 0,
+                pnl REAL DEFAULT NULL,
+                timestamp DATETIME
+            );
+            CREATE TABLE account (
+                portfolio_id TEXT PRIMARY KEY,
+                cash REAL NOT NULL,
+                equity REAL NOT NULL,
+                daily_pnl REAL DEFAULT 0,
+                realized_pnl REAL DEFAULT 0,
+                unrealized_pnl REAL DEFAULT 0,
+                timestamp DATETIME
+            );
+            CREATE TABLE equity_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id TEXT NOT NULL,
+                date TEXT NOT NULL,
+                equity REAL NOT NULL,
+                cash REAL DEFAULT 0,
+                positions_value REAL DEFAULT 0,
+                realized_pnl REAL DEFAULT 0,
+                unrealized_pnl REAL DEFAULT 0,
+                timestamp DATETIME
+            );
+            INSERT INTO portfolios VALUES ('default', 'Default');
+            INSERT INTO account VALUES
+              ('default', 1000, 1200, 0, 0, 200, '2026-07-28T11:59:00+00:00');
+            INSERT INTO positions(portfolio_id,symbol,quantity,avg_cost,market_price,timestamp)
+            VALUES
+              ('default','AAPL',2,100,110,'2026-07-28T11:59:00+00:00'),
+              ('default','MSFT',3,200,210,'2026-07-28T11:59:00+00:00');
+            INSERT INTO trades(portfolio_id,symbol,side,quantity,price,notional,timestamp)
+            VALUES
+              ('default','AAPL','BUY',2,100,200,'2026-07-28T11:58:00+00:00');
+            INSERT INTO equity_history(
+                portfolio_id,date,equity,cash,positions_value,realized_pnl,unrealized_pnl,timestamp
+            ) VALUES
+              ('default','2026-07-28',1200,1000,200,0,200,
+               '2026-07-28T11:59:00+00:00');
+        """)
 
 
 def _runtime(database: Path) -> RuntimeContract:
@@ -64,23 +130,6 @@ def _runtime(database: Path) -> RuntimeContract:
         safety_execution_domain_scope="paper-simulator-v1",
         safety_journal_path=str(database.with_name("safety-journal.db")),
     )
-
-
-def _coverage(**overrides: bool) -> ReconciliationCoverage:
-    values = {
-        "broker_account": True,
-        "broker_positions": True,
-        "broker_open_orders": True,
-        "broker_completed_orders": True,
-        "broker_executions": True,
-        "broker_commissions": True,
-        "ledger_positions": True,
-        "ledger_orders": True,
-        "ledger_executions": True,
-        "ledger_cash": True,
-    }
-    values.update(overrides)
-    return ReconciliationCoverage(**values)
 
 
 def _collection_evidence(
@@ -193,8 +242,8 @@ def _snapshot(
             account_alias="***1234",
             account_type="paper",
             base_currency="USD",
-            total_cash=Decimal("25000.00"),
-            buying_power=Decimal("100000.00"),
+            total_cash=Decimal("25000"),
+            buying_power=Decimal("100000"),
             observed_at=retrieved_at,
         ),
         observed_from=retrieved_at - timedelta(seconds=1),
@@ -208,57 +257,81 @@ def _snapshot(
     )
 
 
-def _ledger_evidence(
-    database: Path,
-    runtime: RuntimeContract,
-    *,
-    coverage: ReconciliationCoverage | None = None,
-    differences: tuple[ReconciliationDifference, ...] = (),
-    observed_at: datetime = NOW - timedelta(seconds=1),
-    portfolio_ids: tuple[str, ...] = ("default",),
-    known_portfolio_ids: tuple[str, ...] | None = None,
-    covered_portfolio_ids: tuple[str, ...] | None = None,
-) -> BootstrapLedgerEvidence:
-    metadata = os.lstat(database)
-    return BootstrapLedgerEvidence(
+@dataclass(frozen=True, slots=True)
+class FakeVerifiedBrokerEnvelope:
+    snapshot: NormalizedBrokerSnapshot
+    snapshot_id: str
+    snapshot_hash: str
+    artifact_hash: str
+    runtime_fingerprint: str
+    account_scope: str
+    receipt_id: str
+    public_key_fingerprint: str
+    issued_at: datetime
+    expires_at: datetime
+
+
+def _envelope(
+    snapshot: NormalizedBrokerSnapshot, runtime: RuntimeContract
+) -> FakeVerifiedBrokerEnvelope:
+    artifact_hash = hashlib.sha256(snapshot.canonical_payload().encode()).hexdigest()
+    return FakeVerifiedBrokerEnvelope(
+        snapshot=snapshot,
+        snapshot_id=snapshot.snapshot_id,
+        snapshot_hash=artifact_hash,
+        artifact_hash="56" * 32,
         runtime_fingerprint=runtime.fingerprint,
-        execution_domain_scope=ExecutionDomainScope.PAPER_SIMULATOR,
         account_scope=ACCOUNT_SCOPE,
-        database_path=str(database),
-        database_identity=runtime.database_identity,
-        database_device=metadata.st_dev,
-        database_inode=metadata.st_ino,
-        database_size=metadata.st_size,
-        database_mtime_ns=metadata.st_mtime_ns,
-        database_ctime_ns=metadata.st_ctime_ns,
-        portfolio_ids=portfolio_ids,
-        known_portfolio_ids=known_portfolio_ids or portfolio_ids,
-        active_portfolio_ids=portfolio_ids,
-        covered_portfolio_ids=covered_portfolio_ids or portfolio_ids,
-        local_simulator_positions_count=2,
-        legacy_snapshot_hash="ab" * 32,
-        observed_at=observed_at,
-        coverage=coverage or _coverage(),
-        differences=differences,
+        receipt_id="bevr-v2-" + "12" * 32,
+        public_key_fingerprint="34" * 32,
+        issued_at=NOW,
+        expires_at=NOW + timedelta(minutes=5),
     )
 
 
-class Receiver:
+class FakeBrokerVerifier:
+    def __init__(self, *envelopes: FakeVerifiedBrokerEnvelope) -> None:
+        self._owned = {id(value): value for value in envelopes}
+
+    def consume(self, value: object) -> FakeVerifiedBrokerEnvelope:
+        owned = self._owned.pop(id(value), None)
+        if owned is not value:
+            raise BootstrapReconciliationBlocked("test envelope is not verifier-owned")
+        return cast(FakeVerifiedBrokerEnvelope, value)
+
+
+class ClaimingReceiver:
+    def __init__(self, *, before_claim=None) -> None:
+        self.results: list[UnsignedBootstrapReconciliation] = []
+        self.before_claim = before_claim
+
+    def receive_unsigned_bootstrap_reconciliation(
+        self,
+        result: UnsignedBootstrapReconciliation,
+    ) -> UnsignedBootstrapReconciliation:
+        if self.before_claim is not None:
+            self.before_claim()
+        claimed = assert_and_consume_producer_owned_bootstrap_reconciliation(result)
+        self.results.append(claimed)
+        return claimed
+
+
+class BypassReceiver:
     def __init__(self) -> None:
         self.results: list[UnsignedBootstrapReconciliation] = []
 
     def receive_unsigned_bootstrap_reconciliation(
         self,
         result: UnsignedBootstrapReconciliation,
-    ) -> UnsignedBootstrapReconciliation:
+    ) -> str:
         self.results.append(result)
-        return result
+        return "bypassed"
 
 
 @pytest.fixture
 def database(tmp_path: Path) -> Path:
     path = tmp_path / "ledger.db"
-    path.write_bytes(b"immutable-ledger-evidence")
+    _legacy_database(path)
     return path
 
 
@@ -266,116 +339,110 @@ def _produce(
     database: Path,
     *,
     snapshot: NormalizedBrokerSnapshot | None = None,
-    evidence: BootstrapLedgerEvidence | None = None,
+    envelope: FakeVerifiedBrokerEnvelope | None = None,
     runtime: RuntimeContract | None = None,
-    receiver: Receiver | None = None,
-    now: datetime = NOW,
-) -> tuple[UnsignedBootstrapReconciliation, Receiver]:
+    receiver: object | None = None,
+    clock: Callable[[], datetime] | None = None,
+    verifier: FakeBrokerVerifier | None = None,
+) -> tuple[
+    producer_module.BootstrapReconciliationDelivery[object],
+    Any,
+    FakeVerifiedBrokerEnvelope,
+]:
     contract = runtime or _runtime(database)
-    sink = receiver or Receiver()
-    result = produce_bootstrap_reconciliation(
-        snapshot or _snapshot(),
-        evidence or _ledger_evidence(database, contract),
-        contract,
-        sink,
-        now=now,
+    verified = envelope or _envelope(snapshot or _snapshot(), contract)
+    authority = verifier or FakeBrokerVerifier(verified)
+    sink = receiver or ClaimingReceiver()
+    capability = _issue_test_producer_capability(
+        clock=clock or (lambda: NOW),
+        broker_consumer=cast(
+            Callable[[object], producer_module.VerifiedBrokerEvidenceEnvelope],
+            authority.consume,
+        ),
     )
-    return result, sink
+    delivery: producer_module.BootstrapReconciliationDelivery[object] = (
+        _produce_bootstrap_reconciliation_for_test(
+            verified,
+            contract,
+            sink,  # type: ignore[arg-type]
+            capability,
+        )
+    )
+    return delivery, sink, verified
 
 
-def test_clean_stage_binds_all_evidence_and_is_non_authorizing(database: Path) -> None:
-    snapshot = _snapshot()
-    result, receiver = _produce(database, snapshot=snapshot)
+def test_clean_stage_collects_ledger_and_binds_non_authorizing_result(database: Path) -> None:
+    expected_legacy_hash = str(inspect_legacy_state(database)["snapshot_hash"])
 
-    assert receiver.results == [result]
+    delivery, receiver, envelope = _produce(database)
+
+    assert isinstance(receiver, ClaimingReceiver)
+    result = receiver.results[0]
+    assert delivery.receiver_result is result
+    assert delivery.local_position_identities == (("default", "AAPL"), ("default", "MSFT"))
     assert result.status == BOOTSTRAP_RECONCILIATION_STATUS
     assert result.reconciliation_status is ReconciliationStatus.PASSED
-    assert result.broker_snapshot_id == snapshot.snapshot_id
-    assert (
-        result.broker_snapshot_hash
-        == hashlib.sha256(snapshot.canonical_payload().encode()).hexdigest()
-    )
-    assert result.legacy_snapshot_hash == "ab" * 32
+    assert result.broker_snapshot_id == envelope.snapshot_id
+    assert result.broker_snapshot_hash == envelope.snapshot_hash
+    assert result.broker_artifact_hash == envelope.artifact_hash
+    assert result.broker_artifact_hash != result.broker_snapshot_hash
+    assert result.legacy_snapshot_hash == expected_legacy_hash
     assert result.portfolio_ids == ("default",)
-    assert len(result.broker_collection_evidence_ids) == len(BrokerCollectionKind)
     assert result.local_simulator_positions_count == 2
     assert result.broker_positions_count == 0
     assert result.broker_open_orders_count == 0
     assert result.mutated_state is False
     assert result.authorizes_startup is False
     assert result.execution_domain_scope == "paper-simulator-v1"
-    payload = json.loads(result.canonical_payload())
-    assert payload["snapshot_id"] == result.snapshot_id
-    assert payload["authorizes_startup"] is False
-    assert payload["mutated_state"] is False
 
 
-def test_local_simulator_positions_are_not_compared_to_zero_ibkr_exposure(
-    database: Path,
-) -> None:
-    runtime = _runtime(database)
-    evidence = replace(
-        _ledger_evidence(database, runtime),
-        local_simulator_positions_count=17,
+def test_public_interface_accepts_no_snapshot_ledger_clock_or_freshness_authority() -> None:
+    parameters = inspect.signature(producer_module.produce_bootstrap_reconciliation).parameters
+    assert set(parameters) == {"verified_broker_evidence", "runtime_contract", "receiver"}
+    assert all(
+        forbidden not in parameters
+        for forbidden in ("snapshot", "ledger_evidence", "now", "clock", "max_age_seconds")
     )
 
-    result, _ = _produce(database, runtime=runtime, evidence=evidence)
+
+def test_local_simulator_positions_are_not_compared_to_zero_ibkr(database: Path) -> None:
+    delivery, receiver, _ = _produce(database)
+    result = receiver.results[0]
 
     assert result.reconciliation_status is ReconciliationStatus.PASSED
-    assert result.local_simulator_positions_count == 17
+    assert result.local_simulator_positions_count == 2
     assert result.broker_positions_count == 0
+    assert delivery.local_position_identities == result.local_position_identities
 
 
-def test_completed_broker_history_is_allowed_but_remains_diagnostic(database: Path) -> None:
+def test_completed_broker_history_remains_diagnostic_not_simulator_equality(
+    database: Path,
+) -> None:
     snapshot = _snapshot(
         orders=(_order(collection=BrokerOrderCollection.COMPLETED),),
         executions=(_execution(),),
     )
 
-    result, _ = _produce(database, snapshot=snapshot)
+    _, receiver, _ = _produce(database, snapshot=snapshot)
 
-    assert result.reconciliation_status is ReconciliationStatus.PASSED
-    assert result.broker_positions_count == 0
-    assert result.broker_open_orders_count == 0
+    assert receiver.results[0].reconciliation_status is ReconciliationStatus.PASSED
 
 
-@pytest.mark.parametrize("difference_kind", [DifferenceKind.UNKNOWN, DifferenceKind.CASH_MISMATCH])
-def test_unknown_or_material_local_difference_blocks_without_receiver_call(
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        _snapshot(positions=(_position(),)),
+        _snapshot(orders=(_order(),)),
+        _snapshot(complete=False),
+        _snapshot(retrieved_at=NOW - timedelta(minutes=5)),
+        _snapshot(scope=OTHER_ACCOUNT_SCOPE),
+    ],
+)
+def test_exposure_incomplete_stale_or_wrong_account_blocks(
     database: Path,
-    difference_kind: DifferenceKind,
+    snapshot: NormalizedBrokerSnapshot,
 ) -> None:
-    runtime = _runtime(database)
-    materiality = (
-        DifferenceMateriality.UNKNOWN
-        if difference_kind is DifferenceKind.UNKNOWN
-        else DifferenceMateriality.MATERIAL
-    )
-    difference = ReconciliationDifference(
-        kind=difference_kind,
-        materiality=materiality,
-        reason_code="LOCAL_STATE_NOT_RECONCILED",
-        subject="local_ledger",
-    )
-    evidence = _ledger_evidence(database, runtime, differences=(difference,))
-    receiver = Receiver()
-
-    with pytest.raises(BootstrapReconciliationBlocked, match="unknown, or material"):
-        _produce(database, runtime=runtime, evidence=evidence, receiver=receiver)
-
-    assert receiver.results == []
-
-
-@pytest.mark.parametrize("exposure", ["position", "open_order"])
-def test_ibkr_exposure_blocks_instead_of_becoming_local_equality_evidence(
-    database: Path,
-    exposure: str,
-) -> None:
-    snapshot = (
-        _snapshot(positions=(_position(),))
-        if exposure == "position"
-        else _snapshot(orders=(_order(),))
-    )
-    receiver = Receiver()
+    receiver = ClaimingReceiver()
 
     with pytest.raises(BootstrapReconciliationBlocked):
         _produce(database, snapshot=snapshot, receiver=receiver)
@@ -383,154 +450,148 @@ def test_ibkr_exposure_blocks_instead_of_becoming_local_equality_evidence(
     assert receiver.results == []
 
 
-def test_stale_or_incomplete_broker_snapshot_blocks(database: Path) -> None:
-    for snapshot in (
-        _snapshot(retrieved_at=NOW - timedelta(minutes=5)),
-        _snapshot(complete=False),
-    ):
-        receiver = Receiver()
-        with pytest.raises(BootstrapReconciliationBlocked):
-            _produce(database, snapshot=snapshot, receiver=receiver)
-        assert receiver.results == []
+def test_stale_internal_clock_blocks_without_receiver_call(database: Path) -> None:
+    clock_values = iter((NOW, NOW + timedelta(seconds=31)))
+    receiver = ClaimingReceiver()
 
-
-def test_wrong_account_blocks_without_leaking_or_delivering(database: Path) -> None:
-    receiver = Receiver()
-
-    with pytest.raises(BootstrapReconciliationBlocked, match="account identity") as raised:
-        _produce(database, snapshot=_snapshot(scope=OTHER_ACCOUNT_SCOPE), receiver=receiver)
+    with pytest.raises(BootstrapReconciliationBlocked, match="became stale"):
+        _produce(database, receiver=receiver, clock=lambda: next(clock_values))
 
     assert receiver.results == []
-    assert "DU" not in str(raised.value)
 
 
-def test_incomplete_local_coverage_and_portfolio_coverage_block(database: Path) -> None:
+def test_forged_or_replayed_verified_envelope_blocks(database: Path) -> None:
     runtime = _runtime(database)
-    cases = (
-        _ledger_evidence(database, runtime, coverage=_coverage(ledger_cash=False)),
-        _ledger_evidence(
-            database,
-            runtime,
-            portfolio_ids=("default",),
-            known_portfolio_ids=("default", "secondary"),
-            covered_portfolio_ids=("default",),
-        ),
-    )
-    for evidence in cases:
-        receiver = Receiver()
-        with pytest.raises(BootstrapReconciliationBlocked, match="coverage is incomplete"):
-            _produce(database, runtime=runtime, evidence=evidence, receiver=receiver)
-        assert receiver.results == []
+    envelope = _envelope(_snapshot(), runtime)
+    verifier = FakeBrokerVerifier(envelope)
+    _produce(database, runtime=runtime, envelope=envelope, verifier=verifier)
+
+    with pytest.raises(BootstrapReconciliationBlocked):
+        _produce(database, runtime=runtime, envelope=envelope, verifier=verifier)
+
+    forged = replace(envelope)
+    with pytest.raises(BootstrapReconciliationBlocked):
+        _produce(database, runtime=runtime, envelope=forged, verifier=verifier)
 
 
-def test_stale_local_evidence_blocks_without_delivery(database: Path) -> None:
+def test_public_producer_rejects_structurally_valid_caller_envelope(database: Path) -> None:
     runtime = _runtime(database)
-    evidence = _ledger_evidence(
-        database,
-        runtime,
-        observed_at=NOW - timedelta(minutes=5),
-    )
-    receiver = Receiver()
+    forged = _envelope(_snapshot(), runtime)
+    receiver = ClaimingReceiver()
 
-    with pytest.raises(BootstrapReconciliationBlocked, match="future or stale"):
-        _produce(database, runtime=runtime, evidence=evidence, receiver=receiver)
+    with pytest.raises(BootstrapReconciliationBlocked, match="not verifier-owned"):
+        producer_module.produce_bootstrap_reconciliation(forged, runtime, receiver)
 
     assert receiver.results == []
 
 
-def test_database_content_or_inode_drift_blocks_without_delivery(
-    database: Path,
-    tmp_path: Path,
-) -> None:
-    runtime = _runtime(database)
-    evidence = _ledger_evidence(database, runtime)
-    receiver = Receiver()
-    database.write_bytes(b"changed-ledger-state")
+def test_forged_typed_ledger_evidence_is_rejected(database: Path, monkeypatch) -> None:
+    forged = object.__new__(producer_module._CollectedLedgerEvidence)
 
-    with pytest.raises(BootstrapReconciliationBlocked, match="database changed"):
-        _produce(database, runtime=runtime, evidence=evidence, receiver=receiver)
-    assert receiver.results == []
+    @contextmanager
+    def forged_collector(*args, **kwargs):
+        del args, kwargs
+        yield forged
 
-    database.unlink()
-    replacement = tmp_path / "replacement.db"
-    replacement.write_bytes(b"immutable-ledger-evidence")
-    replacement.replace(database)
-    with pytest.raises(BootstrapReconciliationBlocked, match="database changed"):
-        _produce(database, runtime=runtime, evidence=evidence, receiver=receiver)
-    assert receiver.results == []
+    monkeypatch.setattr(producer_module, "_collect_wal_visible_ledger", forged_collector)
+    receiver = ClaimingReceiver()
 
-
-def test_database_drift_during_policy_evaluation_blocks_before_delivery(
-    database: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runtime = _runtime(database)
-    evidence = _ledger_evidence(database, runtime)
-    receiver = Receiver()
-    real_evaluate = producer_module.evaluate_paper_simulator_reconciliation
-
-    def evaluate_then_drift(*args, **kwargs):
-        verdict = real_evaluate(*args, **kwargs)
-        database.write_bytes(b"drifted-during-policy-evaluation")
-        return verdict
-
-    monkeypatch.setattr(
-        producer_module,
-        "evaluate_paper_simulator_reconciliation",
-        evaluate_then_drift,
-    )
-
-    with pytest.raises(BootstrapReconciliationBlocked, match="database changed"):
-        _produce(database, runtime=runtime, evidence=evidence, receiver=receiver)
+    with pytest.raises(BootstrapReconciliationBlocked, match="collector-owned"):
+        _produce(database, receiver=receiver)
 
     assert receiver.results == []
 
 
-def test_runtime_binding_drift_blocks_without_delivery(database: Path) -> None:
-    runtime = _runtime(database)
-    evidence = _ledger_evidence(database, runtime)
-    changed = replace(runtime, build_id="different-build")
-    receiver = Receiver()
+def test_receiver_must_independently_claim_ownership(database: Path) -> None:
+    receiver = BypassReceiver()
 
-    with pytest.raises(BootstrapReconciliationBlocked, match="validated runtime"):
-        _produce(database, runtime=changed, evidence=evidence, receiver=receiver)
+    with pytest.raises(BootstrapReconciliationBlocked, match="independently claim"):
+        _produce(database, receiver=receiver)
 
-    assert receiver.results == []
+    assert len(receiver.results) == 1
+    with pytest.raises(BootstrapReconciliationBlocked, match="not producer-owned"):
+        assert_and_consume_producer_owned_bootstrap_reconciliation(receiver.results[0])
 
 
-def test_receiver_is_narrow_and_no_signer_key_or_artifact_path_is_accepted(
-    database: Path,
-) -> None:
-    parameters = inspect.signature(produce_bootstrap_reconciliation).parameters
-    assert set(parameters) == {
-        "snapshot",
-        "ledger_evidence",
-        "runtime_contract",
-        "receiver",
-        "now",
-        "max_age_seconds",
-    }
-    assert all(
-        fragment not in name
-        for name in parameters
-        for fragment in ("sign", "key", "artifact", "json", "output_path")
-    )
+def test_result_direct_construction_copy_and_replay_fail(database: Path) -> None:
+    _, receiver, _ = _produce(database)
+    assert isinstance(receiver, ClaimingReceiver)
+    result = receiver.results[0]
+    copied = replace(result)
 
-    with pytest.raises(BootstrapReconciliationBlocked, match="receiver capability"):
-        produce_bootstrap_reconciliation(
-            _snapshot(),
-            _ledger_evidence(database, _runtime(database)),
-            _runtime(database),
-            object(),  # type: ignore[arg-type]
-            now=NOW,
+    with pytest.raises(BootstrapReconciliationBlocked, match="not producer-owned"):
+        assert_and_consume_producer_owned_bootstrap_reconciliation(result)
+    with pytest.raises(BootstrapReconciliationBlocked, match="not producer-owned"):
+        assert_and_consume_producer_owned_bootstrap_reconciliation(copied)
+    with pytest.raises(TypeError, match="cannot be copied"):
+        copy(result)
+    with pytest.raises(TypeError, match="cannot be copied"):
+        deepcopy(result)
+    with pytest.raises(TypeError, match="cannot be pickled"):
+        pickle.dumps(result)
+    with pytest.raises((TypeError, BootstrapReconciliationBlocked)):
+        UnsignedBootstrapReconciliation()  # type: ignore[call-arg]
+
+
+def test_wal_visible_commit_is_included_in_snapshot_hash(database: Path) -> None:
+    writer = sqlite3.connect(database)
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute(
+            "INSERT INTO positions(portfolio_id,symbol,quantity,avg_cost,market_price,timestamp) "
+            "VALUES ('default','NVDA',4,300,310,'2026-07-28T11:59:30+00:00')"
         )
+        writer.commit()
+        wal_path = Path(f"{database}-wal")
+        assert wal_path.exists() and wal_path.stat().st_size > 0
+
+        delivery, receiver, _ = _produce(database)
+
+        result = receiver.results[0]
+        assert ("default", "NVDA") in delivery.local_position_identities
+        assert result.legacy_snapshot_hash == inspect_legacy_state(database)["snapshot_hash"]
+    finally:
+        writer.close()
 
 
-def test_unsigned_result_is_immutable_and_canonical(database: Path) -> None:
-    first, _ = _produce(database)
-    second, _ = _produce(database)
+def test_wal_only_commit_after_snapshot_before_delivery_blocks(database: Path) -> None:
+    writer = sqlite3.connect(database)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("PRAGMA wal_autocheckpoint=0")
 
-    assert first.canonical_payload() == second.canonical_payload()
-    assert first.snapshot_id == second.snapshot_id
-    with pytest.raises((FrozenInstanceError, TypeError)):
-        first.authorizes_startup = True  # type: ignore[misc]
+    def commit_during_receiver() -> None:
+        writer.execute(
+            "INSERT INTO trades(portfolio_id,symbol,side,quantity,price,notional,timestamp) "
+            "VALUES ('default','MSFT','BUY',1,210,210,'2026-07-28T12:00:00+00:00')"
+        )
+        writer.commit()
+
+    clock_calls = 0
+
+    def clock_with_commit() -> datetime:
+        nonlocal clock_calls
+        clock_calls += 1
+        if clock_calls == 2:
+            commit_during_receiver()
+        return NOW
+
+    receiver = ClaimingReceiver()
+    try:
+        with pytest.raises(BootstrapReconciliationBlocked, match="ledger WAL changed"):
+            _produce(database, receiver=receiver, clock=clock_with_commit)
+        assert receiver.results == []
+    finally:
+        writer.close()
+
+
+def test_malformed_or_partial_database_blocks_without_delivery(tmp_path: Path) -> None:
+    database = tmp_path / "partial.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE account(portfolio_id TEXT)")
+    receiver = ClaimingReceiver()
+
+    with pytest.raises(BootstrapReconciliationBlocked):
+        _produce(database, receiver=receiver)
+
+    assert receiver.results == []
