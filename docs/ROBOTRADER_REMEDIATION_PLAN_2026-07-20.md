@@ -1,9 +1,10 @@
 # RoboTrader Remediation and Launch Plan
 
 Document date: 2026-07-20
-Last updated: 2026-07-26
+Last updated: 2026-07-28
 Status: Active execution plan; Gate A remains closed
-Source baseline: repository audit at commit `51f0e99` on branch `main`
+Source baseline: repository audit at commit `51f0e99`; execution baseline
+`1ae64808ae20956e412e95f17f194776f4851478` on branch `main`
 Target: safe supervised paper operation first, then remote read-only access, then an explicitly gated limited live canary
 
 Current execution baseline (2026-07-25): `main` includes the truthful Phase 0
@@ -39,10 +40,14 @@ integration, performance, lint, security, container, Cursor security, and
 exact-head Codex review gates passed; the Claude workflow was unavailable
 because its repository OAuth token was revoked before review. The
 implementation remains deliberately dormant behind the shared
-terminal-settlement readiness gate. PR 2B.3 implementation and exact-head local
-review are complete at `14f6b55` on `codex/pr2b3-terminal-settlement` from the
-PR #106 merge commit; hosted review and merge remain pending. Gate A remains
-closed and this work is not a launch authorization.
+terminal-settlement readiness gate. PR 2B.3 merged through PR #107 as
+`017f43e`. PR 3 merged through PR #111 as `8596920`. The PR 4 exact-state
+bootstrap code slice merged through PR #112 as `bccb96b`; strict FIFO,
+operator-reviewed bootstrap/application, and restore evidence remain open. PR
+5 foundations merged through PR #113 (`6176931`) and PR #115 (`1ae6480`);
+production startup/reconnect/periodic wiring and a current operator-reviewed
+reconciliation remain open. Gate A remains closed, the trader remains stopped,
+and none of these merges authorizes startup.
 
 ## 1. Purpose
 
@@ -123,6 +128,15 @@ The required order is:
 12. PR 15 permits only a tiny, manually armed live canary.
 
 PRs may be prepared in parallel only when their files and safety contracts do not overlap. Merge order still follows the dependency chain.
+
+PR 7 is deliberately staged. After the PR 2-through-5 safety foundations,
+Gate-A-only PR 7 slices may merge before PR 6 when they either narrow the
+existing local-paper surface or add dormant, non-authorizing foundations. Such
+slices must not widen admitted strategies or order shapes, consume backtest
+results, set paper readiness true, authorize startup, or add broker-write
+capability. PR 6 remains a prerequisite for strategy readiness cards,
+performance or parameter approval, selector enablement, completion of PR 7,
+and Gate B. This is the sole exception to the merge order above.
 
 # Phase A - Preserve containment and correct the active paper system
 
@@ -1125,7 +1139,17 @@ reconciliation evidence. A numeric PR range never implicitly omits PR 1A or PR
 
 ## Gate A - Supervised local paper readiness
 
-Required PRs: 1, 1A, 1B, 2 through 5, plus relevant parts of 7.
+Required PRs: 1, 1A, 1B, 2 through 5, plus the Gate-A parts of 7 defined below.
+
+The Gate-A PR 7 subset requires baseline-only containment across every
+sanctioned entrypoint; one exact risk contract owning entry sizing and
+admission; quantity flooring and the configured position cap; current canonical
+quote, liquidity, correlation, buying-power, signed-position, and reconciliation
+evidence; durable daily gross-filled-notional restoration and enforcement; and
+exact-once terminal-fill ingestion. Missing, stale, malformed, replaced, or
+quarantined evidence must block entry. Incomplete strategies, shorts, smart
+execution, AI/ML discovery, and take-profit remain disabled. Readiness remains
+false until the integrated evidence is reviewed and passes.
 
 Evidence required:
 
@@ -1339,10 +1363,9 @@ Update after each merge.
   `3ecdaa05b3352ddcd4519662b0fe957751f3fdb1`. PR #106 merged PR 2B.2
   on 2026-07-26 from exact reviewed head
   `6e2b768ea474d7e8e41037c7b3e9a3606ed00482` as
-  `8328c822733b1a2358a8d6f26d368ab0819cd106`. PR 2B.3 implementation and
-  exact-head local review are complete at `14f6b55` on
-  `codex/pr2b3-terminal-settlement`; hosted review and merge remain pending and
-  its readiness gate remains false.
+  `8328c822733b1a2358a8d6f26d368ab0819cd106`. PR 2B.3 merged through PR
+  #107 as `017f43e` after exact-head hosted and local review. Its shared
+  terminal-settlement readiness gate remains false.
 
   PR 2A contains strict exact-`Decimal` models, account/portfolio-aware
   reduce-only validation, zero-crossing and over-close rejection, deterministic
@@ -1513,13 +1536,21 @@ Update after each merge.
   inference with zero input or output tokens; it produced no code verdict and
   was not counted as a pass. The merge grants no order authority or startup
   approval. Gate A remains closed and the trader remains stopped.
-- PR 3: In progress on `codex/pr3-market-data-contract`; implementation and
-  adversarial local review are not yet complete. This status does not authorize
-  startup.
-- PR 4: Not started
-- PR 5: Not started
+- PR 3: Merged through PR #111 as `8596920`. The canonical market-data
+  contract and adversarial tests are present; cumulative Gate-A operational
+  evidence remains required.
+- PR 4: The exact-state bootstrap code slice merged through PR #112 as
+  `bccb96b`. Strict FIFO lot accounting, stopped-system operator review and
+  application, and clean-room backup/restore evidence remain open.
+- PR 5: Reconciliation domain and runtime evidence/service foundations merged
+  through PR #113 (`6176931`) and PR #115 (`1ae6480`). Production
+  startup/reconnect/periodic integration and a current reviewed read-only
+  broker-versus-ledger reconciliation remain open.
 - PR 6: Not started
-- PR 7: Not started
+- PR 7: Staged. Dormant entry-risk PR #114, dormant filled-notional PR #116,
+  and paper-path containment PR #117 are under review. All must remain within
+  the sole Gate-A staging exception above; integration and post-PR6 strategy
+  readiness work remain open.
 - PR 8: Not started
 - PR 9: Not started
 - PR 10: Not started
