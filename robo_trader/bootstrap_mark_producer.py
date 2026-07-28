@@ -18,12 +18,15 @@ import json
 import os
 import re
 import stat
+import threading
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Generic, Protocol, TypeVar
 
 from .config import PAPER_ONLY_EXECUTION_SOURCE, RuntimeContract
+from .market_data_contract import BrokerProtectiveQuote
 from .protective_quote_evidence import (
     ProtectiveQuoteEvidence,
     ProtectiveQuoteSource,
@@ -31,6 +34,7 @@ from .protective_quote_evidence import (
     assert_current_authoritative_protective_quote,
 )
 from .runtime_contract_constants import PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
+from .stop_loss_monitor import StopLossMonitor
 
 BOOTSTRAP_MARK_SCHEMA_VERSION = 1
 BOOTSTRAP_MARK_SOURCE = "pr3-validated-market-data-v1"
@@ -204,6 +208,22 @@ class BootstrapProtectiveMarkReceiver(Protocol, Generic[ReceiverResult]):
         """Consume one validated unsigned protective accounting mark."""
 
 
+class ProtectiveQuoteCollector(Protocol):
+    """Read-only live-quote capability required by bootstrap mark collection."""
+
+    @property
+    def is_connected(self) -> bool:
+        """Return exact current broker connectivity state."""
+
+    async def get_protective_quotes(
+        self,
+        symbols: list[str] | tuple[str, ...],
+        *,
+        active_symbols: list[str] | tuple[str, ...] | None = None,
+    ) -> tuple[BrokerProtectiveQuote, ...]:
+        """Collect exact typed live quotes from one current transport generation."""
+
+
 @dataclass(frozen=True, slots=True)
 class _DatabaseBinding:
     device: int
@@ -211,6 +231,21 @@ class _DatabaseBinding:
     size: int
     mtime_ns: int
     ctime_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class _MarkOnlyProducerBinding:
+    runtime_fingerprint: str
+    account_scope: str
+    database_identity: str
+    database_binding: _DatabaseBinding
+    portfolio_id: str
+
+
+_MARK_ONLY_PRODUCERS: weakref.WeakKeyDictionary[object, _MarkOnlyProducerBinding] = (
+    weakref.WeakKeyDictionary()
+)
+_MARK_ONLY_PRODUCERS_LOCK = threading.Lock()
 
 
 def _validate_runtime(runtime: object) -> tuple[RuntimeContract, _DatabaseBinding]:
@@ -272,6 +307,188 @@ def _assert_database_binding(runtime: RuntimeContract, expected: _DatabaseBindin
     _, observed = _validate_runtime(runtime)
     if observed != expected:
         raise BootstrapMarkBlocked("runtime database changed during mark production")
+
+
+async def _deny_mark_only_reduction(*_args: object, **_kwargs: object) -> None:
+    raise BootstrapMarkBlocked("mark-only producer has no reduction capability")
+
+
+def create_runtime_bound_mark_only_producer(
+    runtime_contract: RuntimeContract,
+    *,
+    portfolio_id: str,
+) -> StopLossMonitor:
+    """Create an exact ``StopLossMonitor`` that can only accept quote evidence.
+
+    ``StopLossMonitor`` requires a reduction callback at construction.  This
+    factory supplies a permanent deny callback and registers the exact monitor
+    against the runtime/database binding.  The collector rejects a changed
+    callback, any stop/execution state, or runtime drift before broker access.
+    """
+
+    normalized_portfolio = _strict_text(portfolio_id, "portfolio_id", _PORTFOLIO_ID)
+    runtime, database_binding = _validate_runtime(runtime_contract)
+    if not isinstance(runtime.safety_account_scope, str):  # pragma: no cover - validated above
+        raise BootstrapMarkBlocked("runtime account scope is unavailable")
+    producer = StopLossMonitor(
+        execute_reduction=_deny_mark_only_reduction,
+        risk_manager=None,
+        portfolio_id=normalized_portfolio,
+    )
+    binding = _MarkOnlyProducerBinding(
+        runtime_fingerprint=runtime.fingerprint,
+        account_scope=runtime.safety_account_scope,
+        database_identity=runtime.database_identity,
+        database_binding=database_binding,
+        portfolio_id=normalized_portfolio,
+    )
+    with _MARK_ONLY_PRODUCERS_LOCK:
+        _MARK_ONLY_PRODUCERS[producer] = binding
+    return producer
+
+
+def _assert_producer_context(
+    producer: object,
+    *,
+    runtime: RuntimeContract,
+    database_binding: _DatabaseBinding,
+    portfolio_id: str,
+) -> None:
+    if type(producer) is not StopLossMonitor:
+        raise BootstrapMarkBlocked("mark collector requires an exact StopLossMonitor producer")
+    if producer.portfolio_id != portfolio_id:
+        raise BootstrapMarkBlocked("protective quote producer portfolio does not match")
+    with _MARK_ONLY_PRODUCERS_LOCK:
+        mark_only_binding = _MARK_ONLY_PRODUCERS.get(producer)
+    if mark_only_binding is None:
+        return
+    if not isinstance(runtime.safety_account_scope, str):  # pragma: no cover - validated above
+        raise BootstrapMarkBlocked("runtime account scope is unavailable")
+    expected = _MarkOnlyProducerBinding(
+        runtime_fingerprint=runtime.fingerprint,
+        account_scope=runtime.safety_account_scope,
+        database_identity=runtime.database_identity,
+        database_binding=database_binding,
+        portfolio_id=portfolio_id,
+    )
+    if mark_only_binding != expected:
+        raise BootstrapMarkBlocked("mark-only producer runtime binding changed")
+    if producer._execute_reduction is not _deny_mark_only_reduction:
+        raise BootstrapMarkBlocked("mark-only producer reduction capability changed")
+    if (
+        producer.active_stops
+        or producer.monitoring_active
+        or producer._pending_stop_triggers
+        or producer._latched_stop_crossings
+        or producer._queued_stop_orders
+        or producer._inflight_stop_orders
+    ):
+        raise BootstrapMarkBlocked("mark-only producer contains trading execution state")
+
+
+@dataclass(frozen=True, slots=True)
+class _CollectorCapabilityIdentity:
+    collector_type: type[object]
+    method_function: object
+
+
+def _quote_collector_capability(
+    source: object,
+    *,
+    expected: _CollectorCapabilityIdentity | None = None,
+):
+    try:
+        connected = getattr(source, "is_connected")
+        capability = getattr(source, "get_protective_quotes")
+    except Exception as exc:
+        raise BootstrapMarkBlocked("protective quote collector capability is unavailable") from exc
+    if type(connected) is not bool or connected is not True:
+        raise BootstrapMarkBlocked("protective quote collector is not connected")
+    method_owner = getattr(capability, "__self__", None)
+    method_function = getattr(capability, "__func__", None)
+    if method_owner is not source or method_function is None or not callable(capability):
+        raise BootstrapMarkBlocked("protective quote collector capability is not a bound method")
+    identity = _CollectorCapabilityIdentity(type(source), method_function)
+    if expected is not None and identity != expected:
+        raise BootstrapMarkBlocked("protective quote collector capability changed")
+    return capability, identity
+
+
+def _validated_broker_quote(
+    value: object,
+    *,
+    symbol: str,
+    con_id: int,
+    transport_generation: str,
+) -> tuple[BrokerProtectiveQuote, tuple[object, ...]]:
+    if type(value) is not BrokerProtectiveQuote:
+        raise BootstrapMarkBlocked("collector must return exact BrokerProtectiveQuote evidence")
+    try:
+        checked = BrokerProtectiveQuote(
+            schema_version=value.schema_version,
+            symbol=value.symbol,
+            con_id=value.con_id,
+            exchange=value.exchange,
+            primary_exchange=value.primary_exchange,
+            currency=value.currency,
+            security_type=value.security_type,
+            price=value.price,
+            source_timestamp=value.source_timestamp,
+            retrieval_timestamp=value.retrieval_timestamp,
+            session=value.session,
+            source=value.source,
+            source_event_id=value.source_event_id,
+            transport_generation=value.transport_generation,
+            market_data_type=value.market_data_type,
+        )
+    except Exception as exc:
+        raise BootstrapMarkBlocked(
+            "collector returned malformed protective quote evidence"
+        ) from exc
+    if checked != value:
+        raise BootstrapMarkBlocked("collector protective quote changed during validation")
+    if checked.symbol != symbol:
+        raise BootstrapMarkBlocked("collector protective quote symbol does not match")
+    if checked.con_id != con_id:
+        raise BootstrapMarkBlocked("collector protective quote contract does not match")
+    if checked.transport_generation != transport_generation:
+        raise BootstrapMarkBlocked("collector protective quote transport generation does not match")
+    signature = (
+        checked.schema_version,
+        checked.symbol,
+        checked.con_id,
+        checked.exchange,
+        checked.primary_exchange,
+        checked.currency,
+        checked.security_type,
+        checked.price,
+        checked.source_timestamp,
+        checked.retrieval_timestamp,
+        checked.session,
+        checked.source,
+        checked.source_event_id,
+        checked.transport_generation,
+        checked.market_data_type,
+    )
+    return checked, signature
+
+
+def _assert_broker_quote_unchanged(
+    value: BrokerProtectiveQuote,
+    expected_signature: tuple[object, ...],
+    *,
+    symbol: str,
+    con_id: int,
+    transport_generation: str,
+) -> None:
+    _, current = _validated_broker_quote(
+        value,
+        symbol=symbol,
+        con_id=con_id,
+        transport_generation=transport_generation,
+    )
+    if current != expected_signature:
+        raise BootstrapMarkBlocked("collector protective quote changed after collection")
 
 
 def _revalidate_quote(
@@ -376,3 +593,130 @@ def produce_bootstrap_protective_mark(
     if not callable(capability):
         raise BootstrapMarkBlocked("bootstrap protective mark receiver capability is unavailable")
     return capability(result)
+
+
+async def collect_and_produce_bootstrap_protective_mark(
+    quote_source: ProtectiveQuoteCollector,
+    producer: StopLossMonitor,
+    runtime_contract: RuntimeContract,
+    receiver: BootstrapProtectiveMarkReceiver[ReceiverResult],
+    *,
+    expected_portfolio_id: str,
+    expected_symbol: str,
+    expected_con_id: int,
+    expected_transport_generation: str,
+    expected_source_event_id: str | None = None,
+) -> ReceiverResult:
+    """Collect one live quote and deliver its producer-owned accounting mark.
+
+    The source is called only through ``get_protective_quotes`` and receives no
+    artifact, signer, output path, monitor, or receiver capability.  The exact
+    typed quote is published through the portfolio-owned monitor, which is the
+    only supported way to create ``ProtectiveQuoteEvidence``.
+    """
+
+    portfolio_id = _strict_text(
+        expected_portfolio_id,
+        "expected_portfolio_id",
+        _PORTFOLIO_ID,
+    )
+    symbol = _strict_text(expected_symbol, "expected_symbol", _SYMBOL)
+    con_id = _positive_int(expected_con_id, "expected_con_id")
+    transport_generation = _strict_text(
+        expected_transport_generation,
+        "expected_transport_generation",
+        _TRANSPORT_GENERATION,
+    )
+    source_event_id = (
+        None
+        if expected_source_event_id is None
+        else _strict_text(
+            expected_source_event_id,
+            "expected_source_event_id",
+            _SOURCE_EVENT_ID,
+        )
+    )
+    runtime, database_binding = _validate_runtime(runtime_contract)
+    _assert_producer_context(
+        producer,
+        runtime=runtime,
+        database_binding=database_binding,
+        portfolio_id=portfolio_id,
+    )
+    typed_producer = producer
+    capability, capability_identity = _quote_collector_capability(quote_source)
+    try:
+        collected = await capability((symbol,), active_symbols=(symbol,))
+    except BootstrapMarkBlocked:
+        raise
+    except Exception as exc:
+        raise BootstrapMarkBlocked("protective quote collection failed closed") from exc
+    _quote_collector_capability(quote_source, expected=capability_identity)
+    if type(collected) is not tuple or len(collected) != 1:
+        raise BootstrapMarkBlocked("protective quote collection is not exact and complete")
+    source_quote = collected[0]
+    checked_quote, quote_signature = _validated_broker_quote(
+        source_quote,
+        symbol=symbol,
+        con_id=con_id,
+        transport_generation=transport_generation,
+    )
+    if source_event_id is not None and checked_quote.source_event_id != source_event_id:
+        raise BootstrapMarkBlocked("collector protective quote source event does not match")
+    _assert_database_binding(runtime, database_binding)
+    _assert_producer_context(
+        producer,
+        runtime=runtime,
+        database_binding=database_binding,
+        portfolio_id=portfolio_id,
+    )
+    accepted = await typed_producer.update_price(
+        checked_quote.symbol,
+        checked_quote.price,
+        source_timestamp=checked_quote.source_timestamp,
+        source=ProtectiveQuoteSource.LIVE_BROKER,
+        con_id=checked_quote.con_id,
+        transport_generation=checked_quote.transport_generation,
+        source_event_id=checked_quote.source_event_id,
+    )
+    if accepted is not True:
+        raise BootstrapMarkBlocked("portfolio producer rejected the collected protective quote")
+
+    _quote_collector_capability(quote_source, expected=capability_identity)
+    _assert_broker_quote_unchanged(
+        source_quote,
+        quote_signature,
+        symbol=symbol,
+        con_id=con_id,
+        transport_generation=transport_generation,
+    )
+    _assert_database_binding(runtime, database_binding)
+    _assert_producer_context(
+        producer,
+        runtime=runtime,
+        database_binding=database_binding,
+        portfolio_id=portfolio_id,
+    )
+    evidence = typed_producer.get_protective_quote_evidence(symbol)
+    if evidence is None:
+        raise BootstrapMarkBlocked("portfolio producer did not retain protective quote evidence")
+    checked_evidence = _revalidate_quote(
+        evidence,
+        producer=typed_producer,
+        portfolio_id=portfolio_id,
+        symbol=symbol,
+        con_id=con_id,
+        transport_generation=transport_generation,
+        source_event_id=checked_quote.source_event_id,
+    )
+    return produce_bootstrap_protective_mark(
+        checked_evidence,
+        typed_producer,
+        runtime,
+        receiver,
+        expected_portfolio_id=portfolio_id,
+        expected_symbol=symbol,
+        expected_con_id=con_id,
+        expected_transport_generation=transport_generation,
+        expected_source_event_id=checked_quote.source_event_id,
+    )
