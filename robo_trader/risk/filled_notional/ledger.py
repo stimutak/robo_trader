@@ -68,6 +68,7 @@ _ZERO_HASH = "0" * 64
 _SCHEMA_VERSION = 3
 _ANCHOR_VERSION = 2
 _MAX_DAILY_FILL_ROWS = 100_000
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 _IDENTIFIER_RE = re.compile(r"[\x21-\x7e]{1,128}\Z")
 _CURRENCY_RE = re.compile(r"[A-Z]{3}\Z")
 _LEDGER_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
@@ -1316,6 +1317,8 @@ class DailyFilledNotional:
         except FileNotFoundError:
             pass
 
+        self._reject_sidecars_without_database()
+
         binding: Optional[SQLitePathBinding] = None
         connection: Optional[sqlite3.Connection] = None
         try:
@@ -1382,6 +1385,24 @@ class DailyFilledNotional:
                 connection.close()
             if binding is not None:
                 binding.close()
+
+    def _reject_sidecars_without_database(self) -> None:
+        """Preserve ambiguous SQLite recovery evidence when the main file is absent."""
+
+        for suffix in _SQLITE_SIDECAR_SUFFIXES:
+            sidecar = Path(f"{self._path}{suffix}")
+            try:
+                os.lstat(sidecar)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise FilledNotionalUnavailable(
+                    "SQLite sidecar identity cannot be inspected safely"
+                ) from exc
+            raise FilledNotionalUnavailable(
+                "SQLite sidecar exists while the main database is absent; "
+                "preserve it for reviewed recovery"
+            )
 
     def _recover_hot_journal(self) -> None:
         """Force identity-bound SQLite recovery before any read-only open."""

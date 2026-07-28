@@ -495,6 +495,74 @@ def test_current_query_is_read_only(tmp_path):
     assert not Path(f"{ledger.database_path}-wal").exists()
 
 
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+@pytest.mark.parametrize("sidecar_kind", ["plain", "hardlink", "symlink", "directory"])
+def test_missing_database_preserves_and_rejects_every_sqlite_sidecar(
+    tmp_path, suffix, sidecar_kind
+):
+    path = tmp_path / "notional.db"
+    sidecar = Path(f"{path}{suffix}")
+    preserved_target = tmp_path / f"preserved-{sidecar_kind}{suffix}"
+    marker = None
+
+    if sidecar_kind == "plain":
+        sidecar.write_bytes(b"preserve plain sidecar evidence")
+    elif sidecar_kind == "hardlink":
+        preserved_target.write_bytes(b"preserve hardlinked sidecar evidence")
+        os.link(preserved_target, sidecar)
+    elif sidecar_kind == "symlink":
+        preserved_target.write_bytes(b"preserve symlink target evidence")
+        sidecar.symlink_to(preserved_target)
+    else:
+        sidecar.mkdir()
+        marker = sidecar / "preserve.marker"
+        marker.write_bytes(b"preserve non-regular sidecar evidence")
+
+    def stable_metadata(candidate: Path):
+        metadata = candidate.lstat()
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_nlink,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+
+    sidecar_metadata = stable_metadata(sidecar)
+    sidecar_link = os.readlink(sidecar) if sidecar_kind == "symlink" else None
+    target_metadata = (
+        stable_metadata(preserved_target) if sidecar_kind in {"hardlink", "symlink"} else None
+    )
+    target_bytes = (
+        preserved_target.read_bytes() if sidecar_kind in {"hardlink", "symlink"} else None
+    )
+    sidecar_bytes = sidecar.read_bytes() if sidecar_kind == "plain" else None
+    marker_metadata = stable_metadata(marker) if marker is not None else None
+    marker_bytes = marker.read_bytes() if marker is not None else None
+
+    with pytest.raises(FilledNotionalUnavailable, match="main database is absent"):
+        _service(path)
+
+    assert not path.exists()
+    assert not _anchor_path(path).exists()
+    assert stable_metadata(sidecar) == sidecar_metadata
+    if sidecar_kind == "plain":
+        assert sidecar.read_bytes() == sidecar_bytes
+    elif sidecar_kind in {"hardlink", "symlink"}:
+        assert stable_metadata(preserved_target) == target_metadata
+        assert preserved_target.read_bytes() == target_bytes
+        if sidecar_kind == "hardlink":
+            assert sidecar.samefile(preserved_target)
+        else:
+            assert os.readlink(sidecar) == sidecar_link
+    else:
+        assert marker is not None
+        assert stable_metadata(marker) == marker_metadata
+        assert marker.read_bytes() == marker_bytes
+
+
 def test_wal_shm_hardlinks_are_rejected_without_mutating_targets(tmp_path):
     path = tmp_path / "notional.db"
     ledger = _service(path)
