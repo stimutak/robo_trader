@@ -302,7 +302,7 @@ _COMPLETED_ORDER_SCOPE_KEYS = {
     "kind",
     "api_method",
     "api_only",
-    "all_clients",
+    "client_scope",
     "request_count",
     "stability_check",
     "retention_scope",
@@ -317,7 +317,6 @@ _COMPLETED_ORDER_SCOPE_KEYS = {
 _BROKER_SNAPSHOT_MAX_AGE_SECONDS = 300.0
 _BROKER_SNAPSHOT_MAX_WINDOW_SECONDS = 60.0
 _BROKER_SNAPSHOT_MAX_CLOCK_SKEW_SECONDS = 120.0
-_BROKER_EXECUTION_LOOKBACK_SECONDS = 24 * 60 * 60
 _CONTRACT_TEXT_RE = re.compile(r"^[A-Z0-9][A-Z0-9._:/-]{0,63}$")
 _BROKER_SAFETY_SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
 _OPAQUE_ACCOUNT_SCOPE_RE = re.compile(r"^acct_v1_[0-9a-f]{64}$")
@@ -2094,16 +2093,29 @@ class SubprocessIBKRClient:
                 "kind",
                 "start_at",
                 "end_at",
+                "retention_scope",
+                "full_history",
+                "commission_scope",
             }:
                 raise ValueError("broker snapshot execution scope schema is invalid")
-            if execution_scope["kind"] != "bounded_execution_filter":
+            if execution_scope["kind"] != "broker_date_since_midnight":
                 raise ValueError("broker snapshot execution scope is unsupported")
+            if (
+                execution_scope["retention_scope"] != "ibkr_gateway_broker_date_since_midnight"
+                or execution_scope["full_history"] is not False
+                or execution_scope["commission_scope"]
+                != "matching_callbacks_for_returned_executions"
+            ):
+                raise ValueError("broker snapshot execution retention scope is unsupported")
             execution_start = self._strict_timestamp(
                 execution_scope["start_at"], "execution scope start"
             )
             execution_end = self._strict_timestamp(execution_scope["end_at"], "execution scope end")
-            expected_execution_start = broker_before.replace(microsecond=0) - timedelta(
-                seconds=_BROKER_EXECUTION_LOOKBACK_SECONDS
+            expected_execution_start = broker_before.replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
             )
             if execution_start != expected_execution_start:
                 raise ValueError("broker snapshot execution scope does not match the wire filter")
@@ -2304,7 +2316,7 @@ class SubprocessIBKRClient:
             value["kind"] != "ibkr_current_retained_completed_orders"
             or value["api_method"] != "reqCompletedOrders"
             or value["api_only"] is not False
-            or value["all_clients"] is not True
+            or value["client_scope"] != "api_and_manual_orders_visible_to_current_tws_session"
             or type(value["request_count"]) is not int
             or value["request_count"] != 2
             or value["stability_check"] != "identical_second_read"
@@ -3750,6 +3762,32 @@ class SubprocessIBKRClient:
         """Check if connected to IBKR"""
         connected, _, _, _, _, _ = self._connection_state_snapshot()
         return connected
+
+    @property
+    def protective_quote_generation(self) -> str:
+        """Return the exact live read-only generation usable for quote collection."""
+
+        generation = self._generation
+        if generation is None:
+            raise IBKRTransportPoisonedError(
+                "Protective quote source has no current worker generation"
+            )
+        with generation.state_lock:
+            with self._connection_state_lock:
+                identity = self._connection_identity
+                if (
+                    self._generation is not generation
+                    or generation.poisoned_reason is not None
+                    or self._connected is not True
+                    or self._connection_generation_id != generation.generation_id
+                    or identity is None
+                    or identity[1] != 4002
+                    or identity[3] is not True
+                ):
+                    raise IBKRTransportPoisonedError(
+                        "Protective quote source generation is not current paper/read-only"
+                    )
+                return generation.generation_id
 
     @property
     def gateway_failure_detail(self) -> Optional[str]:

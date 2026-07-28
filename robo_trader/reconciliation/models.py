@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence
@@ -284,7 +284,7 @@ class BrokerExecutionScope:
     end_at: datetime
 
     def __post_init__(self) -> None:
-        if self.kind != "bounded_execution_filter":
+        if self.kind not in {"bounded_execution_filter", "broker_date_since_midnight"}:
             raise BrokerEvidenceError("broker execution scope is unsupported")
         object.__setattr__(
             self,
@@ -303,10 +303,26 @@ class BrokerExecutionScope:
                 "broker execution scope start is not the exact whole-second wire filter"
             )
         duration_seconds = (self.end_at - self.start_at).total_seconds()
-        # The upper bound is the 60-second snapshot collection limit plus the
-        # sub-second amount discarded by IBKR's whole-second wire format.
-        if duration_seconds < 86400 or duration_seconds >= 86461:
-            raise BrokerEvidenceError("broker execution scope is not the exact bounded window")
+        if self.kind == "bounded_execution_filter":
+            # Backward-compatible only for the historical exact 24-hour wire
+            # request plus the bounded snapshot-collection tail.
+            if duration_seconds < 86400 or duration_seconds >= 86461:
+                raise BrokerEvidenceError("broker execution scope is not the exact bounded window")
+        else:
+            expected_midnight = self.start_at.replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            if self.start_at != expected_midnight or self.end_at.date() != self.start_at.date():
+                raise BrokerEvidenceError(
+                    "broker execution scope is not bounded to one broker date"
+                )
+            if duration_seconds >= 86400:
+                raise BrokerEvidenceError("broker execution scope overclaims broker retention")
+        if self.end_at > datetime.now(timezone.utc) + timedelta(seconds=120):
+            raise BrokerEvidenceError("broker execution scope ends in the future")
 
     def public_dict(self) -> dict[str, str]:
         return {

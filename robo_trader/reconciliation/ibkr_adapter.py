@@ -14,9 +14,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import MappingProxyType
-from typing import Any, Awaitable, Mapping, Protocol, SupportsIndex
+from typing import Any, Awaitable, Generic, Mapping, Protocol, SupportsIndex, TypeVar
 
 from robo_trader.clients.subprocess_ibkr_client import SubprocessIBKRClient
+from robo_trader.market_data_contract import BrokerProtectiveQuote
 
 from .domain import (
     BrokerCollectionEvidence,
@@ -32,7 +33,11 @@ from .domain import (
     ReconciliationDomainError,
 )
 from .errors import BrokerEvidenceError
-from .identity import RuntimeSafetyContext, mask_account_identifier
+from .identity import (
+    RuntimeSafetyContext,
+    assert_validated_runtime_safety_context,
+    mask_account_identifier,
+)
 from .models import (
     BrokerExecution,
     BrokerExecutionScope,
@@ -121,7 +126,16 @@ _EXECUTION_KEYS = frozenset(
         "unavailable",
     }
 )
-_EXECUTION_SCOPE_KEYS = frozenset({"kind", "start_at", "end_at"})
+_EXECUTION_SCOPE_KEYS = frozenset(
+    {
+        "kind",
+        "start_at",
+        "end_at",
+        "retention_scope",
+        "full_history",
+        "commission_scope",
+    }
+)
 _ORDER_OPTIONAL_KEYS = frozenset(
     {"permanent_id", "limit_price", "stop_price", "avg_fill_price", "last_status_at"}
 )
@@ -144,7 +158,7 @@ _COMPLETED_ORDER_SCOPE_KEYS = frozenset(
         "kind",
         "api_method",
         "api_only",
-        "all_clients",
+        "client_scope",
         "request_count",
         "stability_check",
         "retention_scope",
@@ -172,7 +186,7 @@ class CompletedOrderCollectionScope:
     kind: str
     api_method: str
     api_only: bool
-    all_clients: bool
+    client_scope: str
     request_count: int
     stability_check: str
     retention_scope: str
@@ -186,11 +200,11 @@ class CompletedOrderCollectionScope:
 
     def canonical_dict(self) -> dict[str, object]:
         return {
-            "all_clients": self.all_clients,
             "api_method": self.api_method,
             "api_only": self.api_only,
             "broker_time_after": self.broker_time_after.isoformat(),
             "broker_time_before": self.broker_time_before.isoformat(),
+            "client_scope": self.client_scope,
             "full_history": self.full_history,
             "kind": self.kind,
             "request_count": self.request_count,
@@ -200,6 +214,28 @@ class CompletedOrderCollectionScope:
             "stability_check": self.stability_check,
             "verification_completed_at": self.verification_completed_at.isoformat(),
             "verification_started_at": self.verification_started_at.isoformat(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionCollectionScope:
+    """Exact broker-retained execution and matching commission scope."""
+
+    kind: str
+    start_at: datetime
+    end_at: datetime
+    retention_scope: str
+    full_history: bool
+    commission_scope: str
+
+    def canonical_dict(self) -> dict[str, object]:
+        return {
+            "commission_scope": self.commission_scope,
+            "end_at": self.end_at.isoformat(),
+            "full_history": self.full_history,
+            "kind": self.kind,
+            "retention_scope": self.retention_scope,
+            "start_at": self.start_at.isoformat(),
         }
 
 
@@ -249,6 +285,7 @@ class BrokerSnapshotProducerResult:
     __slots__ = (
         "snapshot",
         "completed_order_scope",
+        "execution_scope",
         "purpose",
         "_producer_marker",
         "_construction_capability",
@@ -257,6 +294,7 @@ class BrokerSnapshotProducerResult:
 
     snapshot: NormalizedBrokerSnapshot
     completed_order_scope: CompletedOrderCollectionScope
+    execution_scope: ExecutionCollectionScope
     purpose: str
     _producer_marker: object
     _construction_capability: _BrokerSnapshotResultCapability
@@ -266,6 +304,8 @@ class BrokerSnapshotProducerResult:
             raise BrokerEvidenceError("broker producer result is not normalized")
         if type(self.completed_order_scope) is not CompletedOrderCollectionScope:
             raise BrokerEvidenceError("broker producer completed-order scope is invalid")
+        if type(self.execution_scope) is not ExecutionCollectionScope:
+            raise BrokerEvidenceError("broker producer execution scope is invalid")
         if self.purpose != _BROKER_RESULT_PURPOSE:
             raise BrokerEvidenceError("broker producer result purpose is invalid")
         if self._producer_marker is not _BROKER_RESULT_MARKER:
@@ -293,18 +333,23 @@ class BrokerSnapshotProducerResult:
         raise TypeError("broker producer result cannot be pickled")
 
 
-_BrokerResultRegistryEntry = tuple[
-    weakref.ReferenceType[BrokerSnapshotProducerResult],
-    str,
-    str,
-]
+@dataclass(frozen=True, slots=True)
+class _BrokerResultRegistryEntry:
+    result: BrokerSnapshotProducerResult
+    receiver: object
+    digest: str
+    registration_token: object
+
+
 _BROKER_RESULT_REGISTRY: dict[int, _BrokerResultRegistryEntry] = {}
+_CONSUMED_BROKER_RESULT_REGISTRATIONS: set[object] = set()
 
 
 def _broker_result_payload(result: BrokerSnapshotProducerResult) -> str:
     return json.dumps(
         {
             "completed_order_collection_scope": result.completed_order_scope.canonical_dict(),
+            "execution_collection_scope": result.execution_scope.canonical_dict(),
             "purpose": result.purpose,
             "snapshot": json.loads(result.snapshot.canonical_payload()),
         },
@@ -327,6 +372,7 @@ def _produce_broker_snapshot_result(
     *,
     snapshot: NormalizedBrokerSnapshot,
     completed_order_scope: CompletedOrderCollectionScope,
+    execution_scope: ExecutionCollectionScope,
 ) -> BrokerSnapshotProducerResult:
     if type(producer) is not IBKRDiagnosticSnapshotProvider:
         raise BrokerEvidenceError("broker producer result requires the diagnostic provider")
@@ -342,45 +388,93 @@ def _produce_broker_snapshot_result(
     result = BrokerSnapshotProducerResult(
         snapshot=snapshot,
         completed_order_scope=completed_order_scope,
+        execution_scope=execution_scope,
         purpose=capability.purpose,
         _producer_marker=_BROKER_RESULT_MARKER,
         _construction_capability=capability,
     )
-    object_id = id(result)
-
-    def discard(reference: weakref.ReferenceType[BrokerSnapshotProducerResult]) -> None:
-        with _BROKER_RESULT_REGISTRY_LOCK:
-            registered = _BROKER_RESULT_REGISTRY.get(object_id)
-            if registered is not None and registered[0] is reference:
-                _BROKER_RESULT_REGISTRY.pop(object_id, None)
-
-    reference = weakref.ref(result, discard)
-    digest = _broker_result_digest(result)
-    with _BROKER_RESULT_REGISTRY_LOCK:
-        _BROKER_RESULT_REGISTRY[object_id] = (reference, digest, capability.purpose)
     return result
+
+
+def _register_broker_result(result: BrokerSnapshotProducerResult, receiver: object) -> object:
+    registration_token = object()
+    entry = _BrokerResultRegistryEntry(
+        result=result,
+        receiver=receiver,
+        digest=_broker_result_digest(result),
+        registration_token=registration_token,
+    )
+    with _BROKER_RESULT_REGISTRY_LOCK:
+        if id(result) in _BROKER_RESULT_REGISTRY:
+            raise BrokerEvidenceError("broker producer result registration collided")
+        _BROKER_RESULT_REGISTRY[id(result)] = entry
+    return registration_token
+
+
+def _abandon_broker_result_registration(
+    result: BrokerSnapshotProducerResult,
+    registration_token: object,
+) -> None:
+    with _BROKER_RESULT_REGISTRY_LOCK:
+        entry = _BROKER_RESULT_REGISTRY.get(id(result))
+        if entry is not None and entry.registration_token is registration_token:
+            _BROKER_RESULT_REGISTRY.pop(id(result), None)
+        _CONSUMED_BROKER_RESULT_REGISTRATIONS.discard(registration_token)
+
+
+def _assert_broker_result_registration_consumed(
+    result: BrokerSnapshotProducerResult,
+    registration_token: object,
+) -> None:
+    with _BROKER_RESULT_REGISTRY_LOCK:
+        if registration_token in _CONSUMED_BROKER_RESULT_REGISTRATIONS:
+            _CONSUMED_BROKER_RESULT_REGISTRATIONS.remove(registration_token)
+            return
+        entry = _BROKER_RESULT_REGISTRY.get(id(result))
+        if entry is not None and entry.registration_token is registration_token:
+            _BROKER_RESULT_REGISTRY.pop(id(result), None)
+    raise BrokerEvidenceError("broker receiver did not authenticate its one-shot result")
 
 
 def assert_producer_owned_broker_snapshot_result(
     result: BrokerSnapshotProducerResult,
+    *,
+    receiver: object,
 ) -> BrokerSnapshotProducerResult:
-    """Claim the exact signer-purpose handoff once; reject forgery and replay."""
+    """Consume one exact result registered to the asserting signing receiver."""
 
     if type(result) is not BrokerSnapshotProducerResult:
         raise BrokerEvidenceError("exact broker producer result is required")
     digest = _broker_result_digest(result)
     with _BROKER_RESULT_REGISTRY_LOCK:
-        registered = _BROKER_RESULT_REGISTRY.pop(id(result), None)
-        if registered is None or registered[0]() is not result:
+        registered = _BROKER_RESULT_REGISTRY.get(id(result))
+        if registered is None or registered.result is not result:
             raise BrokerEvidenceError("broker producer result is absent or already consumed")
+        if registered.receiver is not receiver:
+            raise BrokerEvidenceError("broker producer result belongs to a different receiver")
         if (
-            registered[2] != _BROKER_RESULT_PURPOSE
-            or result.purpose != _BROKER_RESULT_PURPOSE
+            result.purpose != _BROKER_RESULT_PURPOSE
             or result._producer_marker is not _BROKER_RESULT_MARKER
-            or not hmac.compare_digest(registered[1], digest)
+            or not hmac.compare_digest(registered.digest, digest)
         ):
+            _BROKER_RESULT_REGISTRY.pop(id(result), None)
             raise BrokerEvidenceError("broker producer result failed ownership validation")
+        _BROKER_RESULT_REGISTRY.pop(id(result), None)
+        _CONSUMED_BROKER_RESULT_REGISTRATIONS.add(registered.registration_token)
     return result
+
+
+BrokerReceiverResult = TypeVar("BrokerReceiverResult", covariant=True)
+
+
+class BootstrapBrokerResultReceiver(Protocol, Generic[BrokerReceiverResult]):
+    """The only post-production handoff available to the broker signer."""
+
+    def receive_broker_snapshot_producer_result(
+        self,
+        result: BrokerSnapshotProducerResult,
+    ) -> BrokerReceiverResult:
+        """Consume one exact registered broker result."""
 
 
 class DiagnosticTransport(Protocol):
@@ -406,6 +500,22 @@ class DiagnosticTransport(Protocol):
 
     async def stop(self) -> None:
         """Stop and reap the isolated worker."""
+
+    @property
+    def is_connected(self) -> bool:
+        """Return exact current connection state."""
+
+    @property
+    def protective_quote_generation(self) -> str:
+        """Return the exact live read-only worker generation."""
+
+    async def get_protective_quotes(
+        self,
+        symbols: list[str] | tuple[str, ...],
+        *,
+        active_symbols: list[str] | tuple[str, ...] | None = None,
+    ) -> tuple[BrokerProtectiveQuote, ...]:
+        """Collect current-generation live protective quotes."""
 
 
 def _record(value: object, keys: frozenset[str], label: str) -> Mapping[str, Any]:
@@ -447,7 +557,7 @@ def _completed_order_scope(
         record["kind"] != "ibkr_current_retained_completed_orders"
         or record["api_method"] != "reqCompletedOrders"
         or record["api_only"] is not False
-        or record["all_clients"] is not True
+        or record["client_scope"] != "api_and_manual_orders_visible_to_current_tws_session"
         or type(record["request_count"]) is not int
         or record["request_count"] != 2
         or record["stability_check"] != "identical_second_read"
@@ -459,7 +569,7 @@ def _completed_order_scope(
         kind=record["kind"],
         api_method=record["api_method"],
         api_only=record["api_only"],
-        all_clients=record["all_clients"],
+        client_scope=record["client_scope"],
         request_count=record["request_count"],
         stability_check=record["stability_check"],
         retention_scope=record["retention_scope"],
@@ -491,6 +601,42 @@ def _completed_order_scope(
         or scope.verification_completed_at > broker_time_after + timedelta(seconds=120)
     ):
         raise BrokerEvidenceError("diagnostic broker completed-order request bounds are unbounded")
+    return scope
+
+
+def _execution_collection_scope(
+    value: object,
+    *,
+    broker_time_before: datetime,
+    broker_time_after: datetime,
+) -> ExecutionCollectionScope:
+    record = _record(value, _EXECUTION_SCOPE_KEYS, "execution scope")
+    if (
+        record["kind"] != "broker_date_since_midnight"
+        or record["retention_scope"] != "ibkr_gateway_broker_date_since_midnight"
+        or record["full_history"] is not False
+        or record["commission_scope"] != "matching_callbacks_for_returned_executions"
+    ):
+        raise BrokerEvidenceError("diagnostic broker execution retention scope is unsupported")
+    scope = ExecutionCollectionScope(
+        kind=record["kind"],
+        start_at=_timestamp(record["start_at"], "execution scope start"),
+        end_at=_timestamp(record["end_at"], "execution scope end"),
+        retention_scope=record["retention_scope"],
+        full_history=record["full_history"],
+        commission_scope=record["commission_scope"],
+    )
+    expected_start = broker_time_before.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    if (
+        scope.start_at != expected_start
+        or not broker_time_before <= scope.end_at <= broker_time_after
+    ):
+        raise BrokerEvidenceError("diagnostic broker execution scope is inconsistent")
     return scope
 
 
@@ -729,21 +875,16 @@ def snapshot_from_transport(
             )
         )
 
-    execution_scope = _record(record["execution_scope"], _EXECUTION_SCOPE_KEYS, "execution scope")
-    if execution_scope["kind"] != "bounded_execution_filter":
-        raise BrokerEvidenceError("diagnostic broker execution scope is unsupported")
-    scope_start = _timestamp(execution_scope["start_at"], "execution scope start")
-    scope_end = _timestamp(execution_scope["end_at"], "execution scope end")
     broker_time_before = _timestamp(record["broker_time_before"], "broker time before")
     broker_time_after = _timestamp(record["broker_time_after"], "broker time after")
     retrieved_at = _timestamp(record["retrieved_at"], "retrieval timestamp")
-    expected_scope_start = broker_time_before.replace(microsecond=0) - timedelta(hours=24)
-    if scope_start != expected_scope_start:
-        raise BrokerEvidenceError(
-            "diagnostic broker execution scope does not match the wire filter"
-        )
-    if not broker_time_before <= scope_end <= broker_time_after:
-        raise BrokerEvidenceError("diagnostic broker execution scope is inconsistent")
+    execution_collection_scope = _execution_collection_scope(
+        record["execution_scope"],
+        broker_time_before=broker_time_before,
+        broker_time_after=broker_time_after,
+    )
+    scope_start = execution_collection_scope.start_at
+    scope_end = execution_collection_scope.end_at
     if any(execution.commission is None for execution in executions):
         raise BrokerEvidenceError("diagnostic broker commission evidence is incomplete")
     _complete_collection_evidence(
@@ -761,14 +902,14 @@ def snapshot_from_transport(
         },
     )
 
-    snapshot = BrokerSnapshot(
+    return BrokerSnapshot(
         schema_version=1,
         account_alias=mask_account_identifier(expected_account),
         broker_time_before=broker_time_before,
         broker_time_after=broker_time_after,
         retrieved_at=retrieved_at,
         execution_scope=BrokerExecutionScope(
-            kind=execution_scope["kind"],
+            kind=execution_collection_scope.kind,
             start_at=scope_start,
             end_at=scope_end,
         ),
@@ -777,7 +918,6 @@ def snapshot_from_transport(
         recent_executions=tuple(executions),
         balances=MappingProxyType(balances),
     )
-    return snapshot
 
 
 def _normalized_snapshot_from_transport(
@@ -818,21 +958,13 @@ def _normalized_snapshot_from_transport(
         raise BrokerEvidenceError("diagnostic broker collection window is reversed")
     if not broker_time_before <= account_observed_at <= broker_time_after:
         raise BrokerEvidenceError("diagnostic broker account evidence is outside bounds")
-    execution_scope = _record(
+    execution_collection_scope = _execution_collection_scope(
         record["execution_scope"],
-        _EXECUTION_SCOPE_KEYS,
-        "execution scope",
+        broker_time_before=broker_time_before,
+        broker_time_after=broker_time_after,
     )
-    if execution_scope["kind"] != "bounded_execution_filter":
-        raise BrokerEvidenceError("diagnostic broker execution scope is unsupported")
-    execution_start = _timestamp(execution_scope["start_at"], "execution scope start")
-    execution_end = _timestamp(execution_scope["end_at"], "execution scope end")
-    if execution_start != broker_time_before.replace(microsecond=0) - timedelta(hours=24):
-        raise BrokerEvidenceError(
-            "diagnostic broker execution scope does not match the wire filter"
-        )
-    if not broker_time_before <= execution_end <= broker_time_after:
-        raise BrokerEvidenceError("diagnostic broker execution scope is inconsistent")
+    execution_start = execution_collection_scope.start_at
+    execution_end = execution_collection_scope.end_at
 
     raw_positions = _records(record["positions"], "positions")
     raw_open_orders = _records(record["open_orders"], "open orders")
@@ -1117,10 +1249,299 @@ def _completed_order_scope_from_transport(payload: object) -> CompletedOrderColl
     )
 
 
+def _execution_scope_from_transport(payload: object) -> ExecutionCollectionScope:
+    record = _record(payload, _TOP_LEVEL_KEYS, "snapshot")
+    return _execution_collection_scope(
+        record["execution_scope"],
+        broker_time_before=_timestamp(record["broker_time_before"], "broker time before"),
+        broker_time_after=_timestamp(record["broker_time_after"], "broker time after"),
+    )
+
+
+_FACTORY_PROVIDER_MARKER = object()
+_FACTORY_PROVIDER_KEY = secrets.token_bytes(32)
+_FACTORY_PROVIDER_LOCK = threading.Lock()
+_QUOTE_SOURCE_MARKER = object()
+_QUOTE_SOURCE_KEY = secrets.token_bytes(32)
+_QUOTE_SOURCE_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True, slots=True)
+class _FactoryProviderEntry:
+    provider: IBKRDiagnosticSnapshotProvider
+    transport: SubprocessIBKRClient
+    runtime_contract: object
+    transport_generation: str
+    digest: str
+
+
+_FACTORY_PROVIDERS: dict[int, _FactoryProviderEntry] = {}
+
+
+def _factory_provider_digest(
+    provider: IBKRDiagnosticSnapshotProvider,
+    *,
+    transport_generation: str,
+) -> str:
+    return hmac.new(
+        _FACTORY_PROVIDER_KEY,
+        (
+            f"{id(provider)}|{id(provider._transport)}|{id(provider._runtime_contract)}|"
+            f"{provider._runtime_fingerprint}|{provider._account_scope}|"
+            f"{provider._expected_account}|{transport_generation}"
+        ).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _register_factory_provider(
+    provider: IBKRDiagnosticSnapshotProvider,
+    *,
+    transport: SubprocessIBKRClient,
+    runtime_contract: object,
+) -> None:
+    generation = transport.protective_quote_generation
+    digest = _factory_provider_digest(provider, transport_generation=generation)
+    with _FACTORY_PROVIDER_LOCK:
+        _FACTORY_PROVIDERS[id(provider)] = _FactoryProviderEntry(
+            provider=provider,
+            transport=transport,
+            runtime_contract=runtime_contract,
+            transport_generation=generation,
+            digest=digest,
+        )
+
+
+def _invalidate_factory_provider(provider: IBKRDiagnosticSnapshotProvider) -> None:
+    with _FACTORY_PROVIDER_LOCK:
+        _FACTORY_PROVIDERS.pop(id(provider), None)
+
+
+def assert_factory_owned_diagnostic_provider(
+    provider: object,
+) -> IBKRDiagnosticSnapshotProvider:
+    """Require the exact live provider registered by the validated factory."""
+
+    if type(provider) is not IBKRDiagnosticSnapshotProvider:
+        raise BrokerEvidenceError("exact diagnostic provider is required")
+    with _FACTORY_PROVIDER_LOCK:
+        entry = _FACTORY_PROVIDERS.get(id(provider))
+    if (
+        entry is None
+        or entry.provider is not provider
+        or provider._factory_marker is not _FACTORY_PROVIDER_MARKER
+        or provider._closed is not False
+        or type(provider._transport) is not SubprocessIBKRClient
+        or entry.transport is not provider._transport
+        or entry.runtime_contract is not provider._runtime_contract
+    ):
+        raise BrokerEvidenceError("diagnostic provider is not factory-owned")
+    try:
+        generation = entry.transport.protective_quote_generation
+    except Exception as exc:
+        raise BrokerEvidenceError("diagnostic provider generation is unavailable") from exc
+    digest = _factory_provider_digest(provider, transport_generation=generation)
+    if generation != entry.transport_generation or not hmac.compare_digest(entry.digest, digest):
+        _invalidate_factory_provider(provider)
+        raise BrokerEvidenceError("diagnostic provider generation or runtime binding changed")
+    return provider
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectiveQuoteSourceIdentity:
+    """Stable public identity for one factory/runtime/generation quote capability."""
+
+    source_type: type[object]
+    method_function: object
+    runtime_fingerprint: str
+    provider_id: int
+    transport_generation: str
+
+
+@dataclass(frozen=True, repr=False)
+class ProtectiveQuoteSourceCapability:
+    """Narrow live-quote source with no generic transport or signing authority."""
+
+    __slots__ = (
+        "_provider",
+        "_runtime_contract",
+        "_runtime_fingerprint",
+        "_transport_generation",
+        "_nonce",
+        "_producer_marker",
+        "__weakref__",
+    )
+
+    _provider: IBKRDiagnosticSnapshotProvider
+    _runtime_contract: object
+    _runtime_fingerprint: str
+    _transport_generation: str
+    _nonce: str
+    _producer_marker: object
+
+    @property
+    def is_connected(self) -> bool:
+        identity = assert_factory_owned_protective_quote_source(
+            self,
+            runtime_contract=self._runtime_contract,
+        )
+        connected = self._provider._transport.is_connected
+        if type(connected) is not bool:
+            raise BrokerEvidenceError("protective quote source connection state is invalid")
+        if (
+            assert_factory_owned_protective_quote_source(
+                self,
+                runtime_contract=self._runtime_contract,
+            )
+            != identity
+        ):
+            raise BrokerEvidenceError("protective quote source changed during connection check")
+        return connected
+
+    async def get_protective_quotes(
+        self,
+        symbols: list[str] | tuple[str, ...],
+        *,
+        active_symbols: list[str] | tuple[str, ...] | None = None,
+    ) -> tuple[BrokerProtectiveQuote, ...]:
+        identity = assert_factory_owned_protective_quote_source(
+            self,
+            runtime_contract=self._runtime_contract,
+        )
+        quotes = await self._provider._transport.get_protective_quotes(
+            symbols,
+            active_symbols=active_symbols,
+        )
+        if (
+            assert_factory_owned_protective_quote_source(
+                self,
+                runtime_contract=self._runtime_contract,
+            )
+            != identity
+        ):
+            raise BrokerEvidenceError("protective quote source changed during collection")
+        if type(quotes) is not tuple or any(
+            type(item) is not BrokerProtectiveQuote for item in quotes
+        ):
+            raise BrokerEvidenceError("protective quote source returned invalid evidence")
+        return quotes
+
+    def __copy__(self) -> ProtectiveQuoteSourceCapability:
+        raise TypeError("protective quote source cannot be copied")
+
+    def __deepcopy__(self, memo: object) -> ProtectiveQuoteSourceCapability:
+        raise TypeError("protective quote source cannot be copied")
+
+    def __reduce__(self) -> str | tuple[Any, ...]:
+        raise TypeError("protective quote source cannot be pickled")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[Any, ...]:
+        raise TypeError("protective quote source cannot be pickled")
+
+
+@dataclass(frozen=True, slots=True)
+class _QuoteSourceEntry:
+    source: weakref.ReferenceType[ProtectiveQuoteSourceCapability]
+    provider: IBKRDiagnosticSnapshotProvider
+    runtime_contract: object
+    digest: str
+
+
+_QUOTE_SOURCES: dict[int, _QuoteSourceEntry] = {}
+
+
+def _quote_source_digest(source: ProtectiveQuoteSourceCapability) -> str:
+    return hmac.new(
+        _QUOTE_SOURCE_KEY,
+        (
+            f"{id(source)}|{id(source._provider)}|{id(source._runtime_contract)}|"
+            f"{source._runtime_fingerprint}|{source._transport_generation}|{source._nonce}"
+        ).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _register_quote_source(source: ProtectiveQuoteSourceCapability) -> None:
+    object_id = id(source)
+
+    def discard(reference: weakref.ReferenceType[ProtectiveQuoteSourceCapability]) -> None:
+        with _QUOTE_SOURCE_LOCK:
+            entry = _QUOTE_SOURCES.get(object_id)
+            if entry is not None and entry.source is reference:
+                _QUOTE_SOURCES.pop(object_id, None)
+
+    reference = weakref.ref(source, discard)
+    entry = _QuoteSourceEntry(
+        source=reference,
+        provider=source._provider,
+        runtime_contract=source._runtime_contract,
+        digest=_quote_source_digest(source),
+    )
+    with _QUOTE_SOURCE_LOCK:
+        _QUOTE_SOURCES[object_id] = entry
+
+
+def assert_factory_owned_protective_quote_source(
+    source: object,
+    *,
+    runtime_contract: object,
+) -> ProtectiveQuoteSourceIdentity:
+    """Verify exact factory/provider/runtime/generation quote-source ownership."""
+
+    if type(source) is not ProtectiveQuoteSourceCapability:
+        raise BrokerEvidenceError("exact protective quote source is required")
+    with _QUOTE_SOURCE_LOCK:
+        entry = _QUOTE_SOURCES.get(id(source))
+    if (
+        entry is None
+        or entry.source() is not source
+        or source._producer_marker is not _QUOTE_SOURCE_MARKER
+        or entry.provider is not source._provider
+        or entry.runtime_contract is not runtime_contract
+        or source._runtime_contract is not runtime_contract
+    ):
+        raise BrokerEvidenceError("protective quote source is not factory-owned")
+    provider = assert_factory_owned_diagnostic_provider(source._provider)
+    runtime_fingerprint = getattr(runtime_contract, "fingerprint", None)
+    if (
+        type(runtime_fingerprint) is not str
+        or runtime_fingerprint != source._runtime_fingerprint
+        or provider._runtime_contract is not runtime_contract
+        or provider._runtime_fingerprint != runtime_fingerprint
+    ):
+        raise BrokerEvidenceError("protective quote source runtime binding changed")
+    try:
+        generation = provider._transport.protective_quote_generation
+    except Exception as exc:
+        raise BrokerEvidenceError("protective quote source generation is unavailable") from exc
+    if generation != source._transport_generation or not hmac.compare_digest(
+        entry.digest, _quote_source_digest(source)
+    ):
+        with _QUOTE_SOURCE_LOCK:
+            _QUOTE_SOURCES.pop(id(source), None)
+        raise BrokerEvidenceError("protective quote source is stale or changed")
+    method = source.get_protective_quotes
+    return ProtectiveQuoteSourceIdentity(
+        source_type=type(source),
+        method_function=getattr(method, "__func__", None),
+        runtime_fingerprint=runtime_fingerprint,
+        provider_id=id(provider),
+        transport_generation=generation,
+    )
+
+
 class IBKRDiagnosticSnapshotProvider:
     """Expose only snapshot and cleanup capabilities to reconciliation."""
 
-    __slots__ = ("_transport", "_expected_account", "_account_scope")
+    __slots__ = (
+        "_transport",
+        "_expected_account",
+        "_account_scope",
+        "_runtime_contract",
+        "_runtime_fingerprint",
+        "_factory_marker",
+        "_closed",
+    )
 
     def __init__(
         self,
@@ -1128,10 +1549,17 @@ class IBKRDiagnosticSnapshotProvider:
         *,
         expected_account: str,
         account_scope: str | None = None,
+        runtime_contract: object = None,
+        runtime_fingerprint: str | None = None,
+        _factory_marker: object = None,
     ) -> None:
         self._transport = transport
         self._expected_account = expected_account
         self._account_scope = account_scope
+        self._runtime_contract = runtime_contract
+        self._runtime_fingerprint = runtime_fingerprint
+        self._factory_marker = _factory_marker
+        self._closed = False
 
     async def get_broker_snapshot(
         self, expected_account: str, *, max_age_seconds: float
@@ -1147,10 +1575,12 @@ class IBKRDiagnosticSnapshotProvider:
     async def produce_normalized_snapshot(
         self,
         *,
+        receiver: BootstrapBrokerResultReceiver[BrokerReceiverResult],
         max_age_seconds: float = 30.0,
-    ) -> BrokerSnapshotProducerResult:
-        """Produce unsigned canonical PR5 evidence for a separate core signer."""
+    ) -> BrokerReceiverResult:
+        """Produce and synchronously hand one raw result to its exact signer."""
 
+        assert_factory_owned_diagnostic_provider(self)
         if not isinstance(self._account_scope, str) or not self._account_scope:
             raise BrokerEvidenceError("diagnostic broker account scope is unavailable")
         payload = await self._transport.get_broker_snapshot(
@@ -1164,13 +1594,59 @@ class IBKRDiagnosticSnapshotProvider:
             max_age_seconds=max_age_seconds,
         )
         completed_order_scope = _completed_order_scope_from_transport(payload)
-        return _produce_broker_snapshot_result(
+        execution_scope = _execution_scope_from_transport(payload)
+        result = _produce_broker_snapshot_result(
             self,
             snapshot=snapshot,
             completed_order_scope=completed_order_scope,
+            execution_scope=execution_scope,
         )
+        capability = getattr(receiver, "receive_broker_snapshot_producer_result", None)
+        if not callable(capability):
+            raise BrokerEvidenceError("broker signing receiver capability is unavailable")
+        registration_token = _register_broker_result(result, receiver)
+        try:
+            received = capability(result)
+        except BaseException:
+            _abandon_broker_result_registration(result, registration_token)
+            raise
+        _assert_broker_result_registration_consumed(result, registration_token)
+        return received
+
+    def issue_protective_quote_source(
+        self,
+        *,
+        runtime_contract: object,
+    ) -> ProtectiveQuoteSourceCapability:
+        """Issue one narrow source bound to this exact live runtime generation."""
+
+        provider = assert_factory_owned_diagnostic_provider(self)
+        runtime_fingerprint = getattr(runtime_contract, "fingerprint", None)
+        if (
+            runtime_contract is not provider._runtime_contract
+            or type(runtime_fingerprint) is not str
+            or runtime_fingerprint != provider._runtime_fingerprint
+        ):
+            raise BrokerEvidenceError("protective quote source runtime does not match provider")
+        generation = provider._transport.protective_quote_generation
+        source = ProtectiveQuoteSourceCapability(
+            _provider=provider,
+            _runtime_contract=runtime_contract,
+            _runtime_fingerprint=runtime_fingerprint,
+            _transport_generation=generation,
+            _nonce=secrets.token_hex(32),
+            _producer_marker=_QUOTE_SOURCE_MARKER,
+        )
+        _register_quote_source(source)
+        assert_factory_owned_protective_quote_source(
+            source,
+            runtime_contract=runtime_contract,
+        )
+        return source
 
     async def close(self) -> None:
+        self._closed = True
+        _invalidate_factory_provider(self)
         await _stop_transport_required(self._transport)
 
 
@@ -1220,8 +1696,15 @@ async def build_diagnostic_provider(
     """Start a dedicated paper/read-only transport or fail closed and reap it."""
     connection = runtime.diagnostic_connection
     expected_account = runtime.expected_account_for_provider
+    runtime_contract = runtime.runtime_contract
+    runtime_fingerprint = getattr(runtime_contract, "fingerprint", None)
+    account_scope = getattr(runtime_contract, "safety_account_scope", None)
     if not isinstance(expected_account, str) or not expected_account.strip():
         raise BrokerEvidenceError("diagnostic broker expected account is unavailable")
+    if type(runtime_fingerprint) is not str or not runtime_fingerprint:
+        raise BrokerEvidenceError("diagnostic broker runtime fingerprint is unavailable")
+    if type(account_scope) is not str or not account_scope:
+        raise BrokerEvidenceError("diagnostic broker account scope is unavailable")
     transport = transport_factory()
     try:
         await transport.start()
@@ -1248,11 +1731,33 @@ async def build_diagnostic_provider(
         if cleanup_cancelled:
             raise asyncio.CancelledError
         raise BrokerEvidenceError("diagnostic broker provider initialization failed") from exc
-    return IBKRDiagnosticSnapshotProvider(
+    provider = IBKRDiagnosticSnapshotProvider(
         transport,
         expected_account=expected_account,
-        account_scope=getattr(runtime.runtime_contract, "safety_account_scope", None),
+        account_scope=account_scope,
+        runtime_contract=runtime_contract,
+        runtime_fingerprint=runtime_fingerprint,
+        _factory_marker=_FACTORY_PROVIDER_MARKER,
     )
+    if type(transport) is SubprocessIBKRClient:
+        try:
+            if assert_validated_runtime_safety_context(runtime) is not runtime:
+                raise BrokerEvidenceError("diagnostic runtime validation identity changed")
+            _register_factory_provider(
+                provider,
+                transport=transport,
+                runtime_contract=runtime_contract,
+            )
+        except Exception as exc:
+            provider._closed = True
+            try:
+                await await_cleanup_required(_stop_transport_required(transport))
+            except Exception as cleanup_exc:
+                raise BrokerEvidenceError(
+                    "diagnostic broker provider registration cleanup failed"
+                ) from cleanup_exc
+            raise BrokerEvidenceError("diagnostic broker provider registration failed") from exc
+    return provider
 
 
 async def diagnostic_provider_factory(

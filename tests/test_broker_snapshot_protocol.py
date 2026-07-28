@@ -365,7 +365,9 @@ async def test_worker_snapshot_is_fresh_atomic_read_only_and_precise(fake_ib):
     )
     assert completed_scope["api_method"] == "reqCompletedOrders"
     assert completed_scope["api_only"] is False
-    assert completed_scope["all_clients"] is True
+    assert completed_scope["client_scope"] == (
+        "api_and_manual_orders_visible_to_current_tws_session"
+    )
     assert completed_scope["request_count"] == 2
     assert completed_scope["stability_check"] == "identical_second_read"
     assert completed_scope["retention_scope"] == "current_tws_or_gateway_retained_set"
@@ -375,12 +377,17 @@ async def test_worker_snapshot_is_fresh_atomic_read_only_and_precise(fake_ib):
         for item in data["collection_evidence"]
         if item["collection"] != "completed_orders"
     )
-    assert data["execution_scope"]["kind"] == "bounded_execution_filter"
+    assert data["execution_scope"]["kind"] == "broker_date_since_midnight"
     broker_before = datetime.fromisoformat(data["broker_time_before"])
     broker_after = datetime.fromisoformat(data["broker_time_after"])
     scope_start = datetime.fromisoformat(data["execution_scope"]["start_at"])
     scope_end = datetime.fromisoformat(data["execution_scope"]["end_at"])
-    assert scope_start == broker_before.replace(microsecond=0) - timedelta(hours=24)
+    assert scope_start == broker_before.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
     assert fake_ib.execution_filters[0].time == scope_start.strftime("%Y%m%d %H:%M:%S UTC")
     assert broker_before <= scope_end <= broker_after
     assert scope_end != datetime.fromisoformat(data["retrieved_at"])
@@ -560,6 +567,26 @@ async def test_worker_conflicting_duplicate_account_summary_callback_blocks(fake
             tag="BuyingPower",
             currency="USD",
             value="1",
+        )
+    )
+
+    result = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert result["status"] == worker.PROTOCOL_ERROR_STATUS
+    assert result["error_type"] == worker.PROTOCOL_ERROR_TYPE
+
+
+@pytest.mark.asyncio
+async def test_worker_identical_duplicate_account_summary_callback_blocks(fake_ib):
+    original = next(
+        value for value in fake_ib.account_summary_batches[0] if value.tag == "BuyingPower"
+    )
+    fake_ib.account_summary_batches[0].append(
+        SimpleNamespace(
+            account=original.account,
+            tag=original.tag,
+            currency=original.currency,
+            value=original.value,
         )
     )
 
@@ -1632,6 +1659,9 @@ async def test_client_poison_after_snapshot_validation_never_returns_data(fake_i
         lambda data: data["completeness"].update(completed_orders=False),
         lambda data: data["collection_evidence"].pop(),
         lambda data: data["collection_evidence"][0].update(result_count=0),
+        lambda data: data["execution_scope"].update(full_history=True),
+        lambda data: data["execution_scope"].update(retention_scope="full_history"),
+        lambda data: data["execution_scope"].update(commission_scope="all_history"),
         lambda data: next(
             evidence
             for evidence in data["collection_evidence"]
@@ -1641,7 +1671,7 @@ async def test_client_poison_after_snapshot_validation_never_returns_data(fake_i
             evidence
             for evidence in data["collection_evidence"]
             if evidence["collection"] == "completed_orders"
-        )["scope"].update(all_clients=False),
+        )["scope"].update(client_scope="all_clients"),
         lambda data: next(
             evidence
             for evidence in data["collection_evidence"]

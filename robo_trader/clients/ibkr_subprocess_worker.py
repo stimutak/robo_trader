@@ -333,8 +333,9 @@ async def _request_fresh_broker_account_summary(account: str) -> list[Any]:
         )
         identity = (owned_value.account, owned_value.tag, owned_value.currency)
         previous = captured.get(identity)
-        if previous is not None and previous != owned_value:
+        if previous is not None:
             callback_failed = True
+            return
         captured[identity] = owned_value
 
     request: Any = None
@@ -1341,7 +1342,12 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
         # IBKR's ExecutionFilter carries a lower bound only, serialized to
         # whole seconds. Derive that exact wire value from authoritative broker
         # time and expose the identical instant in the snapshot.
-        execution_window_start = broker_time_before.replace(microsecond=0) - timedelta(hours=24)
+        execution_window_start = broker_time_before.replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
         execution_filter_time = execution_window_start.strftime("%Y%m%d %H:%M:%S UTC")
         execution_filter = ExecutionFilter(
             acctCode=account,
@@ -1555,13 +1561,14 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
         retrieved_at = datetime.now(timezone.utc)
         completed_order_scope = {
             # reqCompletedOrders has no caller-supplied historical time bound.
-            # apiOnly=False asks TWS/Gateway for the all-client set it currently
-            # retains. This is complete only for that explicitly declared set;
+            # apiOnly=False asks TWS/Gateway for its current retained set,
+            # including manual orders visible to this TWS session. This is
+            # complete only for that explicitly declared broker-retained set;
             # it is never evidence of full broker-account order history.
             "kind": "ibkr_current_retained_completed_orders",
             "api_method": "reqCompletedOrders",
             "api_only": False,
-            "all_clients": True,
+            "client_scope": "api_and_manual_orders_visible_to_current_tws_session",
             "request_count": 2,
             "stability_check": "identical_second_read",
             "retention_scope": "current_tws_or_gateway_retained_set",
@@ -1614,9 +1621,12 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
                 },
                 "collection_evidence": collection_evidence,
                 "execution_scope": {
-                    "kind": "bounded_execution_filter",
+                    "kind": "broker_date_since_midnight",
                     "start_at": execution_window_start.isoformat(),
                     "end_at": execution_window_end.isoformat(),
+                    "retention_scope": "ibkr_gateway_broker_date_since_midnight",
+                    "full_history": False,
+                    "commission_scope": "matching_callbacks_for_returned_executions",
                 },
             },
         }
