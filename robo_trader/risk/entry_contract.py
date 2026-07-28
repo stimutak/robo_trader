@@ -38,14 +38,49 @@ _SECTOR = re.compile(r"^[A-Za-z][A-Za-z0-9 &./_-]{0,63}$")
 _BROKER_IDENTITY = re.compile(r"^[A-Z0-9][A-Z0-9._:/-]{0,63}$")
 
 
+class _DecisionReplayTombstones:
+    """Bounded live-window replay records with an exact time watermark."""
+
+    __slots__ = ("_entries", "_last_consumed_at", "_limit")
+
+    def __init__(self, limit: int) -> None:
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("decision replay tombstone limit must be positive")
+        self._entries: dict[tuple[object, ...], datetime] = {}
+        self._last_consumed_at: Optional[datetime] = None
+        self._limit = limit
+
+    def record(
+        self,
+        replay_key: tuple[object, ...],
+        *,
+        expires_at: datetime,
+        consumed_at: datetime,
+    ) -> None:
+        if self._last_consumed_at is not None and consumed_at < self._last_consumed_at:
+            raise EntryRiskContractError("RiskDecision replay clock rollback detected")
+        self._last_consumed_at = consumed_at
+
+        expired_keys = tuple(key for key, expiry in self._entries.items() if expiry <= consumed_at)
+        for key in expired_keys:
+            self._entries.pop(key, None)
+
+        if consumed_at >= expires_at:
+            raise EntryRiskContractError("RiskDecision expired before consumption")
+        if replay_key in self._entries:
+            raise EntryRiskContractError("RiskDecision semantic replay detected")
+        if len(self._entries) >= self._limit:
+            raise EntryRiskContractError("RiskDecision live replay registry capacity exhausted")
+        self._entries[replay_key] = expires_at
+
+
 def _build_capability_authority():
     seal = object()
     registry: dict[
         int,
         tuple[weakref.ReferenceType[object], type[object], tuple[object, ...]],
     ] = {}
-    consumed_decision_keys: set[tuple[object, ...]] = set()
-    consumed_decision_limit = 4096
+    consumed_decisions = _DecisionReplayTombstones(4096)
     lock = threading.Lock()
 
     def is_sealed(candidate: object) -> bool:
@@ -67,7 +102,12 @@ def _build_capability_authority():
             registry[object_id] = (reference, capability_type, state)
         return capability
 
-    def consume(capability: object, expected_type):
+    def consume(
+        capability: object,
+        expected_type,
+        *,
+        consumed_at: Optional[datetime] = None,
+    ):
         if type(capability) is not expected_type:
             raise EntryRiskContractError(f"exact {expected_type.__name__} capability is required")
         with lock:
@@ -97,13 +137,17 @@ def _build_capability_authority():
                 f"{expected_type.__name__} changed during authorization-boundary revalidation"
             )
         if expected_type is RiskDecision:
+            if type(consumed_at) is not datetime:
+                raise EntryRiskContractError(
+                    "RiskDecision consumption requires an exact consumed_at"
+                )
             replay_key = _risk_decision_replay_key(capability)
             with lock:
-                if replay_key in consumed_decision_keys:
-                    raise EntryRiskContractError("RiskDecision semantic replay detected")
-                if len(consumed_decision_keys) >= consumed_decision_limit:
-                    raise EntryRiskContractError("RiskDecision replay registry capacity exhausted")
-                consumed_decision_keys.add(replay_key)
+                consumed_decisions.record(
+                    replay_key,
+                    expires_at=capability.expires_at,
+                    consumed_at=consumed_at,
+                )
         return capability
 
     def transfer_decision(decision: RiskDecision) -> ConsumedRiskDecision:
@@ -124,6 +168,7 @@ def _build_capability_authority():
                 decision.quote_id,
                 decision.limiting_capacity,
                 decision.schema_version,
+                decision.expires_at,
             ),
             _seal=seal,
         )
@@ -1108,6 +1153,7 @@ class RiskDecision(_SealedCapability):
     broker_contract: EntryBrokerContractIdentity
     transport_generation: str
     evaluated_at: datetime
+    expires_at: datetime
     risk_approved: bool
     reasons: tuple[RiskReason, ...]
     approved_quantity: int
@@ -1135,8 +1181,13 @@ class RiskDecision(_SealedCapability):
             "transport_generation",
             _transport_generation(self.transport_generation, "transport_generation"),
         )
-        object.__setattr__(self, "evaluated_at", _timestamp(self.evaluated_at, "evaluated_at"))
         _flag(self.risk_approved, "risk_approved")
+        evaluated = _timestamp(self.evaluated_at, "evaluated_at")
+        expires = _timestamp(self.expires_at, "risk decision expires_at")
+        if self.risk_approved and expires <= evaluated:
+            raise EntryRiskContractError("approved risk decision expiry must follow evaluation")
+        object.__setattr__(self, "evaluated_at", evaluated)
+        object.__setattr__(self, "expires_at", expires)
         if (
             type(self.reasons) is not tuple
             or not self.reasons
@@ -1179,7 +1230,7 @@ class ConsumedRiskDecision(tuple):
     """Immutable terminal snapshot returned after one semantic decision consume."""
 
     __slots__ = ()
-    _VALUE_COUNT = 15
+    _VALUE_COUNT = 16
 
     def __new__(
         cls,
@@ -1253,6 +1304,10 @@ class ConsumedRiskDecision(tuple):
         return cast(int, self[14])
 
     @property
+    def expires_at(self) -> datetime:
+        return cast(datetime, self[15])
+
+    @property
     def authorizes_order_submission(self) -> bool:
         return False
 
@@ -1293,6 +1348,7 @@ def _rejected(
             "broker_contract": intent.broker_contract,
             "transport_generation": intent.transport_generation,
             "evaluated_at": evaluated_at,
+            "expires_at": intent.expires_at,
             "risk_approved": False,
             "reasons": ordered,
             "approved_quantity": 0,
@@ -1475,6 +1531,7 @@ def _capability_state(capability: object) -> tuple[object, ...]:
             _contract_state(decision.broker_contract),
             decision.transport_generation,
             decision.evaluated_at.isoformat(timespec="microseconds"),
+            decision.expires_at.isoformat(timespec="microseconds"),
             decision.risk_approved,
             tuple(reason.value for reason in decision.reasons),
             decision.approved_quantity,
@@ -1488,10 +1545,19 @@ def _capability_state(capability: object) -> tuple[object, ...]:
     raise EntryRiskContractError("unknown sealed capability type")
 
 
-def assert_and_consume_risk_decision(decision: object) -> ConsumedRiskDecision:
+def assert_and_consume_risk_decision(
+    decision: object,
+    *,
+    consumed_at: datetime,
+) -> ConsumedRiskDecision:
     """Consume an exact decision once at a future dormant integration seam."""
 
-    consumed = _consume_capability(decision, RiskDecision)
+    consumption_time = _timestamp(consumed_at, "risk decision consumed_at")
+    consumed = _consume_capability(
+        decision,
+        RiskDecision,
+        consumed_at=consumption_time,
+    )
     return _transfer_risk_decision(consumed)
 
 
@@ -1913,6 +1979,7 @@ def evaluate_entry_intent(
             "broker_contract": intent.broker_contract,
             "transport_generation": intent.transport_generation,
             "evaluated_at": now,
+            "expires_at": intent.expires_at,
             "risk_approved": True,
             "reasons": (RiskReason.APPROVED,),
             "approved_quantity": quantity,

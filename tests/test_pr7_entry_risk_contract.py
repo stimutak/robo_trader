@@ -30,6 +30,7 @@ from robo_trader.risk.entry_contract import (
     RefreshedQuoteSource,
     RiskReason,
     SignalSource,
+    _DecisionReplayTombstones,
     assert_and_consume_risk_decision,
     build_correlation_evidence,
     build_entry_intent,
@@ -272,6 +273,7 @@ def test_signal_to_intent_to_decision_preserves_versioned_lineage() -> None:
     assert decision.side is signal.side
     assert decision.broker_contract == signal.broker_contract
     assert decision.transport_generation == signal.transport_generation
+    assert decision.expires_at == intent.expires_at
     assert decision.authorizes_order_submission is False
     assert decision.runtime_integration_ready is False
     with pytest.raises(FrozenInstanceError):
@@ -713,14 +715,15 @@ def test_signal_intent_evidence_and_decision_are_each_single_use() -> None:
     decision = _evaluate(intent=intent, evidence=evidence)
     with pytest.raises(EntryRiskContractError, match="already consumed"):
         _evaluate(intent=intent, evidence=_evidence())
-    consumed = assert_and_consume_risk_decision(decision)
+    consumed = assert_and_consume_risk_decision(decision, consumed_at=NOW)
     assert type(consumed) is ConsumedRiskDecision
     assert consumed.intent_id == decision.intent_id
     assert consumed.approved_quantity == decision.approved_quantity
+    assert consumed.expires_at == decision.expires_at
     assert consumed.authorizes_order_submission is False
     assert consumed.runtime_integration_ready is False
     with pytest.raises(EntryRiskContractError, match="already consumed"):
-        assert_and_consume_risk_decision(decision)
+        assert_and_consume_risk_decision(decision, consumed_at=NOW)
 
 
 def test_mutated_or_replaced_risk_decision_cannot_be_consumed() -> None:
@@ -736,7 +739,7 @@ def test_mutated_or_replaced_risk_decision_cannot_be_consumed() -> None:
     mutated = _decision()
     object.__setattr__(mutated, "approved_quantity", 999)
     with pytest.raises(EntryRiskContractError, match="altered"):
-        assert_and_consume_risk_decision(mutated)
+        assert_and_consume_risk_decision(mutated, consumed_at=NOW)
 
 
 def test_equivalent_independently_minted_decision_pipeline_is_semantic_replay() -> None:
@@ -749,14 +752,14 @@ def test_equivalent_independently_minted_decision_pipeline_is_semantic_replay() 
         duplicate.signal_id,
         duplicate.quote_id,
     )
-    assert_and_consume_risk_decision(first)
+    assert_and_consume_risk_decision(first, consumed_at=NOW)
     with pytest.raises(EntryRiskContractError, match="semantic replay"):
-        assert_and_consume_risk_decision(duplicate)
+        assert_and_consume_risk_decision(duplicate, consumed_at=NOW)
 
 
 def test_consumed_decision_is_a_deeply_immutable_non_authorizing_snapshot() -> None:
     decision = _decision_with_ids("immutable-transfer")
-    consumed = assert_and_consume_risk_decision(decision)
+    consumed = assert_and_consume_risk_decision(decision, consumed_at=NOW)
     alias = consumed
 
     object.__setattr__(decision, "authorizes_order_submission", True)
@@ -782,7 +785,7 @@ def test_consumed_decision_is_a_deeply_immutable_non_authorizing_snapshot() -> N
     assert raw.authorizes_order_submission is False
     assert raw.runtime_integration_ready is False
     with pytest.raises(EntryRiskContractError, match="exact RiskDecision"):
-        assert_and_consume_risk_decision(raw)
+        assert_and_consume_risk_decision(raw, consumed_at=NOW)
 
 
 def test_configured_two_percent_cap_floors_quantity_and_never_rounds_up() -> None:
@@ -1134,6 +1137,10 @@ def test_datetime_subclasses_cannot_override_freshness_authority() -> None:
         lambda: _ml(observed_at=adversarial),
         lambda: _evidence(observed_at=adversarial),
         lambda: _evaluate(evaluated_at=adversarial),
+        lambda: assert_and_consume_risk_decision(
+            _decision_with_ids("adversarial-consumed-at"),
+            consumed_at=adversarial,
+        ),
     )
 
     for operation in operations:
@@ -1184,3 +1191,87 @@ def test_exhausted_capacity_rejects_without_authority(changes: dict[str, Decimal
     assert decision.reasons == (RiskReason.NO_CAPACITY,)
     assert decision.approved_quantity == 0
     assert decision.authorizes_order_submission is False
+
+
+def test_more_than_replay_limit_sequential_expired_decisions_continue() -> None:
+    tombstones = _DecisionReplayTombstones(4096)
+
+    for index in range(4097):
+        consumed_at = NOW + timedelta(seconds=index)
+        tombstones.record(
+            ("risk-decision-v1", 1, "portfolio-alpha", f"intent-expired-{index}"),
+            expires_at=consumed_at + timedelta(seconds=1),
+            consumed_at=consumed_at,
+        )
+
+
+def test_live_replay_tombstones_exhaust_only_when_every_entry_remains_live() -> None:
+    tombstones = _DecisionReplayTombstones(4096)
+    live_expiry = NOW + timedelta(days=1)
+
+    for index in range(4096):
+        tombstones.record(
+            ("risk-decision-v1", 1, "portfolio-alpha", f"intent-live-{index}"),
+            expires_at=live_expiry,
+            consumed_at=NOW,
+        )
+
+    with pytest.raises(EntryRiskContractError, match="live replay registry capacity"):
+        tombstones.record(
+            ("risk-decision-v1", 1, "portfolio-alpha", "intent-live-overflow"),
+            expires_at=live_expiry,
+            consumed_at=NOW,
+        )
+
+
+def test_duplicate_rejects_before_and_after_its_tombstone_expires() -> None:
+    tombstones = _DecisionReplayTombstones(2)
+    replay_key = ("risk-decision-v1", 1, "portfolio-alpha", "intent-replayed")
+    expiry = NOW + timedelta(seconds=1)
+    tombstones.record(replay_key, expires_at=expiry, consumed_at=NOW)
+
+    with pytest.raises(EntryRiskContractError, match="semantic replay"):
+        tombstones.record(
+            replay_key,
+            expires_at=expiry,
+            consumed_at=NOW + timedelta(microseconds=1),
+        )
+
+    after_expiry = NOW + timedelta(seconds=2)
+    tombstones.record(
+        ("risk-decision-v1", 1, "portfolio-alpha", "intent-after-expiry"),
+        expires_at=after_expiry + timedelta(seconds=1),
+        consumed_at=after_expiry,
+    )
+    with pytest.raises(EntryRiskContractError, match="expired before consumption"):
+        tombstones.record(
+            replay_key,
+            expires_at=expiry,
+            consumed_at=after_expiry,
+        )
+
+
+def test_replay_tombstones_detect_clock_rollback() -> None:
+    tombstones = _DecisionReplayTombstones(2)
+    tombstones.record(
+        ("risk-decision-v1", 1, "portfolio-alpha", "intent-newer"),
+        expires_at=NOW + timedelta(seconds=10),
+        consumed_at=NOW,
+    )
+
+    with pytest.raises(EntryRiskContractError, match="clock rollback"):
+        tombstones.record(
+            ("risk-decision-v1", 1, "portfolio-alpha", "intent-older"),
+            expires_at=NOW + timedelta(seconds=10),
+            consumed_at=NOW - timedelta(microseconds=1),
+        )
+
+
+def test_risk_decision_cannot_be_consumed_at_or_after_exact_expiry() -> None:
+    decision = _decision_with_ids("expired-consumption")
+
+    with pytest.raises(EntryRiskContractError, match="expired before consumption"):
+        assert_and_consume_risk_decision(
+            decision,
+            consumed_at=decision.expires_at,
+        )
