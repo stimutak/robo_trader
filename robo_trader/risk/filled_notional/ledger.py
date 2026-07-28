@@ -296,6 +296,13 @@ _TRIGGER_SQL = {
     """,
 }
 
+_PROTECTED_TABLES = (
+    "daily_filled_notional_schema",
+    "daily_filled_notional_records",
+    "daily_filled_notional_conflicts",
+    "daily_filled_notional_checkpoints",
+)
+
 
 class FilledNotionalError(RuntimeError):
     """Base error for the filled-notional safety boundary."""
@@ -671,6 +678,9 @@ class DailyFilledNotional:
                 "independent monotonic verifier is required for authoritative accounting"
             )
         self._monotonic_verifier = monotonic_verifier
+        self._review_only = _review_only
+        if self._review_only:
+            self._require_review_artifacts()
         self._validate_independent_anchor_path()
         self._account_id = _validate_identifier(account_id, "account_id")
         self._portfolio_id = _validate_identifier(portfolio_id, "portfolio_id")
@@ -681,24 +691,13 @@ class DailyFilledNotional:
         self._currency = currency
         self._clock = clock
         self._failed_reason: Optional[str] = None
-        self._review_only = _review_only
 
         try:
-            created = self._initialize_if_missing()
-            if not created:
-                recovery_required = self._preflight_existing_schema()
-            else:
-                recovery_required = False
-            with self._anchor_transition_lock():
-                if recovery_required:
-                    self._recover_hot_journal()
-                with self._connection(readonly=True) as connection:
+            if self._review_only:
+                with self._connection(readonly=True, immutable=True) as connection:
                     connection.execute("BEGIN")
                     state = self._validate_ledger(connection)
-                    if created:
-                        anchor = self._create_initial_anchor(state)
-                    else:
-                        anchor = self._reconcile_anchor(state)
+                    anchor = self._require_exact_anchor(state)
                     self._verify_monotonic_state(state)
                     self._ledger_id = state.ledger_id
                     current_day = self._current_trading_date()
@@ -706,6 +705,29 @@ class DailyFilledNotional:
                     anchor = self._require_exact_anchor(state)
                     self._verify_monotonic_state(state)
                     connection.commit()
+            else:
+                created = self._initialize_if_missing()
+                if not created:
+                    recovery_required = self._preflight_existing_schema()
+                else:
+                    recovery_required = False
+                with self._anchor_transition_lock():
+                    if recovery_required:
+                        self._recover_hot_journal()
+                    with self._connection(readonly=True) as connection:
+                        connection.execute("BEGIN")
+                        state = self._validate_ledger(connection)
+                        if created:
+                            anchor = self._create_initial_anchor(state)
+                        else:
+                            anchor = self._reconcile_anchor(state)
+                        self._verify_monotonic_state(state)
+                        self._ledger_id = state.ledger_id
+                        current_day = self._current_trading_date()
+                        total = self._total_for_date(connection, current_day)
+                        anchor = self._require_exact_anchor(state)
+                        self._verify_monotonic_state(state)
+                        connection.commit()
         except FilledNotionalError:
             raise
         except DecimalException as exc:
@@ -729,6 +751,32 @@ class DailyFilledNotional:
         if type(value) is not bytes or len(value) < 32:
             raise FilledNotionalError("anchor_key must be at least 32 exact bytes")
         return value
+
+    def _require_review_artifacts(self) -> None:
+        """Require existing exclusive regular artifacts without creating either one."""
+
+        for path, label in (
+            (self._path, "database"),
+            (self._anchor_path, "anchor"),
+        ):
+            try:
+                metadata = os.lstat(path)
+            except FileNotFoundError as exc:
+                raise FilledNotionalUnavailable(
+                    f"review requires existing filled-notional {label}"
+                ) from exc
+            except OSError as exc:
+                raise FilledNotionalUnavailable(
+                    f"review cannot inspect filled-notional {label} safely"
+                ) from exc
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+            ):
+                raise FilledNotionalUnavailable(
+                    f"review requires existing exclusive non-symlink regular {label}"
+                )
 
     def _validate_independent_anchor_path(self) -> None:
         if self._anchor_path == self._path:
@@ -982,6 +1030,13 @@ class DailyFilledNotional:
                         if mutated
                         else before
                     )
+                    if mutated:
+                        verified_after = self._validate_checkpointed_state(connection)
+                        if verified_after != after:
+                            raise FilledNotionalIntegrityError(
+                                "filled-notional append did not advance checkpoint state"
+                            )
+                        after = verified_after
                     trading_day = date.fromisoformat(canonical.trading_date)
                     total = self._total_for_date(connection, trading_day)
                     if mutated:
@@ -1089,7 +1144,7 @@ class DailyFilledNotional:
             _review_only=True,
         )
         try:
-            with reviewer._connection(readonly=True) as connection:
+            with reviewer._connection(readonly=True, immutable=True) as connection:
                 connection.execute("BEGIN")
                 state = reviewer._validate_checkpointed_state(connection)
                 reviewer._require_exact_anchor(state)
@@ -1610,11 +1665,18 @@ class DailyFilledNotional:
             ("index", "daily_filled_notional_scope_date"): _SCOPE_DATE_SQL,
             **{("trigger", name): sql for name, sql in _TRIGGER_SQL.items()},
         }
-        rows = connection.execute("""
+        rows = connection.execute(
+            """
             SELECT type, name, sql FROM sqlite_master
             WHERE name LIKE 'daily_filled_notional_%'
+               OR (
+                   type = 'trigger'
+                   AND tbl_name IN (?, ?, ?, ?)
+               )
             ORDER BY type, name
-            """).fetchall()
+            """,
+            _PROTECTED_TABLES,
+        ).fetchall()
         actual_sql = {(str(row[0]), str(row[1])): str(row[2]) for row in rows}
         if set(actual_sql) != set(expected_sql):
             raise FilledNotionalIntegrityError("filled-notional schema objects do not match")

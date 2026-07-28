@@ -120,6 +120,15 @@ def _anchor_path(database_path: Path) -> Path:
     return database_path.parent / "protected-anchor" / f"{database_path.name}.anchor"
 
 
+def _file_snapshot(path: Path) -> tuple[bytes, int, int]:
+    metadata = os.lstat(path)
+    return path.read_bytes(), metadata.st_dev, metadata.st_ino
+
+
+def _path_inventory(root: Path) -> tuple[str, ...]:
+    return tuple(sorted(str(path.relative_to(root)) for path in root.rglob("*")))
+
+
 def test_counts_only_executed_fill_evidence_with_exact_decimal_math(tmp_path):
     ledger = _service(tmp_path / "notional.db")
 
@@ -425,6 +434,84 @@ def test_trigger_removal_and_row_tamper_fail_closed_on_restart(tmp_path):
 
     with pytest.raises(FilledNotionalIntegrityError, match="schema objects do not match"):
         _service(path)
+
+
+def test_foreign_raise_ignore_trigger_on_protected_table_fails_closed_without_mutation(tmp_path):
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("""
+            CREATE TRIGGER foreign_suppress_filled_notional_insert
+            BEFORE INSERT ON daily_filled_notional_records
+            BEGIN
+                SELECT RAISE(IGNORE);
+            END
+            """)
+
+    database_before = path.read_bytes()
+    database_identity = (os.lstat(path).st_dev, os.lstat(path).st_ino)
+    anchor_before = ledger.anchor_path.read_bytes()
+    anchor_identity = (
+        os.lstat(ledger.anchor_path).st_dev,
+        os.lstat(ledger.anchor_path).st_ino,
+    )
+
+    with pytest.raises(FilledNotionalIntegrityError, match="schema objects do not match"):
+        ledger.record_fill(_fill("must-not-be-ignored"))
+
+    assert path.read_bytes() == database_before
+    assert (os.lstat(path).st_dev, os.lstat(path).st_ino) == database_identity
+    assert ledger.anchor_path.read_bytes() == anchor_before
+    assert (
+        os.lstat(ledger.anchor_path).st_dev,
+        os.lstat(ledger.anchor_path).st_ino,
+    ) == anchor_identity
+
+
+@pytest.mark.parametrize("suppressed_append", ["fill", "checkpoint"])
+def test_record_fill_verifies_uncommitted_append_advanced_before_anchor_publication(
+    tmp_path, monkeypatch, suppressed_append
+):
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+    database_before = path.read_bytes()
+    database_identity = (os.lstat(path).st_dev, os.lstat(path).st_ino)
+    anchor_before = ledger.anchor_path.read_bytes()
+    anchor_identity = (
+        os.lstat(ledger.anchor_path).st_dev,
+        os.lstat(ledger.anchor_path).st_ino,
+    )
+
+    if suppressed_append == "fill":
+        monkeypatch.setattr(ledger, "_append_fill", lambda *args, **kwargs: "f" * 64)
+    else:
+        monkeypatch.setattr(
+            ledger,
+            "_append_checkpoint",
+            lambda connection, before, after: replace(
+                after,
+                checkpoint_sequence=before.checkpoint_sequence + 1,
+                checkpoint_head="f" * 64,
+            ),
+        )
+
+    with pytest.raises(FilledNotionalIntegrityError, match="checkpoint|append"):
+        ledger.record_fill(_fill(f"suppressed-{suppressed_append}"))
+
+    assert path.read_bytes() == database_before
+    assert (os.lstat(path).st_dev, os.lstat(path).st_ino) == database_identity
+    assert ledger.anchor_path.read_bytes() == anchor_before
+    assert (
+        os.lstat(ledger.anchor_path).st_dev,
+        os.lstat(ledger.anchor_path).st_ino,
+    ) == anchor_identity
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM daily_filled_notional_records"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT count(*) FROM daily_filled_notional_checkpoints"
+        ).fetchone() == (1,)
 
 
 def test_service_connection_has_no_update_delete_or_schema_authority(tmp_path):
@@ -1035,7 +1122,7 @@ def test_review_reverifies_monotonic_state_after_constructor_before_return(tmp_p
     @contextmanager
     def restore_before_review(self, *, readonly, immutable=False):
         nonlocal authoritative_read_count
-        if readonly and not immutable:
+        if readonly:
             authoritative_read_count += 1
             if authoritative_read_count == 2:
                 path.write_bytes(old_database)
@@ -1053,6 +1140,116 @@ def test_review_reverifies_monotonic_state_after_constructor_before_return(tmp_p
             anchor_key=ANCHOR_KEY,
             monotonic_verifier=verifier,
         )
+
+
+def test_review_quarantine_success_is_byte_inode_and_path_read_only(tmp_path):
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+    ledger.record_fill(_fill("review-read-only"))
+    database_before = _file_snapshot(path)
+    anchor_before = _file_snapshot(ledger.anchor_path)
+    paths_before = _path_inventory(tmp_path)
+
+    evidence = DailyFilledNotional.review_quarantine(
+        path,
+        anchor_path=ledger.anchor_path,
+        anchor_key=ANCHOR_KEY,
+        monotonic_verifier=_MONOTONIC_VERIFIERS[str(path)],
+    )
+
+    assert evidence == ()
+    assert _file_snapshot(path) == database_before
+    assert _file_snapshot(ledger.anchor_path) == anchor_before
+    assert _path_inventory(tmp_path) == paths_before
+
+
+@pytest.mark.parametrize("missing_artifact", ["database", "anchor"])
+def test_review_requires_existing_artifacts_without_creating_or_mutating(
+    tmp_path, missing_artifact
+):
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+    target = path if missing_artifact == "database" else ledger.anchor_path
+    survivor = ledger.anchor_path if missing_artifact == "database" else path
+    target.unlink()
+    survivor_before = _file_snapshot(survivor)
+    paths_before = _path_inventory(tmp_path)
+
+    with pytest.raises(FilledNotionalUnavailable, match="review requires existing"):
+        DailyFilledNotional.review_quarantine(
+            path,
+            anchor_path=ledger.anchor_path,
+            anchor_key=ANCHOR_KEY,
+            monotonic_verifier=_MONOTONIC_VERIFIERS[str(path)],
+        )
+
+    assert not target.exists()
+    assert _file_snapshot(survivor) == survivor_before
+    assert _path_inventory(tmp_path) == paths_before
+
+
+@pytest.mark.parametrize("mistyped_artifact", ["database", "anchor"])
+def test_review_rejects_mistyped_artifacts_without_mutating_paths(tmp_path, mistyped_artifact):
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+    target = path if mistyped_artifact == "database" else ledger.anchor_path
+    survivor = ledger.anchor_path if mistyped_artifact == "database" else path
+    preserved = tmp_path / f"preserved-{mistyped_artifact}"
+    target.rename(preserved)
+    target.mkdir(mode=0o700)
+    target_identity = (os.lstat(target).st_dev, os.lstat(target).st_ino)
+    preserved_before = _file_snapshot(preserved)
+    survivor_before = _file_snapshot(survivor)
+    paths_before = _path_inventory(tmp_path)
+
+    with pytest.raises(FilledNotionalUnavailable, match="non-symlink regular"):
+        DailyFilledNotional.review_quarantine(
+            path,
+            anchor_path=ledger.anchor_path,
+            anchor_key=ANCHOR_KEY,
+            monotonic_verifier=_MONOTONIC_VERIFIERS[str(path)],
+        )
+
+    assert target.is_dir()
+    assert (os.lstat(target).st_dev, os.lstat(target).st_ino) == target_identity
+    assert _file_snapshot(preserved) == preserved_before
+    assert _file_snapshot(survivor) == survivor_before
+    assert _path_inventory(tmp_path) == paths_before
+
+
+@pytest.mark.parametrize("deleted_artifact", ["database", "anchor"])
+def test_review_does_not_recreate_artifact_deleted_after_preflight(
+    tmp_path, monkeypatch, deleted_artifact
+):
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+    target = path if deleted_artifact == "database" else ledger.anchor_path
+    survivor = ledger.anchor_path if deleted_artifact == "database" else path
+    preserved = tmp_path / f"deleted-during-review-{deleted_artifact}"
+    target_before = _file_snapshot(target)
+    survivor_before = _file_snapshot(survivor)
+    paths_after_deletion: list[tuple[str, ...]] = []
+    original_require = DailyFilledNotional._require_review_artifacts
+
+    def delete_after_preflight(self):
+        original_require(self)
+        target.rename(preserved)
+        paths_after_deletion.append(_path_inventory(tmp_path))
+
+    monkeypatch.setattr(DailyFilledNotional, "_require_review_artifacts", delete_after_preflight)
+
+    with pytest.raises(FilledNotionalUnavailable):
+        DailyFilledNotional.review_quarantine(
+            path,
+            anchor_path=ledger.anchor_path,
+            anchor_key=ANCHOR_KEY,
+            monotonic_verifier=_MONOTONIC_VERIFIERS[str(path)],
+        )
+
+    assert not target.exists()
+    assert _file_snapshot(preserved) == target_before
+    assert _file_snapshot(survivor) == survivor_before
+    assert _path_inventory(tmp_path) == paths_after_deletion[0]
 
 
 def test_authoritative_service_requires_independent_monotonic_verifier(tmp_path):

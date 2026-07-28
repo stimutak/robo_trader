@@ -40,9 +40,19 @@ operated monotonic state or service, this ledger is non-authoritative.
 Each append first fsyncs an authenticated pending transition to the anchor,
 then commits SQLite, then atomically replaces and directory-fsyncs the stable
 anchor. A pending anchor may resolve only to its authenticated old or new
-state; a stable anchor is never advanced heuristically. Authoritative reads and
-reviews use one SQLite snapshot and re-check both the exact anchor and external
-monotonic state immediately before returning.
+state; a stable anchor is never advanced heuristically. Before publishing that
+pending anchor, the writer re-reads the uncommitted checkpoint and fill/conflict
+tails and requires them to equal the expected advanced state. A suppressed
+insert or checkpoint therefore rolls back without changing the durable anchor.
+Authoritative reads use one SQLite snapshot and re-check both the exact anchor
+and external monotonic state immediately before returning.
+
+Quarantine review requires both the main database and anchor to be existing,
+exclusive, non-symlink regular files. It opens the database through immutable
+read-only SQLite snapshots, does not initialize or recover the database, does
+not reconcile or replace the anchor, and does not create the anchor transition
+lock. Missing, mistyped, or concurrently removed artifacts fail unavailable
+without recreating either artifact or otherwise mutating disk.
 
 Writers also hold an owner-only, inode-checked transition lock in the protected
 anchor directory from checkpoint validation through stable-anchor publication
@@ -63,6 +73,11 @@ tampering. This assumes the process and ledger paths retain their configured OS
 access controls between startup and use. If that local-file integrity boundary
 cannot be trusted, reconstruct on a reviewed copy or restart to force the full
 audit before relying on the ledger.
+
+Schema validation inventories every trigger whose target is a protected ledger
+table, regardless of the trigger's name, and rejects anything beyond the exact
+versioned trigger set. This prevents a foreign trigger such as
+`RAISE(IGNORE)` from silently suppressing an append.
 
 For an existing database, schema version detection is immutable and read-only
 before any read-write recovery. Read-write recovery of a hot rollback journal
