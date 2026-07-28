@@ -36,7 +36,9 @@ declaring that no model was used.
 
 `robo_trader.backtesting.provenance` provides the supported hashing boundaries:
 
-- `digest_file()` hashes a regular file's exact bytes and rejects symlinks.
+- `digest_file()` opens a regular file with no-follow semantics, rejects symlink
+  swaps, and rejects a file whose identity, size, or timestamps change while it
+  is being hashed.
 - `digest_file_set()` hashes relative paths and file digests under a declared root. File
   ordering does not change the result, but renaming a file does.
 - `digest_dataframe()` covers index values/names, column labels, dtypes, cell values, and

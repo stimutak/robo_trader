@@ -13,6 +13,15 @@ touch (or the limit, whichever is worse); a limit reached later in the bar
 executes at its limit.  A stop gapped through at the open executes at the
 opening touch; a stop reached later becomes a market order at the stop touch.
 No assumption is made about whether the high or low occurred first.
+
+For a logical order carried across bars, callers pass cumulative filled
+quantity and commission already paid.  The per-order minimum is then charged
+once while per-share commission can accrue as cumulative fills grow.
+Engine callers also pass the last completed bar's known volume as the next
+bar's liquidity budget; execution-bar total volume is never used at its open.
+Execution analytics define fill rate by filled/requested quantity and require
+an explicit average portfolio value for turnover; they never invent one from
+the fill price.
 """
 
 import logging
@@ -133,6 +142,9 @@ class ExecutionSimulator:
     ``reset`` remain deterministic.
     """
 
+    supports_parent_order_commission = True
+    supports_lagged_liquidity = True
+
     def __init__(
         self,
         spread_model: str = "dynamic",
@@ -211,6 +223,9 @@ class ExecutionSimulator:
         timestamp: datetime,
         limit_price: Optional[float] = None,
         stop_price: Optional[float] = None,
+        cumulative_filled_quantity: int = 0,
+        commission_paid: float = 0.0,
+        liquidity_volume: Optional[float] = None,
     ) -> SimulatedOrder:
         """Simulate an order using only the bar at ``timestamp``.
 
@@ -230,6 +245,33 @@ class ExecutionSimulator:
             limit_price,
             stop_price,
         )
+        if (
+            isinstance(cumulative_filled_quantity, bool)
+            or not isinstance(cumulative_filled_quantity, Integral)
+            or cumulative_filled_quantity < 0
+        ):
+            raise ValueError("cumulative_filled_quantity must be a non-negative integer")
+        normalized_commission_paid = self._finite_nonnegative(commission_paid, "commission_paid")
+        normalized_liquidity_volume = (
+            None
+            if liquidity_volume is None
+            else self._finite_nonnegative(liquidity_volume, "liquidity_volume")
+        )
+        expected_commission_paid = (
+            0.0
+            if cumulative_filled_quantity == 0
+            else max(
+                self.min_commission,
+                self.commission_per_share * int(cumulative_filled_quantity),
+            )
+        )
+        if not math.isclose(
+            normalized_commission_paid,
+            expected_commission_paid,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("commission_paid does not match cumulative_filled_quantity and policy")
         requested_quantity = int(quantity)
         normalized_limit = float(limit_price) if limit_price is not None else None
         normalized_stop = float(stop_price) if stop_price is not None else None
@@ -241,7 +283,10 @@ class ExecutionSimulator:
             )
 
         arrival_price = float(current_data["open"])
-        volume = float(current_data["volume"])
+        reported_volume = float(current_data["volume"])
+        volume = (
+            reported_volume if normalized_liquidity_volume is None else normalized_liquidity_volume
+        )
         spread = self._calculate_spread(current_data, arrival_price)
         fills, base_fill_price = self._check_order_fill(
             order_type,
@@ -271,6 +316,8 @@ class ExecutionSimulator:
             spread,
             volume,
             current_data,
+            cumulative_filled_quantity=int(cumulative_filled_quantity),
+            commission_paid=normalized_commission_paid,
         )
         final_fill_price = self._apply_adverse_costs(
             base_fill_price,
@@ -463,7 +510,8 @@ class ExecutionSimulator:
         high = float(market_data["high"])
         low = float(market_data["low"])
         if order_type == "limit":
-            assert limit_price is not None  # validated at the public boundary
+            if limit_price is None:
+                raise ValueError("limit_price is required")
             if side == "buy":
                 if opening_touch <= limit_price:
                     return True, min(opening_touch, limit_price)
@@ -476,7 +524,8 @@ class ExecutionSimulator:
                     return True, float(limit_price)
             return False, 0.0
 
-        assert stop_price is not None  # validated at the public boundary
+        if stop_price is None:
+            raise ValueError("stop_price is required")
         if side == "buy":
             if mid_price >= stop_price:
                 return True, max(opening_touch, float(stop_price))
@@ -497,6 +546,9 @@ class ExecutionSimulator:
         spread: float,
         volume: float,
         market_data: pd.Series,
+        *,
+        cumulative_filled_quantity: int,
+        commission_paid: float,
     ) -> ExecutionCost:
         """Calculate each adverse cost component exactly once."""
 
@@ -508,7 +560,11 @@ class ExecutionSimulator:
             quantity, volume, volatility, relative_spread
         )
         market_impact = (permanent_impact + temporary_impact) * fill_price
-        commission = max(self.min_commission, self.commission_per_share * quantity)
+        cumulative_commission = max(
+            self.min_commission,
+            self.commission_per_share * (cumulative_filled_quantity + quantity),
+        )
+        commission = max(cumulative_commission - commission_paid, 0.0)
         slippage = fill_price * self.slippage_factor * abs(float(self._rng.normal()))
         total_cost = (spread_cost + market_impact + slippage) * quantity + commission
         return ExecutionCost(
@@ -587,8 +643,14 @@ class ExecutionSimulator:
             return trade.partial_fill
         return trade.quantity if trade.filled else 0
 
-    def calculate_portfolio_turnover(self, trades: List[SimulatedOrder]) -> float:
-        """Calculate portfolio turnover using executed, not requested, quantity."""
+    def calculate_portfolio_turnover(
+        self, trades: List[SimulatedOrder], *, average_portfolio_value: float
+    ) -> float:
+        """Calculate traded notional divided by an explicit portfolio value."""
+
+        denominator = float(average_portfolio_value)
+        if not math.isfinite(denominator) or denominator <= 0:
+            raise ValueError("average_portfolio_value must be finite and positive")
 
         filled_trades = [trade for trade in trades if self._executed_quantity(trade) > 0]
         if not filled_trades:
@@ -596,15 +658,23 @@ class ExecutionSimulator:
         total_traded = sum(
             abs(self._executed_quantity(trade) * trade.fill_price) for trade in filled_trades
         )
-        avg_portfolio_value = float(np.mean([trade.fill_price * 10000 for trade in filled_trades]))
-        return total_traded / avg_portfolio_value if avg_portfolio_value > 0 else 0.0
+        return total_traded / denominator
 
-    def get_execution_analytics(self, trades: List[SimulatedOrder]) -> Dict:
+    def get_execution_analytics(
+        self, trades: List[SimulatedOrder], *, average_portfolio_value: float
+    ) -> Dict:
         """Return aggregate analytics without double-counting any cost component."""
 
+        denominator = float(average_portfolio_value)
+        if not math.isfinite(denominator) or denominator <= 0:
+            raise ValueError("average_portfolio_value must be finite and positive")
         if not trades:
             return {}
         filled_trades = [trade for trade in trades if self._executed_quantity(trade) > 0]
+        total_requested_quantity = sum(trade.quantity for trade in trades)
+        if total_requested_quantity <= 0:
+            raise ValueError("analytics require positive requested quantities")
+        total_filled_quantity = sum(self._executed_quantity(trade) for trade in filled_trades)
         if not filled_trades:
             return {"fill_rate": 0.0}
 
@@ -622,7 +692,7 @@ class ExecutionSimulator:
             for trade in filled_trades
         )
         return {
-            "fill_rate": len(filled_trades) / len(trades),
+            "fill_rate": total_filled_quantity / total_requested_quantity,
             "avg_spread_cost_bps": float(
                 np.mean(
                     [
@@ -644,5 +714,7 @@ class ExecutionSimulator:
             "total_commission": total_commission,
             "total_slippage": total_slippage,
             "total_execution_cost": sum(trade.execution_cost.total_cost for trade in filled_trades),
-            "turnover": self.calculate_portfolio_turnover(filled_trades),
+            "turnover": self.calculate_portfolio_turnover(
+                filled_trades, average_portfolio_value=denominator
+            ),
         }

@@ -7,7 +7,12 @@ import pandas as pd
 import pytest
 
 from robo_trader.backtesting.engine import BacktestEngine
-from robo_trader.backtesting.execution_simulator import ExecutionCost, SimulatedOrder
+from robo_trader.backtesting.execution_simulator import (
+    ExecutionCost,
+    ExecutionSimulator,
+    MarketImpactModel,
+    SimulatedOrder,
+)
 
 
 def _bars(
@@ -138,6 +143,46 @@ def test_partial_fill_remainder_persists_across_exact_future_bars() -> None:
     assert result.equity_curve.iloc[-1] == pytest.approx(1_006)
 
 
+def test_partial_fill_parent_order_pays_minimum_commission_only_once() -> None:
+    strategy = ScriptedStrategy([{"SINGLE": {"action": "buy", "quantity": 3}}, {}, {}, {}])
+    simulator = ExecutionSimulator(
+        spread_model="fixed",
+        commission_per_share=0.005,
+        min_commission=1.0,
+        market_impact_model=MarketImpactModel(0, 0),
+        slippage_factor=0,
+        max_volume_participation=1,
+    )
+    data = _bars([100, 100, 100, 100])
+    data["volume"] = 1
+    engine = _engine(strategy, simulator)
+
+    result = engine.run(data)
+
+    assert result.positions[0].quantity == 3
+    assert sum(float(lot.commission_remaining) for lot in engine._lots["SINGLE"]) == 1.0
+    assert result.equity_curve.iloc[-1] == pytest.approx(998.985)
+
+
+def test_next_open_fill_capacity_uses_only_decision_bar_known_volume() -> None:
+    strategy = ScriptedStrategy([{"SINGLE": {"action": "buy", "quantity": 100}}, {}])
+    simulator = ExecutionSimulator(
+        spread_model="fixed",
+        commission_per_share=0,
+        min_commission=0,
+        market_impact_model=MarketImpactModel(0, 0),
+        slippage_factor=0,
+        max_volume_participation=1,
+    )
+    data = _bars([100, 100])
+    data["volume"] = [1, 10_000]
+
+    result = _engine(strategy, simulator).run(data)
+
+    assert result.positions[0].quantity == 1
+    assert result.approval_eligible
+
+
 def test_short_lots_and_partial_cover_use_fifo_and_signed_marking() -> None:
     strategy = ScriptedStrategy(
         [
@@ -203,9 +248,10 @@ def test_forced_liquidation_replaces_final_mark_after_fill() -> None:
     result = engine.run(_bars([9, 11, 12], [9, 11, 13]))
 
     assert result.positions == []
-    assert result.trades[0].pnl == pytest.approx(8)
-    assert result.equity_curve.iloc[-1] == pytest.approx(1_008)
-    assert result.metrics["final_equity"] == pytest.approx(1_008)
+    assert result.trades[0].exit_price == 13
+    assert result.trades[0].pnl == pytest.approx(18)
+    assert result.equity_curve.iloc[-1] == pytest.approx(1_018)
+    assert result.metrics["final_equity"] == pytest.approx(1_018)
 
 
 def test_each_run_resets_state_and_previous_result_is_detached() -> None:

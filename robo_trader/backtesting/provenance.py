@@ -9,6 +9,8 @@ import base64
 import hashlib
 import json
 import math
+import os
+import stat
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -184,17 +186,39 @@ def digest_json(value: Any) -> ContentDigest:
 
 
 def digest_file(path: Path) -> ContentDigest:
-    """Hash one regular file without following a symlink."""
+    """Hash one stable regular file without following a symlink."""
 
     candidate = Path(path)
     if candidate.is_symlink() or not candidate.is_file():
         raise ValueError("path must identify a regular, non-symlink file")
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise RuntimeError("secure file hashing requires O_NOFOLLOW support")
+    flags = os.O_RDONLY | no_follow | getattr(os, "O_BINARY", 0)
+    try:
+        descriptor = os.open(candidate, flags)
+    except OSError as exc:
+        raise ValueError("path changed or could not be opened without following links") from exc
     hasher = hashlib.sha256()
     length = 0
-    with candidate.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            hasher.update(chunk)
-            length += len(chunk)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("path must identify a regular file")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                hasher.update(chunk)
+                length += len(chunk)
+            after = os.fstat(stream.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    identity_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(before, field) != getattr(after, field) for field in identity_fields):
+        raise ValueError("file changed while it was being hashed")
+    if length != before.st_size:
+        raise ValueError("file size changed while it was being hashed")
     return ContentDigest("sha256", hasher.hexdigest(), length)
 
 

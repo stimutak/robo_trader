@@ -4,6 +4,16 @@ The engine is deliberately offline-only.  A strategy observes a completed bar,
 creates a decision, and that decision can first execute on the symbol's next
 exact bar.  Accounting consumes the execution simulator's reported filled
 quantity and commission once; it never invents fills or substitutes quotes.
+The next bar's opening price is executable, but its completed total volume is
+not yet known; liquidity capacity therefore uses the last completed bar volume
+captured with the decision and advances only for a later retry.
+
+Stop-loss and take-profit predicates receive the adverse and favorable
+intrabar extremes respectively.  If both are touched in one completed bar, the
+stop wins because OHLC does not reveal path order.  The resulting reduce-only
+decision executes no earlier than the next exact bar.  Rebalancing occurs once
+per observed daily, weekly, or monthly period, with exposure reductions queued
+before increases in deterministic symbol order.
 """
 
 import copy
@@ -113,6 +123,9 @@ class _PendingOrder:
     decision_time: pd.Timestamp
     reason: str
     reduce_only: bool = False
+    filled_quantity: int = 0
+    commission_paid: Decimal = Decimal(0)
+    known_volume: Optional[float] = None
 
 
 class BacktestEngine:
@@ -190,6 +203,8 @@ class BacktestEngine:
         self._signals: List[Dict[str, Any]] = []
         self._errors: List[str] = []
         self._approval_eligible = True
+        self._last_rebalance_bucket: Optional[Tuple[int, ...]] = None
+        self._known_volumes: Dict[str, float] = {}
 
     def run(self, data: pd.DataFrame, symbols: Optional[List[str]] = None) -> BacktestResult:
         """Run one isolated backtest.
@@ -217,6 +232,9 @@ class BacktestEngine:
                 self._execute_pending(current, timestamp)
                 self._sync_positions()
                 self._mark(current, timestamp)
+                self._known_volumes.update(
+                    {symbol: float(current.loc[symbol, "volume"]) for symbol in current.index}
+                )
 
                 if self._should_rebalance(timestamp):
                     self._queue_rebalance(current, timestamp)
@@ -407,14 +425,21 @@ class BacktestEngine:
                 )
                 if not (reduces_long or reduces_short):
                     continue
-                assert position is not None
+                if position is None:
+                    raise RuntimeError("reduce-only validation lost its position")
                 pending.remaining_quantity = min(pending.remaining_quantity, abs(position.quantity))
             requested = pending.remaining_quantity
             filled = self._simulate_and_account(
-                pending.symbol, requested, pending.side, current.loc[pending.symbol], timestamp
+                pending.symbol,
+                requested,
+                pending.side,
+                current.loc[pending.symbol],
+                timestamp,
+                parent_order=pending,
             )
             pending.remaining_quantity -= filled
             if pending.remaining_quantity > 0:
+                pending.known_volume = float(current.loc[pending.symbol, "volume"])
                 still_pending.append(pending)
         self._pending = still_pending
 
@@ -425,8 +450,24 @@ class BacktestEngine:
         side: str,
         market_data: pd.Series,
         timestamp: pd.Timestamp,
+        *,
+        parent_order: Optional[_PendingOrder] = None,
     ) -> int:
         price_data = pd.DataFrame([market_data], index=pd.DatetimeIndex([timestamp]))
+        simulation_options: Dict[str, Any] = {}
+        if parent_order is not None and getattr(
+            self.execution_simulator, "supports_parent_order_commission", False
+        ):
+            simulation_options = {
+                "cumulative_filled_quantity": parent_order.filled_quantity,
+                "commission_paid": float(parent_order.commission_paid),
+            }
+        if (
+            parent_order is not None
+            and parent_order.known_volume is not None
+            and getattr(self.execution_simulator, "supports_lagged_liquidity", False)
+        ):
+            simulation_options["liquidity_volume"] = parent_order.known_volume
         order = self.execution_simulator.simulate_execution(
             symbol=symbol,
             quantity=quantity,
@@ -434,6 +475,7 @@ class BacktestEngine:
             order_type="market",
             price_data=price_data,
             timestamp=timestamp,
+            **simulation_options,
         )
         if not hasattr(order, "filled_quantity"):
             raise ValueError("execution result must report filled_quantity")
@@ -462,6 +504,9 @@ class BacktestEngine:
         self._cash += cash_delta
         self.cash = float(self._cash)
         self._apply_fill_to_lots(symbol, side, filled, fill_price, commission, timestamp)
+        if parent_order is not None:
+            parent_order.filled_quantity += filled
+            parent_order.commission_paid += commission
         self._sync_positions()
         return filled
 
@@ -666,7 +711,7 @@ class BacktestEngine:
         reduce_only: bool = False,
     ) -> None:
         position = self.positions.get(symbol)
-        if reason in {"close", "risk-exit", "risk-close"} and position:
+        if reduce_only and position:
             already_pending = sum(
                 pending.remaining_quantity
                 for pending in self._pending
@@ -690,6 +735,7 @@ class BacktestEngine:
                 pd.Timestamp(timestamp),
                 reason,
                 reduce_only=reduce_only,
+                known_volume=self._known_volumes.get(symbol),
             )
         )
 
@@ -712,11 +758,26 @@ class BacktestEngine:
         return max(0, int((self._cash / open_slots) / close))
 
     def _should_rebalance(self, timestamp: datetime) -> bool:
+        """Return true only for the first observed event in each configured period.
+
+        Period transitions are based on observed events rather than weekday or
+        month-day literals, so a holiday cannot suppress an entire weekly or
+        monthly rebalance and intraday bars cannot schedule duplicates.
+        """
+
+        event = pd.Timestamp(timestamp)
+        bucket: Tuple[int, ...]
         if self.rebalance_frequency == "daily":
-            return True
-        if self.rebalance_frequency == "weekly":
-            return timestamp.weekday() == 0
-        return timestamp.day == 1
+            bucket = (event.year, event.month, event.day)
+        elif self.rebalance_frequency == "weekly":
+            iso = event.isocalendar()
+            bucket = (int(iso.year), int(iso.week))
+        else:
+            bucket = (event.year, event.month)
+        if bucket == self._last_rebalance_bucket:
+            return False
+        self._last_rebalance_bucket = bucket
+        return True
 
     def _queue_rebalance(self, current: pd.DataFrame, timestamp: pd.Timestamp) -> None:
         if not hasattr(self.strategy, "get_target_weights"):
@@ -734,42 +795,83 @@ class BacktestEngine:
         current: pd.DataFrame,
         timestamp: pd.Timestamp,
     ) -> None:
+        if not isinstance(target_weights, dict):
+            raise ValueError("target weights must be a symbol mapping")
         portfolio_value = self._portfolio_value(current)
+        orders: List[Tuple[int, str, str, int, bool]] = []
+        normalized_weights: Dict[str, Decimal] = {}
         for symbol, weight_value in target_weights.items():
+            if not isinstance(symbol, str) or not symbol:
+                raise ValueError("target weight symbols must be non-empty strings")
             if symbol not in current.index:
                 raise ValueError(f"target weight references unavailable symbol {symbol}")
             weight = _decimal(weight_value, f"{symbol} target weight")
             if not Decimal("-1") <= weight <= Decimal("1"):
                 raise ValueError("target weights must be between -1 and 1")
+            normalized_weights[symbol] = weight
+        if sum(abs(weight) for weight in normalized_weights.values()) > Decimal(1):
+            raise ValueError("absolute target weights must not exceed unlevered gross exposure")
+
+        for symbol, weight in normalized_weights.items():
             price = _decimal(current.loc[symbol, "close"], f"{symbol} close")
             target = int((portfolio_value * weight) / price)
             current_quantity = self.positions.get(
                 symbol, Position(symbol, 0, 0.0, timestamp)
             ).quantity
+            if current_quantity and target and (current_quantity > 0) != (target > 0):
+                close_side = "sell" if current_quantity > 0 else "buy"
+                open_side = "buy" if target > 0 else "sell"
+                orders.append((0, symbol, close_side, abs(current_quantity), True))
+                orders.append((1, symbol, open_side, abs(target), False))
+                continue
             delta = target - current_quantity
-            if delta:
-                self._queue_order(
-                    symbol, "buy" if delta > 0 else "sell", abs(delta), timestamp, "rebalance"
-                )
+            if not delta:
+                continue
+            side = "buy" if delta > 0 else "sell"
+            reduces_exposure = abs(target) < abs(current_quantity)
+            # Exposure reductions run before increases so sale proceeds are
+            # available to rotations.  Symbol ordering makes equivalent
+            # mappings execution-identical regardless of insertion order.
+            priority = 0 if reduces_exposure else 1
+            orders.append((priority, symbol, side, abs(delta), reduces_exposure))
+        for _priority, symbol, side, quantity, reduce_only in sorted(orders):
+            self._queue_order(
+                symbol,
+                side,
+                quantity,
+                timestamp,
+                "rebalance-reduce" if reduce_only else "rebalance-increase",
+                reduce_only=reduce_only,
+            )
 
     def _update_positions(self, current: pd.DataFrame, timestamp: pd.Timestamp) -> None:
         for symbol, position in list(self.positions.items()):
             if symbol not in current.index:
                 raise RuntimeError(f"missing exact quote for held position {symbol}")
-            price = float(current.loc[symbol, "close"])
-            close = False
+            row = current.loc[symbol]
+            adverse_price = float(row["low"] if position.quantity > 0 else row["high"])
+            favorable_price = float(row["high"] if position.quantity > 0 else row["low"])
+            stop_triggered = False
+            take_profit_triggered = False
             if hasattr(self.strategy, "check_stop_loss"):
-                close = bool(self.strategy.check_stop_loss(position, price))
-            if not close and hasattr(self.strategy, "check_take_profit"):
-                close = bool(self.strategy.check_take_profit(position, price))
-            if close:
+                stop_triggered = bool(self.strategy.check_stop_loss(position, adverse_price))
+            if hasattr(self.strategy, "check_take_profit"):
+                take_profit_triggered = bool(
+                    self.strategy.check_take_profit(position, favorable_price)
+                )
+            if stop_triggered or take_profit_triggered:
                 side = "sell" if position.quantity > 0 else "buy"
+                # A bar does not reveal whether high or low occurred first.
+                # When both thresholds were touched, the adverse stop wins.
+                # The completed bar creates a decision; the reduce-only market
+                # order can execute only on the symbol's next exact bar.
+                reason = "risk-stop" if stop_triggered else "risk-take-profit"
                 self._queue_order(
                     symbol,
                     side,
                     abs(position.quantity),
                     timestamp,
-                    "risk-exit",
+                    reason,
                     reduce_only=True,
                 )
 
@@ -826,8 +928,13 @@ class BacktestEngine:
             if symbol not in current.index:
                 raise RuntimeError(f"missing exact quote for held position {symbol}")
             side = "sell" if position.quantity > 0 else "buy"
+            closing_event = current.loc[symbol].drop(labels=["bid", "ask"], errors="ignore").copy()
+            # Finalization happens after the final completed bar was observed.
+            # Reusing the bar's opening touch would travel backward in time, so
+            # the synthetic terminal event executes at the known closing touch.
+            closing_event["open"] = closing_event["close"]
             self._simulate_and_account(
-                symbol, abs(position.quantity), side, current.loc[symbol], timestamp
+                symbol, abs(position.quantity), side, closing_event, timestamp
             )
 
     def _execute_buy(
@@ -913,9 +1020,14 @@ class BacktestEngine:
                     if pending.symbol != symbol:
                         continue
                     adjusted = Decimal(pending.remaining_quantity) * split
-                    if adjusted != adjusted.to_integral_value():
+                    adjusted_filled = Decimal(pending.filled_quantity) * split
+                    if (
+                        adjusted != adjusted.to_integral_value()
+                        or adjusted_filled != adjusted_filled.to_integral_value()
+                    ):
                         raise RuntimeError("split creates an unsupported fractional order")
                     pending.remaining_quantity = int(adjusted)
+                    pending.filled_quantity = int(adjusted_filled)
             dividend = _decimal(row.get("dividend", 0), f"{symbol} dividend")
             if dividend < 0:
                 raise ValueError("dividend must be non-negative")
@@ -980,8 +1092,8 @@ class BacktestEngine:
             if standard_deviation > 0
             else 0.0
         )
-        downside = returns[returns < 0]
-        downside_deviation = float(np.std(downside)) if len(downside) > 1 else 0.0
+        downside = np.minimum(returns, 0.0)
+        downside_deviation = float(np.sqrt(np.mean(np.square(downside)))) if len(downside) else 0.0
         sortino = (
             annualizer * float(np.mean(returns)) / downside_deviation
             if downside_deviation > 0

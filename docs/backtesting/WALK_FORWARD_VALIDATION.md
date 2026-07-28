@@ -19,7 +19,8 @@ authority.
 - fixed-size out-of-sample test data;
 - a step size that must keep test windows non-overlapping;
 - an optional embargo between consecutive test windows; and
-- one fixed-size final holdout at the end of the dataset.
+- one fixed-size final holdout at the end of the dataset, separated from the
+  development region by the configured purge size.
 
 All train, validation, and test sizes must be positive. The validator never shrinks a window
 to fit a short dataset. It rejects a plan with zero-sized test data, a step smaller than the
@@ -71,7 +72,9 @@ The aggregate return sequence is constructed internally by concatenating only ea
 test returns in window order. `WalkForwardResult` rejects a manually constructed aggregate
 that differs from those exact observations. Training scores, validation scores, and final
 holdout returns cannot enter aggregate observation count, mean return, cumulative return,
-volatility, or Sharpe ratio.
+volatility, or return-to-volatility ratio. The evaluator contract does not declare a sampling
+frequency, so this module deliberately reports the unannualized `return_to_volatility` ratio.
+It does not relabel observation-count scaling as a Sharpe ratio.
 
 The final holdout has its own observation sequence and metrics. It remains visible for the
 candidate readiness decision without being reused for tuning.

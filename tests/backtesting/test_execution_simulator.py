@@ -368,15 +368,65 @@ def test_execution_analytics_use_filled_quantity_and_precomputed_total_once() ->
     partial = _execute(simulator, quantity=100, price_data=_bars(volume=200))
     unfilled = _execute(simulator, quantity=10, price_data=_bars(volume=0))
 
-    analytics = simulator.get_execution_analytics([partial, unfilled])
+    analytics = simulator.get_execution_analytics(
+        [partial, unfilled], average_portfolio_value=10_000
+    )
 
-    assert analytics["fill_rate"] == pytest.approx(0.5)
+    assert analytics["fill_rate"] == pytest.approx(50 / 110)
     assert analytics["total_spread_cost"] == pytest.approx(partial.execution_cost.spread_cost * 50)
     assert analytics["total_commission"] == partial.execution_cost.commission
     assert analytics["total_execution_cost"] == partial.execution_cost.total_cost
-    assert simulator.calculate_portfolio_turnover([partial]) == pytest.approx(
-        (50 * partial.fill_price) / (partial.fill_price * 10_000)
+    assert simulator.calculate_portfolio_turnover(
+        [partial], average_portfolio_value=10_000
+    ) == pytest.approx((50 * partial.fill_price) / 10_000)
+
+
+def test_parent_order_minimum_commission_is_not_recharged_on_each_partial_fill() -> None:
+    simulator = _simulator(commission_per_share=0.005, min_commission=1.0)
+    first = _execute(
+        simulator,
+        quantity=3,
+        price_data=_bars(volume=1),
+        cumulative_filled_quantity=0,
+        commission_paid=0,
     )
+    second = _execute(
+        simulator,
+        quantity=2,
+        price_data=_bars(volume=1),
+        cumulative_filled_quantity=1,
+        commission_paid=first.execution_cost.commission,
+    )
+    third = _execute(
+        simulator,
+        quantity=1,
+        price_data=_bars(volume=1),
+        cumulative_filled_quantity=2,
+        commission_paid=first.execution_cost.commission + second.execution_cost.commission,
+    )
+
+    assert [order.filled_quantity for order in (first, second, third)] == [1, 1, 1]
+    assert sum(order.execution_cost.commission for order in (first, second, third)) == 1.0
+
+    with pytest.raises(ValueError, match="commission_paid does not match"):
+        _execute(
+            simulator,
+            quantity=1,
+            price_data=_bars(volume=1),
+            cumulative_filled_quantity=2,
+            commission_paid=999,
+        )
+
+
+@pytest.mark.parametrize("average_portfolio_value", [0, -1, float("nan"), float("inf")])
+def test_execution_analytics_require_explicit_valid_portfolio_value(
+    average_portfolio_value: float,
+) -> None:
+    with pytest.raises(ValueError, match="average_portfolio_value"):
+        _simulator().get_execution_analytics(
+            [_execute(_simulator())],
+            average_portfolio_value=average_portfolio_value,
+        )
 
 
 def test_legacy_public_fields_and_constructor_remain_available() -> None:

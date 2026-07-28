@@ -17,7 +17,7 @@ from .manifest import BacktestRunManifest, SeedPolicy
 from .provenance import ContentDigest, HashedInput, digest_bytes, digest_dataframe, digest_json
 
 _SCHEMA_VERSION = "robotrader-walk-forward-v1"
-_SELECTION_METRICS = frozenset({"mean_return", "cumulative_return", "sharpe_ratio"})
+_SELECTION_METRICS = frozenset({"mean_return", "cumulative_return", "return_to_volatility"})
 
 
 class WalkForwardValidationError(RuntimeError):
@@ -68,13 +68,16 @@ def _metrics(returns: Sequence[float]) -> Dict[str, float]:
     mean = float(np.mean(values))
     deviation = float(np.std(values)) if len(values) > 1 else 0.0
     cumulative = float(np.prod(1.0 + values) - 1.0)
-    sharpe = mean / deviation * math.sqrt(len(values)) if deviation > 0 else 0.0
+    # The evaluator contract does not declare a sampling frequency.  Report a
+    # truthful unannualized return-to-volatility ratio rather than scaling by
+    # sqrt(observation_count), which is a t-statistic and not a Sharpe ratio.
+    return_to_volatility = mean / deviation if deviation > 0 else 0.0
     metrics = {
         "observation_count": float(len(values)),
         "mean_return": mean,
         "cumulative_return": cumulative,
         "volatility": deviation,
-        "sharpe_ratio": sharpe,
+        "return_to_volatility": return_to_volatility,
     }
     if not all(math.isfinite(value) for value in metrics.values()):
         raise WalkForwardValidationError("evaluation produced non-finite aggregate metrics")
@@ -640,10 +643,12 @@ class WalkForwardValidator:
 
     def build_windows(self, event_count: int) -> Tuple[WindowBoundary, ...]:
         count = _positive_integer(event_count, "event_count")
-        development_end = count - self.plan.holdout_size
+        holdout_start = count - self.plan.holdout_size
+        development_end = holdout_start - self.plan.purge_size
         if development_end < self.plan.minimum_development_size:
             raise WalkForwardValidationError(
-                "insufficient events for one fixed train/validation/test window and holdout"
+                "insufficient events for one fixed train/validation/test window, "
+                "holdout purge, and holdout"
             )
         windows: List[WindowBoundary] = []
         start = 0
@@ -674,7 +679,9 @@ class WalkForwardValidator:
             if previous.test_end + self.plan.embargo_size > current.test_start:
                 raise WalkForwardValidationError("test windows violate non-overlap or embargo")
         if any(window.test_end > development_end for window in windows):
-            raise WalkForwardValidationError("a test window overlaps the final holdout")
+            raise WalkForwardValidationError(
+                "a test window overlaps the final holdout purge or holdout"
+            )
         return tuple(windows)
 
     @staticmethod

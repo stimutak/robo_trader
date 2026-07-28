@@ -116,7 +116,7 @@ def test_fixed_windows_are_ordered_purged_and_exclude_holdout() -> None:
         assert window.test_end - window.test_start == plan.test_size
         assert window.validation_start - window.train_end == plan.purge_size
         assert window.test_start - window.validation_end == plan.purge_size
-        assert window.test_end <= holdout_start
+        assert window.test_end + plan.purge_size <= holdout_start
     for previous, current in zip(windows, windows[1:]):
         assert previous.test_end + plan.embargo_size <= current.test_start
 
@@ -216,6 +216,19 @@ def test_aggregate_metrics_contain_only_window_test_observations() -> None:
     assert not set(result.aggregate_oos_returns).intersection(
         data.iloc[-plan.holdout_size :]["return"]
     )
+
+
+def test_unannualized_return_to_volatility_does_not_scale_with_observation_count() -> None:
+    short = EvaluationOutcome((0.01, -0.005)).metrics
+    repeated = EvaluationOutcome((0.01, -0.005, 0.01, -0.005)).metrics
+
+    assert short["return_to_volatility"] == pytest.approx(repeated["return_to_volatility"])
+    assert "sharpe_ratio" not in short
+
+
+def test_plan_rejects_mislabeled_observation_count_scaled_sharpe_metric() -> None:
+    with pytest.raises(ValueError, match="unsupported selection metric"):
+        _plan(selection_metric="sharpe_ratio")
 
 
 def test_seeded_validation_is_byte_deterministic() -> None:

@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import robo_trader.backtesting.provenance as provenance
 from robo_trader.backtesting.provenance import (
     ContentDigest,
     canonical_json_bytes,
@@ -100,6 +101,26 @@ def test_file_hash_rejects_symlinks_and_file_set_escape(tmp_path: Path) -> None:
             digest_file_set([outside], tmp_path)
     finally:
         outside.unlink()
+
+
+def test_file_hash_rejects_symlink_swap_between_check_and_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = tmp_path / "candidate"
+    outside = tmp_path / "outside"
+    candidate.write_bytes(b"reviewed")
+    outside.write_bytes(b"different")
+    real_open = provenance.os.open
+
+    def swap_then_open(path, flags):
+        candidate.unlink()
+        candidate.symlink_to(outside)
+        return real_open(path, flags)
+
+    monkeypatch.setattr(provenance.os, "open", swap_then_open)
+
+    with pytest.raises(ValueError, match="without following links"):
+        digest_file(candidate)
 
 
 def test_content_digest_rejects_malformed_identity() -> None:
