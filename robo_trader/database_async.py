@@ -399,7 +399,16 @@ class AsyncTradingDatabase:
             raise
         finally:
             if binding is not None:
-                binding.close()
+                try:
+                    binding.close()
+                except BaseException as exc:
+                    if committed_receipt is not None:
+                        raise ExactStateBootstrapCommittedBackupInvalid(
+                            bootstrap_id=candidate.bootstrap_id,
+                            candidate_fingerprint=candidate.fingerprint(),
+                            detail=str(exc),
+                        ) from exc
+                    raise
 
     def _retire_pool_generation(self, reason: str) -> List[aiosqlite.Connection]:
         """Synchronously fail one generation before any cleanup can suspend."""
@@ -1648,6 +1657,211 @@ class AsyncTradingDatabase:
         ):
             raise ExactStateBootstrapError("bootstrap backup does not restore the reviewed ledger")
 
+    @staticmethod
+    async def _assert_prebootstrap_tables_match_backup(
+        connection: aiosqlite.Connection,
+        receipt: ExactStateBootstrapBackupReceipt,
+    ) -> None:
+        """Prove every table present in the raw source still matches its backup."""
+
+        cursor = await connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )
+        live_tables = tuple(str(row[0]) for row in await cursor.fetchall())
+        receipt_tables = tuple(name for name, _ in receipt.row_counts)
+        if live_tables != receipt_tables:
+            raise ExactStateBootstrapError("source table set changed after the bootstrap backup")
+
+        expected_counts = dict(receipt.row_counts)
+        expected_hashes = dict(receipt.table_hashes)
+        for table in receipt_tables:
+            quoted = '"' + table.replace('"', '""') + '"'
+            columns = await connection.execute(f"PRAGMA table_info({quoted})")
+            column_rows = await columns.fetchall()
+            order = ",".join(str(index + 1) for index in range(len(column_rows)))
+            query = f"SELECT * FROM {quoted}"
+            if order:
+                query += f" ORDER BY {order}"
+            rows = await connection.execute(query)
+            digest = hashlib.sha256()
+            count = 0
+            for row in await rows.fetchall():
+                values: list[object] = []
+                for value in row:
+                    if isinstance(value, bytes):
+                        values.append({"blob_hex": value.hex()})
+                    elif value is None or type(value) in {str, int, float}:
+                        values.append(value)
+                    else:
+                        raise ExactStateBootstrapError(
+                            "source contains an unsupported SQLite value"
+                        )
+                encoded = json.dumps(
+                    values,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+                count += 1
+            if count != expected_counts[table] or not hmac.compare_digest(
+                digest.hexdigest(), expected_hashes[table]
+            ):
+                raise ExactStateBootstrapError(f"source table changed after backup: {table}")
+
+    @staticmethod
+    async def _prepare_exact_bootstrap_schema(
+        connection: aiosqlite.Connection,
+    ) -> None:
+        """Prepare only the exact-state dependency graph in the caller transaction."""
+
+        await connection.execute("""
+            CREATE TABLE IF NOT EXISTS paper_reduction_settlements (
+                settlement_id TEXT PRIMARY KEY,
+                execution_domain_scope TEXT NOT NULL,
+                account_scope TEXT NOT NULL,
+                portfolio_id TEXT NOT NULL,
+                con_id INTEGER NOT NULL CHECK (con_id > 0),
+                symbol TEXT NOT NULL,
+                reservation_id TEXT NOT NULL UNIQUE,
+                claim_id TEXT NOT NULL UNIQUE,
+                order_ref TEXT NOT NULL,
+                protective_quote_payload TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                request_payload_json TEXT NOT NULL,
+                terminal_status TEXT NOT NULL,
+                trade_id INTEGER,
+                database_path TEXT NOT NULL,
+                database_identity TEXT NOT NULL,
+                database_device INTEGER NOT NULL,
+                database_inode INTEGER NOT NULL,
+                committed_at TEXT NOT NULL,
+                receipt_fingerprint TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,
+                UNIQUE(execution_domain_scope, account_scope, order_ref),
+                FOREIGN KEY(trade_id) REFERENCES trades(id)
+            )
+        """)
+        await connection.execute("""
+            CREATE TABLE IF NOT EXISTS paper_account_settlement_state (
+                portfolio_id TEXT PRIMARY KEY,
+                cash_text TEXT NOT NULL,
+                realized_pnl_text TEXT NOT NULL,
+                daily_pnl_text TEXT NOT NULL,
+                daily_pnl_baseline_text TEXT NOT NULL,
+                daily_pnl_date TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                source_settlement_id TEXT,
+                FOREIGN KEY(source_settlement_id)
+                    REFERENCES paper_reduction_settlements(settlement_id)
+            )
+        """)
+        await connection.execute("""
+            CREATE TABLE IF NOT EXISTS paper_position_settlement_state (
+                portfolio_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                cost_basis_text TEXT NOT NULL,
+                mark_price_text TEXT,
+                source_settlement_id TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (portfolio_id, symbol),
+                FOREIGN KEY(source_settlement_id)
+                    REFERENCES paper_reduction_settlements(settlement_id)
+            )
+        """)
+        await apply_exact_state_migrations(connection)
+        await assert_exact_state_schema(connection)
+
+    async def apply_exact_state_bootstrap_offline_atomic(
+        self,
+        candidate: ExactStateBootstrapCandidate,
+        *,
+        evidence: ExactStateBootstrapEvidence,
+        backup_receipt: ExactStateBootstrapBackupReceipt,
+        operator_reason: str,
+        runtime_contract: object,
+    ) -> ExactStateBootstrapReceipt:
+        """Prepare schema and bootstrap an existing raw ledger in one commit."""
+
+        expected_identity = self._expected_database_file_identity
+        if expected_identity is None:
+            raise ExactStateBootstrapError("bootstrap requires an existing database")
+        binding: Optional[SQLitePathBinding] = None
+        connection: Optional[aiosqlite.Connection] = None
+        committed_receipt: Optional[ExactStateBootstrapReceipt] = None
+        try:
+            binding = SQLitePathBinding.open_for_initialization(self.db_path, create=False)
+            if (binding.device, binding.inode) != expected_identity:
+                raise ExactStateBootstrapError(
+                    "bootstrap database changed before atomic schema preparation"
+                )
+            binding.assert_path_identity()
+            connection = await aiosqlite.connect(self.db_path)
+            self._quarantine_pool_connection(connection)
+            connection_binding = binding.bind_sqlite_connection(
+                await self._sqlite_descriptor_identity(connection)
+            )
+            await connection.execute("PRAGMA busy_timeout=5000")
+            await connection.execute("PRAGMA foreign_keys=ON")
+            foreign_keys = await connection.execute("PRAGMA foreign_keys")
+            if await foreign_keys.fetchone() != (1,):
+                raise ExactStateBootstrapError("SQLite foreign-key enforcement is unavailable")
+            descriptor = await self._sqlite_descriptor_identity(connection)
+            connection_binding.assert_connection_identity(descriptor)
+            self._verify_exact_state_backup(candidate, evidence, backup_receipt, descriptor)
+
+            await connection.execute("BEGIN IMMEDIATE")
+            await self._assert_prebootstrap_tables_match_backup(connection, backup_receipt)
+            self._paper_settlement_fault("BEFORE_EXACT_BOOTSTRAP_SCHEMA_PREP")
+            await self._prepare_exact_bootstrap_schema(connection)
+            self._paper_settlement_fault("AFTER_EXACT_BOOTSTRAP_SCHEMA_PREP")
+            committed_receipt = await self._apply_exact_state_bootstrap(
+                candidate,
+                evidence=evidence,
+                backup_receipt=backup_receipt,
+                operator_reason=operator_reason,
+                runtime_contract=runtime_contract,
+                connection=connection,
+                transaction_started=True,
+            )
+            connection_binding.assert_connection_identity(
+                await self._sqlite_descriptor_identity(connection)
+            )
+            binding.assert_path_identity()
+        except BaseException as exc:
+            if connection is not None and getattr(connection, "in_transaction", False):
+                await connection.rollback()
+            if committed_receipt is not None and not isinstance(
+                exc, ExactStateBootstrapCommittedBackupInvalid
+            ):
+                raise ExactStateBootstrapCommittedBackupInvalid(
+                    bootstrap_id=candidate.bootstrap_id,
+                    candidate_fingerprint=candidate.fingerprint(),
+                    detail=str(exc),
+                ) from exc
+            raise
+        finally:
+            if connection is not None:
+                try:
+                    await self._close_scoped_quarantined_connections(
+                        [connection],
+                        "offline bootstrap connection could not be closed",
+                    )
+                except BaseException as exc:
+                    if committed_receipt is not None:
+                        raise ExactStateBootstrapCommittedBackupInvalid(
+                            bootstrap_id=candidate.bootstrap_id,
+                            candidate_fingerprint=candidate.fingerprint(),
+                            detail=str(exc),
+                        ) from exc
+                    raise
+            if binding is not None:
+                binding.close()
+        if committed_receipt is None:
+            raise ExactStateBootstrapError("atomic bootstrap returned no receipt")
+        return committed_receipt
+
     async def apply_exact_state_bootstrap(
         self,
         candidate: ExactStateBootstrapCandidate,
@@ -1656,6 +1870,25 @@ class AsyncTradingDatabase:
         backup_receipt: ExactStateBootstrapBackupReceipt,
         operator_reason: str,
         runtime_contract: object,
+    ) -> ExactStateBootstrapReceipt:
+        return await self._apply_exact_state_bootstrap(
+            candidate,
+            evidence=evidence,
+            backup_receipt=backup_receipt,
+            operator_reason=operator_reason,
+            runtime_contract=runtime_contract,
+        )
+
+    async def _apply_exact_state_bootstrap(
+        self,
+        candidate: ExactStateBootstrapCandidate,
+        *,
+        evidence: ExactStateBootstrapEvidence,
+        backup_receipt: ExactStateBootstrapBackupReceipt,
+        operator_reason: str,
+        runtime_contract: object,
+        connection: Optional[aiosqlite.Connection] = None,
+        transaction_started: bool = False,
     ) -> ExactStateBootstrapReceipt:
         """Insert one sealed exact accounting epoch without rewriting legacy rows.
 
@@ -1685,7 +1918,15 @@ class AsyncTradingDatabase:
             )
         assert_exact_state_bootstrap_evidence(candidate, evidence, runtime_contract)
 
-        async with self.get_connection() as conn:
+        @asynccontextmanager
+        async def connection_scope():
+            if connection is not None:
+                yield connection
+                return
+            async with self.get_connection() as pooled_connection:
+                yield pooled_connection
+
+        async with connection_scope() as conn:
             descriptor = await self._sqlite_descriptor_identity(conn)
             expected_file_identity = self._expected_database_file_identity
             if expected_file_identity != (descriptor.device, descriptor.inode):
@@ -1697,7 +1938,13 @@ class AsyncTradingDatabase:
                 descriptor,
             )
             try:
-                await conn.execute("BEGIN IMMEDIATE")
+                if transaction_started:
+                    if not getattr(conn, "in_transaction", False):
+                        raise ExactStateBootstrapError(
+                            "atomic bootstrap transaction was not started"
+                        )
+                else:
+                    await conn.execute("BEGIN IMMEDIATE")
                 for authentication in evidence.authentication_receipts:
                     replay = await conn.execute(
                         """
@@ -2020,7 +2267,7 @@ class AsyncTradingDatabase:
                         backup_receipt,
                         descriptor,
                     )
-                except Exception as exc:
+                except BaseException as exc:
                     raise ExactStateBootstrapCommittedBackupInvalid(
                         bootstrap_id=candidate.bootstrap_id,
                         candidate_fingerprint=candidate.fingerprint(),

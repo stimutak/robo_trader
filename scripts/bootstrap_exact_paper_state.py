@@ -547,8 +547,7 @@ async def _apply(
 ) -> dict[str, object]:
     database = AsyncTradingDatabase(database_path)
     try:
-        await database.initialize()
-        receipt = await database.apply_exact_state_bootstrap(
+        receipt = await database.apply_exact_state_bootstrap_offline_atomic(
             candidate,
             evidence=evidence,
             backup_receipt=backup_receipt,
@@ -568,16 +567,6 @@ async def _apply(
         "schema_version": 1,
         "status": "BOOTSTRAPPED_GATE_A_STILL_CLOSED",
     }
-
-
-async def _prepare_exact_schema(database_path: Path) -> None:
-    """Apply exact-state migrations before the all-table rollback backup."""
-
-    database = AsyncTradingDatabase(database_path)
-    try:
-        await database.initialize()
-    finally:
-        await database.close()
 
 
 def _required_confirmation(
@@ -653,25 +642,35 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 candidate_binding.assert_identity()
                 _assert_stopped()
-                asyncio.run(_prepare_exact_schema(database_path))
-                candidate_binding.assert_identity()
-                report = preview(candidate, database_path, evidence, runtime_contract)
                 backup = _online_backup(database_path, args.backup_path, candidate)
                 candidate_binding.assert_identity()
                 backup.assert_restorable()
-                report = asyncio.run(
-                    _apply(
-                        candidate,
-                        database_path,
-                        args.reason.strip(),
-                        evidence=evidence,
-                        backup_receipt=backup.receipt,
-                        runtime_contract=runtime_contract,
+                committed = False
+                try:
+                    report = asyncio.run(
+                        _apply(
+                            candidate,
+                            database_path,
+                            args.reason.strip(),
+                            evidence=evidence,
+                            backup_receipt=backup.receipt,
+                            runtime_contract=runtime_contract,
+                        )
                     )
-                )
-                candidate_binding.assert_identity()
-                backup.assert_restorable()
-                report["backup"] = backup.report()
+                    committed = True
+                    candidate_binding.assert_identity()
+                    backup.assert_restorable()
+                    report["backup"] = backup.report()
+                except ExactStateBootstrapCommittedBackupInvalid:
+                    raise
+                except BaseException as exc:
+                    if committed:
+                        raise ExactStateBootstrapCommittedBackupInvalid(
+                            bootstrap_id=candidate.bootstrap_id,
+                            candidate_fingerprint=candidate.fingerprint(),
+                            detail=str(exc),
+                        ) from exc
+                    raise
             finally:
                 lock.release()
         print(json.dumps(report, sort_keys=True, separators=(",", ":")))

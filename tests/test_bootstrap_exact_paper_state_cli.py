@@ -10,10 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 import scripts.bootstrap_exact_paper_state as cli
-from robo_trader.financial_state_bootstrap import (
-    ExactStateBootstrapCommittedBackupInvalid,
-    ExactStateBootstrapError,
-)
+from robo_trader.financial_state_bootstrap import ExactStateBootstrapError
 
 
 def _candidate(database_path: Path, *, portfolio_id: str = "default") -> SimpleNamespace:
@@ -297,10 +294,9 @@ async def test_apply_passes_every_authority_to_database(
         def __init__(self, path: Path) -> None:
             captured["path"] = path
 
-        async def initialize(self) -> None:
-            captured["initialized"] = True
-
-        async def apply_exact_state_bootstrap(self, candidate: object, **kwargs: object) -> object:
+        async def apply_exact_state_bootstrap_offline_atomic(
+            self, candidate: object, **kwargs: object
+        ) -> object:
             captured["candidate"] = candidate
             captured.update(kwargs)
             return result_receipt
@@ -375,7 +371,7 @@ def test_wrong_typed_confirmation_blocks_before_backup(
     assert json.loads(capsys.readouterr().err)["mutated_state"] is False
 
 
-def test_committed_backup_failure_prints_unmistakable_mutated_state(
+def test_post_return_backup_failure_prints_unmistakable_mutated_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -400,22 +396,23 @@ def test_committed_backup_failure_prints_unmistakable_mutated_state(
         json=True,
     )
     binding = SimpleNamespace(candidate=candidate, assert_identity=lambda: None, close=lambda: None)
+    verification_count = 0
+
+    def verify_backup() -> None:
+        nonlocal verification_count
+        verification_count += 1
+        if verification_count == 2:
+            raise ExactStateBootstrapError("sealed backup gained a hard link")
+
     backup = SimpleNamespace(
         receipt=object(),
-        assert_restorable=lambda: None,
+        assert_restorable=verify_backup,
         report=lambda: {},
         close=lambda: None,
     )
 
-    async def prepare(_path: Path) -> None:
-        return None
-
-    async def fail_after_commit(*_args: object, **_kwargs: object) -> dict[str, object]:
-        raise ExactStateBootstrapCommittedBackupInvalid(
-            bootstrap_id=candidate.bootstrap_id,
-            candidate_fingerprint=candidate.fingerprint(),
-            detail="sealed backup gained a hard link",
-        )
+    async def commit_then_return(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {"status": "BOOTSTRAPPED_GATE_A_STILL_CLOSED"}
 
     monkeypatch.setattr(cli, "_parser", lambda: SimpleNamespace(parse_args=lambda _argv: args))
     monkeypatch.setattr(cli, "load_runtime_contract_from_env", lambda **_kwargs: runtime)
@@ -423,9 +420,8 @@ def test_committed_backup_failure_prints_unmistakable_mutated_state(
     monkeypatch.setattr(cli, "load_exact_state_bootstrap_evidence", lambda **_kwargs: object())
     monkeypatch.setattr(cli, "preview", lambda *_args: {"status": "ready"})
     monkeypatch.setattr(cli, "_assert_stopped", lambda: None)
-    monkeypatch.setattr(cli, "_prepare_exact_schema", prepare)
     monkeypatch.setattr(cli, "_online_backup", lambda *_args: backup)
-    monkeypatch.setattr(cli, "_apply", fail_after_commit)
+    monkeypatch.setattr(cli, "_apply", commit_then_return)
     monkeypatch.setattr(
         cli,
         "RuntimeLifecycleLock",
@@ -449,3 +445,67 @@ def test_committed_backup_failure_prints_unmistakable_mutated_state(
         "schema_version": 1,
         "status": "COMMITTED_BACKUP_INVALID",
     }
+
+
+def test_backup_failure_precedes_schema_open_and_leaves_source_byte_identical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database_path = tmp_path / "legacy.db"
+    _legacy_database(database_path).close()
+    before = database_path.read_bytes()
+    identity = "paper:" + cli.hashlib.sha256(str(database_path.resolve()).encode()).hexdigest()[:12]
+    runtime = SimpleNamespace(database_path=str(database_path), database_identity=identity)
+    candidate = _candidate(database_path)
+    candidate.database_identity = identity
+    confirmation = cli._required_confirmation(candidate, runtime, tmp_path / "backup.db")
+    args = argparse.Namespace(
+        command="apply",
+        db_path=database_path,
+        candidate=tmp_path / "candidate.json",
+        reconciliation_evidence=tmp_path / "reconciliation.json",
+        broker_snapshot=tmp_path / "broker.json",
+        protective_marks=[],
+        backup_path=tmp_path / "backup.db",
+        reason="reviewed offline bootstrap",
+        confirm=confirmation,
+        json=True,
+    )
+    binding = SimpleNamespace(candidate=candidate, assert_identity=lambda: None, close=lambda: None)
+    applied = False
+
+    async def forbidden_apply(*_args: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal applied
+        applied = True
+        return {}
+
+    monkeypatch.setattr(cli, "_parser", lambda: SimpleNamespace(parse_args=lambda _argv: args))
+    monkeypatch.setattr(cli, "load_runtime_contract_from_env", lambda **_kwargs: runtime)
+    monkeypatch.setattr(cli, "_open_candidate", lambda _path: binding)
+    monkeypatch.setattr(cli, "load_exact_state_bootstrap_evidence", lambda **_kwargs: object())
+    monkeypatch.setattr(cli, "preview", lambda *_args: {"status": "ready"})
+    monkeypatch.setattr(cli, "_assert_stopped", lambda: None)
+    monkeypatch.setattr(
+        cli,
+        "_online_backup",
+        lambda *_args: (_ for _ in ()).throw(ExactStateBootstrapError("backup failed")),
+    )
+    monkeypatch.setattr(cli, "_apply", forbidden_apply)
+    monkeypatch.setattr(
+        cli,
+        "RuntimeLifecycleLock",
+        lambda: SimpleNamespace(acquire=lambda: True, release=lambda: None),
+    )
+
+    assert cli.main([]) == 2
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["mutated_state"] is False
+    assert applied is False
+    assert database_path.read_bytes() == before
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE name IN ('rt_schema_migrations','paper_state_bootstraps',"
+            "'exact_bootstrap_evidence_consumptions')"
+        ).fetchone() == (0,)

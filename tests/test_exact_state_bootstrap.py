@@ -383,6 +383,80 @@ def _legacy_rows(path: Path) -> dict[str, list[tuple]]:
 
 
 @pytest.mark.asyncio
+async def test_offline_atomic_bootstrap_migrates_raw_legacy_schema_in_one_commit(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    candidate, evidence, runtime_contract = _candidate_bundle(path, tmp_path)
+    backup_receipt = _backup_receipt(path, tmp_path / "backup.db", candidate)
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE name IN ('rt_schema_migrations','paper_state_bootstraps')"
+        ).fetchone() == (0,)
+
+    database = AsyncTradingDatabase(path, pool_size=1)
+    try:
+        receipt = await database.apply_exact_state_bootstrap_offline_atomic(
+            candidate,
+            evidence=evidence,
+            backup_receipt=backup_receipt,
+            operator_reason="Seal the reviewed raw legacy simulator accounting epoch.",
+            runtime_contract=runtime_contract,
+        )
+    finally:
+        await database.close()
+
+    assert receipt.bootstrap_id == candidate.bootstrap_id
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM rt_schema_migrations " "WHERE component='paper_exact_state'"
+        ).fetchone() == (2,)
+        assert connection.execute("SELECT COUNT(*) FROM paper_state_bootstraps").fetchone() == (1,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM exact_bootstrap_evidence_consumptions"
+        ).fetchone() == (4,)
+
+
+@pytest.mark.asyncio
+async def test_offline_schema_failure_rolls_back_to_byte_identical_raw_legacy_database(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    candidate, evidence, runtime_contract = _candidate_bundle(path, tmp_path)
+    backup_receipt = _backup_receipt(path, tmp_path / "backup.db", candidate)
+    before = path.read_bytes()
+    database = AsyncTradingDatabase(path, pool_size=1)
+
+    def fail_after_schema(step: str) -> None:
+        if step == "AFTER_EXACT_BOOTSTRAP_SCHEMA_PREP":
+            raise ExactStateBootstrapError("injected post-schema failure")
+
+    database._paper_settlement_fault_hook = fail_after_schema
+    try:
+        with pytest.raises(ExactStateBootstrapError, match="post-schema failure"):
+            await database.apply_exact_state_bootstrap_offline_atomic(
+                candidate,
+                evidence=evidence,
+                backup_receipt=backup_receipt,
+                operator_reason="Reject after transactional schema preparation.",
+                runtime_contract=runtime_contract,
+            )
+    finally:
+        await database.close()
+
+    assert path.read_bytes() == before
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE name IN ('rt_schema_migrations','paper_state_bootstraps',"
+            "'exact_bootstrap_evidence_consumptions')"
+        ).fetchone() == (0,)
+
+
+@pytest.mark.asyncio
 async def test_bootstrap_is_insert_only_exact_and_receipt_replay_is_rejected(
     tmp_path: Path,
 ) -> None:
