@@ -185,6 +185,52 @@ def test_fixture_migration_rejects_hard_link_alias_before_mutation(tmp_path):
     production.close()
 
 
+def test_fixture_migration_rejects_copied_or_renamed_nonfixture_schema(tmp_path):
+    path = tmp_path / "renamed-production.fifo-fixture.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE sentinel(value TEXT NOT NULL)")
+    connection.execute("INSERT INTO sentinel VALUES ('preserve')")
+    connection.commit()
+
+    with pytest.raises(FifoFixtureMigrationError, match="requires an empty database"):
+        migrate_fifo_fixture_database(connection, expected_path=path)
+
+    assert connection.execute("SELECT value FROM sentinel").fetchone() == ("preserve",)
+    assert connection.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'fifo_%'"
+    ).fetchone() == (0,)
+    connection.close()
+
+
+def test_fixture_migration_handles_sqlite_row_factory_exactly(tmp_path):
+    path = tmp_path / "row-factory.fifo-fixture.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+
+    migrate_fifo_fixture_database(connection, expected_path=path)
+    assert_fifo_accounting_schema(connection)
+    migrate_fifo_fixture_database(connection, expected_path=path)
+    assert_fifo_accounting_schema(connection)
+    connection.close()
+
+
+def test_exact_fifo_schema_plus_unrelated_table_is_not_a_fixture(tmp_path):
+    path = tmp_path / "mixed-schema.fifo-fixture.sqlite3"
+    connection = sqlite3.connect(path)
+    migrate_fifo_fixture_database(connection, expected_path=path)
+    connection.execute("CREATE TABLE sentinel(value TEXT NOT NULL)")
+    connection.execute("INSERT INTO sentinel VALUES ('preserve')")
+    connection.commit()
+
+    with pytest.raises(FifoFixtureMigrationError, match="unexpected table sentinel"):
+        assert_fifo_accounting_schema(connection)
+    with pytest.raises(FifoFixtureMigrationError, match="unexpected table sentinel"):
+        migrate_fifo_fixture_database(connection, expected_path=path)
+
+    assert connection.execute("SELECT value FROM sentinel").fetchone() == ("preserve",)
+    connection.close()
+
+
 def test_interrupted_fixture_migration_rolls_back_all_schema_objects(tmp_path):
     path = tmp_path / "interrupted.fifo-fixture.sqlite3"
     connection = sqlite3.connect(path)

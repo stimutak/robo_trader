@@ -405,17 +405,33 @@ def _assert_no_temp_fifo_objects(connection: sqlite3.Connection) -> None:
         raise FifoFixtureMigrationError("temporary FIFO objects cannot shadow durable main state")
 
 
+def _pragma_foreign_keys_enabled(connection: sqlite3.Connection) -> bool:
+    row = connection.execute("PRAGMA foreign_keys").fetchone()
+    return row is not None and type(row[0]) is int and row[0] == 1
+
+
 def assert_fifo_accounting_schema(connection: sqlite3.Connection) -> None:
     """Fail closed unless the complete PR4A fixture schema is exact."""
 
     _assert_no_temp_fifo_objects(connection)
-    if connection.execute("PRAGMA foreign_keys").fetchone() != (1,):
+    if not _pragma_foreign_keys_enabled(connection):
         raise FifoFixtureMigrationError("FIFO accounting requires foreign-key enforcement")
 
     rows = connection.execute(
-        "SELECT name, sql FROM main.sqlite_master WHERE type = 'table'"
+        "SELECT name, sql FROM main.sqlite_master "
+        "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
     ).fetchall()
     actual_tables = {str(name): _normalize_sql(sql) for name, sql in rows}
+    missing_tables = set(_TABLE_SQL).difference(actual_tables)
+    unexpected_tables = set(actual_tables).difference(_TABLE_SQL)
+    if missing_tables:
+        raise FifoFixtureMigrationError(
+            f"FIFO accounting table {sorted(missing_tables)[0]} is missing"
+        )
+    if unexpected_tables:
+        raise FifoFixtureMigrationError(
+            f"FIFO fixture contains unexpected table {sorted(unexpected_tables)[0]}"
+        )
     for name, statement in _TABLE_SQL.items():
         if actual_tables.get(name) != _normalize_sql(statement):
             raise FifoFixtureMigrationError(f"FIFO accounting table {name} is malformed")
@@ -424,15 +440,35 @@ def assert_fifo_accounting_schema(connection: sqlite3.Connection) -> None:
         "SELECT name, sql FROM main.sqlite_master WHERE type = 'trigger'"
     ).fetchall()
     actual_triggers = {str(name): _normalize_sql(sql) for name, sql in rows}
+    missing_triggers = set(_TRIGGER_SQL).difference(actual_triggers)
+    unexpected_triggers = set(actual_triggers).difference(_TRIGGER_SQL)
+    if missing_triggers:
+        raise FifoFixtureMigrationError(
+            f"FIFO accounting trigger {sorted(missing_triggers)[0]} is missing"
+        )
+    if unexpected_triggers:
+        raise FifoFixtureMigrationError(
+            f"FIFO fixture contains unexpected trigger {sorted(unexpected_triggers)[0]}"
+        )
     for name, statement in _TRIGGER_SQL.items():
         if actual_triggers.get(name) != _normalize_sql(statement):
             raise FifoFixtureMigrationError(f"FIFO accounting trigger {name} is malformed")
 
-    versions = connection.execute(
+    unexpected_schema = connection.execute(
+        "SELECT type, name FROM main.sqlite_master "
+        "WHERE type IN ('view','index') AND name NOT LIKE 'sqlite_%'"
+    ).fetchall()
+    if unexpected_schema:
+        raise FifoFixtureMigrationError("FIFO fixture contains unexpected schema objects")
+
+    version_rows = connection.execute(
         "SELECT version FROM main.fifo_schema_migrations WHERE component = ? ORDER BY version",
         (FIFO_ACCOUNTING_COMPONENT,),
     ).fetchall()
-    if versions != [(FIFO_ACCOUNTING_SCHEMA_VERSION,)]:
+    versions = [row[0] for row in version_rows]
+    if versions != [FIFO_ACCOUNTING_SCHEMA_VERSION] or any(
+        type(version) is not int for version in versions
+    ):
         raise FifoFixtureMigrationError("FIFO accounting migration evidence is incomplete")
     if connection.execute("PRAGMA main.foreign_key_check").fetchone() is not None:
         raise FifoFixtureMigrationError("FIFO accounting schema has foreign-key violations")
@@ -454,19 +490,24 @@ def migrate_fifo_fixture_database(
     if connection.in_transaction:
         raise FifoFixtureMigrationError("fixture migration requires an idle connection")
     connection.execute("PRAGMA foreign_keys = ON")
-    if connection.execute("PRAGMA foreign_keys").fetchone() != (1,):
+    if not _pragma_foreign_keys_enabled(connection):
         raise FifoFixtureMigrationError("could not enable fixture foreign keys")
-
-    existing = connection.execute(
-        "SELECT name FROM main.sqlite_master WHERE type IN ('table','trigger') "
-        "AND name LIKE 'fifo_%'"
-    ).fetchall()
-    if existing:
-        assert_fifo_accounting_schema(connection)
-        return
 
     try:
         connection.execute("BEGIN IMMEDIATE")
+        schema_objects = connection.execute(
+            "SELECT type, name FROM main.sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        ).fetchall()
+        fifo_objects = [row for row in schema_objects if str(row[1]).startswith("fifo_")]
+        if fifo_objects:
+            assert_fifo_accounting_schema(connection)
+            connection.commit()
+            return
+        if schema_objects:
+            raise FifoFixtureMigrationError(
+                "fixture migration requires an empty database or an exact FIFO fixture"
+            )
         for statement in _TABLE_SQL.values():
             connection.execute(statement)
         connection.execute(
