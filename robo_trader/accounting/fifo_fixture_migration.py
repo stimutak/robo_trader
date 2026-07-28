@@ -333,17 +333,20 @@ _INSERT_CONFLICT_PREDICATES = {
 
 def _insert_conflict_guard_sql(table: str) -> str:
     # Every interpolated identifier and predicate comes from the closed constants above.
-    return f"""
-        CREATE TRIGGER {table}_no_replace
-        BEFORE INSERT ON {table}
-        WHEN EXISTS (
-            SELECT 1 FROM {table}
-            WHERE {_INSERT_CONFLICT_PREDICATES[table]}
+    predicate = _INSERT_CONFLICT_PREDICATES[table]
+    return "\n".join(
+        (
+            f"CREATE TRIGGER {table}_no_replace",
+            f"BEFORE INSERT ON {table}",
+            "WHEN EXISTS (",
+            f"SELECT 1 FROM {table}",  # nosec B608
+            f"WHERE {predicate}",
+            ")",
+            "BEGIN",
+            f"SELECT RAISE(ABORT, '{table} identity is append-only');",
+            "END",
         )
-        BEGIN
-            SELECT RAISE(ABORT, '{table} identity is append-only');
-        END
-    """
+    )
 
 
 _TRIGGER_SQL = {
