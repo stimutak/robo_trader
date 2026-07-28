@@ -70,6 +70,11 @@ _SCHEMA_VERSION = 3
 _ANCHOR_VERSION = 2
 _MAX_DAILY_FILL_ROWS = 100_000
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+# SQLite's POSIX VFS serializes writers on the RESERVED byte.  Holding the
+# same advisory lock through the journal-absence check and SQLite's first file
+# access closes the sidecar check-to-open race against every SQLite process.
+_SQLITE_PENDING_BYTE = 0x40000000
+_SQLITE_RESERVED_BYTE = _SQLITE_PENDING_BYTE + 1
 _IDENTIFIER_RE = re.compile(r"[\x21-\x7e]{1,128}\Z")
 _CURRENCY_RE = re.compile(r"[A-Z]{3}\Z")
 _LEDGER_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
@@ -1905,10 +1910,43 @@ class DailyFilledNotional:
     ) -> Iterator[sqlite3.Connection]:
         binding: Optional[SQLitePathBinding] = None
         connection: Optional[sqlite3.Connection] = None
+        writer_guard: Optional[int] = None
         try:
             self._require_exclusive_database_path()
             binding = SQLitePathBinding.open_for_initialization(self._path, create=False)
             self._require_exclusive_database_path(binding)
+            if not readonly:
+                if not hasattr(os, "O_NOFOLLOW"):
+                    raise FilledNotionalUnavailable(
+                        "platform cannot serialize SQLite writer startup safely"
+                    )
+                writer_guard = os.open(
+                    self._path,
+                    os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                )
+                guard_metadata = os.fstat(writer_guard)
+                if (
+                    not stat.S_ISREG(guard_metadata.st_mode)
+                    or guard_metadata.st_nlink != 1
+                    or (guard_metadata.st_dev, guard_metadata.st_ino)
+                    != (binding.device, binding.inode)
+                ):
+                    raise FilledNotionalIntegrityError(
+                        "SQLite writer guard does not bind the authoritative database"
+                    )
+                try:
+                    fcntl.lockf(
+                        writer_guard,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                        1,
+                        _SQLITE_RESERVED_BYTE,
+                        os.SEEK_SET,
+                    )
+                except OSError as exc:
+                    raise FilledNotionalUnavailable(
+                        "another SQLite writer owns the authoritative database"
+                    ) from exc
+                self._require_exclusive_database_path(binding)
             self._require_rollback_journal_header(binding)
             self._reject_wal_sidecars()
             self._validate_existing_rollback_journal()
@@ -1921,6 +1959,10 @@ class DailyFilledNotional:
                 timeout=1.0,
                 isolation_level=None,
             )
+            # sqlite3.connect is lazy on supported VFS implementations.  Recheck
+            # immediately before the first pragma while the RESERVED-byte guard
+            # excludes every other SQLite process from creating a journal.
+            self._validate_existing_rollback_journal()
             connection.row_factory = sqlite3.Row
             bound = binding.bind_sqlite_connection(sqlite_connection_file_identity(connection))
             journal_mode = connection.execute("PRAGMA journal_mode").fetchone()
@@ -1939,6 +1981,17 @@ class DailyFilledNotional:
                 connection.close()
             if binding is not None:
                 binding.close()
+            if writer_guard is not None:
+                try:
+                    fcntl.lockf(
+                        writer_guard,
+                        fcntl.LOCK_UN,
+                        1,
+                        _SQLITE_RESERVED_BYTE,
+                        os.SEEK_SET,
+                    )
+                finally:
+                    os.close(writer_guard)
 
     def _schema_version(self, connection: sqlite3.Connection) -> int:
         table = connection.execute(

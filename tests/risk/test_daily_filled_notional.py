@@ -2445,6 +2445,59 @@ signal.pause()
     assert _file_snapshot(ledger.anchor_path) == anchor_before
 
 
+def test_writer_guard_closes_journal_check_to_open_race(tmp_path, monkeypatch):
+    path = tmp_path / "writer-guard-race.db"
+    ledger = _service(path)
+    original_validate = ledger._validate_existing_rollback_journal
+    probe_results: list[subprocess.CompletedProcess[str]] = []
+    validation_calls = 0
+
+    def validate_then_probe_competing_sqlite_writer() -> None:
+        nonlocal validation_calls
+        original_validate()
+        validation_calls += 1
+        if validation_calls != 1:
+            return
+        script = f"""
+import sqlite3
+
+connection = sqlite3.connect({str(path)!r}, isolation_level=None, timeout=0)
+try:
+    connection.execute('BEGIN IMMEDIATE')
+except sqlite3.OperationalError as exc:
+    print(str(exc), flush=True)
+else:
+    print('UNEXPECTED-WRITER-LOCK', flush=True)
+finally:
+    connection.close()
+"""
+        probe_results.append(
+            subprocess.run(
+                [sys.executable, "-c", script],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=10,
+            )
+        )
+
+    monkeypatch.setattr(
+        ledger,
+        "_validate_existing_rollback_journal",
+        validate_then_probe_competing_sqlite_writer,
+    )
+
+    result = ledger.record_fill(_fill("writer-guard-race"))
+
+    assert result.recorded
+    assert validation_calls >= 2
+    assert len(probe_results) == 1
+    assert probe_results[0].returncode == 0
+    assert "locked" in probe_results[0].stdout.lower()
+    assert "UNEXPECTED-WRITER-LOCK" not in probe_results[0].stdout
+    assert not Path(f"{path}-journal").exists()
+
+
 def test_future_schema_version_fails_closed_without_downgrade(tmp_path):
     path = tmp_path / "future.db"
     with sqlite3.connect(path) as connection:
