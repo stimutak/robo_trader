@@ -30,8 +30,9 @@ from .bootstrap_evidence_auth import (
     bootstrap_evidence_trust_public_dict,
     verify_receipt,
 )
+from .reconciliation.domain import IBKR_READ_ONLY_SCOPE, canonical_json, fingerprint
 from .runtime_contract_constants import PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
-from .reconciliation.domain import canonical_json, fingerprint
+from .safety.journal import SafetyJournal
 from .safety.models import decimal_to_fixed, utc_to_text
 from .safety.sqlite_identity import (
     SQLiteIdentityError,
@@ -112,6 +113,14 @@ class ExactStateBootstrapEvidence:
     database_identity: str
     database_device: int
     database_inode: int
+    safety_journal_path: str
+    safety_journal_identity: str
+    safety_journal_device: int
+    safety_journal_inode: int
+    safety_journal_last_sequence: int
+    safety_journal_last_chain_hash: str
+    terminal_settlement_count: int
+    terminal_fill_count: int
     portfolio_ids: tuple[str, ...]
     broker_observed_at: datetime
     reconciliation_generated_at: datetime
@@ -174,6 +183,14 @@ def _evidence_object_digest(evidence: ExactStateBootstrapEvidence) -> str:
         "reconciliation_report_hash": evidence.reconciliation_report_hash,
         "reconciliation_snapshot_id": evidence.reconciliation_snapshot_id,
         "runtime_fingerprint": evidence.runtime_fingerprint,
+        "safety_journal_device": evidence.safety_journal_device,
+        "safety_journal_identity": evidence.safety_journal_identity,
+        "safety_journal_inode": evidence.safety_journal_inode,
+        "safety_journal_last_chain_hash": evidence.safety_journal_last_chain_hash,
+        "safety_journal_last_sequence": evidence.safety_journal_last_sequence,
+        "safety_journal_path": evidence.safety_journal_path,
+        "terminal_fill_count": evidence.terminal_fill_count,
+        "terminal_settlement_count": evidence.terminal_settlement_count,
     }
     return hmac.new(
         _EVIDENCE_OBJECT_KEY,
@@ -212,13 +229,13 @@ class ExactStateBootstrapBackupReceipt:
             path = Path(value)
             if not path.is_absolute() or str(path) != value:
                 raise ExactStateBootstrapError(f"{label} must be absolute and lexical")
-        for value, label in (
+        for numeric_value, label in (
             (self.source_device, "backup source_device"),
             (self.source_inode, "backup source_inode"),
             (self.backup_device, "backup backup_device"),
             (self.backup_inode, "backup backup_inode"),
         ):
-            if type(value) is not int or value < 0:
+            if type(numeric_value) is not int or numeric_value < 0:
                 raise ExactStateBootstrapError(f"{label} is invalid")
         _hash(self.candidate_fingerprint, "backup candidate_fingerprint")
         _hash(self.source_snapshot_hash, "backup source_snapshot_hash")
@@ -533,22 +550,28 @@ def load_exact_state_bootstrap_evidence(
     broker, broker_hash = _verified_canonical_json(Path(broker_snapshot_path), "broker snapshot")
     _exact_keys(
         broker,
-        {"completed_order_collection_scope", "purpose", "snapshot"},
+        {
+            "completed_order_collection_scope",
+            "execution_collection_scope",
+            "purpose",
+            "snapshot",
+        },
         "broker producer result",
     )
     completed_scope = broker["completed_order_collection_scope"]
-    if type(completed_scope) is not dict:
-        raise ExactStateBootstrapError("broker completed-order scope is malformed")
+    execution_scope = broker["execution_collection_scope"]
+    if type(completed_scope) is not dict or type(execution_scope) is not dict:
+        raise ExactStateBootstrapError("broker collection scope is malformed")
     _exact_keys(
         completed_scope,
         {
-            "all_clients",
             "api_method",
             "api_only",
             "broker_time_after",
             "broker_time_before",
             "full_history",
             "kind",
+            "client_scope",
             "request_count",
             "request_completed_at",
             "request_started_at",
@@ -558,6 +581,18 @@ def load_exact_state_bootstrap_evidence(
             "verification_started_at",
         },
         "broker completed-order scope",
+    )
+    _exact_keys(
+        execution_scope,
+        {
+            "commission_scope",
+            "end_at",
+            "full_history",
+            "kind",
+            "retention_scope",
+            "start_at",
+        },
+        "broker execution scope",
     )
     if (
         _json_string(broker["purpose"], "broker producer purpose") != "bootstrap-broker-signing-v1"
@@ -571,10 +606,18 @@ def load_exact_state_bootstrap_evidence(
         or _json_string(completed_scope["stability_check"], "completed-order stability_check")
         != "identical_second_read"
         or _json_bool(completed_scope["api_only"], "completed-order api_only") is not False
-        or _json_bool(completed_scope["all_clients"], "completed-order all_clients") is not True
+        or _json_string(completed_scope["client_scope"], "completed-order client_scope")
+        != "api_and_manual_orders_visible_to_current_tws_session"
         or _json_bool(completed_scope["full_history"], "completed-order full_history") is not False
+        or _json_string(execution_scope["kind"], "execution scope kind")
+        != "broker_date_since_midnight"
+        or _json_string(execution_scope["retention_scope"], "execution retention scope")
+        != "ibkr_gateway_broker_date_since_midnight"
+        or _json_string(execution_scope["commission_scope"], "execution commission scope")
+        != "matching_callbacks_for_returned_executions"
+        or _json_bool(execution_scope["full_history"], "execution full_history") is not False
     ):
-        raise ExactStateBootstrapError("broker completed-order scope is not bounded/current")
+        raise ExactStateBootstrapError("broker collection scope is not bounded/current")
     scope_times = [
         _utc(completed_scope[field], f"completed-order {field}")
         for field in (
@@ -592,12 +635,17 @@ def load_exact_state_bootstrap_evidence(
     scope_broker_time_after = _utc(
         completed_scope["broker_time_after"], "completed-order broker_time_after"
     )
+    execution_start = _utc(execution_scope["start_at"], "execution scope start_at")
+    execution_end = _utc(execution_scope["end_at"], "execution scope end_at")
     if (
         scope_times[-1] - scope_times[0] > timedelta(seconds=60)
         or scope_times[0] < scope_broker_time_before - timedelta(seconds=120)
         or scope_times[-1] > scope_broker_time_after + timedelta(seconds=120)
+        or execution_start
+        != scope_broker_time_before.replace(hour=0, minute=0, second=0, microsecond=0)
+        or not scope_broker_time_before <= execution_end <= scope_broker_time_after
     ):
-        raise ExactStateBootstrapError("broker completed-order scope is unbounded")
+        raise ExactStateBootstrapError("broker collection scope is unbounded")
     broker = broker["snapshot"]
     if type(broker) is not dict:
         raise ExactStateBootstrapError("broker normalized snapshot is malformed")
@@ -695,7 +743,7 @@ def load_exact_state_bootstrap_evidence(
             or _json_int(collection["result_count"], "broker collection result_count") != 0
             or _json_int(collection["schema_version"], "broker collection schema_version") != 1
             or _json_string(collection["source_scope"], "broker collection source_scope")
-            != "ibkr-read-only"
+            != IBKR_READ_ONLY_SCOPE
         ):
             raise ExactStateBootstrapError("broker collection evidence is not zero/read-only")
     broker_observed_at = _utc(broker["retrieved_at"], "broker retrieved_at")
@@ -715,12 +763,13 @@ def load_exact_state_bootstrap_evidence(
     _assert_fresh_against_wall_clock(broker_observed_at, "broker snapshot")
     if (
         _json_int(broker["schema_version"], "broker schema_version") != 1
-        or _json_string(broker["source_scope"], "broker source_scope") != "ibkr-read-only"
+        or _json_string(broker["source_scope"], "broker source_scope") != IBKR_READ_ONLY_SCOPE
         or _json_int(account["schema_version"], "broker account schema_version") != 1
-        or _json_string(account["source_scope"], "broker account source_scope") != "ibkr-read-only"
+        or _json_string(account["source_scope"], "broker account source_scope")
+        != IBKR_READ_ONLY_SCOPE
         or _json_string(account["account_type"], "broker account_type") != "paper"
         or _json_string(account["account_alias"], "broker account_alias")
-        != expected_runtime_contract.account_alias
+        != getattr(expected_runtime_contract, "account_alias", None)
         or not hmac.compare_digest(
             _json_string(account["account_scope"], "broker account_scope"), account_scope
         )
@@ -776,6 +825,14 @@ def load_exact_state_bootstrap_evidence(
             "database_identity",
             "database_device",
             "database_inode",
+            "safety_journal_path",
+            "safety_journal_identity",
+            "safety_journal_device",
+            "safety_journal_inode",
+            "safety_journal_last_sequence",
+            "safety_journal_last_chain_hash",
+            "terminal_settlement_count",
+            "terminal_fill_count",
             "portfolio_ids",
             "legacy_snapshot_hash",
             "broker_snapshot_id",
@@ -803,6 +860,64 @@ def load_exact_state_bootstrap_evidence(
     coverage = reconciliation["comparison_coverage"]
     collection_ids = reconciliation["broker_collection_evidence_ids"]
     local_position_identities = reconciliation["local_position_identities"]
+    safety_journal_path = _json_string(
+        reconciliation["safety_journal_path"],
+        "reconciliation safety_journal_path",
+    )
+    safety_journal_identity = _json_string(
+        reconciliation["safety_journal_identity"],
+        "reconciliation safety_journal_identity",
+    )
+    expected_journal_path = getattr(expected_runtime_contract, "safety_journal_path", None)
+    expected_journal_identity = getattr(
+        expected_runtime_contract,
+        "safety_journal_identity",
+        None,
+    )
+    if (
+        type(expected_journal_path) is not str
+        or type(expected_journal_identity) is not str
+        or safety_journal_path != expected_journal_path
+        or safety_journal_identity != expected_journal_identity
+    ):
+        raise ExactStateBootstrapError("reconciliation safety journal is not bound to the runtime")
+    try:
+        safety_journal_metadata = os.lstat(safety_journal_path)
+    except OSError as exc:
+        raise ExactStateBootstrapError(
+            "runtime safety journal identity cannot be inspected"
+        ) from exc
+    if (
+        stat.S_ISLNK(safety_journal_metadata.st_mode)
+        or not stat.S_ISREG(safety_journal_metadata.st_mode)
+        or safety_journal_metadata.st_nlink != 1
+    ):
+        raise ExactStateBootstrapError(
+            "runtime safety journal must be a single-link non-symlink regular file"
+        )
+    journal_sequence = _json_int(
+        reconciliation["safety_journal_last_sequence"],
+        "reconciliation safety journal last sequence",
+    )
+    journal_chain_hash = _hash(
+        reconciliation["safety_journal_last_chain_hash"],
+        "reconciliation safety journal last chain hash",
+    )
+    terminal_settlement_count = _json_int(
+        reconciliation["terminal_settlement_count"],
+        "reconciliation terminal settlement count",
+    )
+    terminal_fill_count = _json_int(
+        reconciliation["terminal_fill_count"],
+        "reconciliation terminal fill count",
+    )
+    try:
+        journal_state = SafetyJournal(Path(safety_journal_path)).replay_and_bind_runtime_path(
+            expected_execution_domain_scope=PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE,
+            expected_account_scope=account_scope,
+        )
+    except Exception as exc:
+        raise ExactStateBootstrapError("runtime safety journal cannot be verified") from exc
     if type(local_position_identities) is not list:
         raise ExactStateBootstrapError("reconciliation local position identities are malformed")
     normalized_position_identities: list[tuple[str, str]] = []
@@ -887,6 +1002,19 @@ def load_exact_state_bootstrap_evidence(
         != database_metadata.st_dev
         or _json_int(reconciliation["database_inode"], "reconciliation database_inode")
         != database_metadata.st_ino
+        or _json_int(
+            reconciliation["safety_journal_device"],
+            "reconciliation safety journal device",
+        )
+        != safety_journal_metadata.st_dev
+        or _json_int(
+            reconciliation["safety_journal_inode"],
+            "reconciliation safety journal inode",
+        )
+        != safety_journal_metadata.st_ino
+        or journal_sequence != journal_state.last_sequence
+        or not hmac.compare_digest(journal_chain_hash, journal_state.last_chain_hash)
+        or terminal_fill_count > terminal_settlement_count
         or _json_string(reconciliation["broker_snapshot_id"], "reconciliation broker_snapshot_id")
         != broker_snapshot_id
         or not hmac.compare_digest(
@@ -1056,6 +1184,14 @@ def load_exact_state_bootstrap_evidence(
         database_identity=database_identity,
         database_device=database_metadata.st_dev,
         database_inode=database_metadata.st_ino,
+        safety_journal_path=safety_journal_path,
+        safety_journal_identity=safety_journal_identity,
+        safety_journal_device=safety_journal_metadata.st_dev,
+        safety_journal_inode=safety_journal_metadata.st_ino,
+        safety_journal_last_sequence=journal_sequence,
+        safety_journal_last_chain_hash=journal_chain_hash,
+        terminal_settlement_count=terminal_settlement_count,
+        terminal_fill_count=terminal_fill_count,
         portfolio_ids=tuple(portfolio_ids),
         broker_observed_at=broker_observed_at,
         reconciliation_generated_at=generated_at,

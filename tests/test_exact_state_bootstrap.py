@@ -34,6 +34,7 @@ from robo_trader.financial_state_bootstrap import (
     verified_file_sha256,
 )
 from robo_trader.reconciliation.domain import fingerprint
+from robo_trader.safety.journal import SafetyJournal
 
 ACCOUNT_SCOPE = _derive_safety_account_scope("0123456789abcdef" * 4, "DU_TEST_PAPER")
 _TEST_PRIVATE_KEYS: dict[str, Path] = {}
@@ -228,6 +229,7 @@ def _runtime_contract(path: Path) -> RuntimeContract:
         state_namespace="paper",
         safety_account_scope=ACCOUNT_SCOPE,
         safety_execution_domain_scope="paper-simulator-v1",
+        safety_journal_path=str(path.with_name("safety-journal.db")),
     )
 
 
@@ -266,6 +268,12 @@ def _candidate_bundle(
 ) -> tuple[ExactStateBootstrapCandidate, object, RuntimeContract]:
     effective = datetime.now(timezone.utc).replace(microsecond=0)
     runtime_contract = _runtime_contract(path)
+    journal_path = Path(str(runtime_contract.safety_journal_path))
+    if not journal_path.exists():
+        SafetyJournal(journal_path).initialize(
+            execution_domain_scope="paper-simulator-v1",
+            account_scope=ACCOUNT_SCOPE,
+        )
     legacy_snapshot_hash = legacy_hash or str(inspect_legacy_state(path)["snapshot_hash"])
     broker_path = artifact_root / "broker.json"
     broker_observed_from = effective - timedelta(seconds=3)
@@ -288,7 +296,7 @@ def _candidate_bundle(
                 "observed_at": evidence_auth._utc_text(broker_observed_through),
                 "result_count": 0,
                 "schema_version": 1,
-                "source_scope": "ibkr-read-only",
+                "source_scope": "ibkr-read-only-v1",
             }
         )
     broker_payload = {
@@ -300,7 +308,7 @@ def _candidate_bundle(
             "buying_power": "100000",
             "observed_at": evidence_auth._utc_text(effective - timedelta(seconds=2)),
             "schema_version": 1,
-            "source_scope": "ibkr-read-only",
+            "source_scope": "ibkr-read-only-v1",
             "total_cash": "100000",
         },
         "completeness": {
@@ -319,7 +327,7 @@ def _candidate_bundle(
         "positions": [],
         "retrieved_at": evidence_auth._utc_text(broker_retrieved_at),
         "schema_version": 1,
-        "source_scope": "ibkr-read-only",
+        "source_scope": "ibkr-read-only-v1",
     }
     broker_snapshot_id = fingerprint("broker-reconciliation-v1", broker_payload)
     broker_snapshot_hash = hashlib.sha256(
@@ -327,13 +335,13 @@ def _candidate_bundle(
     ).hexdigest()
     broker_artifact_payload = {
         "completed_order_collection_scope": {
-            "all_clients": True,
             "api_method": "reqCompletedOrders",
             "api_only": False,
             "broker_time_after": evidence_auth._utc_text(broker_observed_through),
             "broker_time_before": evidence_auth._utc_text(broker_observed_from),
             "full_history": False,
             "kind": "ibkr_current_retained_completed_orders",
+            "client_scope": "api_and_manual_orders_visible_to_current_tws_session",
             "request_count": 2,
             "request_completed_at": evidence_auth._utc_text(
                 broker_observed_from + timedelta(milliseconds=100)
@@ -346,6 +354,16 @@ def _candidate_bundle(
             ),
             "verification_started_at": evidence_auth._utc_text(
                 broker_observed_from + timedelta(milliseconds=200)
+            ),
+        },
+        "execution_collection_scope": {
+            "commission_scope": "matching_callbacks_for_returned_executions",
+            "end_at": evidence_auth._utc_text(broker_observed_through),
+            "full_history": False,
+            "kind": "broker_date_since_midnight",
+            "retention_scope": "ibkr_gateway_broker_date_since_midnight",
+            "start_at": evidence_auth._utc_text(
+                broker_observed_from.replace(hour=0, minute=0, second=0, microsecond=0)
             ),
         },
         "purpose": "bootstrap-broker-signing-v1",
@@ -401,6 +419,7 @@ def _candidate_bundle(
         )
         mark_paths.append(mark_path)
     metadata = path.stat()
+    journal_metadata = journal_path.stat()
     reconciliation_path = artifact_root / "reconciliation.json"
     reconciliation_payload = {
         "account_scope": ACCOUNT_SCOPE,
@@ -445,8 +464,16 @@ def _candidate_bundle(
         "portfolio_ids": ["default"],
         "reconciliation_status": "passed",
         "runtime_fingerprint": runtime_contract.fingerprint,
+        "safety_journal_device": journal_metadata.st_dev,
+        "safety_journal_identity": runtime_contract.safety_journal_identity,
+        "safety_journal_inode": journal_metadata.st_ino,
+        "safety_journal_last_chain_hash": "0" * 64,
+        "safety_journal_last_sequence": 0,
+        "safety_journal_path": str(journal_path),
         "schema_version": 1,
         "status": "BOOTSTRAP_EVIDENCE_COMPLETE",
+        "terminal_fill_count": 0,
+        "terminal_settlement_count": 0,
     }
     reconciliation_snapshot_id = fingerprint("bootstrap-reconciliation-v1", reconciliation_payload)
     reconciliation_payload["snapshot_id"] = reconciliation_snapshot_id
@@ -1040,6 +1067,11 @@ def test_current_authentication_cannot_refresh_thirty_day_old_snapshot(tmp_path:
     completed_scope["verification_completed_at"] = evidence_auth._utc_text(
         stale - timedelta(seconds=1, milliseconds=700)
     )
+    execution_scope = broker["execution_collection_scope"]
+    execution_scope["start_at"] = evidence_auth._utc_text(
+        stale.replace(hour=0, minute=0, second=0, microsecond=0)
+    )
+    execution_scope["end_at"] = snapshot["observed_through"]
     broker_hash = _write_artifact(
         broker_path,
         broker,
@@ -1119,7 +1151,19 @@ def test_broker_integer_fields_reject_json_booleans(
         )
 
 
-@pytest.mark.parametrize("field", ["broker_positions_count", "database_device", "database_inode"])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "broker_positions_count",
+        "database_device",
+        "database_inode",
+        "safety_journal_device",
+        "safety_journal_inode",
+        "safety_journal_last_sequence",
+        "terminal_settlement_count",
+        "terminal_fill_count",
+    ],
+)
 def test_reconciliation_integer_fields_reject_json_floats(tmp_path: Path, field: str) -> None:
     path = tmp_path / "legacy.db"
     _legacy_database(path)

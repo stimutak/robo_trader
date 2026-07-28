@@ -4,8 +4,8 @@
 The production command accepts no input artifacts, JSON payloads, prices, or
 signing-key paths.  It owns fresh broker collection, immutable local-ledger
 observation, reconciliation, and protective-mark production through typed
-receivers.  Until the live protective-quote owner supplies its standalone
-collector callback, the CLI fails closed before opening signing capabilities.
+receivers.  The diagnostic provider remains open through protective-mark
+collection and is reaped before all signing capabilities are released.
 """
 
 from __future__ import annotations
@@ -27,12 +27,18 @@ from robo_trader.bootstrap_evidence_receivers import (  # noqa: E402
     SealedBootstrapEvidenceArtifact,
     create_bootstrap_evidence_receivers,
 )
+from robo_trader.bootstrap_mark_producer import (  # noqa: E402
+    collect_and_produce_bootstrap_protective_mark,
+    create_runtime_bound_mark_only_producer,
+)
 from robo_trader.config import RuntimeContract  # noqa: E402
 from robo_trader.reconciliation.bootstrap_producer import (  # noqa: E402
     produce_bootstrap_reconciliation,
 )
 from robo_trader.reconciliation.ibkr_adapter import (  # noqa: E402
     IBKRDiagnosticSnapshotProvider,
+    ProtectiveQuoteSourceCapability,
+    assert_factory_owned_protective_quote_source,
     await_cleanup_required,
     build_diagnostic_provider,
 )
@@ -52,6 +58,7 @@ class ProtectiveMarkCollector(Protocol):
         *,
         runtime_contract: RuntimeContract,
         mark_identities: tuple[tuple[str, str], ...],
+        quote_source: ProtectiveQuoteSourceCapability,
         receiver: object,
     ) -> tuple[SealedBootstrapEvidenceArtifact, ...]:
         """Collect current authoritative quotes and invoke the typed receiver."""
@@ -67,48 +74,115 @@ async def produce_bootstrap_evidence_bundle(
     """Run fresh producers in dependency order and require complete mark coverage."""
 
     try:
-        broker_result = await snapshot_provider.produce_normalized_snapshot(max_age_seconds=30.0)
-    finally:
-        cleanup_cancelled = await await_cleanup_required(snapshot_provider.close())
-    if cleanup_cancelled:
-        raise asyncio.CancelledError
-    broker_envelope = receivers.broker_snapshot.receive_broker_snapshot_producer_result(
-        broker_result
-    )
-    broker_artifact = receivers.broker_artifact
-    reconciliation_delivery = produce_bootstrap_reconciliation(
-        broker_envelope,
-        runtime_contract,
-        receivers.reconciliation_report,
-    )
-    mark_artifacts = await protective_mark_collector(
-        runtime_contract=runtime_contract,
-        mark_identities=reconciliation_delivery.local_position_identities,
-        receiver=receivers.protective_mark,
-    )
-    if (
-        type(mark_artifacts) is not tuple
-        or any(type(item) is not SealedBootstrapEvidenceArtifact for item in mark_artifacts)
-        or len(mark_artifacts) != len(reconciliation_delivery.local_position_identities)
-    ):
-        raise BootstrapEvidencePipelineError(
-            "protective mark collector returned incomplete evidence"
+        broker_envelope = await snapshot_provider.produce_normalized_snapshot(
+            receiver=receivers.broker_snapshot,
+            max_age_seconds=30.0,
         )
-    receivers.assert_complete(set(reconciliation_delivery.local_position_identities))
-    reconciliation_artifact = reconciliation_delivery.receiver_result
-    if type(reconciliation_artifact) is not SealedBootstrapEvidenceArtifact:
-        raise BootstrapEvidencePipelineError("reconciliation receiver returned invalid evidence")
-    return {
-        "authorizes_startup": False,
-        "broker_snapshot": str(broker_artifact.artifact_path),
-        "protective_marks": [str(item.artifact_path) for item in mark_artifacts],
-        "reconciliation_report": str(reconciliation_artifact.artifact_path),
-        "schema_version": 1,
-        "status": "EVIDENCE_COMPLETE_GATE_A_STILL_CLOSED",
-    }
+        broker_artifact = receivers.broker_artifact
+        reconciliation_delivery = produce_bootstrap_reconciliation(
+            broker_envelope,
+            runtime_contract,
+            receivers.reconciliation_report,
+        )
+        quote_source = snapshot_provider.issue_protective_quote_source(
+            runtime_contract=runtime_contract,
+        )
+        mark_artifacts = await protective_mark_collector(
+            runtime_contract=runtime_contract,
+            mark_identities=reconciliation_delivery.local_position_identities,
+            quote_source=quote_source,
+            receiver=receivers.protective_mark,
+        )
+        if (
+            type(mark_artifacts) is not tuple
+            or any(type(item) is not SealedBootstrapEvidenceArtifact for item in mark_artifacts)
+            or len(mark_artifacts) != len(reconciliation_delivery.local_position_identities)
+        ):
+            raise BootstrapEvidencePipelineError(
+                "protective mark collector returned incomplete evidence"
+            )
+        receivers.assert_complete(set(reconciliation_delivery.local_position_identities))
+        reconciliation_artifact = reconciliation_delivery.receiver_result
+        if type(reconciliation_artifact) is not SealedBootstrapEvidenceArtifact:
+            raise BootstrapEvidencePipelineError(
+                "reconciliation receiver returned invalid evidence"
+            )
+        return {
+            "authorizes_startup": False,
+            "broker_snapshot": str(broker_artifact.artifact_path),
+            "protective_marks": [str(item.artifact_path) for item in mark_artifacts],
+            "reconciliation_report": str(reconciliation_artifact.artifact_path),
+            "schema_version": 1,
+            "status": "EVIDENCE_COMPLETE_GATE_A_STILL_CLOSED",
+        }
+    finally:
+        try:
+            cleanup_cancelled = await await_cleanup_required(snapshot_provider.close())
+        finally:
+            receivers.close()
+        if cleanup_cancelled:
+            raise asyncio.CancelledError
 
 
-_PRODUCTION_MARK_COLLECTOR: ProtectiveMarkCollector | None = None
+async def _collect_production_marks(
+    *,
+    runtime_contract: RuntimeContract,
+    mark_identities: tuple[tuple[str, str], ...],
+    quote_source: ProtectiveQuoteSourceCapability,
+    receiver: object,
+) -> tuple[SealedBootstrapEvidenceArtifact, ...]:
+    """Collect and seal one current live mark for every reconciled position."""
+
+    identity = assert_factory_owned_protective_quote_source(
+        quote_source,
+        runtime_contract=runtime_contract,
+    )
+    artifacts: list[SealedBootstrapEvidenceArtifact] = []
+    for portfolio_id, symbol in mark_identities:
+        discovery = await quote_source.get_protective_quotes(
+            (symbol,),
+            active_symbols=(symbol,),
+        )
+        if type(discovery) is not tuple or len(discovery) != 1:
+            raise BootstrapEvidencePipelineError(
+                "protective quote discovery returned incomplete evidence"
+            )
+        quote = discovery[0]
+        if quote.symbol != symbol or quote.transport_generation != identity.transport_generation:
+            raise BootstrapEvidencePipelineError(
+                "protective quote discovery changed runtime generation or symbol"
+            )
+        producer = create_runtime_bound_mark_only_producer(
+            runtime_contract,
+            portfolio_id=portfolio_id,
+        )
+        artifact = await collect_and_produce_bootstrap_protective_mark(
+            quote_source,
+            producer,
+            runtime_contract,
+            receiver,
+            expected_portfolio_id=portfolio_id,
+            expected_symbol=symbol,
+            expected_con_id=quote.con_id,
+            expected_transport_generation=identity.transport_generation,
+        )
+        if type(artifact) is not SealedBootstrapEvidenceArtifact:
+            raise BootstrapEvidencePipelineError(
+                "protective mark receiver returned invalid evidence"
+            )
+        artifacts.append(artifact)
+    if (
+        assert_factory_owned_protective_quote_source(
+            quote_source,
+            runtime_contract=runtime_contract,
+        )
+        != identity
+    ):
+        raise BootstrapEvidencePipelineError("protective quote source changed during collection")
+    return tuple(artifacts)
+
+
+_PRODUCTION_MARK_COLLECTOR: ProtectiveMarkCollector = _collect_production_marks
 
 
 async def _run(args: argparse.Namespace) -> dict[str, object]:
@@ -116,25 +190,26 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
     runtime = context.runtime_contract
     if type(runtime) is not RuntimeContract:
         raise BootstrapEvidencePipelineError("validated runtime contract is unavailable")
-    # Fail before opening the broker connection or signing capabilities until
-    # production wiring can supply the typed live-quote collectors and their
-    # portfolio-owned StopLossMonitor instances.
-    if _PRODUCTION_MARK_COLLECTOR is None:
-        raise BootstrapEvidencePipelineError(
-            "standalone authoritative protective-quote collection is not integrated"
-        )
     provider = await build_diagnostic_provider(context)
-    receivers = create_bootstrap_evidence_receivers(
-        runtime_contract=runtime,
-        capability_directory=args.capability_directory,
-        output_directory=args.output_directory,
-    )
-    return await produce_bootstrap_evidence_bundle(
-        runtime_contract=runtime,
-        snapshot_provider=provider,
-        receivers=receivers,
-        protective_mark_collector=_PRODUCTION_MARK_COLLECTOR,
-    )
+    bundle_owns_provider_cleanup = False
+    try:
+        receivers = create_bootstrap_evidence_receivers(
+            runtime_contract=runtime,
+            capability_directory=args.capability_directory,
+            output_directory=args.output_directory,
+        )
+        bundle_owns_provider_cleanup = True
+        return await produce_bootstrap_evidence_bundle(
+            runtime_contract=runtime,
+            snapshot_provider=provider,
+            receivers=receivers,
+            protective_mark_collector=_PRODUCTION_MARK_COLLECTOR,
+        )
+    finally:
+        if not bundle_owns_provider_cleanup:
+            cleanup_cancelled = await await_cleanup_required(provider.close())
+            if cleanup_cancelled:
+                raise asyncio.CancelledError
 
 
 def _parser() -> argparse.ArgumentParser:

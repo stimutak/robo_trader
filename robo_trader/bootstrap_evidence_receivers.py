@@ -18,7 +18,7 @@ import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, SupportsIndex
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -59,6 +59,13 @@ _FACTORY_TOKEN = object()
 _VERIFIED_BROKER_MARKER = object()
 _VERIFIED_BROKER_REGISTRY_KEY = secrets.token_bytes(32)
 _VERIFIED_BROKER_REGISTRY_LOCK = threading.Lock()
+_RECONCILIATION_RECEIVER_REGISTRY_LOCK = threading.Lock()
+_RECONCILIATION_RECEIVER_REGISTRY: weakref.WeakValueDictionary[
+    int, "ReconciliationEvidenceReceiver"
+] = weakref.WeakValueDictionary()
+_RECONCILIATION_STAGE_MARKER = object()
+_RECONCILIATION_STAGE_REGISTRY_LOCK = threading.Lock()
+_RECONCILIATION_STAGE_REGISTRY: dict[int, "_StagedReconciliationEvidence"] = {}
 
 
 class BootstrapEvidenceReceiverError(ValueError):
@@ -117,10 +124,11 @@ class VerifiedBrokerEvidenceEnvelope:
     def __deepcopy__(self, memo: object) -> "VerifiedBrokerEvidenceEnvelope":
         raise TypeError("verified broker envelope cannot be copied")
 
-    def __reduce__(self) -> object:
+    def __reduce__(self) -> str | tuple[Any, ...]:
         raise TypeError("verified broker envelope cannot be pickled")
 
-    def __reduce_ex__(self, protocol: int) -> object:
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[Any, ...]:
+        del protocol
         raise TypeError("verified broker envelope cannot be pickled")
 
 
@@ -205,7 +213,45 @@ class _BundleBindings:
     broker_artifact: SealedBootstrapEvidenceArtifact | None = None
     reconciliation_snapshot_id: str | None = None
     reconciliation_portfolio_ids: tuple[str, ...] = ()
+    database_device: int | None = None
+    database_inode: int | None = None
+    safety_journal_path: str | None = None
+    safety_journal_identity: str | None = None
+    safety_journal_device: int | None = None
+    safety_journal_inode: int | None = None
+    safety_journal_last_sequence: int | None = None
+    safety_journal_last_chain_hash: str | None = None
+    terminal_settlement_count: int | None = None
+    terminal_fill_count: int | None = None
+    local_simulator_positions_count: int | None = None
+    broker_positions_count: int | None = None
+    broker_open_orders_count: int | None = None
     marks: set[tuple[str, str]] = field(default_factory=set)
+
+
+@dataclass(frozen=True, slots=True)
+class _StagedReconciliationEvidence:
+    receiver: "ReconciliationEvidenceReceiver" = field(repr=False, compare=False)
+    artifact: SealedBootstrapEvidenceArtifact
+    staged_artifact_path: Path
+    staged_receipt_path: Path
+    final_artifact_path: Path
+    final_receipt_path: Path
+    portfolio_ids: tuple[str, ...]
+    database_device: int
+    database_inode: int
+    safety_journal_path: str
+    safety_journal_identity: str
+    safety_journal_device: int
+    safety_journal_inode: int
+    safety_journal_last_sequence: int
+    safety_journal_last_chain_hash: str
+    terminal_settlement_count: int
+    terminal_fill_count: int
+    local_simulator_positions_count: int
+    broker_positions_count: int
+    broker_open_orders_count: int
+    marker: object = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +270,13 @@ class BootstrapEvidenceReceiverSet:
             raise BootstrapEvidenceReceiverError(
                 "evidence bundle is incomplete for the reconciled ledger positions"
             )
+
+    def close(self) -> None:
+        """Release all private signing capabilities after the one-shot bundle."""
+
+        self.broker_snapshot._release_capability()
+        self.reconciliation_report._release_capability()
+        self.protective_mark._release_capability()
 
     @property
     def broker_artifact(self) -> SealedBootstrapEvidenceArtifact:
@@ -246,12 +299,14 @@ def _safe_private_key(
     directory = Path(capability_directory)
     try:
         metadata = os.lstat(directory)
+        resolved_directory = directory.resolve(strict=True)
     except OSError as exc:
         raise BootstrapEvidenceReceiverError(
             "bootstrap signing capability directory cannot be inspected"
         ) from exc
     if (
         not directory.is_absolute()
+        or resolved_directory != directory
         or stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != os.geteuid()
@@ -414,9 +469,11 @@ class BrokerSnapshotEvidenceReceiver:
         self,
         result: BrokerSnapshotProducerResult,
     ) -> VerifiedBrokerEvidenceEnvelope:
+        if self.__key is None:
+            raise BootstrapEvidenceReceiverError("broker signing capability was released")
         # This one-shot producer claim must happen before any field or payload
         # is read, hashed, persisted, or signed.
-        result = assert_producer_owned_broker_snapshot_result(result)
+        result = assert_producer_owned_broker_snapshot_result(result, receiver=self)
         if type(result) is not BrokerSnapshotProducerResult:
             raise BootstrapEvidenceReceiverError(
                 "broker receiver requires BrokerSnapshotProducerResult"
@@ -493,9 +550,12 @@ class BrokerSnapshotEvidenceReceiver:
             )
         )
 
+    def _release_capability(self) -> None:
+        self.__key = None
+
 
 class ReconciliationEvidenceReceiver:
-    __slots__ = ("__clock", "__key", "__output", "__state")
+    __slots__ = ("__clock", "__key", "__output", "__state", "__weakref__")
 
     def __init__(
         self,
@@ -512,12 +572,14 @@ class ReconciliationEvidenceReceiver:
         self.__key = key
         self.__clock = clock
 
-    def receive_unsigned_bootstrap_reconciliation(
+    def stage_unsigned_bootstrap_reconciliation(
         self,
         result: UnsignedBootstrapReconciliation,
-    ) -> SealedBootstrapEvidenceArtifact:
+    ) -> object:
+        if self.__key is None:
+            raise BootstrapEvidenceReceiverError("reconciliation signing capability was released")
         # Claim the producer-owned one-shot result before reading any field,
-        # hashing its payload, or creating output files.
+        # hashing its payload, or creating unpublished staging files.
         result = assert_and_consume_producer_owned_bootstrap_reconciliation(result)
         if type(result) is not UnsignedBootstrapReconciliation:
             raise BootstrapEvidenceReceiverError(
@@ -530,6 +592,8 @@ class ReconciliationEvidenceReceiver:
             or result.broker_snapshot_id != self.__state.broker_snapshot_id
             or result.broker_snapshot_hash != self.__state.broker_snapshot_hash
             or result.broker_artifact_hash != self.__state.broker_artifact_hash
+            or result.safety_journal_path != self.__state.safety_journal_path
+            or result.safety_journal_identity != self.__state.safety_journal_identity
             or self.__state.reconciliation_snapshot_id is not None
         ):
             raise BootstrapEvidenceReceiverError(
@@ -537,8 +601,17 @@ class ReconciliationEvidenceReceiver:
             )
         payload = _canonical_payload_bytes(result.canonical_payload())
         artifact_hash = hashlib.sha256(payload).hexdigest()
-        artifact_path = self.__output / _RECONCILIATION_ARTIFACT_FILENAME
-        _write_new_sealed_file(artifact_path, payload)
+        final_artifact_path = self.__output / _RECONCILIATION_ARTIFACT_FILENAME
+        final_receipt_path = final_artifact_path.with_name(final_artifact_path.name + AUTH_SUFFIX)
+        stage_nonce = secrets.token_hex(32)
+        staged_artifact_path = self.__output / (
+            f".{_RECONCILIATION_ARTIFACT_FILENAME}.stage-{stage_nonce}"
+        )
+        staged_receipt_path = self.__output / (
+            f".{_RECONCILIATION_ARTIFACT_FILENAME}{AUTH_SUFFIX}.stage-{stage_nonce}"
+        )
+        if final_artifact_path.exists() or final_receipt_path.exists():
+            raise BootstrapEvidenceReceiverError("reconciliation evidence was already published")
         now = self.__clock().astimezone(timezone.utc)
         values: dict[str, object] = {
             "schema_version": AUTH_SCHEMA_VERSION,
@@ -563,21 +636,148 @@ class ReconciliationEvidenceReceiver:
             account_scope=self.__state.account_scope,
             now=now,
         )
-        receipt_path = artifact_path.with_name(artifact_path.name + AUTH_SUFFIX)
-        _write_new_sealed_file(
-            receipt_path,
-            json.dumps(values, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode(
-                "utf-8"
-            ),
-        )
-        self.__state.reconciliation_snapshot_id = result.snapshot_id
-        self.__state.reconciliation_portfolio_ids = result.portfolio_ids
-        return SealedBootstrapEvidenceArtifact(
+        receipt_payload = json.dumps(
+            values,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        artifact = SealedBootstrapEvidenceArtifact(
             artifact_kind="reconciliation_report",
-            artifact_path=artifact_path,
-            authentication_receipt_path=receipt_path,
+            artifact_path=final_artifact_path,
+            authentication_receipt_path=final_receipt_path,
             artifact_sha256=artifact_hash,
             producer_object_id=result.snapshot_id,
+        )
+        stage = _StagedReconciliationEvidence(
+            receiver=self,
+            artifact=artifact,
+            staged_artifact_path=staged_artifact_path,
+            staged_receipt_path=staged_receipt_path,
+            final_artifact_path=final_artifact_path,
+            final_receipt_path=final_receipt_path,
+            portfolio_ids=result.portfolio_ids,
+            database_device=result.database_device,
+            database_inode=result.database_inode,
+            safety_journal_path=result.safety_journal_path,
+            safety_journal_identity=result.safety_journal_identity,
+            safety_journal_device=result.safety_journal_device,
+            safety_journal_inode=result.safety_journal_inode,
+            safety_journal_last_sequence=result.safety_journal_last_sequence,
+            safety_journal_last_chain_hash=result.safety_journal_last_chain_hash,
+            terminal_settlement_count=result.terminal_settlement_count,
+            terminal_fill_count=result.terminal_fill_count,
+            local_simulator_positions_count=result.local_simulator_positions_count,
+            broker_positions_count=result.broker_positions_count,
+            broker_open_orders_count=result.broker_open_orders_count,
+            marker=_RECONCILIATION_STAGE_MARKER,
+        )
+        try:
+            _write_new_sealed_file(staged_artifact_path, payload)
+            _write_new_sealed_file(staged_receipt_path, receipt_payload)
+            with _RECONCILIATION_STAGE_REGISTRY_LOCK:
+                _RECONCILIATION_STAGE_REGISTRY[id(stage)] = stage
+        except BaseException:
+            for path in (staged_receipt_path, staged_artifact_path):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
+        return stage
+
+    def commit_staged_bootstrap_reconciliation(
+        self,
+        stage: object,
+    ) -> SealedBootstrapEvidenceArtifact:
+        checked = self.__consume_stage(stage)
+        artifact_published = False
+        try:
+            if checked.final_artifact_path.exists() or checked.final_receipt_path.exists():
+                raise BootstrapEvidenceReceiverError(
+                    "reconciliation evidence publication target already exists"
+                )
+            checked.staged_artifact_path.rename(checked.final_artifact_path)
+            artifact_published = True
+            checked.staged_receipt_path.rename(checked.final_receipt_path)
+        except BaseException:
+            if artifact_published and checked.final_artifact_path.exists():
+                try:
+                    checked.final_artifact_path.rename(checked.staged_artifact_path)
+                except OSError as exc:
+                    with _RECONCILIATION_STAGE_REGISTRY_LOCK:
+                        _RECONCILIATION_STAGE_REGISTRY[id(checked)] = checked
+                    raise BootstrapEvidenceReceiverError(
+                        "reconciliation publication rollback failed closed"
+                    ) from exc
+            with _RECONCILIATION_STAGE_REGISTRY_LOCK:
+                _RECONCILIATION_STAGE_REGISTRY[id(checked)] = checked
+            raise
+        self.__state.reconciliation_snapshot_id = checked.artifact.producer_object_id
+        self.__state.reconciliation_portfolio_ids = checked.portfolio_ids
+        self.__state.database_device = checked.database_device
+        self.__state.database_inode = checked.database_inode
+        self.__state.safety_journal_path = checked.safety_journal_path
+        self.__state.safety_journal_identity = checked.safety_journal_identity
+        self.__state.safety_journal_device = checked.safety_journal_device
+        self.__state.safety_journal_inode = checked.safety_journal_inode
+        self.__state.safety_journal_last_sequence = checked.safety_journal_last_sequence
+        self.__state.safety_journal_last_chain_hash = checked.safety_journal_last_chain_hash
+        self.__state.terminal_settlement_count = checked.terminal_settlement_count
+        self.__state.terminal_fill_count = checked.terminal_fill_count
+        self.__state.local_simulator_positions_count = checked.local_simulator_positions_count
+        self.__state.broker_positions_count = checked.broker_positions_count
+        self.__state.broker_open_orders_count = checked.broker_open_orders_count
+        return checked.artifact
+
+    def abort_staged_bootstrap_reconciliation(self, stage: object) -> None:
+        checked = self.__consume_stage(stage)
+        failures: list[OSError] = []
+        for path in (checked.staged_receipt_path, checked.staged_artifact_path):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                failures.append(exc)
+        if failures:
+            raise BootstrapEvidenceReceiverError(
+                "unpublished reconciliation stage could not be removed"
+            ) from failures[0]
+
+    def __consume_stage(self, stage: object) -> _StagedReconciliationEvidence:
+        if type(stage) is not _StagedReconciliationEvidence:
+            raise BootstrapEvidenceReceiverError("reconciliation stage is not core-owned")
+        with _RECONCILIATION_STAGE_REGISTRY_LOCK:
+            registered = _RECONCILIATION_STAGE_REGISTRY.pop(id(stage), None)
+        if (
+            registered is not stage
+            or stage.receiver is not self
+            or stage.marker is not _RECONCILIATION_STAGE_MARKER
+        ):
+            raise BootstrapEvidenceReceiverError(
+                "reconciliation stage is forged, cross-receiver, or already consumed"
+            )
+        return stage
+
+    def _release_capability(self) -> None:
+        with _RECONCILIATION_RECEIVER_REGISTRY_LOCK:
+            registered = _RECONCILIATION_RECEIVER_REGISTRY.get(id(self))
+            if registered is self:
+                _RECONCILIATION_RECEIVER_REGISTRY.pop(id(self), None)
+        self.__key = None
+
+
+def assert_reconciliation_receiver_capability(receiver: object) -> None:
+    """Authenticate one exact receiver created by the core capability factory."""
+
+    if type(receiver) is not ReconciliationEvidenceReceiver:
+        raise BootstrapEvidenceReceiverError(
+            "exact factory-issued reconciliation receiver is required"
+        )
+    with _RECONCILIATION_RECEIVER_REGISTRY_LOCK:
+        registered = _RECONCILIATION_RECEIVER_REGISTRY.get(id(receiver))
+    if registered is not receiver:
+        raise BootstrapEvidenceReceiverError(
+            "reconciliation receiver was not issued by the core capability factory"
         )
 
 
@@ -603,6 +803,8 @@ class ProtectiveMarkEvidenceReceiver:
         self,
         result: UnsignedBootstrapProtectiveMark,
     ) -> SealedBootstrapEvidenceArtifact:
+        if self.__key is None:
+            raise BootstrapEvidenceReceiverError("mark signing capability was released")
         # Producer ownership is receiver-bound and one-shot.  Consume it
         # before reading any result field or creating any artifact.
         result = assert_producer_owned_unsigned_bootstrap_protective_mark(
@@ -619,6 +821,8 @@ class ProtectiveMarkEvidenceReceiver:
             or result.runtime_fingerprint != self.__state.runtime_fingerprint
             or result.account_scope != self.__state.account_scope
             or result.database_identity != self.__state.database_identity
+            or result.database_device != self.__state.database_device
+            or result.database_inode != self.__state.database_inode
             or result.portfolio_id not in self.__state.reconciliation_portfolio_ids
             or identity in self.__state.marks
         ):
@@ -670,6 +874,9 @@ class ProtectiveMarkEvidenceReceiver:
             artifact_sha256=artifact_hash,
             producer_object_id=result.protective_quote_id,
         )
+
+    def _release_capability(self) -> None:
+        self.__key = None
 
 
 def create_bootstrap_evidence_receivers(
@@ -729,11 +936,22 @@ def create_bootstrap_evidence_receivers(
         runtime_fingerprint=runtime_contract.fingerprint,
         account_scope=runtime_contract.safety_account_scope,
         database_identity=runtime_contract.database_identity,
+        safety_journal_path=runtime_contract.safety_journal_path,
+        safety_journal_identity=runtime_contract.safety_journal_identity,
     )
 
     def clock() -> datetime:
         return datetime.now(timezone.utc)
 
+    reconciliation_receiver = ReconciliationEvidenceReceiver(
+        _FACTORY_TOKEN,
+        output,
+        state,
+        reconciliation_key,
+        clock,
+    )
+    with _RECONCILIATION_RECEIVER_REGISTRY_LOCK:
+        _RECONCILIATION_RECEIVER_REGISTRY[id(reconciliation_receiver)] = reconciliation_receiver
     return BootstrapEvidenceReceiverSet(
         broker_snapshot=BrokerSnapshotEvidenceReceiver(
             _FACTORY_TOKEN,
@@ -743,13 +961,7 @@ def create_bootstrap_evidence_receivers(
             broker_key,
             clock,
         ),
-        reconciliation_report=ReconciliationEvidenceReceiver(
-            _FACTORY_TOKEN,
-            output,
-            state,
-            reconciliation_key,
-            clock,
-        ),
+        reconciliation_report=reconciliation_receiver,
         protective_mark=ProtectiveMarkEvidenceReceiver(
             _FACTORY_TOKEN,
             output,
