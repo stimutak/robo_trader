@@ -1328,7 +1328,9 @@ def test_pending_writer_timeout_is_bounded_and_does_not_latch_reader(tmp_path, m
     assert ledger.current_gross_filled_notional() == Decimal("0")
 
 
-def test_sigkill_hot_journal_is_recovered_rw_before_readonly_validation(tmp_path):
+def test_sigkill_hot_journal_is_preserved_for_review_without_authoritative_mutation(
+    tmp_path, monkeypatch
+):
     if not hasattr(signal, "SIGKILL"):
         pytest.skip("SIGKILL unavailable on this host")
     path = tmp_path / "notional.db"
@@ -1380,12 +1382,23 @@ service.record_fill(ExecutedFill(
 
     journal = Path(f"{path}-journal")
     assert journal.exists() and journal.stat().st_size > 0
-    restarted = _service(path)
-    assert restarted.restored_gross_filled_notional == Decimal("20.5")
-    with sqlite3.connect(path) as connection:
-        assert connection.execute(
-            "SELECT broker_execution_id FROM daily_filled_notional_records"
-        ).fetchall() == [("durable",)]
+    database_before = _file_snapshot(path)
+    journal_before = _file_snapshot(journal)
+    anchor_before = _file_snapshot(ledger.anchor_path)
+    paths_before = _path_inventory(tmp_path)
+
+    def reject_authoritative_sqlite_open(*args, **kwargs):
+        pytest.fail("hot-journal handling must not reopen the authoritative database")
+
+    monkeypatch.setattr(DailyFilledNotional, "_connection", reject_authoritative_sqlite_open)
+
+    with pytest.raises(FilledNotionalUnavailable, match="automatic hot-journal recovery"):
+        _service(path)
+
+    assert _file_snapshot(path) == database_before
+    assert _file_snapshot(journal) == journal_before
+    assert _file_snapshot(ledger.anchor_path) == anchor_before
+    assert _path_inventory(tmp_path) == paths_before
 
 
 def test_hot_journal_monotonic_rejection_preserves_all_original_evidence(tmp_path):
@@ -1452,7 +1465,9 @@ signal.pause()
     assert _path_inventory(tmp_path) == paths_before
 
 
-def test_hot_journal_is_revalidated_under_lock_immediately_before_recovery(tmp_path, monkeypatch):
+def test_hot_journal_swap_after_final_validation_cannot_mutate_authoritative_files(
+    tmp_path, monkeypatch
+):
     if not hasattr(signal, "SIGKILL"):
         pytest.skip("SIGKILL unavailable on this host")
     path = tmp_path / "replaced-hot-journal.db"
@@ -1497,31 +1512,35 @@ signal.pause()
     replacement_bytes = bytearray(journal.read_bytes())
     replacement_bytes[0] ^= 0xFF
     replacement.write_bytes(replacement_bytes)
+    preserved_original = tmp_path / "preserved-original.journal"
     original_validator = DailyFilledNotional._validate_hot_journal_recovery_on_copy
     validation_calls = 0
 
-    def replace_after_first_validation(self):
+    def replace_after_final_validation(self):
         nonlocal validation_calls
         validation_calls += 1
         evidence = original_validator(self)
-        if validation_calls == 1:
+        if validation_calls == 2:
+            os.replace(journal, preserved_original)
             os.replace(replacement, journal)
         return evidence
 
     monkeypatch.setattr(
         DailyFilledNotional,
         "_validate_hot_journal_recovery_on_copy",
-        replace_after_first_validation,
+        replace_after_final_validation,
     )
     database_before = _file_snapshot(path)
     anchor_before = _file_snapshot(ledger.anchor_path)
+    original_journal_before = _file_snapshot(journal)
 
-    with pytest.raises(FilledNotionalError):
+    with pytest.raises(FilledNotionalUnavailable, match="automatic hot-journal recovery"):
         _service(path)
 
     assert validation_calls == 2
     assert _file_snapshot(path) == database_before
     assert journal.read_bytes() == bytes(replacement_bytes)
+    assert _file_snapshot(preserved_original) == original_journal_before
     assert _file_snapshot(ledger.anchor_path) == anchor_before
 
 

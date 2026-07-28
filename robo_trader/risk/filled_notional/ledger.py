@@ -1595,18 +1595,26 @@ class DailyFilledNotional:
             )
 
     def _recover_hot_journal(self, expected: _HotJournalRecoveryEvidence) -> None:
-        """Force identity-bound SQLite recovery before any read-only open."""
+        """Preserve a hot journal because SQLite cannot bind it through recovery.
+
+        SQLite derives the rollback-journal name from the database pathname and
+        reopens that name internally.  Holding or validating a descriptor does
+        not prevent another process from replacing the pathname between the
+        final check and SQLite's first mutation.  Revalidate for diagnostic
+        consistency, but never open the authoritative database read-write while
+        a hot journal exists.  Reviewed recovery must operate on an isolated
+        copy and install a separately authenticated ledger generation.
+        """
 
         self._require_exclusive_database_path()
         if self._validate_hot_journal_recovery_on_copy() != expected:
             raise FilledNotionalUnavailable(
                 "hot-journal recovery evidence changed after validation"
             )
-        with self._connection(readonly=False) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute("PRAGMA schema_version").fetchone()
-            connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
-            connection.commit()
+        raise FilledNotionalUnavailable(
+            "automatic hot-journal recovery is unsafe; preserve the database, "
+            "journal, and anchor for reviewed recovery"
+        )
 
     def _reject_wal_sidecars(self) -> None:
         """Reject WAL state before SQLite can open or mutate WAL/SHM artifacts."""

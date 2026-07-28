@@ -79,20 +79,23 @@ table, regardless of the trigger's name or the target identifier's ASCII case,
 and rejects anything beyond the exact versioned trigger set. This prevents a
 foreign trigger such as `RAISE(IGNORE)` from silently suppressing an append.
 
-For an existing database, schema version detection is immutable and read-only
-before any read-write recovery. Read-write recovery of a hot rollback journal
-is authorized only by a valid current-version anchor bound to that exact
-database device/inode. A legacy or otherwise ambiguous hot journal without
-that authority is preserved byte for byte and the service raises unavailable.
-This is required because SQLite cache spill can place an uncommitted future
-schema marker in the main database while the rollback journal still contains
-the authoritative legacy image; trusting that marker and recovering would
-destroy migration evidence.
+For an existing database, schema version detection is immutable and read-only.
+Any hot rollback journal, including one whose isolated-copy recovery validates
+against a current-version anchor, is preserved and the service raises
+unavailable. SQLite derives and reopens the journal by pathname during recovery;
+there is no portable way to bind the validated journal inode through SQLite's
+first mutation if another local process can replace that pathname. Reviewed
+recovery must therefore operate on an isolated copy and install a separately
+authenticated ledger generation. This also protects legacy evidence because
+SQLite cache spill can place an uncommitted future schema marker in the main
+database while the rollback journal still contains the authoritative legacy
+image; trusting that marker and recovering would destroy migration evidence.
 
 Version 3 requires SQLite rollback-journal mode (header read/write versions
 `1/1`) and does not accept WAL mode. Existing `-wal` or `-shm` files are
 preserved and rejected before SQLite opens them. A rollback `-journal` is
-eligible for authenticated recovery only when it is a non-symlink regular file
-with one link; hardlinked journals are preserved and rejected. These checks
-prevent read-only construction and accounting writes from following or
-mutating unbound SQLite sidecar targets.
+inspected on an isolated copy only when it is a non-symlink regular file with
+one link, but automatic recovery is still rejected; hardlinked journals are
+preserved and rejected before copying. These checks prevent read-only
+construction and accounting writes from following or mutating unbound SQLite
+sidecar targets.
