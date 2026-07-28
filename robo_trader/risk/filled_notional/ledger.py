@@ -1193,30 +1193,15 @@ class DailyFilledNotional:
                 portfolio_id="__review__",
                 _review_only=True,
             )
-            with reviewer._connection(readonly=True, immutable=True) as connection:
-                connection.execute("BEGIN")
-                state = reviewer._validate_checkpointed_state(connection)
-                reviewer._require_exact_anchor(state)
-                rows = connection.execute(
-                    "SELECT * FROM daily_filled_notional_conflicts ORDER BY sequence"
-                ).fetchall()
-                evidence = tuple(
-                    ConflictEvidence(
-                        sequence=int(row["sequence"]),
-                        account_id=str(row["account_id"]),
-                        broker_execution_id=str(row["broker_execution_id"]),
-                        existing_portfolio_id=str(row["existing_portfolio_id"]),
-                        claimed_portfolio_id=str(row["claimed_portfolio_id"]),
-                        claimed_fill_json=str(row["claimed_fill_json"]),
-                        observed_at_utc=str(row["observed_at_utc"]),
-                        conflict_hash=str(row["conflict_hash"]),
-                    )
-                    for row in rows
-                )
-                reviewer._require_exact_anchor(state)
-                connection.commit()
-            reviewer._verify_monotonic_state(state)
-            return evidence
+            for _ in range(3):
+                state, anchor, evidence = reviewer._quarantine_snapshot()
+                reviewer._verify_monotonic_state(state)
+                final_state, final_anchor, final_evidence = reviewer._quarantine_snapshot()
+                if final_state == state and final_anchor == anchor and final_evidence == evidence:
+                    return evidence
+            raise FilledNotionalUnavailable(
+                "quarantine review snapshot kept advancing during verification"
+            )
         except _PendingAnchorInProgress as exc:
             raise FilledNotionalUnavailable(
                 "quarantine review unavailable during pending anchor transition"
@@ -1224,6 +1209,35 @@ class DailyFilledNotional:
         finally:
             if reviewer is not None:
                 reviewer._latch_failure("review-only instance cannot perform accounting")
+
+    def _quarantine_snapshot(
+        self,
+    ) -> tuple[_LedgerState, _Anchor, tuple[ConflictEvidence, ...]]:
+        """Read one immutable authenticated quarantine snapshot without mutating artifacts."""
+
+        with self._connection(readonly=True, immutable=True) as connection:
+            connection.execute("BEGIN")
+            state = self._validate_checkpointed_state(connection)
+            anchor = self._require_exact_anchor(state)
+            rows = connection.execute(
+                "SELECT * FROM daily_filled_notional_conflicts ORDER BY sequence"
+            ).fetchall()
+            evidence = tuple(
+                ConflictEvidence(
+                    sequence=int(row["sequence"]),
+                    account_id=str(row["account_id"]),
+                    broker_execution_id=str(row["broker_execution_id"]),
+                    existing_portfolio_id=str(row["existing_portfolio_id"]),
+                    claimed_portfolio_id=str(row["claimed_portfolio_id"]),
+                    claimed_fill_json=str(row["claimed_fill_json"]),
+                    observed_at_utc=str(row["observed_at_utc"]),
+                    conflict_hash=str(row["conflict_hash"]),
+                )
+                for row in rows
+            )
+            anchor = self._require_exact_anchor(state)
+            connection.commit()
+        return state, anchor, evidence
 
     def _append_fill(
         self,
@@ -1479,6 +1493,7 @@ class DailyFilledNotional:
         connection: Optional[sqlite3.Connection] = None
         try:
             binding = SQLitePathBinding.open_for_initialization(self._path, create=True)
+            self._require_exclusive_database_path(binding)
             connection = sqlite3.connect(
                 self._path.as_uri() + "?mode=rw",
                 uri=True,
@@ -1563,6 +1578,7 @@ class DailyFilledNotional:
     def _recover_hot_journal(self) -> None:
         """Force identity-bound SQLite recovery before any read-only open."""
 
+        self._require_exclusive_database_path()
         with self._connection(readonly=False) as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute("PRAGMA schema_version").fetchone()
@@ -1589,6 +1605,7 @@ class DailyFilledNotional:
     def _validate_existing_rollback_journal(self) -> None:
         """Ensure a rollback journal cannot redirect mutations through another inode name."""
 
+        self._require_exclusive_database_path()
         journal = Path(f"{self._path}-journal")
         try:
             metadata = os.lstat(journal)
@@ -1616,6 +1633,7 @@ class DailyFilledNotional:
         if (
             stat.S_ISLNK(database_metadata.st_mode)
             or not stat.S_ISREG(database_metadata.st_mode)
+            or database_metadata.st_nlink != 1
             or anchor.state.database_device != database_metadata.st_dev
             or anchor.state.database_inode != database_metadata.st_ino
         ):
@@ -1643,6 +1661,7 @@ class DailyFilledNotional:
     def _preflight_existing_schema(self) -> bool:
         """Identify legacy state without permitting SQLite journal recovery."""
 
+        self._require_exclusive_database_path()
         self._reject_wal_sidecars()
         journal = Path(f"{self._path}-journal")
         try:
@@ -1666,7 +1685,10 @@ class DailyFilledNotional:
                     "hot journal lacks an authenticated current-schema recovery anchor"
                 ) from exc
             if (
-                anchor.state.database_device != database_metadata.st_dev
+                stat.S_ISLNK(database_metadata.st_mode)
+                or not stat.S_ISREG(database_metadata.st_mode)
+                or database_metadata.st_nlink != 1
+                or anchor.state.database_device != database_metadata.st_dev
                 or anchor.state.database_inode != database_metadata.st_ino
             ):
                 raise FilledNotionalUnavailable(
@@ -1686,6 +1708,39 @@ class DailyFilledNotional:
             ) from exc
         return False
 
+    def _require_exclusive_database_path(
+        self, binding: Optional[SQLitePathBinding] = None
+    ) -> os.stat_result:
+        """Reject shared or redirected main files before SQLite can recover or write."""
+
+        try:
+            path_metadata = os.lstat(self._path)
+            descriptor_metadata = (
+                os.fstat(binding.guardian_file_descriptor) if binding is not None else None
+            )
+        except OSError as exc:
+            raise FilledNotionalUnavailable(
+                "main database identity cannot be inspected safely"
+            ) from exc
+        if (
+            stat.S_ISLNK(path_metadata.st_mode)
+            or not stat.S_ISREG(path_metadata.st_mode)
+            or path_metadata.st_nlink != 1
+        ):
+            raise FilledNotionalIntegrityError(
+                "main database must be an exclusive non-symlink regular file"
+            )
+        if descriptor_metadata is not None and (
+            not stat.S_ISREG(descriptor_metadata.st_mode)
+            or descriptor_metadata.st_nlink != 1
+            or (descriptor_metadata.st_dev, descriptor_metadata.st_ino)
+            != (path_metadata.st_dev, path_metadata.st_ino)
+        ):
+            raise FilledNotionalIntegrityError(
+                "main database guardian is not an exclusive bound regular file"
+            )
+        return path_metadata
+
     @contextmanager
     def _connection(
         self,
@@ -1696,12 +1751,15 @@ class DailyFilledNotional:
         binding: Optional[SQLitePathBinding] = None
         connection: Optional[sqlite3.Connection] = None
         try:
+            self._require_exclusive_database_path()
             binding = SQLitePathBinding.open_for_initialization(self._path, create=False)
+            self._require_exclusive_database_path(binding)
             self._require_rollback_journal_header(binding)
             self._reject_wal_sidecars()
             self._validate_existing_rollback_journal()
             mode = "ro" if readonly else "rw"
             immutable_query = "&immutable=1" if immutable else ""
+            self._require_exclusive_database_path(binding)
             connection = sqlite3.connect(
                 self._path.as_uri() + f"?mode={mode}{immutable_query}",
                 uri=True,

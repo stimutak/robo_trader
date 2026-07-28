@@ -892,7 +892,7 @@ def test_hardlinked_main_ledger_is_rejected_before_fill_mutation(tmp_path):
     anchor_before = _file_snapshot(ledger.anchor_path)
     paths_before = _path_inventory(tmp_path)
 
-    with pytest.raises(FilledNotionalIntegrityError, match="checkpoint database identity"):
+    with pytest.raises(FilledNotionalIntegrityError, match="exclusive non-symlink regular"):
         ledger.record_fill(_fill("must-not-mutate-hardlinked-ledger"))
 
     assert _file_snapshot(path) == database_before
@@ -1388,6 +1388,69 @@ service.record_fill(ExecutedFill(
         ).fetchall() == [("durable",)]
 
 
+def test_sigkill_spilled_hot_journal_rejects_hardlinked_main_without_mutation(tmp_path):
+    if not hasattr(signal, "SIGKILL"):
+        pytest.skip("SIGKILL unavailable on this host")
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+    ledger.record_fill(_fill("durable-before-spill"))
+    stable_database = path.read_bytes()
+    script = f"""
+import signal
+import sqlite3
+
+connection = sqlite3.connect({str(path)!r}, isolation_level=None)
+connection.execute('PRAGMA journal_mode=DELETE')
+connection.execute('PRAGMA synchronous=FULL')
+connection.execute('PRAGMA cache_size=1')
+connection.execute('PRAGMA cache_spill=ON')
+connection.execute('BEGIN IMMEDIATE')
+connection.execute('CREATE TABLE spill_payload (id INTEGER PRIMARY KEY, value BLOB)')
+connection.executemany(
+    'INSERT INTO spill_payload VALUES (?, randomblob(4096))',
+    ((index,) for index in range(1, 513)),
+)
+print('READY', flush=True)
+signal.pause()
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "READY"
+        os.kill(child.pid, signal.SIGKILL)
+        child.wait(timeout=10)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+
+    journal = Path(f"{path}-journal")
+    assert journal.exists() and journal.stat().st_size > 0
+    assert path.read_bytes() != stable_database
+    preserved_alias = tmp_path / "preserved-hot-ledger.db"
+    os.link(path, preserved_alias)
+    database_before = _file_snapshot(path)
+    alias_before = _file_snapshot(preserved_alias)
+    journal_before = _file_snapshot(journal)
+    anchor_before = _file_snapshot(ledger.anchor_path)
+    paths_before = _path_inventory(tmp_path)
+
+    with pytest.raises(FilledNotionalUnavailable, match="exclusive non-symlink regular"):
+        _service(path)
+
+    assert _file_snapshot(path) == database_before
+    assert _file_snapshot(preserved_alias) == alias_before
+    assert _file_snapshot(journal) == journal_before
+    assert _file_snapshot(ledger.anchor_path) == anchor_before
+    assert path.samefile(preserved_alias)
+    assert _path_inventory(tmp_path) == paths_before
+
+
 def test_ledger_tail_deletion_is_detected_against_independent_anchor(tmp_path):
     path = tmp_path / "notional.db"
     ledger = _service(path)
@@ -1515,6 +1578,46 @@ def test_review_quarantine_success_is_byte_inode_and_path_read_only(tmp_path):
     assert _file_snapshot(path) == database_before
     assert _file_snapshot(ledger.anchor_path) == anchor_before
     assert _path_inventory(tmp_path) == paths_before
+
+
+def test_review_quarantine_retries_when_conflict_commits_during_verification(tmp_path):
+    path = tmp_path / "notional.db"
+    verifier = TestMonotonicVerifier()
+    ledger = _service(path, monotonic_verifier=verifier)
+    original = _fill("conflict-during-review-verification")
+    ledger.record_fill(original)
+    writer = _service(path, monotonic_verifier=verifier)
+
+    class CommitConflictDuringSecondVerification:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.conflict_committed = False
+
+        def __call__(self, state) -> bool:
+            self.calls += 1
+            accepted = verifier(state)
+            if self.calls == 2:
+                try:
+                    writer.record_fill(replace(original, price=Decimal("999")))
+                except FilledNotionalConflict:
+                    self.conflict_committed = True
+                else:  # pragma: no cover - durable conflict must reject the writer
+                    raise AssertionError("conflicting execution unexpectedly succeeded")
+            return accepted
+
+    race_verifier = CommitConflictDuringSecondVerification()
+
+    evidence = DailyFilledNotional.review_quarantine(
+        path,
+        anchor_path=ledger.anchor_path,
+        anchor_key=ANCHOR_KEY,
+        monotonic_verifier=race_verifier,
+    )
+
+    assert race_verifier.conflict_committed
+    assert race_verifier.calls >= 3
+    assert len(evidence) == 1
+    assert evidence[0].broker_execution_id == original.broker_execution_id
 
 
 def test_review_quarantine_translates_concurrent_pending_writer_without_mutation(
