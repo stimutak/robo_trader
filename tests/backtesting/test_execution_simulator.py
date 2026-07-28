@@ -338,6 +338,17 @@ def test_execution_bar_volume_cannot_change_lagged_liquidity_costs() -> None:
     assert thin.execution_cost == deep.execution_cost
 
 
+def test_lagged_observed_spread_still_respects_real_spread_configuration() -> None:
+    result = _execute(
+        _simulator(use_real_spreads=False),
+        liquidity_spread=10,
+        liquidity_volatility=0.02,
+        ignore_reported_cost_inputs=True,
+    )
+
+    assert result.execution_cost.spread_cost == pytest.approx(0.005)
+
+
 def test_buy_fill_is_reduced_to_reserve_all_execution_costs() -> None:
     result = _execute(
         _simulator(commission_per_share=0, min_commission=0),

@@ -567,7 +567,7 @@ class ExecutionSimulator:
     ) -> float:
         """Calculate a finite, non-negative full bid-ask spread."""
 
-        if observed_spread is not None:
+        if self.use_real_spreads and observed_spread is not None:
             return float(observed_spread)
         if (
             reported_inputs_allowed
