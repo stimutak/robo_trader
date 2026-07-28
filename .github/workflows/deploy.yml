@@ -235,10 +235,22 @@ jobs:
           echo "Running smoke tests against staging"
           # curl https://staging.robo-trader.example.com/health
           
+      - name: Check Slack notification configuration
+        id: staging-slack
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          if [[ -n "$SLACK_WEBHOOK_URL" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Notify deployment
         # TODO(R2-CFG-H1.4): pin to specific commit SHA
         uses: 8398a7/action-slack@v3
-        if: always()
+        if: always() && steps.staging-slack.outputs.configured == 'true'
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
         with:
@@ -328,9 +340,21 @@ jobs:
           # - Restore database backup if needed
           # - Clear caches
           
+      - name: Check Slack notification configuration
+        id: rollback-slack
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          if [[ -n "$SLACK_WEBHOOK_URL" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Notify rollback
         # TODO(R2-CFG-H1.4): pin to specific commit SHA
         uses: 8398a7/action-slack@v3
+        if: steps.rollback-slack.outputs.configured == 'true'
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
         with:
