@@ -11,6 +11,7 @@ from enum import Enum
 from typing import Awaitable, Callable, Protocol
 
 from .domain import NormalizedBrokerSnapshot, ReconciliationDomainError, _timestamp
+from .ibkr_adapter import await_cleanup_required
 from .persistence import PersistedReconciliation, ReconciliationPersistence
 from .policy import (
     ExpectedTimingLagProof,
@@ -19,6 +20,10 @@ from .policy import (
     ReconciliationStatus,
     ReconciliationVerdict,
     evaluate_paper_simulator_reconciliation,
+)
+from .runtime_evidence import (
+    VerifiedRuntimeReconciliationEvidence,
+    assert_and_consume_verified_runtime_reconciliation_evidence,
 )
 
 
@@ -41,6 +46,7 @@ class ReconciliationServiceState(str, Enum):
     READY = "ready"
     DEGRADED = "degraded"
     QUARANTINED = "quarantined"
+    CLOSING = "closing"
     CLOSED = "closed"
 
 
@@ -66,20 +72,21 @@ class ReconciliationServiceOutcome:
     persisted: PersistedReconciliation
     state: ReconciliationServiceState
     entry_eligible: bool
+    eligible_until: datetime
 
 
-class NormalizedSnapshotSource(Protocol):
-    """Narrow source implemented by the existing read-only provider pipeline.
+class VerifiedEvidenceSource(Protocol):
+    """Narrow source implemented by the core-authenticated provider pipeline.
 
-    Runtime composition must supply the provider's authenticated normalized
-    evidence handoff. The service intentionally receives no transport or order
-    capability and cannot reach around that handoff.
+    A structurally compatible source is not trusted: every result is consumed
+    through the exact one-shot runtime evidence assertion before any field is
+    inspected.
     """
 
-    async def collect_normalized_snapshot(
+    async def collect_verified_evidence(
         self, *, max_age_seconds: float
-    ) -> NormalizedBrokerSnapshot:
-        """Collect one bounded read-only broker snapshot."""
+    ) -> VerifiedRuntimeReconciliationEvidence:
+        """Collect one exact core-bound read-only broker generation."""
 
     async def close(self) -> None:
         """Close only the diagnostic read-only transport."""
@@ -109,7 +116,7 @@ class ReconciliationService:
     def __init__(
         self,
         *,
-        snapshot_source: NormalizedSnapshotSource,
+        evidence_source: VerifiedEvidenceSource,
         comparison_source: ReconciliationComparisonSource,
         persistence: ReconciliationPersistence,
         expected_account_scope: str,
@@ -133,13 +140,13 @@ class ReconciliationService:
             raise ReconciliationServiceBlocked(
                 "periodic interval must be positive and no longer than evidence age"
             )
-        if not callable(getattr(snapshot_source, "collect_normalized_snapshot", None)):
-            raise ReconciliationServiceBlocked("normalized snapshot source is unavailable")
-        if not callable(getattr(snapshot_source, "close", None)):
-            raise ReconciliationServiceBlocked("snapshot source cleanup is unavailable")
+        if not callable(getattr(evidence_source, "collect_verified_evidence", None)):
+            raise ReconciliationServiceBlocked("verified evidence source is unavailable")
+        if not callable(getattr(evidence_source, "close", None)):
+            raise ReconciliationServiceBlocked("evidence source cleanup is unavailable")
         if not callable(comparison_source):
             raise ReconciliationServiceBlocked("comparison source is unavailable")
-        self._snapshot_source = snapshot_source
+        self._evidence_source = evidence_source
         self._comparison_source = comparison_source
         self._persistence = persistence
         self._expected_account_scope = expected_account_scope
@@ -174,8 +181,19 @@ class ReconciliationService:
         try:
             checked_at = _timestamp(at if at is not None else self._clock(), "eligibility clock")
         except Exception:
+            self._quarantine()
             return False
-        return checked_at <= outcome.verdict.fresh_until
+        if (
+            checked_at < outcome.verdict.checked_at
+            or self._last_completed_at is None
+            or checked_at < self._last_completed_at
+        ):
+            self._quarantine()
+            return False
+        if checked_at > outcome.eligible_until:
+            self._state = ReconciliationServiceState.QUARANTINED
+            return False
+        return True
 
     async def initialize(self) -> None:
         async with self._lock:
@@ -211,11 +229,17 @@ class ReconciliationService:
         async with self._lock:
             if self._state is ReconciliationServiceState.CLOSED:
                 return
-            self._quarantine()
+            self._latest_outcome = None
+            self._last_completed_at = None
+            self._state = ReconciliationServiceState.CLOSING
             try:
-                await self._snapshot_source.close()
-            finally:
-                self._state = ReconciliationServiceState.CLOSED
+                cancellation_received = await await_cleanup_required(self._evidence_source.close())
+            except BaseException:
+                self._state = ReconciliationServiceState.CLOSING
+                raise
+            self._state = ReconciliationServiceState.CLOSED
+            if cancellation_received:
+                raise asyncio.CancelledError
 
     async def _run(self, trigger: ReconciliationTrigger) -> ReconciliationServiceOutcome:
         async with self._lock:
@@ -246,11 +270,11 @@ class ReconciliationService:
     ) -> ReconciliationServiceOutcome:
         self._state = ReconciliationServiceState.RUNNING
         try:
-            snapshot = await self._snapshot_source.collect_normalized_snapshot(
+            produced = await self._evidence_source.collect_verified_evidence(
                 max_age_seconds=self._max_age_seconds
             )
-            if type(snapshot) is not NormalizedBrokerSnapshot:
-                raise ReconciliationServiceBlocked("snapshot source returned invalid evidence")
+            runtime_evidence = assert_and_consume_verified_runtime_reconciliation_evidence(produced)
+            snapshot = runtime_evidence.snapshot
             comparison_result = self._comparison_source(snapshot, trigger)
             if inspect.isawaitable(comparison_result):
                 comparison_result = await comparison_result
@@ -271,12 +295,36 @@ class ReconciliationService:
             completed_at = self._clock_value("completion clock")
             if completed_at < checked_at:
                 raise ReconciliationServiceBlocked("completion clock moved backwards")
+            relied_on_proof_expiries = []
+            proofs_by_key = {
+                proof.binding_key: proof for proof in comparison_result.timing_lag_proofs
+            }
+            for difference in verdict.differences:
+                if difference.kind.value != "expected_timing_lag":
+                    continue
+                proof = proofs_by_key.get(
+                    (
+                        snapshot.snapshot_id,
+                        difference.kind.value,
+                        difference.reason_code,
+                        difference.subject,
+                        difference.evidence_ids[0],
+                    )
+                )
+                if proof is not None:
+                    relied_on_proof_expiries.append(proof.expires_at)
+            eligible_until = min(
+                verdict.fresh_until,
+                runtime_evidence.expires_at,
+                *relied_on_proof_expiries,
+            )
             persisted = await self._persistence.append_reconciliation(
                 trigger_type=trigger.value,
-                snapshot=snapshot,
+                runtime_evidence=runtime_evidence,
                 verdict=verdict,
                 started_at=started_at,
                 completed_at=completed_at,
+                eligible_until=eligible_until,
             )
         except BaseException as exc:
             self._quarantine()
@@ -297,6 +345,7 @@ class ReconciliationService:
             persisted=persisted,
             state=state,
             entry_eligible=persisted.entry_eligible,
+            eligible_until=eligible_until,
         )
         self._state = state
         self._latest_outcome = outcome
@@ -317,3 +366,5 @@ class ReconciliationService:
     def _assert_not_closed(self) -> None:
         if self._state is ReconciliationServiceState.CLOSED:
             raise ReconciliationServiceBlocked("reconciliation service is closed")
+        if self._state is ReconciliationServiceState.CLOSING:
+            raise ReconciliationServiceBlocked("reconciliation source cleanup is incomplete")

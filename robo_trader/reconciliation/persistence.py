@@ -15,10 +15,15 @@ from robo_trader.reconciliation_migrations import (
     apply_reconciliation_migrations,
     assert_reconciliation_schema,
 )
+from robo_trader.safety.sqlite_identity import (
+    SQLiteDescriptorIdentity,
+    SQLiteIdentityError,
+    SQLitePathBinding,
+    sqlite_connection_file_identity,
+)
 
 from .domain import (
     DOMAIN_SCHEMA_VERSION,
-    NormalizedBrokerSnapshot,
     ReconciliationDomainError,
     _timestamp,
     canonical_json,
@@ -26,6 +31,7 @@ from .domain import (
     fingerprint,
 )
 from .policy import ReconciliationDifference, ReconciliationVerdict
+from .runtime_evidence import VerifiedRuntimeReconciliationEvidence
 
 _OPERATOR_ID = re.compile(r"^[A-Za-z0-9._@:-]{1,64}$")
 _EVIDENCE_REFERENCE = re.compile(r"^[A-Za-z0-9._:/-]{1,256}$")
@@ -103,53 +109,137 @@ class ReconciliationPersistence:
             raise ReconciliationPersistenceError("reconciliation database path must be absolute")
         self._database_path = database_path
 
-    async def _connect(self) -> aiosqlite.Connection:
-        connection = await aiosqlite.connect(self._database_path, isolation_level=None)
-        await connection.execute("PRAGMA foreign_keys = ON")
-        foreign_keys = await connection.execute("PRAGMA foreign_keys")
-        if await foreign_keys.fetchone() != (1,):
-            await connection.close()
-            raise ReconciliationPersistenceError(
-                "reconciliation database cannot enforce foreign keys"
+    @staticmethod
+    async def _descriptor_identity(
+        connection: aiosqlite.Connection,
+    ) -> SQLiteDescriptorIdentity:
+        try:
+            return await connection._execute(  # type: ignore[attr-defined]
+                sqlite_connection_file_identity,
+                connection._conn,  # type: ignore[attr-defined]
             )
-        return connection
+        except Exception as exc:
+            raise ReconciliationPersistenceError(
+                "reconciliation SQLite descriptor identity is unavailable"
+            ) from exc
+
+    async def _connect(
+        self,
+        *,
+        initialize: bool = False,
+    ) -> tuple[aiosqlite.Connection, SQLitePathBinding]:
+        try:
+            if initialize:
+                try:
+                    binding = SQLitePathBinding.open_for_initialization(
+                        self._database_path,
+                        create=True,
+                    )
+                except SQLiteIdentityError:
+                    binding = SQLitePathBinding.open_for_initialization(
+                        self._database_path,
+                        create=False,
+                    )
+            else:
+                binding = SQLitePathBinding.open_readonly(self._database_path)
+        except Exception as exc:
+            raise ReconciliationPersistenceError(
+                "reconciliation database path identity cannot be guarded"
+            ) from exc
+        try:
+            connection = await aiosqlite.connect(binding.path, isolation_level=None)
+            bound = binding.bind_sqlite_connection(await self._descriptor_identity(connection))
+            await connection.execute("PRAGMA foreign_keys = ON")
+            foreign_keys = await connection.execute("PRAGMA foreign_keys")
+            if await foreign_keys.fetchone() != (1,):
+                raise ReconciliationPersistenceError(
+                    "reconciliation database cannot enforce foreign keys"
+                )
+            return connection, bound
+        except BaseException:
+            if "connection" in locals():
+                await connection.close()
+            binding.close()
+            raise
+
+    async def _assert_binding(
+        self,
+        connection: aiosqlite.Connection,
+        binding: SQLitePathBinding,
+        runtime_evidence: VerifiedRuntimeReconciliationEvidence | None = None,
+    ) -> None:
+        try:
+            binding.assert_connection_identity(await self._descriptor_identity(connection))
+        except Exception as exc:
+            raise ReconciliationPersistenceError(
+                "reconciliation database path or descriptor was replaced"
+            ) from exc
+        if runtime_evidence is not None and (
+            runtime_evidence.database_path != str(binding.path)
+            or runtime_evidence.database_identity == ""
+            or (runtime_evidence.database_device, runtime_evidence.database_inode)
+            != (binding.device, binding.inode)
+        ):
+            raise ReconciliationPersistenceError(
+                "runtime evidence belongs to a different database identity"
+            )
 
     async def initialize(self) -> None:
         """Register and validate this component without touching legacy rows."""
 
-        connection = await self._connect()
+        connection, binding = await self._connect(initialize=True)
         try:
             await connection.execute("BEGIN IMMEDIATE")
             await apply_reconciliation_migrations(connection)
             await assert_reconciliation_schema(connection)
+            await self._assert_binding(connection, binding)
             await connection.execute("COMMIT")
         except BaseException:
-            await connection.execute("ROLLBACK")
+            if connection.in_transaction:
+                await connection.execute("ROLLBACK")
             raise
         finally:
             await connection.close()
+            binding.close()
 
     async def append_reconciliation(
         self,
         *,
         trigger_type: str,
-        snapshot: NormalizedBrokerSnapshot,
+        runtime_evidence: VerifiedRuntimeReconciliationEvidence,
         verdict: ReconciliationVerdict,
         started_at: datetime,
         completed_at: datetime,
+        eligible_until: datetime,
     ) -> PersistedReconciliation:
         """Atomically append one snapshot, verdict, and all difference rows."""
 
-        if type(snapshot) is not NormalizedBrokerSnapshot:
-            raise ReconciliationPersistenceError("normalized broker snapshot is required")
+        if type(runtime_evidence) is not VerifiedRuntimeReconciliationEvidence:
+            raise ReconciliationPersistenceError(
+                "verified runtime reconciliation evidence is required"
+            )
+        snapshot = runtime_evidence.snapshot
         if type(verdict) is not ReconciliationVerdict:
             raise ReconciliationPersistenceError("normalized reconciliation verdict is required")
         if verdict.broker_snapshot_id != snapshot.snapshot_id:
             raise ReconciliationPersistenceError("verdict does not bind the broker snapshot")
         started = _timestamp(started_at, "reconciliation started_at")
         completed = _timestamp(completed_at, "reconciliation completed_at")
+        eligibility_expiry = _timestamp(eligible_until, "reconciliation eligible_until")
         if completed < started or verdict.checked_at < started or verdict.checked_at > completed:
             raise ReconciliationPersistenceError("reconciliation run chronology is invalid")
+        if not verdict.quarantine_required and eligibility_expiry < completed:
+            raise ReconciliationPersistenceError(
+                "reconciliation evidence expired before durable completion"
+            )
+        if (
+            runtime_evidence.snapshot_id != snapshot.snapshot_id
+            or runtime_evidence.account_scope != verdict.expected_account_scope
+            or runtime_evidence.database_path != str(self._database_path)
+        ):
+            raise ReconciliationPersistenceError(
+                "runtime evidence is outside the persistence binding"
+            )
         allowed_triggers = {
             "startup",
             "reconnect",
@@ -166,6 +256,8 @@ class ReconciliationPersistence:
             "reconciliation-run-v1",
             {
                 "completed_at": canonical_timestamp(completed),
+                "eligible_until": canonical_timestamp(eligibility_expiry),
+                "runtime_fingerprint": runtime_evidence.runtime_fingerprint,
                 "started_at": canonical_timestamp(started),
                 "trigger_type": trigger_type,
                 "verdict_id": verdict.verdict_id,
@@ -180,13 +272,17 @@ class ReconciliationPersistence:
             )
             difference_rows.append((difference_id, difference, payload))
 
-        connection = await self._connect()
+        connection, binding = await self._connect()
         try:
             await connection.execute("BEGIN IMMEDIATE")
+            await self._assert_binding(connection, binding, runtime_evidence)
             await assert_reconciliation_schema(connection)
             existing = await connection.execute(
                 """
-                SELECT payload_sha256, payload_json
+                SELECT payload_sha256, payload_json, runtime_fingerprint,
+                       database_identity, database_device, database_inode,
+                       broker_artifact_hash, broker_receipt_id,
+                       broker_public_key_fingerprint, bundle_id, snapshot_hash
                 FROM rt_reconciliation_snapshots WHERE snapshot_id = ?
                 """,
                 (snapshot.snapshot_id,),
@@ -196,15 +292,31 @@ class ReconciliationPersistence:
                 await connection.execute(
                     """
                     INSERT INTO rt_reconciliation_snapshots(
-                        snapshot_id, schema_version, account_scope, observed_from,
-                        observed_through, retrieved_at, complete, payload_json,
-                        payload_sha256, persisted_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        snapshot_id, schema_version, account_scope, account_alias,
+                        snapshot_hash, bundle_id, runtime_fingerprint, database_path,
+                        database_identity, database_device, database_inode,
+                        broker_artifact_hash, broker_receipt_id,
+                        broker_public_key_fingerprint, broker_evidence_expires_at,
+                        observed_from, observed_through, retrieved_at, complete,
+                        payload_json, payload_sha256, persisted_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         snapshot.snapshot_id,
                         snapshot.schema_version,
-                        snapshot.account.account_scope,
+                        runtime_evidence.account_scope,
+                        runtime_evidence.account_alias,
+                        runtime_evidence.snapshot_hash,
+                        runtime_evidence.bundle_id,
+                        runtime_evidence.runtime_fingerprint,
+                        runtime_evidence.database_path,
+                        runtime_evidence.database_identity,
+                        runtime_evidence.database_device,
+                        runtime_evidence.database_inode,
+                        runtime_evidence.broker_artifact_hash,
+                        runtime_evidence.broker_receipt_id,
+                        runtime_evidence.broker_public_key_fingerprint,
+                        canonical_timestamp(runtime_evidence.expires_at),
                         canonical_timestamp(snapshot.observed_from),
                         canonical_timestamp(snapshot.observed_through),
                         canonical_timestamp(snapshot.retrieved_at),
@@ -214,7 +326,19 @@ class ReconciliationPersistence:
                         canonical_timestamp(completed),
                     ),
                 )
-            elif tuple(existing_row) != (_sha256(snapshot_payload), snapshot_payload):
+            elif tuple(existing_row) != (
+                _sha256(snapshot_payload),
+                snapshot_payload,
+                runtime_evidence.runtime_fingerprint,
+                runtime_evidence.database_identity,
+                runtime_evidence.database_device,
+                runtime_evidence.database_inode,
+                runtime_evidence.broker_artifact_hash,
+                runtime_evidence.broker_receipt_id,
+                runtime_evidence.broker_public_key_fingerprint,
+                runtime_evidence.bundle_id,
+                runtime_evidence.snapshot_hash,
+            ):
                 raise ReconciliationPersistenceError(
                     "stored snapshot identity has conflicting evidence"
                 )
@@ -223,7 +347,7 @@ class ReconciliationPersistence:
             existing_run = await connection.execute(
                 """
                 SELECT snapshot_id, trigger_type, verdict_id, verdict_payload_json,
-                       verdict_sha256, entry_eligible
+                       verdict_sha256, entry_eligible, eligible_until
                 FROM rt_reconciliation_runs WHERE run_id = ?
                 """,
                 (run_id,),
@@ -237,6 +361,7 @@ class ReconciliationPersistence:
                     verdict_payload,
                     _sha256(verdict_payload),
                     int(entry_eligible),
+                    canonical_timestamp(eligibility_expiry),
                 )
                 if tuple(existing_run_row) != expected_run_row:
                     raise ReconciliationPersistenceError(
@@ -255,6 +380,7 @@ class ReconciliationPersistence:
                     raise ReconciliationPersistenceError(
                         "stored reconciliation differences are incomplete"
                     )
+                await self._assert_binding(connection, binding, runtime_evidence)
                 await connection.execute("COMMIT")
                 return PersistedReconciliation(
                     run_id=run_id,
@@ -268,9 +394,10 @@ class ReconciliationPersistence:
                 INSERT INTO rt_reconciliation_runs(
                     run_id, schema_version, trigger_type, snapshot_id, verdict_id,
                     expected_account_scope, started_at, completed_at, status,
+                    eligible_until,
                     evidence_fresh, comparison_complete, quarantine_required,
                     entry_eligible, coverage_json, verdict_payload_json, verdict_sha256
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -282,6 +409,7 @@ class ReconciliationPersistence:
                     canonical_timestamp(started),
                     canonical_timestamp(completed),
                     verdict.status.value,
+                    canonical_timestamp(eligibility_expiry),
                     int(verdict.evidence_fresh),
                     int(verdict.comparison_complete),
                     int(verdict.quarantine_required),
@@ -313,12 +441,15 @@ class ReconciliationPersistence:
                         canonical_timestamp(completed),
                     ),
                 )
+            await self._assert_binding(connection, binding, runtime_evidence)
             await connection.execute("COMMIT")
         except BaseException:
-            await connection.execute("ROLLBACK")
+            if connection.in_transaction:
+                await connection.execute("ROLLBACK")
             raise
         finally:
             await connection.close()
+            binding.close()
         return PersistedReconciliation(
             run_id=run_id,
             snapshot_id=snapshot.snapshot_id,
@@ -378,9 +509,10 @@ class ReconciliationPersistence:
             evidence_reference=evidence,
             created_at=created,
         )
-        connection = await self._connect()
+        connection, binding = await self._connect()
         try:
             await connection.execute("BEGIN IMMEDIATE")
+            await self._assert_binding(connection, binding)
             await assert_reconciliation_schema(connection)
             target = await connection.execute(
                 """
@@ -393,6 +525,34 @@ class ReconciliationPersistence:
                 raise ReconciliationPersistenceError(
                     "operator resolution target does not exist in the run"
                 )
+            existing = await connection.execute(
+                """
+                SELECT schema_version, run_id, difference_id, resolution_kind,
+                       operator_id, reason, evidence_reference, created_at
+                FROM rt_reconciliation_operator_resolutions
+                WHERE resolution_id = ?
+                """,
+                (event.resolution_id,),
+            )
+            existing_row = await existing.fetchone()
+            expected_row = (
+                event.schema_version,
+                event.run_id,
+                event.difference_id,
+                event.resolution_kind.value,
+                event.operator_id,
+                event.reason,
+                event.evidence_reference,
+                canonical_timestamp(event.created_at),
+            )
+            if existing_row is not None:
+                if tuple(existing_row) != expected_row:
+                    raise ReconciliationPersistenceError(
+                        "stored operator resolution has conflicting evidence"
+                    )
+                await self._assert_binding(connection, binding)
+                await connection.execute("COMMIT")
+                return event
             await connection.execute(
                 """
                 INSERT INTO rt_reconciliation_operator_resolutions(
@@ -412,10 +572,13 @@ class ReconciliationPersistence:
                     canonical_timestamp(event.created_at),
                 ),
             )
+            await self._assert_binding(connection, binding)
             await connection.execute("COMMIT")
         except BaseException:
-            await connection.execute("ROLLBACK")
+            if connection.in_transaction:
+                await connection.execute("ROLLBACK")
             raise
         finally:
             await connection.close()
+            binding.close()
         return event

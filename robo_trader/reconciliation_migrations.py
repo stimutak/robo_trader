@@ -28,6 +28,26 @@ async def _migration_v1(connection: aiosqlite.Connection) -> None:
                 AND substr(account_scope, 1, 8) = 'acct_v1_'
                 AND substr(account_scope, 9) NOT GLOB '*[^0-9a-f]*'
             ),
+            account_alias TEXT NOT NULL,
+            snapshot_hash TEXT NOT NULL CHECK (
+                length(snapshot_hash) = 64 AND snapshot_hash = lower(snapshot_hash)
+            ),
+            bundle_id TEXT NOT NULL,
+            runtime_fingerprint TEXT NOT NULL,
+            database_path TEXT NOT NULL,
+            database_identity TEXT NOT NULL,
+            database_device INTEGER NOT NULL,
+            database_inode INTEGER NOT NULL,
+            broker_artifact_hash TEXT NOT NULL CHECK (
+                length(broker_artifact_hash) = 64
+                AND broker_artifact_hash = lower(broker_artifact_hash)
+            ),
+            broker_receipt_id TEXT NOT NULL,
+            broker_public_key_fingerprint TEXT NOT NULL CHECK (
+                length(broker_public_key_fingerprint) = 64
+                AND broker_public_key_fingerprint = lower(broker_public_key_fingerprint)
+            ),
+            broker_evidence_expires_at TEXT NOT NULL,
             observed_from TEXT NOT NULL,
             observed_through TEXT NOT NULL,
             retrieved_at TEXT NOT NULL,
@@ -56,6 +76,7 @@ async def _migration_v1(connection: aiosqlite.Connection) -> None:
             ),
             started_at TEXT NOT NULL,
             completed_at TEXT NOT NULL,
+            eligible_until TEXT NOT NULL,
             status TEXT NOT NULL CHECK (status IN ('passed', 'degraded', 'quarantined')),
             evidence_fresh INTEGER NOT NULL CHECK (evidence_fresh IN (0, 1)),
             comparison_complete INTEGER NOT NULL CHECK (comparison_complete IN (0, 1)),
@@ -103,6 +124,7 @@ async def _migration_v1(connection: aiosqlite.Connection) -> None:
                     AND materiality = 'material')
             ),
             UNIQUE(run_id, ordinal),
+            UNIQUE(run_id, difference_id),
             FOREIGN KEY(run_id) REFERENCES rt_reconciliation_runs(run_id)
         )
     """)
@@ -121,7 +143,8 @@ async def _migration_v1(connection: aiosqlite.Connection) -> None:
             evidence_reference TEXT,
             created_at TEXT NOT NULL,
             FOREIGN KEY(run_id) REFERENCES rt_reconciliation_runs(run_id),
-            FOREIGN KEY(difference_id) REFERENCES rt_reconciliation_differences(difference_id)
+            FOREIGN KEY(run_id, difference_id)
+                REFERENCES rt_reconciliation_differences(run_id, difference_id)
         )
     """)
     for table in _TABLES:
@@ -150,6 +173,18 @@ _EXPECTED_COLUMNS = {
         "snapshot_id",
         "schema_version",
         "account_scope",
+        "account_alias",
+        "snapshot_hash",
+        "bundle_id",
+        "runtime_fingerprint",
+        "database_path",
+        "database_identity",
+        "database_device",
+        "database_inode",
+        "broker_artifact_hash",
+        "broker_receipt_id",
+        "broker_public_key_fingerprint",
+        "broker_evidence_expires_at",
         "observed_from",
         "observed_through",
         "retrieved_at",
@@ -167,6 +202,7 @@ _EXPECTED_COLUMNS = {
         "expected_account_scope",
         "started_at",
         "completed_at",
+        "eligible_until",
         "status",
         "evidence_fresh",
         "comparison_complete",
@@ -206,12 +242,16 @@ _REQUIRED_TABLE_SQL = {
     "rt_reconciliation_snapshots": (
         "schema_version integer not null check (schema_version = 1)",
         "length(account_scope) = 72",
+        "length(snapshot_hash) = 64 and snapshot_hash = lower(snapshot_hash)",
+        "length(broker_artifact_hash) = 64 and broker_artifact_hash = "
+        "lower(broker_artifact_hash)",
         "check (json_valid(payload_json))",
         "length(payload_sha256) = 64 and payload_sha256 = lower(payload_sha256)",
     ),
     "rt_reconciliation_runs": (
         "trigger_type in ('startup', 'reconnect', 'periodic', 'before_live', " "'ambiguous_order')",
         "status in ('passed', 'degraded', 'quarantined')",
+        "eligible_until text not null",
         "status = 'quarantined' and quarantine_required = 1 and entry_eligible = 0",
         "foreign key(snapshot_id) references rt_reconciliation_snapshots(snapshot_id)",
     ),
@@ -219,6 +259,7 @@ _REQUIRED_TABLE_SQL = {
         "kind = 'expected_timing_lag' and materiality = 'informational'",
         "kind = 'unknown' and materiality = 'unknown'",
         "unique(run_id, ordinal)",
+        "unique(run_id, difference_id)",
         "foreign key(run_id) references rt_reconciliation_runs(run_id)",
     ),
     "rt_reconciliation_operator_resolutions": (
@@ -226,7 +267,8 @@ _REQUIRED_TABLE_SQL = {
         "'investigation_note')",
         "length(trim(reason)) >= 10",
         "foreign key(run_id) references rt_reconciliation_runs(run_id)",
-        "foreign key(difference_id) references rt_reconciliation_differences(difference_id)",
+        "foreign key(run_id, difference_id) references "
+        "rt_reconciliation_differences(run_id, difference_id)",
     ),
 }
 
@@ -331,14 +373,14 @@ async def assert_reconciliation_schema(connection: aiosqlite.Connection) -> None
     for table in _TABLES:
         for suffix, operation in (("no_update", "update"), ("no_delete", "delete")):
             name = f"{table}_{suffix}"
-            expected = _normalized_sql(f"""
+            expected_trigger = _normalized_sql(f"""
                 CREATE TRIGGER {name}
                 BEFORE {operation.upper()} ON {table}
                 BEGIN
                     SELECT RAISE(ABORT, 'reconciliation evidence is append-only');
                 END
                 """)
-            if triggers[name] != expected:
+            if triggers[name] != expected_trigger:
                 raise RuntimeError(f"reconciliation trigger {name} is malformed")
     violations = await connection.execute("PRAGMA foreign_key_check")
     if await violations.fetchone() is not None:
