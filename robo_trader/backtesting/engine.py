@@ -123,7 +123,8 @@ class _PendingOrder:
     decision_time: pd.Timestamp
     reason: str
     reduce_only: bool = False
-    filled_quantity: int = 0
+    requires_flat: bool = False
+    commission_quantity: int = 0
     commission_paid: Decimal = Decimal(0)
     known_volume: Optional[float] = None
 
@@ -406,9 +407,31 @@ class BacktestEngine:
         return current
 
     def _execute_pending(self, current: pd.DataFrame, timestamp: pd.Timestamp) -> None:
+        event_capacity: Dict[str, int] = {}
+        if getattr(self.execution_simulator, "supports_shared_event_capacity", False):
+            eligible = [
+                pending
+                for pending in self._pending
+                if timestamp > pending.decision_time and pending.symbol in current.index
+            ]
+            for pending in eligible:
+                volume = (
+                    pending.known_volume
+                    if pending.known_volume is not None
+                    else float(current.loc[pending.symbol, "volume"])
+                )
+                capacity = self.execution_simulator.calculate_fill_capacity(volume)
+                event_capacity[pending.symbol] = min(
+                    event_capacity.get(pending.symbol, capacity), capacity
+                )
+
         still_pending: List[_PendingOrder] = []
         for pending in self._pending:
             if timestamp <= pending.decision_time or pending.symbol not in current.index:
+                still_pending.append(pending)
+                continue
+            if pending.requires_flat and pending.symbol in self.positions:
+                pending.known_volume = float(current.loc[pending.symbol, "volume"])
                 still_pending.append(pending)
                 continue
             if pending.symbol not in self.positions and len(self.positions) >= self.max_positions:
@@ -436,7 +459,10 @@ class BacktestEngine:
                 current.loc[pending.symbol],
                 timestamp,
                 parent_order=pending,
+                max_fill_quantity=event_capacity.get(pending.symbol),
             )
+            if pending.symbol in event_capacity:
+                event_capacity[pending.symbol] -= filled
             pending.remaining_quantity -= filled
             if pending.remaining_quantity > 0:
                 pending.known_volume = float(current.loc[pending.symbol, "volume"])
@@ -452,6 +478,7 @@ class BacktestEngine:
         timestamp: pd.Timestamp,
         *,
         parent_order: Optional[_PendingOrder] = None,
+        max_fill_quantity: Optional[int] = None,
     ) -> int:
         price_data = pd.DataFrame([market_data], index=pd.DatetimeIndex([timestamp]))
         simulation_options: Dict[str, Any] = {}
@@ -459,7 +486,7 @@ class BacktestEngine:
             self.execution_simulator, "supports_parent_order_commission", False
         ):
             simulation_options = {
-                "cumulative_filled_quantity": parent_order.filled_quantity,
+                "cumulative_filled_quantity": parent_order.commission_quantity,
                 "commission_paid": float(parent_order.commission_paid),
             }
         if (
@@ -468,6 +495,12 @@ class BacktestEngine:
             and getattr(self.execution_simulator, "supports_lagged_liquidity", False)
         ):
             simulation_options["liquidity_volume"] = parent_order.known_volume
+        if max_fill_quantity is not None and getattr(
+            self.execution_simulator, "supports_shared_event_capacity", False
+        ):
+            simulation_options["max_fill_quantity"] = max_fill_quantity
+        if side == "buy" and getattr(self.execution_simulator, "supports_cash_budget", False):
+            simulation_options["cash_available"] = float(self._cash)
         order = self.execution_simulator.simulate_execution(
             symbol=symbol,
             quantity=quantity,
@@ -505,7 +538,7 @@ class BacktestEngine:
         self.cash = float(self._cash)
         self._apply_fill_to_lots(symbol, side, filled, fill_price, commission, timestamp)
         if parent_order is not None:
-            parent_order.filled_quantity += filled
+            parent_order.commission_quantity += filled
             parent_order.commission_paid += commission
         self._sync_positions()
         return filled
@@ -709,6 +742,7 @@ class BacktestEngine:
         reason: str,
         *,
         reduce_only: bool = False,
+        requires_flat: bool = False,
     ) -> None:
         position = self.positions.get(symbol)
         if reduce_only and position:
@@ -735,6 +769,7 @@ class BacktestEngine:
                 pd.Timestamp(timestamp),
                 reason,
                 reduce_only=reduce_only,
+                requires_flat=requires_flat,
                 known_volume=self._known_volumes.get(symbol),
             )
         )
@@ -797,8 +832,14 @@ class BacktestEngine:
     ) -> None:
         if not isinstance(target_weights, dict):
             raise ValueError("target weights must be a symbol mapping")
+        if self._pending:
+            raise RuntimeError("target weights cannot be applied while orders are pending")
+        omitted_positions = set(self.positions).difference(target_weights)
+        if omitted_positions:
+            omitted = ", ".join(sorted(omitted_positions))
+            raise ValueError(f"target weights must include every held symbol; missing: {omitted}")
         portfolio_value = self._portfolio_value(current)
-        orders: List[Tuple[int, str, str, int, bool]] = []
+        orders: List[Tuple[int, str, str, int, bool, bool]] = []
         normalized_weights: Dict[str, Decimal] = {}
         for symbol, weight_value in target_weights.items():
             if not isinstance(symbol, str) or not symbol:
@@ -821,8 +862,8 @@ class BacktestEngine:
             if current_quantity and target and (current_quantity > 0) != (target > 0):
                 close_side = "sell" if current_quantity > 0 else "buy"
                 open_side = "buy" if target > 0 else "sell"
-                orders.append((0, symbol, close_side, abs(current_quantity), True))
-                orders.append((1, symbol, open_side, abs(target), False))
+                orders.append((0, symbol, close_side, abs(current_quantity), True, False))
+                orders.append((1, symbol, open_side, abs(target), False, True))
                 continue
             delta = target - current_quantity
             if not delta:
@@ -833,8 +874,8 @@ class BacktestEngine:
             # available to rotations.  Symbol ordering makes equivalent
             # mappings execution-identical regardless of insertion order.
             priority = 0 if reduces_exposure else 1
-            orders.append((priority, symbol, side, abs(delta), reduces_exposure))
-        for _priority, symbol, side, quantity, reduce_only in sorted(orders):
+            orders.append((priority, symbol, side, abs(delta), reduces_exposure, False))
+        for _priority, symbol, side, quantity, reduce_only, requires_flat in sorted(orders):
             self._queue_order(
                 symbol,
                 side,
@@ -842,6 +883,7 @@ class BacktestEngine:
                 timestamp,
                 "rebalance-reduce" if reduce_only else "rebalance-increase",
                 reduce_only=reduce_only,
+                requires_flat=requires_flat,
             )
 
     def _update_positions(self, current: pd.DataFrame, timestamp: pd.Timestamp) -> None:
@@ -1020,14 +1062,9 @@ class BacktestEngine:
                     if pending.symbol != symbol:
                         continue
                     adjusted = Decimal(pending.remaining_quantity) * split
-                    adjusted_filled = Decimal(pending.filled_quantity) * split
-                    if (
-                        adjusted != adjusted.to_integral_value()
-                        or adjusted_filled != adjusted_filled.to_integral_value()
-                    ):
+                    if adjusted != adjusted.to_integral_value():
                         raise RuntimeError("split creates an unsupported fractional order")
                     pending.remaining_quantity = int(adjusted)
-                    pending.filled_quantity = int(adjusted_filled)
             dividend = _decimal(row.get("dividend", 0), f"{symbol} dividend")
             if dividend < 0:
                 raise ValueError("dividend must be non-negative")

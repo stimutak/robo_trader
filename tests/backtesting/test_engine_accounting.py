@@ -1,6 +1,7 @@
 """Accounting invariants for the deterministic backtest engine."""
 
 from dataclasses import replace
+from decimal import Decimal
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -162,6 +163,65 @@ def test_partial_fill_parent_order_pays_minimum_commission_only_once() -> None:
     assert result.positions[0].quantity == 3
     assert sum(float(lot.commission_remaining) for lot in engine._lots["SINGLE"]) == 1.0
     assert result.equity_curve.iloc[-1] == pytest.approx(998.985)
+
+
+def test_split_does_not_restate_parent_order_commission_history() -> None:
+    strategy = ScriptedStrategy([{"SINGLE": {"action": "buy", "quantity": 300}}, {}, {}, {}])
+    simulator = ExecutionSimulator(
+        spread_model="fixed",
+        commission_per_share=0.01,
+        min_commission=1.0,
+        market_impact_model=MarketImpactModel(0, 0),
+        slippage_factor=0,
+        max_volume_participation=1,
+    )
+    data = _bars([2, 2, 1, 1])
+    data["low"] = [1, 1, 0.5, 0.5]
+    data["volume"] = 100
+    data["split"] = [1, 1, 2, 1]
+    engine = _engine(strategy, simulator)
+
+    result = engine.run(data)
+
+    assert result.positions[0].quantity == 400
+    assert sum(float(lot.commission_remaining) for lot in engine._lots["SINGLE"]) == 3.0
+    assert engine._pending[0].remaining_quantity == 200
+    assert engine._pending[0].commission_quantity == 300
+
+
+def test_reversal_legs_share_capacity_and_open_only_after_flat() -> None:
+    simulator = ExecutionSimulator(
+        spread_model="fixed",
+        commission_per_share=0,
+        min_commission=0,
+        market_impact_model=MarketImpactModel(0, 0),
+        slippage_factor=0,
+        max_volume_participation=1,
+    )
+    engine = _engine(ScriptedStrategy([{}]), simulator)
+    decision_time = pd.Timestamp("2026-01-05")
+    execution_time = decision_time + pd.Timedelta(days=1)
+    current = pd.DataFrame(
+        {
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "close": [100.0],
+            "volume": [1_000_000.0],
+        },
+        index=["A"],
+    )
+    engine._cash = Decimal(500)
+    engine._apply_fill_to_lots("A", "buy", 5, Decimal(100), Decimal(0), decision_time)
+    engine._sync_positions()
+    engine._known_volumes["A"] = 2
+    engine._queue_target_weights({"A": -0.5}, current, decision_time)
+
+    engine._execute_pending(current, execution_time)
+
+    assert engine.positions["A"].quantity == 3
+    assert [order.remaining_quantity for order in engine._pending] == [3, 5]
+    assert engine._pending[1].requires_flat
 
 
 def test_next_open_fill_capacity_uses_only_decision_bar_known_volume() -> None:

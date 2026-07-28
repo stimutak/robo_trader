@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from robo_trader.backtesting.engine import BacktestEngine
+from robo_trader.backtesting.execution_simulator import ExecutionSimulator, MarketImpactModel
 from tests.backtesting.test_engine_accounting import (
     ExactFillSimulator,
     ScriptedStrategy,
@@ -355,6 +356,62 @@ def test_rebalance_rejects_implicit_leverage_and_splits_direction_reversal() -> 
         ("sell", 5, True),
         ("sell", 5, False),
     ]
+
+
+def test_target_weights_are_full_portfolio_targets_not_implicit_retention() -> None:
+    engine = _engine()
+    timestamp = pd.Timestamp("2026-01-05")
+    current = pd.DataFrame(
+        {
+            "open": [100, 100],
+            "high": [101, 101],
+            "low": [99, 99],
+            "close": [100, 100],
+            "volume": [10_000, 10_000],
+        },
+        index=["A", "B"],
+    )
+    engine._execute_sell("A", 5, current.loc["A"], timestamp)
+
+    with pytest.raises(ValueError, match="include every held symbol"):
+        engine._queue_target_weights({"B": 1.0}, current, timestamp)
+
+
+def test_full_cash_target_reserves_spread_before_filling() -> None:
+    class FullInvestmentStrategy:
+        def initialize(self, symbols: List[str]) -> None:
+            pass
+
+        def get_target_weights(self, _data: pd.DataFrame, _positions: Dict) -> Dict:
+            return {"SINGLE": 1.0}
+
+        def generate_signals(self, _data: pd.DataFrame, _positions: Dict) -> Dict:
+            return {}
+
+    index = pd.date_range("2026-01-05 09:30", periods=2, freq="1h")
+    data = pd.DataFrame(
+        {"open": 100, "high": 101, "low": 99, "close": 100, "volume": 10_000},
+        index=index,
+    )
+    simulator = ExecutionSimulator(
+        spread_model="fixed",
+        commission_per_share=0,
+        min_commission=0,
+        market_impact_model=MarketImpactModel(0, 0),
+        slippage_factor=0,
+        max_volume_participation=1,
+    )
+    engine = BacktestEngine(
+        FullInvestmentStrategy(),
+        simulator,
+        initial_capital=1_000,
+        finalization_policy="mark_to_market",
+    )
+
+    result = engine.run(data)
+
+    assert result.positions[0].quantity == 9
+    assert engine._pending[0].remaining_quantity == 1
 
 
 def test_fail_fast_is_default() -> None:

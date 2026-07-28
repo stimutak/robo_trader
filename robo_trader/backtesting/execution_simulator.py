@@ -144,6 +144,8 @@ class ExecutionSimulator:
 
     supports_parent_order_commission = True
     supports_lagged_liquidity = True
+    supports_shared_event_capacity = True
+    supports_cash_budget = True
 
     def __init__(
         self,
@@ -226,6 +228,8 @@ class ExecutionSimulator:
         cumulative_filled_quantity: int = 0,
         commission_paid: float = 0.0,
         liquidity_volume: Optional[float] = None,
+        max_fill_quantity: Optional[int] = None,
+        cash_available: Optional[float] = None,
     ) -> SimulatedOrder:
         """Simulate an order using only the bar at ``timestamp``.
 
@@ -257,6 +261,17 @@ class ExecutionSimulator:
             if liquidity_volume is None
             else self._finite_nonnegative(liquidity_volume, "liquidity_volume")
         )
+        if max_fill_quantity is not None and (
+            isinstance(max_fill_quantity, bool)
+            or not isinstance(max_fill_quantity, Integral)
+            or max_fill_quantity < 0
+        ):
+            raise ValueError("max_fill_quantity must be a non-negative integer")
+        normalized_cash_available = (
+            None
+            if cash_available is None
+            else self._finite_nonnegative(cash_available, "cash_available")
+        )
         expected_commission_paid = (
             0.0
             if cumulative_filled_quantity == 0
@@ -287,7 +302,11 @@ class ExecutionSimulator:
         volume = (
             reported_volume if normalized_liquidity_volume is None else normalized_liquidity_volume
         )
-        spread = self._calculate_spread(current_data, arrival_price)
+        spread = self._calculate_spread(
+            current_data,
+            arrival_price,
+            liquidity_volume=volume,
+        )
         fills, base_fill_price = self._check_order_fill(
             order_type,
             side,
@@ -302,30 +321,55 @@ class ExecutionSimulator:
                 symbol, requested_quantity, side, order_type, timestamp, arrival_price
             )
 
-        capacity = int(math.floor(volume * self.max_volume_participation))
+        capacity = self.calculate_fill_capacity(volume)
+        if max_fill_quantity is not None:
+            capacity = min(capacity, int(max_fill_quantity))
         filled_quantity = min(requested_quantity, max(0, capacity))
         if filled_quantity == 0:
             return self._create_unfilled_order(
                 symbol, requested_quantity, side, order_type, timestamp, arrival_price
             )
 
-        execution_cost = self._calculate_execution_costs(
-            filled_quantity,
-            side,
-            base_fill_price,
-            spread,
-            volume,
-            current_data,
-            cumulative_filled_quantity=int(cumulative_filled_quantity),
-            commission_paid=normalized_commission_paid,
-        )
-        final_fill_price = self._apply_adverse_costs(
-            base_fill_price,
-            side,
-            filled_quantity,
-            execution_cost,
-            normalized_limit if order_type == "limit" else None,
-        )
+        slippage_draw = abs(float(self._rng.normal()))
+
+        def execution_for(candidate_quantity: int) -> Tuple[ExecutionCost, float]:
+            candidate_cost = self._calculate_execution_costs(
+                candidate_quantity,
+                side,
+                base_fill_price,
+                spread,
+                volume,
+                current_data,
+                cumulative_filled_quantity=int(cumulative_filled_quantity),
+                commission_paid=normalized_commission_paid,
+                slippage_draw=slippage_draw,
+            )
+            candidate_price = self._apply_adverse_costs(
+                base_fill_price,
+                side,
+                candidate_quantity,
+                candidate_cost,
+                normalized_limit if order_type == "limit" else None,
+            )
+            return candidate_cost, candidate_price
+
+        if side == "buy" and normalized_cash_available is not None:
+            lower, upper = 0, filled_quantity
+            while lower < upper:
+                candidate = (lower + upper + 1) // 2
+                candidate_cost, candidate_price = execution_for(candidate)
+                required_cash = candidate_price * candidate + candidate_cost.commission
+                if required_cash <= normalized_cash_available + 1e-12:
+                    lower = candidate
+                else:
+                    upper = candidate - 1
+            filled_quantity = lower
+            if filled_quantity == 0:
+                return self._create_unfilled_order(
+                    symbol, requested_quantity, side, order_type, timestamp, arrival_price
+                )
+
+        execution_cost, final_fill_price = execution_for(filled_quantity)
         if not math.isfinite(final_fill_price) or final_fill_price <= 0:
             raise ValueError("cost model produced a non-finite or non-positive fill price")
         execution_cost.fill_price = final_fill_price
@@ -344,6 +388,12 @@ class ExecutionSimulator:
             filled_quantity=filled_quantity,
             remaining_quantity=requested_quantity - filled_quantity,
         )
+
+    def calculate_fill_capacity(self, liquidity_volume: float) -> int:
+        """Return the whole-share capacity available to one symbol/event."""
+
+        volume = self._finite_nonnegative(liquidity_volume, "liquidity_volume")
+        return int(math.floor(volume * self.max_volume_participation))
 
     def _validate_order_and_data(
         self,
@@ -471,7 +521,13 @@ class ExecutionSimulator:
         # Series rather than an ambiguous DataFrame.
         return row
 
-    def _calculate_spread(self, market_data: pd.Series, mid_price: float) -> float:
+    def _calculate_spread(
+        self,
+        market_data: pd.Series,
+        mid_price: float,
+        *,
+        liquidity_volume: Optional[float] = None,
+    ) -> float:
         """Calculate a finite, non-negative full bid-ask spread."""
 
         if self.use_real_spreads and "bid" in market_data and "ask" in market_data:
@@ -481,7 +537,11 @@ class ExecutionSimulator:
             return 0.01
         if self.spread_model == "dynamic":
             volatility = float(market_data.get("volatility", 0.02))
-            volume = float(market_data["volume"])
+            volume = (
+                float(market_data["volume"])
+                if liquidity_volume is None
+                else float(liquidity_volume)
+            )
             volume_factor = max(math.log10(volume + 1.0) / 10.0, 0.05)
             return float(mid_price * (0.0001 + volatility * 0.01) / volume_factor)
         return float(mid_price * 0.0005)
@@ -549,6 +609,7 @@ class ExecutionSimulator:
         *,
         cumulative_filled_quantity: int,
         commission_paid: float,
+        slippage_draw: Optional[float] = None,
     ) -> ExecutionCost:
         """Calculate each adverse cost component exactly once."""
 
@@ -565,7 +626,12 @@ class ExecutionSimulator:
             self.commission_per_share * (cumulative_filled_quantity + quantity),
         )
         commission = max(cumulative_commission - commission_paid, 0.0)
-        slippage = fill_price * self.slippage_factor * abs(float(self._rng.normal()))
+        normalized_draw = (
+            abs(float(self._rng.normal()))
+            if slippage_draw is None
+            else self._finite_nonnegative(slippage_draw, "slippage_draw")
+        )
+        slippage = fill_price * self.slippage_factor * normalized_draw
         total_cost = (spread_cost + market_impact + slippage) * quantity + commission
         return ExecutionCost(
             spread_cost=float(spread_cost),

@@ -64,6 +64,34 @@ def test_dataframe_digest_covers_values_schema_labels_and_timezone() -> None:
     assert hashed_dataframe_input("bars-v1", frame).digest == original
 
 
+def test_dataframe_digest_binds_categorical_encoding_metadata() -> None:
+    ascending = pd.DataFrame(
+        {
+            "signal": pd.Categorical(
+                [1, 2],
+                categories=[1, 2],
+                ordered=True,
+            )
+        }
+    )
+    descending = pd.DataFrame(
+        {
+            "signal": pd.Categorical(
+                [1, 2],
+                categories=[2, 1],
+                ordered=True,
+            )
+        }
+    )
+    unordered = ascending.copy()
+    unordered["signal"] = unordered["signal"].cat.as_unordered()
+
+    assert ascending["signal"].tolist() == descending["signal"].tolist()
+    assert ascending["signal"].cat.codes.tolist() != descending["signal"].cat.codes.tolist()
+    assert digest_dataframe(ascending) != digest_dataframe(descending)
+    assert digest_dataframe(ascending) != digest_dataframe(unordered)
+
+
 def test_dataframe_digest_rejects_ambiguous_or_nonfinite_data() -> None:
     frame = pd.DataFrame({"close": [1.0, 2.0]}, index=[0, 0])
     with pytest.raises(ValueError, match="unique"):

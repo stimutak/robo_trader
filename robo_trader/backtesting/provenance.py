@@ -260,18 +260,38 @@ def digest_dataframe(frame: pd.DataFrame) -> ContentDigest:
     if any(not isinstance(column, str) for column in frame.columns):
         raise ValueError("frame columns must be strings")
 
+    def dtype_metadata(values: Any) -> Dict[str, Any]:
+        dtype = values.dtype
+        metadata: Dict[str, Any] = {"dtype": str(dtype)}
+        if isinstance(dtype, pd.CategoricalDtype):
+            categorical = values.array
+            metadata.update(
+                {
+                    "categories": dtype.categories.tolist(),
+                    "ordered": bool(dtype.ordered),
+                    "codes": categorical.codes.tolist(),
+                }
+            )
+        return metadata
+
     if isinstance(frame.index, pd.MultiIndex):
         index_values: Sequence[Any] = [tuple(value) for value in frame.index.tolist()]
         index_names = list(frame.index.names)
+        index_dtypes = [
+            dtype_metadata(frame.index.get_level_values(level))
+            for level in range(frame.index.nlevels)
+        ]
     else:
         index_values = frame.index.tolist()
         index_names = [frame.index.name]
+        index_dtypes = [dtype_metadata(frame.index)]
     payload = {
-        "schema": "dataframe-sha256-v1",
+        "schema": "dataframe-sha256-v2",
         "index_names": index_names,
+        "index_dtypes": index_dtypes,
         "index": list(index_values),
         "columns": list(frame.columns),
-        "dtypes": [str(frame[column].dtype) for column in frame.columns],
+        "dtypes": [dtype_metadata(frame[column]) for column in frame.columns],
         "rows": frame.to_numpy(dtype=object).tolist(),
     }
     return digest_bytes(canonical_json_bytes(payload))

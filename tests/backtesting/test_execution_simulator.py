@@ -317,6 +317,39 @@ def test_volume_participation_produces_genuine_partial_fill() -> None:
     assert result.execution_cost.commission == pytest.approx(1.0)
 
 
+def test_execution_bar_volume_cannot_change_lagged_liquidity_costs() -> None:
+    options = {
+        "quantity": 100,
+        "liquidity_volume": 1_000,
+    }
+    thin = _execute(
+        _simulator(spread_model="dynamic", use_real_spreads=False),
+        price_data=_bars(volume=1),
+        **options,
+    )
+    deep = _execute(
+        _simulator(spread_model="dynamic", use_real_spreads=False),
+        price_data=_bars(volume=1_000_000),
+        **options,
+    )
+
+    assert thin.filled_quantity == deep.filled_quantity == 100
+    assert thin.fill_price == deep.fill_price
+    assert thin.execution_cost == deep.execution_cost
+
+
+def test_buy_fill_is_reduced_to_reserve_all_execution_costs() -> None:
+    result = _execute(
+        _simulator(commission_per_share=0, min_commission=0),
+        quantity=10,
+        cash_available=1_000,
+    )
+
+    assert result.filled_quantity == 9
+    assert result.remaining_quantity == 1
+    assert result.fill_price * result.filled_quantity <= 1_000
+
+
 def test_zero_or_subshare_capacity_returns_unfilled_order() -> None:
     result = _execute(
         _simulator(max_volume_participation=0.10),
