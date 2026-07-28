@@ -144,6 +144,7 @@ class ExecutionSimulator:
 
     supports_parent_order_commission = True
     supports_lagged_liquidity = True
+    supports_lagged_cost_inputs = True
     supports_shared_event_capacity = True
     supports_cash_budget = True
 
@@ -230,6 +231,10 @@ class ExecutionSimulator:
         liquidity_volume: Optional[float] = None,
         max_fill_quantity: Optional[int] = None,
         cash_available: Optional[float] = None,
+        liquidity_volatility: Optional[float] = None,
+        liquidity_spread: Optional[float] = None,
+        ignore_reported_cost_inputs: bool = False,
+        reserve_short_margin: bool = False,
     ) -> SimulatedOrder:
         """Simulate an order using only the bar at ``timestamp``.
 
@@ -272,6 +277,20 @@ class ExecutionSimulator:
             if cash_available is None
             else self._finite_nonnegative(cash_available, "cash_available")
         )
+        normalized_liquidity_volatility = (
+            None
+            if liquidity_volatility is None
+            else self._finite_nonnegative(liquidity_volatility, "liquidity_volatility")
+        )
+        normalized_liquidity_spread = (
+            None
+            if liquidity_spread is None
+            else self._finite_nonnegative(liquidity_spread, "liquidity_spread")
+        )
+        if not isinstance(ignore_reported_cost_inputs, bool):
+            raise ValueError("ignore_reported_cost_inputs must be a boolean")
+        if not isinstance(reserve_short_margin, bool):
+            raise ValueError("reserve_short_margin must be a boolean")
         expected_commission_paid = (
             0.0
             if cumulative_filled_quantity == 0
@@ -302,10 +321,22 @@ class ExecutionSimulator:
         volume = (
             reported_volume if normalized_liquidity_volume is None else normalized_liquidity_volume
         )
+        volatility = (
+            0.02
+            if ignore_reported_cost_inputs and normalized_liquidity_volatility is None
+            else (
+                float(current_data.get("volatility", 0.02))
+                if normalized_liquidity_volatility is None
+                else normalized_liquidity_volatility
+            )
+        )
         spread = self._calculate_spread(
             current_data,
             arrival_price,
             liquidity_volume=volume,
+            volatility=volatility,
+            observed_spread=normalized_liquidity_spread,
+            reported_inputs_allowed=not ignore_reported_cost_inputs,
         )
         fills, base_fill_price = self._check_order_fill(
             order_type,
@@ -339,7 +370,7 @@ class ExecutionSimulator:
                 base_fill_price,
                 spread,
                 volume,
-                current_data,
+                volatility,
                 cumulative_filled_quantity=int(cumulative_filled_quantity),
                 commission_paid=normalized_commission_paid,
                 slippage_draw=slippage_draw,
@@ -353,12 +384,15 @@ class ExecutionSimulator:
             )
             return candidate_cost, candidate_price
 
-        if side == "buy" and normalized_cash_available is not None:
+        if (side == "buy" or reserve_short_margin) and normalized_cash_available is not None:
             lower, upper = 0, filled_quantity
             while lower < upper:
                 candidate = (lower + upper + 1) // 2
                 candidate_cost, candidate_price = execution_for(candidate)
-                required_cash = candidate_price * candidate + candidate_cost.commission
+                collateral_price = (
+                    max(candidate_price, arrival_price) if reserve_short_margin else candidate_price
+                )
+                required_cash = collateral_price * candidate + candidate_cost.commission
                 if required_cash <= normalized_cash_available + 1e-12:
                     lower = candidate
                 else:
@@ -527,23 +561,37 @@ class ExecutionSimulator:
         mid_price: float,
         *,
         liquidity_volume: Optional[float] = None,
+        volatility: Optional[float] = None,
+        observed_spread: Optional[float] = None,
+        reported_inputs_allowed: bool = True,
     ) -> float:
         """Calculate a finite, non-negative full bid-ask spread."""
 
-        if self.use_real_spreads and "bid" in market_data and "ask" in market_data:
+        if observed_spread is not None:
+            return float(observed_spread)
+        if (
+            reported_inputs_allowed
+            and self.use_real_spreads
+            and "bid" in market_data
+            and "ask" in market_data
+        ):
             return float(market_data["ask"] - market_data["bid"])
 
         if self.spread_model == "fixed":
             return 0.01
         if self.spread_model == "dynamic":
-            volatility = float(market_data.get("volatility", 0.02))
+            normalized_volatility = (
+                float(market_data.get("volatility", 0.02))
+                if volatility is None
+                else float(volatility)
+            )
             volume = (
                 float(market_data["volume"])
                 if liquidity_volume is None
                 else float(liquidity_volume)
             )
             volume_factor = max(math.log10(volume + 1.0) / 10.0, 0.05)
-            return float(mid_price * (0.0001 + volatility * 0.01) / volume_factor)
+            return float(mid_price * (0.0001 + normalized_volatility * 0.01) / volume_factor)
         return float(mid_price * 0.0005)
 
     def _check_order_fill(
@@ -605,7 +653,7 @@ class ExecutionSimulator:
         fill_price: float,
         spread: float,
         volume: float,
-        market_data: pd.Series,
+        volatility: float,
         *,
         cumulative_filled_quantity: int,
         commission_paid: float,
@@ -615,7 +663,6 @@ class ExecutionSimulator:
 
         del side  # Costs are adverse magnitudes; side is applied at the price boundary.
         spread_cost = spread / 2.0
-        volatility = float(market_data.get("volatility", 0.02))
         relative_spread = spread / fill_price
         permanent_impact, temporary_impact = self.market_impact_model.calculate_impact(
             quantity, volume, volatility, relative_spread

@@ -177,16 +177,15 @@ def test_split_does_not_restate_parent_order_commission_history() -> None:
     )
     data = _bars([2, 2, 1, 1])
     data["low"] = [1, 1, 0.5, 0.5]
-    data["volume"] = 100
+    data["volume"] = [100, 100, 200, 200]
     data["split"] = [1, 1, 2, 1]
     engine = _engine(strategy, simulator)
 
     result = engine.run(data)
 
-    assert result.positions[0].quantity == 400
-    assert sum(float(lot.commission_remaining) for lot in engine._lots["SINGLE"]) == 3.0
-    assert engine._pending[0].remaining_quantity == 200
-    assert engine._pending[0].commission_quantity == 300
+    assert result.positions[0].quantity == 600
+    assert sum(float(lot.commission_remaining) for lot in engine._lots["SINGLE"]) == 5.0
+    assert not engine._pending
 
 
 def test_reversal_legs_share_capacity_and_open_only_after_flat() -> None:
@@ -224,6 +223,65 @@ def test_reversal_legs_share_capacity_and_open_only_after_flat() -> None:
     assert engine._pending[1].requires_flat
 
 
+def test_opening_short_reserves_unlevered_margin_and_commission() -> None:
+    simulator = ExecutionSimulator(
+        spread_model="fixed",
+        commission_per_share=0,
+        min_commission=1,
+        market_impact_model=MarketImpactModel(0, 0),
+        slippage_factor=0,
+        max_volume_participation=1,
+    )
+    engine = BacktestEngine(
+        ScriptedStrategy([{}]),
+        simulator,
+        initial_capital=0.5,
+        finalization_policy="mark_to_market",
+    )
+    timestamp = pd.Timestamp("2026-01-05")
+    market = pd.Series({"open": 0.02, "high": 0.021, "low": 0.019, "close": 0.02, "volume": 1_000})
+
+    engine._execute_sell("A", 1, market, timestamp)
+
+    assert engine.positions == {}
+    assert engine.cash == 0.5
+
+
+def test_reversal_open_leg_reserves_costs_after_long_is_closed() -> None:
+    simulator = ExecutionSimulator(
+        spread_model="fixed",
+        commission_per_share=0,
+        min_commission=1,
+        market_impact_model=MarketImpactModel(0, 0),
+        slippage_factor=0,
+        max_volume_participation=1,
+    )
+    engine = BacktestEngine(
+        ScriptedStrategy([{}]),
+        simulator,
+        initial_capital=1.5,
+        finalization_policy="mark_to_market",
+    )
+    decision_time = pd.Timestamp("2026-01-05")
+    execution_time = decision_time + pd.Timedelta(days=1)
+    current = pd.DataFrame(
+        {"open": [1.0], "high": [1.01], "low": [0.99], "close": [1.0], "volume": [1_000]},
+        index=["A"],
+    )
+    engine._cash = Decimal("0.5")
+    engine._apply_fill_to_lots("A", "buy", 1, Decimal(1), Decimal(0), decision_time)
+    engine._sync_positions()
+    engine._known_volumes["A"] = 1_000
+    engine._queue_target_weights({"A": -1.0}, current, decision_time)
+
+    engine._execute_pending(current, execution_time)
+
+    assert engine.positions == {}
+    assert engine.cash >= 0
+    assert len(engine._pending) == 1
+    assert engine._pending[0].requires_flat
+
+
 def test_next_open_fill_capacity_uses_only_decision_bar_known_volume() -> None:
     strategy = ScriptedStrategy([{"SINGLE": {"action": "buy", "quantity": 100}}, {}])
     simulator = ExecutionSimulator(
@@ -241,6 +299,57 @@ def test_next_open_fill_capacity_uses_only_decision_bar_known_volume() -> None:
 
     assert result.positions[0].quantity == 1
     assert result.approval_eligible
+
+
+def test_next_open_costs_ignore_execution_bar_completed_volatility() -> None:
+    def run(execution_volatility: float):
+        strategy = ScriptedStrategy([{"SINGLE": {"action": "buy", "quantity": 1}}, {}])
+        simulator = ExecutionSimulator(
+            spread_model="dynamic",
+            commission_per_share=0,
+            min_commission=0,
+            slippage_factor=0,
+            use_real_spreads=False,
+            max_volume_participation=1,
+        )
+        data = _bars([100, 100])
+        data["volatility"] = [0.01, execution_volatility]
+        return _engine(strategy, simulator).run(data)
+
+    calm = run(0.01)
+    future_spike = run(10.0)
+
+    assert calm.positions[0].entry_price == future_spike.positions[0].entry_price
+    assert calm.equity_curve.equals(future_spike.equity_curve)
+
+
+def test_split_scales_lagged_volume_into_post_split_share_units() -> None:
+    strategy = ScriptedStrategy([{"SINGLE": {"action": "buy", "quantity": 100}}, {}])
+    simulator = ExecutionSimulator(
+        spread_model="fixed",
+        commission_per_share=0,
+        min_commission=0,
+        market_impact_model=MarketImpactModel(0, 0),
+        slippage_factor=0,
+        max_volume_participation=1,
+    )
+    data = _bars([100, 50])
+    data["high"] = [101, 51]
+    data["low"] = [99, 49]
+    data["close"] = [100, 50]
+    data["volume"] = [100, 200]
+    data["split"] = [1, 2]
+
+    engine = BacktestEngine(
+        strategy,
+        simulator,
+        initial_capital=20_000,
+        finalization_policy="mark_to_market",
+    )
+    result = engine.run(data)
+
+    assert result.positions[0].quantity == 200
+    assert not engine._pending
 
 
 def test_short_lots_and_partial_cover_use_fifo_and_signed_marking() -> None:

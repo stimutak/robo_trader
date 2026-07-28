@@ -241,6 +241,20 @@ def test_timezone_session_and_execution_policy_are_mandatory() -> None:
         replace(manifest.execution_assumptions, finalization_policy_id="invented")
 
 
+def test_data_window_accepts_pandas2_pytz_iana_metadata() -> None:
+    pytz = pytest.importorskip("pytz")
+    timezone = pytz.timezone("America/New_York")
+    assumptions = _manifest().data_assumptions
+
+    compatible = replace(
+        assumptions,
+        start_at=timezone.localize(datetime(2020, 1, 1)),
+        end_at=timezone.localize(datetime(2024, 1, 1)),
+    )
+
+    assert compatible.timezone == "America/New_York"
+
+
 def test_recorded_error_manifest_is_never_approval_eligible() -> None:
     manifest = _manifest(approval_eligible=False, errors=("strategy failed",))
     with pytest.raises(ValueError, match="not approval eligible"):

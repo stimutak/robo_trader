@@ -118,6 +118,22 @@ def _mapping(value: Any, name: str) -> Mapping[str, Any]:
     return value
 
 
+def _canonical_decimal(value: Decimal) -> str:
+    """Encode a finite Decimal exactly without consulting ambient context."""
+
+    sign, digit_tuple, exponent = value.as_tuple()
+    exact_exponent = int(exponent)
+    digits = list(digit_tuple)
+    if not digits or all(digit == 0 for digit in digits):
+        return "0e0"
+    while digits[-1] == 0:
+        digits.pop()
+        exact_exponent += 1
+    coefficient = "".join(str(digit) for digit in digits)
+    prefix = "-" if sign else ""
+    return f"{prefix}{coefficient}e{exact_exponent}"
+
+
 def canonicalize(value: Any) -> Any:
     """Return a JSON-safe, type-preserving canonical value.
 
@@ -139,7 +155,7 @@ def canonicalize(value: Any) -> Any:
     if isinstance(value, Decimal):
         if not value.is_finite():
             raise ValueError("canonical payload cannot contain non-finite decimals")
-        return {"$decimal": str(value.normalize())}
+        return {"$decimal": _canonical_decimal(value)}
     if isinstance(value, pd.Timestamp):
         if pd.isna(value) or value.tzinfo is None:
             raise ValueError("timestamps must be finite and timezone-aware")

@@ -1,7 +1,7 @@
 """Deterministic content-identity tests for offline backtest inputs."""
 
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -35,6 +35,22 @@ def test_canonical_json_is_order_independent_and_type_preserving() -> None:
     assert digest_json(first) == digest_json(second)
     assert b'"$float"' in canonical_json_bytes(first)
     assert b'"$int"' in canonical_json_bytes(first)
+
+
+def test_decimal_hashing_is_exact_and_independent_of_ambient_context() -> None:
+    first = Decimal("123.45")
+    second = Decimal("124.45")
+    with localcontext() as context:
+        context.prec = 2
+        low_precision_first = digest_json({"value": first})
+        low_precision_second = digest_json({"value": second})
+    with localcontext() as context:
+        context.prec = 50
+        high_precision_first = digest_json({"value": first})
+
+    assert low_precision_first != low_precision_second
+    assert low_precision_first == high_precision_first
+    assert digest_json({"value": Decimal("1.0")}) == digest_json({"value": Decimal("1.0000")})
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), Decimal("NaN")])

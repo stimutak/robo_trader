@@ -52,6 +52,22 @@ def _aware_datetime(value: datetime, name: str) -> datetime:
     return value
 
 
+def _iana_timezone_key(value: datetime) -> Any:
+    """Return an exact IANA key for both zoneinfo and pandas 2/pytz datetimes."""
+
+    if value.tzinfo is None:
+        return None
+    key = getattr(value.tzinfo, "key", None)
+    if key is None:
+        key = getattr(value.tzinfo, "zone", None)
+    if not isinstance(key, str):
+        return None
+    try:
+        return ZoneInfo(key).key
+    except ZoneInfoNotFoundError:
+        return None
+
+
 def _parse_datetime(value: Any, name: str) -> datetime:
     if not isinstance(value, str):
         raise TypeError(f"{name} must be an ISO-8601 string")
@@ -191,10 +207,7 @@ class DataAssumptions:
             raise ValueError(f"unknown IANA timezone {self.timezone}") from exc
         start = _aware_datetime(self.start_at, "start_at")
         end = _aware_datetime(self.end_at, "end_at")
-        if (
-            getattr(start.tzinfo, "key", None) != zone.key
-            or getattr(end.tzinfo, "key", None) != zone.key
-        ):
+        if _iana_timezone_key(start) != zone.key or _iana_timezone_key(end) != zone.key:
             raise ValueError("data window datetimes must use the declared IANA timezone")
         if start >= end:
             raise ValueError("data window start_at must precede end_at")

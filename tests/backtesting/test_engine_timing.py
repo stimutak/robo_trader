@@ -414,6 +414,92 @@ def test_full_cash_target_reserves_spread_before_filling() -> None:
     assert engine._pending[0].remaining_quantity == 1
 
 
+def test_empty_target_mapping_explicitly_flattens_all_holdings() -> None:
+    class EmptyTargetStrategy:
+        def initialize(self, symbols: List[str]) -> None:
+            pass
+
+        def get_target_weights(self, _data: pd.DataFrame, _positions: Dict) -> Dict:
+            return {}
+
+        def generate_signals(self, _data: pd.DataFrame, _positions: Dict) -> Dict:
+            return {}
+
+    engine = BacktestEngine(
+        EmptyTargetStrategy(),
+        ExactFillSimulator(commission=0),
+        initial_capital=1_000,
+        finalization_policy="mark_to_market",
+    )
+    timestamp = pd.Timestamp("2026-01-05")
+    current = pd.DataFrame(
+        {"open": [100], "high": [101], "low": [99], "close": [100], "volume": [1_000]},
+        index=["SINGLE"],
+    )
+    engine._execute_buy("SINGLE", 1, current.loc["SINGLE"], timestamp)
+
+    engine._queue_rebalance(current, timestamp)
+
+    assert [
+        (order.side, order.remaining_quantity, order.reduce_only) for order in engine._pending
+    ] == [("sell", 1, True)]
+
+
+def test_stop_exit_cancels_same_bar_strategy_increase() -> None:
+    class StopStrategy(ScriptedStrategy):
+        def check_stop_loss(self, _position, price: float) -> bool:
+            return price <= 80
+
+    strategy = StopStrategy(
+        [
+            {"SINGLE": {"action": "buy", "quantity": 1}},
+            {"SINGLE": {"action": "buy", "quantity": 1}},
+            {},
+        ]
+    )
+    simulator = ExactFillSimulator(commission=0)
+    data = _bars([100, 100, 95])
+    data["low"] = [99, 80, 94]
+    engine = BacktestEngine(
+        strategy,
+        simulator,
+        initial_capital=1_000,
+        finalization_policy="mark_to_market",
+    )
+
+    result = engine.run(data)
+
+    assert [call[3] for call in simulator.calls] == ["buy", "sell"]
+    assert result.positions == []
+
+
+def test_risk_manager_close_cancels_same_bar_strategy_increase() -> None:
+    class CloseRiskManager:
+        def check_risk(self, *, positions: Dict, **_kwargs) -> List[Dict]:
+            return [{"type": "close_all"}] if positions else []
+
+    strategy = ScriptedStrategy(
+        [
+            {"SINGLE": {"action": "buy", "quantity": 1}},
+            {"SINGLE": {"action": "buy", "quantity": 1}},
+            {},
+        ]
+    )
+    simulator = ExactFillSimulator(commission=0)
+    engine = BacktestEngine(
+        strategy,
+        simulator,
+        initial_capital=1_000,
+        finalization_policy="mark_to_market",
+        risk_manager=CloseRiskManager(),
+    )
+
+    result = engine.run(_bars([100, 100, 95]))
+
+    assert [call[3] for call in simulator.calls] == ["buy", "sell"]
+    assert result.positions == []
+
+
 def test_fail_fast_is_default() -> None:
     strategy = ScriptedStrategy([RuntimeError("fail now")])
     with pytest.raises(RuntimeError, match="fail now"):

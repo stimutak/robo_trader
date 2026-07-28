@@ -123,10 +123,13 @@ class _PendingOrder:
     decision_time: pd.Timestamp
     reason: str
     reduce_only: bool = False
+    close_all: bool = False
     requires_flat: bool = False
     commission_quantity: int = 0
     commission_paid: Decimal = Decimal(0)
     known_volume: Optional[float] = None
+    known_volatility: float = 0.02
+    known_spread: Optional[float] = None
 
 
 class BacktestEngine:
@@ -206,6 +209,8 @@ class BacktestEngine:
         self._approval_eligible = True
         self._last_rebalance_bucket: Optional[Tuple[int, ...]] = None
         self._known_volumes: Dict[str, float] = {}
+        self._known_volatilities: Dict[str, float] = {}
+        self._known_spreads: Dict[str, Optional[float]] = {}
 
     def run(self, data: pd.DataFrame, symbols: Optional[List[str]] = None) -> BacktestResult:
         """Run one isolated backtest.
@@ -235,6 +240,15 @@ class BacktestEngine:
                 self._mark(current, timestamp)
                 self._known_volumes.update(
                     {symbol: float(current.loc[symbol, "volume"]) for symbol in current.index}
+                )
+                self._known_volatilities.update(
+                    {
+                        symbol: float(current.loc[symbol].get("volatility", 0.02))
+                        for symbol in current.index
+                    }
+                )
+                self._known_spreads.update(
+                    {symbol: self._observed_spread(current.loc[symbol]) for symbol in current.index}
                 )
 
                 if self._should_rebalance(timestamp):
@@ -385,7 +399,7 @@ class BacktestEngine:
             numeric["low"] > np.minimum.reduce([numeric["open"], numeric["high"], numeric["close"]])
         ).any():
             raise ValueError(f"{symbol} low violates OHLC bounds")
-        for optional in ("dividend", "split", "borrow_rate"):
+        for optional in ("dividend", "split", "borrow_rate", "volatility"):
             if optional in frame:
                 values = frame[optional].to_numpy(dtype=float)
                 if not np.isfinite(values).all():
@@ -393,6 +407,31 @@ class BacktestEngine:
                 minimum = 0 if optional != "split" else np.nextafter(0.0, 1.0)
                 if (values < minimum).any():
                     raise ValueError(f"{symbol} {optional} contains an invalid value")
+        has_bid = "bid" in frame
+        has_ask = "ask" in frame
+        if has_bid != has_ask:
+            raise ValueError(f"{symbol} must provide bid and ask together")
+        if has_bid:
+            bids = frame["bid"].to_numpy(dtype=float)
+            asks = frame["ask"].to_numpy(dtype=float)
+            if (
+                not np.isfinite(bids).all()
+                or not np.isfinite(asks).all()
+                or (bids <= 0).any()
+                or (asks < bids).any()
+            ):
+                raise ValueError(f"{symbol} requires finite 0 < bid <= ask")
+
+    @staticmethod
+    def _observed_spread(market_data: pd.Series) -> Optional[float]:
+        if "bid" not in market_data or "ask" not in market_data:
+            return None
+        return float(market_data["ask"] - market_data["bid"])
+
+    def _refresh_pending_cost_inputs(self, pending: _PendingOrder, market_data: pd.Series) -> None:
+        pending.known_volume = float(market_data["volume"])
+        pending.known_volatility = float(market_data.get("volatility", 0.02))
+        pending.known_spread = self._observed_spread(market_data)
 
     @staticmethod
     def _market_slice(frames: Dict[str, pd.DataFrame], timestamp: pd.Timestamp) -> pd.DataFrame:
@@ -426,12 +465,13 @@ class BacktestEngine:
                 )
 
         still_pending: List[_PendingOrder] = []
-        for pending in self._pending:
+        ordered_pending = sorted(self._pending, key=lambda pending: not pending.reduce_only)
+        for pending in ordered_pending:
             if timestamp <= pending.decision_time or pending.symbol not in current.index:
                 still_pending.append(pending)
                 continue
             if pending.requires_flat and pending.symbol in self.positions:
-                pending.known_volume = float(current.loc[pending.symbol, "volume"])
+                self._refresh_pending_cost_inputs(pending, current.loc[pending.symbol])
                 still_pending.append(pending)
                 continue
             if pending.symbol not in self.positions and len(self.positions) >= self.max_positions:
@@ -450,7 +490,12 @@ class BacktestEngine:
                     continue
                 if position is None:
                     raise RuntimeError("reduce-only validation lost its position")
-                pending.remaining_quantity = min(pending.remaining_quantity, abs(position.quantity))
+                if pending.close_all:
+                    pending.remaining_quantity = abs(position.quantity)
+                else:
+                    pending.remaining_quantity = min(
+                        pending.remaining_quantity, abs(position.quantity)
+                    )
             requested = pending.remaining_quantity
             filled = self._simulate_and_account(
                 pending.symbol,
@@ -465,7 +510,7 @@ class BacktestEngine:
                 event_capacity[pending.symbol] -= filled
             pending.remaining_quantity -= filled
             if pending.remaining_quantity > 0:
-                pending.known_volume = float(current.loc[pending.symbol, "volume"])
+                self._refresh_pending_cost_inputs(pending, current.loc[pending.symbol])
                 still_pending.append(pending)
         self._pending = still_pending
 
@@ -481,6 +526,15 @@ class BacktestEngine:
         max_fill_quantity: Optional[int] = None,
     ) -> int:
         price_data = pd.DataFrame([market_data], index=pd.DatetimeIndex([timestamp]))
+        position_before = self.positions.get(symbol)
+        long_quantity_before = max(position_before.quantity, 0) if position_before else 0
+        opens_short = side == "sell" and quantity > long_quantity_before
+        short_margin_available = self._cash - sum(
+            Decimal(2) * lot.entry_price * abs(lot.quantity)
+            for lots in self._lots.values()
+            for lot in lots
+            if lot.quantity < 0
+        )
         simulation_options: Dict[str, Any] = {}
         if parent_order is not None and getattr(
             self.execution_simulator, "supports_parent_order_commission", False
@@ -495,12 +549,28 @@ class BacktestEngine:
             and getattr(self.execution_simulator, "supports_lagged_liquidity", False)
         ):
             simulation_options["liquidity_volume"] = parent_order.known_volume
+        if parent_order is not None and getattr(
+            self.execution_simulator, "supports_lagged_cost_inputs", False
+        ):
+            simulation_options.update(
+                {
+                    "liquidity_volatility": parent_order.known_volatility,
+                    "liquidity_spread": parent_order.known_spread,
+                    "ignore_reported_cost_inputs": True,
+                }
+            )
         if max_fill_quantity is not None and getattr(
             self.execution_simulator, "supports_shared_event_capacity", False
         ):
             simulation_options["max_fill_quantity"] = max_fill_quantity
-        if side == "buy" and getattr(self.execution_simulator, "supports_cash_budget", False):
-            simulation_options["cash_available"] = float(self._cash)
+        if (side == "buy" or opens_short) and getattr(
+            self.execution_simulator, "supports_cash_budget", False
+        ):
+            simulation_options["cash_available"] = float(
+                self._cash if side == "buy" else max(short_margin_available, Decimal(0))
+            )
+            if opens_short:
+                simulation_options["reserve_short_margin"] = True
         order = self.execution_simulator.simulate_execution(
             symbol=symbol,
             quantity=quantity,
@@ -528,6 +598,12 @@ class BacktestEngine:
         commission = _decimal(order.execution_cost.commission, "commission")
         if fill_price <= 0 or commission < 0:
             raise ValueError("execution returned invalid price or commission")
+        opened_short_quantity = max(filled - long_quantity_before, 0) if side == "sell" else 0
+        if opened_short_quantity:
+            margin_price = max(fill_price, _decimal(market_data["open"], "open price"))
+            required_margin = margin_price * opened_short_quantity + commission
+            if short_margin_available < required_margin:
+                raise RuntimeError("execution fill exceeds available unlevered short margin")
         if side == "buy":
             cash_delta = -(fill_price * filled + commission)
             if self._cash + cash_delta < 0:
@@ -742,6 +818,7 @@ class BacktestEngine:
         reason: str,
         *,
         reduce_only: bool = False,
+        close_all: bool = False,
         requires_flat: bool = False,
     ) -> None:
         position = self.positions.get(symbol)
@@ -769,9 +846,40 @@ class BacktestEngine:
                 pd.Timestamp(timestamp),
                 reason,
                 reduce_only=reduce_only,
+                close_all=close_all,
                 requires_flat=requires_flat,
                 known_volume=self._known_volumes.get(symbol),
+                known_volatility=self._known_volatilities.get(symbol, 0.02),
+                known_spread=self._known_spreads.get(symbol),
             )
+        )
+
+    def _cancel_pending_increases(self, symbol: str) -> None:
+        self._pending = [
+            pending for pending in self._pending if pending.symbol != symbol or pending.reduce_only
+        ]
+
+    def _queue_authoritative_close(
+        self,
+        symbol: str,
+        side: str,
+        timestamp: pd.Timestamp,
+        reason: str,
+    ) -> None:
+        position = self.positions.get(symbol)
+        if position is None:
+            return
+        # One risk close supersedes all stale intent for the symbol.  It is
+        # resized against the actual position immediately before each fill.
+        self._pending = [pending for pending in self._pending if pending.symbol != symbol]
+        self._queue_order(
+            symbol,
+            side,
+            abs(position.quantity),
+            timestamp,
+            reason,
+            reduce_only=True,
+            close_all=True,
         )
 
     def _calculate_position_size(
@@ -820,7 +928,7 @@ class BacktestEngine:
         target_weights = self.strategy.get_target_weights(
             current.copy(deep=True), copy.deepcopy(self.positions)
         )
-        if not target_weights:
+        if target_weights is None:
             return
         self._queue_target_weights(target_weights, current, timestamp)
 
@@ -834,6 +942,8 @@ class BacktestEngine:
             raise ValueError("target weights must be a symbol mapping")
         if self._pending:
             raise RuntimeError("target weights cannot be applied while orders are pending")
+        if not target_weights:
+            target_weights = {symbol: 0.0 for symbol in self.positions}
         omitted_positions = set(self.positions).difference(target_weights)
         if omitted_positions:
             omitted = ", ".join(sorted(omitted_positions))
@@ -908,14 +1018,7 @@ class BacktestEngine:
                 # The completed bar creates a decision; the reduce-only market
                 # order can execute only on the symbol's next exact bar.
                 reason = "risk-stop" if stop_triggered else "risk-take-profit"
-                self._queue_order(
-                    symbol,
-                    side,
-                    abs(position.quantity),
-                    timestamp,
-                    reason,
-                    reduce_only=True,
-                )
+                self._queue_authoritative_close(symbol, side, timestamp, reason)
 
     def _apply_risk_management(self, current: pd.DataFrame, timestamp: pd.Timestamp) -> None:
         risk_manager = self.risk_manager
@@ -936,14 +1039,7 @@ class BacktestEngine:
             if action_type == "close_all":
                 for symbol, position in self.positions.items():
                     side = "sell" if position.quantity > 0 else "buy"
-                    self._queue_order(
-                        symbol,
-                        side,
-                        abs(position.quantity),
-                        timestamp,
-                        "risk-close",
-                        reduce_only=True,
-                    )
+                    self._queue_authoritative_close(symbol, side, timestamp, "risk-close")
             elif action_type == "reduce_position":
                 symbol = action["symbol"]
                 if symbol not in self.positions:
@@ -954,6 +1050,7 @@ class BacktestEngine:
                 position = self.positions[symbol]
                 quantity = max(1, int(abs(position.quantity) * reduction))
                 side = "sell" if position.quantity > 0 else "buy"
+                self._cancel_pending_increases(symbol)
                 self._queue_order(
                     symbol,
                     side,
@@ -1065,6 +1162,10 @@ class BacktestEngine:
                     if adjusted != adjusted.to_integral_value():
                         raise RuntimeError("split creates an unsupported fractional order")
                     pending.remaining_quantity = int(adjusted)
+                    if pending.known_volume is not None:
+                        pending.known_volume *= float(split)
+                    if pending.known_spread is not None:
+                        pending.known_spread /= float(split)
             dividend = _decimal(row.get("dividend", 0), f"{symbol} dividend")
             if dividend < 0:
                 raise ValueError("dividend must be non-negative")
