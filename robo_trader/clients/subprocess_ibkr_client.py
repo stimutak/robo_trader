@@ -274,7 +274,7 @@ _INTRADAY_BAR_SIZES = {
     "4 hours",
     "8 hours",
 }
-_BROKER_SNAPSHOT_SCHEMA_VERSION = 2
+_BROKER_SNAPSHOT_SCHEMA_VERSION = 3
 _BROKER_SAFETY_SNAPSHOT_SCHEMA_VERSION = 1
 _BROKER_CONTRACT_SAFETY_SNAPSHOT_SCHEMA_VERSION = 1
 _BROKER_SNAPSHOT_BALANCE_TAGS = {
@@ -297,6 +297,22 @@ _BROKER_SNAPSHOT_COLLECTIONS = {
     "completed_orders",
     "executions",
     "commissions",
+}
+_COMPLETED_ORDER_SCOPE_KEYS = {
+    "kind",
+    "api_method",
+    "api_only",
+    "all_clients",
+    "request_count",
+    "stability_check",
+    "retention_scope",
+    "full_history",
+    "request_started_at",
+    "request_completed_at",
+    "verification_started_at",
+    "verification_completed_at",
+    "broker_time_before",
+    "broker_time_after",
 }
 _BROKER_SNAPSHOT_MAX_AGE_SECONDS = 300.0
 _BROKER_SNAPSHOT_MAX_WINDOW_SECONDS = 60.0
@@ -2232,6 +2248,7 @@ class SubprocessIBKRClient:
                 "evidence_id",
                 "observed_at",
                 "result_count",
+                "scope",
             }:
                 raise ValueError("broker snapshot collection evidence schema is invalid")
             collection = evidence["collection"]
@@ -2258,10 +2275,76 @@ class SubprocessIBKRClient:
                 or result_count != counts[collection]
             ):
                 raise ValueError("broker snapshot collection evidence count is inconsistent")
+            scope = evidence["scope"]
+            if collection == "completed_orders":
+                self._validate_completed_order_scope(
+                    scope,
+                    broker_before=broker_before,
+                    broker_after=broker_after,
+                )
+            elif scope is not None:
+                raise ValueError("broker snapshot collection scope is unexpected")
             seen_collections.add(collection)
             seen_evidence_ids.add(evidence_id)
         if seen_collections != _BROKER_SNAPSHOT_COLLECTIONS:
             raise ValueError("broker snapshot collection evidence is incomplete")
+
+    def _validate_completed_order_scope(
+        self,
+        value: Any,
+        *,
+        broker_before: datetime,
+        broker_after: datetime,
+    ) -> None:
+        """Accept only IBKR's explicit current-retained, all-client query scope."""
+
+        if not isinstance(value, dict) or set(value) != _COMPLETED_ORDER_SCOPE_KEYS:
+            raise ValueError("broker snapshot completed-order scope schema is invalid")
+        if (
+            value["kind"] != "ibkr_current_retained_completed_orders"
+            or value["api_method"] != "reqCompletedOrders"
+            or value["api_only"] is not False
+            or value["all_clients"] is not True
+            or type(value["request_count"]) is not int
+            or value["request_count"] != 2
+            or value["stability_check"] != "identical_second_read"
+            or value["retention_scope"] != "current_tws_or_gateway_retained_set"
+            or value["full_history"] is not False
+        ):
+            raise ValueError("broker snapshot completed-order scope is unsupported")
+        request_started = self._strict_timestamp(
+            value["request_started_at"], "completed-order request start"
+        )
+        request_completed = self._strict_timestamp(
+            value["request_completed_at"], "completed-order request completion"
+        )
+        verification_started = self._strict_timestamp(
+            value["verification_started_at"], "completed-order verification start"
+        )
+        verification_completed = self._strict_timestamp(
+            value["verification_completed_at"], "completed-order verification completion"
+        )
+        scope_broker_before = self._strict_timestamp(
+            value["broker_time_before"], "completed-order broker time before"
+        )
+        scope_broker_after = self._strict_timestamp(
+            value["broker_time_after"], "completed-order broker time after"
+        )
+        if scope_broker_before != broker_before or scope_broker_after != broker_after:
+            raise ValueError("broker snapshot completed-order broker bounds are inconsistent")
+        if not (
+            request_started <= request_completed <= verification_started <= verification_completed
+        ):
+            raise ValueError("broker snapshot completed-order request bounds are reversed")
+        if (
+            (verification_completed - request_started).total_seconds()
+            > _BROKER_SNAPSHOT_MAX_WINDOW_SECONDS
+            or request_started
+            < broker_before - timedelta(seconds=_BROKER_SNAPSHOT_MAX_CLOCK_SKEW_SECONDS)
+            or verification_completed
+            > broker_after + timedelta(seconds=_BROKER_SNAPSHOT_MAX_CLOCK_SKEW_SECONDS)
+        ):
+            raise ValueError("broker snapshot completed-order request bounds are unbounded")
 
     def _validate_snapshot_executions(
         self,

@@ -330,7 +330,7 @@ async def test_worker_snapshot_is_fresh_atomic_read_only_and_precise(fake_ib):
 
     assert result["status"] == "success"
     data = result["data"]
-    assert data["snapshot_schema_version"] == 2
+    assert data["snapshot_schema_version"] == 3
     assert data["account"] == ACCOUNT
     assert data["positions"][0]["quantity"] == "10.5"
     assert data["positions"][0]["avg_cost"] == "123.45"
@@ -358,6 +358,23 @@ async def test_worker_snapshot_is_fresh_atomic_read_only_and_precise(fake_ib):
         "open_orders": 1,
         "positions": 1,
     }
+    completed_scope = next(
+        item["scope"]
+        for item in data["collection_evidence"]
+        if item["collection"] == "completed_orders"
+    )
+    assert completed_scope["api_method"] == "reqCompletedOrders"
+    assert completed_scope["api_only"] is False
+    assert completed_scope["all_clients"] is True
+    assert completed_scope["request_count"] == 2
+    assert completed_scope["stability_check"] == "identical_second_read"
+    assert completed_scope["retention_scope"] == "current_tws_or_gateway_retained_set"
+    assert completed_scope["full_history"] is False
+    assert all(
+        item["scope"] is None
+        for item in data["collection_evidence"]
+        if item["collection"] != "completed_orders"
+    )
     assert data["execution_scope"]["kind"] == "bounded_execution_filter"
     broker_before = datetime.fromisoformat(data["broker_time_before"])
     broker_after = datetime.fromisoformat(data["broker_time_after"])
@@ -1615,6 +1632,21 @@ async def test_client_poison_after_snapshot_validation_never_returns_data(fake_i
         lambda data: data["completeness"].update(completed_orders=False),
         lambda data: data["collection_evidence"].pop(),
         lambda data: data["collection_evidence"][0].update(result_count=0),
+        lambda data: next(
+            evidence
+            for evidence in data["collection_evidence"]
+            if evidence["collection"] == "completed_orders"
+        )["scope"].update(full_history=True),
+        lambda data: next(
+            evidence
+            for evidence in data["collection_evidence"]
+            if evidence["collection"] == "completed_orders"
+        )["scope"].update(all_clients=False),
+        lambda data: next(
+            evidence
+            for evidence in data["collection_evidence"]
+            if evidence["collection"] == "completed_orders"
+        )["scope"].update(retention_scope="full_history"),
         lambda data: data["executions"][0].update(commission_currency=None),
     ],
 )

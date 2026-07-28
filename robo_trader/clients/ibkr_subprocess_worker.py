@@ -161,7 +161,7 @@ class _RequestScopedAccountSummaryValue(NamedTuple):
     currency: str
 
 
-BROKER_SNAPSHOT_SCHEMA_VERSION = 2
+BROKER_SNAPSHOT_SCHEMA_VERSION = 3
 BROKER_SAFETY_SNAPSHOT_SCHEMA_VERSION = 1
 BROKER_CONTRACT_SAFETY_SNAPSHOT_SCHEMA_VERSION = 1
 BROKER_SAFETY_SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
@@ -1174,12 +1174,14 @@ def _collection_evidence(
     account: str,
     observed_at: datetime,
     counts: dict[str, int],
+    completed_order_scope: dict[str, Any],
 ) -> list[dict[str, Any]]:
     """Emit deterministic proof that every required collection completed."""
 
     evidence = []
     for collection in BROKER_SNAPSHOT_COLLECTIONS:
         result_count = counts[collection]
+        scope = completed_order_scope if collection == "completed_orders" else None
         fingerprint = hashlib.sha256(
             json.dumps(
                 {
@@ -1188,6 +1190,7 @@ def _collection_evidence(
                     "generation": WORKER_GENERATION_ID,
                     "observed_at": _aware_iso(observed_at),
                     "result_count": result_count,
+                    "scope": scope,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -1199,6 +1202,7 @@ def _collection_evidence(
                 "evidence_id": f"broker-collection-v1-{fingerprint}",
                 "observed_at": _aware_iso(observed_at),
                 "result_count": result_count,
+                "scope": scope,
             }
         )
     return evidence
@@ -1307,10 +1311,12 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
             open_orders_data.append(order_evidence)
         initial_order_signature = _order_evidence_signature(open_orders_data)
 
+        completed_request_started_at = datetime.now(timezone.utc)
         completed_trades = await _await_broker_snapshot_stage(
             "completed_orders_initial",
             ib.reqCompletedOrdersAsync(False),
         )
+        completed_request_completed_at = datetime.now(timezone.utc)
         if not ib.isConnected():
             raise ConnectionError("Broker disconnected during snapshot collection")
         completed_orders_data = []
@@ -1510,10 +1516,12 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
         final_order_signature = await _await_broker_snapshot_stage(
             "open_orders_final_identity", _order_state_signature(final_open_trades, account)
         )
+        completed_verification_started_at = datetime.now(timezone.utc)
         final_completed_trades = await _await_broker_snapshot_stage(
             "completed_orders_final",
             ib.reqCompletedOrdersAsync(False),
         )
+        completed_verification_completed_at = datetime.now(timezone.utc)
         final_completed_order_signature = await _await_broker_snapshot_stage(
             "completed_orders_final_identity",
             _completed_order_state_signature(final_completed_trades, account),
@@ -1545,6 +1553,26 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
         executions_data.sort(key=lambda item: cast(str, item["execution_id"]))
         balances.sort(key=lambda item: (item["tag"], item["currency"]))
         retrieved_at = datetime.now(timezone.utc)
+        completed_order_scope = {
+            # reqCompletedOrders has no caller-supplied historical time bound.
+            # apiOnly=False asks TWS/Gateway for the all-client set it currently
+            # retains. This is complete only for that explicitly declared set;
+            # it is never evidence of full broker-account order history.
+            "kind": "ibkr_current_retained_completed_orders",
+            "api_method": "reqCompletedOrders",
+            "api_only": False,
+            "all_clients": True,
+            "request_count": 2,
+            "stability_check": "identical_second_read",
+            "retention_scope": "current_tws_or_gateway_retained_set",
+            "full_history": False,
+            "request_started_at": completed_request_started_at.isoformat(),
+            "request_completed_at": completed_request_completed_at.isoformat(),
+            "verification_started_at": completed_verification_started_at.isoformat(),
+            "verification_completed_at": completed_verification_completed_at.isoformat(),
+            "broker_time_before": _aware_iso(broker_time_before),
+            "broker_time_after": _aware_iso(broker_time_after),
+        }
         collection_evidence = _collection_evidence(
             account=account,
             observed_at=broker_time_after,
@@ -1555,6 +1583,7 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
                 "executions": len(executions_data),
                 "commissions": len(executions_data),
             },
+            completed_order_scope=completed_order_scope,
         )
         return {
             "status": "success",

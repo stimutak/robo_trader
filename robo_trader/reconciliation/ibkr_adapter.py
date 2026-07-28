@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import json
 import re
-from dataclasses import dataclass
+import secrets
+import threading
+import weakref
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import MappingProxyType
-from typing import Any, Awaitable, Mapping, Protocol
+from typing import Any, Awaitable, Mapping, Protocol, SupportsIndex
 
 from robo_trader.clients.subprocess_ibkr_client import SubprocessIBKRClient
 
@@ -130,18 +136,141 @@ _COMPLETENESS_KEYS = frozenset(
         "commissions",
     }
 )
-_COLLECTION_EVIDENCE_KEYS = frozenset({"collection", "evidence_id", "observed_at", "result_count"})
+_COLLECTION_EVIDENCE_KEYS = frozenset(
+    {"collection", "evidence_id", "observed_at", "result_count", "scope"}
+)
+_COMPLETED_ORDER_SCOPE_KEYS = frozenset(
+    {
+        "kind",
+        "api_method",
+        "api_only",
+        "all_clients",
+        "request_count",
+        "stability_check",
+        "retention_scope",
+        "full_history",
+        "request_started_at",
+        "request_completed_at",
+        "verification_started_at",
+        "verification_completed_at",
+        "broker_time_before",
+        "broker_time_after",
+    }
+)
+_BROKER_RESULT_PURPOSE = "bootstrap-broker-signing-v1"
+_BROKER_RESULT_MARKER = object()
+_BROKER_RESULT_REGISTRY_KEY = secrets.token_bytes(32)
+_BROKER_RESULT_REGISTRY_LOCK = threading.Lock()
+_BROKER_CAPABILITY_REGISTRY_KEY = secrets.token_bytes(32)
+_BROKER_CAPABILITY_REGISTRY_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True, slots=True)
+class CompletedOrderCollectionScope:
+    """Exact, bounded semantics of IBKR's completed-order collection request."""
+
+    kind: str
+    api_method: str
+    api_only: bool
+    all_clients: bool
+    request_count: int
+    stability_check: str
+    retention_scope: str
+    full_history: bool
+    request_started_at: datetime
+    request_completed_at: datetime
+    verification_started_at: datetime
+    verification_completed_at: datetime
+    broker_time_before: datetime
+    broker_time_after: datetime
+
+    def canonical_dict(self) -> dict[str, object]:
+        return {
+            "all_clients": self.all_clients,
+            "api_method": self.api_method,
+            "api_only": self.api_only,
+            "broker_time_after": self.broker_time_after.isoformat(),
+            "broker_time_before": self.broker_time_before.isoformat(),
+            "full_history": self.full_history,
+            "kind": self.kind,
+            "request_count": self.request_count,
+            "request_completed_at": self.request_completed_at.isoformat(),
+            "request_started_at": self.request_started_at.isoformat(),
+            "retention_scope": self.retention_scope,
+            "stability_check": self.stability_check,
+            "verification_completed_at": self.verification_completed_at.isoformat(),
+            "verification_started_at": self.verification_started_at.isoformat(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _BrokerSnapshotResultCapability:
+    purpose: str
+    producer_id: int
+    nonce: str
+    _marker: object = field(repr=False, compare=False)
+
+
+_BROKER_CAPABILITY_REGISTRY: dict[
+    int,
+    tuple[_BrokerSnapshotResultCapability, str],
+] = {}
+
+
+def _capability_digest(capability: _BrokerSnapshotResultCapability) -> str:
+    return hmac.new(
+        _BROKER_CAPABILITY_REGISTRY_KEY,
+        (f"{capability.purpose}|{capability.producer_id}|{capability.nonce}").encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _consume_result_capability(capability: _BrokerSnapshotResultCapability) -> None:
+    if type(capability) is not _BrokerSnapshotResultCapability:
+        raise BrokerEvidenceError("broker producer result capability is invalid")
+    digest = _capability_digest(capability)
+    with _BROKER_CAPABILITY_REGISTRY_LOCK:
+        registered = _BROKER_CAPABILITY_REGISTRY.pop(id(capability), None)
+    if (
+        registered is None
+        or registered[0] is not capability
+        or capability._marker is not _BROKER_RESULT_MARKER
+        or capability.purpose != _BROKER_RESULT_PURPOSE
+        or capability.producer_id <= 0
+        or not hmac.compare_digest(registered[1], digest)
+    ):
+        raise BrokerEvidenceError("broker producer capability is absent or already consumed")
+
+
+@dataclass(frozen=True, repr=False)
 class BrokerSnapshotProducerResult:
-    """Typed, unsigned producer output for the separately owned core signer."""
+    """One-shot producer-owned handoff exclusively for the broker signer."""
+
+    __slots__ = (
+        "snapshot",
+        "completed_order_scope",
+        "purpose",
+        "_producer_marker",
+        "_construction_capability",
+        "__weakref__",
+    )
 
     snapshot: NormalizedBrokerSnapshot
+    completed_order_scope: CompletedOrderCollectionScope
+    purpose: str
+    _producer_marker: object
+    _construction_capability: _BrokerSnapshotResultCapability
 
     def __post_init__(self) -> None:
         if type(self.snapshot) is not NormalizedBrokerSnapshot:
             raise BrokerEvidenceError("broker producer result is not normalized")
+        if type(self.completed_order_scope) is not CompletedOrderCollectionScope:
+            raise BrokerEvidenceError("broker producer completed-order scope is invalid")
+        if self.purpose != _BROKER_RESULT_PURPOSE:
+            raise BrokerEvidenceError("broker producer result purpose is invalid")
+        if self._producer_marker is not _BROKER_RESULT_MARKER:
+            raise BrokerEvidenceError("broker producer result requires producer ownership")
+        _consume_result_capability(self._construction_capability)
 
     @property
     def snapshot_id(self) -> str:
@@ -149,7 +278,109 @@ class BrokerSnapshotProducerResult:
 
     @property
     def canonical_payload(self) -> str:
-        return self.snapshot.canonical_payload()
+        return _broker_result_payload(self)
+
+    def __copy__(self) -> BrokerSnapshotProducerResult:
+        raise TypeError("broker producer result cannot be copied")
+
+    def __deepcopy__(self, memo: object) -> BrokerSnapshotProducerResult:
+        raise TypeError("broker producer result cannot be copied")
+
+    def __reduce__(self) -> str | tuple[Any, ...]:
+        raise TypeError("broker producer result cannot be pickled")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[Any, ...]:
+        raise TypeError("broker producer result cannot be pickled")
+
+
+_BrokerResultRegistryEntry = tuple[
+    weakref.ReferenceType[BrokerSnapshotProducerResult],
+    str,
+    str,
+]
+_BROKER_RESULT_REGISTRY: dict[int, _BrokerResultRegistryEntry] = {}
+
+
+def _broker_result_payload(result: BrokerSnapshotProducerResult) -> str:
+    return json.dumps(
+        {
+            "completed_order_collection_scope": result.completed_order_scope.canonical_dict(),
+            "purpose": result.purpose,
+            "snapshot": json.loads(result.snapshot.canonical_payload()),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _broker_result_digest(result: BrokerSnapshotProducerResult) -> str:
+    return hmac.new(
+        _BROKER_RESULT_REGISTRY_KEY,
+        f"{result.snapshot_id}|{_broker_result_payload(result)}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _produce_broker_snapshot_result(
+    producer: object,
+    *,
+    snapshot: NormalizedBrokerSnapshot,
+    completed_order_scope: CompletedOrderCollectionScope,
+) -> BrokerSnapshotProducerResult:
+    if type(producer) is not IBKRDiagnosticSnapshotProvider:
+        raise BrokerEvidenceError("broker producer result requires the diagnostic provider")
+    capability = _BrokerSnapshotResultCapability(
+        purpose=_BROKER_RESULT_PURPOSE,
+        producer_id=id(producer),
+        nonce=secrets.token_hex(32),
+        _marker=_BROKER_RESULT_MARKER,
+    )
+    capability_digest = _capability_digest(capability)
+    with _BROKER_CAPABILITY_REGISTRY_LOCK:
+        _BROKER_CAPABILITY_REGISTRY[id(capability)] = (capability, capability_digest)
+    result = BrokerSnapshotProducerResult(
+        snapshot=snapshot,
+        completed_order_scope=completed_order_scope,
+        purpose=capability.purpose,
+        _producer_marker=_BROKER_RESULT_MARKER,
+        _construction_capability=capability,
+    )
+    object_id = id(result)
+
+    def discard(reference: weakref.ReferenceType[BrokerSnapshotProducerResult]) -> None:
+        with _BROKER_RESULT_REGISTRY_LOCK:
+            registered = _BROKER_RESULT_REGISTRY.get(object_id)
+            if registered is not None and registered[0] is reference:
+                _BROKER_RESULT_REGISTRY.pop(object_id, None)
+
+    reference = weakref.ref(result, discard)
+    digest = _broker_result_digest(result)
+    with _BROKER_RESULT_REGISTRY_LOCK:
+        _BROKER_RESULT_REGISTRY[object_id] = (reference, digest, capability.purpose)
+    return result
+
+
+def assert_producer_owned_broker_snapshot_result(
+    result: BrokerSnapshotProducerResult,
+) -> BrokerSnapshotProducerResult:
+    """Claim the exact signer-purpose handoff once; reject forgery and replay."""
+
+    if type(result) is not BrokerSnapshotProducerResult:
+        raise BrokerEvidenceError("exact broker producer result is required")
+    digest = _broker_result_digest(result)
+    with _BROKER_RESULT_REGISTRY_LOCK:
+        registered = _BROKER_RESULT_REGISTRY.pop(id(result), None)
+        if registered is None or registered[0]() is not result:
+            raise BrokerEvidenceError("broker producer result is absent or already consumed")
+        if (
+            registered[2] != _BROKER_RESULT_PURPOSE
+            or result.purpose != _BROKER_RESULT_PURPOSE
+            or result._producer_marker is not _BROKER_RESULT_MARKER
+            or not hmac.compare_digest(registered[1], digest)
+        ):
+            raise BrokerEvidenceError("broker producer result failed ownership validation")
+    return result
 
 
 class DiagnosticTransport(Protocol):
@@ -203,6 +434,64 @@ def _timestamp(value: object, label: str) -> datetime:
 
 def _optional_timestamp(value: object, label: str) -> datetime | None:
     return None if value is None else _timestamp(value, label)
+
+
+def _completed_order_scope(
+    value: object,
+    *,
+    broker_time_before: datetime,
+    broker_time_after: datetime,
+) -> CompletedOrderCollectionScope:
+    record = _record(value, _COMPLETED_ORDER_SCOPE_KEYS, "completed-order scope")
+    if (
+        record["kind"] != "ibkr_current_retained_completed_orders"
+        or record["api_method"] != "reqCompletedOrders"
+        or record["api_only"] is not False
+        or record["all_clients"] is not True
+        or type(record["request_count"]) is not int
+        or record["request_count"] != 2
+        or record["stability_check"] != "identical_second_read"
+        or record["retention_scope"] != "current_tws_or_gateway_retained_set"
+        or record["full_history"] is not False
+    ):
+        raise BrokerEvidenceError("diagnostic broker completed-order scope is unsupported")
+    scope = CompletedOrderCollectionScope(
+        kind=record["kind"],
+        api_method=record["api_method"],
+        api_only=record["api_only"],
+        all_clients=record["all_clients"],
+        request_count=record["request_count"],
+        stability_check=record["stability_check"],
+        retention_scope=record["retention_scope"],
+        full_history=record["full_history"],
+        request_started_at=_timestamp(record["request_started_at"], "request start"),
+        request_completed_at=_timestamp(record["request_completed_at"], "request completion"),
+        verification_started_at=_timestamp(record["verification_started_at"], "verification start"),
+        verification_completed_at=_timestamp(
+            record["verification_completed_at"], "verification completion"
+        ),
+        broker_time_before=_timestamp(record["broker_time_before"], "scope broker time before"),
+        broker_time_after=_timestamp(record["broker_time_after"], "scope broker time after"),
+    )
+    if (
+        scope.broker_time_before != broker_time_before
+        or scope.broker_time_after != broker_time_after
+    ):
+        raise BrokerEvidenceError("diagnostic broker completed-order bounds are inconsistent")
+    if not (
+        scope.request_started_at
+        <= scope.request_completed_at
+        <= scope.verification_started_at
+        <= scope.verification_completed_at
+    ):
+        raise BrokerEvidenceError("diagnostic broker completed-order request bounds are reversed")
+    if (
+        (scope.verification_completed_at - scope.request_started_at).total_seconds() > 60.0
+        or scope.request_started_at < broker_time_before - timedelta(seconds=120)
+        or scope.verification_completed_at > broker_time_after + timedelta(seconds=120)
+    ):
+        raise BrokerEvidenceError("diagnostic broker completed-order request bounds are unbounded")
+    return scope
 
 
 def _decimal(value: object, label: str) -> Decimal:
@@ -324,6 +613,14 @@ def _complete_collection_evidence(
             or result_count != expected_counts.get(kind)
         ):
             raise BrokerEvidenceError("diagnostic broker collection evidence count is inconsistent")
+        if kind is BrokerCollectionKind.COMPLETED_ORDERS:
+            _completed_order_scope(
+                evidence["scope"],
+                broker_time_before=broker_time_before,
+                broker_time_after=broker_time_after,
+            )
+        elif evidence["scope"] is not None:
+            raise BrokerEvidenceError("diagnostic broker collection scope is unexpected")
         evidence_by_kind[kind] = evidence
         seen_ids.add(evidence_id)
     if set(evidence_by_kind) != set(BrokerCollectionKind):
@@ -340,7 +637,7 @@ def snapshot_from_transport(
     if not isinstance(expected_account, str) or not expected_account.strip():
         raise BrokerEvidenceError("diagnostic broker expected account is unavailable")
     record = _record(payload, _TOP_LEVEL_KEYS, "snapshot")
-    if record["snapshot_schema_version"] != 2:
+    if record["snapshot_schema_version"] != 3:
         raise BrokerEvidenceError("diagnostic broker snapshot schema is unsupported")
     if record["account"] != expected_account:
         raise BrokerEvidenceError("diagnostic broker account identity does not match runtime")
@@ -496,7 +793,7 @@ def _normalized_snapshot_from_transport(
     if not isinstance(expected_account, str) or not expected_account.strip():
         raise BrokerEvidenceError("diagnostic broker expected account is unavailable")
     record = _record(payload, _TOP_LEVEL_KEYS, "snapshot")
-    if record["snapshot_schema_version"] != 2:
+    if record["snapshot_schema_version"] != 3:
         raise BrokerEvidenceError("diagnostic broker snapshot schema is unsupported")
     if record["account"] != expected_account:
         raise BrokerEvidenceError("diagnostic broker account identity does not match runtime")
@@ -801,6 +1098,25 @@ def normalized_snapshot_from_transport(
         raise BrokerEvidenceError("diagnostic broker normalized snapshot is invalid") from exc
 
 
+def _completed_order_scope_from_transport(payload: object) -> CompletedOrderCollectionScope:
+    record = _record(payload, _TOP_LEVEL_KEYS, "snapshot")
+    broker_time_before = _timestamp(record["broker_time_before"], "broker time before")
+    broker_time_after = _timestamp(record["broker_time_after"], "broker time after")
+    matches = [
+        evidence
+        for evidence in _records(record["collection_evidence"], "collection evidence")
+        if isinstance(evidence, dict) and evidence.get("collection") == "completed_orders"
+    ]
+    if len(matches) != 1:
+        raise BrokerEvidenceError("diagnostic broker completed-order scope is unavailable")
+    evidence = _record(matches[0], _COLLECTION_EVIDENCE_KEYS, "collection evidence")
+    return _completed_order_scope(
+        evidence["scope"],
+        broker_time_before=broker_time_before,
+        broker_time_after=broker_time_after,
+    )
+
+
 class IBKRDiagnosticSnapshotProvider:
     """Expose only snapshot and cleanup capabilities to reconciliation."""
 
@@ -847,7 +1163,12 @@ class IBKRDiagnosticSnapshotProvider:
             account_scope=self._account_scope,
             max_age_seconds=max_age_seconds,
         )
-        return BrokerSnapshotProducerResult(snapshot=snapshot)
+        completed_order_scope = _completed_order_scope_from_transport(payload)
+        return _produce_broker_snapshot_result(
+            self,
+            snapshot=snapshot,
+            completed_order_scope=completed_order_scope,
+        )
 
     async def close(self) -> None:
         await _stop_transport_required(self._transport)
