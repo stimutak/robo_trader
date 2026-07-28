@@ -58,7 +58,11 @@ async def _factory_provider(monkeypatch, *, payload=None):
     transport.start = AsyncMock()
     transport.connect = AsyncMock(return_value=True)
     transport.get_broker_snapshot = AsyncMock(
-        return_value=_payload() if payload is None else payload
+        return_value=(
+            _payload(now=datetime.now(timezone.utc).replace(microsecond=0))
+            if payload is None
+            else payload
+        )
     )
     transport.get_protective_quotes = AsyncMock(return_value=())
     transport.stop = AsyncMock()
@@ -85,7 +89,7 @@ def _contract():
     }
 
 
-def _payload():
+def _payload(*, now: datetime = NOW):
     return {
         "snapshot_schema_version": 3,
         "account": ACCOUNT,
@@ -94,10 +98,10 @@ def _payload():
         "base_currency": "USD",
         "total_cash": "25000.5",
         "buying_power": "999999",
-        "account_observed_at": NOW.isoformat(),
-        "broker_time_before": (NOW - timedelta(seconds=2)).isoformat(),
-        "broker_time_after": NOW.isoformat(),
-        "retrieved_at": NOW.isoformat(),
+        "account_observed_at": now.isoformat(),
+        "broker_time_before": (now - timedelta(seconds=2)).isoformat(),
+        "broker_time_after": now.isoformat(),
+        "retrieved_at": now.isoformat(),
         "positions": [
             {
                 "account": ACCOUNT,
@@ -128,7 +132,7 @@ def _payload():
                 "limit_price": "120.25",
                 "stop_price": None,
                 "avg_fill_price": None,
-                "last_status_at": NOW.isoformat(),
+                "last_status_at": now.isoformat(),
                 "unavailable": {
                     "stop_price": "not supplied for this order type",
                     "avg_fill_price": "order has no fills",
@@ -148,7 +152,7 @@ def _payload():
                 "quantity": "1.25",
                 "price": "120.25",
                 "average_price": "120.25",
-                "executed_at": (NOW - timedelta(minutes=1)).isoformat(),
+                "executed_at": (now - timedelta(minutes=1)).isoformat(),
                 "execution_exchange": "NASDAQ",
                 "commission": "1.23",
                 "commission_currency": "USD",
@@ -168,7 +172,7 @@ def _payload():
             {
                 "collection": collection,
                 "evidence_id": f"broker-collection-v1-{index:064x}",
-                "observed_at": NOW.isoformat(),
+                "observed_at": now.isoformat(),
                 "result_count": count,
                 "scope": (
                     {
@@ -181,19 +185,19 @@ def _payload():
                         "retention_scope": "current_tws_or_gateway_retained_set",
                         "full_history": False,
                         "request_started_at": (
-                            NOW - timedelta(seconds=1, microseconds=800000)
+                            now - timedelta(seconds=1, microseconds=800000)
                         ).isoformat(),
                         "request_completed_at": (
-                            NOW - timedelta(seconds=1, microseconds=700000)
+                            now - timedelta(seconds=1, microseconds=700000)
                         ).isoformat(),
                         "verification_started_at": (
-                            NOW - timedelta(microseconds=200000)
+                            now - timedelta(microseconds=200000)
                         ).isoformat(),
                         "verification_completed_at": (
-                            NOW - timedelta(microseconds=100000)
+                            now - timedelta(microseconds=100000)
                         ).isoformat(),
-                        "broker_time_before": (NOW - timedelta(seconds=2)).isoformat(),
-                        "broker_time_after": NOW.isoformat(),
+                        "broker_time_before": (now - timedelta(seconds=2)).isoformat(),
+                        "broker_time_after": now.isoformat(),
                     }
                     if collection == "completed_orders"
                     else None
@@ -212,10 +216,10 @@ def _payload():
         ],
         "execution_scope": {
             "kind": "broker_date_since_midnight",
-            "start_at": (NOW - timedelta(seconds=2))
+            "start_at": (now - timedelta(seconds=2))
             .replace(hour=0, minute=0, second=0, microsecond=0)
             .isoformat(),
-            "end_at": NOW.isoformat(),
+            "end_at": now.isoformat(),
             "retention_scope": "ibkr_gateway_broker_date_since_midnight",
             "full_history": False,
             "commission_scope": "matching_callbacks_for_returned_executions",
