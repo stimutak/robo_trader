@@ -23,6 +23,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -512,9 +513,10 @@ def preview(
     legacy = inspect_legacy_state(database_path)
     if legacy["snapshot_hash"] != candidate.legacy_snapshot_hash:
         raise ExactStateBootstrapError("legacy ledger differs from the reviewed candidate")
+    position_rows = cast(list[dict[str, object]], legacy["position_rows"])
     actual = {
-        (row["portfolio_id"], row["symbol"]): int(row["quantity"])
-        for row in legacy["position_rows"]
+        (row["portfolio_id"], row["symbol"]): int(cast(int, row["quantity"]))
+        for row in position_rows
         if row["portfolio_id"] == candidate.portfolio_id
     }
     expected = {
@@ -640,7 +642,17 @@ def main(argv: list[str] | None = None) -> int:
             if not lock.acquire():
                 raise RuntimeError("runtime lifecycle lock is already held")
             try:
+                # The preview load above has no apply authority. Reload all
+                # artifacts only after lifecycle exclusion is held so the
+                # evidence object passed into the transaction is lock-bound.
+                evidence = load_exact_state_bootstrap_evidence(
+                    reconciliation_path=args.reconciliation_evidence,
+                    broker_snapshot_path=args.broker_snapshot,
+                    protective_mark_paths=args.protective_marks,
+                    expected_runtime_contract=runtime_contract,
+                )
                 candidate_binding.assert_identity()
+                report = preview(candidate, database_path, evidence, runtime_contract)
                 _assert_stopped()
                 backup = _online_backup(database_path, args.backup_path, candidate)
                 candidate_binding.assert_identity()

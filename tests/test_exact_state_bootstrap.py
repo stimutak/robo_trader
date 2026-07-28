@@ -28,6 +28,7 @@ from robo_trader.financial_state_bootstrap import (
     ExactStateBootstrapCandidate,
     ExactStateBootstrapCommittedBackupInvalid,
     ExactStateBootstrapError,
+    acquire_exact_state_safety_journal_guard,
     inspect_legacy_state,
     load_exact_state_bootstrap_evidence,
     sqlite_table_evidence,
@@ -379,6 +380,7 @@ def _candidate_bundle(
     broker_receipt = json.loads(
         broker_path.with_name(broker_path.name + ".auth.json").read_text(encoding="utf-8")
     )
+    bundle_id = "bootstrap-evidence-bundle-v1-" + "9" * 64
     mark_specs = (
         ()
         if flat
@@ -397,6 +399,12 @@ def _candidate_bundle(
             {
                 "account_scope": ACCOUNT_SCOPE,
                 "authorizes_startup": False,
+                "broker_artifact_hash": broker_hash,
+                "broker_public_key_fingerprint": broker_receipt["public_key_fingerprint"],
+                "broker_receipt_id": broker_receipt["receipt_id"],
+                "broker_snapshot_hash": broker_snapshot_hash,
+                "broker_snapshot_id": broker_snapshot_id,
+                "bundle_id": bundle_id,
                 "con_id": con_id,
                 "database_device": path.stat().st_dev,
                 "database_identity": runtime_contract.database_identity,
@@ -412,6 +420,7 @@ def _candidate_bundle(
                 "source_event_id": event_id,
                 "protective_quote_id": "quote:v1:" + hashlib.sha256(event_id.encode()).hexdigest(),
                 "protective_quote_source": "live-broker",
+                "reconciliation_snapshot_id": "pending",
                 "runtime_fingerprint": runtime_contract.fingerprint,
                 "transport_generation": "test-generation-v1",
             },
@@ -436,6 +445,7 @@ def _candidate_bundle(
         "broker_snapshot_id": broker_snapshot_id,
         "broker_verdict_hash": "d" * 64,
         "broker_verdict_id": "reconciliation-verdict-v1-" + "e" * 64,
+        "bundle_id": bundle_id,
         "comparison_coverage": {
             "broker_account": True,
             "broker_commissions": True,
@@ -477,6 +487,14 @@ def _candidate_bundle(
     }
     reconciliation_snapshot_id = fingerprint("bootstrap-reconciliation-v1", reconciliation_payload)
     reconciliation_payload["snapshot_id"] = reconciliation_snapshot_id
+    for mark_path in mark_paths:
+        mark_payload = json.loads(mark_path.read_text(encoding="utf-8"))
+        mark_payload["reconciliation_snapshot_id"] = reconciliation_snapshot_id
+        mark_hashes[str(mark_payload["symbol"])] = _write_artifact(
+            mark_path,
+            mark_payload,
+            artifact_kind="protective_mark",
+        )
     reconciliation_hash = _write_artifact(
         reconciliation_path,
         reconciliation_payload,
@@ -609,6 +627,63 @@ async def test_offline_atomic_bootstrap_migrates_raw_legacy_schema_in_one_commit
         assert connection.execute(
             "SELECT COUNT(*) FROM exact_bootstrap_evidence_consumptions"
         ).fetchone() == (4,)
+
+
+@pytest.mark.asyncio
+async def test_offline_apply_blocks_replaced_journal_before_schema_mutation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    candidate, evidence, runtime_contract = _candidate_bundle(path, tmp_path)
+    backup_receipt = _backup_receipt(path, tmp_path / "backup.db", candidate)
+    journal_path = Path(str(runtime_contract.safety_journal_path))
+    journal_path.rename(tmp_path / "reviewed-safety-journal.db")
+    SafetyJournal(journal_path).initialize(
+        execution_domain_scope="paper-simulator-v1",
+        account_scope=ACCOUNT_SCOPE,
+    )
+
+    database = AsyncTradingDatabase(path, pool_size=1)
+    try:
+        with pytest.raises(ExactStateBootstrapError, match="journal identity changed"):
+            await database.apply_exact_state_bootstrap_offline_atomic(
+                candidate,
+                evidence=evidence,
+                backup_receipt=backup_receipt,
+                operator_reason="Reject journal replacement before exact-state mutation.",
+                runtime_contract=runtime_contract,
+            )
+    finally:
+        await database.close()
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='paper_state_bootstraps'"
+        ).fetchone() == (0,)
+
+
+def test_safety_journal_guard_blocks_mutation_and_releases_writer_lock(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    _candidate, evidence, runtime_contract = _candidate_bundle(path, tmp_path)
+    guard = acquire_exact_state_safety_journal_guard(evidence, runtime_contract)
+    writer = sqlite3.connect(
+        str(runtime_contract.safety_journal_path),
+        timeout=0.01,
+        isolation_level=None,
+    )
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            writer.execute("BEGIN IMMEDIATE")
+        guard.assert_unchanged()
+        guard.close()
+        writer.execute("BEGIN IMMEDIATE")
+        writer.rollback()
+    finally:
+        writer.close()
 
 
 @pytest.mark.asyncio
@@ -1222,7 +1297,7 @@ def test_reconciliation_strong_broker_and_position_bindings_cannot_drift(
 
     with pytest.raises(
         ExactStateBootstrapError,
-        match="runtime evidence|exactly cover",
+        match="runtime evidence|exactly cover|runtime lineage",
     ):
         load_exact_state_bootstrap_evidence(
             reconciliation_path=reconciliation_path,

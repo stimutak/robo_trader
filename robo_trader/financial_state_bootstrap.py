@@ -62,6 +62,68 @@ class ExactStateBootstrapError(ValueError):
     """A candidate cannot safely establish a sealed accounting epoch."""
 
 
+class ExactStateSafetyJournalGuard:
+    """Hold the exact reviewed journal against writes through bootstrap commit."""
+
+    __slots__ = (
+        "_binding",
+        "_connection",
+        "_connection_binding",
+        "_released",
+        "_snapshot",
+    )
+
+    def __init__(
+        self,
+        *,
+        binding: SQLitePathBinding,
+        connection: sqlite3.Connection,
+        connection_binding: SQLitePathBinding,
+        snapshot: tuple[tuple[int, str], ...],
+    ) -> None:
+        self._binding = binding
+        self._connection = connection
+        self._connection_binding = connection_binding
+        self._snapshot = snapshot
+        self._released = False
+
+    def assert_unchanged(self) -> None:
+        """Revalidate path, descriptor, and exact chain while write lock is held."""
+
+        if self._released:
+            raise ExactStateBootstrapError("safety journal guard was already released")
+        try:
+            self._connection_binding.assert_connection_identity(
+                sqlite_connection_file_identity(self._connection)
+            )
+            self._binding.assert_path_identity()
+            current = tuple(
+                (int(row[0]), str(row[1]))
+                for row in self._connection.execute(
+                    "SELECT sequence,chain_hash FROM safety_journal_events ORDER BY sequence"
+                ).fetchall()
+            )
+        except (OSError, sqlite3.Error, SQLiteIdentityError) as exc:
+            raise ExactStateBootstrapError(
+                "safety journal changed inside the bootstrap transaction boundary"
+            ) from exc
+        if current != self._snapshot:
+            raise ExactStateBootstrapError(
+                "safety journal changed inside the bootstrap transaction boundary"
+            )
+
+    def close(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        try:
+            if self._connection.in_transaction:
+                self._connection.rollback()
+        finally:
+            self._connection.close()
+            self._binding.close()
+
+
 class ExactStateBootstrapCommittedBackupInvalid(ExactStateBootstrapError):
     """The bootstrap committed, but its required rollback backup became invalid."""
 
@@ -103,6 +165,7 @@ class ExactStateBootstrapEvidence:
     """Cross-linked offline evidence verified from regular owner-only files."""
 
     reconciliation_snapshot_id: str
+    bundle_id: str
     reconciliation_report_hash: str
     broker_snapshot_hash: str
     legacy_snapshot_hash: str
@@ -159,6 +222,7 @@ def _evidence_object_digest(evidence: ExactStateBootstrapEvidence) -> str:
         "broker_open_order_count": evidence.broker_open_order_count,
         "broker_position_count": evidence.broker_position_count,
         "broker_snapshot_hash": evidence.broker_snapshot_hash,
+        "bundle_id": evidence.bundle_id,
         "database_device": evidence.database_device,
         "database_identity": evidence.database_identity,
         "database_inode": evidence.database_inode,
@@ -817,6 +881,7 @@ def load_exact_state_bootstrap_evidence(
         {
             "schema_version",
             "snapshot_id",
+            "bundle_id",
             "generated_at",
             "runtime_fingerprint",
             "execution_domain_scope",
@@ -857,6 +922,9 @@ def load_exact_state_bootstrap_evidence(
         "reconciliation report",
     )
     portfolio_ids = reconciliation["portfolio_ids"]
+    bundle_id = _json_string(reconciliation["bundle_id"], "reconciliation bundle_id")
+    if not re.fullmatch(r"bootstrap-evidence-bundle-v1-[0-9a-f]{64}", bundle_id):
+        raise ExactStateBootstrapError("reconciliation bundle identity is malformed")
     coverage = reconciliation["comparison_coverage"]
     collection_ids = reconciliation["broker_collection_evidence_ids"]
     local_position_identities = reconciliation["local_position_identities"]
@@ -1086,6 +1154,13 @@ def load_exact_state_bootstrap_evidence(
             mark,
             {
                 "schema_version",
+                "bundle_id",
+                "reconciliation_snapshot_id",
+                "broker_snapshot_id",
+                "broker_snapshot_hash",
+                "broker_artifact_hash",
+                "broker_receipt_id",
+                "broker_public_key_fingerprint",
                 "portfolio_id",
                 "symbol",
                 "price_text",
@@ -1116,6 +1191,31 @@ def load_exact_state_bootstrap_evidence(
             != "live-broker"
             or _json_string(mark["runtime_fingerprint"], "mark runtime_fingerprint")
             != runtime_fingerprint
+            or _json_string(mark["bundle_id"], "mark bundle_id") != bundle_id
+            or _json_string(
+                mark["reconciliation_snapshot_id"],
+                "mark reconciliation_snapshot_id",
+            )
+            != reconciliation_snapshot_id
+            or _json_string(mark["broker_snapshot_id"], "mark broker_snapshot_id")
+            != broker_snapshot_id
+            or not hmac.compare_digest(
+                _hash(mark["broker_snapshot_hash"], "mark broker_snapshot_hash"),
+                broker_snapshot_hash,
+            )
+            or not hmac.compare_digest(
+                _hash(mark["broker_artifact_hash"], "mark broker_artifact_hash"),
+                broker_hash,
+            )
+            or _safe_id(mark["broker_receipt_id"], "mark broker receipt_id")
+            != broker_authenticated_at.receipt_id
+            or not hmac.compare_digest(
+                _hash(
+                    mark["broker_public_key_fingerprint"],
+                    "mark broker public key fingerprint",
+                ),
+                broker_authenticated_at.public_key_fingerprint,
+            )
             or _json_string(mark["execution_domain_scope"], "mark execution_domain_scope")
             != PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
             or not hmac.compare_digest(
@@ -1174,6 +1274,7 @@ def load_exact_state_bootstrap_evidence(
 
     evidence = ExactStateBootstrapEvidence(
         reconciliation_snapshot_id=reconciliation_snapshot_id,
+        bundle_id=bundle_id,
         reconciliation_report_hash=reconciliation_hash,
         broker_snapshot_hash=broker_hash,
         legacy_snapshot_hash=legacy_snapshot_hash,
@@ -1480,6 +1581,92 @@ class ExactStateBootstrapCandidate:
             positions=positions,
             schema_version=raw["schema_version"],
         )
+
+
+def acquire_exact_state_safety_journal_guard(
+    evidence: ExactStateBootstrapEvidence,
+    runtime_contract: object,
+) -> ExactStateSafetyJournalGuard:
+    """Replay and write-lock the reviewed journal until bootstrap finishes."""
+
+    if type(evidence) is not ExactStateBootstrapEvidence:
+        raise ExactStateBootstrapError("bootstrap evidence has the wrong type")
+    journal_path_value = getattr(runtime_contract, "safety_journal_path", None)
+    journal_identity = getattr(runtime_contract, "safety_journal_identity", None)
+    execution_scope = getattr(runtime_contract, "safety_execution_domain_scope", None)
+    account_scope = getattr(runtime_contract, "safety_account_scope", None)
+    if (
+        type(journal_path_value) is not str
+        or journal_path_value != evidence.safety_journal_path
+        or type(journal_identity) is not str
+        or journal_identity != evidence.safety_journal_identity
+        or execution_scope != PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
+        or type(account_scope) is not str
+    ):
+        raise ExactStateBootstrapError("runtime safety journal does not match reviewed evidence")
+    journal_path = Path(journal_path_value)
+    binding: SQLitePathBinding | None = None
+    connection: sqlite3.Connection | None = None
+    try:
+        binding = SQLitePathBinding.open_for_initialization(journal_path, create=False)
+        if (binding.device, binding.inode) != (
+            evidence.safety_journal_device,
+            evidence.safety_journal_inode,
+        ):
+            raise ExactStateBootstrapError("runtime safety journal identity changed")
+        connection = sqlite3.connect(
+            journal_path.as_uri() + "?mode=rw",
+            uri=True,
+            timeout=1.0,
+            isolation_level=None,
+        )
+        connection.execute("PRAGMA busy_timeout=1000")
+        connection_binding = binding.bind_sqlite_connection(
+            sqlite_connection_file_identity(connection)
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        replay = SafetyJournal(journal_path).replay_and_bind_runtime_path(
+            expected_execution_domain_scope=execution_scope,
+            expected_account_scope=account_scope,
+        )
+        snapshot = tuple(
+            (int(row[0]), str(row[1]))
+            for row in connection.execute(
+                "SELECT sequence,chain_hash FROM safety_journal_events ORDER BY sequence"
+            ).fetchall()
+        )
+        if (
+            replay.last_sequence != evidence.safety_journal_last_sequence
+            or not hmac.compare_digest(
+                replay.last_chain_hash,
+                evidence.safety_journal_last_chain_hash,
+            )
+            or len(snapshot) != replay.last_sequence
+            or (snapshot and snapshot[-1] != (replay.last_sequence, replay.last_chain_hash))
+            or (not snapshot and replay.last_chain_hash != "0" * 64)
+        ):
+            raise ExactStateBootstrapError("runtime safety journal changed after review")
+        guard = ExactStateSafetyJournalGuard(
+            binding=binding,
+            connection=connection,
+            connection_binding=connection_binding,
+            snapshot=snapshot,
+        )
+        guard.assert_unchanged()
+        binding = None
+        connection = None
+        return guard
+    except (OSError, sqlite3.Error, SQLiteIdentityError) as exc:
+        raise ExactStateBootstrapError(
+            "runtime safety journal cannot be locked and revalidated"
+        ) from exc
+    finally:
+        if connection is not None:
+            if connection.in_transaction:
+                connection.rollback()
+            connection.close()
+        if binding is not None:
+            binding.close()
 
 
 def assert_exact_state_bootstrap_evidence(

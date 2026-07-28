@@ -20,6 +20,8 @@ from robo_trader.bootstrap_evidence_receivers import (
     PROTECTIVE_MARK_PRIVATE_KEY_FILENAME,
     RECONCILIATION_PRIVATE_KEY_FILENAME,
     BootstrapEvidenceReceiverError,
+    ProtectiveMarkBundleIdentity,
+    assert_protective_mark_receiver_capability,
     assert_reconciliation_receiver_capability,
     create_bootstrap_evidence_receivers,
 )
@@ -294,6 +296,12 @@ async def test_full_empty_position_evidence_chain_is_typed_and_one_shot(
         assert kwargs["mark_identities"] == ()
         assert kwargs["quote_source"] is provider
         assert provider.closed is False
+        mark_identity = assert_protective_mark_receiver_capability(
+            kwargs["receiver"],
+            runtime_contract=runtime,
+        )
+        assert type(mark_identity) is ProtectiveMarkBundleIdentity
+        assert mark_identity.reconciliation_snapshot_id.startswith("bootstrap-reconciliation-v1-")
         provider.events.append("marks")
         return ()
 
@@ -410,6 +418,50 @@ async def test_run_reaps_provider_once_when_receiver_factory_fails(
         )
 
     assert provider.close_count == 1
+
+
+def test_public_receivers_expose_no_raw_key_or_generic_signing_callable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _install_test_trust(monkeypatch, tmp_path)
+    database = tmp_path / "ledger.db"
+    _ledger(database)
+    receivers = create_bootstrap_evidence_receivers(
+        runtime_contract=_runtime(database),
+        capability_directory=capability,
+        output_directory=tmp_path / "evidence",
+    )
+    try:
+        for receiver in (
+            receivers.broker_snapshot,
+            receivers.reconciliation_report,
+            receivers.protective_mark,
+        ):
+            exposed: list[object] = []
+            for receiver_type in type(receiver).__mro__:
+                slots = getattr(receiver_type, "__slots__", ())
+                if isinstance(slots, str):
+                    slots = (slots,)
+                for slot in slots:
+                    if slot == "__weakref__":
+                        continue
+                    attribute = (
+                        f"_{receiver_type.__name__}{slot}"
+                        if slot.startswith("__") and not slot.endswith("__")
+                        else slot
+                    )
+                    exposed.append(getattr(receiver, attribute))
+            assert not any(isinstance(value, Ed25519PrivateKey) for value in exposed)
+            assert not hasattr(receiver, "sign")
+            assert not hasattr(receiver, "sign_bytes")
+            assert not any(
+                callable(getattr(receiver, name))
+                for name in dir(receiver)
+                if name.strip("_") in {"sign", "sign_bytes", "sign_payload"}
+            )
+    finally:
+        receivers.close()
 
 
 @pytest.mark.asyncio

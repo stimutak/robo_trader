@@ -39,7 +39,9 @@ from robo_trader.financial_state_bootstrap import (
     ExactStateBootstrapError,
     ExactStateBootstrapEvidence,
     ExactStateBootstrapReceipt,
+    ExactStateSafetyJournalGuard,
     _canonical_legacy_rows,
+    acquire_exact_state_safety_journal_guard,
     assert_exact_state_bootstrap_evidence,
     inspect_legacy_state,
     sqlite_table_evidence,
@@ -399,16 +401,7 @@ class AsyncTradingDatabase:
             raise
         finally:
             if binding is not None:
-                try:
-                    binding.close()
-                except BaseException as exc:
-                    if committed_receipt is not None:
-                        raise ExactStateBootstrapCommittedBackupInvalid(
-                            bootstrap_id=candidate.bootstrap_id,
-                            candidate_fingerprint=candidate.fingerprint(),
-                            detail=str(exc),
-                        ) from exc
-                    raise
+                binding.close()
 
     def _retire_pool_generation(self, reason: str) -> List[aiosqlite.Connection]:
         """Synchronously fail one generation before any cleanup can suspend."""
@@ -1790,7 +1783,12 @@ class AsyncTradingDatabase:
         binding: Optional[SQLitePathBinding] = None
         connection: Optional[aiosqlite.Connection] = None
         committed_receipt: Optional[ExactStateBootstrapReceipt] = None
+        journal_guard: Optional[ExactStateSafetyJournalGuard] = None
         try:
+            journal_guard = acquire_exact_state_safety_journal_guard(
+                evidence,
+                runtime_contract,
+            )
             binding = SQLitePathBinding.open_for_initialization(self.db_path, create=False)
             if (binding.device, binding.inode) != expected_identity:
                 raise ExactStateBootstrapError(
@@ -1812,6 +1810,7 @@ class AsyncTradingDatabase:
             self._verify_exact_state_backup(candidate, evidence, backup_receipt, descriptor)
 
             await connection.execute("BEGIN IMMEDIATE")
+            journal_guard.assert_unchanged()
             await self._assert_prebootstrap_tables_match_backup(connection, backup_receipt)
             self._paper_settlement_fault("BEFORE_EXACT_BOOTSTRAP_SCHEMA_PREP")
             await self._prepare_exact_bootstrap_schema(connection)
@@ -1824,6 +1823,7 @@ class AsyncTradingDatabase:
                 runtime_contract=runtime_contract,
                 connection=connection,
                 transaction_started=True,
+                journal_guard=journal_guard,
             )
             connection_binding.assert_connection_identity(
                 await self._sqlite_descriptor_identity(connection)
@@ -1858,6 +1858,8 @@ class AsyncTradingDatabase:
                     raise
             if binding is not None:
                 binding.close()
+            if journal_guard is not None:
+                journal_guard.close()
         if committed_receipt is None:
             raise ExactStateBootstrapError("atomic bootstrap returned no receipt")
         return committed_receipt
@@ -1871,13 +1873,21 @@ class AsyncTradingDatabase:
         operator_reason: str,
         runtime_contract: object,
     ) -> ExactStateBootstrapReceipt:
-        return await self._apply_exact_state_bootstrap(
-            candidate,
-            evidence=evidence,
-            backup_receipt=backup_receipt,
-            operator_reason=operator_reason,
-            runtime_contract=runtime_contract,
+        journal_guard = acquire_exact_state_safety_journal_guard(
+            evidence,
+            runtime_contract,
         )
+        try:
+            return await self._apply_exact_state_bootstrap(
+                candidate,
+                evidence=evidence,
+                backup_receipt=backup_receipt,
+                operator_reason=operator_reason,
+                runtime_contract=runtime_contract,
+                journal_guard=journal_guard,
+            )
+        finally:
+            journal_guard.close()
 
     async def _apply_exact_state_bootstrap(
         self,
@@ -1889,6 +1899,7 @@ class AsyncTradingDatabase:
         runtime_contract: object,
         connection: Optional[aiosqlite.Connection] = None,
         transaction_started: bool = False,
+        journal_guard: Optional[ExactStateSafetyJournalGuard] = None,
     ) -> ExactStateBootstrapReceipt:
         """Insert one sealed exact accounting epoch without rewriting legacy rows.
 
@@ -1917,6 +1928,9 @@ class AsyncTradingDatabase:
                 "bootstrap database identity does not match the runtime contract"
             )
         assert_exact_state_bootstrap_evidence(candidate, evidence, runtime_contract)
+        if journal_guard is None:
+            raise ExactStateBootstrapError("bootstrap requires a held exact safety-journal guard")
+        journal_guard.assert_unchanged()
 
         @asynccontextmanager
         async def connection_scope():
@@ -1945,6 +1959,7 @@ class AsyncTradingDatabase:
                         )
                 else:
                     await conn.execute("BEGIN IMMEDIATE")
+                journal_guard.assert_unchanged()
                 for authentication in evidence.authentication_receipts:
                     replay = await conn.execute(
                         """
@@ -2258,6 +2273,7 @@ class AsyncTradingDatabase:
                     raise ExactStateBootstrapError(
                         "bootstrap database descriptor changed before commit"
                     )
+                journal_guard.assert_unchanged()
                 await conn.commit()
                 try:
                     self._paper_settlement_fault("AFTER_EXACT_BOOTSTRAP_COMMIT")
