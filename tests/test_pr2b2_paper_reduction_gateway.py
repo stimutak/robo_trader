@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import pickle
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -34,6 +35,7 @@ from robo_trader.market_data_contract import (
 from robo_trader.paper_execution_capability import (
     PaperExecutionCapabilityError,
     _bind_gateway_baseline_execution,
+    _issue_gateway_baseline_terminal_dispatch,
     _issue_gateway_execution_binding_capability,
     _submit_gateway_baseline_once,
 )
@@ -755,6 +757,12 @@ def test_gateway_binding_capability_rejects_direct_copy_substitution_and_replay(
             capability=admitted,
         )
         assert not hasattr(binding, "_submit_baseline_once")
+        with pytest.raises(PaperExecutionCapabilityError, match="cannot copy"):
+            copy.copy(binding)
+        with pytest.raises(PaperExecutionCapabilityError, match="cannot copy"):
+            copy.deepcopy(binding)
+        with pytest.raises(PaperExecutionCapabilityError, match="cannot serialize"):
+            pickle.dumps(binding)
         with pytest.raises(PaperExecutionCapabilityError, match="already consumed"):
             _bind_gateway_baseline_execution(
                 **issue_kwargs,
@@ -783,9 +791,10 @@ async def test_baseline_entry_intent_is_exact_session_scoped_and_one_shot(
         handle=handle_b,
     )
     binding_a = harness.gateway._bindings["portfolio-a"].baseline_execution_binding
-    with pytest.raises(PaperExecutionCapabilityError, match="session does not match"):
+    with pytest.raises(PaperExecutionCapabilityError, match="dispatch is invalid"):
         _submit_gateway_baseline_once(
             binding_a,
+            object(),
             gateway=harness.gateway,
             runtime_context=harness.context,
             active_session=object(),
@@ -847,6 +856,76 @@ async def test_baseline_entry_intent_is_exact_session_scoped_and_one_shot(
             portfolio_id="portfolio-a",
             intent=intent_a,
         )
+
+
+@pytest.mark.asyncio
+async def test_baseline_terminal_dispatch_direct_replay_cannot_fill_twice(
+    harness: GatewayHarness,
+) -> None:
+    executor = PaperExecutor()
+    await _bind_runtime(harness, "portfolio-a", executor)
+    binding = harness.gateway._bindings["portfolio-a"].baseline_execution_binding
+    now = datetime.now(timezone.utc)
+    quote = BrokerProtectiveQuote(
+        schema_version=1,
+        symbol=SYMBOL,
+        con_id=CON_ID,
+        exchange="SMART",
+        primary_exchange="NASDAQ",
+        currency="USD",
+        security_type="STK",
+        price=Decimal("123.4500"),
+        source_timestamp=now,
+        retrieval_timestamp=now,
+        session=MarketSession.REGULAR,
+        source=MarketDataSource.IBKR_LIVE_LAST_TRADE,
+        source_event_id="entry-dispatch-replay-test",
+        transport_generation="gateway-generation",
+        market_data_type=1,
+    )
+    harness.gateway._fetch_protective_quotes_locked = AsyncMock(return_value=(quote,))
+    order = Order(SYMBOL, 1, "BUY", quote.price, order_ref="baseline-dispatch-replay")
+
+    async with harness.gateway.serialize_entry(SYMBOL, portfolio_id="portfolio-a"):
+        task = asyncio.current_task()
+        assert task is not None
+        session = harness.gateway._active_entry_sessions[task]
+        session.consumed = True
+        dispatch = _issue_gateway_baseline_terminal_dispatch(
+            binding,
+            gateway=harness.gateway,
+            runtime_context=harness.context,
+            active_session=session,
+            order=order,
+        )
+        first = _submit_gateway_baseline_once(
+            binding,
+            dispatch,
+            gateway=harness.gateway,
+            runtime_context=harness.context,
+            active_session=session,
+            order=order,
+        )
+        with pytest.raises(PaperExecutionCapabilityError, match="already issued"):
+            _issue_gateway_baseline_terminal_dispatch(
+                binding,
+                gateway=harness.gateway,
+                runtime_context=harness.context,
+                active_session=session,
+                order=order,
+            )
+        with pytest.raises(PaperExecutionCapabilityError, match="already consumed"):
+            _submit_gateway_baseline_once(
+                binding,
+                dispatch,
+                gateway=harness.gateway,
+                runtime_context=harness.context,
+                active_session=session,
+                order=order,
+            )
+
+    assert first.ok is True
+    assert len(executor.fills) == 1
 
 
 def test_gateway_requires_exact_runtime_coordinator_database_and_executor_binding(

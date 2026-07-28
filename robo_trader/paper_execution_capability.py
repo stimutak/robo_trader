@@ -15,7 +15,10 @@ import weakref
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from .execution import PaperExecutor
 
 
 class PaperExecutionCapabilityError(RuntimeError):
@@ -73,6 +76,48 @@ class _GatewayExecutionBindingCapability:
         return self.__copy__()
 
 
+class _GatewayReductionBindingCapability:
+    """Opaque one-shot grant for the reduction half of registration."""
+
+    __slots__ = ("__weakref__",)
+
+    def __new__(cls, *, _token: object | None = None):
+        if _token is not _REDUCTION_BIND_CAPABILITY_TOKEN:
+            raise PaperExecutionCapabilityError("reduction binding capability is issuer-only")
+        return super().__new__(cls)
+
+    def __copy__(self):
+        with _REGISTRY_LOCK:
+            record = _REDUCTION_BINDINGS.get(self)
+            if type(record) is _ReductionBindingRecord:
+                record.consumed = True
+        raise PaperExecutionCapabilityError("reduction binding capability cannot copy")
+
+    def __deepcopy__(self, _memo):
+        return self.__copy__()
+
+    def __reduce__(self):
+        raise PaperExecutionCapabilityError("reduction binding capability cannot serialize")
+
+
+class _BaselineTerminalDispatch:
+    __slots__ = ("__weakref__",)
+
+    def __new__(cls, *, _token: object | None = None):
+        if _token is not _TERMINAL_DISPATCH_TOKEN:
+            raise PaperExecutionCapabilityError("baseline terminal dispatch is issuer-only")
+        return super().__new__(cls)
+
+
+class _ReductionTerminalDispatch:
+    __slots__ = ("__weakref__",)
+
+    def __new__(cls, *, _token: object | None = None):
+        if _token is not _TERMINAL_DISPATCH_TOKEN:
+            raise PaperExecutionCapabilityError("reduction terminal dispatch is issuer-only")
+        return super().__new__(cls)
+
+
 @dataclass(slots=True)
 class _CapabilityRecord:
     authority: object
@@ -94,9 +139,49 @@ class _GatewayBindingRecord:
     consumed: bool = False
 
 
-_REDUCTION_BIND_TOKEN = object()
+@dataclass(slots=True)
+class _BaselineBindingRecord:
+    gateway: object
+    runtime_context: object
+    executor: object
+    portfolio_id: str
+
+
+@dataclass(slots=True)
+class _ReductionBindingRecord(_GatewayBindingRecord):
+    coordinator: object = None
+
+
+@dataclass(slots=True)
+class _ReductionAuthorityRecord:
+    gateway: object
+    runtime_context: object
+    executor: object
+    portfolio_id: str
+    coordinator: object
+    submitter: object | None = None
+
+
+@dataclass(slots=True)
+class _TerminalDispatchRecord:
+    binding: object | None
+    gateway: object | None
+    runtime_context: object | None
+    active_session: object | None
+    submitter: object | None
+    coordinator: object | None
+    executor: object
+    portfolio_id: str
+    fingerprint: _OrderFingerprint
+    pre_position_quantity: Decimal | None
+    consumed: bool = False
+
+
 _BIND_CAPABILITY_TOKEN = object()
+_REDUCTION_BIND_CAPABILITY_TOKEN = object()
+_REDUCTION_AUTHORITY_TOKEN = object()
 _BASELINE_BIND_TOKEN = object()
+_TERMINAL_DISPATCH_TOKEN = object()
 _CAPABILITY_TOKEN = object()
 _REGISTRY_LOCK = threading.Lock()
 _CAPABILITIES: weakref.WeakKeyDictionary[_PaperExecutionCapability, _CapabilityRecord] = (
@@ -105,114 +190,61 @@ _CAPABILITIES: weakref.WeakKeyDictionary[_PaperExecutionCapability, _CapabilityR
 _GATEWAY_BINDINGS: weakref.WeakKeyDictionary[
     _GatewayExecutionBindingCapability, _GatewayBindingRecord
 ] = weakref.WeakKeyDictionary()
+_BASELINE_BINDINGS: weakref.WeakKeyDictionary[
+    _GatewayBaselineExecutionBinding, _BaselineBindingRecord
+] = weakref.WeakKeyDictionary()
+_REDUCTION_BINDINGS: weakref.WeakKeyDictionary[
+    _GatewayReductionBindingCapability, _ReductionBindingRecord
+] = weakref.WeakKeyDictionary()
+_REDUCTION_AUTHORITIES: weakref.WeakKeyDictionary[
+    PaperReductionExecutionAuthority, _ReductionAuthorityRecord
+] = weakref.WeakKeyDictionary()
+_BASELINE_DISPATCHES: weakref.WeakKeyDictionary[
+    _BaselineTerminalDispatch, _TerminalDispatchRecord
+] = weakref.WeakKeyDictionary()
+_REDUCTION_DISPATCHES: weakref.WeakKeyDictionary[
+    _ReductionTerminalDispatch, _TerminalDispatchRecord
+] = weakref.WeakKeyDictionary()
 
 
 class PaperReductionExecutionAuthority:
-    """Sealed executor/portfolio binding for coordinator-authorized reductions."""
+    """Opaque methodless identity for one gateway-bound reduction runtime."""
 
-    __slots__ = ("__executor", "__portfolio_id", "__sealed")
-    __executor: Any
-    __portfolio_id: str
-    __sealed: bool
+    __slots__ = ("__weakref__",)
 
-    def __init__(
-        self,
-        executor: object,
-        portfolio_id: str,
-        *,
-        _token: object | None = None,
-    ) -> None:
-        if _token is not _REDUCTION_BIND_TOKEN:
-            raise PaperExecutionCapabilityError(
-                "paper reduction authority must be bound by its sealed submitter"
-            )
-        if (
-            not isinstance(portfolio_id, str)
-            or not portfolio_id
-            or portfolio_id.strip() != portfolio_id
-        ):
-            raise PaperExecutionCapabilityError("paper execution portfolio scope is malformed")
-        object.__setattr__(self, "_PaperReductionExecutionAuthority__executor", executor)
-        object.__setattr__(self, "_PaperReductionExecutionAuthority__portfolio_id", portfolio_id)
-        object.__setattr__(self, "_PaperReductionExecutionAuthority__sealed", True)
+    def __new__(cls, *, _token: object | None = None):
+        if _token is not _REDUCTION_AUTHORITY_TOKEN:
+            raise PaperExecutionCapabilityError("paper reduction authority is gateway-only")
+        return super().__new__(cls)
 
-    def __setattr__(self, name: str, value: object) -> None:
-        if getattr(self, "_PaperReductionExecutionAuthority__sealed", False):
-            raise AttributeError("PaperReductionExecutionAuthority is sealed")
-        object.__setattr__(self, name, value)
+    def __copy__(self):
+        raise PaperExecutionCapabilityError("paper reduction authority cannot copy")
 
-    def _is_bound_to(self, executor: object, portfolio_id: str) -> bool:
-        return self.__executor is executor and self.__portfolio_id == portfolio_id
+    def __deepcopy__(self, _memo):
+        return self.__copy__()
 
-    def _submit_reduction_once(self, order: object, *, pre_position_quantity: Decimal):
-        fingerprint = _fingerprint_order(order)
-        _validate_reduction_bounds(fingerprint, pre_position_quantity)
-        capability = _PaperExecutionCapability(_token=_CAPABILITY_TOKEN)
-        with _REGISTRY_LOCK:
-            _CAPABILITIES[capability] = _CapabilityRecord(
-                authority=self,
-                executor=self.__executor,
-                portfolio_id=self.__portfolio_id,
-                kind=_CapabilityKind.REDUCTION,
-                fingerprint=fingerprint,
-                pre_position_quantity=pre_position_quantity,
-            )
-        return self.__executor._place_simple_order(
-            order,
-            _capability=capability,
-        )
+    def __reduce__(self):
+        raise PaperExecutionCapabilityError("paper reduction authority cannot serialize")
 
 
 class _GatewayBaselineExecutionBinding:
-    """Sealed baseline binding with no submission method of its own."""
+    """Opaque registry-backed identity for one baseline runtime binding."""
 
-    __slots__ = (
-        "_executor",
-        "_gateway",
-        "_portfolio_id",
-        "_runtime_context",
-        "__sealed",
-    )
-    _executor: Any
-    _gateway: object
-    _portfolio_id: str
-    _runtime_context: object
-    __sealed: bool
+    __slots__ = ("__weakref__",)
 
-    def __init__(
-        self,
-        *,
-        gateway: object,
-        runtime_context: object,
-        executor: object,
-        portfolio_id: str,
-        _token: object | None = None,
-    ) -> None:
+    def __new__(cls, *, _token: object | None = None):
         if _token is not _BASELINE_BIND_TOKEN:
             raise PaperExecutionCapabilityError("baseline execution binding is gateway-only")
-        object.__setattr__(self, "_gateway", gateway)
-        object.__setattr__(self, "_runtime_context", runtime_context)
-        object.__setattr__(self, "_executor", executor)
-        object.__setattr__(self, "_portfolio_id", portfolio_id)
-        object.__setattr__(self, "_GatewayBaselineExecutionBinding__sealed", True)
+        return super().__new__(cls)
 
-    def __setattr__(self, name: str, value: object) -> None:
-        if getattr(self, "_GatewayBaselineExecutionBinding__sealed", False):
-            raise AttributeError("GatewayBaselineExecutionBinding is sealed")
-        object.__setattr__(self, name, value)
+    def __copy__(self):
+        raise PaperExecutionCapabilityError("baseline execution binding cannot copy")
 
+    def __deepcopy__(self, _memo):
+        return self.__copy__()
 
-def _bind_paper_reduction_execution_authority(
-    executor: object,
-    portfolio_id: str,
-) -> PaperReductionExecutionAuthority:
-    """Private reduction-submitter binding hook."""
-
-    return PaperReductionExecutionAuthority(
-        executor,
-        portfolio_id,
-        _token=_REDUCTION_BIND_TOKEN,
-    )
+    def __reduce__(self):
+        raise PaperExecutionCapabilityError("baseline execution binding cannot serialize")
 
 
 def _issue_gateway_execution_binding_capability(
@@ -286,49 +318,185 @@ def _bind_gateway_baseline_execution(
         raise PaperExecutionCapabilityError(
             "gateway execution binding capability does not match runtime"
         )
-    return _GatewayBaselineExecutionBinding(
+    binding = _GatewayBaselineExecutionBinding(_token=_BASELINE_BIND_TOKEN)
+    with _REGISTRY_LOCK:
+        _BASELINE_BINDINGS[binding] = _BaselineBindingRecord(
+            gateway=gateway,
+            runtime_context=runtime_context,
+            executor=executor,
+            portfolio_id=portfolio_id,
+        )
+    return binding
+
+
+def _issue_gateway_reduction_binding_capability(
+    *,
+    gateway: object,
+    runtime_context: object,
+    binding_session: object,
+    executor: object,
+    portfolio_id: str,
+    coordinator: object,
+) -> _GatewayReductionBindingCapability:
+    """Issue exactly one reduction binding grant in gateway registration."""
+
+    _validate_gateway_binding_scope(
         gateway=gateway,
         runtime_context=runtime_context,
+        binding_session=binding_session,
         executor=executor,
         portfolio_id=portfolio_id,
-        _token=_BASELINE_BIND_TOKEN,
     )
+    from .safety import SafetyRuntimeCoordinator
+
+    if (
+        type(coordinator) is not SafetyRuntimeCoordinator
+        or coordinator.started is not True
+        or getattr(gateway, "_coordinator", None) is not coordinator
+    ):
+        raise PaperExecutionCapabilityError("reduction coordinator binding is invalid")
+    if getattr(binding_session, "reduction_capability_issued", False):
+        raise PaperExecutionCapabilityError(
+            "gateway runtime binding session already issued reduction capability"
+        )
+    setattr(binding_session, "reduction_capability_issued", True)
+    capability = _GatewayReductionBindingCapability(_token=_REDUCTION_BIND_CAPABILITY_TOKEN)
+    with _REGISTRY_LOCK:
+        _REDUCTION_BINDINGS[capability] = _ReductionBindingRecord(
+            gateway=gateway,
+            runtime_context=runtime_context,
+            binding_session=binding_session,
+            executor=executor,
+            portfolio_id=portfolio_id,
+            coordinator=coordinator,
+        )
+    return capability
 
 
-def _submit_gateway_baseline_once(
+def _bind_gateway_reduction_execution(
+    *,
+    gateway: object,
+    runtime_context: object,
+    binding_session: object,
+    executor: object,
+    portfolio_id: str,
+    coordinator: object,
+    capability: object,
+) -> PaperReductionExecutionAuthority:
+    """Consume one gateway grant and register a methodless reduction authority."""
+
+    if type(capability) is not _GatewayReductionBindingCapability:
+        raise PaperExecutionCapabilityError("reduction binding capability is invalid")
+    with _REGISTRY_LOCK:
+        record = _REDUCTION_BINDINGS.get(capability)
+        if type(record) is not _ReductionBindingRecord or record.consumed:
+            raise PaperExecutionCapabilityError(
+                "reduction binding capability is unknown or already consumed"
+            )
+        record.consumed = True
+    _validate_gateway_binding_scope(
+        gateway=gateway,
+        runtime_context=runtime_context,
+        binding_session=binding_session,
+        executor=executor,
+        portfolio_id=portfolio_id,
+    )
+    if (
+        record.gateway is not gateway
+        or record.runtime_context is not runtime_context
+        or record.binding_session is not binding_session
+        or record.executor is not executor
+        or record.portfolio_id != portfolio_id
+        or record.coordinator is not coordinator
+    ):
+        raise PaperExecutionCapabilityError("reduction binding does not match runtime")
+    authority = PaperReductionExecutionAuthority(_token=_REDUCTION_AUTHORITY_TOKEN)
+    with _REGISTRY_LOCK:
+        _REDUCTION_AUTHORITIES[authority] = _ReductionAuthorityRecord(
+            gateway=gateway,
+            runtime_context=runtime_context,
+            executor=executor,
+            portfolio_id=portfolio_id,
+            coordinator=coordinator,
+        )
+    return authority
+
+
+def _attach_gateway_reduction_submitter(
+    authority: object,
+    *,
+    submitter: object,
+    executor: object,
+    coordinator: object,
+    portfolio_id: str,
+) -> None:
+    """Bind the exact sealed submitter once, before the gateway publishes it."""
+
+    if type(authority) is not PaperReductionExecutionAuthority:
+        raise PaperExecutionCapabilityError("reduction authority is invalid")
+    with _REGISTRY_LOCK:
+        record = _REDUCTION_AUTHORITIES.get(authority)
+        if (
+            type(record) is not _ReductionAuthorityRecord
+            or record.submitter is not None
+            or record.executor is not executor
+            or record.coordinator is not coordinator
+            or record.portfolio_id != portfolio_id
+        ):
+            raise PaperExecutionCapabilityError("reduction submitter binding is invalid")
+        record.submitter = submitter
+
+
+def _reduction_authority_matches(
+    authority: object,
+    *,
+    executor: object,
+    coordinator: object,
+    portfolio_id: str,
+) -> bool:
+    with _REGISTRY_LOCK:
+        record = (
+            _REDUCTION_AUTHORITIES.get(authority)
+            if type(authority) is PaperReductionExecutionAuthority
+            else None
+        )
+        return bool(
+            type(record) is _ReductionAuthorityRecord
+            and record.executor is executor
+            and record.coordinator is coordinator
+            and record.portfolio_id == portfolio_id
+        )
+
+
+def _issue_gateway_baseline_terminal_dispatch(
     binding: object,
     *,
     gateway: object,
     runtime_context: object,
     active_session: object,
     order: object,
-):
-    """Submit a BUY only from the exact active gateway entry session."""
+) -> _BaselineTerminalDispatch:
+    """Register one terminal dispatch for the exact active entry session."""
 
     from .paper_reduction_gateway import (
         PaperReductionGateway,
         _ActiveEntrySession,
     )
 
-    if type(binding) is not _GatewayBaselineExecutionBinding:
-        raise PaperExecutionCapabilityError("baseline execution binding is invalid")
     task = asyncio.current_task()
     sessions = getattr(gateway, "_active_entry_sessions", None)
+    fingerprint = _fingerprint_order(order)
     if (
         type(gateway) is not PaperReductionGateway
         or gateway.started is not True
-        or binding._gateway is not gateway
-        or binding._runtime_context is not runtime_context
         or getattr(gateway, "_runtime_context", None) is not runtime_context
         or type(active_session) is not _ActiveEntrySession
         or not isinstance(sessions, dict)
         or task is None
         or sessions.get(task) is not active_session
         or active_session.consumed is not True
-        or active_session.portfolio_id != binding._portfolio_id
     ):
         raise PaperExecutionCapabilityError("baseline gateway session does not match binding")
-    fingerprint = _fingerprint_order(order)
     if (
         fingerprint.side != "BUY"
         or fingerprint.take_profit is not None
@@ -336,17 +504,214 @@ def _submit_gateway_baseline_once(
         or fingerprint.price != active_session.quote.price
     ):
         raise PaperExecutionCapabilityError("baseline order does not match gateway session")
+    with _REGISTRY_LOCK:
+        binding_record = (
+            _BASELINE_BINDINGS.get(binding)
+            if type(binding) is _GatewayBaselineExecutionBinding
+            else None
+        )
+        if (
+            type(binding_record) is not _BaselineBindingRecord
+            or binding_record.gateway is not gateway
+            or binding_record.runtime_context is not runtime_context
+            or active_session.portfolio_id != binding_record.portfolio_id
+            or active_session.dispatch_issued is True
+        ):
+            raise PaperExecutionCapabilityError(
+                "baseline gateway session does not match binding or already issued"
+            )
+        active_session.dispatch_issued = True
+        dispatch = _BaselineTerminalDispatch(_token=_TERMINAL_DISPATCH_TOKEN)
+        _BASELINE_DISPATCHES[dispatch] = _TerminalDispatchRecord(
+            binding=binding,
+            gateway=gateway,
+            runtime_context=runtime_context,
+            active_session=active_session,
+            submitter=None,
+            coordinator=None,
+            executor=binding_record.executor,
+            portfolio_id=binding_record.portfolio_id,
+            fingerprint=fingerprint,
+            pre_position_quantity=None,
+        )
+    return dispatch
+
+
+def _submit_gateway_baseline_once(
+    binding: object,
+    dispatch: object,
+    *,
+    gateway: object,
+    runtime_context: object,
+    active_session: object,
+    order: object,
+):
+    """Atomically burn one registered baseline dispatch before submission."""
+
+    if type(dispatch) is not _BaselineTerminalDispatch:
+        raise PaperExecutionCapabilityError("baseline terminal dispatch is invalid")
+    with _REGISTRY_LOCK:
+        record = _BASELINE_DISPATCHES.get(dispatch)
+        if type(record) is not _TerminalDispatchRecord or record.consumed:
+            raise PaperExecutionCapabilityError(
+                "baseline terminal dispatch is unknown or already consumed"
+            )
+        record.consumed = True
+        expected_binding = record.binding
+        expected_gateway = record.gateway
+        expected_context = record.runtime_context
+        expected_session = record.active_session
+        executor = cast("PaperExecutor", record.executor)
+        portfolio_id = record.portfolio_id
+        expected_fingerprint = record.fingerprint
+        record.binding = None
+        record.gateway = None
+        record.runtime_context = None
+        record.active_session = None
+    fingerprint = _fingerprint_order(order)
+    if (
+        type(binding) is not _GatewayBaselineExecutionBinding
+        or expected_binding is not binding
+        or expected_gateway is not gateway
+        or expected_context is not runtime_context
+        or expected_session is not active_session
+        or fingerprint != expected_fingerprint
+    ):
+        raise PaperExecutionCapabilityError("baseline terminal dispatch does not match attempt")
     capability = _PaperExecutionCapability(_token=_CAPABILITY_TOKEN)
     with _REGISTRY_LOCK:
         _CAPABILITIES[capability] = _CapabilityRecord(
             authority=binding,
-            executor=binding._executor,
-            portfolio_id=binding._portfolio_id,
+            executor=executor,
+            portfolio_id=portfolio_id,
             kind=_CapabilityKind.BASELINE_ENTRY,
             fingerprint=fingerprint,
             pre_position_quantity=None,
         )
-    return binding._executor._place_simple_order(order, _capability=capability)
+    return executor._place_simple_order(order, _capability=capability)
+
+
+def _issue_gateway_reduction_terminal_dispatch(
+    authority: object,
+    *,
+    submitter: object,
+    executor: object,
+    coordinator: object,
+    final_allocation: object,
+    descriptor: object,
+    contract: object,
+    order: object,
+    pre_position_quantity: Decimal,
+) -> _ReductionTerminalDispatch:
+    """Register one dispatch after the coordinator envelope was claimed."""
+
+    from .safety.runtime import _consume_claimed_paper_submission_allocation
+
+    try:
+        _consume_claimed_paper_submission_allocation(
+            final_allocation,
+            coordinator=coordinator,
+            descriptor=descriptor,
+            contract=contract,
+        )
+    except (RuntimeError, TypeError) as exc:
+        raise PaperExecutionCapabilityError(
+            "reduction terminal dispatch lacks exact final allocation"
+        ) from exc
+    fingerprint = _fingerprint_order(order)
+    try:
+        from .paper_reduction_submitter import _map_order
+
+        expected_fingerprint = _fingerprint_order(_map_order(descriptor, contract))
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise PaperExecutionCapabilityError(
+            "reduction final allocation is not terminally representable"
+        ) from exc
+    if fingerprint != expected_fingerprint:
+        raise PaperExecutionCapabilityError(
+            "reduction order does not match the claimed final allocation"
+        )
+    _validate_reduction_bounds(fingerprint, pre_position_quantity)
+    with _REGISTRY_LOCK:
+        authority_record = (
+            _REDUCTION_AUTHORITIES.get(authority)
+            if type(authority) is PaperReductionExecutionAuthority
+            else None
+        )
+        if (
+            type(authority_record) is not _ReductionAuthorityRecord
+            or authority_record.submitter is not submitter
+            or authority_record.executor is not executor
+            or authority_record.coordinator is not coordinator
+        ):
+            raise PaperExecutionCapabilityError("reduction terminal issuer is not bound")
+        dispatch = _ReductionTerminalDispatch(_token=_TERMINAL_DISPATCH_TOKEN)
+        _REDUCTION_DISPATCHES[dispatch] = _TerminalDispatchRecord(
+            binding=authority,
+            gateway=authority_record.gateway,
+            runtime_context=authority_record.runtime_context,
+            active_session=None,
+            submitter=submitter,
+            coordinator=coordinator,
+            executor=executor,
+            portfolio_id=authority_record.portfolio_id,
+            fingerprint=fingerprint,
+            pre_position_quantity=pre_position_quantity,
+        )
+    return dispatch
+
+
+def _submit_gateway_reduction_once(
+    authority: object,
+    dispatch: object,
+    *,
+    submitter: object,
+    order: object,
+    pre_position_quantity: Decimal,
+):
+    """Atomically burn one submitter-issued reduction dispatch."""
+
+    if type(dispatch) is not _ReductionTerminalDispatch:
+        raise PaperExecutionCapabilityError("reduction terminal dispatch is invalid")
+    with _REGISTRY_LOCK:
+        record = _REDUCTION_DISPATCHES.get(dispatch)
+        if type(record) is not _TerminalDispatchRecord or record.consumed:
+            raise PaperExecutionCapabilityError(
+                "reduction terminal dispatch is unknown or already consumed"
+            )
+        record.consumed = True
+        expected_authority = record.binding
+        expected_submitter = record.submitter
+        executor = cast("PaperExecutor", record.executor)
+        portfolio_id = record.portfolio_id
+        expected_fingerprint = record.fingerprint
+        expected_pre_position = record.pre_position_quantity
+        record.binding = None
+        record.gateway = None
+        record.runtime_context = None
+        record.submitter = None
+        record.coordinator = None
+    fingerprint = _fingerprint_order(order)
+    _validate_reduction_bounds(fingerprint, pre_position_quantity)
+    if (
+        type(authority) is not PaperReductionExecutionAuthority
+        or expected_authority is not authority
+        or expected_submitter is not submitter
+        or fingerprint != expected_fingerprint
+        or pre_position_quantity != expected_pre_position
+    ):
+        raise PaperExecutionCapabilityError("reduction terminal dispatch does not match attempt")
+    capability = _PaperExecutionCapability(_token=_CAPABILITY_TOKEN)
+    with _REGISTRY_LOCK:
+        _CAPABILITIES[capability] = _CapabilityRecord(
+            authority=authority,
+            executor=executor,
+            portfolio_id=portfolio_id,
+            kind=_CapabilityKind.REDUCTION,
+            fingerprint=fingerprint,
+            pre_position_quantity=pre_position_quantity,
+        )
+    return executor._place_simple_order(order, _capability=capability)
 
 
 def _validate_gateway_binding_scope(

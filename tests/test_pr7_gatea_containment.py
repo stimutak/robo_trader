@@ -27,11 +27,13 @@ from robo_trader.multiuser.portfolio_config import PortfolioConfig, load_portfol
 from robo_trader.order_manager import OrderManager, OrderStatus
 from robo_trader.paper_execution_capability import (
     PaperExecutionCapabilityError,
-    _bind_paper_reduction_execution_authority,
+    _issue_gateway_reduction_terminal_dispatch,
+    _submit_gateway_reduction_once,
 )
 from robo_trader.runner.signal_generator import SignalGenerator
 from robo_trader.runner.trade_executor import TradeExecutor
 from robo_trader.runner_async import run_continuous
+from tests.paper_execution_test_support import bind_gateway_reduction_harness
 
 
 @pytest.mark.parametrize(
@@ -73,6 +75,13 @@ def test_gate_a_safe_environment_has_one_strategy() -> None:
     profile = validate_gate_a_environment({})
 
     assert profile.enabled_strategies == ALLOWED_STRATEGIES
+
+
+def test_example_environment_uses_the_only_admitted_strategy() -> None:
+    example = (Path(__file__).parents[1] / ".env.example").read_text(encoding="utf-8")
+
+    assignments = [line for line in example.splitlines() if line.startswith("STRATEGY_ENABLED=")]
+    assert assignments == ["STRATEGY_ENABLED=baseline_sma  # Gate-A permits exactly this strategy"]
 
 
 @pytest.mark.parametrize(
@@ -197,8 +206,13 @@ def test_baseline_intent_and_terminal_capability_have_single_runtime_call_sites(
 
 def test_no_independently_bindable_baseline_authority_exists() -> None:
     assert not hasattr(capability_module, "_bind_paper_execution_authority")
-    authority = _bind_paper_reduction_execution_authority(PaperExecutor(), "default")
+    assert not hasattr(capability_module, "_bind_paper_reduction_execution_authority")
+    authority = bind_gateway_reduction_harness(
+        PaperExecutor(),
+        "default",
+    ).authority
     assert not hasattr(authority, "_submit_baseline_once")
+    assert not hasattr(authority, "_submit_reduction_once")
 
 
 def test_paper_executor_rejects_every_naked_submission(monkeypatch) -> None:
@@ -222,13 +236,13 @@ def test_paper_executor_rejects_every_naked_submission(monkeypatch) -> None:
 
 def test_bound_authority_preserves_exact_reductions() -> None:
     executor = PaperExecutor()
-    authority = _bind_paper_reduction_execution_authority(executor, "default")
+    harness = bind_gateway_reduction_harness(executor, "default")
 
-    sell = authority._submit_reduction_once(
+    sell = harness.submit(
         Order("AAPL", 1, "SELL", Decimal("100.0000")),
         pre_position_quantity=Decimal("1"),
     )
-    cover = authority._submit_reduction_once(
+    cover = harness.submit(
         Order("MSFT", 2, "BUY_TO_COVER", Decimal("50.0000")),
         pre_position_quantity=Decimal("-2"),
     )
@@ -251,20 +265,21 @@ def test_reduction_capability_cannot_cross_zero(
     side: str, quantity: int, pre_position: Decimal
 ) -> None:
     executor = PaperExecutor()
-    authority = _bind_paper_reduction_execution_authority(executor, "default")
+    harness = bind_gateway_reduction_harness(executor, "default")
 
-    with pytest.raises(PaperExecutionCapabilityError, match="exposure"):
-        authority._submit_reduction_once(
-            Order("AAPL", quantity, side, Decimal("100.0000")),
-            pre_position_quantity=pre_position,
-        )
+    result = harness.submit(
+        Order("AAPL", quantity, side, Decimal("100.0000")),
+        pre_position_quantity=pre_position,
+    )
 
+    assert result.ok is False
+    assert "exposure" in result.message
     assert executor.fills == {}
 
 
 def test_capability_substitution_burns_authority(monkeypatch) -> None:
     executor = PaperExecutor()
-    authority = _bind_paper_reduction_execution_authority(executor, "default")
+    harness = bind_gateway_reduction_harness(executor, "default")
     captured = []
 
     def capture(_order, *, _capability):
@@ -273,7 +288,7 @@ def test_capability_substitution_burns_authority(monkeypatch) -> None:
 
     monkeypatch.setattr(executor, "_place_simple_order", capture)
     original = Order("AAPL", 1, "SELL", Decimal("100.0000"))
-    authority._submit_reduction_once(
+    harness.submit(
         original,
         pre_position_quantity=Decimal("1"),
     )
@@ -294,6 +309,70 @@ def test_capability_substitution_burns_authority(monkeypatch) -> None:
     assert "does not match" in substituted.message
     assert replay.ok is False
     assert "already consumed" in replay.message
+    assert executor.fills == {}
+
+
+@pytest.mark.parametrize(
+    ("side", "pre_position"),
+    [("SELL", Decimal("1")), ("BUY_TO_COVER", Decimal("-1"))],
+)
+def test_direct_reduction_helpers_reject_unregistered_authority(
+    side: str,
+    pre_position: Decimal,
+) -> None:
+    executor = PaperExecutor()
+    order = Order("AAPL", 1, side, Decimal("100.0000"))
+
+    with pytest.raises(PaperExecutionCapabilityError, match="final allocation"):
+        _issue_gateway_reduction_terminal_dispatch(
+            object(),
+            submitter=object(),
+            executor=executor,
+            coordinator=object(),
+            final_allocation=object(),
+            descriptor=object(),
+            contract=object(),
+            order=order,
+            pre_position_quantity=pre_position,
+        )
+    with pytest.raises(PaperExecutionCapabilityError, match="dispatch is invalid"):
+        _submit_gateway_reduction_once(
+            object(),
+            object(),
+            submitter=object(),
+            order=order,
+            pre_position_quantity=pre_position,
+        )
+
+    assert executor.fills == {}
+
+
+def test_reduction_terminal_dispatch_mismatch_burns_before_replay() -> None:
+    executor = PaperExecutor()
+    harness = bind_gateway_reduction_harness(executor, "default")
+    admitted = Order("AAPL", 1, "SELL", Decimal("100.0000"))
+    dispatch = harness.issue(
+        admitted,
+        pre_position_quantity=Decimal("1"),
+    )
+
+    with pytest.raises(PaperExecutionCapabilityError, match="does not match attempt"):
+        _submit_gateway_reduction_once(
+            harness.authority,
+            dispatch,
+            submitter=harness.submitter_identity,
+            order=Order("MSFT", 1, "SELL", Decimal("100.0000")),
+            pre_position_quantity=Decimal("1"),
+        )
+    with pytest.raises(PaperExecutionCapabilityError, match="already consumed"):
+        _submit_gateway_reduction_once(
+            harness.authority,
+            dispatch,
+            submitter=harness.submitter_identity,
+            order=admitted,
+            pre_position_quantity=Decimal("1"),
+        )
+
     assert executor.fills == {}
 
 

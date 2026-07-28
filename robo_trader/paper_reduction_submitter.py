@@ -15,7 +15,13 @@ from enum import Enum
 from typing import Optional
 
 from .execution import ExecutionResult, Order, PaperExecutor
-from .paper_execution_capability import PaperReductionExecutionAuthority
+from .paper_execution_capability import (
+    PaperReductionExecutionAuthority,
+    _attach_gateway_reduction_submitter,
+    _issue_gateway_reduction_terminal_dispatch,
+    _reduction_authority_matches,
+    _submit_gateway_reduction_once,
+)
 from .runtime_contract_constants import PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
 from .safety.models import (
     EvidenceStatus,
@@ -220,15 +226,23 @@ class PaperReductionSubmitter:
             )
         if not coordinator.started:
             raise PaperReductionSubmissionError("coordinator must be started before binding")
-        if type(
-            execution_authority
-        ) is not PaperReductionExecutionAuthority or not execution_authority._is_bound_to(
-            executor, portfolio_id
+        if not _reduction_authority_matches(
+            execution_authority,
+            executor=executor,
+            coordinator=coordinator,
+            portfolio_id=portfolio_id,
         ):
             raise PaperReductionSubmissionError("execution authority is malformed")
         self.__executor = executor
         self.__coordinator = coordinator
         self.__authority = execution_authority
+        _attach_gateway_reduction_submitter(
+            execution_authority,
+            submitter=self,
+            executor=executor,
+            coordinator=coordinator,
+            portfolio_id=portfolio_id,
+        )
         self.__sealed = True
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -270,7 +284,9 @@ class PaperReductionSubmitter:
         # Claim first. Every subsequent failure remains one-shot and cannot
         # cause a second paper fill through replay or concurrent reuse.
         try:
-            descriptor, contract = coordinator._claim_consumed_paper_submission(envelope)
+            descriptor, contract, final_allocation = coordinator._claim_consumed_paper_submission(
+                envelope
+            )
         except (RuntimeError, TypeError, ValidationError) as exc:
             raise PaperReductionSubmissionError("paper submission envelope claim failed") from exc
 
@@ -282,8 +298,22 @@ class PaperReductionSubmitter:
         # This is deliberately the adapter's sole execution call. It bypasses
         # legacy soft gates only after final safety revalidation and durable
         # permit consumption; there is no validation, smart, fallback, or retry.
-        result = self.__authority._submit_reduction_once(
-            order,
+        terminal_dispatch = _issue_gateway_reduction_terminal_dispatch(
+            self.__authority,
+            submitter=self,
+            executor=executor,
+            coordinator=coordinator,
+            final_allocation=final_allocation,
+            descriptor=descriptor,
+            contract=contract,
+            order=order,
+            pre_position_quantity=pre_position_quantity,
+        )
+        result = _submit_gateway_reduction_once(
+            self.__authority,
+            terminal_dispatch,
+            submitter=self,
+            order=order,
             pre_position_quantity=pre_position_quantity,
         )
         return _terminal_outcome(result, safe_descriptor)
@@ -301,10 +331,11 @@ def _bind_paper_reduction_submitter(
         raise PaperReductionSubmissionError("executor must be exactly PaperExecutor")
     if type(coordinator) is not SafetyRuntimeCoordinator:
         raise PaperReductionSubmissionError("coordinator must be exactly SafetyRuntimeCoordinator")
-    if type(
-        execution_authority
-    ) is not PaperReductionExecutionAuthority or not execution_authority._is_bound_to(
-        executor, portfolio_id
+    if not _reduction_authority_matches(
+        execution_authority,
+        executor=executor,
+        coordinator=coordinator,
+        portfolio_id=portfolio_id,
     ):
         raise PaperReductionSubmissionError("execution authority binding does not match")
     return PaperReductionSubmitter(

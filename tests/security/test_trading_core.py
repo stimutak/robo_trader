@@ -20,14 +20,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from robo_trader.execution import ExecutionResult, Order, PaperExecutor
-from robo_trader.paper_execution_capability import (
-    _bind_paper_reduction_execution_authority,
-)
 from robo_trader.paper_reduction_submitter import (
     LocalPaperOrderStatus,
     LocalPaperOutcomeProvenance,
     LocalPaperTerminalOutcome,
 )
+from tests.paper_execution_test_support import bind_gateway_reduction_harness
 from robo_trader.portfolio import Portfolio
 from robo_trader.protective_quote_evidence import ProtectiveQuoteSource
 from robo_trader.risk.advanced_risk import AdvancedRiskManager, KillSwitch
@@ -219,7 +217,7 @@ def test_validate_order_rejects_nan_quantity() -> None:
 
 def test_paper_executor_rejects_nan_price() -> None:
     px = PaperExecutor()
-    res = _bind_paper_reduction_execution_authority(px, "test")._submit_reduction_once(
+    res = bind_gateway_reduction_harness(px, "test").submit(
         Order("AAPL", quantity=1, side="BUY_TO_COVER", price=float("nan")),
         pre_position_quantity=Decimal("-1"),
     )
@@ -338,8 +336,8 @@ def test_pairs_buy_calls_validate_order() -> None:
 def test_paper_executor_rejects_stale_cached_price(monkeypatch: pytest.MonkeyPatch) -> None:
     px = PaperExecutor()
     # Seed cache with a price ~ now
-    authority = _bind_paper_reduction_execution_authority(px, "test")
-    res = authority._submit_reduction_once(
+    harness = bind_gateway_reduction_harness(px, "test")
+    res = harness.submit(
         Order("AAPL", quantity=1, side="BUY_TO_COVER", price=100.0),
         pre_position_quantity=Decimal("-1"),
     )
@@ -351,7 +349,7 @@ def test_paper_executor_rejects_stale_cached_price(monkeypatch: pytest.MonkeyPat
     px._execution_cache_ts["AAPL"] = dt.datetime.utcnow() - dt.timedelta(seconds=120)
 
     # Now a market order (price=None) should fail with a staleness error
-    res = authority._submit_reduction_once(
+    res = harness.submit(
         Order("AAPL", quantity=1, side="BUY_TO_COVER", price=None),
         pre_position_quantity=Decimal("-1"),
     )

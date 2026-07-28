@@ -13,9 +13,6 @@ from pathlib import Path
 import pytest
 
 from robo_trader.execution import ExecutionResult, Order, PaperExecutor
-from robo_trader.paper_execution_capability import (
-    _bind_paper_reduction_execution_authority,
-)
 from robo_trader.paper_reduction_submitter import (
     LocalPaperOrderStatus,
     LocalPaperOutcomeProvenance,
@@ -48,6 +45,7 @@ from robo_trader.safety.runtime import (
     SafetyRuntimeCoordinator,
     _assemble_coherent_safety_snapshot,
 )
+from tests.paper_execution_test_support import bind_gateway_reduction_authority
 
 ACCOUNT_SCOPE = "acct_v1_" + hashlib.sha256(b"paper-submit-account").hexdigest()
 OTHER_ACCOUNT_SCOPE = "acct_v1_" + hashlib.sha256(b"other-account").hexdigest()
@@ -205,7 +203,11 @@ def _make_case(
         portfolio_quantity=starting_quantity,
     )
     executor = PaperExecutor()
-    authority = _bind_paper_reduction_execution_authority(executor, "portfolio-a")
+    authority, _ = bind_gateway_reduction_authority(
+        executor,
+        "portfolio-a",
+        coordinator=coordinator,
+    )
     submitter = _bind_paper_reduction_submitter(
         executor,
         coordinator,
@@ -516,7 +518,11 @@ def test_cross_account_coordinator_cannot_claim_envelope(tmp_path: Path) -> None
     foreign_submitter = _bind_paper_reduction_submitter(
         second.executor,
         second.coordinator,
-        _bind_paper_reduction_execution_authority(second.executor, "portfolio-a"),
+        bind_gateway_reduction_authority(
+            second.executor,
+            "portfolio-a",
+            coordinator=second.coordinator,
+        )[0],
         "portfolio-a",
     )
     with pytest.raises(PaperReductionSubmissionError, match="claim failed"):
@@ -863,7 +869,13 @@ def test_adapter_has_one_capability_call_and_no_forbidden_route() -> None:
         for node in ast.walk(tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     ]
-    assert sum(node.func.attr == "_submit_reduction_once" for node in calls) == 1
+    named_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    ]
+    assert sum(node.func.id == "_submit_gateway_reduction_once" for node in named_calls) == 1
+    assert not any(node.func.attr == "_submit_reduction_once" for node in calls)
     assert not any(node.func.attr == "_place_simple_order" for node in calls)
     forbidden = {
         "place_order",

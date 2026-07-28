@@ -615,6 +615,7 @@ class RuntimeAuthorization:
 
 _FINAL_EVIDENCE_PROOF_MARKER = object()
 _CONSUMED_ENVELOPE_MARKER = object()
+_CLAIMED_PAPER_ALLOCATION_TOKEN = object()
 _RUNTIME_AUTHORIZATION_REGISTRY_LOCK = threading.RLock()
 _RUNTIME_AUTHORIZATION_REGISTRY: dict[
     int, tuple[weakref.ReferenceType[RuntimeAuthorization], str]
@@ -626,6 +627,16 @@ _FINAL_EVIDENCE_REGISTRY: dict[
 _CONSUMED_ENVELOPE_REGISTRY_LOCK = threading.RLock()
 _CONSUMED_ENVELOPE_REGISTRY: dict[
     int, tuple[weakref.ReferenceType["ConsumedPaperSubmissionEnvelope"], str]
+] = {}
+_CLAIMED_PAPER_ALLOCATION_REGISTRY_LOCK = threading.RLock()
+_CLAIMED_PAPER_ALLOCATION_REGISTRY: dict[
+    int,
+    tuple[
+        weakref.ReferenceType["_ClaimedPaperSubmissionAllocation"],
+        object,
+        SubmissionDescriptor,
+        AuthoritativeContract,
+    ],
 ] = {}
 
 
@@ -818,6 +829,77 @@ class ConsumedPaperSubmissionEnvelope:
 
     def __reduce__(self):
         raise TypeError("ConsumedPaperSubmissionEnvelope cannot be serialized")
+
+
+class _ClaimedPaperSubmissionAllocation:
+    """Opaque one-shot identity emitted only after coordinator envelope claim."""
+
+    __slots__ = ("__weakref__",)
+
+    def __new__(cls, *, _token: object | None = None):
+        if _token is not _CLAIMED_PAPER_ALLOCATION_TOKEN:
+            raise RuntimeSafetyError("claimed paper allocation is coordinator-only")
+        return super().__new__(cls)
+
+    def __copy__(self):
+        raise TypeError("claimed paper allocation cannot be copied")
+
+    def __deepcopy__(self, _memo):
+        return self.__copy__()
+
+    def __reduce__(self):
+        raise TypeError("claimed paper allocation cannot be serialized")
+
+
+def _register_claimed_paper_submission_allocation(
+    allocation: _ClaimedPaperSubmissionAllocation,
+    *,
+    coordinator_token: object,
+    descriptor: SubmissionDescriptor,
+    contract: AuthoritativeContract,
+) -> None:
+    object_id = id(allocation)
+
+    def discard(reference: weakref.ReferenceType[_ClaimedPaperSubmissionAllocation]) -> None:
+        with _CLAIMED_PAPER_ALLOCATION_REGISTRY_LOCK:
+            registered = _CLAIMED_PAPER_ALLOCATION_REGISTRY.get(object_id)
+            if registered is not None and registered[0] is reference:
+                _CLAIMED_PAPER_ALLOCATION_REGISTRY.pop(object_id, None)
+
+    reference = weakref.ref(allocation, discard)
+    with _CLAIMED_PAPER_ALLOCATION_REGISTRY_LOCK:
+        _CLAIMED_PAPER_ALLOCATION_REGISTRY[object_id] = (
+            reference,
+            coordinator_token,
+            descriptor,
+            contract,
+        )
+
+
+def _consume_claimed_paper_submission_allocation(
+    allocation: object,
+    *,
+    coordinator: object,
+    descriptor: object,
+    contract: object,
+) -> None:
+    """Burn and verify the exact final allocation before terminal dispatch."""
+
+    if type(allocation) is not _ClaimedPaperSubmissionAllocation:
+        raise RuntimeSafetyError("exact claimed paper allocation is required")
+    with _CLAIMED_PAPER_ALLOCATION_REGISTRY_LOCK:
+        registered = _CLAIMED_PAPER_ALLOCATION_REGISTRY.pop(id(allocation), None)
+    if (
+        registered is None
+        or registered[0]() is not allocation
+        or type(coordinator) is not SafetyRuntimeCoordinator
+        or registered[1] is not coordinator._coordinator_token
+        or registered[2] is not descriptor
+        or registered[3] is not contract
+    ):
+        raise RuntimeSafetyError(
+            "claimed paper allocation is forged, changed, replayed, or foreign"
+        )
 
 
 def _final_evidence_digest(proof: FinalSubmissionEvidenceProof) -> str:
@@ -1414,7 +1496,11 @@ class SafetyRuntimeCoordinator:
     def _claim_consumed_paper_submission(
         self,
         envelope: ConsumedPaperSubmissionEnvelope,
-    ) -> tuple[SubmissionDescriptor, AuthoritativeContract]:
+    ) -> tuple[
+        SubmissionDescriptor,
+        AuthoritativeContract,
+        _ClaimedPaperSubmissionAllocation,
+    ]:
         """Atomically claim the exact envelope for the bound paper adapter."""
 
         with self._startup_lock:
@@ -1437,7 +1523,14 @@ class SafetyRuntimeCoordinator:
                 or contract.transport_generation != envelope.contract_transport_generation
             ):
                 raise RuntimeSafetyError("claimed paper envelope lineage is inconsistent")
-            return descriptor, contract
+            allocation = _ClaimedPaperSubmissionAllocation(_token=_CLAIMED_PAPER_ALLOCATION_TOKEN)
+            _register_claimed_paper_submission_allocation(
+                allocation,
+                coordinator_token=self._coordinator_token,
+                descriptor=descriptor,
+                contract=contract,
+            )
+            return descriptor, contract, allocation
 
     def release_after_local_paper_settlement(
         self,

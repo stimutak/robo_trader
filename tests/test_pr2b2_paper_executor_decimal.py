@@ -9,9 +9,7 @@ import pytest
 
 import robo_trader.execution as execution_module
 from robo_trader.execution import ExecutionResult, Order, PaperExecutor
-from robo_trader.paper_execution_capability import (
-    _bind_paper_reduction_execution_authority,
-)
+from tests.paper_execution_test_support import bind_gateway_reduction_harness
 
 
 def _order(*, side: str = "BUY_TO_COVER", price: float | Decimal = Decimal("123.45")) -> Order:
@@ -25,14 +23,14 @@ def _order(*, side: str = "BUY_TO_COVER", price: float | Decimal = Decimal("123.
 
 
 def _submit(executor: PaperExecutor, order: Order) -> ExecutionResult:
-    authority = _bind_paper_reduction_execution_authority(executor, "test")
+    harness = bind_gateway_reduction_harness(executor, "test")
     if order.side == "SELL":
-        return authority._submit_reduction_once(
+        return harness.submit(
             order,
             pre_position_quantity=Decimal(order.quantity),
         )
     if order.side == "BUY_TO_COVER":
-        return authority._submit_reduction_once(
+        return harness.submit(
             order,
             pre_position_quantity=Decimal(-order.quantity),
         )
