@@ -1388,6 +1388,143 @@ service.record_fill(ExecutedFill(
         ).fetchall() == [("durable",)]
 
 
+def test_hot_journal_monotonic_rejection_preserves_all_original_evidence(tmp_path):
+    if not hasattr(signal, "SIGKILL"):
+        pytest.skip("SIGKILL unavailable on this host")
+    path = tmp_path / "monotonic-replay-hot.db"
+    verifier = TestMonotonicVerifier()
+    ledger = _service(path, monotonic_verifier=verifier)
+    ledger.record_fill(_fill("older"))
+    old_database = path.read_bytes()
+    old_anchor = ledger.anchor_path.read_bytes()
+    ledger.record_fill(_fill("newer"))
+
+    path.write_bytes(old_database)
+    ledger.anchor_path.write_bytes(old_anchor)
+    os.chmod(ledger.anchor_path, 0o600)
+    script = f"""
+import signal
+import sqlite3
+
+connection = sqlite3.connect({str(path)!r}, isolation_level=None)
+connection.execute('PRAGMA journal_mode=DELETE')
+connection.execute('PRAGMA synchronous=FULL')
+connection.execute('PRAGMA cache_size=1')
+connection.execute('PRAGMA cache_spill=ON')
+connection.execute('BEGIN IMMEDIATE')
+connection.execute('CREATE TABLE spill_payload (id INTEGER PRIMARY KEY, value BLOB)')
+connection.executemany(
+    'INSERT INTO spill_payload VALUES (?, randomblob(4096))',
+    ((index,) for index in range(1, 513)),
+)
+print('READY', flush=True)
+signal.pause()
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "READY"
+        os.kill(child.pid, signal.SIGKILL)
+        child.wait(timeout=10)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+
+    journal = Path(f"{path}-journal")
+    assert journal.exists() and journal.stat().st_size > 0
+    database_before = _file_snapshot(path)
+    journal_before = _file_snapshot(journal)
+    anchor_before = _file_snapshot(ledger.anchor_path)
+    paths_before = _path_inventory(tmp_path)
+
+    with pytest.raises(FilledNotionalIntegrityError, match="monotonic authority rejected"):
+        _service(path, monotonic_verifier=verifier)
+
+    assert _file_snapshot(path) == database_before
+    assert _file_snapshot(journal) == journal_before
+    assert _file_snapshot(ledger.anchor_path) == anchor_before
+    assert _path_inventory(tmp_path) == paths_before
+
+
+def test_hot_journal_is_revalidated_under_lock_immediately_before_recovery(tmp_path, monkeypatch):
+    if not hasattr(signal, "SIGKILL"):
+        pytest.skip("SIGKILL unavailable on this host")
+    path = tmp_path / "replaced-hot-journal.db"
+    ledger = _service(path)
+    ledger.record_fill(_fill("durable-before-replacement"))
+    script = f"""
+import signal
+import sqlite3
+
+connection = sqlite3.connect({str(path)!r}, isolation_level=None)
+connection.execute('PRAGMA journal_mode=DELETE')
+connection.execute('PRAGMA synchronous=FULL')
+connection.execute('PRAGMA cache_size=1')
+connection.execute('PRAGMA cache_spill=ON')
+connection.execute('BEGIN IMMEDIATE')
+connection.execute('CREATE TABLE spill_payload (id INTEGER PRIMARY KEY, value BLOB)')
+connection.executemany(
+    'INSERT INTO spill_payload VALUES (?, randomblob(4096))',
+    ((index,) for index in range(1, 513)),
+)
+print('READY', flush=True)
+signal.pause()
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "READY"
+        os.kill(child.pid, signal.SIGKILL)
+        child.wait(timeout=10)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+
+    journal = Path(f"{path}-journal")
+    replacement = tmp_path / "replacement.journal"
+    replacement_bytes = bytearray(journal.read_bytes())
+    replacement_bytes[0] ^= 0xFF
+    replacement.write_bytes(replacement_bytes)
+    original_validator = DailyFilledNotional._validate_hot_journal_recovery_on_copy
+    validation_calls = 0
+
+    def replace_after_first_validation(self):
+        nonlocal validation_calls
+        validation_calls += 1
+        evidence = original_validator(self)
+        if validation_calls == 1:
+            os.replace(replacement, journal)
+        return evidence
+
+    monkeypatch.setattr(
+        DailyFilledNotional,
+        "_validate_hot_journal_recovery_on_copy",
+        replace_after_first_validation,
+    )
+    database_before = _file_snapshot(path)
+    anchor_before = _file_snapshot(ledger.anchor_path)
+
+    with pytest.raises(FilledNotionalError):
+        _service(path)
+
+    assert validation_calls == 2
+    assert _file_snapshot(path) == database_before
+    assert journal.read_bytes() == bytes(replacement_bytes)
+    assert _file_snapshot(ledger.anchor_path) == anchor_before
+
+
 def test_sigkill_spilled_hot_journal_rejects_hardlinked_main_without_mutation(tmp_path):
     if not hasattr(signal, "SIGKILL"):
         pytest.skip("SIGKILL unavailable on this host")

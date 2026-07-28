@@ -437,6 +437,22 @@ class _Anchor:
     mac: str
 
 
+@dataclass(frozen=True, slots=True)
+class _RecoveryFileEvidence:
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+    digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class _HotJournalRecoveryEvidence:
+    database: _RecoveryFileEvidence
+    journal: _RecoveryFileEvidence
+
+
 def _normalized_sql(value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         return ""
@@ -717,9 +733,9 @@ class DailyFilledNotional:
                 database_was_missing = self._database_path_is_missing()
                 if database_was_missing:
                     self._preflight_missing_database_artifacts()
-                    recovery_required = False
+                    recovery_required = None
                 else:
-                    recovery_required = self._preflight_existing_schema()
+                    recovery_required = None
                 with self._anchor_transition_lock(
                     pre_create_check=(
                         self._reject_missing_database_artifacts if database_was_missing else None
@@ -730,8 +746,10 @@ class DailyFilledNotional:
                         created = self._initialize_if_missing()
                         if not created:
                             recovery_required = self._preflight_existing_schema()
-                    if recovery_required:
-                        self._recover_hot_journal()
+                    else:
+                        recovery_required = self._preflight_existing_schema()
+                    if recovery_required is not None:
+                        self._recover_hot_journal(recovery_required)
                     with self._connection(readonly=True) as connection:
                         connection.execute("BEGIN")
                         state = self._validate_ledger(connection)
@@ -1576,10 +1594,14 @@ class DailyFilledNotional:
                 "preserve it for reviewed recovery"
             )
 
-    def _recover_hot_journal(self) -> None:
+    def _recover_hot_journal(self, expected: _HotJournalRecoveryEvidence) -> None:
         """Force identity-bound SQLite recovery before any read-only open."""
 
         self._require_exclusive_database_path()
+        if self._validate_hot_journal_recovery_on_copy() != expected:
+            raise FilledNotionalUnavailable(
+                "hot-journal recovery evidence changed after validation"
+            )
         with self._connection(readonly=False) as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute("PRAGMA schema_version").fetchone()
@@ -1659,7 +1681,7 @@ class DailyFilledNotional:
                 "SQLite ledger must use rollback-journal mode; WAL is unsupported"
             )
 
-    def _preflight_existing_schema(self) -> bool:
+    def _preflight_existing_schema(self) -> Optional[_HotJournalRecoveryEvidence]:
         """Identify legacy state without permitting SQLite journal recovery."""
 
         self._require_exclusive_database_path()
@@ -1695,8 +1717,7 @@ class DailyFilledNotional:
                 raise FilledNotionalUnavailable(
                     "hot journal recovery anchor does not bind this database"
                 )
-            self._validate_hot_journal_recovery_on_copy()
-            return True
+            return self._validate_hot_journal_recovery_on_copy()
         try:
             with self._connection(readonly=True, immutable=True) as connection:
                 self._schema_version(connection)
@@ -1708,10 +1729,10 @@ class DailyFilledNotional:
             raise FilledNotionalUnavailable(
                 "existing schema cannot be detected without SQLite recovery"
             ) from exc
-        return False
+        return None
 
     @staticmethod
-    def _copy_exclusive_regular_file(source: Path, target: Path) -> None:
+    def _copy_exclusive_regular_file(source: Path, target: Path) -> _RecoveryFileEvidence:
         """Copy a stable, single-link source without following a replacement path."""
 
         source_descriptor: Optional[int] = None
@@ -1739,10 +1760,12 @@ class DailyFilledNotional:
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
                 0o600,
             )
+            digest = hashlib.sha256()
             while True:
                 chunk = os.read(source_descriptor, 1024 * 1024)
                 if not chunk:
                     break
+                digest.update(chunk)
                 view = memoryview(chunk)
                 while view:
                     written = os.write(target_descriptor, view)
@@ -1770,6 +1793,14 @@ class DailyFilledNotional:
                 raise FilledNotionalUnavailable(
                     "hot-journal recovery evidence changed while being copied"
                 )
+            return _RecoveryFileEvidence(
+                device=after.st_dev,
+                inode=after.st_ino,
+                size=after.st_size,
+                modified_ns=after.st_mtime_ns,
+                changed_ns=after.st_ctime_ns,
+                digest=digest.hexdigest(),
+            )
         except FilledNotionalError:
             raise
         except OSError as exc:
@@ -1782,7 +1813,7 @@ class DailyFilledNotional:
             if source_descriptor is not None:
                 os.close(source_descriptor)
 
-    def _validate_hot_journal_recovery_on_copy(self) -> None:
+    def _validate_hot_journal_recovery_on_copy(self) -> _HotJournalRecoveryEvidence:
         """Prove recovery yields the anchored current schema before touching evidence."""
 
         journal = Path(f"{self._path}-journal")
@@ -1790,14 +1821,19 @@ class DailyFilledNotional:
             with tempfile.TemporaryDirectory(prefix="filled-notional-recovery-") as directory:
                 copied_database = Path(directory) / "ledger.sqlite3"
                 copied_journal = Path(f"{copied_database}-journal")
-                self._copy_exclusive_regular_file(self._path, copied_database)
-                self._copy_exclusive_regular_file(journal, copied_journal)
+                database_evidence = self._copy_exclusive_regular_file(self._path, copied_database)
+                journal_evidence = self._copy_exclusive_regular_file(journal, copied_journal)
                 with sqlite3.connect(copied_database, isolation_level=None) as connection:
                     connection.row_factory = sqlite3.Row
                     connection.execute("BEGIN")
                     state = self._validate_ledger(connection)
                     self._require_anchor_authenticates_recovered_state(state)
+                    self._verify_monotonic_state(state)
                     connection.commit()
+                return _HotJournalRecoveryEvidence(
+                    database=database_evidence,
+                    journal=journal_evidence,
+                )
         except FilledNotionalError:
             raise
         except (OSError, sqlite3.Error) as exc:
