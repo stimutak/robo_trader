@@ -50,21 +50,12 @@ FORBIDDEN_SIGNING_ENV = frozenset(
     }
 )
 _TRUST_ROOT = Path(__file__).with_name("bootstrap_evidence_trust")
-_PINNED_PUBLIC_KEYS: dict[str, tuple[Path, str]] = {
-    "broker_snapshot": (
-        _TRUST_ROOT / "broker_snapshot_ed25519_public.pem",
-        "f07b78427afc1c9ac34008de0d22da47636c3f2c04cb34783cbb34caa0c394e2",
-    ),
-    "reconciliation_report": (
-        _TRUST_ROOT / "reconciliation_report_ed25519_public.pem",
-        "48c087ce23c8bdc95cca3c11c1372631420b2a11f6ef062c126736dd05b59c13",
-    ),
-    "protective_mark": (
-        _TRUST_ROOT / "protective_mark_ed25519_public.pem",
-        "fa8963176466eb433593799177bea797cf63d8d2a34858afb48732374b2c5743",
-    ),
+_PINNED_PUBLIC_KEY_PATHS: dict[str, Path] = {
+    "broker_snapshot": (_TRUST_ROOT / "broker_snapshot_ed25519_public.pem"),
+    "reconciliation_report": (_TRUST_ROOT / "reconciliation_report_ed25519_public.pem"),
+    "protective_mark": _TRUST_ROOT / "protective_mark_ed25519_public.pem",
 }
-_PINNED_TRUST_SET_DIGEST = "d9269d1cd24431ae691b6736c59842d4cc69733588ad995dd943a5f5ead3311a"
+_TRUST_MANIFEST_PATH = _TRUST_ROOT / "manifest.json"
 _MAX_FILE_BYTES = 2 * 1024 * 1024
 
 
@@ -148,7 +139,7 @@ def _parse_utc(value: object, label: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def _receipt_payload(values: Mapping[str, object]) -> bytes:
+def receipt_signature_payload(values: Mapping[str, object]) -> bytes:
     signed = {
         key: values[key]
         for key in (
@@ -175,7 +166,7 @@ def _receipt_payload(values: Mapping[str, object]) -> bytes:
     )
 
 
-def _public_fingerprint(public_key: Ed25519PublicKey) -> str:
+def ed25519_public_key_fingerprint(public_key: Ed25519PublicKey) -> str:
     raw = public_key.public_bytes(
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw,
@@ -194,7 +185,51 @@ def _load_public_key(path: Path) -> Ed25519PublicKey:
     return key
 
 
-def _pinned_public_keys() -> dict[str, Ed25519PublicKey]:
+def _trust_manifest() -> dict[str, object]:
+    payload = _safe_file_bytes(
+        _TRUST_MANIFEST_PATH,
+        "bootstrap evidence trust manifest",
+        allow_public_read=True,
+    )
+    try:
+        manifest = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise BootstrapEvidenceAuthenticationError("trust manifest is invalid") from exc
+    expected_fields = {
+        "schema_version",
+        "producer_ids",
+        "public_key_fingerprints",
+        "trust_set_digest",
+    }
+    if (
+        type(manifest) is not dict
+        or set(manifest) != expected_fields
+        or manifest["schema_version"] != 1
+        or manifest["producer_ids"] != _KINDS
+        or type(manifest["public_key_fingerprints"]) is not dict
+        or set(manifest["public_key_fingerprints"]) != set(_KINDS)
+        or type(manifest["trust_set_digest"]) is not str
+    ):
+        raise BootstrapEvidenceAuthenticationError("trust manifest fields are invalid")
+    canonical = json.dumps(
+        {
+            "producer_ids": manifest["producer_ids"],
+            "public_key_fingerprints": manifest["public_key_fingerprints"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(digest, manifest["trust_set_digest"]):
+        raise BootstrapEvidenceAuthenticationError(
+            "bootstrap evidence trust-set manifest digest is invalid"
+        )
+    return manifest
+
+
+def _pinned_public_keys(
+    manifest: dict[str, object] | None = None,
+) -> dict[str, Ed25519PublicKey]:
     """Load the tracked trust set and reject every environment override surface."""
 
     rejected = _REJECTED_PUBLIC_KEY_ENV | FORBIDDEN_SIGNING_ENV
@@ -205,9 +240,18 @@ def _pinned_public_keys() -> dict[str, Ed25519PublicKey]:
         )
     keys: dict[str, Ed25519PublicKey] = {}
     fingerprints: dict[str, str] = {}
-    for kind, (path, expected_fingerprint) in _PINNED_PUBLIC_KEYS.items():
+    manifest = _trust_manifest() if manifest is None else manifest
+    expected_fingerprints = manifest["public_key_fingerprints"]
+    if type(expected_fingerprints) is not dict:  # pragma: no cover - checked above
+        raise BootstrapEvidenceAuthenticationError("trust manifest fingerprints are invalid")
+    for kind, path in _PINNED_PUBLIC_KEY_PATHS.items():
+        expected_fingerprint = expected_fingerprints[kind]
+        if type(expected_fingerprint) is not str:
+            raise BootstrapEvidenceAuthenticationError(
+                f"tracked {kind} verification fingerprint is malformed"
+            )
         key = _load_public_key(path)
-        actual_fingerprint = _public_fingerprint(key)
+        actual_fingerprint = ed25519_public_key_fingerprint(key)
         if not hmac.compare_digest(actual_fingerprint, expected_fingerprint):
             raise BootstrapEvidenceAuthenticationError(
                 f"tracked {kind} verification key does not match its immutable fingerprint"
@@ -224,26 +268,14 @@ def _pinned_public_keys() -> dict[str, Ed25519PublicKey]:
 def bootstrap_evidence_trust_public_dict() -> dict[str, object]:
     """Return reviewable trust facts included in every RuntimeContract fingerprint."""
 
-    keys = _pinned_public_keys()
-    fingerprints = {kind: _public_fingerprint(keys[kind]) for kind in sorted(_KINDS)}
-    canonical = json.dumps(
-        {
-            "producer_ids": {kind: _KINDS[kind] for kind in sorted(_KINDS)},
-            "public_key_fingerprints": fingerprints,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    trust_set_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    if not hmac.compare_digest(trust_set_digest, _PINNED_TRUST_SET_DIGEST):
-        raise BootstrapEvidenceAuthenticationError(
-            "bootstrap evidence trust-set manifest does not match its immutable digest"
-        )
+    manifest = _trust_manifest()
+    keys = _pinned_public_keys(manifest)
+    fingerprints = {kind: ed25519_public_key_fingerprint(keys[kind]) for kind in sorted(_KINDS)}
     return {
         "schema_version": 1,
         "producer_ids": {kind: _KINDS[kind] for kind in sorted(_KINDS)},
         "public_key_fingerprints": fingerprints,
-        "trust_set_digest": trust_set_digest,
+        "trust_set_digest": manifest["trust_set_digest"],
     }
 
 
@@ -300,12 +332,12 @@ def verify_receipt(
     ):
         raise BootstrapEvidenceAuthenticationError("authentication receipt is expired or future")
     public_key = _pinned_public_keys()[artifact_kind]
-    fingerprint = _public_fingerprint(public_key)
+    fingerprint = ed25519_public_key_fingerprint(public_key)
     if raw["public_key_fingerprint"] != fingerprint:
         raise BootstrapEvidenceAuthenticationError("authentication receipt uses the wrong key")
     try:
         signature = base64.b64decode(str(raw["signature_ed25519"]), validate=True)
-        public_key.verify(signature, _receipt_payload(raw))
+        public_key.verify(signature, receipt_signature_payload(raw))
     except (InvalidSignature, ValueError) as exc:
         raise BootstrapEvidenceAuthenticationError("authentication signature is invalid") from exc
     return AuthenticatedEvidenceReceipt(

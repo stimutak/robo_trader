@@ -31,6 +31,7 @@ from .bootstrap_evidence_auth import (
     verify_receipt,
 )
 from .runtime_contract_constants import PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
+from .reconciliation.domain import canonical_json, fingerprint
 from .safety.models import decimal_to_fixed, utc_to_text
 from .safety.sqlite_identity import (
     SQLiteIdentityError,
@@ -53,6 +54,7 @@ _BOOTSTRAP_ID = re.compile(r"^pboot-[0-9a-f]{32}$")
 _ACCOUNT_SCOPE = re.compile(r"^acct_v1_[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _SYMBOL = re.compile(r"^[A-Z][A-Z0-9.]{0,9}$")
+_PRINTABLE_EVENT_ID = re.compile(r"^[^\x00-\x1f\x7f]{1,128}$")
 
 
 class ExactStateBootstrapError(ValueError):
@@ -281,6 +283,12 @@ def _safe_id(value: object, label: str) -> str:
     return value
 
 
+def _printable_event_id(value: object, label: str) -> str:
+    if type(value) is not str or value != value.strip() or not _PRINTABLE_EVENT_ID.fullmatch(value):
+        raise ExactStateBootstrapError(f"{label} is malformed")
+    return value
+
+
 def _exact_keys(raw: Mapping[str, Any], expected: set[str], label: str) -> None:
     if set(raw) != expected:
         raise ExactStateBootstrapError(f"{label} fields are incomplete or unknown")
@@ -373,6 +381,17 @@ def _verified_json(path: Path, label: str) -> tuple[Mapping[str, Any], str]:
         raise ExactStateBootstrapError(f"{label} is not valid UTF-8 JSON") from exc
     if not isinstance(raw, Mapping):
         raise ExactStateBootstrapError(f"{label} must contain a JSON object")
+    return raw, hashlib.sha256(payload).hexdigest()
+
+
+def _verified_canonical_json(path: Path, label: str) -> tuple[Mapping[str, Any], str]:
+    payload, _ = _verified_regular_file_bytes(path, label)
+    try:
+        raw = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ExactStateBootstrapError(f"{label} is not valid UTF-8 JSON") from exc
+    if not isinstance(raw, Mapping) or canonical_json(raw).encode("utf-8") != payload:
+        raise ExactStateBootstrapError(f"{label} is not canonical producer JSON")
     return raw, hashlib.sha256(payload).hexdigest()
 
 
@@ -511,64 +530,228 @@ def load_exact_state_bootstrap_evidence(
             "runtime database must be a single-link non-symlink regular file"
         )
 
-    broker, broker_hash = _verified_json(Path(broker_snapshot_path), "broker snapshot")
+    broker, broker_hash = _verified_canonical_json(Path(broker_snapshot_path), "broker snapshot")
+    _exact_keys(
+        broker,
+        {"completed_order_collection_scope", "purpose", "snapshot"},
+        "broker producer result",
+    )
+    completed_scope = broker["completed_order_collection_scope"]
+    if type(completed_scope) is not dict:
+        raise ExactStateBootstrapError("broker completed-order scope is malformed")
+    _exact_keys(
+        completed_scope,
+        {
+            "all_clients",
+            "api_method",
+            "api_only",
+            "broker_time_after",
+            "broker_time_before",
+            "full_history",
+            "kind",
+            "request_count",
+            "request_completed_at",
+            "request_started_at",
+            "retention_scope",
+            "stability_check",
+            "verification_completed_at",
+            "verification_started_at",
+        },
+        "broker completed-order scope",
+    )
+    if (
+        _json_string(broker["purpose"], "broker producer purpose") != "bootstrap-broker-signing-v1"
+        or _json_string(completed_scope["kind"], "completed-order scope kind")
+        != "ibkr_current_retained_completed_orders"
+        or _json_string(completed_scope["api_method"], "completed-order API method")
+        != "reqCompletedOrders"
+        or _json_string(completed_scope["retention_scope"], "completed-order retention scope")
+        != "current_tws_or_gateway_retained_set"
+        or _json_int(completed_scope["request_count"], "completed-order request_count") != 2
+        or _json_string(completed_scope["stability_check"], "completed-order stability_check")
+        != "identical_second_read"
+        or _json_bool(completed_scope["api_only"], "completed-order api_only") is not False
+        or _json_bool(completed_scope["all_clients"], "completed-order all_clients") is not True
+        or _json_bool(completed_scope["full_history"], "completed-order full_history") is not False
+    ):
+        raise ExactStateBootstrapError("broker completed-order scope is not bounded/current")
+    scope_times = [
+        _utc(completed_scope[field], f"completed-order {field}")
+        for field in (
+            "request_started_at",
+            "request_completed_at",
+            "verification_started_at",
+            "verification_completed_at",
+        )
+    ]
+    if scope_times != sorted(scope_times):
+        raise ExactStateBootstrapError("broker completed-order scope is time-inconsistent")
+    scope_broker_time_before = _utc(
+        completed_scope["broker_time_before"], "completed-order broker_time_before"
+    )
+    scope_broker_time_after = _utc(
+        completed_scope["broker_time_after"], "completed-order broker_time_after"
+    )
+    if (
+        scope_times[-1] - scope_times[0] > timedelta(seconds=60)
+        or scope_times[0] < scope_broker_time_before - timedelta(seconds=120)
+        or scope_times[-1] > scope_broker_time_after + timedelta(seconds=120)
+    ):
+        raise ExactStateBootstrapError("broker completed-order scope is unbounded")
+    broker = broker["snapshot"]
+    if type(broker) is not dict:
+        raise ExactStateBootstrapError("broker normalized snapshot is malformed")
     _exact_keys(
         broker,
         {
-            "schema_version",
-            "snapshot_id",
-            "observed_at",
-            "broker_time_before",
-            "broker_time_after",
-            "runtime_fingerprint",
-            "execution_domain_scope",
-            "account_scope",
-            "broker_host",
-            "broker_port",
-            "read_only",
-            "managed_account_count",
+            "account",
+            "completeness",
+            "collection_evidence",
+            "executions",
+            "observed_from",
+            "observed_through",
+            "orders",
             "positions",
-            "open_orders",
+            "retrieved_at",
+            "schema_version",
+            "source_scope",
         },
         "broker snapshot",
     )
-    if _json_int(broker["schema_version"], "broker schema_version") != 1:
-        raise ExactStateBootstrapError("broker snapshot schema is unsupported")
-    broker_observed_at = _utc(broker["observed_at"], "broker observed_at")
-    broker_time_before = _utc(broker["broker_time_before"], "broker_time_before")
-    broker_time_after = _utc(broker["broker_time_after"], "broker_time_after")
-    if not broker_time_before <= broker_observed_at <= broker_time_after:
+    account = broker["account"]
+    completeness = broker["completeness"]
+    collections = broker["collection_evidence"]
+    if type(account) is not dict or type(completeness) is not dict:
+        raise ExactStateBootstrapError("broker account/completeness evidence is malformed")
+    _exact_keys(
+        account,
+        {
+            "account_alias",
+            "account_scope",
+            "account_type",
+            "base_currency",
+            "buying_power",
+            "observed_at",
+            "schema_version",
+            "source_scope",
+            "total_cash",
+        },
+        "broker account",
+    )
+    _exact_keys(
+        completeness,
+        {
+            "account",
+            "positions",
+            "open_orders",
+            "completed_orders",
+            "executions",
+            "commissions",
+        },
+        "broker completeness",
+    )
+    expected_collections = {
+        "positions",
+        "open_orders",
+        "completed_orders",
+        "executions",
+        "commissions",
+    }
+    if type(collections) is not list or len(collections) != len(expected_collections):
+        raise ExactStateBootstrapError("broker collection evidence is incomplete")
+    collection_names: set[str] = set()
+    broker_collection_ids: list[str] = []
+    collection_observed_times: list[datetime] = []
+    for collection in collections:
+        if type(collection) is not dict:
+            raise ExactStateBootstrapError("broker collection evidence is malformed")
+        _exact_keys(
+            collection,
+            {
+                "account_scope",
+                "collection",
+                "evidence_id",
+                "observed_at",
+                "result_count",
+                "schema_version",
+                "source_scope",
+            },
+            "broker collection evidence",
+        )
+        name = _json_string(collection["collection"], "broker collection")
+        collection_names.add(name)
+        evidence_id = _json_string(collection["evidence_id"], "broker collection evidence_id")
+        if not re.fullmatch(r"broker-collection-v1-[0-9a-f]{64}", evidence_id):
+            raise ExactStateBootstrapError("broker collection evidence identity is malformed")
+        broker_collection_ids.append(evidence_id)
+        collection_observed_times.append(
+            _utc(collection["observed_at"], "broker collection observed_at")
+        )
+        if (
+            not hmac.compare_digest(
+                _json_string(collection["account_scope"], "broker collection account_scope"),
+                account_scope,
+            )
+            or _json_int(collection["result_count"], "broker collection result_count") != 0
+            or _json_int(collection["schema_version"], "broker collection schema_version") != 1
+            or _json_string(collection["source_scope"], "broker collection source_scope")
+            != "ibkr-read-only"
+        ):
+            raise ExactStateBootstrapError("broker collection evidence is not zero/read-only")
+    broker_observed_at = _utc(broker["retrieved_at"], "broker retrieved_at")
+    broker_time_before = _utc(broker["observed_from"], "broker observed_from")
+    broker_time_after = _utc(broker["observed_through"], "broker observed_through")
+    account_observed_at = _utc(account["observed_at"], "broker account observed_at")
+    if (
+        scope_broker_time_before != broker_time_before
+        or scope_broker_time_after != broker_time_after
+        or not broker_time_before <= account_observed_at <= broker_time_after <= broker_observed_at
+        or any(
+            not broker_time_before <= observed_at <= broker_time_after
+            for observed_at in collection_observed_times
+        )
+    ):
         raise ExactStateBootstrapError("broker snapshot time bounds are inconsistent")
     _assert_fresh_against_wall_clock(broker_observed_at, "broker snapshot")
     if (
-        _json_string(broker["runtime_fingerprint"], "broker runtime_fingerprint")
-        != runtime_fingerprint
-        or _json_string(broker["execution_domain_scope"], "broker execution_domain_scope")
-        != PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
+        _json_int(broker["schema_version"], "broker schema_version") != 1
+        or _json_string(broker["source_scope"], "broker source_scope") != "ibkr-read-only"
+        or _json_int(account["schema_version"], "broker account schema_version") != 1
+        or _json_string(account["source_scope"], "broker account source_scope") != "ibkr-read-only"
+        or _json_string(account["account_type"], "broker account_type") != "paper"
+        or _json_string(account["account_alias"], "broker account_alias")
+        != expected_runtime_contract.account_alias
         or not hmac.compare_digest(
-            _json_string(broker["account_scope"], "broker account_scope"), account_scope
+            _json_string(account["account_scope"], "broker account_scope"), account_scope
         )
-        or _json_string(broker["broker_host"], "broker broker_host").casefold()
-        != str(expected_runtime_contract.ibkr_host).casefold()
-        or _json_int(broker["broker_port"], "broker broker_port") != 4002
-        or _json_bool(broker["read_only"], "broker read_only") is not True
-        or _json_int(broker["managed_account_count"], "broker managed_account_count") != 1
+        or set(completeness) != expected_collections | {"account"}
+        or any(
+            _json_bool(value, "broker completeness flag") is not True
+            for value in completeness.values()
+        )
+        or collection_names != expected_collections
+        or len(broker_collection_ids) != len(set(broker_collection_ids))
     ):
         raise ExactStateBootstrapError("broker snapshot is not bound to runtime evidence")
-    if type(broker["positions"]) is not list or type(broker["open_orders"]) is not list:
-        raise ExactStateBootstrapError("broker position/order evidence must be JSON arrays")
-    if broker["positions"] != [] or broker["open_orders"] != []:
-        raise ExactStateBootstrapError("broker snapshot does not prove zero paper exposure")
-    host = _json_string(broker["broker_host"], "broker broker_host").casefold()
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        address = None
-    if host not in {"localhost", "localhost."} and not (
-        address is not None and address.is_loopback
+    if (
+        not re.fullmatch(
+            r"[A-Z]{3}", _json_string(account["base_currency"], "broker base_currency")
+        )
+        or _decimal(account["buying_power"], "broker buying_power") < 0
     ):
-        raise ExactStateBootstrapError("broker snapshot is not bound to loopback")
-    broker_snapshot_id = _safe_id(broker["snapshot_id"], "broker snapshot_id")
+        raise ExactStateBootstrapError("broker account financial evidence is malformed")
+    _decimal(account["total_cash"], "broker total_cash")
+    if (
+        type(broker["positions"]) is not list
+        or type(broker["orders"]) is not list
+        or type(broker["executions"]) is not list
+        or broker["positions"] != []
+        or broker["orders"] != []
+        or broker["executions"] != []
+    ):
+        raise ExactStateBootstrapError("broker snapshot does not prove zero paper exposure")
+    broker_snapshot_id = fingerprint("broker-reconciliation-v1", broker)
+    broker_snapshot_hash = hashlib.sha256(canonical_json(broker).encode("utf-8")).hexdigest()
     broker_authenticated_at = _verify_artifact_authentication(
         artifact_path=Path(broker_snapshot_path),
         artifact_kind="broker_snapshot",
@@ -577,7 +760,7 @@ def load_exact_state_bootstrap_evidence(
         account_scope=account_scope,
     )
 
-    reconciliation, reconciliation_hash = _verified_json(
+    reconciliation, reconciliation_hash = _verified_canonical_json(
         Path(reconciliation_path), "reconciliation report"
     )
     _exact_keys(
@@ -597,6 +780,16 @@ def load_exact_state_bootstrap_evidence(
             "legacy_snapshot_hash",
             "broker_snapshot_id",
             "broker_snapshot_hash",
+            "broker_artifact_hash",
+            "broker_collection_evidence_ids",
+            "broker_receipt_id",
+            "broker_public_key_fingerprint",
+            "broker_verdict_id",
+            "broker_verdict_hash",
+            "comparison_coverage",
+            "reconciliation_status",
+            "local_simulator_positions_count",
+            "local_position_identities",
             "status",
             "authorizes_startup",
             "mutated_state",
@@ -607,6 +800,32 @@ def load_exact_state_bootstrap_evidence(
         "reconciliation report",
     )
     portfolio_ids = reconciliation["portfolio_ids"]
+    coverage = reconciliation["comparison_coverage"]
+    collection_ids = reconciliation["broker_collection_evidence_ids"]
+    local_position_identities = reconciliation["local_position_identities"]
+    if type(local_position_identities) is not list:
+        raise ExactStateBootstrapError("reconciliation local position identities are malformed")
+    normalized_position_identities: list[tuple[str, str]] = []
+    for identity in local_position_identities:
+        if type(identity) is not list or len(identity) != 2:
+            raise ExactStateBootstrapError("reconciliation local position identities are malformed")
+        portfolio_id = _safe_id(identity[0], "reconciliation position portfolio_id")
+        symbol = _json_string(identity[1], "reconciliation position symbol")
+        if symbol != symbol.upper() or not _SYMBOL.fullmatch(symbol):
+            raise ExactStateBootstrapError("reconciliation local position identities are malformed")
+        normalized_position_identities.append((portfolio_id, symbol))
+    expected_coverage = {
+        "broker_account",
+        "broker_positions",
+        "broker_open_orders",
+        "broker_completed_orders",
+        "broker_executions",
+        "broker_commissions",
+        "ledger_positions",
+        "ledger_orders",
+        "ledger_executions",
+        "ledger_cash",
+    }
     if (
         _json_int(reconciliation["schema_version"], "reconciliation schema_version") != 1
         or _json_string(reconciliation["status"], "reconciliation status")
@@ -627,6 +846,28 @@ def load_exact_state_bootstrap_evidence(
             "reconciliation broker_open_orders_count",
         )
         != 0
+        or _json_int(
+            reconciliation["local_simulator_positions_count"],
+            "reconciliation local simulator positions count",
+        )
+        != len(normalized_position_identities)
+        or normalized_position_identities != sorted(set(normalized_position_identities))
+        or type(coverage) is not dict
+        or set(coverage) != expected_coverage
+        or any(
+            _json_bool(value, "reconciliation coverage flag") is not True
+            for value in coverage.values()
+        )
+        or _json_string(
+            reconciliation["reconciliation_status"],
+            "reconciliation status",
+        )
+        not in {"passed", "degraded"}
+        or type(collection_ids) is not list
+        or len(collection_ids) != 5
+        or any(type(value) is not str for value in collection_ids)
+        or collection_ids != sorted(set(collection_ids))
+        or collection_ids != sorted(broker_collection_ids)
         or _json_string(reconciliation["runtime_fingerprint"], "reconciliation runtime_fingerprint")
         != runtime_fingerprint
         or _json_string(
@@ -650,12 +891,28 @@ def load_exact_state_bootstrap_evidence(
         != broker_snapshot_id
         or not hmac.compare_digest(
             _hash(reconciliation["broker_snapshot_hash"], "reconciliation broker_snapshot_hash"),
+            broker_snapshot_hash,
+        )
+        or not hmac.compare_digest(
+            _hash(reconciliation["broker_artifact_hash"], "reconciliation broker_artifact_hash"),
             broker_hash,
+        )
+        or _safe_id(reconciliation["broker_receipt_id"], "reconciliation broker receipt_id")
+        != broker_authenticated_at.receipt_id
+        or not hmac.compare_digest(
+            _hash(
+                reconciliation["broker_public_key_fingerprint"],
+                "reconciliation broker public key fingerprint",
+            ),
+            broker_authenticated_at.public_key_fingerprint,
         )
         or type(portfolio_ids) is not list
         or not portfolio_ids
         or any(type(value) is not str for value in portfolio_ids)
         or portfolio_ids != sorted(set(portfolio_ids))
+        or any(
+            portfolio_id not in portfolio_ids for portfolio_id, _ in normalized_position_identities
+        )
     ):
         raise ExactStateBootstrapError("reconciliation report is not bound to runtime evidence")
     generated_at = _utc(reconciliation["generated_at"], "reconciliation generated_at")
@@ -666,6 +923,21 @@ def load_exact_state_bootstrap_evidence(
     reconciliation_snapshot_id = _safe_id(
         reconciliation["snapshot_id"], "reconciliation snapshot_id"
     )
+    if not re.fullmatch(
+        r"reconciliation-verdict-v1-[0-9a-f]{64}",
+        _json_string(reconciliation["broker_verdict_id"], "broker verdict_id"),
+    ) or not _HEX_64.fullmatch(
+        _json_string(reconciliation["broker_verdict_hash"], "broker verdict_hash")
+    ):
+        raise ExactStateBootstrapError("reconciliation broker verdict binding is malformed")
+    reconciliation_binding = dict(reconciliation)
+    reconciliation_binding.pop("snapshot_id")
+    if reconciliation_snapshot_id != fingerprint(
+        "bootstrap-reconciliation-v1", reconciliation_binding
+    ):
+        raise ExactStateBootstrapError(
+            "reconciliation snapshot identity is not bound to its canonical payload"
+        )
     reconciliation_authenticated_at = _verify_artifact_authentication(
         artifact_path=Path(reconciliation_path),
         artifact_kind="reconciliation_report",
@@ -681,7 +953,7 @@ def load_exact_state_bootstrap_evidence(
     marks: list[ExactBootstrapMarkEvidence] = []
     authentication_receipts = [broker_authenticated_at, reconciliation_authenticated_at]
     for mark_path in protective_mark_paths:
-        mark, mark_hash = _verified_json(Path(mark_path), "protective mark")
+        mark, mark_hash = _verified_canonical_json(Path(mark_path), "protective mark")
         _exact_keys(
             mark,
             {
@@ -693,15 +965,27 @@ def load_exact_state_bootstrap_evidence(
                 "source",
                 "source_event_id",
                 "con_id",
+                "transport_generation",
+                "protective_quote_id",
+                "protective_quote_source",
                 "runtime_fingerprint",
                 "execution_domain_scope",
                 "account_scope",
+                "database_identity",
+                "database_device",
+                "database_inode",
+                "authorizes_startup",
+                "mutated_state",
             },
             "protective mark",
         )
         if (
             _json_int(mark["schema_version"], "mark schema_version") != 1
             or _json_string(mark["source"], "mark source") != MARK_EVIDENCE_SOURCE
+            or _json_bool(mark["authorizes_startup"], "mark authorizes_startup") is not False
+            or _json_bool(mark["mutated_state"], "mark mutated_state") is not False
+            or _json_string(mark["protective_quote_source"], "mark protective_quote_source")
+            != "live-broker"
             or _json_string(mark["runtime_fingerprint"], "mark runtime_fingerprint")
             != runtime_fingerprint
             or _json_string(mark["execution_domain_scope"], "mark execution_domain_scope")
@@ -710,6 +994,11 @@ def load_exact_state_bootstrap_evidence(
                 _json_string(mark["account_scope"], "mark account_scope"), account_scope
             )
             or _json_int(mark["con_id"], "mark con_id", minimum=1) <= 0
+            or _json_string(mark["database_identity"], "mark database_identity")
+            != database_identity
+            or _json_int(mark["database_device"], "mark database_device")
+            != database_metadata.st_dev
+            or _json_int(mark["database_inode"], "mark database_inode") != database_metadata.st_ino
         ):
             raise ExactStateBootstrapError("protective mark lacks PR3/runtime lineage")
         portfolio_id = _safe_id(mark["portfolio_id"], "mark portfolio_id")
@@ -719,13 +1008,19 @@ def load_exact_state_bootstrap_evidence(
             raise ExactStateBootstrapError("protective mark symbol is malformed")
         mark_observed_at = _utc(mark["observed_at"], "mark observed_at")
         _assert_fresh_against_wall_clock(mark_observed_at, "protective mark")
+        protective_quote_id = _json_string(mark["protective_quote_id"], "mark protective_quote_id")
+        if not re.fullmatch(r"quote:v1:[0-9a-f]{64}", protective_quote_id):
+            raise ExactStateBootstrapError("protective mark quote identity is malformed")
+        _printable_event_id(mark["transport_generation"], "mark transport_generation")
         marks.append(
             ExactBootstrapMarkEvidence(
                 portfolio_id=portfolio_id,
                 symbol=symbol,
                 price=_decimal(mark["price_text"], "mark price", positive=True),
                 observed_at=mark_observed_at,
-                source_event_id=_safe_id(mark["source_event_id"], "mark source_event_id"),
+                source_event_id=_printable_event_id(
+                    mark["source_event_id"], "mark source_event_id"
+                ),
                 con_id=mark["con_id"],
                 artifact_path=str(Path(mark_path)),
                 artifact_hash=mark_hash,
@@ -743,6 +1038,10 @@ def load_exact_state_bootstrap_evidence(
     mark_keys = [(mark.portfolio_id, mark.symbol) for mark in marks]
     if mark_keys != sorted(mark_keys) or len(mark_keys) != len(set(mark_keys)):
         raise ExactStateBootstrapError("protective marks must be unique and sorted")
+    if mark_keys != normalized_position_identities:
+        raise ExactStateBootstrapError(
+            "protective marks do not exactly cover reconciled local positions"
+        )
     _assert_authentication_receipts_unconsumed(database_path, authentication_receipts)
 
     evidence = ExactStateBootstrapEvidence(

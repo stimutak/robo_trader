@@ -33,6 +33,7 @@ from robo_trader.financial_state_bootstrap import (
     sqlite_table_evidence,
     verified_file_sha256,
 )
+from robo_trader.reconciliation.domain import fingerprint
 
 ACCOUNT_SCOPE = _derive_safety_account_scope("0123456789abcdef" * 4, "DU_TEST_PAPER")
 _TEST_PRIVATE_KEYS: dict[str, Path] = {}
@@ -41,7 +42,8 @@ _TEST_PRIVATE_KEYS: dict[str, Path] = {}
 @pytest.fixture(autouse=True)
 def _bootstrap_evidence_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     producers = ("broker_snapshot", "reconciliation_report", "protective_mark")
-    pinned: dict[str, tuple[Path, str]] = {}
+    paths: dict[str, Path] = {}
+    fingerprints: dict[str, str] = {}
     for kind in producers:
         private_key = Ed25519PrivateKey.generate()
         private_path = tmp_path / f"{kind}.private.pem"
@@ -62,21 +64,27 @@ def _bootstrap_evidence_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
         private_path.chmod(0o400)
         public_path.chmod(0o444)
         _TEST_PRIVATE_KEYS[kind] = private_path
-        pinned[kind] = (public_path, evidence_auth._public_fingerprint(private_key.public_key()))
-    monkeypatch.setattr(evidence_auth, "_PINNED_PUBLIC_KEYS", pinned)
+        paths[kind] = public_path
+        fingerprints[kind] = evidence_auth.ed25519_public_key_fingerprint(private_key.public_key())
     canonical = json.dumps(
         {
             "producer_ids": {kind: evidence_auth._KINDS[kind] for kind in sorted(producers)},
-            "public_key_fingerprints": {kind: pinned[kind][1] for kind in sorted(producers)},
+            "public_key_fingerprints": {kind: fingerprints[kind] for kind in sorted(producers)},
         },
         sort_keys=True,
         separators=(",", ":"),
     )
-    monkeypatch.setattr(
-        evidence_auth,
-        "_PINNED_TRUST_SET_DIGEST",
-        hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
-    )
+    manifest = {
+        "producer_ids": {kind: evidence_auth._KINDS[kind] for kind in producers},
+        "public_key_fingerprints": fingerprints,
+        "schema_version": 1,
+        "trust_set_digest": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    }
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
+    manifest_path.chmod(0o444)
+    monkeypatch.setattr(evidence_auth, "_PINNED_PUBLIC_KEY_PATHS", paths)
+    monkeypatch.setattr(evidence_auth, "_TRUST_MANIFEST_PATH", manifest_path)
     monkeypatch.delenv("SAFETY_ACCOUNT_SCOPE_KEY", raising=False)
 
 
@@ -108,10 +116,12 @@ def _emit_test_receipt(
         "account_scope": account_scope,
         "issued_at": evidence_auth._utc_text(now),
         "expires_at": evidence_auth._utc_text(now + evidence_auth.MAX_RECEIPT_LIFETIME),
-        "public_key_fingerprint": evidence_auth._public_fingerprint(private_key.public_key()),
+        "public_key_fingerprint": evidence_auth.ed25519_public_key_fingerprint(
+            private_key.public_key()
+        ),
     }
     values["signature_ed25519"] = base64.b64encode(
-        private_key.sign(evidence_auth._receipt_payload(values))
+        private_key.sign(evidence_auth.receipt_signature_payload(values))
     ).decode("ascii")
     receipt_path = artifact_path.with_name(artifact_path.name + evidence_auth.AUTH_SUFFIX)
     receipt_path.write_text(json.dumps(values, sort_keys=True, separators=(",", ":")))
@@ -227,6 +237,8 @@ def _write_artifact(
     *,
     artifact_kind: str,
     issued_at: datetime | None = None,
+    runtime_fingerprint: str | None = None,
+    account_scope: str | None = None,
 ) -> str:
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     path.write_bytes(raw)
@@ -238,8 +250,8 @@ def _write_artifact(
     _emit_test_receipt(
         artifact_path=path,
         artifact_kind=artifact_kind,
-        runtime_fingerprint=str(payload["runtime_fingerprint"]),
-        account_scope=str(payload["account_scope"]),
+        runtime_fingerprint=runtime_fingerprint or str(payload["runtime_fingerprint"]),
+        account_scope=account_scope or str(payload["account_scope"]),
         issued_at=issued_at,
     )
     return artifact_hash
@@ -256,25 +268,98 @@ def _candidate_bundle(
     runtime_contract = _runtime_contract(path)
     legacy_snapshot_hash = legacy_hash or str(inspect_legacy_state(path)["snapshot_hash"])
     broker_path = artifact_root / "broker.json"
+    broker_observed_from = effective - timedelta(seconds=3)
+    broker_observed_through = effective - timedelta(seconds=1)
+    broker_retrieved_at = effective
+    collection_evidence = []
+    for collection in (
+        "commissions",
+        "completed_orders",
+        "executions",
+        "open_orders",
+        "positions",
+    ):
+        collection_evidence.append(
+            {
+                "account_scope": ACCOUNT_SCOPE,
+                "collection": collection,
+                "evidence_id": "broker-collection-v1-"
+                + hashlib.sha256(collection.encode()).hexdigest(),
+                "observed_at": evidence_auth._utc_text(broker_observed_through),
+                "result_count": 0,
+                "schema_version": 1,
+                "source_scope": "ibkr-read-only",
+            }
+        )
+    broker_payload = {
+        "account": {
+            "account_alias": "***PER",
+            "account_scope": ACCOUNT_SCOPE,
+            "account_type": "paper",
+            "base_currency": "USD",
+            "buying_power": "100000",
+            "observed_at": evidence_auth._utc_text(effective - timedelta(seconds=2)),
+            "schema_version": 1,
+            "source_scope": "ibkr-read-only",
+            "total_cash": "100000",
+        },
+        "completeness": {
+            "account": True,
+            "positions": True,
+            "open_orders": True,
+            "completed_orders": True,
+            "executions": True,
+            "commissions": True,
+        },
+        "collection_evidence": collection_evidence,
+        "executions": [],
+        "observed_from": evidence_auth._utc_text(broker_observed_from),
+        "observed_through": evidence_auth._utc_text(broker_observed_through),
+        "orders": [],
+        "positions": [],
+        "retrieved_at": evidence_auth._utc_text(broker_retrieved_at),
+        "schema_version": 1,
+        "source_scope": "ibkr-read-only",
+    }
+    broker_snapshot_id = fingerprint("broker-reconciliation-v1", broker_payload)
+    broker_snapshot_hash = hashlib.sha256(
+        json.dumps(broker_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    broker_artifact_payload = {
+        "completed_order_collection_scope": {
+            "all_clients": True,
+            "api_method": "reqCompletedOrders",
+            "api_only": False,
+            "broker_time_after": evidence_auth._utc_text(broker_observed_through),
+            "broker_time_before": evidence_auth._utc_text(broker_observed_from),
+            "full_history": False,
+            "kind": "ibkr_current_retained_completed_orders",
+            "request_count": 2,
+            "request_completed_at": evidence_auth._utc_text(
+                broker_observed_from + timedelta(milliseconds=100)
+            ),
+            "request_started_at": evidence_auth._utc_text(broker_observed_from),
+            "retention_scope": "current_tws_or_gateway_retained_set",
+            "stability_check": "identical_second_read",
+            "verification_completed_at": evidence_auth._utc_text(
+                broker_observed_from + timedelta(milliseconds=300)
+            ),
+            "verification_started_at": evidence_auth._utc_text(
+                broker_observed_from + timedelta(milliseconds=200)
+            ),
+        },
+        "purpose": "bootstrap-broker-signing-v1",
+        "snapshot": broker_payload,
+    }
     broker_hash = _write_artifact(
         broker_path,
-        {
-            "schema_version": 1,
-            "snapshot_id": "broker-zero-exposure-v1",
-            "observed_at": (effective - timedelta(seconds=2)).isoformat(),
-            "broker_time_before": (effective - timedelta(seconds=3)).isoformat(),
-            "broker_time_after": (effective - timedelta(seconds=1)).isoformat(),
-            "runtime_fingerprint": runtime_contract.fingerprint,
-            "execution_domain_scope": "paper-simulator-v1",
-            "account_scope": ACCOUNT_SCOPE,
-            "broker_host": "127.0.0.1",
-            "broker_port": 4002,
-            "read_only": True,
-            "managed_account_count": 1,
-            "positions": [],
-            "open_orders": [],
-        },
+        broker_artifact_payload,
         artifact_kind="broker_snapshot",
+        runtime_fingerprint=runtime_contract.fingerprint,
+        account_scope=ACCOUNT_SCOPE,
+    )
+    broker_receipt = json.loads(
+        broker_path.with_name(broker_path.name + ".auth.json").read_text(encoding="utf-8")
     )
     mark_specs = (
         ()
@@ -292,47 +377,82 @@ def _candidate_bundle(
         mark_hashes[symbol] = _write_artifact(
             mark_path,
             {
+                "account_scope": ACCOUNT_SCOPE,
+                "authorizes_startup": False,
+                "con_id": con_id,
+                "database_device": path.stat().st_dev,
+                "database_identity": runtime_contract.database_identity,
+                "database_inode": path.stat().st_ino,
+                "execution_domain_scope": "paper-simulator-v1",
+                "mutated_state": False,
+                "observed_at": evidence_auth._utc_text(mark_observed_at),
                 "schema_version": 1,
                 "portfolio_id": "default",
                 "symbol": symbol,
                 "price_text": price,
-                "observed_at": mark_observed_at.isoformat(),
                 "source": "pr3-validated-market-data-v1",
                 "source_event_id": event_id,
-                "con_id": con_id,
+                "protective_quote_id": "quote:v1:" + hashlib.sha256(event_id.encode()).hexdigest(),
+                "protective_quote_source": "live-broker",
                 "runtime_fingerprint": runtime_contract.fingerprint,
-                "execution_domain_scope": "paper-simulator-v1",
-                "account_scope": ACCOUNT_SCOPE,
+                "transport_generation": "test-generation-v1",
             },
             artifact_kind="protective_mark",
         )
         mark_paths.append(mark_path)
     metadata = path.stat()
     reconciliation_path = artifact_root / "reconciliation.json"
+    reconciliation_payload = {
+        "account_scope": ACCOUNT_SCOPE,
+        "authorizes_startup": False,
+        "broker_collection_evidence_ids": sorted(
+            item["evidence_id"] for item in collection_evidence
+        ),
+        "broker_open_orders_count": 0,
+        "broker_positions_count": 0,
+        "broker_artifact_hash": broker_hash,
+        "broker_public_key_fingerprint": broker_receipt["public_key_fingerprint"],
+        "broker_receipt_id": broker_receipt["receipt_id"],
+        "broker_snapshot_hash": broker_snapshot_hash,
+        "broker_snapshot_id": broker_snapshot_id,
+        "broker_verdict_hash": "d" * 64,
+        "broker_verdict_id": "reconciliation-verdict-v1-" + "e" * 64,
+        "comparison_coverage": {
+            "broker_account": True,
+            "broker_commissions": True,
+            "broker_completed_orders": True,
+            "broker_executions": True,
+            "broker_open_orders": True,
+            "broker_positions": True,
+            "ledger_cash": True,
+            "ledger_executions": True,
+            "ledger_orders": True,
+            "ledger_positions": True,
+        },
+        "database_device": metadata.st_dev,
+        "database_identity": runtime_contract.database_identity,
+        "database_inode": metadata.st_ino,
+        "database_path": str(path),
+        "execution_domain_scope": "paper-simulator-v1",
+        "generated_at": evidence_auth._utc_text(effective - timedelta(seconds=1)),
+        "legacy_snapshot_hash": legacy_snapshot_hash,
+        "local_simulator_positions_count": len(mark_specs),
+        "local_position_identities": [
+            ["default", symbol] for symbol, _price, _event_id, _con_id in mark_specs
+        ],
+        "managed_account_count": 1,
+        "mutated_state": False,
+        "portfolio_ids": ["default"],
+        "reconciliation_status": "passed",
+        "runtime_fingerprint": runtime_contract.fingerprint,
+        "schema_version": 1,
+        "status": "BOOTSTRAP_EVIDENCE_COMPLETE",
+    }
+    reconciliation_snapshot_id = fingerprint("bootstrap-reconciliation-v1", reconciliation_payload)
+    reconciliation_payload["snapshot_id"] = reconciliation_snapshot_id
     reconciliation_hash = _write_artifact(
         reconciliation_path,
-        {
-            "schema_version": 1,
-            "snapshot_id": "recon-zero-exposure-v1",
-            "generated_at": (effective - timedelta(seconds=1)).isoformat(),
-            "runtime_fingerprint": runtime_contract.fingerprint,
-            "execution_domain_scope": "paper-simulator-v1",
-            "account_scope": ACCOUNT_SCOPE,
-            "database_path": str(path),
-            "database_identity": runtime_contract.database_identity,
-            "database_device": metadata.st_dev,
-            "database_inode": metadata.st_ino,
-            "portfolio_ids": ["default"],
-            "legacy_snapshot_hash": legacy_snapshot_hash,
-            "broker_snapshot_id": "broker-zero-exposure-v1",
-            "broker_snapshot_hash": broker_hash,
-            "status": "BOOTSTRAP_EVIDENCE_COMPLETE",
-            "authorizes_startup": False,
-            "mutated_state": False,
-            "managed_account_count": 1,
-            "broker_positions_count": 0,
-            "broker_open_orders_count": 0,
-        },
+        reconciliation_payload,
         artifact_kind="reconciliation_report",
     )
     candidate = ExactStateBootstrapCandidate(
@@ -342,7 +462,7 @@ def _candidate_bundle(
         portfolio_id="default",
         database_path=str(path),
         database_identity=runtime_contract.database_identity,
-        reconciliation_snapshot_id="recon-zero-exposure-v1",
+        reconciliation_snapshot_id=reconciliation_snapshot_id,
         reconciliation_report_hash=reconciliation_hash,
         broker_snapshot_hash=broker_hash,
         legacy_snapshot_hash=legacy_snapshot_hash,
@@ -709,8 +829,14 @@ def test_evidence_loader_rejects_tampered_broker_and_wrong_runtime_scope(
     _, _, runtime_contract = _candidate_bundle(path, tmp_path)
     broker_path = tmp_path / "broker.json"
     broker = json.loads(broker_path.read_text(encoding="utf-8"))
-    broker["positions"] = [{"symbol": "AAPL", "quantity": "1"}]
-    _write_artifact(broker_path, broker, artifact_kind="broker_snapshot")
+    broker["snapshot"]["positions"] = [{"symbol": "AAPL", "quantity": "1"}]
+    _write_artifact(
+        broker_path,
+        broker,
+        artifact_kind="broker_snapshot",
+        runtime_fingerprint=runtime_contract.fingerprint,
+        account_scope=ACCOUNT_SCOPE,
+    )
 
     with pytest.raises(ExactStateBootstrapError, match="zero paper exposure"):
         load_exact_state_bootstrap_evidence(
@@ -720,7 +846,9 @@ def test_evidence_loader_rejects_tampered_broker_and_wrong_runtime_scope(
             expected_runtime_contract=runtime_contract,
         )
 
-    _, _, runtime_contract = _candidate_bundle(path, tmp_path)
+    fresh_artifacts = tmp_path / "fresh"
+    fresh_artifacts.mkdir()
+    _, _, runtime_contract = _candidate_bundle(path, fresh_artifacts)
     wrong_scope = replace(
         runtime_contract,
         safety_account_scope=_derive_safety_account_scope(
@@ -728,11 +856,14 @@ def test_evidence_loader_rejects_tampered_broker_and_wrong_runtime_scope(
             "DU_OTHER_PAPER",
         ),
     )
-    with pytest.raises(ExactStateBootstrapError, match="runtime evidence"):
+    with pytest.raises(ExactStateBootstrapError, match="runtime evidence|zero/read-only"):
         load_exact_state_bootstrap_evidence(
-            reconciliation_path=tmp_path / "reconciliation.json",
-            broker_snapshot_path=broker_path,
-            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            reconciliation_path=fresh_artifacts / "reconciliation.json",
+            broker_snapshot_path=fresh_artifacts / "broker.json",
+            protective_mark_paths=[
+                fresh_artifacts / "mark-NVDA.json",
+                fresh_artifacts / "mark-TSLA.json",
+            ],
             expected_runtime_contract=wrong_scope,
         )
 
@@ -889,10 +1020,33 @@ def test_current_authentication_cannot_refresh_thirty_day_old_snapshot(tmp_path:
     broker_path = tmp_path / "broker.json"
     broker = json.loads(broker_path.read_text())
     stale = datetime.now(timezone.utc) - timedelta(days=30)
-    broker["observed_at"] = stale.isoformat()
-    broker["broker_time_before"] = (stale - timedelta(seconds=1)).isoformat()
-    broker["broker_time_after"] = (stale + timedelta(seconds=1)).isoformat()
-    broker_hash = _write_artifact(broker_path, broker, artifact_kind="broker_snapshot")
+    snapshot = broker["snapshot"]
+    snapshot["retrieved_at"] = evidence_auth._utc_text(stale)
+    snapshot["observed_from"] = evidence_auth._utc_text(stale - timedelta(seconds=2))
+    snapshot["observed_through"] = evidence_auth._utc_text(stale - timedelta(seconds=1))
+    snapshot["account"]["observed_at"] = evidence_auth._utc_text(stale - timedelta(seconds=1))
+    for collection in snapshot["collection_evidence"]:
+        collection["observed_at"] = evidence_auth._utc_text(stale - timedelta(seconds=1))
+    completed_scope = broker["completed_order_collection_scope"]
+    completed_scope["broker_time_before"] = snapshot["observed_from"]
+    completed_scope["broker_time_after"] = snapshot["observed_through"]
+    completed_scope["request_started_at"] = evidence_auth._utc_text(stale - timedelta(seconds=2))
+    completed_scope["request_completed_at"] = evidence_auth._utc_text(
+        stale - timedelta(seconds=1, milliseconds=900)
+    )
+    completed_scope["verification_started_at"] = evidence_auth._utc_text(
+        stale - timedelta(seconds=1, milliseconds=800)
+    )
+    completed_scope["verification_completed_at"] = evidence_auth._utc_text(
+        stale - timedelta(seconds=1, milliseconds=700)
+    )
+    broker_hash = _write_artifact(
+        broker_path,
+        broker,
+        artifact_kind="broker_snapshot",
+        runtime_fingerprint=runtime.fingerprint,
+        account_scope=ACCOUNT_SCOPE,
+    )
     reconciliation_path = tmp_path / "reconciliation.json"
     reconciliation = json.loads(reconciliation_path.read_text())
     reconciliation["broker_snapshot_hash"] = broker_hash
@@ -921,6 +1075,8 @@ def test_expired_producer_receipt_is_rejected(tmp_path: Path) -> None:
         broker,
         artifact_kind="broker_snapshot",
         issued_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+        runtime_fingerprint=runtime.fingerprint,
+        account_scope=ACCOUNT_SCOPE,
     )
     with pytest.raises(ExactStateBootstrapError, match="expired"):
         load_exact_state_bootstrap_evidence(
@@ -933,7 +1089,7 @@ def test_expired_producer_receipt_is_rejected(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     ("field", "invalid"),
-    [("schema_version", True), ("managed_account_count", True)],
+    [("schema_version", True), ("collection_result_count", True)],
 )
 def test_broker_integer_fields_reject_json_booleans(
     tmp_path: Path, field: str, invalid: object
@@ -943,8 +1099,17 @@ def test_broker_integer_fields_reject_json_booleans(
     _, _, runtime = _candidate_bundle(path, tmp_path)
     broker_path = tmp_path / "broker.json"
     broker = json.loads(broker_path.read_text())
-    broker[field] = invalid
-    _write_artifact(broker_path, broker, artifact_kind="broker_snapshot")
+    if field == "schema_version":
+        broker["snapshot"]["schema_version"] = invalid
+    else:
+        broker["snapshot"]["collection_evidence"][0]["result_count"] = invalid
+    _write_artifact(
+        broker_path,
+        broker,
+        artifact_kind="broker_snapshot",
+        runtime_fingerprint=runtime.fingerprint,
+        account_scope=ACCOUNT_SCOPE,
+    )
     with pytest.raises(ExactStateBootstrapError, match="JSON integer"):
         load_exact_state_bootstrap_evidence(
             reconciliation_path=tmp_path / "reconciliation.json",
@@ -972,6 +1137,56 @@ def test_reconciliation_integer_fields_reject_json_floats(tmp_path: Path, field:
             reconciliation_path=reconciliation_path,
             broker_snapshot_path=tmp_path / "broker.json",
             protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            expected_runtime_contract=runtime,
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "broker_artifact_hash",
+        "broker_receipt_id",
+        "broker_public_key_fingerprint",
+        "local_position_identities",
+    ],
+)
+def test_reconciliation_strong_broker_and_position_bindings_cannot_drift(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    _, _, runtime = _candidate_bundle(path, tmp_path)
+    reconciliation_path = tmp_path / "reconciliation.json"
+    reconciliation = json.loads(reconciliation_path.read_text(encoding="utf-8"))
+    if field == "broker_artifact_hash":
+        reconciliation[field] = "0" * 64
+    elif field == "broker_receipt_id":
+        reconciliation[field] = "bevr-v2-" + "0" * 64
+    elif field == "broker_public_key_fingerprint":
+        reconciliation[field] = "0" * 64
+    else:
+        reconciliation[field] = [["default", "AAPL"], ["default", "TSLA"]]
+    binding = dict(reconciliation)
+    binding.pop("snapshot_id")
+    reconciliation["snapshot_id"] = fingerprint("bootstrap-reconciliation-v1", binding)
+    _write_artifact(
+        reconciliation_path,
+        reconciliation,
+        artifact_kind="reconciliation_report",
+    )
+
+    with pytest.raises(
+        ExactStateBootstrapError,
+        match="runtime evidence|exactly cover",
+    ):
+        load_exact_state_bootstrap_evidence(
+            reconciliation_path=reconciliation_path,
+            broker_snapshot_path=tmp_path / "broker.json",
+            protective_mark_paths=[
+                tmp_path / "mark-NVDA.json",
+                tmp_path / "mark-TSLA.json",
+            ],
             expected_runtime_contract=runtime,
         )
 
@@ -1041,7 +1256,7 @@ def test_bootstrap_consumer_refuses_public_trust_root_substitution(
     _, _, runtime = _candidate_bundle(path, tmp_path)
     monkeypatch.setenv(
         "BOOTSTRAP_BROKER_EVIDENCE_PUBLIC_KEY_PATH",
-        str(evidence_auth._PINNED_PUBLIC_KEYS["protective_mark"][0]),
+        str(evidence_auth._PINNED_PUBLIC_KEY_PATHS["protective_mark"]),
     )
     with pytest.raises(ExactStateBootstrapError, match="refuses evidence trust/signing overrides"):
         load_exact_state_bootstrap_evidence(
@@ -1105,11 +1320,11 @@ def test_pinned_public_verification_key_identity_is_strict(tmp_path: Path, attac
     path = tmp_path / "legacy.db"
     _legacy_database(path)
     _, _, runtime = _candidate_bundle(path, tmp_path)
-    public_path = evidence_auth._PINNED_PUBLIC_KEYS["broker_snapshot"][0]
+    public_path = evidence_auth._PINNED_PUBLIC_KEY_PATHS["broker_snapshot"]
     if attack == "tamper":
         public_path.chmod(0o600)
         public_path.write_bytes(
-            evidence_auth._PINNED_PUBLIC_KEYS["protective_mark"][0].read_bytes()
+            evidence_auth._PINNED_PUBLIC_KEY_PATHS["protective_mark"].read_bytes()
         )
         public_path.chmod(0o444)
     else:
