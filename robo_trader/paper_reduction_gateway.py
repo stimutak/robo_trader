@@ -27,8 +27,12 @@ from .database_async import AsyncTradingDatabase
 from .execution import ExecutionResult, Order, PaperExecutor
 from .market_data_contract import BrokerProtectiveQuote
 from .paper_execution_capability import (
-    PaperExecutionAuthority,
-    _bind_paper_execution_authority,
+    PaperReductionExecutionAuthority,
+    _bind_gateway_baseline_execution,
+    _bind_paper_reduction_execution_authority,
+    _GatewayBaselineExecutionBinding,
+    _issue_gateway_execution_binding_capability,
+    _submit_gateway_baseline_once,
 )
 from .paper_reduction_submitter import (
     LocalPaperOrderStatus,
@@ -72,7 +76,8 @@ _REFERENCE_PRICE_TICK = Decimal("0.0001")
 @dataclass(frozen=True, slots=True)
 class _PaperRuntimeBinding:
     submitter: PaperReductionSubmitter
-    execution_authority: PaperExecutionAuthority
+    reduction_execution_authority: PaperReductionExecutionAuthority
+    baseline_execution_binding: _GatewayBaselineExecutionBinding
     baseline_entry_handle: "_BaselineEntryHandle"
     protective_quote_producer: object
     settlement_participant: PaperRuntimeSettlementParticipant
@@ -117,6 +122,15 @@ class _ActiveEntrySession:
     symbol: str
     quote: BrokerProtectiveQuote
     consumed: bool = False
+
+
+@dataclass(slots=True)
+class _PaperRuntimeBindingSession:
+    gateway: "PaperReductionGateway"
+    runtime_context: RuntimeSafetyContext
+    executor: PaperExecutor
+    portfolio_id: str
+    capability_issued: bool = False
 
 
 class PaperReductionGateway:
@@ -179,6 +193,7 @@ class PaperReductionGateway:
         )
         self._account_order_gate = asyncio.Lock()
         self._bindings: dict[str, _PaperRuntimeBinding] = {}
+        self._active_runtime_binding_session: _PaperRuntimeBindingSession | None = None
         self._baseline_entry_intents: weakref.WeakKeyDictionary[
             _BaselineEntryIntent, _BaselineEntryIntentRecord
         ] = weakref.WeakKeyDictionary()
@@ -730,7 +745,7 @@ class PaperReductionGateway:
                 existing.submitter._is_bound_to(
                     executor,
                     self._coordinator,
-                    existing.execution_authority,
+                    existing.reduction_execution_authority,
                 )
                 and existing.protective_quote_producer is protective_quote_producer
                 and existing.settlement_participant is settlement_participant
@@ -742,16 +757,52 @@ class PaperReductionGateway:
             raise PaperReductionGatewayError(
                 "paper runtime quote producer was not provisionally attached"
             )
-        execution_authority = _bind_paper_execution_authority(executor, portfolio_id)
+        if not self._started:
+            raise PaperReductionGatewayError(
+                "paper runtime registration requires a started gateway"
+            )
+        if self._active_runtime_binding_session is not None:
+            raise PaperReductionGatewayError("paper runtime registration session is already active")
+        binding_session = _PaperRuntimeBindingSession(
+            gateway=self,
+            runtime_context=self._runtime_context,
+            executor=executor,
+            portfolio_id=portfolio_id,
+        )
+        self._active_runtime_binding_session = binding_session
+        try:
+            binding_capability = _issue_gateway_execution_binding_capability(
+                gateway=self,
+                runtime_context=self._runtime_context,
+                binding_session=binding_session,
+                executor=executor,
+                portfolio_id=portfolio_id,
+            )
+            baseline_execution_binding = _bind_gateway_baseline_execution(
+                gateway=self,
+                runtime_context=self._runtime_context,
+                binding_session=binding_session,
+                executor=executor,
+                portfolio_id=portfolio_id,
+                capability=binding_capability,
+            )
+        finally:
+            if self._active_runtime_binding_session is binding_session:
+                self._active_runtime_binding_session = None
+        reduction_execution_authority = _bind_paper_reduction_execution_authority(
+            executor,
+            portfolio_id,
+        )
         baseline_entry_handle = _BaselineEntryHandle(_token=_ENTRY_HANDLE_TOKEN)
         self._bindings[portfolio_id] = _PaperRuntimeBinding(
             submitter=_bind_paper_reduction_submitter(
                 executor,
                 self._coordinator,
-                execution_authority,
+                reduction_execution_authority,
                 portfolio_id,
             ),
-            execution_authority=execution_authority,
+            reduction_execution_authority=reduction_execution_authority,
+            baseline_execution_binding=baseline_execution_binding,
             baseline_entry_handle=baseline_entry_handle,
             protective_quote_producer=protective_quote_producer,
             settlement_participant=settlement_participant,
@@ -917,7 +968,13 @@ class PaperReductionGateway:
             or order.take_profit is not None
         ):
             raise PaperReductionGatewayError("baseline entry order does not match session evidence")
-        return binding.execution_authority._submit_baseline_once(order)
+        return _submit_gateway_baseline_once(
+            binding.baseline_execution_binding,
+            gateway=self,
+            runtime_context=self._runtime_context,
+            active_session=session,
+            order=order,
+        )
 
     async def submit_reduction(
         self,

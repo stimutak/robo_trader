@@ -12,6 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 import robo_trader.execution as execution_module
+import robo_trader.paper_execution_capability as capability_module
 from robo_trader.config import Config
 from robo_trader.core.engine import TradingEngine
 from robo_trader.execution import Order, PaperExecutor
@@ -26,7 +27,7 @@ from robo_trader.multiuser.portfolio_config import PortfolioConfig, load_portfol
 from robo_trader.order_manager import OrderManager, OrderStatus
 from robo_trader.paper_execution_capability import (
     PaperExecutionCapabilityError,
-    _bind_paper_execution_authority,
+    _bind_paper_reduction_execution_authority,
 )
 from robo_trader.runner.signal_generator import SignalGenerator
 from robo_trader.runner.trade_executor import TradeExecutor
@@ -179,15 +180,25 @@ def test_baseline_intent_and_terminal_capability_have_single_runtime_call_sites(
     for path in package.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            if not isinstance(node, ast.Call):
                 continue
-            if node.func.attr == "issue_baseline_entry_intent":
+            if isinstance(node.func, ast.Attribute) and node.func.attr == (
+                "issue_baseline_entry_intent"
+            ):
                 issue_calls.append(path)
-            elif node.func.attr == "_submit_baseline_once":
+            elif isinstance(node.func, ast.Name) and node.func.id == (
+                "_submit_gateway_baseline_once"
+            ):
                 terminal_calls.append(path)
 
     assert issue_calls == [package / "runner_async.py"]
     assert terminal_calls == [package / "paper_reduction_gateway.py"]
+
+
+def test_no_independently_bindable_baseline_authority_exists() -> None:
+    assert not hasattr(capability_module, "_bind_paper_execution_authority")
+    authority = _bind_paper_reduction_execution_authority(PaperExecutor(), "default")
+    assert not hasattr(authority, "_submit_baseline_once")
 
 
 def test_paper_executor_rejects_every_naked_submission(monkeypatch) -> None:
@@ -211,7 +222,7 @@ def test_paper_executor_rejects_every_naked_submission(monkeypatch) -> None:
 
 def test_bound_authority_preserves_exact_reductions() -> None:
     executor = PaperExecutor()
-    authority = _bind_paper_execution_authority(executor, "default")
+    authority = _bind_paper_reduction_execution_authority(executor, "default")
 
     sell = authority._submit_reduction_once(
         Order("AAPL", 1, "SELL", Decimal("100.0000")),
@@ -240,7 +251,7 @@ def test_reduction_capability_cannot_cross_zero(
     side: str, quantity: int, pre_position: Decimal
 ) -> None:
     executor = PaperExecutor()
-    authority = _bind_paper_execution_authority(executor, "default")
+    authority = _bind_paper_reduction_execution_authority(executor, "default")
 
     with pytest.raises(PaperExecutionCapabilityError, match="exposure"):
         authority._submit_reduction_once(
@@ -253,7 +264,7 @@ def test_reduction_capability_cannot_cross_zero(
 
 def test_capability_substitution_burns_authority(monkeypatch) -> None:
     executor = PaperExecutor()
-    authority = _bind_paper_execution_authority(executor, "default")
+    authority = _bind_paper_reduction_execution_authority(executor, "default")
     captured = []
 
     def capture(_order, *, _capability):
@@ -287,15 +298,36 @@ def test_capability_substitution_burns_authority(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_order_manager_cannot_bypass_terminal_capability() -> None:
+@pytest.mark.parametrize("side", ["BUY", "SELL", "BUY_TO_COVER"])
+async def test_order_manager_cannot_bypass_terminal_capability(side: str) -> None:
     executor = PaperExecutor()
     manager = OrderManager(max_retries=1)
 
-    result = await manager.place_order("AAPL", 1, "BUY", executor=executor)
+    result = await manager.place_order("AAPL", 1, side, executor=executor)
 
     assert result.status is OrderStatus.ERROR
     assert "submission capability" in (result.error_message or "")
     assert executor.fills == {}
+
+
+class _FakeOrderExecutor:
+    def place_order(self, _order):
+        return SimpleNamespace(ok=True, message="forged acceptance", order_id="fake")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["BUY", "SELL", "BUY_TO_COVER"])
+@pytest.mark.parametrize("executor", [None, object(), _FakeOrderExecutor()])
+async def test_order_manager_rejects_missing_or_alternate_executor(side, executor) -> None:
+    manager = OrderManager(max_retries=1)
+
+    result = await manager.place_order("AAPL", 1, side, executor=executor)
+
+    assert result.status is OrderStatus.ERROR
+    assert "exact contained PaperExecutor" in (result.error_message or "")
+    assert result.id not in manager.pending_orders
+    assert result.id not in manager.active_orders
+    assert result.id not in manager.monitoring_tasks
 
 
 @pytest.mark.asyncio

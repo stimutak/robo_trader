@@ -9,10 +9,12 @@ import pytest
 
 import robo_trader.execution as execution_module
 from robo_trader.execution import ExecutionResult, Order, PaperExecutor
-from robo_trader.paper_execution_capability import _bind_paper_execution_authority
+from robo_trader.paper_execution_capability import (
+    _bind_paper_reduction_execution_authority,
+)
 
 
-def _order(*, side: str = "BUY", price: float | Decimal = Decimal("123.45")) -> Order:
+def _order(*, side: str = "BUY_TO_COVER", price: float | Decimal = Decimal("123.45")) -> Order:
     return Order(
         symbol="AAPL",
         quantity=3,
@@ -23,9 +25,7 @@ def _order(*, side: str = "BUY", price: float | Decimal = Decimal("123.45")) -> 
 
 
 def _submit(executor: PaperExecutor, order: Order) -> ExecutionResult:
-    authority = _bind_paper_execution_authority(executor, "test")
-    if order.side == "BUY":
-        return authority._submit_baseline_once(order)
+    authority = _bind_paper_reduction_execution_authority(executor, "test")
     if order.side == "SELL":
         return authority._submit_reduction_once(
             order,
@@ -128,10 +128,10 @@ def test_arbitrary_finite_slippage_is_normalized_before_float_compatibility_view
 @pytest.mark.parametrize(
     ("side", "slippage_bps"),
     [
-        ("BUY", float("nan")),
-        ("BUY", float("inf")),
+        ("BUY_TO_COVER", float("nan")),
+        ("BUY_TO_COVER", float("inf")),
         ("SELL", 20_000.0),
-        ("BUY", -20_000.0),
+        ("BUY_TO_COVER", -20_000.0),
     ],
 )
 def test_decimal_nonfinite_or_nonpositive_fill_fails_closed(
@@ -150,7 +150,7 @@ def test_decimal_nonfinite_or_nonpositive_fill_fails_closed(
 
 @pytest.mark.parametrize(
     ("side", "expected"),
-    [("BUY", 100.1), ("SELL", 99.9), ("BUY_TO_COVER", 100.1)],
+    [("SELL", 99.9), ("BUY_TO_COVER", 100.1)],
 )
 def test_legacy_float_price_behavior_is_unchanged(side: str, expected: float) -> None:
     order = _order(side=side, price=100.0)

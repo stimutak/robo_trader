@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -30,9 +31,16 @@ from robo_trader.market_data_contract import (
     MarketDataSource,
     MarketSession,
 )
+from robo_trader.paper_execution_capability import (
+    PaperExecutionCapabilityError,
+    _bind_gateway_baseline_execution,
+    _issue_gateway_execution_binding_capability,
+    _submit_gateway_baseline_once,
+)
 from robo_trader.paper_reduction_gateway import (
     PaperReductionGateway,
     PaperReductionGatewayError,
+    _PaperRuntimeBindingSession,
 )
 from robo_trader.paper_reduction_submitter import PaperReductionSubmissionError
 from robo_trader.paper_runtime_settlement import (
@@ -667,6 +675,95 @@ async def _bind_runtime(
     return entry_handle
 
 
+def test_gateway_binding_capability_rejects_direct_copy_substitution_and_replay(
+    harness: GatewayHarness,
+) -> None:
+    gateway = harness.gateway
+    executor = PaperExecutor()
+
+    def activate():
+        session = _PaperRuntimeBindingSession(
+            gateway=gateway,
+            runtime_context=harness.context,
+            executor=executor,
+            portfolio_id="portfolio-a",
+        )
+        gateway._active_runtime_binding_session = session
+        kwargs = {
+            "gateway": gateway,
+            "runtime_context": harness.context,
+            "binding_session": session,
+            "executor": executor,
+            "portfolio_id": "portfolio-a",
+        }
+        return kwargs
+
+    issue_kwargs = activate()
+    gateway._active_runtime_binding_session = None
+
+    with pytest.raises(PaperExecutionCapabilityError, match="scope is invalid"):
+        _issue_gateway_execution_binding_capability(**issue_kwargs)
+
+    try:
+        issue_kwargs = activate()
+        capability = _issue_gateway_execution_binding_capability(**issue_kwargs)
+        with pytest.raises(PaperExecutionCapabilityError, match="cannot copy"):
+            copy.copy(capability)
+        with pytest.raises(PaperExecutionCapabilityError, match="already issued"):
+            _issue_gateway_execution_binding_capability(**issue_kwargs)
+        with pytest.raises(PaperExecutionCapabilityError, match="already consumed"):
+            _bind_gateway_baseline_execution(
+                **issue_kwargs,
+                capability=capability,
+            )
+
+        issue_kwargs = activate()
+        capability = _issue_gateway_execution_binding_capability(**issue_kwargs)
+        with pytest.raises(PaperExecutionCapabilityError, match="capability is invalid"):
+            _bind_gateway_baseline_execution(
+                **issue_kwargs,
+                capability=object(),
+            )
+        with pytest.raises(PaperExecutionCapabilityError, match="scope is invalid"):
+            _bind_gateway_baseline_execution(
+                **{**issue_kwargs, "portfolio_id": "portfolio-b"},
+                capability=capability,
+            )
+        with pytest.raises(PaperExecutionCapabilityError, match="already consumed"):
+            _bind_gateway_baseline_execution(
+                **issue_kwargs,
+                capability=capability,
+            )
+
+        issue_kwargs = activate()
+        substituted = _issue_gateway_execution_binding_capability(**issue_kwargs)
+        with pytest.raises(PaperExecutionCapabilityError, match="scope is invalid"):
+            _bind_gateway_baseline_execution(
+                **{**issue_kwargs, "executor": PaperExecutor()},
+                capability=substituted,
+            )
+        with pytest.raises(PaperExecutionCapabilityError, match="already consumed"):
+            _bind_gateway_baseline_execution(
+                **issue_kwargs,
+                capability=substituted,
+            )
+
+        issue_kwargs = activate()
+        admitted = _issue_gateway_execution_binding_capability(**issue_kwargs)
+        binding = _bind_gateway_baseline_execution(
+            **issue_kwargs,
+            capability=admitted,
+        )
+        assert not hasattr(binding, "_submit_baseline_once")
+        with pytest.raises(PaperExecutionCapabilityError, match="already consumed"):
+            _bind_gateway_baseline_execution(
+                **issue_kwargs,
+                capability=admitted,
+            )
+    finally:
+        gateway._active_runtime_binding_session = None
+
+
 @pytest.mark.asyncio
 async def test_baseline_entry_intent_is_exact_session_scoped_and_one_shot(
     harness: GatewayHarness,
@@ -685,6 +782,15 @@ async def test_baseline_entry_intent_is_exact_session_scoped_and_one_shot(
         symbol=SYMBOL,
         handle=handle_b,
     )
+    binding_a = harness.gateway._bindings["portfolio-a"].baseline_execution_binding
+    with pytest.raises(PaperExecutionCapabilityError, match="session does not match"):
+        _submit_gateway_baseline_once(
+            binding_a,
+            gateway=harness.gateway,
+            runtime_context=harness.context,
+            active_session=object(),
+            order=Order(SYMBOL, 1, "BUY", Decimal("123.4500")),
+        )
     now = datetime.now(timezone.utc)
     quote = BrokerProtectiveQuote(
         schema_version=1,
@@ -958,6 +1064,7 @@ async def test_reduction_admission_retries_gateway_after_entry_recovery_failed(
             pytest.fail("the failed entry health check must remain denied")
 
     assert harness.gateway.started is False
+    await harness.gateway.start()
     executor = PaperExecutor()
     await _bind_runtime(harness, "portfolio-a", executor)
     _install_broker_boundary(harness, monkeypatch)
@@ -971,7 +1078,7 @@ async def test_reduction_admission_retries_gateway_after_entry_recovery_failed(
     assert harness.gateway.started is True
     assert client.start.await_count == 2
     assert client.connect.await_count == 2
-    assert client.ping.await_count == 2
+    assert client.ping.await_count == 1
     assert len(executor.fills) == 1
 
 

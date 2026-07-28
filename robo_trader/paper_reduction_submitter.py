@@ -15,7 +15,7 @@ from enum import Enum
 from typing import Optional
 
 from .execution import ExecutionResult, Order, PaperExecutor
-from .paper_execution_capability import PaperExecutionAuthority
+from .paper_execution_capability import PaperReductionExecutionAuthority
 from .runtime_contract_constants import PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
 from .safety.models import (
     EvidenceStatus,
@@ -203,7 +203,7 @@ class PaperReductionSubmitter:
         self,
         executor: PaperExecutor,
         coordinator: SafetyRuntimeCoordinator,
-        execution_authority: PaperExecutionAuthority,
+        execution_authority: PaperReductionExecutionAuthority,
         portfolio_id: str,
         *,
         _token: Optional[object] = None,
@@ -222,7 +222,7 @@ class PaperReductionSubmitter:
             raise PaperReductionSubmissionError("coordinator must be started before binding")
         if type(
             execution_authority
-        ) is not PaperExecutionAuthority or not execution_authority._is_bound_to(
+        ) is not PaperReductionExecutionAuthority or not execution_authority._is_bound_to(
             executor, portfolio_id
         ):
             raise PaperReductionSubmissionError("execution authority is malformed")
@@ -240,7 +240,7 @@ class PaperReductionSubmitter:
         self,
         executor: PaperExecutor,
         coordinator: SafetyRuntimeCoordinator,
-        execution_authority: PaperExecutionAuthority,
+        execution_authority: PaperReductionExecutionAuthority,
     ) -> bool:
         """Support idempotent reconnect registration without exposing authority."""
 
@@ -292,7 +292,7 @@ class PaperReductionSubmitter:
 def _bind_paper_reduction_submitter(
     executor: PaperExecutor,
     coordinator: SafetyRuntimeCoordinator,
-    execution_authority: PaperExecutionAuthority,
+    execution_authority: PaperReductionExecutionAuthority,
     portfolio_id: str,
 ) -> PaperReductionSubmitter:
     """Bind the private one-shot adapter to exact executor and coordinator."""
@@ -303,7 +303,7 @@ def _bind_paper_reduction_submitter(
         raise PaperReductionSubmissionError("coordinator must be exactly SafetyRuntimeCoordinator")
     if type(
         execution_authority
-    ) is not PaperExecutionAuthority or not execution_authority._is_bound_to(
+    ) is not PaperReductionExecutionAuthority or not execution_authority._is_bound_to(
         executor, portfolio_id
     ):
         raise PaperReductionSubmissionError("execution authority binding does not match")

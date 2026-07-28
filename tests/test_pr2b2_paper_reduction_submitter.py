@@ -13,7 +13,9 @@ from pathlib import Path
 import pytest
 
 from robo_trader.execution import ExecutionResult, Order, PaperExecutor
-from robo_trader.paper_execution_capability import _bind_paper_execution_authority
+from robo_trader.paper_execution_capability import (
+    _bind_paper_reduction_execution_authority,
+)
 from robo_trader.paper_reduction_submitter import (
     LocalPaperOrderStatus,
     LocalPaperOutcomeProvenance,
@@ -203,7 +205,7 @@ def _make_case(
         portfolio_quantity=starting_quantity,
     )
     executor = PaperExecutor()
-    authority = _bind_paper_execution_authority(executor, "portfolio-a")
+    authority = _bind_paper_reduction_execution_authority(executor, "portfolio-a")
     submitter = _bind_paper_reduction_submitter(
         executor,
         coordinator,
@@ -514,7 +516,7 @@ def test_cross_account_coordinator_cannot_claim_envelope(tmp_path: Path) -> None
     foreign_submitter = _bind_paper_reduction_submitter(
         second.executor,
         second.coordinator,
-        _bind_paper_execution_authority(second.executor, "portfolio-a"),
+        _bind_paper_reduction_execution_authority(second.executor, "portfolio-a"),
         "portfolio-a",
     )
     with pytest.raises(PaperReductionSubmissionError, match="claim failed"):

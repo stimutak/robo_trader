@@ -906,7 +906,7 @@ def load_config_from_env() -> Config:
     - RISK_MAX_POSITION_PCT=0.02
     - DATA_PROVIDER=IBKR
     - IBKR_HOST=127.0.0.1
-    - STRATEGY_ENABLED_STRATEGIES=momentum,mean_reversion
+    - STRATEGY_ENABLED_STRATEGIES=baseline_sma
     - MONITORING_LOG_LEVEL=INFO
 
     Returns:
