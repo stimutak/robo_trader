@@ -83,9 +83,9 @@ def test_secret_scan_covers_each_event_with_a_valid_revision_range() -> None:
     zero_sha = "0000000000000000000000000000000000000000"
 
     def step(name: str) -> str:
-        return workflow.split(f"- name: {name}", maxsplit=1)[1].split(
-            "\n    - name:", maxsplit=1
-        )[0]
+        return workflow.split(f"- name: {name}", maxsplit=1)[1].split("\n    - name:", maxsplit=1)[
+            0
+        ]
 
     pull_request = step("Check pull request for hardcoded secrets")
     assert "if: github.event_name == 'pull_request'" in pull_request
