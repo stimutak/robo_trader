@@ -1,0 +1,443 @@
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from robo_trader.maintenance import (
+    SQLiteMaintenanceError,
+    SQLiteMaintenanceService,
+)
+from robo_trader.multiuser.migration import (
+    LegacyMultiuserMigrationDisabled,
+    MultiuserMigration,
+)
+
+
+def _create_multiportfolio_database(path: Path, *, wal: bool = False) -> sqlite3.Connection:
+    connection = sqlite3.connect(path)
+    if wal:
+        assert connection.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+        connection.execute("PRAGMA wal_autocheckpoint=0")
+    connection.executescript("""
+        PRAGMA foreign_keys=ON;
+        CREATE TABLE portfolios (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL
+        );
+        CREATE TABLE positions (
+            portfolio_id TEXT NOT NULL REFERENCES portfolios(id),
+            symbol TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            PRIMARY KEY (portfolio_id, symbol)
+        );
+        INSERT INTO portfolios VALUES ('alpha', 'Alpha'), ('beta', 'Beta');
+        INSERT INTO positions VALUES
+            ('alpha', 'AAPL', 3),
+            ('beta', 'AAPL', 7),
+            ('beta', 'MSFT', 2);
+        PRAGMA user_version=7;
+        """)
+    connection.commit()
+    return connection
+
+
+def test_wal_active_backup_and_clean_room_restore_preserve_multiportfolio_state(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "synthetic-source.db"
+    backup = tmp_path / "new-backup.db"
+    restored = tmp_path / "new-restore.db"
+    writer = _create_multiportfolio_database(source, wal=True)
+    try:
+        writer.execute("INSERT INTO positions VALUES ('alpha', 'NVDA', 4)")
+        writer.commit()
+        assert source.with_name(source.name + "-wal").stat().st_size > 0
+
+        service = SQLiteMaintenanceService()
+        manifest = service.backup(source, backup)
+        restore_manifest = service.restore_clean_room(backup, restored, manifest)
+
+        assert manifest.operation == "backup"
+        assert restore_manifest.operation == "restore"
+        assert restore_manifest.input_artifact_sha256 == manifest.artifact_sha256
+        assert manifest.evidence == restore_manifest.evidence
+        assert manifest.authorizes_startup is False
+        assert stat.S_IMODE(backup.stat().st_mode) == 0o400
+        assert stat.S_IMODE(restored.stat().st_mode) == 0o400
+        with sqlite3.connect(restored) as connection:
+            assert connection.execute(
+                "SELECT portfolio_id,symbol,quantity FROM positions " "ORDER BY portfolio_id,symbol"
+            ).fetchall() == [
+                ("alpha", "AAPL", 3),
+                ("alpha", "NVDA", 4),
+                ("beta", "AAPL", 7),
+                ("beta", "MSFT", 2),
+            ]
+    finally:
+        writer.close()
+
+
+def test_manifest_is_secret_free_portable_and_exclusively_written(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    manifest_path = tmp_path / "manifest.json"
+    _create_multiportfolio_database(source).close()
+    service = SQLiteMaintenanceService()
+    manifest = service.backup(source, backup)
+    service.write_manifest(manifest, manifest_path)
+    payload = json.loads(manifest_path.read_text())
+
+    serialized = json.dumps(payload, sort_keys=True)
+    assert str(tmp_path) not in serialized
+    assert "credential" not in serialized.lower()
+    assert "account" not in serialized.lower()
+    assert payload["contains_secrets"] is False
+    assert payload["mutated_authoritative_state"] is False
+    assert payload["authorizes_startup"] is False
+    assert service.load_manifest(manifest_path) == manifest
+    with pytest.raises(SQLiteMaintenanceError, match="new exclusive"):
+        service.write_manifest(manifest, manifest_path)
+
+
+@pytest.mark.parametrize("kind", ["source_symlink", "source_hardlink", "target_symlink"])
+def test_aliases_fail_closed(tmp_path: Path, kind: str) -> None:
+    source = tmp_path / "source.db"
+    _create_multiportfolio_database(source).close()
+    candidate_source = source
+    target = tmp_path / "target.db"
+    if kind == "source_symlink":
+        candidate_source = tmp_path / "source-link.db"
+        candidate_source.symlink_to(source)
+    elif kind == "source_hardlink":
+        candidate_source = tmp_path / "source-hardlink.db"
+        os.link(source, candidate_source)
+    else:
+        target.symlink_to(source)
+
+    with pytest.raises(SQLiteMaintenanceError):
+        SQLiteMaintenanceService().backup(candidate_source, target)
+
+
+def test_symlinked_wal_companion_is_rejected_before_sqlite_open(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "target.db"
+    _create_multiportfolio_database(source).close()
+    source.with_name(source.name + "-wal").symlink_to(source)
+
+    with pytest.raises(SQLiteMaintenanceError, match="SQLite companions"):
+        SQLiteMaintenanceService().backup(source, target)
+    assert not target.exists()
+
+
+def test_existing_restore_target_is_never_replaced(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    target = tmp_path / "authoritative-looking.db"
+    _create_multiportfolio_database(source).close()
+    target.write_bytes(b"do-not-replace")
+    service = SQLiteMaintenanceService()
+    manifest = service.backup(source, backup)
+
+    with pytest.raises(SQLiteMaintenanceError, match="new exclusively-created"):
+        service.restore_clean_room(backup, target, manifest)
+    assert target.read_bytes() == b"do-not-replace"
+
+
+def test_target_cannot_overlap_source_sqlite_companion_family(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    _create_multiportfolio_database(source).close()
+    target = source.with_name(source.name + "-journal")
+
+    with pytest.raises(SQLiteMaintenanceError, match="resource families overlap"):
+        SQLiteMaintenanceService().backup(source, target)
+    assert not target.exists()
+
+
+def test_corrupt_backup_is_rejected_before_restore_target_creation(tmp_path: Path) -> None:
+    corrupt = tmp_path / "corrupt.db"
+    target = tmp_path / "restore.db"
+    corrupt.write_bytes(b"not a sqlite database")
+
+    with pytest.raises(SQLiteMaintenanceError):
+        SQLiteMaintenanceService().verify(corrupt)
+    assert not target.exists()
+
+
+def test_manifest_detects_backup_corruption_before_clean_room_creation(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    target = tmp_path / "restore.db"
+    _create_multiportfolio_database(source).close()
+    service = SQLiteMaintenanceService()
+    manifest = service.backup(source, backup)
+    backup.chmod(0o600)
+    with backup.open("r+b") as stream:
+        stream.seek(100)
+        stream.write(b"tampered")
+    backup.chmod(0o400)
+
+    with pytest.raises(SQLiteMaintenanceError):
+        service.restore_clean_room(backup, target, manifest)
+    assert not target.exists()
+
+
+def test_interrupted_backup_preserves_source_and_seals_forensic_target(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "partial.db"
+    _create_multiportfolio_database(source).close()
+    before = source.read_bytes()
+
+    def interrupt(_operation: str, _remaining: int, _total: int) -> None:
+        raise RuntimeError("synthetic interruption")
+
+    with pytest.raises(RuntimeError, match="synthetic interruption"):
+        SQLiteMaintenanceService(progress_hook=interrupt).backup(source, target)
+
+    assert source.read_bytes() == before
+    assert target.exists()
+    assert stat.S_IMODE(target.stat().st_mode) == 0o400
+
+
+def test_manifest_with_unknown_field_is_rejected(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    manifest_path = tmp_path / "manifest.json"
+    _create_multiportfolio_database(source).close()
+    service = SQLiteMaintenanceService()
+    manifest = service.backup(source, backup)
+    payload = manifest.to_dict()
+    payload["broker_token"] = "must-not-be-accepted"
+    manifest_path.write_text(json.dumps(payload))
+
+    with pytest.raises(SQLiteMaintenanceError, match="manifest is invalid"):
+        service.load_manifest(manifest_path)
+
+
+def test_target_substitution_during_backup_fails_descriptor_check(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "target.db"
+    displaced = tmp_path / "displaced.db"
+    _create_multiportfolio_database(source).close()
+    invoked = False
+
+    def replace_target(_operation: str, _remaining: int, _total: int) -> None:
+        nonlocal invoked
+        if invoked:
+            return
+        invoked = True
+        target.rename(displaced)
+        target.symlink_to(source)
+
+    with pytest.raises(SQLiteMaintenanceError, match="failed closed"):
+        SQLiteMaintenanceService(progress_hook=replace_target).backup(source, target)
+    assert source.exists()
+    assert displaced.exists()
+
+
+def test_hardlink_race_during_backup_fails_closed(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "target.db"
+    alias = tmp_path / "target-alias.db"
+    _create_multiportfolio_database(source).close()
+    invoked = False
+
+    def add_link(_operation: str, _remaining: int, _total: int) -> None:
+        nonlocal invoked
+        if not invoked:
+            invoked = True
+            os.link(target, alias)
+
+    with pytest.raises(SQLiteMaintenanceError, match="another filesystem link"):
+        SQLiteMaintenanceService(progress_hook=add_link).backup(source, target)
+    assert source.exists()
+    assert target.exists()
+    assert alias.exists()
+
+
+def test_interrupted_restore_preserves_backup_and_seals_target(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    target = tmp_path / "partial-restore.db"
+    _create_multiportfolio_database(source).close()
+    manifest = SQLiteMaintenanceService().backup(source, backup)
+    backup_before = backup.read_bytes()
+
+    def interrupt(operation: str, _remaining: int, _total: int) -> None:
+        if operation == "restore":
+            raise RuntimeError("synthetic restore interruption")
+
+    with pytest.raises(RuntimeError, match="restore interruption"):
+        SQLiteMaintenanceService(progress_hook=interrupt).restore_clean_room(
+            backup, target, manifest
+        )
+    assert backup.read_bytes() == backup_before
+    assert target.exists()
+    assert stat.S_IMODE(target.stat().st_mode) == 0o400
+
+
+def test_migration_dry_run_changes_only_synthetic_copy(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    _create_multiportfolio_database(source).close()
+    before_bytes = source.read_bytes()
+
+    def migration(connection: sqlite3.Connection) -> None:
+        connection.execute("ALTER TABLE positions ADD COLUMN note TEXT")
+        connection.execute("UPDATE positions SET note='synthetic-only' WHERE portfolio_id='alpha'")
+        connection.execute("PRAGMA user_version=8")
+
+    report = SQLiteMaintenanceService().dry_run_migration(
+        source,
+        target,
+        migration_id="synthetic-v8",
+        migration=migration,
+    )
+
+    assert report.outcome == "applied_to_synthetic_copy"
+    assert report.source_unchanged is True
+    assert report.before != report.after
+    assert report.after.user_version == 8
+    assert report.authorizes_startup is False
+    assert source.read_bytes() == before_bytes
+    with sqlite3.connect(source) as connection:
+        columns = connection.execute("PRAGMA table_info(positions)").fetchall()
+        assert "note" not in {row[1] for row in columns}
+
+
+def test_interrupted_migration_rolls_back_copy_and_preserves_source(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    _create_multiportfolio_database(source).close()
+
+    def migration(connection: sqlite3.Connection) -> None:
+        connection.execute("DELETE FROM positions")
+        raise RuntimeError("simulated interruption")
+
+    report = SQLiteMaintenanceService().dry_run_migration(
+        source,
+        target,
+        migration_id="synthetic-interruption",
+        migration=migration,
+    )
+
+    assert report.outcome == "rolled_back"
+    assert report.error_code == "migration_callback_failed"
+    assert report.before == report.after
+    assert report.source_unchanged is True
+    assert stat.S_IMODE(target.stat().st_mode) == 0o400
+
+
+def test_migration_callback_cannot_attach_or_commit(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    _create_multiportfolio_database(source).close()
+
+    def migration(connection: sqlite3.Connection) -> None:
+        connection.execute("ATTACH DATABASE ':memory:' AS escaped")
+
+    report = SQLiteMaintenanceService().dry_run_migration(
+        source,
+        target,
+        migration_id="synthetic-attach",
+        migration=migration,
+    )
+    assert report.outcome == "rolled_back"
+    assert report.before == report.after
+
+
+@pytest.mark.asyncio
+async def test_legacy_multiuser_migration_preserves_inspection_and_noop(tmp_path: Path) -> None:
+    missing = MultiuserMigration(tmp_path / "missing.db")
+    assert await missing.needs_migration() is True
+    assert await missing.migrate() is False
+
+    applied_path = tmp_path / "applied.db"
+    with sqlite3.connect(applied_path) as connection:
+        connection.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, description TEXT)"
+        )
+        connection.execute("INSERT INTO schema_migrations VALUES (1, 'already applied')")
+    applied = MultiuserMigration(applied_path)
+    assert await applied.needs_migration() is False
+    assert await applied.migrate() is False
+
+
+@pytest.mark.asyncio
+async def test_legacy_multiuser_mutation_entrypoints_are_quarantined(tmp_path: Path) -> None:
+    source = tmp_path / "legacy.db"
+    with sqlite3.connect(source) as connection:
+        connection.execute("CREATE TABLE positions (symbol TEXT)")
+        connection.execute("INSERT INTO positions VALUES ('AAPL')")
+        connection.execute("CREATE TABLE account (id INTEGER PRIMARY KEY, cash REAL)")
+        connection.execute("INSERT INTO account VALUES (1, 1000.0), (2, 1250.0)")
+    before = source.read_bytes()
+    migration = MultiuserMigration(source)
+
+    with pytest.raises(LegacyMultiuserMigrationDisabled):
+        await migration.migrate()
+    with pytest.raises(LegacyMultiuserMigrationDisabled):
+        await migration._create_backup()
+    with pytest.raises(LegacyMultiuserMigrationDisabled):
+        await migration._restore_from_backup(tmp_path / "backup.db")
+    assert source.read_bytes() == before
+    with sqlite3.connect(source) as connection:
+        assert connection.execute("SELECT id,cash FROM account ORDER BY id").fetchall() == [
+            (1, 1000.0),
+            (2, 1250.0),
+        ]
+
+
+def test_cli_backup_verify_and_restore_are_non_authorizing(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    backup_manifest = tmp_path / "backup.json"
+    restore = tmp_path / "restore.db"
+    restore_manifest = tmp_path / "restore.json"
+    _create_multiportfolio_database(source).close()
+    script = Path(__file__).resolve().parents[2] / "scripts" / "database_maintenance.py"
+
+    for arguments in (
+        [
+            "backup",
+            "--source",
+            str(source),
+            "--target",
+            str(backup),
+            "--manifest",
+            str(backup_manifest),
+        ],
+        [
+            "verify",
+            "--database",
+            str(backup),
+            "--manifest",
+            str(backup_manifest),
+        ],
+        [
+            "restore-clean-room",
+            "--backup",
+            str(backup),
+            "--backup-manifest",
+            str(backup_manifest),
+            "--target",
+            str(restore),
+            "--restore-manifest",
+            str(restore_manifest),
+        ],
+    ):
+        completed = subprocess.run(
+            [sys.executable, str(script), *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert json.loads(completed.stdout)["authorizes_startup"] is False
