@@ -147,6 +147,24 @@ def _build_sealed_capability_runtime():
     validate_reduction_bounds = _validate_reduction_bounds
     validate_gateway_binding_scope = _validate_gateway_binding_scope
     replace_record = dataclass_replace
+    # Capture the OS primitive inside the sealed runtime so the terminal
+    # cross-process kill-switch check cannot be replaced through a gateway or
+    # executor attribute. The remaining lstat-to-fill interval is synchronous
+    # and intentionally contains no caller callback.
+    from os import lstat as terminal_lstat
+
+    terminal_entry_lock_path = "data/kill_switch.lock"
+
+    def require_terminal_entry_lock_clear() -> None:
+        try:
+            terminal_lstat(terminal_entry_lock_path)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise PaperExecutionCapabilityError(
+                "terminal kill-switch lock state is unavailable"
+            ) from exc
+        raise PaperExecutionCapabilityError("terminal kill-switch lock is active")
 
     bind_capability_token = object()
     reduction_bind_capability_token = object()
@@ -799,6 +817,7 @@ def _build_sealed_capability_runtime():
             or fingerprint != expected_fingerprint
         ):
             raise PaperExecutionCapabilityError("baseline terminal dispatch does not match attempt")
+        require_terminal_entry_lock_clear()
         capability = PaperExecutionCapability(_token=capability_token)
         with registry_lock:
             capabilities[capability] = CapabilityRecord(

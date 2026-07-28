@@ -569,6 +569,62 @@ async def test_entry_terminal_gate_rechecks_in_memory_kill_switch_after_equity_a
 
 
 @pytest.mark.asyncio
+async def test_entry_terminal_gate_rechecks_lock_file_after_timer_enters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("robo_trader.runner_async.is_extended_hours", lambda: False)
+    (tmp_path / "data").mkdir()
+    gateway, probe = _exact_gateway()
+    runner = _runner(gateway)
+
+    def start_timer_then_lock(*_args, **_kwargs) -> None:
+        (tmp_path / "data" / "kill_switch.lock").touch()
+
+    runner.monitor.start_timer.side_effect = start_timer_then_lock
+
+    result = await _place(runner, _order("BUY"))
+
+    assert result.ok is False
+    assert "terminal safety gate" in result.message
+    assert "kill switch lock active" in result.message.lower()
+    assert probe.enter_count == 1
+    assert probe.exit_count == 1
+    runner.monitor.start_timer.assert_called_once()
+    runner.monitor.end_timer.assert_called_once()
+    gateway.submit_baseline_entry.assert_not_called()
+    runner.executor.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_entry_terminal_gate_rechecks_in_memory_kill_switch_after_timer_enters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("robo_trader.runner_async.is_extended_hours", lambda: False)
+    gateway, _ = _exact_gateway()
+    runner = _runner(gateway)
+
+    def start_timer_then_trigger(*_args, **_kwargs) -> None:
+        runner.advanced_risk.kill_switch.triggered = True
+        runner.advanced_risk.kill_switch.trigger_reason = "Loss limit crossed"
+
+    runner.monitor.start_timer.side_effect = start_timer_then_trigger
+
+    result = await _place(runner, _order("BUY"))
+
+    assert result.ok is False
+    assert "terminal safety gate" in result.message
+    assert "loss limit crossed" in result.message.lower()
+    runner.monitor.start_timer.assert_called_once()
+    runner.monitor.end_timer.assert_called_once()
+    gateway.submit_baseline_entry.assert_not_called()
+    runner.executor.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_entry_fails_closed_when_lock_file_state_is_unreadable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -860,6 +860,60 @@ async def test_baseline_entry_intent_is_exact_session_scoped_and_one_shot(
 
 
 @pytest.mark.asyncio
+async def test_baseline_terminal_boundary_rechecks_cross_process_kill_switch(
+    harness: GatewayHarness,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data").mkdir()
+    executor = PaperExecutor()
+    handle = await _bind_runtime(harness, "portfolio-a", executor)
+    intent = harness.gateway.issue_baseline_entry_intent(
+        portfolio_id="portfolio-a",
+        symbol=SYMBOL,
+        handle=handle,
+    )
+    now = datetime.now(timezone.utc)
+    quote = BrokerProtectiveQuote(
+        schema_version=1,
+        symbol=SYMBOL,
+        con_id=CON_ID,
+        exchange="SMART",
+        primary_exchange="NASDAQ",
+        currency="USD",
+        security_type="STK",
+        price=Decimal("123.4500"),
+        source_timestamp=now,
+        retrieval_timestamp=now,
+        session=MarketSession.REGULAR,
+        source=MarketDataSource.IBKR_LIVE_LAST_TRADE,
+        source_event_id="entry-terminal-kill-switch-test",
+        transport_generation="gateway-generation",
+        market_data_type=1,
+    )
+    harness.gateway._fetch_protective_quotes_locked = AsyncMock(return_value=(quote,))
+    order = Order(SYMBOL, 1, "BUY", quote.price, order_ref="terminal-kill-switch")
+
+    async with harness.gateway.serialize_entry(SYMBOL, portfolio_id="portfolio-a"):
+        (tmp_path / "data" / "kill_switch.lock").touch()
+        with pytest.raises(PaperExecutionCapabilityError, match="kill-switch lock is active"):
+            harness.gateway.submit_baseline_entry(
+                order=order,
+                portfolio_id="portfolio-a",
+                intent=intent,
+            )
+
+    assert executor.fills == {}
+    with pytest.raises(PaperReductionGatewayError, match="already consumed"):
+        harness.gateway.submit_baseline_entry(
+            order=order,
+            portfolio_id="portfolio-a",
+            intent=intent,
+        )
+
+
+@pytest.mark.asyncio
 async def test_baseline_terminal_dispatch_direct_replay_cannot_fill_twice(
     harness: GatewayHarness,
 ) -> None:

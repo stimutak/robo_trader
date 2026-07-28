@@ -1735,19 +1735,15 @@ class AsyncRunner:
                         return self._rejected_order_result(
                             "Entry blocked: canonical session evidence expired during final admission"
                         )
-                    # ``serialize_entry`` and ``portfolio.equity`` both await.
-                    # Recheck the in-memory and cross-process kill-switch state
-                    # at the final synchronous boundary before the one-shot
-                    # entry authority is consumed.  The gateway intentionally
-                    # bypasses PaperExecutor.place_order(), so this preserves
-                    # the terminal lock-file protection formerly supplied by
-                    # BaseExecutor.validate_order().
-                    blocked, reason = self._trading_blocked()
-                    if blocked:
-                        return self._rejected_order_result(
-                            f"Entry blocked at terminal safety gate: {reason}"
-                        )
                     with Timer("order_execution", self.monitor):
+                        # Timer.__enter__ invokes the mutable monitor callback.
+                        # Recheck only after that callback and immediately before
+                        # the one-shot entry authority can be consumed.
+                        blocked, reason = self._trading_blocked()
+                        if blocked:
+                            return self._rejected_order_result(
+                                f"Entry blocked at terminal safety gate: {reason}"
+                            )
                         result = gateway.submit_baseline_entry(
                             order=exact_order,
                             portfolio_id=self.portfolio_id,
