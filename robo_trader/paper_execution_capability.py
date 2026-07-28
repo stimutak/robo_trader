@@ -14,7 +14,8 @@ import datetime as dt
 import math
 import threading
 import weakref
-from dataclasses import dataclass, replace as dataclass_replace
+from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 from decimal import ROUND_HALF_EVEN, Decimal
 from enum import Enum
 from typing import TYPE_CHECKING, cast
