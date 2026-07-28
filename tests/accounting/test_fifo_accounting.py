@@ -535,6 +535,75 @@ def test_snapshot_chain_is_per_asset_and_globally_sequenced(connection, ledger):
     ledger.verify_epoch_integrity(EPOCH_ID)
 
 
+def test_integrity_verifier_replays_every_intermediate_snapshot(connection, ledger):
+    first = ledger.record_fill(_fill(1, FillSide.BUY, "1", "10"))
+    second = ledger.record_fill(_fill(2, FillSide.BUY, "1", "20"))
+
+    first_payload = {
+        "con_id": first.snapshot.con_id,
+        "cumulative_commission_minor": 0,
+        "cumulative_realized_pnl": "0",
+        "epoch_id": EPOCH_ID,
+        "event_sequence": 1,
+        "open_cost": "90",
+        "open_lot_count": 1,
+        "previous_snapshot_id": None,
+        "previous_state_fingerprint": None,
+        "signed_quantity": "9",
+        "snapshot_id": first.snapshot.snapshot_id,
+        "source_fill_id": first.fill_id,
+        "symbol": first.snapshot.symbol,
+    }
+    bad_first_fingerprint = _snapshot_fingerprint(first_payload)
+    second_payload = {
+        "con_id": second.snapshot.con_id,
+        "cumulative_commission_minor": 0,
+        "cumulative_realized_pnl": "0",
+        "epoch_id": EPOCH_ID,
+        "event_sequence": 2,
+        "open_cost": "30",
+        "open_lot_count": 2,
+        "previous_snapshot_id": first.snapshot.snapshot_id,
+        "previous_state_fingerprint": bad_first_fingerprint,
+        "signed_quantity": "2",
+        "snapshot_id": second.snapshot.snapshot_id,
+        "source_fill_id": second.fill_id,
+        "symbol": second.snapshot.symbol,
+    }
+    connection.execute("DROP TRIGGER fifo_position_snapshots_no_update")
+    connection.execute(
+        """
+        UPDATE fifo_position_snapshots
+        SET signed_quantity_text='9', open_cost_text='90', state_fingerprint=?
+        WHERE snapshot_id=?
+        """,
+        (bad_first_fingerprint, first.snapshot.snapshot_id),
+    )
+    connection.execute(
+        """
+        UPDATE fifo_position_snapshots
+        SET previous_state_fingerprint=?, state_fingerprint=?
+        WHERE snapshot_id=?
+        """,
+        (
+            bad_first_fingerprint,
+            _snapshot_fingerprint(second_payload),
+            second.snapshot.snapshot_id,
+        ),
+    )
+    connection.execute("""
+        CREATE TRIGGER fifo_position_snapshots_no_update
+        BEFORE UPDATE ON fifo_position_snapshots
+        BEGIN
+            SELECT RAISE(ABORT, 'fifo_position_snapshots is append-only');
+        END
+        """)
+    connection.commit()
+
+    with pytest.raises(FifoAccountingValidationError, match="snapshot diverges"):
+        ledger.verify_epoch_integrity(EPOCH_ID)
+
+
 def test_integrity_verifier_rejects_fill_without_commission_and_snapshot(connection, ledger):
     _insert_fill_row(connection, _fill(1, FillSide.BUY, "2", "10"))
     connection.commit()

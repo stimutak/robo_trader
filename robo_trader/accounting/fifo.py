@@ -543,7 +543,6 @@ class FifoLedger:
             (epoch_id,),
         ).fetchall()
         prior_time: Optional[datetime] = effective_at
-        last_event_by_asset: dict[tuple[int, str], FillEvent] = {}
         events: list[FillEvent] = []
         for expected_sequence, row in enumerate(rows, start=1):
             event = FillEvent(
@@ -568,7 +567,6 @@ class FifoLedger:
                 raise FifoAccountingValidationError("fill event time is not monotonic")
             prior_time = event.occurred_at
             events.append(event)
-            last_event_by_asset[(event.con_id, event.symbol)] = event
             if event.fingerprint() != row[13]:
                 raise FifoAccountingValidationError("fill payload fingerprint mismatch")
             if _parse_utc(row[14], "commission recorded_at") != event.recorded_at:
@@ -688,7 +686,7 @@ class FifoLedger:
                 )
 
         previous_by_asset: dict[tuple[int, str], tuple[str, str]] = {}
-        latest_snapshot_by_asset: dict[tuple[int, str], Sequence[object]] = {}
+        snapshot_by_fill: dict[str, Sequence[object]] = {}
         snapshots = self._connection.execute(
             """
             SELECT snapshot_id, source_fill_id, event_sequence, con_id, symbol,
@@ -747,10 +745,11 @@ class FifoLedger:
             if _fingerprint(payload) != row[12]:
                 raise FifoAccountingValidationError("snapshot state fingerprint mismatch")
             previous_by_asset[asset] = (str(row[0]), str(row[12]))
-            latest_snapshot_by_asset[asset] = row
+            snapshot_by_fill[str(row[1])] = row
 
-        for asset, event in last_event_by_asset.items():
-            lots = self._open_lots(event)
+        for event in events:
+            asset = (event.con_id, event.symbol)
+            lots = self._open_lots(event, through_sequence=event.event_sequence)
             expected_quantity = Decimal("0")
             expected_open_cost = Decimal("0")
             for lot in lots:
@@ -771,8 +770,9 @@ class FifoLedger:
                 FROM fifo_lot_matches m
                 JOIN fifo_fills f ON f.fill_id = m.closing_fill_id
                 WHERE m.epoch_id = ? AND f.con_id = ? AND f.symbol = ?
+                  AND f.event_sequence <= ?
                 """,
-                (epoch_id, asset[0], asset[1]),
+                (epoch_id, asset[0], asset[1], event.event_sequence),
             ).fetchall()
             expected_realized = Decimal("0")
             for realized_row in realized_rows:
@@ -786,23 +786,24 @@ class FifoLedger:
                 SELECT c.amount_minor
                 FROM fifo_commissions c JOIN fifo_fills f ON f.fill_id = c.fill_id
                 WHERE c.epoch_id = ? AND f.con_id = ? AND f.symbol = ?
+                  AND f.event_sequence <= ?
                 """,
-                (epoch_id, asset[0], asset[1]),
+                (epoch_id, asset[0], asset[1], event.event_sequence),
             ).fetchall()
             expected_commission = sum(int(commission_row[0]) for commission_row in commission_rows)
-            latest = latest_snapshot_by_asset[asset]
+            snapshot = snapshot_by_fill[event.fill_id]
             expected_open_cost_text = (
                 None if expected_quantity == 0 else _decimal_text(expected_open_cost)
             )
             if (
-                _parse_decimal(latest[5], "snapshot signed quantity") != expected_quantity
-                or latest[6] != expected_open_cost_text
-                or int(str(latest[7])) != len(lots)
-                or _parse_decimal(latest[8], "snapshot realized P&L") != expected_realized
-                or int(str(latest[9])) != expected_commission
+                _parse_decimal(snapshot[5], "snapshot signed quantity") != expected_quantity
+                or snapshot[6] != expected_open_cost_text
+                or int(str(snapshot[7])) != len(lots)
+                or _parse_decimal(snapshot[8], "snapshot realized P&L") != expected_realized
+                or int(str(snapshot[9])) != expected_commission
             ):
                 raise FifoAccountingValidationError(
-                    "latest position snapshot diverges from immutable events"
+                    "position snapshot diverges from immutable events"
                 )
 
     def _verify_fifo_projection_structure(self, events: Sequence[FillEvent]) -> None:
@@ -989,16 +990,28 @@ class FifoLedger:
         if any((int(row[0]), str(row[1])) != (event.con_id, event.symbol) for row in rows):
             raise FifoAccountingConflict("contract identifier and symbol binding changed")
 
-    def _open_lots(self, event: FillEvent) -> list[_OpenLot]:
+    def _open_lots(
+        self,
+        event: FillEvent,
+        *,
+        through_sequence: Optional[int] = None,
+    ) -> list[_OpenLot]:
         rows = self._connection.execute(
             """
             SELECT l.lot_id, l.opened_sequence, l.direction, l.opened_quantity_text,
                    l.open_price_text, l.opening_commission_minor
             FROM fifo_lot_openings l
             WHERE l.epoch_id = ? AND l.con_id = ? AND l.symbol = ?
+              AND (? IS NULL OR l.opened_sequence <= ?)
             ORDER BY l.opened_sequence, l.lot_id
             """,
-            (event.epoch_id, event.con_id, event.symbol),
+            (
+                event.epoch_id,
+                event.con_id,
+                event.symbol,
+                through_sequence,
+                through_sequence,
+            ),
         ).fetchall()
         result: list[_OpenLot] = []
         for row in rows:
@@ -1010,9 +1023,10 @@ class FifoLedger:
                 FROM fifo_lot_matches m
                 JOIN fifo_fills f ON f.fill_id = m.closing_fill_id
                 WHERE m.epoch_id = ? AND m.opening_lot_id = ?
+                  AND (? IS NULL OR f.event_sequence <= ?)
                 ORDER BY f.event_sequence, m.match_ordinal
                 """,
-                (event.epoch_id, row[0]),
+                (event.epoch_id, row[0], through_sequence, through_sequence),
             ).fetchall()
             matched = Decimal("0")
             allocated = 0
