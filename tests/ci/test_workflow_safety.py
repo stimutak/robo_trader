@@ -78,6 +78,40 @@ def test_mypy_and_supply_chain_debt_are_explicitly_advisory() -> None:
     assert 'safety check -r "$requirements_file" --json' in workflow
 
 
+def test_secret_scan_covers_each_event_with_a_valid_revision_range() -> None:
+    workflow = _workflow("production-ci.yml")
+    zero_sha = "0000000000000000000000000000000000000000"
+
+    def step(name: str) -> str:
+        return workflow.split(f"- name: {name}", maxsplit=1)[1].split(
+            "\n    - name:", maxsplit=1
+        )[0]
+
+    pull_request = step("Check pull request for hardcoded secrets")
+    assert "if: github.event_name == 'pull_request'" in pull_request
+    assert "base: ${{ github.event.pull_request.base.sha }}" in pull_request
+    assert "head: ${{ github.event.pull_request.head.sha }}" in pull_request
+
+    ordinary_push = step("Check pushed commits for hardcoded secrets")
+    assert f"github.event.before != '{zero_sha}'" in ordinary_push
+    assert "base: ${{ github.event.before }}" in ordinary_push
+    assert "head: ${{ github.sha }}" in ordinary_push
+
+    new_ref = step("Check new ref history for hardcoded secrets")
+    assert f"github.event.before == '{zero_sha}'" in new_ref
+    assert "base: ''" in new_ref
+    assert "head: ${{ github.sha }}" in new_ref
+
+    schedule = step("Check repository history for hardcoded secrets")
+    assert "if: github.event_name == 'schedule'" in schedule
+    assert "base: ''" in schedule
+    assert "head: ''" in schedule
+
+    assert workflow.count("uses: trufflesecurity/trufflehog@main") == 4
+    for secret_scan_step in (pull_request, ordinary_push, new_ref, schedule):
+        assert "continue-on-error: true" not in secret_scan_step
+
+
 def test_full_suite_jobs_fail_closed_on_hangs_with_thread_diagnostics() -> None:
     for workflow_name in ("ci.yml", "deploy.yml", "production-ci.yml"):
         workflow = _workflow(workflow_name)

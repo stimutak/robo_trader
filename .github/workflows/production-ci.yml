@@ -44,14 +44,44 @@ jobs:
       with:
         sarif_file: 'trivy-results.sarif'
 
-    - name: Check for hardcoded secrets
+    - name: Check pull request for hardcoded secrets
       # TODO(R2-CFG-H1.4): pin to specific commit SHA
       uses: trufflesecurity/trufflehog@main
-      if: github.event_name == 'push' || github.event_name == 'pull_request'
+      if: github.event_name == 'pull_request'
       with:
         path: ./
-        base: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-        head: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        base: ${{ github.event.pull_request.base.sha }}
+        head: ${{ github.event.pull_request.head.sha }}
+
+    - name: Check pushed commits for hardcoded secrets
+      # TODO(R2-CFG-H1.4): pin to specific commit SHA
+      uses: trufflesecurity/trufflehog@main
+      if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
+      with:
+        path: ./
+        base: ${{ github.event.before }}
+        head: ${{ github.sha }}
+
+    - name: Check new ref history for hardcoded secrets
+      # A zero before SHA identifies a newly-created branch or tag. Leaving the
+      # base empty avoids passing that sentinel to git as an invalid revision.
+      # TODO(R2-CFG-H1.4): pin to specific commit SHA
+      uses: trufflesecurity/trufflehog@main
+      if: github.event_name == 'push' && github.event.before == '0000000000000000000000000000000000000000'
+      with:
+        path: ./
+        base: ''
+        head: ${{ github.sha }}
+
+    - name: Check repository history for hardcoded secrets
+      # Empty bounds intentionally request a full-history scan on the weekly run.
+      # TODO(R2-CFG-H1.4): pin to specific commit SHA
+      uses: trufflesecurity/trufflehog@main
+      if: github.event_name == 'schedule'
+      with:
+        path: ./
+        base: ''
+        head: ''
 
   # Comprehensive testing
   test-suite:
