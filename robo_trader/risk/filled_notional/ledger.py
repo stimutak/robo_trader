@@ -712,7 +712,11 @@ class DailyFilledNotional:
                     recovery_required = False
                 else:
                     recovery_required = self._preflight_existing_schema()
-                with self._anchor_transition_lock():
+                with self._anchor_transition_lock(
+                    pre_create_check=(
+                        self._reject_missing_database_artifacts if database_was_missing else None
+                    )
+                ):
                     created = False
                     if database_was_missing:
                         created = self._initialize_if_missing()
@@ -860,68 +864,73 @@ class DailyFilledNotional:
             if descriptor is not None:
                 os.close(descriptor)
 
+    def _validate_anchor_transition_lock(self, descriptor: int, directory_descriptor: int) -> None:
+        try:
+            metadata = os.fstat(descriptor)
+            path_metadata = os.stat(
+                self._anchor_lock_name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise FilledNotionalIntegrityError(
+                "anchor transition lock identity cannot be verified"
+            ) from exc
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o077
+            or metadata.st_nlink != 1
+            or (metadata.st_dev, metadata.st_ino) != (path_metadata.st_dev, path_metadata.st_ino)
+        ):
+            raise FilledNotionalIntegrityError("anchor transition lock is not safely bindable")
+
     @contextmanager
-    def _anchor_transition_lock(self, *, create: bool = True) -> Iterator[None]:
+    def _anchor_transition_lock(
+        self,
+        *,
+        create: bool = True,
+        pre_create_check: Optional[Callable[[], None]] = None,
+    ) -> Iterator[None]:
         """Serialize database commits through stable-anchor publication."""
 
         descriptor: Optional[int] = None
+        directory_locked = False
         with self._anchor_directory_descriptor() as directory_descriptor:
             try:
-                flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-                if create:
-                    flags |= os.O_CREAT
-                descriptor = os.open(
-                    self._anchor_lock_name,
-                    flags,
-                    0o600,
-                    dir_fd=directory_descriptor,
-                )
-                metadata = os.fstat(descriptor)
-                path_metadata = os.stat(
-                    self._anchor_lock_name,
-                    dir_fd=directory_descriptor,
-                    follow_symlinks=False,
-                )
-                if (
-                    not stat.S_ISREG(metadata.st_mode)
-                    or metadata.st_mode & 0o077
-                    or metadata.st_nlink != 1
-                    or (metadata.st_dev, metadata.st_ino)
-                    != (path_metadata.st_dev, path_metadata.st_ino)
-                ):
-                    raise FilledNotionalIntegrityError(
-                        "anchor transition lock is not safely bindable"
+                try:
+                    fcntl.flock(directory_descriptor, fcntl.LOCK_EX)
+                    directory_locked = True
+                    if pre_create_check is not None:
+                        pre_create_check()
+                    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+                    if create:
+                        flags |= os.O_CREAT
+                    descriptor = os.open(
+                        self._anchor_lock_name,
+                        flags,
+                        0o600,
+                        dir_fd=directory_descriptor,
                     )
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
-            except FilledNotionalError:
-                if descriptor is not None:
-                    os.close(descriptor)
-                raise
-            except OSError as exc:
-                if descriptor is not None:
-                    os.close(descriptor)
-                raise FilledNotionalIntegrityError(
-                    "anchor transition lock cannot be used safely"
-                ) from exc
-            try:
+                    self._validate_anchor_transition_lock(descriptor, directory_descriptor)
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                    self._validate_anchor_transition_lock(descriptor, directory_descriptor)
+                except FilledNotionalError:
+                    raise
+                except OSError as exc:
+                    raise FilledNotionalIntegrityError(
+                        "anchor transition lock cannot be used safely"
+                    ) from exc
                 yield
-                final_metadata = os.fstat(descriptor)
-                final_path_metadata = os.stat(
-                    self._anchor_lock_name,
-                    dir_fd=directory_descriptor,
-                    follow_symlinks=False,
-                )
-                if final_metadata.st_nlink != 1 or (
-                    final_metadata.st_dev,
-                    final_metadata.st_ino,
-                ) != (final_path_metadata.st_dev, final_path_metadata.st_ino):
-                    raise FilledNotionalIntegrityError("anchor transition lock identity changed")
+                self._validate_anchor_transition_lock(descriptor, directory_descriptor)
             finally:
                 if descriptor is not None:
                     try:
                         fcntl.flock(descriptor, fcntl.LOCK_UN)
                     finally:
                         os.close(descriptor)
+                if directory_locked:
+                    fcntl.flock(directory_descriptor, fcntl.LOCK_UN)
 
     @property
     def database_path(self) -> Path:
@@ -1140,16 +1149,17 @@ class DailyFilledNotional:
     ) -> tuple[ConflictEvidence, ...]:
         """Authenticate and return durable conflict markers without clearing them."""
 
-        reviewer = cls(
-            database_path,
-            anchor_path=anchor_path,
-            anchor_key=anchor_key,
-            monotonic_verifier=monotonic_verifier,
-            account_id="__review__",
-            portfolio_id="__review__",
-            _review_only=True,
-        )
+        reviewer: Optional[DailyFilledNotional] = None
         try:
+            reviewer = cls(
+                database_path,
+                anchor_path=anchor_path,
+                anchor_key=anchor_key,
+                monotonic_verifier=monotonic_verifier,
+                account_id="__review__",
+                portfolio_id="__review__",
+                _review_only=True,
+            )
             with reviewer._connection(readonly=True, immutable=True) as connection:
                 connection.execute("BEGIN")
                 state = reviewer._validate_checkpointed_state(connection)
@@ -1175,8 +1185,13 @@ class DailyFilledNotional:
                 reviewer._verify_monotonic_state(state)
                 connection.commit()
                 return evidence
+        except _PendingAnchorInProgress as exc:
+            raise FilledNotionalUnavailable(
+                "quarantine review unavailable during pending anchor transition"
+            ) from exc
         finally:
-            reviewer._latch_failure("review-only instance cannot perform accounting")
+            if reviewer is not None:
+                reviewer._latch_failure("review-only instance cannot perform accounting")
 
     def _append_fill(
         self,
@@ -1410,6 +1425,12 @@ class DailyFilledNotional:
             with self._anchor_transition_lock(create=False):
                 self._raise_if_anchor_survives_missing_database()
             return
+        self._raise_if_anchor_survives_missing_database()
+
+    def _reject_missing_database_artifacts(self) -> None:
+        """Recheck missing-ledger evidence under noncreating directory serialization."""
+
+        self._reject_sidecars_without_database()
         self._raise_if_anchor_survives_missing_database()
 
     def _initialize_if_missing(self) -> bool:

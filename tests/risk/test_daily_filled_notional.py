@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -734,6 +735,50 @@ def test_missing_database_with_surviving_anchor_does_not_create_lock(tmp_path):
     assert all(not Path(f"{path}{suffix}").exists() for suffix in ("-wal", "-shm", "-journal"))
 
 
+@pytest.mark.parametrize("injected_artifact", ["anchor", "-wal", "-shm", "-journal"])
+def test_missing_database_race_rejects_without_creating_transition_lock(
+    tmp_path, monkeypatch, injected_artifact
+):
+    path = tmp_path / "notional.db"
+    anchor_directory = tmp_path / "protected-anchor"
+    anchor_directory.mkdir(mode=0o700)
+    anchor_path = anchor_directory / "notional.db.anchor"
+    lock_path = anchor_directory / ".notional.db.anchor.lock"
+    original_transition_lock = DailyFilledNotional._anchor_transition_lock
+    artifact_path = (
+        anchor_path if injected_artifact == "anchor" else Path(f"{path}{injected_artifact}")
+    )
+    artifact_before: list[tuple[bytes, int, int]] = []
+    paths_after_injection: list[tuple[str, ...]] = []
+
+    @contextmanager
+    def inject_before_lock(self, **kwargs):
+        artifact_path.write_bytes(b"preserved evidence injected before lock acquisition")
+        if artifact_path == anchor_path:
+            os.chmod(artifact_path, 0o600)
+        artifact_before.append(_file_snapshot(artifact_path))
+        paths_after_injection.append(_path_inventory(tmp_path))
+        with original_transition_lock(self, **kwargs):
+            yield
+
+    monkeypatch.setattr(DailyFilledNotional, "_anchor_transition_lock", inject_before_lock)
+
+    with pytest.raises(FilledNotionalUnavailable):
+        DailyFilledNotional(
+            path,
+            anchor_path=anchor_path,
+            anchor_key=ANCHOR_KEY,
+            monotonic_verifier=TestMonotonicVerifier(),
+            account_id="DU12345",
+            portfolio_id="default",
+        )
+
+    assert not path.exists()
+    assert not lock_path.exists()
+    assert _file_snapshot(artifact_path) == artifact_before[0]
+    assert _path_inventory(tmp_path) == paths_after_injection[0]
+
+
 def test_wal_shm_hardlinks_are_rejected_without_mutating_targets(tmp_path):
     path = tmp_path / "notional.db"
     ledger = _service(path)
@@ -1021,6 +1066,92 @@ def test_concurrent_writers_serialize_through_stable_anchor_publication(tmp_path
     assert _service(path).restored_gross_filled_notional == Decimal("41")
 
 
+def test_transition_lock_revalidates_path_identity_after_blocked_flock(tmp_path, monkeypatch):
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+    lock_path = ledger.anchor_path.parent / f".{ledger.anchor_path.name}.lock"
+    preserved_lock = ledger.anchor_path.parent / "preserved-transition.lock"
+    blocker = os.open(lock_path, os.O_RDWR)
+    fcntl.flock(blocker, fcntl.LOCK_EX)
+    worker_opened_lock = threading.Event()
+    worker_entered_section = threading.Event()
+    worker_result: list[BaseException] = []
+    worker_ident: list[int] = []
+    original_open = os.open
+
+    def observe_worker_open(target, flags, mode=0o777, *, dir_fd=None):
+        descriptor = original_open(target, flags, mode, dir_fd=dir_fd)
+        if (
+            worker_ident
+            and threading.get_ident() == worker_ident[0]
+            and target == ledger._anchor_lock_name
+        ):
+            worker_opened_lock.set()
+        return descriptor
+
+    monkeypatch.setattr(ledger_module.os, "open", observe_worker_open)
+
+    def acquire_transition_lock() -> None:
+        worker_ident.append(threading.get_ident())
+        try:
+            with ledger._anchor_transition_lock():
+                worker_entered_section.set()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            worker_result.append(exc)
+
+    worker = threading.Thread(target=acquire_transition_lock)
+    worker.start()
+    assert worker_opened_lock.wait(timeout=5)
+    lock_path.rename(preserved_lock)
+    replacement = original_open(lock_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(replacement)
+    fcntl.flock(blocker, fcntl.LOCK_UN)
+    os.close(blocker)
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert not worker_entered_section.is_set()
+    assert len(worker_result) == 1
+    assert isinstance(worker_result[0], FilledNotionalIntegrityError)
+    assert "transition lock" in str(worker_result[0])
+
+
+@pytest.mark.parametrize("mutation", ["mode", "link-count"])
+def test_transition_lock_revalidates_safety_metadata_after_flock(tmp_path, monkeypatch, mutation):
+    ledger = _service(tmp_path / "notional.db")
+    lock_path = ledger.anchor_path.parent / f".{ledger.anchor_path.name}.lock"
+    extra_link = ledger.anchor_path.parent / "extra-transition-lock-link"
+    lock_identity = (lock_path.stat().st_dev, lock_path.stat().st_ino)
+    original_flock = fcntl.flock
+    mutated = False
+    entered_section = False
+
+    def mutate_after_acquire(descriptor, operation):
+        nonlocal mutated
+        result = original_flock(descriptor, operation)
+        metadata = os.fstat(descriptor)
+        if (
+            not mutated
+            and operation & fcntl.LOCK_EX
+            and (metadata.st_dev, metadata.st_ino) == lock_identity
+        ):
+            mutated = True
+            if mutation == "mode":
+                os.chmod(lock_path, 0o644)
+            else:
+                os.link(lock_path, extra_link)
+        return result
+
+    monkeypatch.setattr(ledger_module.fcntl, "flock", mutate_after_acquire)
+
+    with pytest.raises(FilledNotionalIntegrityError, match="transition lock"):
+        with ledger._anchor_transition_lock():
+            entered_section = True
+
+    assert mutated
+    assert not entered_section
+
+
 def test_invalid_pending_anchor_identity_still_fails_closed(tmp_path):
     path = tmp_path / "notional.db"
     ledger = _service(path)
@@ -1245,6 +1376,129 @@ def test_review_quarantine_success_is_byte_inode_and_path_read_only(tmp_path):
     assert _file_snapshot(path) == database_before
     assert _file_snapshot(ledger.anchor_path) == anchor_before
     assert _path_inventory(tmp_path) == paths_before
+
+
+def test_review_quarantine_translates_concurrent_pending_writer_without_mutation(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+    writer = _service(path)
+    pending_published = threading.Event()
+    release_writer = threading.Event()
+    writer_result: list[object] = []
+    original_commit = writer._commit_database
+
+    def hold_after_pending(connection):
+        pending_published.set()
+        if not release_writer.wait(timeout=5):
+            raise sqlite3.OperationalError("test timed out releasing pending writer")
+        original_commit(connection)
+
+    monkeypatch.setattr(writer, "_commit_database", hold_after_pending)
+
+    def write() -> None:
+        try:
+            writer_result.append(writer.record_fill(_fill("pending-during-review")))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            writer_result.append(exc)
+
+    writer_thread = threading.Thread(target=write)
+    writer_thread.start()
+    assert pending_published.wait(timeout=5)
+    database_before = _file_snapshot(path)
+    anchor_before = _file_snapshot(ledger.anchor_path)
+    paths_before = _path_inventory(tmp_path)
+    try:
+        with pytest.raises(FilledNotionalUnavailable, match="pending anchor transition"):
+            DailyFilledNotional.review_quarantine(
+                path,
+                anchor_path=ledger.anchor_path,
+                anchor_key=ANCHOR_KEY,
+                monotonic_verifier=_MONOTONIC_VERIFIERS[str(path)],
+            )
+
+        assert _file_snapshot(path) == database_before
+        assert _file_snapshot(ledger.anchor_path) == anchor_before
+        assert _path_inventory(tmp_path) == paths_before
+    finally:
+        release_writer.set()
+        writer_thread.join(timeout=5)
+
+    assert not writer_thread.is_alive()
+    assert len(writer_result) == 1
+    assert not isinstance(writer_result[0], BaseException)
+
+
+def test_review_quarantine_translates_pending_writer_after_constructor(tmp_path, monkeypatch):
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+    writer = _service(path)
+    pending_published = threading.Event()
+    release_writer = threading.Event()
+    writer_result: list[object] = []
+    writer_thread: list[threading.Thread] = []
+    original_commit = writer._commit_database
+    original_require = DailyFilledNotional._require_exact_anchor
+    review_require_calls = 0
+    database_at_pending: list[tuple[bytes, int, int]] = []
+    anchor_at_pending: list[tuple[bytes, int, int]] = []
+    paths_at_pending: list[tuple[str, ...]] = []
+
+    def hold_after_pending(connection):
+        pending_published.set()
+        if not release_writer.wait(timeout=5):
+            raise sqlite3.OperationalError("test timed out releasing pending writer")
+        original_commit(connection)
+
+    monkeypatch.setattr(writer, "_commit_database", hold_after_pending)
+
+    def write() -> None:
+        try:
+            writer_result.append(writer.record_fill(_fill("pending-after-review-construction")))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            writer_result.append(exc)
+
+    def start_writer_before_review_read(self, state):
+        nonlocal review_require_calls
+        if self._review_only:
+            review_require_calls += 1
+            if review_require_calls == 3:
+                thread = threading.Thread(target=write)
+                writer_thread.append(thread)
+                thread.start()
+                if not pending_published.wait(timeout=5):
+                    raise RuntimeError("test timed out waiting for pending writer")
+                database_at_pending.append(_file_snapshot(path))
+                anchor_at_pending.append(_file_snapshot(ledger.anchor_path))
+                paths_at_pending.append(_path_inventory(tmp_path))
+        return original_require(self, state)
+
+    monkeypatch.setattr(
+        DailyFilledNotional, "_require_exact_anchor", start_writer_before_review_read
+    )
+
+    try:
+        with pytest.raises(FilledNotionalUnavailable, match="pending anchor transition"):
+            DailyFilledNotional.review_quarantine(
+                path,
+                anchor_path=ledger.anchor_path,
+                anchor_key=ANCHOR_KEY,
+                monotonic_verifier=_MONOTONIC_VERIFIERS[str(path)],
+            )
+
+        assert _file_snapshot(path) == database_at_pending[0]
+        assert _file_snapshot(ledger.anchor_path) == anchor_at_pending[0]
+        assert _path_inventory(tmp_path) == paths_at_pending[0]
+    finally:
+        release_writer.set()
+        if writer_thread:
+            writer_thread[0].join(timeout=5)
+
+    assert review_require_calls == 3
+    assert writer_thread and not writer_thread[0].is_alive()
+    assert len(writer_result) == 1
+    assert not isinstance(writer_result[0], BaseException)
 
 
 @pytest.mark.parametrize("missing_artifact", ["database", "anchor"])
