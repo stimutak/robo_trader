@@ -24,7 +24,7 @@ import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Optional, cast
+from typing import Any, NamedTuple, Optional, cast
 
 # CRITICAL: Enable real disconnect BEFORE importing ib_async or ibkr_safe
 # This prevents zombie connections when the worker process exits
@@ -106,6 +106,23 @@ class BrokerSnapshotAccountMismatchError(ValueError):
     """Expected and connected broker account identities do not match."""
 
 
+class BrokerSnapshotStageTimeout(TimeoutError):
+    """One allowlisted broker snapshot stage exceeded its local deadline."""
+
+    def __init__(self, stage: str):
+        self.stage = stage
+        super().__init__(f"Broker snapshot stage timed out: {stage}")
+
+
+class _RequestScopedAccountSummaryValue(NamedTuple):
+    """One account-summary callback attributed to an exact IBKR request ID."""
+
+    account: str
+    tag: str
+    value: str
+    currency: str
+
+
 BROKER_SNAPSHOT_SCHEMA_VERSION = 1
 BROKER_SAFETY_SNAPSHOT_SCHEMA_VERSION = 1
 BROKER_CONTRACT_SAFETY_SNAPSHOT_SCHEMA_VERSION = 1
@@ -153,6 +170,156 @@ BROKER_SNAPSHOT_BALANCE_TAGS = frozenset(
     }
 )
 BROKER_SNAPSHOT_REQUIRED_BALANCE_TAGS = frozenset({"NetLiquidation", "TotalCashValue"})
+BROKER_SNAPSHOT_STAGE_TIMEOUT_SECONDS = 5.0
+BROKER_SNAPSHOT_ACCOUNT_SUMMARY_TAGS = ",".join(sorted(BROKER_SNAPSHOT_BALANCE_TAGS))
+BROKER_SNAPSHOT_REQUEST_STAGES = frozenset(
+    {
+        "broker_time_before",
+        "positions_initial",
+        "positions_initial_identity",
+        "position_identity",
+        "open_orders_initial",
+        "open_order_identity",
+        "broker_time_execution_cutoff",
+        "executions",
+        "execution_identity",
+        "account_summary",
+        "positions_final",
+        "positions_final_identity",
+        "open_orders_final",
+        "open_orders_final_identity",
+        "broker_time_after",
+    }
+)
+
+
+async def _await_broker_snapshot_stage(stage: str, request: Any) -> Any:
+    """Bound one broker await and expose only its allowlisted stage on timeout."""
+    if stage not in BROKER_SNAPSHOT_REQUEST_STAGES:
+        if inspect.iscoroutine(request):
+            request.close()
+        raise ValueError("Broker snapshot stage is not allowlisted")
+    try:
+        return await asyncio.wait_for(
+            request,
+            timeout=BROKER_SNAPSHOT_STAGE_TIMEOUT_SECONDS,
+        )
+    except (asyncio.TimeoutError, TimeoutError) as exc:
+        raise BrokerSnapshotStageTimeout(stage) from exc
+
+
+async def _request_fresh_broker_account_summary(account: str) -> list[Any]:
+    """Return only values produced by one fresh, cancelled summary request."""
+    if ib is None:
+        raise ConnectionError("Not connected to IBKR")
+    client = getattr(ib, "client", None)
+    wrapper = getattr(ib, "wrapper", None)
+    get_request_id = getattr(client, "getReqId", None)
+    request_summary = getattr(client, "reqAccountSummary", None)
+    cancel_summary = getattr(client, "cancelAccountSummary", None)
+    start_request = getattr(wrapper, "startReq", None)
+    end_request = getattr(wrapper, "_endReq", None)
+    account_summary_callback = getattr(wrapper, "accountSummary", None)
+    wrapper_namespace = getattr(wrapper, "__dict__", None)
+    if (
+        not callable(get_request_id)
+        or not callable(request_summary)
+        or not callable(cancel_summary)
+        or not callable(start_request)
+        or not callable(end_request)
+        or not callable(account_summary_callback)
+        or not isinstance(wrapper_namespace, dict)
+    ):
+        raise RuntimeError("IBKR client has no fresh account-summary API")
+
+    request_id = get_request_id()
+    if isinstance(request_id, bool) or not isinstance(request_id, int) or request_id < 0:
+        raise RuntimeError("IBKR client returned an invalid account-summary request ID")
+
+    missing = object()
+    previous_instance_callback = wrapper_namespace.get("accountSummary", missing)
+    captured: dict[tuple[str, str, str], _RequestScopedAccountSummaryValue] = {}
+    callback_failed = False
+
+    def capture_owned_account_summary(
+        callback_request_id: int,
+        callback_account: str,
+        tag: str,
+        value: str,
+        currency: str,
+    ) -> None:
+        nonlocal callback_failed
+        try:
+            result = account_summary_callback(
+                callback_request_id,
+                callback_account,
+                tag,
+                value,
+                currency,
+            )
+            if inspect.isawaitable(result):
+                if inspect.iscoroutine(result):
+                    result.close()
+                callback_failed = True
+                return
+        except Exception:
+            callback_failed = True
+            raise
+        if type(callback_request_id) is not int or callback_request_id != request_id:
+            return
+        owned_value = _RequestScopedAccountSummaryValue(
+            account=str(callback_account).strip(),
+            tag=str(tag),
+            value=str(value),
+            currency=str(currency).strip(),
+        )
+        captured[(owned_value.account, owned_value.tag, owned_value.currency)] = owned_value
+
+    request: Any = None
+    callback_overridden = False
+    request_registered = False
+    request_started = False
+    try:
+        setattr(wrapper, "accountSummary", capture_owned_account_summary)
+        callback_overridden = True
+        if getattr(wrapper, "accountSummary", None) is not capture_owned_account_summary:
+            raise RuntimeError("IBKR account-summary callback cannot be scoped")
+        request = start_request(request_id)
+        request_registered = True
+        # Treat the subscription as possibly live before the synchronous send:
+        # a partial transport write must still trigger a cancellation attempt.
+        request_started = True
+        request_summary(
+            request_id,
+            "All",
+            BROKER_SNAPSHOT_ACCOUNT_SUMMARY_TAGS,
+        )
+        await request
+    finally:
+        try:
+            if request_started:
+                cancel_summary(request_id)
+        finally:
+            try:
+                if request_registered:
+                    if not request.done():
+                        request.cancel()
+                    end_request(request_id)
+            finally:
+                if callback_overridden:
+                    if previous_instance_callback is missing:
+                        delattr(wrapper, "accountSummary")
+                    else:
+                        setattr(wrapper, "accountSummary", previous_instance_callback)
+
+    if callback_failed:
+        raise RuntimeError("IBKR account-summary callback provenance cannot be proven")
+
+    return [
+        value
+        for value in captured.values()
+        if value.account == account and value.tag in BROKER_SNAPSHOT_BALANCE_TAGS
+    ]
 
 
 def _aware_iso(value: Any) -> str:
@@ -853,9 +1020,13 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
                 "Broker snapshot managed account does not match expectation"
             )
 
-        broker_time_before = await _request_broker_time()
-        positions = await ib.reqPositionsAsync()
-        initial_position_signature = await _position_state_signature(positions, account)
+        broker_time_before = await _await_broker_snapshot_stage(
+            "broker_time_before", _request_broker_time()
+        )
+        positions = await _await_broker_snapshot_stage("positions_initial", ib.reqPositionsAsync())
+        initial_position_signature = await _await_broker_snapshot_stage(
+            "positions_initial_identity", _position_state_signature(positions, account)
+        )
         if not ib.isConnected():
             raise ConnectionError("Broker disconnected during snapshot collection")
 
@@ -865,7 +1036,9 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
         for position in positions:
             if str(getattr(position, "account", "")).strip() != account:
                 raise ValueError("Broker position account is inconsistent")
-            contract_identity = await _qualified_stock_identity(position.contract)
+            contract_identity = await _await_broker_snapshot_stage(
+                "position_identity", _qualified_stock_identity(position.contract)
+            )
             con_id = contract_identity["con_id"]
             symbol = contract_identity["symbol"]
             if con_id in seen_contract_ids or symbol in seen_symbols:
@@ -889,13 +1062,17 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
                 }
             )
 
-        open_trades = await ib.reqAllOpenOrdersAsync()
+        open_trades = await _await_broker_snapshot_stage(
+            "open_orders_initial", ib.reqAllOpenOrdersAsync()
+        )
         if not ib.isConnected():
             raise ConnectionError("Broker disconnected during snapshot collection")
         open_orders_data = []
         seen_order_ids: set[tuple[int, int]] = set()
         for trade in open_trades:
-            order_evidence = await _open_order_evidence(trade, account)
+            order_evidence = await _await_broker_snapshot_stage(
+                "open_order_identity", _open_order_evidence(trade, account)
+            )
             order_id = order_evidence["broker_order_id"]
             client_id = order_evidence["client_id"]
             order_identity = (client_id, order_id)
@@ -919,8 +1096,12 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
         # lower-bound-only request is in flight; such a later fill must make
         # the snapshot fail closed rather than be silently omitted or falsely
         # claimed as covered by an after-the-fact cutoff.
-        execution_window_end = await _request_broker_time()
-        fills = await ib.reqExecutionsAsync(execution_filter)
+        execution_window_end = await _await_broker_snapshot_stage(
+            "broker_time_execution_cutoff", _request_broker_time()
+        )
+        fills = await _await_broker_snapshot_stage(
+            "executions", ib.reqExecutionsAsync(execution_filter)
+        )
         if not ib.isConnected():
             raise ConnectionError("Broker disconnected during snapshot collection")
         executions_data = []
@@ -938,7 +1119,9 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
             if side is None:
                 raise ValueError("Broker execution side is unsupported")
 
-            contract_identity = await _qualified_stock_identity(fill.contract)
+            contract_identity = await _await_broker_snapshot_stage(
+                "execution_identity", _qualified_stock_identity(fill.contract)
+            )
             execution_time = getattr(execution, "time", None) or getattr(fill, "time", None)
             executed_at = _aware_iso(execution_time)
             executed_at_value = datetime.fromisoformat(executed_at)
@@ -1017,8 +1200,9 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
                 }
             )
 
-        await ib.reqAccountSummaryAsync()
-        account_values = ib.accountValues(account)
+        account_values = await _await_broker_snapshot_stage(
+            "account_summary", _request_fresh_broker_account_summary(account)
+        )
         if not ib.isConnected():
             raise ConnectionError("Broker disconnected during snapshot collection")
 
@@ -1049,17 +1233,27 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
         if not BROKER_SNAPSHOT_REQUIRED_BALANCE_TAGS.issubset(present_tags):
             raise ValueError("Broker snapshot is missing required balance evidence")
 
-        final_positions = await ib.reqPositionsAsync()
-        final_position_signature = await _position_state_signature(final_positions, account)
-        final_open_trades = await ib.reqAllOpenOrdersAsync()
-        final_order_signature = await _order_state_signature(final_open_trades, account)
+        final_positions = await _await_broker_snapshot_stage(
+            "positions_final", ib.reqPositionsAsync()
+        )
+        final_position_signature = await _await_broker_snapshot_stage(
+            "positions_final_identity", _position_state_signature(final_positions, account)
+        )
+        final_open_trades = await _await_broker_snapshot_stage(
+            "open_orders_final", ib.reqAllOpenOrdersAsync()
+        )
+        final_order_signature = await _await_broker_snapshot_stage(
+            "open_orders_final_identity", _order_state_signature(final_open_trades, account)
+        )
         if (
             final_position_signature != initial_position_signature
             or final_order_signature != initial_order_signature
         ):
             raise ValueError("Broker critical state changed during snapshot collection")
 
-        broker_time_after = await _request_broker_time()
+        broker_time_after = await _await_broker_snapshot_stage(
+            "broker_time_after", _request_broker_time()
+        )
         accounts_after = [str(item).strip() for item in ib.managedAccounts() if str(item).strip()]
         if accounts_after != accounts_before:
             raise ValueError("Managed account set changed during snapshot collection")
@@ -1100,6 +1294,13 @@ async def handle_get_broker_snapshot(params: dict) -> dict:
             "status": "error",
             "error": "Broker snapshot account mismatch",
             "error_type": "BrokerSnapshotAccountMismatchError",
+        }
+    except BrokerSnapshotStageTimeout as exc:
+        return {
+            "status": "error",
+            "error": "Broker snapshot collection timed out",
+            "error_type": "TimeoutError",
+            "detail": f"Broker snapshot stage timed out: {exc.stage}",
         }
     except TimeoutError:
         # Preserve the timeout classification so the parent poisons this exact

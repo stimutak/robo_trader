@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import json
 import threading
@@ -37,6 +38,110 @@ def _contract(symbol="AAPL", con_id=265598):
     )
 
 
+def _account_summary_values(net_liquidation="100000.00", total_cash="25000.500"):
+    return [
+        SimpleNamespace(
+            account=ACCOUNT,
+            tag="NetLiquidation",
+            currency="USD",
+            value=net_liquidation,
+        ),
+        SimpleNamespace(
+            account=ACCOUNT,
+            tag="TotalCashValue",
+            currency="USD",
+            value=total_cash,
+        ),
+        SimpleNamespace(
+            account=ACCOUNT,
+            tag="BuyingPower",
+            currency="USD",
+            value="999999",
+        ),
+    ]
+
+
+class _FakeAccountSummaryWrapper:
+    def __init__(self):
+        self.acctSummary = {}
+        self.pending = {}
+
+    def startReq(self, request_id):
+        future = asyncio.get_running_loop().create_future()
+        self.pending[request_id] = future
+        return future
+
+    def _endReq(self, request_id):
+        future = self.pending.pop(request_id, None)
+        if future is not None and not future.done():
+            future.set_result(None)
+
+    def accountSummary(self, request_id, account, tag, value, currency):
+        key = (account, tag, currency)
+        self.acctSummary[key] = SimpleNamespace(
+            request_id=request_id,
+            account=account,
+            tag=tag,
+            currency=currency,
+            value=value,
+        )
+
+
+class _FakeAccountSummaryClient:
+    def __init__(self, owner):
+        self.owner = owner
+        self.next_request_id = 1
+        self.cancelled_request_ids = []
+
+    def getReqId(self):
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        return request_id
+
+    def reqAccountSummary(self, request_id, group, tags):
+        self.owner.calls.append("reqAccountSummary")
+        self.owner.account_summary_requests.append((request_id, group, tags))
+        if self.owner.account_summary_hangs:
+            return
+        batch_index = min(
+            len(self.owner.account_summary_requests) - 1,
+            len(self.owner.account_summary_batches) - 1,
+        )
+        for value in self.owner.account_summary_batches[batch_index]:
+            if self.owner.account_summary_bypasses_scoped_callback:
+                _FakeAccountSummaryWrapper.accountSummary(
+                    self.owner.wrapper,
+                    request_id,
+                    value.account,
+                    value.tag,
+                    value.value,
+                    value.currency,
+                )
+            else:
+                self.owner.wrapper.accountSummary(
+                    request_id,
+                    value.account,
+                    value.tag,
+                    value.value,
+                    value.currency,
+                )
+        for foreign_request_id, value in self.owner.foreign_account_summary_callbacks:
+            self.owner.wrapper.accountSummary(
+                foreign_request_id,
+                value.account,
+                value.tag,
+                value.value,
+                value.currency,
+            )
+        self.owner.wrapper._endReq(request_id)
+
+    def cancelAccountSummary(self, request_id):
+        self.owner.calls.append("cancelAccountSummary")
+        self.cancelled_request_ids.append(request_id)
+        if self.owner.account_summary_cancel_raises:
+            raise RuntimeError("raw cancellation failure with sensitive context")
+
+
 class _FakeIB:
     def __init__(self):
         self.calls = []
@@ -44,6 +149,14 @@ class _FakeIB:
         self.account_reads = 0
         self.contract = _contract()
         self.execution_filters = []
+        self.account_summary_batches = [_account_summary_values()]
+        self.account_summary_requests = []
+        self.account_summary_hangs = False
+        self.account_summary_bypasses_scoped_callback = False
+        self.account_summary_cancel_raises = False
+        self.foreign_account_summary_callbacks = []
+        self.wrapper = _FakeAccountSummaryWrapper()
+        self.client = _FakeAccountSummaryClient(self)
 
     def isConnected(self):
         self.calls.append("isConnected")
@@ -128,9 +241,6 @@ class _FakeIB:
             )
         ]
 
-    async def reqAccountSummaryAsync(self):
-        self.calls.append("reqAccountSummaryAsync")
-
     def accountValues(self, account):
         self.calls.append("accountValues")
         assert account == ACCOUNT
@@ -139,13 +249,13 @@ class _FakeIB:
                 account=ACCOUNT,
                 tag="NetLiquidation",
                 currency="USD",
-                value="100000.00",
+                value="1.00",
             ),
             SimpleNamespace(
                 account=ACCOUNT,
                 tag="TotalCashValue",
                 currency="USD",
-                value="25000.500",
+                value="2.00",
             ),
             SimpleNamespace(
                 account=ACCOUNT,
@@ -211,14 +321,17 @@ async def test_worker_snapshot_is_fresh_atomic_read_only_and_precise(fake_ib):
         "reqPositionsAsync",
         "reqAllOpenOrdersAsync",
         "reqExecutionsAsync",
-        "reqAccountSummaryAsync",
-        "accountValues",
+        "reqAccountSummary",
+        "cancelAccountSummary",
         "qualifyContractsAsync",
     }
     assert set(fake_ib.calls) <= allowed
     assert "reqPositionsAsync" in fake_ib.calls
     assert "reqAllOpenOrdersAsync" in fake_ib.calls
     assert "reqExecutionsAsync" in fake_ib.calls
+    assert "reqAccountSummary" in fake_ib.calls
+    assert "cancelAccountSummary" in fake_ib.calls
+    assert "accountValues" not in fake_ib.calls
     execution_request_index = fake_ib.calls.index("reqExecutionsAsync")
     assert fake_ib.calls[execution_request_index - 1] == "reqCurrentTimeAsync"
     assert not any(
@@ -250,13 +363,82 @@ async def test_worker_snapshot_rechecks_account_and_suppresses_sensitive_errors(
 
 
 @pytest.mark.asyncio
+async def test_worker_repeated_snapshot_forces_fresh_account_summary(fake_ib):
+    fake_ib.account_summary_batches = [
+        _account_summary_values("100000.00", "25000.00"),
+        _account_summary_values("101000.00", "26000.00"),
+    ]
+
+    first = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+    second = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert first["status"] == "success"
+    assert second["status"] == "success"
+    first_balances = {
+        (row["tag"], row["currency"]): row["value"] for row in first["data"]["balances"]
+    }
+    second_balances = {
+        (row["tag"], row["currency"]): row["value"] for row in second["data"]["balances"]
+    }
+    assert first_balances[("NetLiquidation", "USD")] == "100000"
+    assert second_balances[("NetLiquidation", "USD")] == "101000"
+    assert first_balances[("TotalCashValue", "USD")] == "25000"
+    assert second_balances[("TotalCashValue", "USD")] == "26000"
+    assert len(fake_ib.account_summary_requests) == 2
+    assert fake_ib.client.cancelled_request_ids == [1, 2]
+    assert "accountSummary" not in fake_ib.wrapper.__dict__
+
+
+@pytest.mark.asyncio
+async def test_worker_account_summary_ignores_foreign_request_cache_interleaving(fake_ib):
+    fake_ib.account_summary_batches = [
+        _account_summary_values("101000.00", "26000.00"),
+    ]
+    fake_ib.foreign_account_summary_callbacks = [
+        (999, value) for value in _account_summary_values("1.00", "2.00")
+    ]
+
+    result = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert result["status"] == "success"
+    balances = {(row["tag"], row["currency"]): row["value"] for row in result["data"]["balances"]}
+    assert balances[("NetLiquidation", "USD")] == "101000"
+    assert balances[("TotalCashValue", "USD")] == "26000"
+    assert fake_ib.wrapper.acctSummary[(ACCOUNT, "NetLiquidation", "USD")].value == "1.00"
+    assert fake_ib.wrapper.acctSummary[(ACCOUNT, "TotalCashValue", "USD")].value == "2.00"
+    assert "accountSummary" not in fake_ib.wrapper.__dict__
+
+
+@pytest.mark.asyncio
+async def test_worker_account_summary_fails_closed_without_owned_callback_provenance(fake_ib):
+    fake_ib.account_summary_bypasses_scoped_callback = True
+
+    result = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert result == {
+        "status": worker.PROTOCOL_ERROR_STATUS,
+        "error": "Broker snapshot collection failed",
+        "error_type": worker.PROTOCOL_ERROR_TYPE,
+    }
+    assert fake_ib.wrapper.acctSummary
+    assert fake_ib.client.cancelled_request_ids == [1]
+    assert "accountSummary" not in fake_ib.wrapper.__dict__
+
+
+@pytest.mark.asyncio
 async def test_worker_wrong_expected_account_performs_zero_data_reads(fake_ib):
     result = await worker.handle_get_broker_snapshot({"expected_account": "DU_WRONG_ACCOUNT"})
 
     assert result["status"] == "error"
     assert result["error_type"] == "BrokerSnapshotAccountMismatchError"
     assert not any(
-        call.startswith("req") or call in {"accountValues", "qualifyContractsAsync"}
+        call.startswith("req")
+        or call
+        in {
+            "accountValues",
+            "cancelAccountSummary",
+            "qualifyContractsAsync",
+        }
         for call in fake_ib.calls
     )
 
@@ -603,8 +785,10 @@ async def test_worker_snapshot_timeout_preserves_parent_timeout_poison(fake_ib, 
         "status": "error",
         "error": "Broker snapshot collection timed out",
         "error_type": "TimeoutError",
+        "detail": "Broker snapshot stage timed out: positions_initial",
     }
     assert ACCOUNT not in worker_response["error"]
+    assert "sensitive diagnostic context" not in json.dumps(worker_response)
 
     client, generation = _transport_response_client(worker_response)
     with pytest.raises(IBKRTimeoutError, match="Broker snapshot collection timed out"):
@@ -613,6 +797,113 @@ async def test_worker_snapshot_timeout_preserves_parent_timeout_poison(fake_ib, 
     assert generation.poisoned_reason is not None
     assert "worker-reported broker timeout" in generation.poisoned_reason
     assert "get_broker_snapshot" in generation.poisoned_reason
+
+
+@pytest.mark.asyncio
+async def test_worker_account_summary_timeout_cancels_subscription_and_is_sanitized(
+    fake_ib, monkeypatch
+):
+    fake_ib.account_summary_hangs = True
+    monkeypatch.setattr(worker, "BROKER_SNAPSHOT_STAGE_TIMEOUT_SECONDS", 0.001)
+
+    worker_response = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert worker_response == {
+        "status": "error",
+        "error": "Broker snapshot collection timed out",
+        "error_type": "TimeoutError",
+        "detail": "Broker snapshot stage timed out: account_summary",
+    }
+    assert fake_ib.client.cancelled_request_ids == [1]
+    assert fake_ib.wrapper.pending == {}
+    assert "accountSummary" not in fake_ib.wrapper.__dict__
+
+
+@pytest.mark.asyncio
+async def test_worker_account_summary_cancellation_restores_callback_and_subscription(fake_ib):
+    fake_ib.account_summary_hangs = True
+
+    task = asyncio.create_task(worker._request_fresh_broker_account_summary(ACCOUNT))
+    while not fake_ib.account_summary_requests:
+        await asyncio.sleep(0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert fake_ib.client.cancelled_request_ids == [1]
+    assert fake_ib.wrapper.pending == {}
+    assert "accountSummary" not in fake_ib.wrapper.__dict__
+
+
+@pytest.mark.asyncio
+async def test_worker_account_summary_cancel_failure_still_cleans_request_and_callback(fake_ib):
+    fake_ib.account_summary_cancel_raises = True
+
+    result = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert result == {
+        "status": worker.PROTOCOL_ERROR_STATUS,
+        "error": "Broker snapshot collection failed",
+        "error_type": worker.PROTOCOL_ERROR_TYPE,
+    }
+    assert fake_ib.client.cancelled_request_ids == [1]
+    assert fake_ib.wrapper.pending == {}
+    assert "accountSummary" not in fake_ib.wrapper.__dict__
+    assert "sensitive context" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", sorted(worker.BROKER_SNAPSHOT_REQUEST_STAGES))
+async def test_worker_snapshot_stage_deadlines_are_bounded_and_sanitized(stage, monkeypatch):
+    sensitive_detail = "DU_SECRET_ACCOUNT raw broker exception"
+
+    async def never_finishes():
+        await asyncio.Future()
+        raise AssertionError(sensitive_detail)
+
+    monkeypatch.setattr(worker, "BROKER_SNAPSHOT_STAGE_TIMEOUT_SECONDS", 0.001)
+
+    with pytest.raises(worker.BrokerSnapshotStageTimeout) as exc_info:
+        await worker._await_broker_snapshot_stage(stage, never_finishes())
+
+    assert exc_info.value.stage == stage
+    assert str(exc_info.value) == f"Broker snapshot stage timed out: {stage}"
+    assert sensitive_detail not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_worker_snapshot_routes_every_broker_await_through_stage_deadline(
+    fake_ib, monkeypatch
+):
+    observed = []
+
+    async def record_stage(stage, request):
+        observed.append(stage)
+        return await request
+
+    monkeypatch.setattr(worker, "_await_broker_snapshot_stage", record_stage)
+
+    result = await worker.handle_get_broker_snapshot({"expected_account": ACCOUNT})
+
+    assert result["status"] == "success"
+    assert observed == [
+        "broker_time_before",
+        "positions_initial",
+        "positions_initial_identity",
+        "position_identity",
+        "open_orders_initial",
+        "open_order_identity",
+        "broker_time_execution_cutoff",
+        "executions",
+        "execution_identity",
+        "account_summary",
+        "positions_final",
+        "positions_final_identity",
+        "open_orders_final",
+        "open_orders_final_identity",
+        "broker_time_after",
+    ]
 
 
 @pytest.mark.asyncio
