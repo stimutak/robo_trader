@@ -15,6 +15,17 @@ import pytest
 
 from robo_trader.database_async import AsyncTradingDatabase
 from robo_trader.execution import ExecutionResult, Order, PaperExecutor
+from robo_trader.market_data_contract import (
+    AdjustmentState,
+    BarTimestampSemantics,
+    BrokerProtectiveQuote,
+    CanonicalBar,
+    CanonicalBarBatch,
+    HistoricalBarContract,
+    MarketDataSource,
+    MarketSession,
+    MarketSessionPolicy,
+)
 from robo_trader.paper_reduction_gateway import (
     PaperReductionGateway,
     PaperReductionGatewayError,
@@ -28,16 +39,17 @@ from robo_trader.stop_loss_monitor import StopLossMonitor
 
 
 class _EntrySerializationProbe(AbstractAsyncContextManager):
-    def __init__(self) -> None:
+    def __init__(self, quote: BrokerProtectiveQuote) -> None:
         self.active = False
         self.enter_count = 0
         self.exit_count = 0
+        self.quote = quote
 
     async def __aenter__(self):
         assert self.active is False
         self.active = True
         self.enter_count += 1
-        return self
+        return self.quote
 
     async def __aexit__(self, exc_type, exc_value, traceback) -> None:
         assert self.active is True
@@ -59,7 +71,26 @@ def _exact_gateway(
     gateway.submit_reduction = AsyncMock(
         return_value=reduction_result or ExecutionResult(True, "gateway reduction filled", 100.0)
     )
-    probe = _EntrySerializationProbe()
+    now = datetime.now(timezone.utc)
+    probe = _EntrySerializationProbe(
+        BrokerProtectiveQuote(
+            schema_version=1,
+            symbol="AAPL",
+            con_id=265598,
+            exchange="SMART",
+            primary_exchange="NASDAQ",
+            currency="USD",
+            security_type="STK",
+            price=Decimal("100.0"),
+            source_timestamp=now,
+            retrieval_timestamp=now,
+            session=MarketSession.REGULAR,
+            source=MarketDataSource.IBKR_LIVE_LAST_TRADE,
+            source_event_id="routing-event-1",
+            transport_generation="routing-generation",
+            market_data_type=1,
+        )
+    )
     gateway.serialize_entry = MagicMock(return_value=probe)
     return gateway, probe
 
@@ -83,7 +114,12 @@ def _runner(
     runner._kill_switch_log_last = {}
     runner._kill_switch_log_throttle_seconds = 60.0
 
-    now = datetime.now(timezone.utc)
+    probe = getattr(getattr(gateway, "serialize_entry", None), "return_value", None)
+    now = (
+        probe.quote.source_timestamp
+        if isinstance(probe, _EntrySerializationProbe)
+        else datetime.now(timezone.utc)
+    )
     monotonic_now = 1000.0
     runner._protective_feed_status = (
         {
@@ -91,6 +127,8 @@ def _runner(
                 "available": True,
                 "live_grade": True,
                 "source": "live_protective",
+                "con_id": 265598,
+                "transport_generation": "routing-generation",
             }
         }
         if live_feed
@@ -133,8 +171,55 @@ def _runner(
         runner._test_protective_quote = None
     runner.stop_loss_monitor = monitor
 
+    contract = HistoricalBarContract(
+        schema_version=1,
+        symbol="AAPL",
+        con_id=265598,
+        exchange="SMART",
+        primary_exchange="NASDAQ",
+        timezone_name="UTC",
+        timeframe="1 min",
+        session_policy=MarketSessionPolicy.REGULAR_ONLY,
+        source=MarketDataSource.IBKR_HISTORICAL_TRADES,
+        retrieval_time=now,
+        broker_time=now,
+        adjustment_state=AdjustmentState.RAW,
+        transport_generation="routing-generation",
+        timestamp_semantics=BarTimestampSemantics.BAR_START,
+        use_rth=True,
+        what_to_show="TRADES",
+    )
+    batch = CanonicalBarBatch(
+        contract,
+        (
+            CanonicalBar(
+                contract=contract,
+                timestamp=now,
+                open=Decimal("99"),
+                high=Decimal("101"),
+                low=Decimal("98"),
+                close=Decimal("100"),
+                volume=100,
+                session=MarketSession.REGULAR,
+            ),
+        ),
+    )
+    frame = batch.to_frame()
+    runner._canonical_bar_batches = {"AAPL": (batch, frame)}
+    runner._broker_protective_quotes = (
+        {"AAPL": probe.quote} if isinstance(probe, _EntrySerializationProbe) and live_feed else {}
+    )
+    runner.latest_prices = {"AAPL": 100.0}
+    runner.latest_price_times = {"AAPL": now}
+    runner.latest_price_sources = {"AAPL": "live_protective"}
+    runner.positions = {}
+    runner.portfolio = SimpleNamespace(equity=AsyncMock(return_value=Decimal("100000")))
+    runner.daily_pnl = 0.0
+    runner.daily_executed_notional = 0.0
+
     runner.risk = SimpleNamespace(
         emergency_shutdown_triggered=emergency_block,
+        validate_order=MagicMock(return_value=(True, "ok")),
     )
     runner.advanced_risk = SimpleNamespace(
         kill_switch=SimpleNamespace(
@@ -403,7 +488,7 @@ async def test_entry_dispatch_occurs_inside_gateway_serialization(
     assert probe.active is False
     assert probe.enter_count == 1
     assert probe.exit_count == 1
-    gateway.serialize_entry.assert_called_once_with()
+    gateway.serialize_entry.assert_called_once_with("AAPL")
     gateway.submit_reduction.assert_not_awaited()
     runner.executor.place_order.assert_called_once_with(_order(side))
 
@@ -451,7 +536,7 @@ async def test_entries_reach_gateway_when_diagnostic_recovery_is_pending(
     result = await runner._place_order_with_circuit_breaker(_order(side))
 
     assert result.ok is True
-    gateway.serialize_entry.assert_called_once_with()
+    gateway.serialize_entry.assert_called_once_with("AAPL")
     assert probe.enter_count == 1
     assert probe.exit_count == 1
     runner.executor.place_order.assert_called_once_with(_order(side))

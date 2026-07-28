@@ -588,7 +588,7 @@ class StopLossMonitor:
     async def update_price(
         self,
         symbol: str,
-        price: float,
+        price: float | Decimal,
         *,
         source_timestamp: Optional[datetime] = None,
         source: ProtectiveQuoteSource = ProtectiveQuoteSource.LEGACY_CALLBACK,
@@ -612,7 +612,15 @@ class StopLossMonitor:
         """
         try:
             symbol = DatabaseValidator.validate_symbol(symbol)
-            price = DatabaseValidator.validate_price(price)
+            if type(price) is Decimal:
+                if not price.is_finite() or price <= 0:
+                    raise ValidationError("price must be finite and positive")
+                exact_price = price
+                price_float = float(price)
+                DatabaseValidator.validate_price(price_float)
+            else:
+                price_float = DatabaseValidator.validate_price(price)
+                exact_price = Decimal(str(price_float))
         except ValidationError as e:
             logger.error(f"Invalid price update: {e}")
             return False
@@ -663,7 +671,7 @@ class StopLossMonitor:
                     self,
                     portfolio_id=self.portfolio_id,
                     symbol=symbol,
-                    price=Decimal(str(price)),
+                    price=exact_price,
                     source_timestamp=event_time,
                     receipt_monotonic=receipt_monotonic,
                     receipt_order=receipt_order,
@@ -675,7 +683,7 @@ class StopLossMonitor:
             except ProtectiveQuoteValidationError as exc:
                 logger.error("Rejected price update for %s: %s", symbol, exc)
                 return False
-            self.last_prices[symbol] = price
+            self.last_prices[symbol] = price_float
             self.price_event_times[symbol] = event_time
             self.price_receipt_monotonic[symbol] = receipt_monotonic
             self.price_receipt_orders[symbol] = receipt_order
@@ -689,15 +697,15 @@ class StopLossMonitor:
                 and stop_key not in self._pending_stop_triggers
             ):
                 if stop.stop_type in [StopType.TRAILING, StopType.TRAILING_PERCENT]:
-                    self._update_trailing_stop(stop, price)
+                    self._update_trailing_stop(stop, price_float)
 
-                if self._price_crosses_stop(stop, price):
+                if self._price_crosses_stop(stop, price_float):
                     stop.status = StopStatus.TRIGGERED
                     stop.triggered_at = event_time
-                    stop.trigger_price = price
+                    stop.trigger_price = price_float
                     evidence = _PendingStopTrigger(
                         stop=stop,
-                        trigger_price=price,
+                        trigger_price=price_float,
                         event_time=event_time,
                         receipt_monotonic=receipt_monotonic,
                         receipt_order=receipt_order,
@@ -714,7 +722,7 @@ class StopLossMonitor:
                         "Latched stop-loss crossing for %s at %.2f "
                         "(stop=%.2f event=%s receipt_order=%d)",
                         symbol,
-                        price,
+                        price_float,
                         stop.stop_price,
                         event_time.isoformat(),
                         receipt_order,
@@ -742,6 +750,17 @@ class StopLossMonitor:
                 normalized_symbol,
             )
             return None
+
+    async def has_pending_reduction(self) -> bool:
+        """Return whether any monitor-owned stop reduction must run first."""
+
+        async with self._price_update_lock:
+            return bool(
+                self._pending_stop_triggers
+                or self._queued_stop_orders
+                or self._inflight_stop_orders
+                or any(stop.status is StopStatus.TRIGGERED for stop in self.active_stops.values())
+            )
 
     @staticmethod
     def _price_crosses_stop(stop: StopLossOrder, price: float) -> bool:
@@ -1153,6 +1172,16 @@ class StopLossMonitor:
             await self.emergency_shutdown("Stop-loss execution failed")
 
         return False
+
+    async def invalidate_protective_quotes(self) -> None:
+        """Synchronously revoke every quote from a retired broker generation."""
+
+        async with self._price_update_lock:
+            self.last_prices.clear()
+            self.price_event_times.clear()
+            self.price_receipt_monotonic.clear()
+            self.price_receipt_orders.clear()
+            self._protective_quote_evidence.clear()
 
     async def _execute_tracked_stop(self, stop: StopLossOrder) -> bool:
         """Execute one stop while publishing exact in-flight ownership."""

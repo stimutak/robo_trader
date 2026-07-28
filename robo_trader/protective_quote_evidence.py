@@ -27,7 +27,8 @@ from enum import Enum
 from typing import Optional
 
 _SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
-_TEXT_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,128}$")
+MAX_PROTECTIVE_SOURCE_EVENT_ID_LENGTH = 128
+_TEXT_RE = re.compile(rf"^[^\x00-\x1f\x7f]{{1,{MAX_PROTECTIVE_SOURCE_EVENT_ID_LENGTH}}}$")
 _PRODUCER_MARKER = object()
 _REGISTRY_KEY = secrets.token_bytes(32)
 _REGISTRY_LOCK = threading.Lock()

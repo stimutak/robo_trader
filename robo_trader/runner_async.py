@@ -26,7 +26,7 @@ from dotenv import load_dotenv  # isort:skip
 load_dotenv()  # noqa: E402 - must run before imports that use os.getenv()
 from dataclasses import dataclass  # isort:skip  # noqa: E402
 from datetime import date, datetime, timezone
-from decimal import Decimal, localcontext
+from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
 from typing import Any, Callable, Coroutine, Dict, List, NoReturn, Optional, Tuple
@@ -40,6 +40,15 @@ from .correlation import CorrelationTracker
 from .database_async import AsyncTradingDatabase
 from .execution import ExecutionResult, Order, PaperExecutor
 from .logger import get_logger
+from .market_data_contract import (
+    BrokerProtectiveQuote,
+    CanonicalBarBatch,
+    MarketDataContractError,
+    MarketDataIdentityError,
+    MarketSession,
+    bar_interval_seconds,
+    market_data_max_age_seconds,
+)
 from .market_hours import (
     get_market_session,
     is_extended_hours,
@@ -124,14 +133,6 @@ from .utils.connection_recovery import OrderRateLimiter
 
 # Initialize logger early for use in import error handling
 logger = get_logger(__name__)
-
-
-class MarketDataContractError(ValueError):
-    """Broker bars failed the runner's fail-closed event-time contract."""
-
-
-class MarketDataIdentityError(MarketDataContractError):
-    """Broker response identity is ambiguous or contradicts the request."""
 
 
 class SymbolCycleAbortError(RuntimeError):
@@ -563,6 +564,8 @@ class AsyncRunner:
         self.latest_price_sources: Dict[str, str] = {}
         self._trusted_bar_closes: Dict[str, float] = {}
         self._protective_feed_status: Dict[str, dict] = {}
+        self._canonical_bar_batches: Dict[str, tuple[CanonicalBarBatch, pd.DataFrame]] = {}
+        self._broker_protective_quotes: Dict[str, BrokerProtectiveQuote] = {}
         self.daily_pnl = 0.0
         self._daily_pnl_exact = Decimal(0)
         self._account_settlement_source_id: Optional[str] = None
@@ -918,32 +921,243 @@ class AsyncRunner:
             fill_price=None,
         )
 
+    @staticmethod
+    def _exact_entry_fill_price(result: object) -> Decimal:
+        """Return the executor's actual opening fill without quote fallback."""
+
+        exact_fill = getattr(result, "exact_fill_price", None)
+        if exact_fill is not None:
+            if type(exact_fill) is Decimal and exact_fill.is_finite() and exact_fill > 0:
+                return exact_fill
+            raise RuntimeError("successful entry has an invalid exact fill price")
+        fill_price = getattr(result, "fill_price", None)
+        try:
+            normalized = Decimal(str(fill_price))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise RuntimeError("successful entry has no valid fill price") from exc
+        if not normalized.is_finite() or normalized <= 0:
+            raise RuntimeError("successful entry has no valid fill price")
+        return normalized
+
+    async def _record_entry_fill_accounting(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        quantity: int,
+        fill_price: Decimal,
+        strategy_reference_price: float,
+    ) -> None:
+        """Persist opening-fill risk and marks from the actual executor fill."""
+
+        fill_price_float = float(fill_price)
+        self.daily_executed_notional += float(fill_price * Decimal(quantity))
+        await self.db.record_trade(
+            symbol,
+            side,
+            quantity,
+            fill_price_float,
+            slippage=(fill_price_float - strategy_reference_price) * quantity,
+        )
+        position = self.positions[symbol]
+        await self.db.update_position(
+            symbol,
+            position.quantity,
+            position.avg_price,
+            fill_price,
+        )
+
     def _order_increases_exposure(self, order: Order) -> bool:
         """Conservatively classify entry intents for temporary session gates."""
         side = str(getattr(order, "side", "") or "").upper()
         return side in {"BUY", "SELL_SHORT"}
 
+    def _record_authoritative_broker_quote(
+        self,
+        quote: BrokerProtectiveQuote,
+    ) -> ProtectiveQuoteEvidence:
+        """Bind gateway-published evidence to runner pricing state."""
+
+        if type(quote) is not BrokerProtectiveQuote:
+            raise MarketDataContractError("broker quote is not canonical")
+        monitor = getattr(self, "stop_loss_monitor", None)
+        if type(monitor) is not StopLossMonitor:
+            raise MarketDataContractError("protective quote producer is unavailable")
+        evidence = monitor.get_protective_quote_evidence(quote.symbol)
+        if type(evidence) is not ProtectiveQuoteEvidence:
+            raise MarketDataContractError("protective monitor did not retain exact quote evidence")
+        try:
+            evidence = assert_current_authoritative_protective_quote(
+                evidence,
+                producer=monitor,
+                expected_portfolio_id=self.portfolio_id,
+                expected_symbol=quote.symbol,
+                expected_con_id=quote.con_id,
+                expected_transport_generation=quote.transport_generation,
+            )
+        except ProtectiveQuoteValidationError as exc:
+            raise MarketDataContractError("protective quote authority is not current") from exc
+        if (
+            evidence.price != quote.price
+            or evidence.source_timestamp != quote.source_timestamp
+            or evidence.source_event_id != quote.source_event_id
+        ):
+            raise MarketDataContractError("monitor evidence differs from the broker quote")
+
+        if not hasattr(self, "_broker_protective_quotes"):
+            self._broker_protective_quotes = {}
+        self._broker_protective_quotes[quote.symbol] = quote
+        self.latest_prices[quote.symbol] = float(quote.price)
+        self.latest_price_times[quote.symbol] = quote.source_timestamp
+        self.latest_price_sources[quote.symbol] = "live_protective"
+        self._protective_feed_status[quote.symbol] = {
+            "available": True,
+            "live_grade": True,
+            "source": "live_protective",
+            "source_timestamp": quote.source_timestamp.isoformat(),
+            "retrieval_timestamp": quote.retrieval_timestamp.isoformat(),
+            "con_id": quote.con_id,
+            "transport_generation": quote.transport_generation,
+            "source_event_id": quote.source_event_id,
+            "session": quote.session.value,
+        }
+        return evidence
+
+    def _canonical_batch_for_execution(self, symbol: str) -> CanonicalBarBatch | None:
+        cached = getattr(self, "_canonical_bar_batches", {}).get(symbol)
+        if (
+            not isinstance(cached, tuple)
+            or len(cached) != 2
+            or type(cached[0]) is not CanonicalBarBatch
+            or cached[0].contract.symbol != symbol
+            or cached[1].attrs.get("canonical_bar_batch") is not cached[0]
+        ):
+            return None
+        return cached[0]
+
+    def _entry_session_is_canonical(
+        self,
+        symbol: str,
+        quote: BrokerProtectiveQuote,
+    ) -> bool:
+        """Require matching exact quote/bar evidence for the current session."""
+
+        batch = self._canonical_batch_for_execution(symbol)
+        if type(batch) is not CanonicalBarBatch or not batch.bars:
+            return False
+        if batch.contract.con_id != quote.con_id:
+            return False
+        try:
+            max_age = market_data_max_age_seconds(bar_interval_seconds(batch.contract.timeframe))
+            now = datetime.now(timezone.utc)
+            bar_age = (now - batch.bars[-1].timestamp).total_seconds()
+            retrieval_age = (now - batch.contract.retrieval_time).total_seconds()
+        except (MarketDataContractError, TypeError, ValueError):
+            return False
+        if not (0 <= bar_age <= max_age and 0 <= retrieval_age <= max_age):
+            return False
+        latest_session = batch.bars[-1].session
+        if is_extended_hours():
+            current = get_market_session()
+            expected = {
+                "pre-market": MarketSession.PRE_MARKET,
+                "after-hours": MarketSession.AFTER_HOURS,
+            }.get(current)
+            return expected is not None and quote.session is expected and latest_session is expected
+        return quote.session is MarketSession.REGULAR and latest_session is MarketSession.REGULAR
+
+    async def _refresh_live_protective_quotes(self, symbols: object) -> bool:
+        """Publish and record complete current-generation broker quote coverage."""
+
+        if not isinstance(symbols, (list, tuple, set)):
+            return False
+        requested = tuple(
+            sorted(
+                {
+                    symbol
+                    for symbol in symbols
+                    if isinstance(symbol, str) and symbol and symbol == symbol.strip()
+                }
+            )
+        )
+        if not requested:
+            return True
+        gateway = getattr(self, "paper_reduction_gateway", None)
+        monitor = getattr(self, "stop_loss_monitor", None)
+        if type(gateway) is not PaperReductionGateway or type(monitor) is not StopLossMonitor:
+            return False
+
+        try:
+            quotes = await gateway.refresh_protective_quotes(requested)
+            by_symbol = {
+                quote.symbol: quote for quote in quotes if type(quote) is BrokerProtectiveQuote
+            }
+            if set(by_symbol) != set(requested):
+                raise RuntimeError("protective broker quote coverage is incomplete")
+
+            if not hasattr(self, "_protective_feed_status"):
+                self._protective_feed_status = {}
+            if not hasattr(self, "latest_price_times"):
+                self.latest_price_times = {}
+            if not hasattr(self, "latest_price_sources"):
+                self.latest_price_sources = {}
+
+            for symbol in requested:
+                self._record_authoritative_broker_quote(by_symbol[symbol])
+            return all(self._has_live_protective_feed(symbol) for symbol in requested)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            statuses = getattr(self, "_protective_feed_status", None)
+            if not isinstance(statuses, dict):
+                self._protective_feed_status = {}
+                statuses = self._protective_feed_status
+            for symbol in requested:
+                statuses[symbol] = {
+                    "available": False,
+                    "live_grade": False,
+                    "source": "live_protective",
+                    "reason": "broker_protective_quote_refresh_failed",
+                }
+            logger.error(
+                "event=protective_quote_refresh_failed symbols=%s error_type=%s",
+                ",".join(requested),
+                type(error).__name__,
+            )
+            return False
+
     def _has_live_protective_feed(self, symbol: str) -> bool:
         """Return whether monitor-accepted live protection is still fresh.
 
-        Provenance flags are necessary but never sufficient: order admission
-        trusts the stop monitor's accepted event and monotonic receipt state,
-        evaluated against its own validated clocks and maximum age. Missing,
-        malformed, stale, or future state fails closed.
+        Mutable dashboard status is deliberately not an authority. Order
+        admission trusts the stop monitor's producer-owned broker event and
+        monotonic receipt state, evaluated against its own validated clocks.
+        Missing, malformed, stale, future, or invalidated state fails closed.
         """
-        statuses = getattr(self, "_protective_feed_status", None)
-        if not isinstance(statuses, dict):
-            return False
-        status = statuses.get(symbol)
-        if not (
-            isinstance(status, dict)
-            and status.get("available") is True
-            and status.get("live_grade") is True
-            and status.get("source") == "live_protective"
+        monitor = getattr(self, "stop_loss_monitor", None)
+        quote = (
+            monitor.get_protective_quote_evidence(symbol)
+            if type(monitor) is StopLossMonitor
+            else None
+        )
+        if (
+            type(quote) is not ProtectiveQuoteEvidence
+            or quote.source is not ProtectiveQuoteSource.LIVE_BROKER
+            or type(quote.con_id) is not int
+            or type(quote.transport_generation) is not str
         ):
             return False
-
-        monitor = getattr(self, "stop_loss_monitor", None)
+        try:
+            assert_current_authoritative_protective_quote(
+                quote,
+                producer=monitor,
+                expected_portfolio_id=self.portfolio_id,
+                expected_symbol=symbol,
+                expected_con_id=quote.con_id,
+                expected_transport_generation=quote.transport_generation,
+            )
+        except ProtectiveQuoteValidationError:
+            return False
         prices = getattr(monitor, "last_prices", None)
         event_times = getattr(monitor, "price_event_times", None)
         receipt_times = getattr(monitor, "price_receipt_monotonic", None)
@@ -988,6 +1202,8 @@ class AsyncRunner:
             or not isinstance(receipt_time, (int, float))
             or isinstance(receipt_time, bool)
             or not math.isfinite(float(receipt_time))
+            or Decimal(str(price)) != quote.price
+            or event_time.astimezone(timezone.utc) != quote.source_timestamp
         ):
             return False
 
@@ -1026,18 +1242,10 @@ class AsyncRunner:
             return False
 
         monitor = self.stop_loss_monitor
-        statuses = getattr(self, "_protective_feed_status", None)
-        status = statuses.get(symbol) if isinstance(statuses, dict) else None
-        if not isinstance(status, dict):
-            return False
-        expected_con_id = status.get("con_id")
-        expected_generation = status.get("transport_generation")
         quote = monitor.get_protective_quote_evidence(symbol)
         if (
             type(quote) is not ProtectiveQuoteEvidence
             or quote.source is not ProtectiveQuoteSource.LIVE_BROKER
-            or type(expected_con_id) is not int
-            or type(expected_generation) is not str
         ):
             return False
         try:
@@ -1046,8 +1254,8 @@ class AsyncRunner:
                 producer=monitor,
                 expected_portfolio_id=self.portfolio_id,
                 expected_symbol=symbol,
-                expected_con_id=expected_con_id,
-                expected_transport_generation=expected_generation,
+                expected_con_id=quote.con_id,
+                expected_transport_generation=quote.transport_generation,
             )
         except ProtectiveQuoteValidationError:
             return False
@@ -1062,9 +1270,9 @@ class AsyncRunner:
             or monitor_event_time.utcoffset() is None
         ):
             return False
-        return float(monitor_price) == float(price) and monitor_event_time.astimezone(
-            timezone.utc
-        ) == event_time.astimezone(timezone.utc)
+        return Decimal(str(monitor_price)) == quote.price == Decimal(
+            str(price)
+        ) and monitor_event_time.astimezone(timezone.utc) == event_time.astimezone(timezone.utc)
 
     def _pairs_execution_admitted(self, pair: object) -> bool:
         """Fail closed until pairs have an atomic two-leg execution lifecycle."""
@@ -1401,30 +1609,19 @@ class AsyncRunner:
                     return self._rejected_order_result(
                         "Order admission blocked: broker transport unavailable"
                     )
-                if not self._has_live_protective_feed(order.symbol):
-                    logger.error(
-                        "Order admission blocked for %s: no admitted " "live-protective feed",
-                        order.symbol,
-                    )
+                if self._canonical_batch_for_execution(order.symbol) is None:
                     return self._rejected_order_result(
-                        "Order admission blocked: live protective feed unavailable"
-                    )
-                if is_extended_hours() and self._order_increases_exposure(order):
-                    logger.warning(
-                        "Extended-hours entry blocked for %s until session-aware "
-                        "market data lands in PR 3",
-                        order.symbol,
-                    )
-                    return self._rejected_order_result(
-                        "Entry blocked: extended-hours session data unavailable"
+                        "Entry blocked: canonical market-data evidence unavailable"
                     )
 
                 # Synchronous paper placement is the point of no return. Hold
                 # admission through the call so an abort is ordered either
                 # before it (no fill) or after it (caller drains accounting).
                 current_task = asyncio.current_task()
-                cycle_workers: set[asyncio.Task] = getattr(self, "_cycle_worker_tasks", set())
-                if current_task is not None and current_task in cycle_workers:
+                admission_cycle_workers: set[asyncio.Task] = getattr(
+                    self, "_cycle_worker_tasks", set()
+                )
+                if current_task is not None and current_task in admission_cycle_workers:
                     if not hasattr(self, "_order_admitted_tasks"):
                         self._order_admitted_tasks = set()
                     self._order_admitted_tasks.add(current_task)
@@ -1437,9 +1634,74 @@ class AsyncRunner:
                 # Hold the same account-wide lock used by reductions. This
                 # prevents an entry from changing the simulator allocation
                 # between a reduction's initial and final evidence snapshots.
-                async with gateway.serialize_entry():
+                async with gateway.serialize_entry(order.symbol) as broker_quote:
+                    if type(broker_quote) is not BrokerProtectiveQuote:
+                        return self._rejected_order_result(
+                            "Entry blocked: refreshed broker quote unavailable"
+                        )
+                    try:
+                        self._record_authoritative_broker_quote(broker_quote)
+                    except MarketDataContractError:
+                        return self._rejected_order_result(
+                            "Entry blocked: refreshed broker quote was not authoritative"
+                        )
+                    if not self._entry_session_is_canonical(order.symbol, broker_quote):
+                        return self._rejected_order_result(
+                            "Entry blocked: canonical session evidence unavailable"
+                        )
+
+                    exact_order = Order(
+                        symbol=order.symbol,
+                        quantity=order.quantity,
+                        side=side,
+                        price=broker_quote.price,
+                        order_ref=order.order_ref,
+                    )
+                    portfolio = getattr(self, "portfolio", None)
+                    risk = getattr(self, "risk", None)
+                    if portfolio is None or risk is None:
+                        return self._rejected_order_result(
+                            "Entry blocked: risk revalidation unavailable"
+                        )
+                    equity_prices = {
+                        sym: self.latest_prices.get(sym, position.avg_price)
+                        for sym, position in self.positions.items()
+                    }
+                    equity_prices[order.symbol] = float(broker_quote.price)
+                    equity = await portfolio.equity(equity_prices)
+                    valid, validation_message = risk.validate_order(
+                        order.symbol,
+                        order.quantity,
+                        broker_quote.price,
+                        equity,
+                        self.daily_pnl,
+                        self.positions,
+                        self.daily_executed_notional,
+                    )
+                    if valid is not True:
+                        return self._rejected_order_result(
+                            f"Entry blocked after quote refresh: {validation_message}"
+                        )
+                    # ``portfolio.equity`` is awaited above and can consume the
+                    # entire protective quote lifetime. Re-prove the exact
+                    # monitor/broker identity and canonical session at the last
+                    # synchronous boundary before the executor can be touched.
+                    try:
+                        self._record_authoritative_broker_quote(broker_quote)
+                    except MarketDataContractError:
+                        return self._rejected_order_result(
+                            "Entry blocked: protective quote expired during final admission"
+                        )
+                    if not self._has_live_protective_feed(order.symbol):
+                        return self._rejected_order_result(
+                            "Entry blocked: protective quote expired during final admission"
+                        )
+                    if not self._entry_session_is_canonical(order.symbol, broker_quote):
+                        return self._rejected_order_result(
+                            "Entry blocked: canonical session evidence expired during final admission"
+                        )
                     with Timer("order_execution", self.monitor):
-                        result = self.executor.place_order(order)
+                        result = self.executor.place_order(exact_order)
 
             # Record success/failure with circuit breaker
             if result.ok:
@@ -2274,6 +2536,10 @@ class AsyncRunner:
                 position_closed_callback=None,
                 order_timeout_seconds=self.cfg.execution.order_timeout_seconds,
             )
+            self.paper_reduction_gateway.attach_protective_quote_producer(
+                self.portfolio_id,
+                self.stop_loss_monitor,
+            )
             await self.stop_loss_monitor.start_monitoring()
             if self.use_trailing_stop:
                 logger.info(
@@ -2496,6 +2762,12 @@ class AsyncRunner:
 
         # Load existing positions from database to prevent duplicate buying
         await self.load_existing_positions()
+        if self.positions and not await self._refresh_live_protective_quotes(tuple(self.positions)):
+            raise UnprotectedExistingPositionsError(
+                self.portfolio_id,
+                len(self.positions),
+                "initial_live_protective_quote_refresh_failed",
+            )
         self._assert_existing_position_protection()
 
         # Registration and the healthy-runtime audit transition are deferred
@@ -2530,6 +2802,7 @@ class AsyncRunner:
             protective_quote_producer=self.stop_loss_monitor,
             settlement_participant=participant,
         )
+        gateway.start_protective_feed()
         self._setup_complete = True
         logger.info("AsyncRunner setup complete")
 
@@ -3559,6 +3832,19 @@ class AsyncRunner:
             raise ConnectionError("Not connected to IBKR")
 
         # Check if subprocess client or legacy IB client
+        if hasattr(self.ib, "get_canonical_historical_bars"):
+            batch = await self.ib.get_canonical_historical_bars(
+                symbol=symbol,
+                duration=duration,
+                bar_size=bar_size,
+                what_to_show=what_to_show,
+                use_rth=use_rth,
+            )
+            if type(batch) is not CanonicalBarBatch:
+                raise MarketDataContractError(
+                    "IBKR client returned a non-canonical historical batch"
+                )
+            return batch.to_frame()
         if hasattr(self.ib, "get_historical_bars"):
             # Subprocess client - use async method
             bars = await self.ib.get_historical_bars(
@@ -3939,10 +4225,13 @@ class AsyncRunner:
         try:
             start_time = asyncio.get_event_loop().time()
             try:
-                with Timer("data_fetch", self.monitor):
+                with Timer("data_fetch", self.monitor, instance=symbol):
                     # Fetch historical bars using IB connection directly
                     df = await self._fetch_historical_bars(
-                        symbol=symbol, duration=self.duration, bar_size=self.bar_size
+                        symbol=symbol,
+                        duration=self.duration,
+                        bar_size=self.bar_size,
+                        use_rth=not is_extended_hours(),
                     )
             finally:
                 self._release_cycle_broker_request(request_owner)
@@ -3963,25 +4252,30 @@ class AsyncRunner:
             logger.info(f"Fetched {len(df)} bars for {symbol}")
 
             # Prepare batch data for efficient storage
-            batch_data = []
-            for timestamp, row in df.iterrows():
-                # Convert pandas Timestamp to datetime for SQLite compatibility
-                if hasattr(timestamp, "to_pydatetime"):
-                    timestamp = timestamp.to_pydatetime()
-                batch_data.append(
-                    {
-                        "symbol": symbol,
-                        "timestamp": timestamp,
-                        "open": float(row.get("open", 0)),
-                        "high": float(row.get("high", 0)),
-                        "low": float(row.get("low", 0)),
-                        "close": float(row.get("close", 0)),
-                        "volume": int(row.get("volume", 0)),
-                    }
-                )
+            canonical_batch = df.attrs.get("canonical_bar_batch")
+            if type(canonical_batch) is CanonicalBarBatch:
+                batch_data = canonical_batch.storage_rows()
+            else:
+                batch_data = []
+                for timestamp, row in df.iterrows():
+                    # Compatibility-only legacy clients cannot provide full
+                    # canonical lineage and remain blocked from trading.
+                    if hasattr(timestamp, "to_pydatetime"):
+                        timestamp = timestamp.to_pydatetime()
+                    batch_data.append(
+                        {
+                            "symbol": symbol,
+                            "timestamp": timestamp,
+                            "open": float(row.get("open", 0)),
+                            "high": float(row.get("high", 0)),
+                            "low": float(row.get("low", 0)),
+                            "close": float(row.get("close", 0)),
+                            "volume": int(row.get("volume", 0)),
+                        }
+                    )
 
             if batch_data:
-                with Timer("database_write", self.monitor):
+                with Timer("database_write", self.monitor, instance=symbol):
                     await self.db.batch_store_market_data(batch_data)
                 self.monitor.record_data_points(len(batch_data))
             if not hasattr(self, "_trusted_bar_closes"):
@@ -4082,6 +4376,12 @@ class AsyncRunner:
                 message="symbol validation error",
             )
 
+        # A failed or legacy fetch must not inherit a still-fresh execution
+        # token from an earlier cycle.
+        if not hasattr(self, "_canonical_bar_batches"):
+            self._canonical_bar_batches = {}
+        self._canonical_bar_batches.pop(symbol, None)
+
         # Fetch and store market data
         df = await self.fetch_and_store_data(symbol)
         if df is None or df.empty:
@@ -4106,6 +4406,26 @@ class AsyncRunner:
             )
         latest_timestamp = latest_timestamp.astimezone(timezone.utc)
 
+        canonical_batch = df.attrs.get("canonical_bar_batch")
+        if (
+            type(canonical_batch) is not CanonicalBarBatch
+            or canonical_batch.contract.symbol != symbol
+        ):
+            logger.error(
+                "Execution sealed for %s: market data lacks CanonicalBarBatch authority",
+                symbol,
+            )
+            return self._blocked_result(
+                symbol,
+                0,
+                latest_price,
+                "Execution blocked: canonical market-data evidence unavailable",
+                df,
+            )
+        if not hasattr(self, "_canonical_bar_batches"):
+            self._canonical_bar_batches = {}
+        self._canonical_bar_batches[symbol] = (canonical_batch, df)
+
         # Historical bars are validated observations, but they are not a
         # live-grade protective feed. A one-minute bar carries its bar event
         # time and cannot honestly satisfy StopLossMonitor's ten-second quote
@@ -4127,7 +4447,20 @@ class AsyncRunner:
 
         if WEBSOCKET_ENABLED and ws_client:
             try:
-                ws_client.send_market_update(symbol, latest_price)
+                canonical_batch = df.attrs.get("canonical_bar_batch")
+                lineage = {}
+                if type(canonical_batch) is CanonicalBarBatch:
+                    lineage = {
+                        "event_timestamp": latest_timestamp.isoformat(),
+                        "retrieval_timestamp": (
+                            canonical_batch.contract.retrieval_time.isoformat()
+                        ),
+                        "source": canonical_batch.contract.source.value,
+                        "session": canonical_batch.bars[-1].session.value,
+                        "timeframe": canonical_batch.contract.timeframe,
+                        "freshness_status": "fresh",
+                    }
+                ws_client.send_market_update(symbol, latest_price, **lineage)
                 logger.info(f"Sent WebSocket update for {symbol}: ${latest_price:.2f}")
             except Exception as e:
                 logger.error(f"Could not send WebSocket update: {e}")
@@ -4136,30 +4469,31 @@ class AsyncRunner:
         if self.use_advanced_risk and self.advanced_risk and latest_price:
             self.advanced_risk.update_market_prices({symbol: latest_price})
 
-        if not hasattr(self, "_protective_feed_status"):
-            self._protective_feed_status = {}
-        self._protective_feed_status[symbol] = {
-            "available": False,
-            "live_grade": False,
-            "source": "historical_bar",
-            "source_timestamp": latest_timestamp.isoformat(),
-            "reason": "independent_live_protective_feed_pending_pr3",
-        }
-        logger.error(
-            "Protective feed unavailable for %s: historical bars are "
-            "observational only; strategy and order paths blocked",
-            symbol,
-        )
-        return self._blocked_result(
-            symbol,
-            0,
-            latest_price,
-            "Protective feed unavailable: historical bars are observational only",
-            df,
-        )
+        if not await self._refresh_live_protective_quotes((symbol,)):
+            if not hasattr(self, "_protective_feed_status"):
+                self._protective_feed_status = {}
+            self._protective_feed_status[symbol] = {
+                "available": False,
+                "live_grade": False,
+                "source": "historical_bar",
+                "source_timestamp": latest_timestamp.isoformat(),
+                "reason": "independent_live_protective_feed_unavailable",
+            }
+            logger.error(
+                "Protective feed unavailable for %s: historical bars are "
+                "observational only; strategy and order paths blocked",
+                symbol,
+            )
+            return self._blocked_result(
+                symbol,
+                0,
+                latest_price,
+                "Protective feed unavailable: historical bars are observational only",
+                df,
+            )
 
         # Generate trading signal
-        with Timer("signal_generation", self.monitor):
+        with Timer("signal_generation", self.monitor, instance=symbol):
             if self.use_ml_enhanced and self.ml_enhanced_strategy:
                 # Use ML Enhanced strategy for signal generation
                 signal_obj = await self.ml_enhanced_strategy.analyze(symbol, df)
@@ -4526,7 +4860,28 @@ class AsyncRunner:
             )
 
         last = signals.iloc[-1]
-        price = PrecisePricing.to_decimal(last.get("close", df["close"].iloc[-1]))
+        broker_quote = getattr(self, "_broker_protective_quotes", {}).get(symbol)
+        if type(broker_quote) is not BrokerProtectiveQuote:
+            return self._blocked_result(
+                symbol,
+                int(last.get("signal", 0)),
+                latest_price,
+                "Execution blocked: authoritative broker quote unavailable",
+                df,
+            )
+        try:
+            self._record_authoritative_broker_quote(broker_quote)
+        except MarketDataContractError:
+            return self._blocked_result(
+                symbol,
+                int(last.get("signal", 0)),
+                latest_price,
+                "Execution blocked: authoritative broker quote is stale",
+                df,
+            )
+        # Historical closes remain feature inputs only. Exact live broker
+        # evidence prices sizing, validation, orders, fills, and derived stops.
+        price = broker_quote.price
         price_float = float(price)
         self.latest_prices[symbol] = price_float
 
@@ -4829,32 +5184,19 @@ class AsyncRunner:
                             Order(symbol=symbol, quantity=qty, side="BUY", price=price)
                         )
                         if res.ok:
-                            fill_price = (
-                                res.fill_price if res.fill_price is not None else price_float
-                            )
+                            exact_fill_price = self._exact_entry_fill_price(res)
+                            fill_price = float(exact_fill_price)
                             # Use atomic position update to prevent race conditions
                             success = await self._update_position_atomic(
                                 symbol, qty, fill_price, "BUY"
                             )
                             if success:
-                                self.daily_executed_notional += price_float * qty
-
-                                # Record trade in database
-                                await self.db.record_trade(
-                                    symbol,
-                                    "BUY",
-                                    qty,
-                                    fill_price,
-                                    slippage=(
-                                        (fill_price - price_float) * qty
-                                        if res.fill_price is not None
-                                        else 0
-                                    ),
-                                )
-                                # Use accumulated position qty/avg from self.positions, not just this order's qty
-                                pos = self.positions[symbol]
-                                await self.db.update_position(
-                                    symbol, pos.quantity, pos.avg_price, price
+                                await self._record_entry_fill_accounting(
+                                    symbol=symbol,
+                                    side="BUY",
+                                    quantity=qty,
+                                    fill_price=exact_fill_price,
+                                    strategy_reference_price=price_float,
                                 )
 
                                 self.monitor.record_order_placed(symbol, qty)
@@ -5051,7 +5393,8 @@ class AsyncRunner:
                         Order(symbol=symbol, quantity=qty, side="SELL_SHORT", price=price)
                     )
                     if res.ok:
-                        fill_price = res.fill_price if res.fill_price is not None else price_float
+                        exact_fill_price = self._exact_entry_fill_price(res)
+                        fill_price = float(exact_fill_price)
 
                         # R2-M4: do the atomic position update FIRST. If it
                         # fails we must not leave an orphaned stop-loss
@@ -5093,23 +5436,12 @@ class AsyncRunner:
                                 except Exception as e:
                                     logger.error(f"Failed to add stop-loss for short {symbol}: {e}")
 
-                            self.daily_executed_notional += price_float * qty
-
-                            await self.db.record_trade(
-                                symbol,
-                                "SELL_SHORT",
-                                qty,
-                                fill_price,
-                                slippage=(
-                                    (fill_price - price_float) * qty
-                                    if res.fill_price is not None
-                                    else 0
-                                ),
-                            )
-                            # Use accumulated position qty/avg from self.positions
-                            pos = self.positions[symbol]
-                            await self.db.update_position(
-                                symbol, pos.quantity, pos.avg_price, price
+                            await self._record_entry_fill_accounting(
+                                symbol=symbol,
+                                side="SELL_SHORT",
+                                quantity=qty,
+                                fill_price=exact_fill_price,
+                                strategy_reference_price=price_float,
                             )
 
                             self.monitor.record_order_placed(symbol, qty)
@@ -6794,85 +7126,31 @@ class AsyncRunner:
             self._recovery_exhausted = True
 
     async def _rewarm_stop_loss_prices_after_recovery(self) -> bool:
-        """Offer cached live protective events after a successful reconnect.
-
-        Reconnect must not manufacture freshness for historical closes.
-        Provenance is therefore mandatory and only ``live_protective`` events
-        may be offered to the stop monitor. The monitor independently rejects
-        any source event older than its ten-second threshold.
-
-        Flat/no-stop runtimes deliberately succeed without a rewarm. If active
-        stops exist, every stop must accept its live-protective event; partial,
-        stale, missing, or failed updates return False so recovery remains
-        fail-closed. Calls remain independent so one failure does not hide
-        evidence about the other active stops.
-        """
+        """Fetch replacement-generation live quotes for every active stop."""
         stop_monitor = getattr(self, "stop_loss_monitor", None)
         active_stops = getattr(stop_monitor, "active_stops", None) if stop_monitor else None
         if not active_stops:
             logger.debug("event=stop_loss_prices_rewarm_skipped reason=no_active_stops")
             return True
-
-        prices = getattr(self, "latest_prices", None)
-        price_times = getattr(self, "latest_price_times", None)
-        price_sources = getattr(self, "latest_price_sources", None)
-        if not all(isinstance(value, dict) for value in (prices, price_times, price_sources)):
-            logger.error(
-                "event=stop_loss_prices_rewarm_incomplete "
-                "reason=missing_or_invalid_cache active_stop_count=%d",
-                len(active_stops),
+        symbols = tuple(
+            sorted(
+                {
+                    stop.symbol
+                    for stop in active_stops.values()
+                    if isinstance(getattr(stop, "symbol", None), str)
+                }
             )
+        )
+        if len(symbols) != len(active_stops):
+            logger.error("event=stop_loss_prices_rewarm_incomplete reason=invalid_stop_symbols")
             return False
-
-        rewarmed = 0
-        skipped = 0
-        # active_stops is keyed by portfolio_id:symbol but the StopLossOrder
-        # objects carry the bare symbol on .symbol.
-        for stop in list(active_stops.values()):
-            symbol = getattr(stop, "symbol", None)
-            if symbol is None or symbol not in prices or symbol not in price_times:
-                skipped += 1
-                continue
-            if price_sources.get(symbol) != "live_protective":
-                logger.warning(
-                    "event=stop_loss_price_rewarm_skipped symbol=%s "
-                    "reason=non_protective_source source=%r",
-                    symbol,
-                    price_sources.get(symbol),
-                )
-                skipped += 1
-                continue
-            try:
-                if self._monitor_owns_exact_fresh_protective_event(
-                    symbol,
-                    prices[symbol],
-                    price_times[symbol],
-                ):
-                    logger.info(
-                        "event=stop_loss_price_rewarm_exact_live_evidence symbol=%s",
-                        symbol,
-                    )
-                    rewarmed += 1
-                else:
-                    logger.warning(
-                        "event=stop_loss_price_rewarm_skipped symbol=%s "
-                        "reason=no_exact_current_transport_lineage",
-                        symbol,
-                    )
-                    skipped += 1
-            except Exception as e:
-                logger.warning(
-                    "event=stop_loss_price_rewarm_failed symbol=%s error=%r",
-                    symbol,
-                    e,
-                )
-                skipped += 1
+        refreshed = await self._refresh_live_protective_quotes(symbols)
         logger.info(
             "event=stop_loss_prices_rewarmed count=%d skipped=%d",
-            rewarmed,
-            skipped,
+            len(symbols) if refreshed else 0,
+            0 if refreshed else len(symbols),
         )
-        return skipped == 0 and rewarmed == len(active_stops)
+        return refreshed
 
     def _maybe_auto_reset_kill_switch_after_recovery(self) -> None:
         """Auto-reset the AdvancedRiskManager kill switch iff it was

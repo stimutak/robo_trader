@@ -28,6 +28,13 @@ import aiosqlite
 
 from robo_trader.database_validator import DatabaseValidator, ValidationError
 from robo_trader.logger import get_logger
+from robo_trader.market_data_contract import (
+    CANONICAL_STORAGE_KEYS,
+    MarketDataContractError,
+    bar_interval_seconds,
+    market_data_max_age_seconds,
+    validate_canonical_storage_row,
+)
 from robo_trader.paper_terminal_settlement import (
     PaperAccountSettlementState,
     PaperTerminalSettlementConflict,
@@ -1141,7 +1148,7 @@ class AsyncTradingDatabase:
                 CREATE TABLE IF NOT EXISTS positions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     portfolio_id TEXT NOT NULL DEFAULT 'default',
-                    symbol TEXT NOT NULL,
+                    symbol TEXT NOT NULL CHECK (length(symbol) BETWEEN 1 AND 32),
                     quantity INTEGER NOT NULL,
                     avg_cost REAL NOT NULL,
                     market_price REAL,
@@ -1159,7 +1166,7 @@ class AsyncTradingDatabase:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS ticks (
                     timestamp DATETIME NOT NULL,
-                    symbol TEXT NOT NULL,
+                    symbol TEXT NOT NULL CHECK (length(symbol) BETWEEN 1 AND 32),
                     bid REAL,
                     ask REAL,
                     last REAL,
@@ -1391,6 +1398,71 @@ class AsyncTradingDatabase:
                     volume INTEGER,
                     timestamp DATETIME NOT NULL,
                     UNIQUE(symbol, timestamp)
+                )
+            """)
+
+            # PR 3 canonical market-data store. Keep the legacy table intact so
+            # existing history is never rewritten or deleted during rollout.
+            # Canonical rows use broker identity + source + timeframe + event
+            # time as their stable identity, so repeated overlapping refreshes
+            # accumulate without collisions between different bar contracts.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS canonical_market_data (
+                    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+                    symbol TEXT NOT NULL,
+                    con_id INTEGER NOT NULL CHECK (con_id > 0),
+                    exchange TEXT NOT NULL CHECK (exchange = 'SMART'),
+                    primary_exchange TEXT NOT NULL CHECK (length(primary_exchange) > 0),
+                    timeframe TEXT NOT NULL CHECK (length(timeframe) > 0),
+                    interval_seconds INTEGER NOT NULL CHECK (interval_seconds > 0),
+                    timezone_name TEXT NOT NULL CHECK (timezone_name = 'UTC'),
+                    session_policy TEXT NOT NULL CHECK (
+                        session_policy IN ('regular-only', 'extended')
+                    ),
+                    timestamp TEXT NOT NULL,
+                    open REAL NOT NULL CHECK (open > 0),
+                    high REAL NOT NULL CHECK (high > 0),
+                    low REAL NOT NULL CHECK (low > 0),
+                    close REAL NOT NULL CHECK (close > 0),
+                    volume INTEGER NOT NULL CHECK (volume >= 0),
+                    session TEXT NOT NULL CHECK (
+                        session IN ('pre-market', 'regular', 'after-hours')
+                    ),
+                    source TEXT NOT NULL CHECK (source = 'ibkr-historical-trades'),
+                    retrieval_timestamp TEXT NOT NULL CHECK (length(retrieval_timestamp) > 0),
+                    broker_timestamp TEXT NOT NULL CHECK (length(broker_timestamp) > 0),
+                    adjustment_state TEXT NOT NULL CHECK (
+                        adjustment_state IN ('unknown', 'raw', 'adjusted')
+                    ),
+                    quality_flags TEXT NOT NULL DEFAULT '' CHECK (
+                        quality_flags IN ('', 'zero-volume')
+                    ),
+                    transport_generation TEXT NOT NULL CHECK (
+                        length(transport_generation) BETWEEN 1 AND 128
+                    ),
+                    timestamp_semantics TEXT NOT NULL CHECK (
+                        timestamp_semantics = 'bar-start'
+                    ),
+                    use_rth INTEGER NOT NULL CHECK (use_rth IN (0, 1)),
+                    what_to_show TEXT NOT NULL CHECK (what_to_show = 'TRADES'),
+                    CHECK (high >= open AND high >= low AND high >= close),
+                    CHECK (low <= open AND low <= high AND low <= close),
+                    CHECK (
+                        (volume = 0 AND quality_flags = 'zero-volume') OR
+                        (volume > 0 AND quality_flags = '')
+                    ),
+                    PRIMARY KEY (
+                        schema_version, source, con_id, timeframe,
+                        session_policy, adjustment_state, timestamp_semantics,
+                        use_rth, what_to_show, timestamp
+                    )
+                ) WITHOUT ROWID
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_canonical_market_data_symbol_time
+                ON canonical_market_data (
+                    symbol, timestamp DESC, interval_seconds ASC,
+                    retrieval_timestamp DESC
                 )
             """)
 
@@ -2569,6 +2641,12 @@ class AsyncTradingDatabase:
             "close",
             "volume",
         }
+        canonical_only_keys = CANONICAL_STORAGE_KEYS - required_keys
+        first_row = data[0]
+        canonical_mode = isinstance(first_row, dict) and bool(
+            canonical_only_keys.intersection(first_row)
+        )
+        normalized_canonical_rows: list[dict] = []
         for idx, row in enumerate(data):
             if not isinstance(row, dict):
                 raise ValueError(
@@ -2580,18 +2658,197 @@ class AsyncTradingDatabase:
                 raise ValueError(
                     f"batch_store_market_data row[{idx}] missing keys: {sorted(missing)}"
                 )
+            row_is_canonical = bool(canonical_only_keys.intersection(row))
+            if row_is_canonical is not canonical_mode:
+                raise ValueError("batch_store_market_data cannot mix canonical and legacy rows")
+            if row_is_canonical:
+                try:
+                    normalized_canonical_rows.append(validate_canonical_storage_row(row))
+                except MarketDataContractError as exc:
+                    raise ValueError(
+                        f"batch_store_market_data row[{idx}] is not canonical: {exc}"
+                    ) from exc
 
+        canonical_conflict: Optional[Tuple[dict, Tuple[str, ...]]] = None
         async with self.get_connection() as conn:
-            await conn.executemany(
-                """
-                INSERT OR REPLACE INTO market_data
-                (symbol, timestamp, open, high, low, close, volume)
-                VALUES (:symbol, :timestamp, :open, :high, :low, :close, :volume)
-            """,
-                data,
+            if canonical_mode:
+                storage_columns = (
+                    "schema_version",
+                    "symbol",
+                    "con_id",
+                    "exchange",
+                    "primary_exchange",
+                    "timeframe",
+                    "interval_seconds",
+                    "timezone_name",
+                    "session_policy",
+                    "timestamp",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "session",
+                    "source",
+                    "retrieval_timestamp",
+                    "broker_timestamp",
+                    "adjustment_state",
+                    "quality_flags",
+                    "transport_generation",
+                    "timestamp_semantics",
+                    "use_rth",
+                    "what_to_show",
+                )
+                identity_columns = (
+                    "schema_version",
+                    "source",
+                    "con_id",
+                    "timeframe",
+                    "session_policy",
+                    "adjustment_state",
+                    "timestamp_semantics",
+                    "use_rth",
+                    "what_to_show",
+                )
+                event_columns = tuple(
+                    column
+                    for column in storage_columns
+                    if column
+                    not in {
+                        "retrieval_timestamp",
+                        "broker_timestamp",
+                        "transport_generation",
+                    }
+                )
+                grouped_rows: Dict[Tuple, List[dict]] = {}
+                incoming_events: Dict[Tuple, dict] = {}
+                for row in normalized_canonical_rows:
+                    group_key = tuple(row[column] for column in identity_columns)
+                    event_key = (*group_key, row["timestamp"])
+                    prior = incoming_events.get(event_key)
+                    if prior is not None:
+                        changed = tuple(
+                            column for column in event_columns if prior[column] != row[column]
+                        )
+                        if changed:
+                            canonical_conflict = (row, changed)
+                            break
+                        continue
+                    incoming_events[event_key] = row
+                    grouped_rows.setdefault(group_key, []).append(row)
+
+                # Lock the writer before comparing immutable event identities.
+                # The retrieval clocks and transport generation describe later
+                # observations of the same broker event; they never rewrite the
+                # first admitted observation. A changed event payload is a
+                # conflict and fails the whole batch before any row is inserted.
+                if canonical_conflict is None:
+                    await conn.execute("BEGIN IMMEDIATE")
+                    for group_key, group_rows in grouped_rows.items():
+                        timestamps = [row["timestamp"] for row in group_rows]
+                        # Both interpolated identifier lists come exclusively
+                        # from the fixed source-code tuples above; row values
+                        # remain bound through SQLite parameters.
+                        existing_query = (
+                            f"SELECT {', '.join(storage_columns)} "  # nosec B608
+                            "FROM canonical_market_data WHERE "
+                            f"{' AND '.join(f'{column} = ?' for column in identity_columns)} "
+                            "AND timestamp BETWEEN ? AND ?"
+                        )
+                        existing_cursor = await conn.execute(
+                            existing_query,
+                            (*group_key, min(timestamps), max(timestamps)),
+                        )
+                        existing_rows = {
+                            existing[storage_columns.index("timestamp")]: dict(
+                                zip(storage_columns, existing)
+                            )
+                            for existing in await existing_cursor.fetchall()
+                        }
+                        for row in group_rows:
+                            existing = existing_rows.get(row["timestamp"])
+                            if existing is None:
+                                continue
+                            changed = tuple(
+                                column
+                                for column in event_columns
+                                if existing[column] != row[column]
+                            )
+                            if changed:
+                                canonical_conflict = (row, changed)
+                                break
+                        if canonical_conflict is not None:
+                            break
+
+                if canonical_conflict is not None:
+                    await conn.rollback()
+                else:
+                    await conn.executemany(
+                        """
+                        INSERT INTO canonical_market_data (
+                            schema_version, symbol, con_id, exchange,
+                            primary_exchange, timeframe, interval_seconds,
+                            timezone_name, session_policy, timestamp,
+                            open, high, low, close, volume, session, source,
+                            retrieval_timestamp, broker_timestamp,
+                            adjustment_state, quality_flags, transport_generation,
+                            timestamp_semantics, use_rth, what_to_show
+                        ) VALUES (
+                            :schema_version, :symbol, :con_id, :exchange,
+                            :primary_exchange, :timeframe, :interval_seconds,
+                            :timezone_name, :session_policy, :timestamp,
+                            :open, :high, :low, :close, :volume, :session, :source,
+                            :retrieval_timestamp, :broker_timestamp,
+                            :adjustment_state, :quality_flags, :transport_generation,
+                            :timestamp_semantics, :use_rth, :what_to_show
+                        )
+                        ON CONFLICT (
+                            schema_version, source, con_id, timeframe,
+                            session_policy, adjustment_state, timestamp_semantics,
+                            use_rth, what_to_show, timestamp
+                        ) DO NOTHING
+                        """,
+                        normalized_canonical_rows,
+                    )
+                    await conn.commit()
+            else:
+                await conn.executemany(
+                    """
+                    INSERT INTO market_data
+                    (symbol, timestamp, open, high, low, close, volume)
+                    VALUES (:symbol, :timestamp, :open, :high, :low, :close, :volume)
+                    ON CONFLICT(symbol, timestamp) DO UPDATE SET
+                        open = excluded.open,
+                        high = excluded.high,
+                        low = excluded.low,
+                        close = excluded.close,
+                        volume = excluded.volume
+                    """,
+                    data,
+                )
+            if not canonical_mode:
+                await conn.commit()
+            if canonical_conflict is None:
+                logger.debug(
+                    "Stored %d %s market data bars",
+                    len(data),
+                    "canonical" if canonical_mode else "legacy",
+                )
+        if canonical_conflict is not None:
+            conflict_row, changed_fields = canonical_conflict
+            logger.critical(
+                "event=canonical_market_data_conflict symbol=%s con_id=%s "
+                "timeframe=%s timestamp=%s changed_fields=%s",
+                conflict_row["symbol"],
+                conflict_row["con_id"],
+                conflict_row["timeframe"],
+                conflict_row["timestamp"],
+                ",".join(changed_fields),
             )
-            await conn.commit()
-            logger.debug(f"Stored {len(data)} market data bars")
+            raise ValueError(
+                "canonical market-data event conflicts with immutable stored evidence: "
+                + ", ".join(changed_fields)
+            )
 
     async def get_position(
         self, symbol: str, portfolio_id: str = DEFAULT_PORTFOLIO_ID
@@ -3327,9 +3584,136 @@ class AsyncTradingDatabase:
                 }
             return {}
 
-    async def get_latest_market_data(self, symbol: str, limit: int = 100) -> List[Dict]:
-        """Get latest market data for a symbol."""
+    async def get_latest_market_data(
+        self,
+        symbol: str,
+        limit: int = 100,
+        timeframe: Optional[str] = None,
+    ) -> List[Dict]:
+        """Get one deterministic canonical series for a symbol."""
+
+        symbol = DatabaseValidator.validate_symbol(symbol)
+        if type(limit) is not int or not 1 <= limit <= 10_000:
+            raise ValueError("market data limit must be an integer between 1 and 10000")
+        if timeframe is not None:
+            bar_interval_seconds(timeframe)
         async with self.get_connection() as conn:
+            if timeframe is None:
+                selector_sql = """
+                    SELECT timestamp, open, high, low, close, volume,
+                           schema_version, con_id, exchange, primary_exchange,
+                           timeframe, interval_seconds, timezone_name, session_policy,
+                           session, source, retrieval_timestamp, broker_timestamp,
+                           adjustment_state, quality_flags, transport_generation,
+                           timestamp_semantics, use_rth, what_to_show
+                    FROM canonical_market_data
+                    WHERE symbol = ?
+                    ORDER BY timestamp DESC, interval_seconds ASC,
+                             retrieval_timestamp DESC, con_id DESC
+                    LIMIT 1
+                """
+                selector_params = (symbol,)
+            else:
+                selector_sql = """
+                    SELECT timestamp, open, high, low, close, volume,
+                           schema_version, con_id, exchange, primary_exchange,
+                           timeframe, interval_seconds, timezone_name, session_policy,
+                           session, source, retrieval_timestamp, broker_timestamp,
+                           adjustment_state, quality_flags, transport_generation,
+                           timestamp_semantics, use_rth, what_to_show
+                    FROM canonical_market_data
+                    WHERE symbol = ? AND timeframe = ?
+                    ORDER BY timestamp DESC, interval_seconds ASC,
+                             retrieval_timestamp DESC, con_id DESC
+                    LIMIT 1
+                """
+                selector_params = (symbol, timeframe)
+            selected = await (await conn.execute(selector_sql, selector_params)).fetchone()
+            rows = []
+            if selected is not None:
+                identity = (
+                    symbol,
+                    selected[7],
+                    selected[10],
+                    selected[13],
+                    selected[15],
+                    selected[18],
+                    selected[21],
+                    selected[22],
+                    selected[23],
+                )
+                cursor = await conn.execute(
+                    """
+                    SELECT timestamp, open, high, low, close, volume,
+                           schema_version, con_id, exchange, primary_exchange,
+                           timeframe, interval_seconds, timezone_name, session_policy,
+                           session, source, retrieval_timestamp, broker_timestamp,
+                           adjustment_state, quality_flags, transport_generation,
+                           timestamp_semantics, use_rth, what_to_show
+                    FROM canonical_market_data
+                    WHERE symbol = ? AND con_id = ? AND timeframe = ?
+                      AND session_policy = ? AND source = ?
+                      AND adjustment_state = ? AND timestamp_semantics = ?
+                      AND use_rth = ? AND what_to_show = ?
+                    ORDER BY timestamp DESC, retrieval_timestamp DESC
+                    LIMIT ?
+                    """,
+                    (*identity, limit),
+                )
+                rows = await cursor.fetchall()
+            if rows:
+                now = datetime.now(timezone.utc)
+                output = []
+                for row in rows:
+                    stored_item = {
+                        "symbol": symbol,
+                        "timestamp": row[0],
+                        "open": row[1],
+                        "high": row[2],
+                        "low": row[3],
+                        "close": row[4],
+                        "volume": row[5],
+                        "schema_version": row[6],
+                        "con_id": row[7],
+                        "exchange": row[8],
+                        "primary_exchange": row[9],
+                        "timeframe": row[10],
+                        "interval_seconds": row[11],
+                        "timezone_name": row[12],
+                        "session_policy": row[13],
+                        "session": row[14],
+                        "source": row[15],
+                        "retrieval_timestamp": row[16],
+                        "broker_timestamp": row[17],
+                        "adjustment_state": row[18],
+                        "quality_flags": row[19],
+                        "transport_generation": row[20],
+                        "timestamp_semantics": row[21],
+                        "use_rth": bool(row[22]),
+                        "what_to_show": row[23],
+                    }
+                    item = validate_canonical_storage_row(stored_item)
+                    item["use_rth"] = bool(item["use_rth"])
+                    item["quality_flags"] = tuple(
+                        flag for flag in str(item["quality_flags"] or "").split(",") if flag
+                    )
+                    event_time = datetime.fromisoformat(
+                        str(item["timestamp"]).replace("Z", "+00:00")
+                    ).astimezone(timezone.utc)
+                    age_seconds = (now - event_time).total_seconds()
+                    freshness_limit = market_data_max_age_seconds(item["interval_seconds"])
+                    freshness_status = (
+                        "future"
+                        if age_seconds < 0
+                        else ("fresh" if age_seconds <= freshness_limit else "stale")
+                    )
+                    item["age_seconds"] = age_seconds
+                    item["freshness_limit_seconds"] = freshness_limit
+                    item["freshness_status"] = freshness_status
+                    output.append(item)
+                return output
+            if timeframe is not None:
+                return []
             cursor = await conn.execute(
                 """
                 SELECT timestamp, open, high, low, close, volume
@@ -3349,6 +3733,10 @@ class AsyncTradingDatabase:
                     "low": row[3],
                     "close": row[4],
                     "volume": row[5],
+                    "source": "legacy-unknown",
+                    "freshness_status": "unknown",
+                    "age_seconds": None,
+                    "freshness_limit_seconds": None,
                 }
                 for row in rows
             ]
@@ -3546,28 +3934,24 @@ class AsyncTradingDatabase:
     ) -> None:
         """Clean up old data from the database.
 
-        Always cleans truly-global tables (market_data, ticks). The signals table
-        is portfolio-scoped, so it is only cleaned when an explicit portfolio_id
-        is provided — never blanketly across all tenants.
+        A scoped call cleans only that portfolio's signals. An unscoped call
+        cleans legacy global observations and ticks. Canonical market-data rows
+        are immutable audit evidence and are never deleted by routine cleanup.
         """
         async with self.get_connection() as conn:
             cutoff_date = datetime.now().timestamp() - (days_to_keep * 86400)
             cutoff_dt = datetime.fromtimestamp(cutoff_date)
 
-            # Clean up old market data (global)
-            await conn.execute(
-                "DELETE FROM market_data WHERE timestamp < ?",
-                (cutoff_dt,),
-            )
-
-            # Clean up old ticks (global)
-            await conn.execute(
-                "DELETE FROM ticks WHERE timestamp < ?",
-                (cutoff_dt,),
-            )
-
-            # Signals are portfolio-scoped; only clean if a specific portfolio is named.
-            if portfolio_id is not None:
+            if portfolio_id is None:
+                await conn.execute(
+                    "DELETE FROM market_data WHERE timestamp < ?",
+                    (cutoff_dt,),
+                )
+                await conn.execute(
+                    "DELETE FROM ticks WHERE timestamp < ?",
+                    (cutoff_dt,),
+                )
+            else:
                 portfolio_id = DatabaseValidator.validate_portfolio_id(portfolio_id)
                 await conn.execute(
                     "DELETE FROM signals WHERE portfolio_id = ? AND timestamp < ?",
@@ -3577,7 +3961,8 @@ class AsyncTradingDatabase:
             await conn.commit()
             logger.info(
                 f"Cleaned up data older than {days_to_keep} days "
-                f"(portfolio={portfolio_id or 'global-only'})"
+                f"(scope={'global-legacy' if portfolio_id is None else portfolio_id}; "
+                "canonical_audit_rows=preserved)"
             )
 
 

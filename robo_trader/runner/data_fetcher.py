@@ -184,7 +184,7 @@ class DataFetcher:
 
         try:
             start_time = asyncio.get_event_loop().time()
-            with Timer("data_fetch", self.monitor):
+            with Timer("data_fetch", self.monitor, instance=symbol):
                 # Fetch historical bars using IB connection directly
                 df = await self.fetch_historical_bars(
                     symbol=symbol, duration=self.duration, bar_size=self.bar_size
@@ -223,7 +223,7 @@ class DataFetcher:
                 )
 
             if batch_data:
-                with Timer("database_write", self.monitor):
+                with Timer("database_write", self.monitor, instance=symbol):
                     await self.db.batch_store_market_data(batch_data)
                 self.monitor.record_data_points(len(batch_data))
 
