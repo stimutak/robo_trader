@@ -40,6 +40,7 @@ from robo_trader.safety.journal import SafetyJournal
 
 ACCOUNT_SCOPE = _derive_safety_account_scope("0123456789abcdef" * 4, "DU_TEST_PAPER")
 _TEST_PRIVATE_KEYS: dict[str, Path] = {}
+_TEST_PUBLICATION_NONCE = "bootstrap-publication-v1-" + "a" * 64
 
 
 @pytest.fixture(autouse=True)
@@ -117,6 +118,8 @@ def _emit_test_receipt(
         "artifact_sha256": hashlib.sha256(artifact).hexdigest(),
         "runtime_fingerprint": runtime_fingerprint,
         "account_scope": account_scope,
+        "publication_directory": str(artifact_path.parent),
+        "publication_nonce": _TEST_PUBLICATION_NONCE,
         "issued_at": evidence_auth._utc_text(now),
         "expires_at": evidence_auth._utc_text(now + evidence_auth.MAX_RECEIPT_LIFETIME),
         "public_key_fingerprint": evidence_auth.ed25519_public_key_fingerprint(
@@ -501,6 +504,21 @@ def _candidate_bundle(
         reconciliation_payload,
         artifact_kind="reconciliation_report",
     )
+    completion_path = artifact_root / "bundle_complete.json"
+    completion_path.write_text(
+        json.dumps(
+            {
+                "bundle_id": bundle_id,
+                "publication_directory": str(artifact_root),
+                "publication_nonce": _TEST_PUBLICATION_NONCE,
+                "schema_version": 1,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    completion_path.chmod(0o400)
     candidate = ExactStateBootstrapCandidate(
         bootstrap_id="pboot-" + ("a" * 32),
         execution_domain_scope="paper-simulator-v1",

@@ -64,6 +64,7 @@ PROTECTIVE_MARK_PRIVATE_KEY_FILENAME = "protective_mark_ed25519_private.pem"
 
 _BROKER_ARTIFACT_FILENAME = "broker_snapshot.json"
 _RECONCILIATION_ARTIFACT_FILENAME = "reconciliation_report.json"
+_COMPLETION_MARKER_FILENAME = "bundle_complete.json"
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
 _FACTORY_TOKEN = object()
@@ -97,6 +98,8 @@ class _SigningAuthority:
     runtime_fingerprint: str
     account_scope: str
     bundle_id: str
+    publication_directory: str
+    publication_nonce: str
     receiver: object = field(repr=False)
 
 
@@ -112,6 +115,8 @@ class _RegisteredSigningStage:
     runtime_fingerprint: str
     account_scope: str
     bundle_id: str
+    publication_directory: str
+    publication_nonce: str
     marker: object = field(repr=False, compare=False)
 
 
@@ -122,20 +127,24 @@ class BootstrapEvidenceReceiverError(ValueError):
     """A signing capability or typed producer handoff is unsafe."""
 
 
-def _rename_directory_exclusive(source: Path, destination: Path) -> None:
+def _rename_directory_exclusive(
+    parent_fd: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
     """Atomically rename one sibling directory without replacing a target."""
 
     libc = ctypes.CDLL(None, use_errno=True)
-    source_bytes = os.fsencode(source)
-    destination_bytes = os.fsencode(destination)
+    source_bytes = os.fsencode(source_name)
+    destination_bytes = os.fsencode(destination_name)
     if sys.platform == "darwin":
         rename_exclusive = getattr(libc, "renameatx_np", None)
         if rename_exclusive is None:  # pragma: no cover - supported macOS invariant
             raise BootstrapEvidenceReceiverError("exclusive directory rename is unavailable")
         result = rename_exclusive(
-            ctypes.c_int(-2),
+            ctypes.c_int(parent_fd),
             ctypes.c_char_p(source_bytes),
-            ctypes.c_int(-2),
+            ctypes.c_int(parent_fd),
             ctypes.c_char_p(destination_bytes),
             ctypes.c_uint(0x00000004),
         )
@@ -144,9 +153,9 @@ def _rename_directory_exclusive(source: Path, destination: Path) -> None:
         if rename_exclusive is None:
             raise BootstrapEvidenceReceiverError("exclusive directory rename is unavailable")
         result = rename_exclusive(
-            ctypes.c_int(-100),
+            ctypes.c_int(parent_fd),
             ctypes.c_char_p(source_bytes),
-            ctypes.c_int(-100),
+            ctypes.c_int(parent_fd),
             ctypes.c_char_p(destination_bytes),
             ctypes.c_uint(1),
         )
@@ -154,7 +163,7 @@ def _rename_directory_exclusive(source: Path, destination: Path) -> None:
         error_number = ctypes.get_errno()
         raise BootstrapEvidenceReceiverError(
             "exclusive evidence directory publication failed"
-        ) from OSError(error_number, os.strerror(error_number), str(destination))
+        ) from OSError(error_number, os.strerror(error_number), destination_name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,9 +332,12 @@ class _BundleBindings:
     final_output_directory: Path
     staging_output_device: int
     staging_output_inode: int
+    staging_output_fd: int
+    output_parent_fd: int
     output_parent_device: int
     output_parent_inode: int
     published: bool = False
+    publication_nonce: str = ""
     broker_snapshot_id: str | None = None
     broker_snapshot_hash: str | None = None
     broker_artifact_hash: str | None = None
@@ -411,8 +423,15 @@ class BootstrapEvidenceReceiverSet:
         self.reconciliation_report._release_capability()
         self.protective_mark._release_capability()
         _release_signing_authority(self)
-        if not self._state.published:
-            self.discard_unpublished_bundle()
+        try:
+            if not self._state.published:
+                self.discard_unpublished_bundle()
+        finally:
+            for attribute in ("staging_output_fd", "output_parent_fd"):
+                descriptor = getattr(self._state, attribute)
+                if descriptor >= 0:
+                    os.close(descriptor)
+                    setattr(self._state, attribute, -1)
 
     def publish_complete_bundle(
         self,
@@ -424,73 +443,196 @@ class BootstrapEvidenceReceiverSet:
         state = self._state
         if state.published:
             raise BootstrapEvidenceReceiverError("evidence bundle was already published")
-        parent = state.final_output_directory.parent
-        parent_metadata = os.lstat(parent)
-        staging_metadata = os.lstat(state.staging_output_directory)
+        self._assert_lexical_publication_binding(require_final=False)
+        parent_metadata = os.fstat(state.output_parent_fd)
+        staging_metadata = os.fstat(state.staging_output_fd)
+        try:
+            staging_entry = os.stat(
+                state.staging_output_directory.name,
+                dir_fd=state.output_parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise BootstrapEvidenceReceiverError(
+                "evidence staging directory is no longer at its bound publication path"
+            ) from exc
+        try:
+            os.stat(
+                state.final_output_directory.name,
+                dir_fd=state.output_parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise BootstrapEvidenceReceiverError("final evidence publication output already exists")
         if (
             (parent_metadata.st_dev, parent_metadata.st_ino)
             != (state.output_parent_device, state.output_parent_inode)
-            or stat.S_ISLNK(parent_metadata.st_mode)
             or not stat.S_ISDIR(parent_metadata.st_mode)
-            or stat.S_ISLNK(staging_metadata.st_mode)
             or not stat.S_ISDIR(staging_metadata.st_mode)
             or (staging_metadata.st_dev, staging_metadata.st_ino)
             != (state.staging_output_device, state.staging_output_inode)
+            or (staging_entry.st_dev, staging_entry.st_ino)
+            != (state.staging_output_device, state.staging_output_inode)
             or staging_metadata.st_uid != os.geteuid()
             or stat.S_IMODE(staging_metadata.st_mode) != 0o700
-            or os.path.lexists(state.final_output_directory)
         ):
             raise BootstrapEvidenceReceiverError(
                 "evidence publication paths changed or final output already exists"
             )
-        directory_descriptor = os.open(
-            state.staging_output_directory,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
-        )
-        parent_descriptor = os.open(
-            parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
-        )
         renamed = False
+        completion_temp = f".{_COMPLETION_MARKER_FILENAME}.stage-{secrets.token_hex(32)}"
         try:
-            os.fsync(directory_descriptor)
+            os.fsync(state.staging_output_fd)
             _rename_directory_exclusive(
-                state.staging_output_directory,
-                state.final_output_directory,
+                state.output_parent_fd,
+                state.staging_output_directory.name,
+                state.final_output_directory.name,
             )
             renamed = True
-            os.fsync(parent_descriptor)
+            final_entry = os.stat(
+                state.final_output_directory.name,
+                dir_fd=state.output_parent_fd,
+                follow_symlinks=False,
+            )
+            if (final_entry.st_dev, final_entry.st_ino) != (
+                state.staging_output_device,
+                state.staging_output_inode,
+            ):
+                raise BootstrapEvidenceReceiverError(
+                    "published evidence directory identity changed during rename"
+                )
+            self._assert_lexical_publication_binding(require_final=True)
+            os.fsync(state.output_parent_fd)
+            completion_payload = json.dumps(
+                {
+                    "bundle_id": state.bundle_id,
+                    "publication_directory": str(state.final_output_directory),
+                    "publication_nonce": state.publication_nonce,
+                    "schema_version": 1,
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            _write_new_sealed_file_at(
+                state.staging_output_fd,
+                completion_temp,
+                completion_payload,
+            )
+            os.fsync(state.staging_output_fd)
+            self._assert_lexical_publication_binding(require_final=True)
+            try:
+                os.rename(
+                    state.final_output_directory / completion_temp,
+                    state.final_output_directory / _COMPLETION_MARKER_FILENAME,
+                )
+            except BaseException:
+                try:
+                    committed_payload = _read_sealed_file_at(
+                        state.staging_output_fd,
+                        _COMPLETION_MARKER_FILENAME,
+                    )
+                    os.stat(
+                        completion_temp,
+                        dir_fd=state.staging_output_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    self._assert_lexical_publication_binding(require_final=True)
+                    if secrets.compare_digest(committed_payload, completion_payload):
+                        state.published = True
+                        return state.final_output_directory
+                except BootstrapEvidenceReceiverError:
+                    pass
+                raise
         except BaseException:
+            try:
+                os.unlink(completion_temp, dir_fd=state.staging_output_fd)
+            except FileNotFoundError:
+                pass
             if renamed:
                 try:
                     _rename_directory_exclusive(
-                        state.final_output_directory,
-                        state.staging_output_directory,
+                        state.output_parent_fd,
+                        state.final_output_directory.name,
+                        state.staging_output_directory.name,
                     )
                 except BootstrapEvidenceReceiverError as exc:
-                    state.published = True
                     raise BootstrapEvidenceReceiverError(
-                        "evidence publication durability failed and rollback was impossible"
+                        "evidence publication failed closed without a completion marker"
                     ) from exc
             raise
-        finally:
-            os.close(parent_descriptor)
-            os.close(directory_descriptor)
         state.published = True
         return state.final_output_directory
+
+    def _assert_lexical_publication_binding(self, *, require_final: bool) -> None:
+        state = self._state
+        lexical_parent_fd: int | None = None
+        try:
+            lexical_parent_fd = os.open(
+                state.final_output_directory.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+            )
+            lexical_parent = os.fstat(lexical_parent_fd)
+            held_parent = os.fstat(state.output_parent_fd)
+            if (lexical_parent.st_dev, lexical_parent.st_ino) != (
+                held_parent.st_dev,
+                held_parent.st_ino,
+            ) or (lexical_parent.st_dev, lexical_parent.st_ino) != (
+                state.output_parent_device,
+                state.output_parent_inode,
+            ):
+                raise BootstrapEvidenceReceiverError(
+                    "lexical evidence publication parent changed identity"
+                )
+            if require_final:
+                lexical_final = os.stat(
+                    state.final_output_directory.name,
+                    dir_fd=lexical_parent_fd,
+                    follow_symlinks=False,
+                )
+                held_final = os.fstat(state.staging_output_fd)
+                if (lexical_final.st_dev, lexical_final.st_ino) != (
+                    held_final.st_dev,
+                    held_final.st_ino,
+                ):
+                    raise BootstrapEvidenceReceiverError(
+                        "lexical final evidence directory changed identity"
+                    )
+        except OSError as exc:
+            raise BootstrapEvidenceReceiverError(
+                "lexical evidence publication path cannot be verified"
+            ) from exc
+        finally:
+            if lexical_parent_fd is not None:
+                os.close(lexical_parent_fd)
 
     def discard_unpublished_bundle(self) -> None:
         """Remove only this factory-created unpublished sibling directory."""
 
         state = self._state
-        if state.published or not os.path.lexists(state.staging_output_directory):
+        if state.published or state.staging_output_fd < 0 or state.output_parent_fd < 0:
             return
         try:
-            metadata = os.lstat(state.staging_output_directory)
+            metadata = os.fstat(state.staging_output_fd)
+            try:
+                current = os.stat(
+                    state.staging_output_directory.name,
+                    dir_fd=state.output_parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                # A failed publish may have left the bound directory at the
+                # final name without a completion marker. It is intentionally
+                # preserved for operator inspection and is not loadable.
+                return
             if (
-                stat.S_ISLNK(metadata.st_mode)
-                or not stat.S_ISDIR(metadata.st_mode)
+                not stat.S_ISDIR(metadata.st_mode)
                 or (metadata.st_dev, metadata.st_ino)
+                != (state.staging_output_device, state.staging_output_inode)
+                or (current.st_dev, current.st_ino)
                 != (state.staging_output_device, state.staging_output_inode)
                 or metadata.st_uid != os.geteuid()
                 or stat.S_IMODE(metadata.st_mode) != 0o700
@@ -498,18 +640,34 @@ class BootstrapEvidenceReceiverSet:
                 raise BootstrapEvidenceReceiverError(
                     "unpublished evidence directory cannot be removed safely"
                 )
-            for entry in os.scandir(state.staging_output_directory):
-                entry_metadata = entry.stat(follow_symlinks=False)
+            for name in os.listdir(state.staging_output_fd):
+                entry_metadata = os.stat(
+                    name,
+                    dir_fd=state.staging_output_fd,
+                    follow_symlinks=False,
+                )
                 if (
-                    not entry.is_file(follow_symlinks=False)
+                    not stat.S_ISREG(entry_metadata.st_mode)
                     or entry_metadata.st_uid != os.geteuid()
                     or entry_metadata.st_nlink != 1
                 ):
                     raise BootstrapEvidenceReceiverError(
                         "unpublished evidence contains an unsafe entry"
                     )
-                os.unlink(entry.path)
-            os.rmdir(state.staging_output_directory)
+                os.unlink(name, dir_fd=state.staging_output_fd)
+            current = os.stat(
+                state.staging_output_directory.name,
+                dir_fd=state.output_parent_fd,
+                follow_symlinks=False,
+            )
+            if (current.st_dev, current.st_ino) != (
+                state.staging_output_device,
+                state.staging_output_inode,
+            ):
+                raise BootstrapEvidenceReceiverError(
+                    "unpublished evidence path changed before directory removal"
+                )
+            os.rmdir(state.staging_output_directory.name, dir_fd=state.output_parent_fd)
         except OSError as exc:
             raise BootstrapEvidenceReceiverError(
                 "unpublished evidence bundle could not be removed"
@@ -543,6 +701,8 @@ def _register_signing_authority(
     runtime_fingerprint: str,
     account_scope: str,
     bundle_id: str,
+    publication_directory: str,
+    publication_nonce: str,
 ) -> None:
     authority = _SigningAuthority(
         key=key,
@@ -551,6 +711,8 @@ def _register_signing_authority(
         runtime_fingerprint=runtime_fingerprint,
         account_scope=account_scope,
         bundle_id=bundle_id,
+        publication_directory=publication_directory,
+        publication_nonce=publication_nonce,
         receiver=receiver,
     )
     with _SIGNING_AUTHORITY_LOCK:
@@ -568,6 +730,8 @@ def _register_signing_stage(
     runtime_fingerprint: str,
     account_scope: str,
     bundle_id: str,
+    publication_directory: str,
+    publication_nonce: str,
 ) -> _RegisteredSigningStage:
     stage = _RegisteredSigningStage(
         receiver=receiver,
@@ -577,6 +741,8 @@ def _register_signing_stage(
         runtime_fingerprint=runtime_fingerprint,
         account_scope=account_scope,
         bundle_id=bundle_id,
+        publication_directory=publication_directory,
+        publication_nonce=publication_nonce,
         marker=_SIGNING_STAGE_MARKER,
     )
     with _SIGNING_STAGE_LOCK:
@@ -627,6 +793,8 @@ def _sign_registered_staged_artifact(
             or authority.runtime_fingerprint != stage.runtime_fingerprint
             or authority.account_scope != stage.account_scope
             or authority.bundle_id != stage.bundle_id
+            or authority.publication_directory != stage.publication_directory
+            or authority.publication_nonce != stage.publication_nonce
         ):
             raise BootstrapEvidenceReceiverError(
                 "signing authority is absent or outside its sealed stage binding"
@@ -639,6 +807,8 @@ def _sign_registered_staged_artifact(
             "artifact_sha256": artifact_sha256,
             "runtime_fingerprint": stage.runtime_fingerprint,
             "account_scope": stage.account_scope,
+            "publication_directory": stage.publication_directory,
+            "publication_nonce": stage.publication_nonce,
             "issued_at": _utc_text(now),
             "expires_at": _utc_text(now + MAX_RECEIPT_LIFETIME),
             "public_key_fingerprint": ed25519_public_key_fingerprint(authority.key.public_key()),
@@ -652,6 +822,8 @@ def _sign_registered_staged_artifact(
             artifact_sha256=artifact_sha256,
             runtime_fingerprint=stage.runtime_fingerprint,
             account_scope=stage.account_scope,
+            publication_directory=stage.publication_directory,
+            publication_nonce=stage.publication_nonce,
             now=now,
         )
     return values, authentication
@@ -752,7 +924,7 @@ def _safe_private_key(
 def _prepare_output_directory(
     path: Path,
     capability_directory: Path,
-) -> tuple[Path, Path, int, int, int, int]:
+) -> tuple[Path, Path, int, int, int, int, int, int]:
     final_output = Path(path)
     if (
         not final_output.is_absolute()
@@ -774,19 +946,49 @@ def _prepare_output_directory(
         raise BootstrapEvidenceReceiverError(
             "evidence staging directory must be new and exclusive"
         ) from exc
-    metadata = os.lstat(staging_output)
-    if (
-        stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or stat.S_IMODE(metadata.st_mode) != 0o700
-    ):
-        raise BootstrapEvidenceReceiverError("evidence staging directory is not owner-only")
+    parent_fd: int | None = None
+    staging_fd: int | None = None
+    try:
+        parent_fd = os.open(
+            final_output.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        staging_fd = os.open(
+            staging_output,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        metadata = os.fstat(staging_fd)
+        current = os.stat(staging_output.name, dir_fd=parent_fd, follow_symlinks=False)
+        current_parent = os.fstat(parent_fd)
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or (metadata.st_dev, metadata.st_ino) != (current.st_dev, current.st_ino)
+            or (current_parent.st_dev, current_parent.st_ino)
+            != (parent_metadata.st_dev, parent_metadata.st_ino)
+        ):
+            raise BootstrapEvidenceReceiverError("evidence staging directory is not owner-only")
+    except BaseException:
+        if staging_fd is not None:
+            os.close(staging_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        try:
+            os.rmdir(staging_output)
+        except OSError:
+            pass
+        raise
+    assert parent_fd is not None
+    assert staging_fd is not None
     return (
         staging_output,
         final_output,
         metadata.st_dev,
         metadata.st_ino,
+        staging_fd,
+        parent_fd,
         parent_metadata.st_dev,
         parent_metadata.st_ino,
     )
@@ -824,6 +1026,78 @@ def _write_new_sealed_file(path: Path, payload: bytes) -> None:
         raise BootstrapEvidenceReceiverError(
             "bootstrap evidence artifact must be a new exclusive file"
         ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _write_new_sealed_file_at(directory_fd: int, filename: str, payload: bytes) -> None:
+    if len(payload) > _MAX_ARTIFACT_BYTES or Path(filename).name != filename:
+        raise BootstrapEvidenceReceiverError("bootstrap completion record is invalid")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(filename, flags, 0o600, dir_fd=directory_fd)
+        written = 0
+        while written < len(payload):
+            count = os.write(descriptor, payload[written:])
+            if count <= 0:
+                raise BootstrapEvidenceReceiverError("bootstrap completion write was partial")
+            written += count
+        os.fsync(descriptor)
+        os.fchmod(descriptor, 0o400)
+        metadata = os.fstat(descriptor)
+        current = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o400
+            or (metadata.st_dev, metadata.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise BootstrapEvidenceReceiverError(
+                "bootstrap completion record is not a sealed owner file"
+            )
+    except OSError as exc:
+        raise BootstrapEvidenceReceiverError(
+            "bootstrap completion record must be a new exclusive file"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _read_sealed_file_at(directory_fd: int, filename: str) -> bytes:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            filename,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_fd,
+        )
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o400
+            or before.st_size > _MAX_ARTIFACT_BYTES
+        ):
+            raise BootstrapEvidenceReceiverError("completion marker is not a sealed owner file")
+        payload = os.read(descriptor, _MAX_ARTIFACT_BYTES + 1)
+        after = os.fstat(descriptor)
+        current = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            len(payload) > _MAX_ARTIFACT_BYTES
+            or os.read(descriptor, 1)
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or (after.st_dev, after.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise BootstrapEvidenceReceiverError("completion marker changed while read")
+        return payload
+    except OSError as exc:
+        raise BootstrapEvidenceReceiverError("completion marker cannot be read safely") from exc
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -937,6 +1211,8 @@ class BrokerSnapshotEvidenceReceiver:
             runtime_fingerprint=self.__state.runtime_fingerprint,
             account_scope=self.__state.account_scope,
             bundle_id=self.__state.bundle_id,
+            publication_directory=str(self.__state.final_output_directory),
+            publication_nonce=self.__state.publication_nonce,
         )
         try:
             now = self.__clock().astimezone(timezone.utc)
@@ -1094,6 +1370,8 @@ class ReconciliationEvidenceReceiver:
                 runtime_fingerprint=self.__state.runtime_fingerprint,
                 account_scope=self.__state.account_scope,
                 bundle_id=self.__state.bundle_id,
+                publication_directory=str(self.__state.final_output_directory),
+                publication_nonce=self.__state.publication_nonce,
             )
             values, _authentication = _sign_registered_staged_artifact(
                 self,
@@ -1318,6 +1596,8 @@ class ProtectiveMarkEvidenceReceiver:
                 runtime_fingerprint=self.__state.runtime_fingerprint,
                 account_scope=self.__state.account_scope,
                 bundle_id=self.__state.bundle_id,
+                publication_directory=str(self.__state.final_output_directory),
+                publication_nonce=self.__state.publication_nonce,
             )
             values, _authentication = _sign_registered_staged_artifact(
                 self,
@@ -1524,6 +1804,8 @@ def create_bootstrap_evidence_receivers(
         final_output,
         staging_device,
         staging_inode,
+        staging_fd,
+        parent_fd,
         parent_device,
         parent_inode,
     ) = _prepare_output_directory(Path(output_directory), capability_directory)
@@ -1537,8 +1819,11 @@ def create_bootstrap_evidence_receivers(
         final_output_directory=final_output,
         staging_output_device=staging_device,
         staging_output_inode=staging_inode,
+        staging_output_fd=staging_fd,
+        output_parent_fd=parent_fd,
         output_parent_device=parent_device,
         output_parent_inode=parent_inode,
+        publication_nonce="bootstrap-publication-v1-" + secrets.token_hex(32),
         safety_journal_path=runtime_contract.safety_journal_path,
         safety_journal_identity=runtime_contract.safety_journal_identity,
     )
@@ -1576,6 +1861,8 @@ def create_bootstrap_evidence_receivers(
             runtime_fingerprint=state.runtime_fingerprint,
             account_scope=state.account_scope,
             bundle_id=bundle_id,
+            publication_directory=str(final_output),
+            publication_nonce=state.publication_nonce,
         )
         _register_signing_authority(
             receiver=reconciliation_receiver,
@@ -1585,6 +1872,8 @@ def create_bootstrap_evidence_receivers(
             runtime_fingerprint=state.runtime_fingerprint,
             account_scope=state.account_scope,
             bundle_id=bundle_id,
+            publication_directory=str(final_output),
+            publication_nonce=state.publication_nonce,
         )
         _register_signing_authority(
             receiver=mark_receiver,
@@ -1594,6 +1883,8 @@ def create_bootstrap_evidence_receivers(
             runtime_fingerprint=state.runtime_fingerprint,
             account_scope=state.account_scope,
             bundle_id=bundle_id,
+            publication_directory=str(final_output),
+            publication_nonce=state.publication_nonce,
         )
         with _RECONCILIATION_RECEIVER_REGISTRY_LOCK:
             _RECONCILIATION_RECEIVER_REGISTRY[id(reconciliation_receiver)] = reconciliation_receiver
@@ -1609,9 +1900,15 @@ def create_bootstrap_evidence_receivers(
     except BaseException:
         for receiver in receivers:
             _release_signing_authority(receiver)
-        if output.exists():
-            for entry in os.scandir(output):
-                if entry.is_file(follow_symlinks=False):
-                    os.unlink(entry.path)
-            os.rmdir(output)
+        try:
+            current = os.stat(output.name, dir_fd=parent_fd, follow_symlinks=False)
+            if (current.st_dev, current.st_ino) == (staging_device, staging_inode):
+                for name in os.listdir(staging_fd):
+                    os.unlink(name, dir_fd=staging_fd)
+                os.rmdir(output.name, dir_fd=parent_fd)
+        except OSError:
+            pass
+        finally:
+            os.close(staging_fd)
+            os.close(parent_fd)
         raise

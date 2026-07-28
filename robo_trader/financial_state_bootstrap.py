@@ -212,6 +212,8 @@ def _evidence_object_digest(evidence: ExactStateBootstrapEvidence) -> str:
                 "expires_at": utc_to_text(receipt.expires_at),
                 "issued_at": utc_to_text(receipt.issued_at),
                 "producer_id": receipt.producer_id,
+                "publication_directory": receipt.publication_directory,
+                "publication_nonce": receipt.publication_nonce,
                 "public_key_fingerprint": receipt.public_key_fingerprint,
                 "receipt_id": receipt.receipt_id,
                 "runtime_fingerprint": receipt.runtime_fingerprint,
@@ -487,6 +489,19 @@ def _verify_artifact_authentication(
     """Verify a detached producer receipt; plain JSON never grants authority."""
 
     receipt_path = artifact_path.with_name(artifact_path.name + AUTH_SUFFIX)
+    publication_directory = artifact_path.parent
+    try:
+        canonical_publication_directory = publication_directory.resolve(strict=True)
+    except OSError as exc:
+        raise ExactStateBootstrapError("evidence publication directory cannot be resolved") from exc
+    if (
+        not publication_directory.is_absolute()
+        or canonical_publication_directory != publication_directory
+        or ".unpublished-" in publication_directory.name
+    ):
+        raise ExactStateBootstrapError(
+            "evidence is not in its canonical final publication directory"
+        )
     receipt, _ = _verified_json(receipt_path, f"{artifact_kind} authentication receipt")
     try:
         return verify_receipt(
@@ -495,6 +510,7 @@ def _verify_artifact_authentication(
             artifact_sha256=artifact_hash,
             runtime_fingerprint=runtime_fingerprint,
             account_scope=account_scope,
+            publication_directory=str(publication_directory),
         )
     except BootstrapEvidenceAuthenticationError as exc:
         raise ExactStateBootstrapError(str(exc)) from exc
@@ -1269,6 +1285,46 @@ def load_exact_state_bootstrap_evidence(
     if mark_keys != normalized_position_identities:
         raise ExactStateBootstrapError(
             "protective marks do not exactly cover reconciled local positions"
+        )
+    publication_directories = {receipt.publication_directory for receipt in authentication_receipts}
+    publication_nonces = {receipt.publication_nonce for receipt in authentication_receipts}
+    if len(publication_directories) != 1 or len(publication_nonces) != 1:
+        raise ExactStateBootstrapError(
+            "evidence artifacts do not share one signed publication lineage"
+        )
+    publication_directory = Path(next(iter(publication_directories)))
+    if any(
+        Path(path).parent != publication_directory
+        for path in (reconciliation_path, broker_snapshot_path, *protective_mark_paths)
+    ):
+        raise ExactStateBootstrapError("evidence paths cross publication directories")
+    completion, _completion_hash = _verified_canonical_json(
+        publication_directory / "bundle_complete.json",
+        "bundle completion record",
+    )
+    _exact_keys(
+        completion,
+        {
+            "bundle_id",
+            "publication_directory",
+            "publication_nonce",
+            "schema_version",
+        },
+        "bundle completion record",
+    )
+    if (
+        _json_int(completion["schema_version"], "completion schema_version") != 1
+        or _json_string(completion["bundle_id"], "completion bundle_id") != bundle_id
+        or _json_string(
+            completion["publication_directory"],
+            "completion publication_directory",
+        )
+        != str(publication_directory)
+        or _json_string(completion["publication_nonce"], "completion publication_nonce")
+        != next(iter(publication_nonces))
+    ):
+        raise ExactStateBootstrapError(
+            "bundle completion record is outside the signed publication lineage"
         )
     _assert_authentication_receipts_unconsumed(database_path, authentication_receipts)
 

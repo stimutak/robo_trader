@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import stat
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -23,9 +24,11 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 AUTH_SUFFIX = ".auth.json"
-AUTH_SCHEMA_VERSION = 2
+AUTH_SCHEMA_VERSION = 3
+_LEGACY_AUTH_SCHEMA_VERSION = 2
 MAX_RECEIPT_LIFETIME = timedelta(minutes=5)
-_AUTH_DOMAIN = b"robotrader-exact-state-bootstrap-evidence-ed25519-v2\0"
+_AUTH_DOMAIN_V2 = b"robotrader-exact-state-bootstrap-evidence-ed25519-v2\0"
+_AUTH_DOMAIN_V3 = b"robotrader-exact-state-bootstrap-evidence-ed25519-v3\0"
 _RECEIPT_ID = "bevr-v2-"
 _KINDS = {
     "broker_snapshot": "robotrader-broker-snapshot-producer-v1",
@@ -71,6 +74,8 @@ class AuthenticatedEvidenceReceipt:
     artifact_sha256: str
     runtime_fingerprint: str
     account_scope: str
+    publication_directory: str
+    publication_nonce: str
     issued_at: datetime
     expires_at: datetime
     public_key_fingerprint: str
@@ -140,26 +145,29 @@ def _parse_utc(value: object, label: str) -> datetime:
 
 
 def receipt_signature_payload(values: Mapping[str, object]) -> bytes:
-    signed = {
-        key: values[key]
-        for key in (
-            "schema_version",
-            "receipt_id",
-            "artifact_kind",
-            "producer_id",
-            "artifact_sha256",
-            "runtime_fingerprint",
-            "account_scope",
-            "issued_at",
-            "expires_at",
-            "public_key_fingerprint",
-        )
-    }
+    fields = (
+        "schema_version",
+        "receipt_id",
+        "artifact_kind",
+        "producer_id",
+        "artifact_sha256",
+        "runtime_fingerprint",
+        "account_scope",
+        "issued_at",
+        "expires_at",
+        "public_key_fingerprint",
+    )
+    if "publication_directory" in values or "publication_nonce" in values:
+        fields += ("publication_directory", "publication_nonce")
+    signed = {key: values[key] for key in fields}
     kind = signed["artifact_kind"]
     if type(kind) is not str:
         raise BootstrapEvidenceAuthenticationError("receipt artifact_kind is invalid")
+    domain = (
+        _AUTH_DOMAIN_V3 if values.get("schema_version") == AUTH_SCHEMA_VERSION else _AUTH_DOMAIN_V2
+    )
     return (
-        _AUTH_DOMAIN
+        domain
         + kind.encode("ascii")
         + b"\0"
         + json.dumps(signed, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -286,6 +294,8 @@ def verify_receipt(
     artifact_sha256: str,
     runtime_fingerprint: str,
     account_scope: str,
+    publication_directory: str | None = None,
+    publication_nonce: str | None = None,
     now: datetime | None = None,
 ) -> AuthenticatedEvidenceReceipt:
     expected_fields = {
@@ -301,9 +311,14 @@ def verify_receipt(
         "public_key_fingerprint",
         "signature_ed25519",
     }
+    if publication_directory is not None:
+        expected_fields |= {"publication_directory", "publication_nonce"}
     if set(raw) != expected_fields or type(raw.get("schema_version")) is not int:
         raise BootstrapEvidenceAuthenticationError("authentication receipt fields are invalid")
-    if raw["schema_version"] != AUTH_SCHEMA_VERSION:
+    expected_schema_version = (
+        AUTH_SCHEMA_VERSION if publication_directory is not None else _LEGACY_AUTH_SCHEMA_VERSION
+    )
+    if raw["schema_version"] != expected_schema_version:
         raise BootstrapEvidenceAuthenticationError("authentication receipt schema is unsupported")
     for field in expected_fields - {"schema_version"}:
         if type(raw[field]) is not str:
@@ -315,6 +330,18 @@ def verify_receipt(
         or raw["artifact_sha256"] != artifact_sha256
         or raw["runtime_fingerprint"] != runtime_fingerprint
         or raw["account_scope"] != account_scope
+        or (
+            publication_directory is not None
+            and raw["publication_directory"] != publication_directory
+        )
+        or (publication_nonce is not None and raw.get("publication_nonce") != publication_nonce)
+        or (
+            publication_directory is not None
+            and not re.fullmatch(
+                r"bootstrap-publication-v1-[0-9a-f]{64}",
+                str(raw["publication_nonce"]),
+            )
+        )
         or not str(raw["receipt_id"]).startswith(_RECEIPT_ID)
         or len(str(raw["receipt_id"])) != len(_RECEIPT_ID) + 64
     ):
@@ -347,6 +374,8 @@ def verify_receipt(
         artifact_sha256=artifact_sha256,
         runtime_fingerprint=runtime_fingerprint,
         account_scope=account_scope,
+        publication_directory=publication_directory or "",
+        publication_nonce=str(raw.get("publication_nonce", "")),
         issued_at=issued_at,
         expires_at=expires_at,
         public_key_fingerprint=fingerprint,

@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -707,3 +708,281 @@ async def test_atomic_publication_never_replaces_a_racing_final_directory(
 
     assert (output / "unrelated.txt").read_text(encoding="utf-8") == "preserve"
     assert not list(tmp_path.glob(".evidence.unpublished-*"))
+
+
+@pytest.mark.asyncio
+async def test_hidden_crash_stage_is_not_loadable_as_published_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _install_test_trust(monkeypatch, tmp_path)
+    database = tmp_path / "ledger.db"
+    _ledger(database)
+    runtime = _runtime(database)
+    output = tmp_path / "evidence"
+    receivers = create_bootstrap_evidence_receivers(
+        runtime_contract=runtime,
+        capability_directory=capability,
+        output_directory=output,
+    )
+    provider = _Provider(_broker_result(datetime.now(timezone.utc) - timedelta(milliseconds=50)))
+    monkeypatch.setattr(
+        type(receivers),
+        "discard_unpublished_bundle",
+        lambda _self: None,
+    )
+
+    async def crashed_marks(**_kwargs: object) -> tuple:
+        raise SystemExit("simulated hard crash")
+
+    with pytest.raises(SystemExit, match="hard crash"):
+        await produce_bootstrap_evidence_bundle(
+            runtime_contract=runtime,
+            snapshot_provider=provider,
+            receivers=receivers,
+            protective_mark_collector=crashed_marks,
+        )
+
+    hidden = next(tmp_path.glob(".evidence.unpublished-*"))
+    with pytest.raises(ExactStateBootstrapError, match="canonical final publication"):
+        load_exact_state_bootstrap_evidence(
+            reconciliation_path=hidden / "reconciliation_report.json",
+            broker_snapshot_path=hidden / "broker_snapshot.json",
+            protective_mark_paths=[],
+            expected_runtime_contract=runtime,
+        )
+
+
+@pytest.mark.asyncio
+async def test_publish_detects_stage_swap_and_preserves_substitute_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _install_test_trust(monkeypatch, tmp_path)
+    database = tmp_path / "ledger.db"
+    _ledger(database)
+    runtime = _runtime(database)
+    output = tmp_path / "evidence"
+    receivers = create_bootstrap_evidence_receivers(
+        runtime_contract=runtime,
+        capability_directory=capability,
+        output_directory=output,
+    )
+    provider = _Provider(_broker_result(datetime.now(timezone.utc) - timedelta(milliseconds=50)))
+    real_rename = receiver_core._rename_directory_exclusive
+    swapped = False
+
+    def swap_then_rename(parent_fd: int, source_name: str, destination_name: str) -> None:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            os.rename(
+                source_name,
+                source_name + ".quarantine",
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.mkdir(source_name, 0o700, dir_fd=parent_fd)
+            substitute_fd = os.open(
+                source_name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                dir_fd=parent_fd,
+            )
+            try:
+                file_fd = os.open(
+                    "unrelated.txt",
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=substitute_fd,
+                )
+                try:
+                    os.write(file_fd, b"preserve")
+                finally:
+                    os.close(file_fd)
+            finally:
+                os.close(substitute_fd)
+        real_rename(parent_fd, source_name, destination_name)
+
+    monkeypatch.setattr(receiver_core, "_rename_directory_exclusive", swap_then_rename)
+
+    async def no_marks(**_kwargs: object) -> tuple:
+        return ()
+
+    with pytest.raises(BootstrapEvidenceReceiverError, match="cannot be removed safely"):
+        await produce_bootstrap_evidence_bundle(
+            runtime_contract=runtime,
+            snapshot_provider=provider,
+            receivers=receivers,
+            protective_mark_collector=no_marks,
+        )
+
+    substitute = next(
+        path
+        for path in tmp_path.glob(".evidence.unpublished-*")
+        if not path.name.endswith(".quarantine")
+    )
+    assert (substitute / "unrelated.txt").read_bytes() == b"preserve"
+    assert not output.exists()
+
+
+@pytest.mark.asyncio
+async def test_parent_fsync_and_rollback_failure_leaves_no_completion_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _install_test_trust(monkeypatch, tmp_path)
+    database = tmp_path / "ledger.db"
+    _ledger(database)
+    runtime = _runtime(database)
+    output = tmp_path / "evidence"
+    receivers = create_bootstrap_evidence_receivers(
+        runtime_contract=runtime,
+        capability_directory=capability,
+        output_directory=output,
+    )
+    provider = _Provider(_broker_result(datetime.now(timezone.utc) - timedelta(milliseconds=50)))
+    parent_fd = receivers._state.output_parent_fd
+    real_fsync = receiver_core.os.fsync
+    real_rename = receiver_core._rename_directory_exclusive
+    rename_count = 0
+
+    def fail_parent_fsync(descriptor: int) -> None:
+        if descriptor == parent_fd:
+            raise OSError("simulated parent fsync failure")
+        real_fsync(descriptor)
+
+    def fail_rollback(parent: int, source_name: str, destination_name: str) -> None:
+        nonlocal rename_count
+        rename_count += 1
+        if rename_count == 2:
+            raise BootstrapEvidenceReceiverError("simulated rollback failure")
+        real_rename(parent, source_name, destination_name)
+
+    monkeypatch.setattr(receiver_core.os, "fsync", fail_parent_fsync)
+    monkeypatch.setattr(receiver_core, "_rename_directory_exclusive", fail_rollback)
+
+    async def no_marks(**_kwargs: object) -> tuple:
+        return ()
+
+    with pytest.raises(BootstrapEvidenceReceiverError, match="without a completion marker"):
+        await produce_bootstrap_evidence_bundle(
+            runtime_contract=runtime,
+            snapshot_provider=provider,
+            receivers=receivers,
+            protective_mark_collector=no_marks,
+        )
+
+    assert output.is_dir()
+    assert not (output / "bundle_complete.json").exists()
+    with pytest.raises(ExactStateBootstrapError, match="completion record cannot be read"):
+        load_exact_state_bootstrap_evidence(
+            reconciliation_path=output / "reconciliation_report.json",
+            broker_snapshot_path=output / "broker_snapshot.json",
+            protective_mark_paths=[],
+            expected_runtime_contract=runtime,
+        )
+
+
+@pytest.mark.asyncio
+async def test_publish_rejects_replaced_lexical_parent_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _install_test_trust(monkeypatch, tmp_path)
+    database = tmp_path / "ledger.db"
+    _ledger(database)
+    runtime = _runtime(database)
+    publication_parent = tmp_path / "publication"
+    publication_parent.mkdir()
+    output = publication_parent / "evidence"
+    receivers = create_bootstrap_evidence_receivers(
+        runtime_contract=runtime,
+        capability_directory=capability,
+        output_directory=output,
+    )
+    provider = _Provider(_broker_result(datetime.now(timezone.utc) - timedelta(milliseconds=50)))
+    moved_parent = tmp_path / "publication-moved"
+    real_rename = receiver_core._rename_directory_exclusive
+    swapped = False
+
+    def swap_parent_then_rename(
+        parent_fd: int,
+        source_name: str,
+        destination_name: str,
+    ) -> None:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            publication_parent.rename(moved_parent)
+            publication_parent.mkdir()
+            (publication_parent / "unrelated.txt").write_text("preserve", encoding="utf-8")
+        real_rename(parent_fd, source_name, destination_name)
+
+    monkeypatch.setattr(
+        receiver_core,
+        "_rename_directory_exclusive",
+        swap_parent_then_rename,
+    )
+
+    async def no_marks(**_kwargs: object) -> tuple:
+        return ()
+
+    with pytest.raises(BootstrapEvidenceReceiverError, match="publication parent changed"):
+        await produce_bootstrap_evidence_bundle(
+            runtime_contract=runtime,
+            snapshot_provider=provider,
+            receivers=receivers,
+            protective_mark_collector=no_marks,
+        )
+
+    assert (publication_parent / "unrelated.txt").read_text(encoding="utf-8") == "preserve"
+    assert not output.exists()
+    assert not (moved_parent / "evidence").exists()
+
+
+@pytest.mark.asyncio
+async def test_completion_rename_success_then_error_resolves_as_committed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _install_test_trust(monkeypatch, tmp_path)
+    database = tmp_path / "ledger.db"
+    _ledger(database)
+    runtime = _runtime(database)
+    output = tmp_path / "evidence"
+    receivers = create_bootstrap_evidence_receivers(
+        runtime_contract=runtime,
+        capability_directory=capability,
+        output_directory=output,
+    )
+    provider = _Provider(_broker_result(datetime.now(timezone.utc) - timedelta(milliseconds=50)))
+    real_rename = receiver_core.os.rename
+
+    def rename_then_error(
+        source: object, destination: object, *args: object, **kwargs: object
+    ) -> None:
+        real_rename(source, destination, *args, **kwargs)
+        if Path(destination).name == "bundle_complete.json":
+            raise OSError("simulated post-rename reporting failure")
+
+    monkeypatch.setattr(receiver_core.os, "rename", rename_then_error)
+
+    async def no_marks(**_kwargs: object) -> tuple:
+        return ()
+
+    report = await produce_bootstrap_evidence_bundle(
+        runtime_contract=runtime,
+        snapshot_provider=provider,
+        receivers=receivers,
+        protective_mark_collector=no_marks,
+    )
+
+    assert Path(str(report["broker_snapshot"])).is_file()
+    assert (output / "bundle_complete.json").is_file()
+    loaded = load_exact_state_bootstrap_evidence(
+        reconciliation_path=Path(str(report["reconciliation_report"])),
+        broker_snapshot_path=Path(str(report["broker_snapshot"])),
+        protective_mark_paths=[],
+        expected_runtime_contract=runtime,
+    )
+    assert loaded.marks == ()
