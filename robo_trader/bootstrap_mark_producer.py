@@ -13,14 +13,17 @@ result itself cannot be passed back through the protective-quote gateway.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
 import re
+import secrets
 import stat
 import threading
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Generic, Protocol, TypeVar
@@ -47,6 +50,8 @@ _RUNTIME_FINGERPRINT = re.compile(r"^[0-9a-f]{16,64}$")
 _SOURCE_EVENT_ID = re.compile(r"^[^\x00-\x1f\x7f]{1,128}$")
 _SYMBOL = re.compile(r"^[A-Z][A-Z0-9.]{0,9}$")
 _TRANSPORT_GENERATION = re.compile(r"^[^\x00-\x1f\x7f]{1,128}$")
+_UNSIGNED_MARK_PRODUCER_MARKER = object()
+_UNSIGNED_MARK_REGISTRY_KEY = secrets.token_bytes(32)
 
 
 class BootstrapMarkBlocked(ValueError):
@@ -116,6 +121,7 @@ class UnsignedBootstrapProtectiveMark:
     database_identity: str
     database_device: int
     database_inode: int
+    _producer_marker: object = field(repr=False, compare=False)
     source: str = BOOTSTRAP_MARK_SOURCE
     protective_quote_source: ProtectiveQuoteSource = ProtectiveQuoteSource.LIVE_BROKER
     schema_version: int = BOOTSTRAP_MARK_SCHEMA_VERSION
@@ -123,6 +129,8 @@ class UnsignedBootstrapProtectiveMark:
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 1:
             raise BootstrapMarkBlocked("bootstrap mark schema version is unsupported")
+        if self._producer_marker is not _UNSIGNED_MARK_PRODUCER_MARKER:
+            raise BootstrapMarkBlocked("unsigned mark lacks producer ownership")
         _strict_text(self.portfolio_id, "portfolio_id", _PORTFOLIO_ID)
         _strict_text(self.symbol, "symbol", _SYMBOL)
         _canonical_decimal(self.price)
@@ -193,6 +201,107 @@ class UnsignedBootstrapProtectiveMark:
             separators=(",", ":"),
             sort_keys=True,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _UnsignedMarkRegistryEntry:
+    result: UnsignedBootstrapProtectiveMark
+    receiver: object
+    digest: str
+    registration_token: object
+
+
+_UNSIGNED_MARK_REGISTRY: dict[int, _UnsignedMarkRegistryEntry] = {}
+_CONSUMED_UNSIGNED_MARK_REGISTRATIONS: set[object] = set()
+_UNSIGNED_MARK_REGISTRY_LOCK = threading.Lock()
+
+
+def _unsigned_mark_digest(result: UnsignedBootstrapProtectiveMark) -> str:
+    return hmac.new(
+        _UNSIGNED_MARK_REGISTRY_KEY,
+        result.canonical_payload().encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _register_unsigned_mark(
+    result: UnsignedBootstrapProtectiveMark,
+    receiver: object,
+) -> object:
+    registration_token = object()
+    entry = _UnsignedMarkRegistryEntry(
+        result=result,
+        receiver=receiver,
+        digest=_unsigned_mark_digest(result),
+        registration_token=registration_token,
+    )
+    with _UNSIGNED_MARK_REGISTRY_LOCK:
+        if id(result) in _UNSIGNED_MARK_REGISTRY:  # pragma: no cover - new object invariant
+            raise BootstrapMarkBlocked("unsigned mark registration identity collided")
+        _UNSIGNED_MARK_REGISTRY[id(result)] = entry
+    return registration_token
+
+
+def _abandon_unsigned_mark_registration(
+    result: UnsignedBootstrapProtectiveMark,
+    registration_token: object,
+) -> None:
+    with _UNSIGNED_MARK_REGISTRY_LOCK:
+        entry = _UNSIGNED_MARK_REGISTRY.get(id(result))
+        if entry is not None and entry.registration_token is registration_token:
+            _UNSIGNED_MARK_REGISTRY.pop(id(result), None)
+        _CONSUMED_UNSIGNED_MARK_REGISTRATIONS.discard(registration_token)
+
+
+def _assert_unsigned_mark_registration_consumed(
+    result: UnsignedBootstrapProtectiveMark,
+    registration_token: object,
+) -> None:
+    with _UNSIGNED_MARK_REGISTRY_LOCK:
+        if registration_token in _CONSUMED_UNSIGNED_MARK_REGISTRATIONS:
+            _CONSUMED_UNSIGNED_MARK_REGISTRATIONS.remove(registration_token)
+            return
+        entry = _UNSIGNED_MARK_REGISTRY.get(id(result))
+        if entry is not None and entry.registration_token is registration_token:
+            _UNSIGNED_MARK_REGISTRY.pop(id(result), None)
+    raise BootstrapMarkBlocked(
+        "bootstrap protective mark receiver did not authenticate its one-shot result"
+    )
+
+
+def assert_producer_owned_unsigned_bootstrap_protective_mark(
+    result: UnsignedBootstrapProtectiveMark,
+    *,
+    receiver: object,
+) -> UnsignedBootstrapProtectiveMark:
+    """Consume one exact result registered to the asserting receiver.
+
+    Trusted signing receivers must call this before reading or persisting the
+    canonical payload.  Success is one-shot.  A copy, reconstruction, replay,
+    changed result, or different receiver has no producer authority.
+    """
+
+    if type(result) is not UnsignedBootstrapProtectiveMark:
+        raise BootstrapMarkBlocked("exact UnsignedBootstrapProtectiveMark is required")
+    try:
+        current_digest = _unsigned_mark_digest(result)
+    except Exception as exc:
+        raise BootstrapMarkBlocked("unsigned mark changed after production") from exc
+    with _UNSIGNED_MARK_REGISTRY_LOCK:
+        entry = _UNSIGNED_MARK_REGISTRY.get(id(result))
+        if entry is None or entry.result is not result:
+            raise BootstrapMarkBlocked("unsigned mark is not producer-owned or was replayed")
+        if entry.receiver is not receiver:
+            raise BootstrapMarkBlocked("unsigned mark belongs to a different receiver")
+        if (
+            result._producer_marker is not _UNSIGNED_MARK_PRODUCER_MARKER
+            or not hmac.compare_digest(entry.digest, current_digest)
+        ):
+            _UNSIGNED_MARK_REGISTRY.pop(id(result), None)
+            raise BootstrapMarkBlocked("unsigned mark changed after production")
+        _UNSIGNED_MARK_REGISTRY.pop(id(result), None)
+        _CONSUMED_UNSIGNED_MARK_REGISTRATIONS.add(entry.registration_token)
+    return result
 
 
 ReceiverResult = TypeVar("ReceiverResult", covariant=True)
@@ -574,6 +683,7 @@ def produce_bootstrap_protective_mark(
         database_identity=runtime.database_identity,
         database_device=database_binding.device,
         database_inode=database_binding.inode,
+        _producer_marker=_UNSIGNED_MARK_PRODUCER_MARKER,
     )
 
     # Both mutable authorities can change after result construction.  Check the
@@ -592,7 +702,14 @@ def produce_bootstrap_protective_mark(
     capability = getattr(receiver, "receive_unsigned_bootstrap_protective_mark", None)
     if not callable(capability):
         raise BootstrapMarkBlocked("bootstrap protective mark receiver capability is unavailable")
-    return capability(result)
+    registration_token = _register_unsigned_mark(result, receiver)
+    try:
+        received = capability(result)
+    except BaseException:
+        _abandon_unsigned_mark_registration(result, registration_token)
+        raise
+    _assert_unsigned_mark_registration_consumed(result, registration_token)
+    return received
 
 
 async def collect_and_produce_bootstrap_protective_mark(

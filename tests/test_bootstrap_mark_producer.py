@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import json
+import pickle
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -17,6 +19,7 @@ from robo_trader.bootstrap_mark_producer import (
     BOOTSTRAP_MARK_SOURCE,
     BootstrapMarkBlocked,
     UnsignedBootstrapProtectiveMark,
+    assert_producer_owned_unsigned_bootstrap_protective_mark,
     collect_and_produce_bootstrap_protective_mark,
     create_runtime_bound_mark_only_producer,
     produce_bootstrap_protective_mark,
@@ -149,7 +152,88 @@ class Receiver:
         self,
         result: UnsignedBootstrapProtectiveMark,
     ) -> UnsignedBootstrapProtectiveMark:
+        assert_producer_owned_unsigned_bootstrap_protective_mark(
+            result,
+            receiver=self,
+        )
         self.results.append(result)
+        return result
+
+
+class CopyChallengeReceiver:
+    def __init__(self) -> None:
+        self.result: UnsignedBootstrapProtectiveMark | None = None
+
+    def receive_unsigned_bootstrap_protective_mark(
+        self,
+        result: UnsignedBootstrapProtectiveMark,
+    ) -> UnsignedBootstrapProtectiveMark:
+        copies = (
+            replace(result),
+            copy.copy(result),
+            pickle.loads(pickle.dumps(result)),
+        )
+        for candidate in copies:
+            with pytest.raises(BootstrapMarkBlocked, match="not producer-owned|replayed"):
+                assert_producer_owned_unsigned_bootstrap_protective_mark(
+                    candidate,
+                    receiver=self,
+                )
+        assert_producer_owned_unsigned_bootstrap_protective_mark(
+            result,
+            receiver=self,
+        )
+        self.result = result
+        return result
+
+
+class WrongReceiverChallenge:
+    def __init__(self) -> None:
+        self.result: UnsignedBootstrapProtectiveMark | None = None
+
+    def receive_unsigned_bootstrap_protective_mark(
+        self,
+        result: UnsignedBootstrapProtectiveMark,
+    ) -> UnsignedBootstrapProtectiveMark:
+        with pytest.raises(BootstrapMarkBlocked, match="different receiver"):
+            assert_producer_owned_unsigned_bootstrap_protective_mark(
+                result,
+                receiver=object(),
+            )
+        assert_producer_owned_unsigned_bootstrap_protective_mark(
+            result,
+            receiver=self,
+        )
+        self.result = result
+        return result
+
+
+class NonAuthenticatingReceiver:
+    def __init__(self) -> None:
+        self.result: UnsignedBootstrapProtectiveMark | None = None
+
+    def receive_unsigned_bootstrap_protective_mark(
+        self,
+        result: UnsignedBootstrapProtectiveMark,
+    ) -> UnsignedBootstrapProtectiveMark:
+        self.result = result
+        return result
+
+
+class MutatingReceiver:
+    def __init__(self) -> None:
+        self.result: UnsignedBootstrapProtectiveMark | None = None
+
+    def receive_unsigned_bootstrap_protective_mark(
+        self,
+        result: UnsignedBootstrapProtectiveMark,
+    ) -> UnsignedBootstrapProtectiveMark:
+        self.result = result
+        object.__setattr__(result, "price", Decimal("188.00"))
+        assert_producer_owned_unsigned_bootstrap_protective_mark(
+            result,
+            receiver=self,
+        )
         return result
 
 
@@ -483,6 +567,128 @@ async def test_producer_delivers_canonical_runtime_bound_unsigned_mark(
     assert payload["mutated_state"] is False
     with pytest.raises((FrozenInstanceError, TypeError)):
         result.price = Decimal("1")  # type: ignore[misc]
+
+
+@pytest.mark.asyncio
+async def test_unsigned_mark_registration_is_exact_receiver_bound_and_one_shot(
+    database: Path,
+) -> None:
+    monitor = _monitor()
+    quote = await _live_quote(monitor)
+    receiver = WrongReceiverChallenge()
+
+    result, _ = _produce(
+        quote,
+        monitor,
+        database,
+        receiver=receiver,  # type: ignore[arg-type]
+    )
+
+    assert receiver.result is result
+    with pytest.raises(BootstrapMarkBlocked, match="not producer-owned|replayed"):
+        assert_producer_owned_unsigned_bootstrap_protective_mark(
+            result,
+            receiver=receiver,
+        )
+
+
+@pytest.mark.asyncio
+async def test_copy_replace_and_pickle_reconstruction_never_inherit_authority(
+    database: Path,
+) -> None:
+    monitor = _monitor()
+    quote = await _live_quote(monitor)
+    receiver = CopyChallengeReceiver()
+
+    result, _ = _produce(
+        quote,
+        monitor,
+        database,
+        receiver=receiver,  # type: ignore[arg-type]
+    )
+
+    assert receiver.result is result
+
+
+@pytest.mark.asyncio
+async def test_receiver_must_authenticate_and_consume_registered_result(
+    database: Path,
+) -> None:
+    monitor = _monitor()
+    quote = await _live_quote(monitor)
+    receiver = NonAuthenticatingReceiver()
+
+    with pytest.raises(BootstrapMarkBlocked, match="did not authenticate"):
+        _produce(
+            quote,
+            monitor,
+            database,
+            receiver=receiver,  # type: ignore[arg-type]
+        )
+
+    assert receiver.result is not None
+    with pytest.raises(BootstrapMarkBlocked, match="not producer-owned|replayed"):
+        assert_producer_owned_unsigned_bootstrap_protective_mark(
+            receiver.result,
+            receiver=receiver,
+        )
+
+
+@pytest.mark.asyncio
+async def test_post_production_mutation_revokes_unsigned_mark_registration(
+    database: Path,
+) -> None:
+    monitor = _monitor()
+    quote = await _live_quote(monitor)
+    receiver = MutatingReceiver()
+
+    with pytest.raises(BootstrapMarkBlocked, match="changed after production"):
+        _produce(
+            quote,
+            monitor,
+            database,
+            receiver=receiver,  # type: ignore[arg-type]
+        )
+
+    assert receiver.result is not None
+    with pytest.raises(BootstrapMarkBlocked, match="not producer-owned|replayed"):
+        assert_producer_owned_unsigned_bootstrap_protective_mark(
+            receiver.result,
+            receiver=receiver,
+        )
+
+
+@pytest.mark.asyncio
+async def test_direct_unsigned_mark_construction_has_no_producer_authority(
+    database: Path,
+) -> None:
+    monitor = _monitor()
+    quote = await _live_quote(monitor)
+    produced, _ = _produce(quote, monitor, database)
+    values = {
+        "portfolio_id": produced.portfolio_id,
+        "symbol": produced.symbol,
+        "price": produced.price,
+        "observed_at": produced.observed_at,
+        "source_event_id": produced.source_event_id,
+        "con_id": produced.con_id,
+        "transport_generation": produced.transport_generation,
+        "protective_quote_id": produced.protective_quote_id,
+        "runtime_fingerprint": produced.runtime_fingerprint,
+        "execution_domain_scope": produced.execution_domain_scope,
+        "account_scope": produced.account_scope,
+        "database_identity": produced.database_identity,
+        "database_device": produced.database_device,
+        "database_inode": produced.database_inode,
+    }
+
+    with pytest.raises(TypeError):
+        UnsignedBootstrapProtectiveMark(**values)  # type: ignore[arg-type]
+    with pytest.raises(BootstrapMarkBlocked, match="lacks producer ownership"):
+        UnsignedBootstrapProtectiveMark(
+            **values,
+            _producer_marker=object(),  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.asyncio
