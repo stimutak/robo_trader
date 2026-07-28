@@ -273,7 +273,8 @@ def test_signal_to_intent_to_decision_preserves_versioned_lineage() -> None:
     assert decision.side is signal.side
     assert decision.broker_contract == signal.broker_contract
     assert decision.transport_generation == signal.transport_generation
-    assert decision.expires_at == intent.expires_at
+    assert decision.expires_at == NOW + timedelta(seconds=9)
+    assert decision.expires_at < intent.expires_at
     assert decision.authorizes_order_submission is False
     assert decision.runtime_integration_ready is False
     with pytest.raises(FrozenInstanceError):
@@ -302,6 +303,30 @@ def test_exact_contract_and_active_generation_are_legitimately_approved() -> Non
     assert decision.reasons == (RiskReason.APPROVED,)
     assert decision.broker_contract is contract
     assert decision.transport_generation == ACTIVE_GENERATION
+
+
+@pytest.mark.parametrize("deadline_source", ["quote", "account", "correlation", "liquidity"])
+def test_approved_decision_expires_at_earliest_evidence_deadline(
+    deadline_source: str,
+) -> None:
+    changes: dict[str, object] = {}
+    if deadline_source == "quote":
+        changes["quote"] = _quote(observed_at=NOW - timedelta(seconds=9))
+    elif deadline_source == "account":
+        changes["observed_at"] = NOW - timedelta(seconds=29)
+    elif deadline_source == "correlation":
+        changes["correlation"] = _correlation(observed_at=NOW - timedelta(seconds=29))
+    else:
+        changes["liquidity"] = _liquidity(observed_at=NOW - timedelta(seconds=29))
+
+    intent = _intent(
+        created_at=NOW - timedelta(seconds=40),
+        observed_at=NOW - timedelta(seconds=50),
+    )
+    decision = _evaluate(intent=intent, evidence=_evidence(**changes))
+
+    assert decision.risk_approved is True
+    assert decision.expires_at == NOW + timedelta(seconds=1)
 
 
 def test_reconnect_retires_matching_pre_reconnect_quote_and_intent() -> None:
@@ -1251,19 +1276,51 @@ def test_duplicate_rejects_before_and_after_its_tombstone_expires() -> None:
         )
 
 
-def test_replay_tombstones_detect_clock_rollback() -> None:
+def test_replay_tombstones_allow_concurrent_out_of_order_consumption_times() -> None:
     tombstones = _DecisionReplayTombstones(2)
     tombstones.record(
         ("risk-decision-v1", 1, "portfolio-alpha", "intent-newer"),
         expires_at=NOW + timedelta(seconds=10),
+        consumed_at=NOW + timedelta(seconds=2),
+    )
+
+    tombstones.record(
+        ("risk-decision-v1", 1, "portfolio-alpha", "intent-older"),
+        expires_at=NOW + timedelta(seconds=10),
+        consumed_at=NOW + timedelta(seconds=1),
+    )
+
+
+def test_invalid_future_consumption_does_not_mutate_live_replay_state() -> None:
+    tombstones = _DecisionReplayTombstones(2)
+    replay_key = ("risk-decision-v1", 1, "portfolio-alpha", "intent-live")
+    tombstones.record(
+        replay_key,
+        expires_at=NOW + timedelta(seconds=10),
         consumed_at=NOW,
     )
 
-    with pytest.raises(EntryRiskContractError, match="clock rollback"):
+    with pytest.raises(EntryRiskContractError, match="expired before consumption"):
         tombstones.record(
-            ("risk-decision-v1", 1, "portfolio-alpha", "intent-older"),
+            ("risk-decision-v1", 1, "portfolio-alpha", "intent-invalid-future"),
+            expires_at=NOW + timedelta(seconds=1),
+            consumed_at=NOW + timedelta(days=1),
+        )
+    with pytest.raises(EntryRiskContractError, match="semantic replay"):
+        tombstones.record(
+            replay_key,
             expires_at=NOW + timedelta(seconds=10),
-            consumed_at=NOW - timedelta(microseconds=1),
+            consumed_at=NOW + timedelta(seconds=1),
+        )
+
+
+def test_risk_decision_cannot_be_consumed_before_evaluation() -> None:
+    decision = _decision_with_ids("pre-evaluation-consumption")
+
+    with pytest.raises(EntryRiskContractError, match="before its evaluation"):
+        assert_and_consume_risk_decision(
+            decision,
+            consumed_at=decision.evaluated_at - timedelta(microseconds=1),
         )
 
 

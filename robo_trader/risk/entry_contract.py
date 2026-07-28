@@ -39,15 +39,14 @@ _BROKER_IDENTITY = re.compile(r"^[A-Z0-9][A-Z0-9._:/-]{0,63}$")
 
 
 class _DecisionReplayTombstones:
-    """Bounded live-window replay records with an exact time watermark."""
+    """Bounded live-window semantic replay records."""
 
-    __slots__ = ("_entries", "_last_consumed_at", "_limit")
+    __slots__ = ("_entries", "_limit")
 
     def __init__(self, limit: int) -> None:
         if type(limit) is not int or limit <= 0:
             raise ValueError("decision replay tombstone limit must be positive")
         self._entries: dict[tuple[object, ...], datetime] = {}
-        self._last_consumed_at: Optional[datetime] = None
         self._limit = limit
 
     def record(
@@ -56,17 +55,17 @@ class _DecisionReplayTombstones:
         *,
         expires_at: datetime,
         consumed_at: datetime,
+        evaluated_at: Optional[datetime] = None,
     ) -> None:
-        if self._last_consumed_at is not None and consumed_at < self._last_consumed_at:
-            raise EntryRiskContractError("RiskDecision replay clock rollback detected")
-        self._last_consumed_at = consumed_at
+        if evaluated_at is not None and consumed_at < evaluated_at:
+            raise EntryRiskContractError("RiskDecision cannot be consumed before its evaluation")
+        if consumed_at >= expires_at:
+            raise EntryRiskContractError("RiskDecision expired before consumption")
 
         expired_keys = tuple(key for key, expiry in self._entries.items() if expiry <= consumed_at)
         for key in expired_keys:
             self._entries.pop(key, None)
 
-        if consumed_at >= expires_at:
-            raise EntryRiskContractError("RiskDecision expired before consumption")
         if replay_key in self._entries:
             raise EntryRiskContractError("RiskDecision semantic replay detected")
         if len(self._entries) >= self._limit:
@@ -147,6 +146,7 @@ def _build_capability_authority():
                     replay_key,
                     expires_at=capability.expires_at,
                     consumed_at=consumed_at,
+                    evaluated_at=capability.evaluated_at,
                 )
         return capability
 
@@ -1577,9 +1577,37 @@ def _evidence_is_current(
     evaluated_at: datetime,
     max_age: timedelta,
 ) -> bool:
-    return (
-        intent.created_at <= observed_at <= evaluated_at and evaluated_at - observed_at <= max_age
-    )
+    return intent.created_at <= observed_at <= evaluated_at and evaluated_at - observed_at < max_age
+
+
+def _approved_decision_expiry(
+    *,
+    intent: EntryIntent,
+    evidence: EntryRiskEvidence,
+    quote: RefreshedQuoteEvidence,
+    correlation: CorrelationEvidence,
+    liquidity: LiquidityEvidence,
+    limits: EntryRiskLimits,
+) -> datetime:
+    """Return the earliest deadline of every evidence item used for approval."""
+
+    if evidence.observed_at is None:
+        raise EntryRiskContractError("approved evidence lacks an account observation time")
+    deadlines = [
+        intent.expires_at,
+        quote.observed_at + limits.max_quote_age,
+        evidence.observed_at + limits.max_account_evidence_age,
+        correlation.observed_at + limits.max_account_evidence_age,
+        liquidity.observed_at + limits.max_account_evidence_age,
+    ]
+    if evidence.ml_corroboration is not None:
+        deadlines.extend(
+            (
+                evidence.ml_corroboration.expires_at,
+                evidence.ml_corroboration.observed_at + limits.max_account_evidence_age,
+            )
+        )
+    return min(deadlines)
 
 
 def _scoped_market_evidence_matches(
@@ -1967,6 +1995,16 @@ def evaluate_entry_intent(
         price_usd=quote.price_usd,
         capacities=capacities,
     )
+    decision_expiry = _approved_decision_expiry(
+        intent=intent,
+        evidence=evidence,
+        quote=quote,
+        correlation=evidence.correlation,
+        liquidity=evidence.liquidity,
+        limits=limits,
+    )
+    if decision_expiry <= now:
+        raise EntryRiskContractError("approved evidence has no remaining freshness window")
 
     return _mint_capability(
         RiskDecision,
@@ -1979,7 +2017,7 @@ def evaluate_entry_intent(
             "broker_contract": intent.broker_contract,
             "transport_generation": intent.transport_generation,
             "evaluated_at": now,
-            "expires_at": intent.expires_at,
+            "expires_at": decision_expiry,
             "risk_approved": True,
             "reasons": (RiskReason.APPROVED,),
             "approved_quantity": quantity,
