@@ -31,8 +31,16 @@ from .bootstrap_evidence_auth import (
     verify_receipt,
 )
 from .reconciliation.domain import IBKR_READ_ONLY_SCOPE, canonical_json, fingerprint
+from .reconciliation.policy import (
+    DifferenceKind,
+    DifferenceMateriality,
+    ExpectedTimingLagProof,
+    ReconciliationCoverage,
+    ReconciliationDifference,
+    ReconciliationStatus,
+)
 from .runtime_contract_constants import PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
-from .safety.journal import SafetyJournal
+from .safety.journal import JournalError, SafetyJournal
 from .safety.models import decimal_to_fixed, utc_to_text
 from .safety.sqlite_identity import (
     SQLiteIdentityError,
@@ -165,8 +173,14 @@ class ExactStateBootstrapEvidence:
     """Cross-linked offline evidence verified from regular owner-only files."""
 
     reconciliation_snapshot_id: str
+    reconciliation_artifact_path: str
     bundle_id: str
     reconciliation_report_hash: str
+    reconciliation_coverage: ReconciliationCoverage
+    reconciliation_status: ReconciliationStatus
+    reconciliation_differences: tuple[ReconciliationDifference, ...]
+    reconciliation_timing_lag_proofs: tuple[ExpectedTimingLagProof, ...]
+    broker_snapshot_id: str
     broker_snapshot_hash: str
     legacy_snapshot_hash: str
     runtime_fingerprint: str
@@ -217,6 +231,7 @@ def _evidence_object_digest(evidence: ExactStateBootstrapEvidence) -> str:
                 "public_key_fingerprint": receipt.public_key_fingerprint,
                 "receipt_id": receipt.receipt_id,
                 "runtime_fingerprint": receipt.runtime_fingerprint,
+                "signature_ed25519": receipt.signature_ed25519,
             }
             for receipt in evidence.authentication_receipts
         ],
@@ -246,8 +261,18 @@ def _evidence_object_digest(evidence: ExactStateBootstrapEvidence) -> str:
         ],
         "portfolio_ids": list(evidence.portfolio_ids),
         "reconciliation_generated_at": utc_to_text(evidence.reconciliation_generated_at),
+        "reconciliation_artifact_path": evidence.reconciliation_artifact_path,
+        "reconciliation_coverage": evidence.reconciliation_coverage.canonical_dict(),
         "reconciliation_report_hash": evidence.reconciliation_report_hash,
         "reconciliation_snapshot_id": evidence.reconciliation_snapshot_id,
+        "reconciliation_status": evidence.reconciliation_status.value,
+        "reconciliation_differences": [
+            value.canonical_dict() for value in evidence.reconciliation_differences
+        ],
+        "reconciliation_timing_lag_proofs": [
+            value.canonical_dict() for value in evidence.reconciliation_timing_lag_proofs
+        ],
+        "broker_snapshot_id": evidence.broker_snapshot_id,
         "runtime_fingerprint": evidence.runtime_fingerprint,
         "safety_journal_device": evidence.safety_journal_device,
         "safety_journal_identity": evidence.safety_journal_identity,
@@ -598,6 +623,76 @@ def _runtime_contract_values(runtime_contract: object) -> tuple[Path, str, str, 
     )
 
 
+def _reconciliation_difference(value: object) -> ReconciliationDifference:
+    if type(value) is not dict:
+        raise ExactStateBootstrapError("reconciliation difference is malformed")
+    _exact_keys(
+        value,
+        {"evidence_ids", "kind", "materiality", "reason_code", "schema_version", "subject"},
+        "reconciliation difference",
+    )
+    evidence_ids = value["evidence_ids"]
+    if type(evidence_ids) is not list or any(type(item) is not str for item in evidence_ids):
+        raise ExactStateBootstrapError("reconciliation difference evidence IDs are malformed")
+    try:
+        difference = ReconciliationDifference(
+            kind=DifferenceKind(_json_string(value["kind"], "difference kind")),
+            materiality=DifferenceMateriality(
+                _json_string(value["materiality"], "difference materiality")
+            ),
+            reason_code=_json_string(value["reason_code"], "difference reason_code"),
+            subject=_json_string(value["subject"], "difference subject"),
+            evidence_ids=tuple(evidence_ids),
+            schema_version=_json_int(value["schema_version"], "difference schema_version"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ExactStateBootstrapError("reconciliation difference is malformed") from exc
+    if difference.canonical_dict() != value:
+        raise ExactStateBootstrapError("reconciliation difference is not canonical")
+    return difference
+
+
+def _reconciliation_timing_lag_proof(value: object) -> ExpectedTimingLagProof:
+    if type(value) is not dict:
+        raise ExactStateBootstrapError("reconciliation timing proof is malformed")
+    _exact_keys(
+        value,
+        {
+            "broker_event_id",
+            "broker_snapshot_id",
+            "difference_kind",
+            "expires_at",
+            "proof_id",
+            "reason_code",
+            "schema_version",
+            "started_at",
+            "subject",
+        },
+        "reconciliation timing proof",
+    )
+    try:
+        proof = ExpectedTimingLagProof(
+            broker_snapshot_id=_json_string(
+                value["broker_snapshot_id"], "timing proof broker_snapshot_id"
+            ),
+            difference_kind=DifferenceKind(
+                _json_string(value["difference_kind"], "timing proof difference_kind")
+            ),
+            reason_code=_json_string(value["reason_code"], "timing proof reason_code"),
+            subject=_json_string(value["subject"], "timing proof subject"),
+            broker_event_id=_json_string(value["broker_event_id"], "timing proof broker_event_id"),
+            started_at=_utc(value["started_at"], "timing proof started_at"),
+            expires_at=_utc(value["expires_at"], "timing proof expires_at"),
+            proof_id=_json_string(value["proof_id"], "timing proof proof_id"),
+            schema_version=_json_int(value["schema_version"], "timing proof schema_version"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ExactStateBootstrapError("reconciliation timing proof is malformed") from exc
+    if proof.canonical_dict() != value:
+        raise ExactStateBootstrapError("reconciliation timing proof is not canonical")
+    return proof
+
+
 def load_exact_state_bootstrap_evidence(
     *,
     reconciliation_path: Path,
@@ -788,6 +883,7 @@ def load_exact_state_bootstrap_evidence(
     if type(collections) is not list or len(collections) != len(expected_collections):
         raise ExactStateBootstrapError("broker collection evidence is incomplete")
     collection_names: set[str] = set()
+    collection_counts: dict[str, int] = {}
     broker_collection_ids: list[str] = []
     collection_observed_times: list[datetime] = []
     for collection in collections:
@@ -808,6 +904,9 @@ def load_exact_state_bootstrap_evidence(
         )
         name = _json_string(collection["collection"], "broker collection")
         collection_names.add(name)
+        collection_counts[name] = _json_int(
+            collection["result_count"], "broker collection result_count"
+        )
         evidence_id = _json_string(collection["evidence_id"], "broker collection evidence_id")
         if not re.fullmatch(r"broker-collection-v1-[0-9a-f]{64}", evidence_id):
             raise ExactStateBootstrapError("broker collection evidence identity is malformed")
@@ -820,7 +919,6 @@ def load_exact_state_bootstrap_evidence(
                 _json_string(collection["account_scope"], "broker collection account_scope"),
                 account_scope,
             )
-            or _json_int(collection["result_count"], "broker collection result_count") != 0
             or _json_int(collection["schema_version"], "broker collection schema_version") != 1
             or _json_string(collection["source_scope"], "broker collection source_scope")
             != IBKR_READ_ONLY_SCOPE
@@ -870,15 +968,27 @@ def load_exact_state_bootstrap_evidence(
     ):
         raise ExactStateBootstrapError("broker account financial evidence is malformed")
     _decimal(account["total_cash"], "broker total_cash")
-    if (
-        type(broker["positions"]) is not list
-        or type(broker["orders"]) is not list
-        or type(broker["executions"]) is not list
-        or broker["positions"] != []
-        or broker["orders"] != []
-        or broker["executions"] != []
-    ):
-        raise ExactStateBootstrapError("broker snapshot does not prove zero paper exposure")
+    positions = broker["positions"]
+    orders = broker["orders"]
+    executions = broker["executions"]
+    if type(positions) is not list or type(orders) is not list or type(executions) is not list:
+        raise ExactStateBootstrapError("broker snapshot collections are malformed")
+    open_order_count = sum(
+        1 for order in orders if type(order) is dict and order.get("collection") == "open_orders"
+    )
+    completed_order_count = sum(
+        1
+        for order in orders
+        if type(order) is dict and order.get("collection") == "completed_orders"
+    )
+    if open_order_count + completed_order_count != len(orders) or collection_counts != {
+        "positions": len(positions),
+        "open_orders": open_order_count,
+        "completed_orders": completed_order_count,
+        "executions": len(executions),
+        "commissions": len(executions),
+    }:
+        raise ExactStateBootstrapError("broker collection evidence counts are inconsistent")
     broker_snapshot_id = fingerprint("broker-reconciliation-v1", broker)
     broker_snapshot_hash = hashlib.sha256(canonical_json(broker).encode("utf-8")).hexdigest()
     broker_authenticated_at = _verify_artifact_authentication(
@@ -926,6 +1036,8 @@ def load_exact_state_bootstrap_evidence(
             "broker_verdict_hash",
             "comparison_coverage",
             "reconciliation_status",
+            "reconciliation_differences",
+            "reconciliation_timing_lag_proofs",
             "local_simulator_positions_count",
             "local_position_identities",
             "status",
@@ -942,6 +1054,8 @@ def load_exact_state_bootstrap_evidence(
     if not re.fullmatch(r"bootstrap-evidence-bundle-v1-[0-9a-f]{64}", bundle_id):
         raise ExactStateBootstrapError("reconciliation bundle identity is malformed")
     coverage = reconciliation["comparison_coverage"]
+    raw_differences = reconciliation["reconciliation_differences"]
+    raw_timing_proofs = reconciliation["reconciliation_timing_lag_proofs"]
     collection_ids = reconciliation["broker_collection_evidence_ids"]
     local_position_identities = reconciliation["local_position_identities"]
     safety_journal_path = _json_string(
@@ -1039,12 +1153,12 @@ def load_exact_state_bootstrap_evidence(
         or _json_int(
             reconciliation["broker_positions_count"], "reconciliation broker_positions_count"
         )
-        != 0
+        != len(positions)
         or _json_int(
             reconciliation["broker_open_orders_count"],
             "reconciliation broker_open_orders_count",
         )
-        != 0
+        != open_order_count
         or _json_int(
             reconciliation["local_simulator_positions_count"],
             "reconciliation local simulator positions count",
@@ -1061,7 +1175,7 @@ def load_exact_state_bootstrap_evidence(
             reconciliation["reconciliation_status"],
             "reconciliation status",
         )
-        not in {"passed", "degraded"}
+        not in {"passed", "degraded", "quarantined"}
         or type(collection_ids) is not list
         or len(collection_ids) != 5
         or any(type(value) is not str for value in collection_ids)
@@ -1149,6 +1263,62 @@ def load_exact_state_bootstrap_evidence(
     ):
         raise ExactStateBootstrapError(
             "reconciliation snapshot identity is not bound to its canonical payload"
+        )
+    reconciliation_coverage = ReconciliationCoverage(
+        **{
+            field_name: _json_bool(coverage[field_name], f"coverage {field_name}")
+            for field_name in sorted(expected_coverage)
+        }
+    )
+    reconciliation_status = ReconciliationStatus(
+        _json_string(reconciliation["reconciliation_status"], "reconciliation status")
+    )
+    if type(raw_differences) is not list or type(raw_timing_proofs) is not list:
+        raise ExactStateBootstrapError("reconciliation mismatch evidence is malformed")
+    reconciliation_differences = tuple(
+        _reconciliation_difference(value) for value in raw_differences
+    )
+    if reconciliation_differences != tuple(
+        sorted(reconciliation_differences, key=lambda value: value.identity)
+    ) or len({value.identity for value in reconciliation_differences}) != len(
+        reconciliation_differences
+    ):
+        raise ExactStateBootstrapError("reconciliation differences are not unique and sorted")
+    reconciliation_timing_lag_proofs = tuple(
+        _reconciliation_timing_lag_proof(value) for value in raw_timing_proofs
+    )
+    if reconciliation_timing_lag_proofs != tuple(
+        sorted(reconciliation_timing_lag_proofs, key=lambda value: value.binding_key)
+    ) or len({value.binding_key for value in reconciliation_timing_lag_proofs}) != len(
+        reconciliation_timing_lag_proofs
+    ):
+        raise ExactStateBootstrapError("reconciliation timing proofs are not unique and sorted")
+    timing_difference_keys = {
+        (
+            broker_snapshot_id,
+            difference.kind.value,
+            difference.reason_code,
+            difference.subject,
+            difference.evidence_ids[0],
+        )
+        for difference in reconciliation_differences
+        if difference.kind is DifferenceKind.EXPECTED_TIMING_LAG
+    }
+    if any(
+        proof.broker_snapshot_id != broker_snapshot_id
+        or proof.binding_key not in timing_difference_keys
+        for proof in reconciliation_timing_lag_proofs
+    ):
+        raise ExactStateBootstrapError("reconciliation timing proof lacks a signed difference")
+    materialities = {value.materiality for value in reconciliation_differences}
+    expected_status = (
+        ReconciliationStatus.QUARANTINED
+        if materialities & {DifferenceMateriality.MATERIAL, DifferenceMateriality.UNKNOWN}
+        else ReconciliationStatus.DEGRADED if materialities else ReconciliationStatus.PASSED
+    )
+    if reconciliation_status is not expected_status:
+        raise ExactStateBootstrapError(
+            "reconciliation status contradicts authenticated differences"
         )
     reconciliation_authenticated_at = _verify_artifact_authentication(
         artifact_path=Path(reconciliation_path),
@@ -1330,8 +1500,14 @@ def load_exact_state_bootstrap_evidence(
 
     evidence = ExactStateBootstrapEvidence(
         reconciliation_snapshot_id=reconciliation_snapshot_id,
+        reconciliation_artifact_path=str(Path(reconciliation_path)),
         bundle_id=bundle_id,
         reconciliation_report_hash=reconciliation_hash,
+        reconciliation_coverage=reconciliation_coverage,
+        reconciliation_status=reconciliation_status,
+        reconciliation_differences=reconciliation_differences,
+        reconciliation_timing_lag_proofs=reconciliation_timing_lag_proofs,
+        broker_snapshot_id=broker_snapshot_id,
         broker_snapshot_hash=broker_hash,
         legacy_snapshot_hash=legacy_snapshot_hash,
         runtime_fingerprint=runtime_fingerprint,
@@ -1352,13 +1528,95 @@ def load_exact_state_bootstrap_evidence(
         portfolio_ids=tuple(portfolio_ids),
         broker_observed_at=broker_observed_at,
         reconciliation_generated_at=generated_at,
-        broker_position_count=0,
-        broker_open_order_count=0,
+        broker_position_count=len(positions),
+        broker_open_order_count=open_order_count,
         marks=tuple(marks),
         authentication_receipts=tuple(authentication_receipts),
         _producer_marker=_EVIDENCE_PRODUCER_MARKER,
     )
     object.__setattr__(evidence, "_producer_digest", _evidence_object_digest(evidence))
+    return evidence
+
+
+def assert_verified_exact_state_reconciliation_evidence(
+    evidence: object,
+    runtime_contract: object,
+) -> ExactStateBootstrapEvidence:
+    """Revalidate one loader-owned signed reconciliation artifact and runtime inode."""
+
+    if type(evidence) is not ExactStateBootstrapEvidence:
+        raise ExactStateBootstrapError("exact-state reconciliation evidence has the wrong type")
+    if evidence._producer_marker is not _EVIDENCE_PRODUCER_MARKER or not hmac.compare_digest(
+        evidence._producer_digest,
+        _evidence_object_digest(evidence),
+    ):
+        raise ExactStateBootstrapError("exact-state reconciliation evidence is not loader-owned")
+    database_path, database_identity, runtime_fingerprint, account_scope = _runtime_contract_values(
+        runtime_contract
+    )
+    try:
+        database_metadata = os.lstat(database_path)
+    except OSError as exc:
+        raise ExactStateBootstrapError("runtime database cannot be revalidated") from exc
+    if (
+        stat.S_ISLNK(database_metadata.st_mode)
+        or not stat.S_ISREG(database_metadata.st_mode)
+        or database_metadata.st_nlink != 1
+        or evidence.database_path != str(database_path)
+        or evidence.database_identity != database_identity
+        or evidence.runtime_fingerprint != runtime_fingerprint
+        or not hmac.compare_digest(evidence.account_scope, account_scope)
+        or (evidence.database_device, evidence.database_inode)
+        != (database_metadata.st_dev, database_metadata.st_ino)
+    ):
+        raise ExactStateBootstrapError("exact-state reconciliation runtime binding changed")
+
+    artifact_path = Path(evidence.reconciliation_artifact_path)
+    reconciliation, artifact_hash = _verified_canonical_json(
+        artifact_path,
+        "reconciliation report",
+    )
+    if (
+        artifact_hash != evidence.reconciliation_report_hash
+        or _safe_id(reconciliation.get("snapshot_id"), "reconciliation snapshot_id")
+        != evidence.reconciliation_snapshot_id
+        or _safe_id(reconciliation.get("bundle_id"), "reconciliation bundle_id")
+        != evidence.bundle_id
+        or _safe_id(reconciliation.get("broker_snapshot_id"), "broker snapshot_id")
+        != evidence.broker_snapshot_id
+        or _json_string(
+            reconciliation.get("runtime_fingerprint"),
+            "reconciliation runtime_fingerprint",
+        )
+        != runtime_fingerprint
+        or not hmac.compare_digest(
+            _json_string(reconciliation.get("account_scope"), "reconciliation account_scope"),
+            account_scope,
+        )
+        or reconciliation.get("comparison_coverage")
+        != evidence.reconciliation_coverage.canonical_dict()
+        or reconciliation.get("reconciliation_status") != evidence.reconciliation_status.value
+        or reconciliation.get("reconciliation_differences")
+        != [value.canonical_dict() for value in evidence.reconciliation_differences]
+        or reconciliation.get("reconciliation_timing_lag_proofs")
+        != [value.canonical_dict() for value in evidence.reconciliation_timing_lag_proofs]
+    ):
+        raise ExactStateBootstrapError("signed reconciliation artifact lineage changed")
+    verified_receipt = _verify_artifact_authentication(
+        artifact_path=artifact_path,
+        artifact_kind="reconciliation_report",
+        artifact_hash=artifact_hash,
+        runtime_fingerprint=runtime_fingerprint,
+        account_scope=account_scope,
+    )
+    reconciliation_receipts = tuple(
+        receipt
+        for receipt in evidence.authentication_receipts
+        if receipt.artifact_kind == "reconciliation_report"
+    )
+    if len(reconciliation_receipts) != 1 or reconciliation_receipts[0] != verified_receipt:
+        raise ExactStateBootstrapError("reconciliation signature receipt lineage changed")
+    _assert_authentication_receipts_unconsumed(database_path, evidence.authentication_receipts)
     return evidence
 
 
@@ -1712,7 +1970,7 @@ def acquire_exact_state_safety_journal_guard(
         binding = None
         connection = None
         return guard
-    except (OSError, sqlite3.Error, SQLiteIdentityError) as exc:
+    except (OSError, sqlite3.Error, SQLiteIdentityError, JournalError) as exc:
         raise ExactStateBootstrapError(
             "runtime safety journal cannot be locked and revalidated"
         ) from exc
@@ -1962,3 +2220,75 @@ def inspect_legacy_state(database_path: Path) -> dict[str, object]:
             connection.close()
         if binding is not None:
             binding.close()
+
+
+def assert_exact_state_runtime_sources_unchanged(
+    evidence: ExactStateBootstrapEvidence,
+    runtime_contract: object,
+) -> None:
+    """Re-read the signed ledger and journal lineage immediately before use."""
+
+    verified = assert_verified_exact_state_reconciliation_evidence(
+        evidence,
+        runtime_contract,
+    )
+    guard = acquire_exact_state_safety_journal_guard(verified, runtime_contract)
+    try:
+        database_path = Path(verified.database_path)
+        family_before = tuple(
+            _runtime_state_file_fingerprint(path)
+            for path in (
+                database_path,
+                Path(f"{database_path}-wal"),
+                Path(f"{database_path}-journal"),
+            )
+        )
+        current = inspect_legacy_state(Path(verified.database_path))
+        family_after = tuple(
+            _runtime_state_file_fingerprint(path)
+            for path in (
+                database_path,
+                Path(f"{database_path}-wal"),
+                Path(f"{database_path}-journal"),
+            )
+        )
+        if (
+            family_before != family_after
+            or current.get("database_device") != verified.database_device
+            or current.get("database_inode") != verified.database_inode
+            or not hmac.compare_digest(
+                _hash(current.get("snapshot_hash"), "runtime legacy snapshot hash"),
+                verified.legacy_snapshot_hash,
+            )
+        ):
+            raise ExactStateBootstrapError(
+                "legacy ledger content changed after signed reconciliation load"
+            )
+        guard.assert_unchanged()
+    finally:
+        guard.close()
+
+
+def _runtime_state_file_fingerprint(path: Path) -> tuple[str, int, int, int, str]:
+    """Hash one SQLite family member and prove stable bytes during the read."""
+
+    try:
+        before = os.lstat(path)
+    except FileNotFoundError:
+        return ("absent", 0, 0, 0, "")
+    except OSError as exc:
+        raise ExactStateBootstrapError("runtime SQLite family cannot be inspected") from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ExactStateBootstrapError("runtime SQLite family member is not a regular file")
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        after = os.lstat(path)
+    except OSError as exc:
+        raise ExactStateBootstrapError("runtime SQLite family cannot be read safely") from exc
+    stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(before, name) != getattr(after, name) for name in stable):
+        raise ExactStateBootstrapError("runtime SQLite family changed during revalidation")
+    return ("regular", after.st_dev, after.st_ino, after.st_size, digest.hexdigest())

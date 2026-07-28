@@ -79,6 +79,7 @@ class AuthenticatedEvidenceReceipt:
     issued_at: datetime
     expires_at: datetime
     public_key_fingerprint: str
+    signature_ed25519: str
 
 
 def _safe_file_bytes(
@@ -145,7 +146,7 @@ def _parse_utc(value: object, label: str) -> datetime:
 
 
 def receipt_signature_payload(values: Mapping[str, object]) -> bytes:
-    fields = (
+    fields: tuple[str, ...] = (
         "schema_version",
         "receipt_id",
         "artifact_kind",
@@ -379,4 +380,5 @@ def verify_receipt(
         issued_at=issued_at,
         expires_at=expires_at,
         public_key_fingerprint=fingerprint,
+        signature_ed25519=str(raw["signature_ed25519"]),
     )
