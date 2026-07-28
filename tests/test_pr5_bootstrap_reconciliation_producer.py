@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, cast
+from unittest.mock import patch
 
 import pytest
 
@@ -22,9 +23,8 @@ from robo_trader.reconciliation.bootstrap_producer import (
     BOOTSTRAP_RECONCILIATION_STATUS,
     BootstrapReconciliationBlocked,
     UnsignedBootstrapReconciliation,
-    _issue_test_producer_capability,
-    _produce_bootstrap_reconciliation_for_test,
     assert_and_consume_producer_owned_bootstrap_reconciliation,
+    produce_bootstrap_reconciliation,
 )
 from robo_trader.reconciliation.domain import (
     BrokerCollectionEvidence,
@@ -39,6 +39,22 @@ from robo_trader.reconciliation.domain import (
     NormalizedBrokerSnapshot,
 )
 from robo_trader.reconciliation.policy import ReconciliationStatus
+from robo_trader.safety import (
+    EvidenceStatus,
+    ExposureEvidence,
+    GateContext,
+    OrderIntent,
+    OrderSide,
+    OrderType,
+    PortfolioAllocationEvidence,
+)
+from robo_trader.safety import ReconciliationStatus as SafetyReconciliationStatus
+from robo_trader.safety import (
+    SafetyJournal,
+    SubmissionDescriptor,
+    TimeInForce,
+    TransportState,
+)
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
 ACCOUNT_SCOPE = "acct_v1_" + "0123456789abcdef" * 4
@@ -130,6 +146,94 @@ def _runtime(database: Path) -> RuntimeContract:
         safety_execution_domain_scope="paper-simulator-v1",
         safety_journal_path=str(database.with_name("safety-journal.db")),
     )
+
+
+def _seed_unresolved_safety_reservation(
+    journal_path: Path,
+    *,
+    outcome_unknown: bool,
+) -> None:
+    journal = SafetyJournal(journal_path, clock=lambda: NOW)
+    intent = OrderIntent(
+        execution_domain_scope="paper-simulator-v1",
+        account_scope=ACCOUNT_SCOPE,
+        portfolio_id="default",
+        con_id=265598,
+        symbol="AAPL",
+        side=OrderSide.SELL,
+        quantity=Decimal("1"),
+        account_current_quantity=Decimal("2"),
+        target_quantity=Decimal("1"),
+        portfolio_target_quantity=Decimal("1"),
+        portfolio_current_quantity=Decimal("2"),
+        created_at=NOW,
+        reduce_only=True,
+        reason="bootstrap adversarial fixture",
+        strategy="test",
+    )
+    exposure = ExposureEvidence(
+        execution_domain_scope="paper-simulator-v1",
+        account_scope=ACCOUNT_SCOPE,
+        con_id=265598,
+        symbol="AAPL",
+        position_quantity=Decimal("2"),
+        observed_at=NOW,
+        status=EvidenceStatus.AUTHORITATIVE,
+        source="test-account-snapshot",
+        snapshot_id="test-account-snapshot-1",
+    )
+    allocation = PortfolioAllocationEvidence(
+        execution_domain_scope="paper-simulator-v1",
+        account_scope=ACCOUNT_SCOPE,
+        portfolio_id="default",
+        con_id=265598,
+        symbol="AAPL",
+        position_quantity=Decimal("2"),
+        aggregate_allocated_quantity=Decimal("2"),
+        has_offsetting_allocations=False,
+        observed_at=NOW,
+        status=EvidenceStatus.AUTHORITATIVE,
+        source="test-allocation-ledger",
+        snapshot_id="test-allocation-snapshot-1",
+    )
+    gates = GateContext(
+        execution_domain_scope="paper-simulator-v1",
+        account_scope=ACCOUNT_SCOPE,
+        con_id=265598,
+        evaluated_at=NOW,
+        max_evidence_age_seconds=30,
+        transport_state=TransportState.CONNECTED,
+        reconciliation_status=SafetyReconciliationStatus.PASSED,
+        open_orders_complete=True,
+        open_orders_all_clients=True,
+        open_orders_snapshot_stable=True,
+        open_orders_observed_at=NOW,
+        open_orders_snapshot_id="test-open-orders-snapshot-1",
+        active_order_count=0,
+    )
+    descriptor = SubmissionDescriptor(
+        execution_domain_scope="paper-simulator-v1",
+        account_scope=ACCOUNT_SCOPE,
+        con_id=265598,
+        side=OrderSide.SELL,
+        quantity=Decimal("1"),
+        order_type=OrderType.MARKET,
+        limit_price=None,
+        stop_price=None,
+        time_in_force=TimeInForce.DAY,
+        outside_regular_hours=False,
+        order_ref="bootstrap-test-order",
+    )
+    journal.authorize_submission(
+        "bootstrap-test-intent",
+        intent,
+        exposure,
+        allocation,
+        gates,
+        descriptor,
+    )
+    if outcome_unknown:
+        journal.mark_outcome_unknown("bootstrap-test-intent", intent.fingerprint())
 
 
 def _collection_evidence(
@@ -303,36 +407,67 @@ class FakeBrokerVerifier:
 class ClaimingReceiver:
     def __init__(self, *, before_claim=None) -> None:
         self.results: list[UnsignedBootstrapReconciliation] = []
+        self.published: list[UnsignedBootstrapReconciliation] = []
+        self.aborted: list[object] = []
         self.before_claim = before_claim
 
-    def receive_unsigned_bootstrap_reconciliation(
+    def stage_unsigned_bootstrap_reconciliation(
         self,
         result: UnsignedBootstrapReconciliation,
-    ) -> UnsignedBootstrapReconciliation:
+    ) -> object:
+        claimed = assert_and_consume_producer_owned_bootstrap_reconciliation(result)
         if self.before_claim is not None:
             self.before_claim()
-        claimed = assert_and_consume_producer_owned_bootstrap_reconciliation(result)
         self.results.append(claimed)
         return claimed
+
+    def commit_staged_bootstrap_reconciliation(
+        self, stage: object
+    ) -> UnsignedBootstrapReconciliation:
+        assert stage is self.results[-1]
+        self.published.append(self.results[-1])
+        return self.results[-1]
+
+    def abort_staged_bootstrap_reconciliation(self, stage: object) -> None:
+        self.aborted.append(stage)
 
 
 class BypassReceiver:
     def __init__(self) -> None:
         self.results: list[UnsignedBootstrapReconciliation] = []
 
-    def receive_unsigned_bootstrap_reconciliation(
+    def stage_unsigned_bootstrap_reconciliation(
         self,
         result: UnsignedBootstrapReconciliation,
-    ) -> str:
+    ) -> object:
         self.results.append(result)
         return "bypassed"
+
+    def commit_staged_bootstrap_reconciliation(self, stage: object) -> str:
+        return str(stage)
+
+    def abort_staged_bootstrap_reconciliation(self, stage: object) -> None:
+        del stage
 
 
 @pytest.fixture
 def database(tmp_path: Path) -> Path:
     path = tmp_path / "ledger.db"
     _legacy_database(path)
+    SafetyJournal(path.with_name("safety-journal.db")).initialize(
+        execution_domain_scope="paper-simulator-v1",
+        account_scope=ACCOUNT_SCOPE,
+    )
     return path
+
+
+@pytest.fixture(autouse=True)
+def authenticated_test_receiver(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        producer_module,
+        "_assert_core_reconciliation_receiver_capability",
+        lambda receiver: None,
+    )
 
 
 def _produce(
@@ -353,21 +488,17 @@ def _produce(
     verified = envelope or _envelope(snapshot or _snapshot(), contract)
     authority = verifier or FakeBrokerVerifier(verified)
     sink = receiver or ClaimingReceiver()
-    capability = _issue_test_producer_capability(
-        clock=clock or (lambda: NOW),
-        broker_consumer=cast(
-            Callable[[object], producer_module.VerifiedBrokerEvidenceEnvelope],
-            authority.consume,
-        ),
-    )
-    delivery: producer_module.BootstrapReconciliationDelivery[object] = (
-        _produce_bootstrap_reconciliation_for_test(
-            verified,
-            contract,
-            sink,  # type: ignore[arg-type]
-            capability,
+    with (
+        patch.object(producer_module, "_system_clock", clock or (lambda: NOW)),
+        patch.object(producer_module, "_consume_verified_broker_evidence", authority.consume),
+    ):
+        delivery: producer_module.BootstrapReconciliationDelivery[object] = (
+            produce_bootstrap_reconciliation(
+                verified,
+                contract,
+                sink,  # type: ignore[arg-type]
+            )
         )
-    )
     return delivery, sink, verified
 
 
@@ -388,6 +519,12 @@ def test_clean_stage_collects_ledger_and_binds_non_authorizing_result(database: 
     assert result.broker_artifact_hash != result.broker_snapshot_hash
     assert result.legacy_snapshot_hash == expected_legacy_hash
     assert result.portfolio_ids == ("default",)
+    assert result.safety_journal_path.endswith("safety-journal.db")
+    assert result.safety_journal_identity.startswith("paper:safety:")
+    assert result.safety_journal_last_sequence == 0
+    assert result.safety_journal_last_chain_hash == "0" * 64
+    assert result.terminal_settlement_count == 0
+    assert result.terminal_fill_count == 0
     assert result.local_simulator_positions_count == 2
     assert result.broker_positions_count == 0
     assert result.broker_open_orders_count == 0
@@ -474,14 +611,28 @@ def test_forged_or_replayed_verified_envelope_blocks(database: Path) -> None:
         _produce(database, runtime=runtime, envelope=forged, verifier=verifier)
 
 
-def test_public_producer_rejects_structurally_valid_caller_envelope(database: Path) -> None:
-    runtime = _runtime(database)
-    forged = _envelope(_snapshot(), runtime)
+def test_no_shipped_test_capability_can_replace_clock_or_broker_authority() -> None:
+    assert not hasattr(producer_module, "_issue_test_producer_capability")
+    assert not hasattr(producer_module, "_produce_bootstrap_reconciliation_for_test")
+
+
+def test_receiver_must_be_authenticated_before_evidence_collection(
+    database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     receiver = ClaimingReceiver()
 
-    with pytest.raises(BootstrapReconciliationBlocked, match="not verifier-owned"):
-        producer_module.produce_bootstrap_reconciliation(forged, runtime, receiver)
+    def reject_receiver(value: object) -> None:
+        del value
+        raise BootstrapReconciliationBlocked("not core-authenticated")
 
+    monkeypatch.setattr(
+        producer_module,
+        "_assert_core_reconciliation_receiver_capability",
+        reject_receiver,
+    )
+    with pytest.raises(BootstrapReconciliationBlocked, match="core-authenticated"):
+        _produce(database, receiver=receiver)
     assert receiver.results == []
 
 
@@ -491,7 +642,7 @@ def test_forged_typed_ledger_evidence_is_rejected(database: Path, monkeypatch) -
     @contextmanager
     def forged_collector(*args, **kwargs):
         del args, kwargs
-        yield forged
+        yield type("ForgedSession", (), {"evidence": forged})()
 
     monkeypatch.setattr(producer_module, "_collect_wal_visible_ledger", forged_collector)
     receiver = ClaimingReceiver()
@@ -555,7 +706,7 @@ def test_wal_visible_commit_is_included_in_snapshot_hash(database: Path) -> None
         writer.close()
 
 
-def test_wal_only_commit_after_snapshot_before_delivery_blocks(database: Path) -> None:
+def test_receiver_stage_wal_commit_blocks_and_aborts_before_publication(database: Path) -> None:
     writer = sqlite3.connect(database)
     writer.execute("PRAGMA journal_mode=WAL")
     writer.execute("PRAGMA wal_autocheckpoint=0")
@@ -567,22 +718,127 @@ def test_wal_only_commit_after_snapshot_before_delivery_blocks(database: Path) -
         )
         writer.commit()
 
-    clock_calls = 0
-
-    def clock_with_commit() -> datetime:
-        nonlocal clock_calls
-        clock_calls += 1
-        if clock_calls == 2:
-            commit_during_receiver()
-        return NOW
-
-    receiver = ClaimingReceiver()
+    receiver = ClaimingReceiver(before_claim=commit_during_receiver)
     try:
         with pytest.raises(BootstrapReconciliationBlocked, match="ledger WAL changed"):
-            _produce(database, receiver=receiver, clock=clock_with_commit)
-        assert receiver.results == []
+            _produce(database, receiver=receiver)
+        assert len(receiver.results) == 1
+        assert receiver.published == []
+        assert receiver.aborted == receiver.results
     finally:
         writer.close()
+
+
+def test_receiver_stage_safety_journal_commit_blocks_and_aborts(
+    database: Path,
+) -> None:
+    journal_path = database.with_name("safety-journal.db")
+    receiver = ClaimingReceiver(
+        before_claim=lambda: _seed_unresolved_safety_reservation(
+            journal_path,
+            outcome_unknown=False,
+        )
+    )
+
+    with pytest.raises(BootstrapReconciliationBlocked, match="safety journal"):
+        _produce(database, receiver=receiver)
+
+    assert len(receiver.results) == 1
+    assert receiver.published == []
+    assert receiver.aborted == receiver.results
+
+
+@pytest.mark.parametrize("outcome_unknown", [False, True])
+def test_unresolved_or_unknown_safety_reservation_blocks(
+    database: Path,
+    outcome_unknown: bool,
+) -> None:
+    _seed_unresolved_safety_reservation(
+        database.with_name("safety-journal.db"),
+        outcome_unknown=outcome_unknown,
+    )
+    receiver = ClaimingReceiver()
+
+    with pytest.raises(
+        BootstrapReconciliationBlocked,
+        match="active, quarantined, or unknown|unresolved",
+    ):
+        _produce(database, receiver=receiver)
+    assert receiver.results == []
+
+
+def test_missing_runtime_bound_safety_journal_blocks(database: Path) -> None:
+    runtime = replace(
+        _runtime(database),
+        safety_journal_path=str(database.with_name("never-initialized-safety.db")),
+    )
+    receiver = ClaimingReceiver()
+
+    with pytest.raises(BootstrapReconciliationBlocked):
+        _produce(database, runtime=runtime, receiver=receiver)
+    assert receiver.results == []
+
+
+def test_tampered_safety_journal_blocks(database: Path) -> None:
+    journal_path = database.with_name("safety-journal.db")
+    with sqlite3.connect(journal_path) as connection:
+        connection.execute("CREATE TABLE hidden_mutable_state(value TEXT)")
+    receiver = ClaimingReceiver()
+
+    with pytest.raises(BootstrapReconciliationBlocked):
+        _produce(database, receiver=receiver)
+    assert receiver.results == []
+
+
+def test_unproven_local_order_coverage_cannot_be_signed(
+    database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        producer_module,
+        "_crosslink_safety_journal_orders",
+        lambda **kwargs: (False, False, 0, 0),
+    )
+    receiver = ClaimingReceiver()
+
+    with pytest.raises(BootstrapReconciliationBlocked):
+        _produce(database, receiver=receiver)
+    assert receiver.results == []
+
+
+@pytest.mark.parametrize("defect", ["non_unique_duplicate", "extra", "missing"])
+def test_account_schema_and_exact_portfolio_cardinality_block_defects(
+    database: Path,
+    defect: str,
+) -> None:
+    with sqlite3.connect(database) as connection:
+        if defect == "non_unique_duplicate":
+            connection.executescript("""
+                ALTER TABLE account RENAME TO account_old;
+                CREATE TABLE account (
+                    portfolio_id TEXT,
+                    cash REAL NOT NULL,
+                    equity REAL NOT NULL,
+                    daily_pnl REAL,
+                    realized_pnl REAL,
+                    unrealized_pnl REAL,
+                    timestamp DATETIME
+                );
+                INSERT INTO account SELECT * FROM account_old;
+                INSERT INTO account SELECT * FROM account_old;
+                DROP TABLE account_old;
+                """)
+        elif defect == "extra":
+            connection.execute(
+                "INSERT INTO account VALUES " "('orphan',100,100,0,0,0,'2026-07-28T11:59:00+00:00')"
+            )
+        else:
+            connection.execute("DELETE FROM account WHERE portfolio_id='default'")
+    receiver = ClaimingReceiver()
+
+    with pytest.raises(BootstrapReconciliationBlocked, match="account"):
+        _produce(database, receiver=receiver)
+    assert receiver.results == []
 
 
 def test_malformed_or_partial_database_blocks_without_delivery(tmp_path: Path) -> None:

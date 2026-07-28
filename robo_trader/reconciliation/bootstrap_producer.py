@@ -28,10 +28,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Callable, Generic, Iterator, Protocol, SupportsIndex, TypeVar
+from typing import Any, Callable, Generic, Iterator, Protocol, SupportsIndex, TypeVar, cast
 
 from robo_trader.config import PAPER_ONLY_EXECUTION_SOURCE, RuntimeContract
+from robo_trader.paper_terminal_settlement import (
+    PaperTerminalSettlementError,
+    PaperTerminalSettlementRequest,
+)
 from robo_trader.runtime_contract_constants import PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
+from robo_trader.safety import JournalError, JournalEventType, SafetyJournal
 from robo_trader.safety.sqlite_identity import (
     SQLiteIdentityError,
     SQLitePathBinding,
@@ -72,6 +77,7 @@ _COLLECTION_EVIDENCE_ID = re.compile(r"^broker-collection-v1-[0-9a-f]{64}$")
 
 _LEDGER_PRODUCER_MARKER = object()
 _RESULT_PRODUCER_MARKER = object()
+_NO_RECEIVER_STAGE = object()
 _LEDGER_DIGEST_KEY = os.urandom(32)
 _RESULT_DIGEST_KEY = os.urandom(32)
 _OWNERSHIP_LOCK = threading.RLock()
@@ -177,6 +183,14 @@ class _CollectedLedgerEvidence:
     database_identity: str
     database_device: int
     database_inode: int
+    safety_journal_path: str
+    safety_journal_identity: str
+    safety_journal_device: int
+    safety_journal_inode: int
+    safety_journal_last_sequence: int
+    safety_journal_last_chain_hash: str
+    terminal_settlement_count: int
+    terminal_fill_count: int
     portfolio_ids: tuple[str, ...]
     active_portfolio_ids: tuple[str, ...]
     position_identities: tuple[tuple[str, str], ...]
@@ -210,6 +224,14 @@ def _ledger_digest(evidence: _CollectedLedgerEvidence) -> str:
         "portfolio_ids": list(evidence.portfolio_ids),
         "position_identities": [list(value) for value in evidence.position_identities],
         "runtime_fingerprint": evidence.runtime_fingerprint,
+        "safety_journal_device": evidence.safety_journal_device,
+        "safety_journal_identity": evidence.safety_journal_identity,
+        "safety_journal_inode": evidence.safety_journal_inode,
+        "safety_journal_last_chain_hash": evidence.safety_journal_last_chain_hash,
+        "safety_journal_last_sequence": evidence.safety_journal_last_sequence,
+        "safety_journal_path": evidence.safety_journal_path,
+        "terminal_fill_count": evidence.terminal_fill_count,
+        "terminal_settlement_count": evidence.terminal_settlement_count,
         "wal_fingerprint": list(evidence.wal_fingerprint),
     }
     return hmac.new(
@@ -263,13 +285,19 @@ def _read_only_authorizer(
     if action == sqlite3.SQLITE_PRAGMA and str(argument1).casefold() in {
         "data_version",
         "integrity_check",
+        "index_info",
+        "index_list",
         "table_info",
     }:
         return sqlite3.SQLITE_OK
     return sqlite3.SQLITE_DENY
 
 
-def _wal_fingerprint(database_path: Path) -> tuple[str, int, int, int, str]:
+def _wal_fingerprint(
+    database_path: Path,
+    *,
+    label: str = "ledger",
+) -> tuple[str, int, int, int, str]:
     """Fingerprint WAL bytes so a WAL-only commit cannot hide behind main-file stat."""
 
     path = Path(f"{database_path}-wal")
@@ -278,9 +306,9 @@ def _wal_fingerprint(database_path: Path) -> tuple[str, int, int, int, str]:
     except FileNotFoundError:
         return ("absent", 0, 0, 0, "")
     except OSError as exc:
-        raise BootstrapReconciliationBlocked("ledger WAL cannot be inspected") from exc
+        raise BootstrapReconciliationBlocked(f"{label} WAL cannot be inspected") from exc
     if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-        raise BootstrapReconciliationBlocked("ledger WAL is not a regular file")
+        raise BootstrapReconciliationBlocked(f"{label} WAL is not a regular file")
     digest = hashlib.sha256()
     try:
         with path.open("rb") as handle:
@@ -288,11 +316,38 @@ def _wal_fingerprint(database_path: Path) -> tuple[str, int, int, int, str]:
                 digest.update(chunk)
         after = os.lstat(path)
     except OSError as exc:
-        raise BootstrapReconciliationBlocked("ledger WAL cannot be read safely") from exc
+        raise BootstrapReconciliationBlocked(f"{label} WAL cannot be read safely") from exc
     stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
     if any(getattr(before, name) != getattr(after, name) for name in stable):
-        raise BootstrapReconciliationBlocked("ledger WAL changed during collection")
+        raise BootstrapReconciliationBlocked(f"{label} WAL changed during collection")
     return ("regular", after.st_dev, after.st_ino, after.st_size, digest.hexdigest())
+
+
+def _regular_file_fingerprint(path: Path, *, label: str) -> tuple[int, int, int, str]:
+    try:
+        before = os.lstat(path)
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise BootstrapReconciliationBlocked(f"{label} is not a regular file")
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        after = os.lstat(path)
+    except OSError as exc:
+        raise BootstrapReconciliationBlocked(f"{label} cannot be read safely") from exc
+    stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(before, name) != getattr(after, name) for name in stable):
+        raise BootstrapReconciliationBlocked(f"{label} changed while it was inspected")
+    return after.st_dev, after.st_ino, after.st_size, digest.hexdigest()
+
+
+def _journal_family_fingerprint(
+    journal_path: Path,
+) -> tuple[tuple[int, int, int, str], tuple[str, int, int, int, str]]:
+    return (
+        _regular_file_fingerprint(journal_path, label="safety journal"),
+        _wal_fingerprint(journal_path, label="safety journal"),
+    )
 
 
 def _canonical_legacy_rows(
@@ -332,6 +387,204 @@ def _strict_ledger_timestamp(value: object, field_name: str) -> None:
         parsed.astimezone(timezone.utc)
     except (OverflowError, ValueError) as exc:
         raise BootstrapReconciliationBlocked(f"ledger {field_name} is malformed") from exc
+
+
+def _parsed_ledger_timestamp(value: object, field_name: str) -> datetime:
+    _strict_ledger_timestamp(value, field_name)
+    assert isinstance(value, str)
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _assert_account_schema_and_cardinality(
+    connection: sqlite3.Connection,
+    portfolios: tuple[str, ...],
+) -> None:
+    table_info = tuple(connection.execute("PRAGMA table_info(account)").fetchall())
+    portfolio_columns = tuple(row for row in table_info if row[1] == "portfolio_id")
+    if len(portfolio_columns) != 1:
+        raise BootstrapReconciliationBlocked("account portfolio key schema is ambiguous")
+    primary_key_columns = tuple(
+        row[1] for row in sorted((row for row in table_info if row[5]), key=lambda row: row[5])
+    )
+    unique_single_column = primary_key_columns == ("portfolio_id",)
+    if not unique_single_column:
+        for index_row in connection.execute("PRAGMA index_list(account)").fetchall():
+            index_name = index_row[1]
+            is_unique = index_row[2]
+            is_partial = index_row[4] if len(index_row) > 4 else 0
+            if is_unique != 1 or is_partial != 0:
+                continue
+            columns = tuple(
+                row[2]
+                for row in connection.execute(
+                    f"PRAGMA index_info({json.dumps(index_name)})"
+                ).fetchall()
+            )
+            if columns == ("portfolio_id",):
+                unique_single_column = True
+                break
+    if not unique_single_column:
+        raise BootstrapReconciliationBlocked(
+            "account portfolio_id must be an exact primary or unique key"
+        )
+    grouped = tuple(
+        (str(row[0]), int(row[1]))
+        for row in connection.execute(
+            "SELECT portfolio_id, COUNT(*) FROM account "
+            "GROUP BY portfolio_id ORDER BY portfolio_id"
+        ).fetchall()
+    )
+    expected = tuple((portfolio_id, 1) for portfolio_id in portfolios)
+    if grouped != expected:
+        raise BootstrapReconciliationBlocked(
+            "every ledger portfolio requires exactly one account projection"
+        )
+
+
+def _receipt_fingerprint_from_settlement_row(row: sqlite3.Row) -> str:
+    committed_at = _parsed_ledger_timestamp(row[18], "settlement committed_at")
+    payload = canonical_json(
+        {
+            "committed_at": committed_at,
+            "database_device": row[16],
+            "database_identity": row[15],
+            "database_inode": row[17],
+            "database_path": row[14],
+            "request_fingerprint": row[10],
+            "schema_version": row[20],
+            "settlement_id": row[0],
+            "trade_id": row[13],
+        }
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _crosslink_safety_journal_orders(
+    *,
+    connection: sqlite3.Connection,
+    actual_tables: set[str],
+    replay_state: object,
+    trade_rows: tuple[sqlite3.Row, ...],
+    runtime: RuntimeContract,
+    database_device: int,
+    database_inode: int,
+) -> tuple[bool, bool, int, int]:
+    reservations = tuple(getattr(replay_state, "reservations", ()))
+    active = tuple(getattr(replay_state, "active_reservations", ()))
+    quarantined = tuple(getattr(replay_state, "quarantined_reservations", ()))
+    if active or quarantined or any(item.outcome_unknown for item in reservations):
+        raise BootstrapReconciliationBlocked(
+            "safety journal has active, quarantined, or unknown order authority"
+        )
+    if any(not item.released or item.terminal_sequence is None for item in reservations):
+        raise BootstrapReconciliationBlocked("safety journal has unresolved reservations")
+
+    if "paper_reduction_settlements" not in actual_tables:
+        if reservations:
+            raise BootstrapReconciliationBlocked(
+                "terminal safety journal orders lack the settlement authority table"
+            )
+        return True, True, 0, 0
+    settlement_rows = tuple(
+        connection.execute(
+            "SELECT settlement_id,execution_domain_scope,account_scope,portfolio_id,"
+            "con_id,symbol,reservation_id,claim_id,order_ref,protective_quote_payload,"
+            "request_fingerprint,request_payload_json,terminal_status,trade_id,"
+            "database_path,database_identity,database_device,database_inode,committed_at,"
+            "receipt_fingerprint,schema_version "
+            "FROM paper_reduction_settlements ORDER BY settlement_id"
+        ).fetchall()
+    )
+    if len(settlement_rows) != len(reservations):
+        raise BootstrapReconciliationBlocked(
+            "safety journal and terminal settlement cardinality differ"
+        )
+    by_reservation = {str(row[6]): row for row in settlement_rows}
+    if len(by_reservation) != len(settlement_rows):
+        raise BootstrapReconciliationBlocked("terminal settlements duplicate reservations")
+    events_by_sequence = {
+        item.sequence: item for item in tuple(getattr(replay_state, "events", ()))
+    }
+    trades_by_id = {row[0]: row for row in trade_rows}
+    terminal_fill_count = 0
+    for reservation in reservations:
+        row = by_reservation.get(reservation.reservation_id)
+        event = events_by_sequence.get(reservation.terminal_sequence)
+        if (
+            row is None
+            or event is None
+            or event.event_type is not JournalEventType.TERMINAL_RECONCILED
+        ):
+            raise BootstrapReconciliationBlocked(
+                "terminal reservation lacks exact journal and settlement evidence"
+            )
+        payload = json.loads(event.payload_json)
+        if payload.get("evidence_kind") != "LOCAL_PAPER_TERMINAL_SETTLEMENT":
+            raise BootstrapReconciliationBlocked(
+                "terminal order was not settled by the local paper authority"
+            )
+        local_evidence = payload.get("evidence")
+        if not isinstance(local_evidence, dict):
+            raise BootstrapReconciliationBlocked("terminal journal evidence is malformed")
+        try:
+            request = PaperTerminalSettlementRequest.from_canonical_payload(str(row[11]))
+        except PaperTerminalSettlementError as exc:
+            raise BootstrapReconciliationBlocked(
+                "terminal settlement request cannot be authenticated"
+            ) from exc
+        request_fingerprint = request.fingerprint()
+        if (
+            row[1] != runtime.safety_execution_domain_scope
+            or row[2] != runtime.safety_account_scope
+            or row[3] != reservation.portfolio_id
+            or row[4] != reservation.con_id
+            or row[5] != reservation.symbol
+            or row[6] != reservation.reservation_id
+            or row[7] != reservation.claim_id
+            or row[8] != reservation.order_ref
+            or row[9] != request.protective_quote_payload
+            or row[10] != request_fingerprint
+            or row[12] != request.terminal_status.value
+            or row[14] != runtime.database_path
+            or row[15] != runtime.database_identity
+            or row[16] != database_device
+            or row[17] != database_inode
+            or row[19] != _receipt_fingerprint_from_settlement_row(row)
+            or local_evidence.get("settlement_id") != row[0]
+            or local_evidence.get("settlement_request_fingerprint") != request_fingerprint
+            or local_evidence.get("settlement_receipt_fingerprint") != row[19]
+            or local_evidence.get("database_path") != row[14]
+            or local_evidence.get("database_identity") != row[15]
+            or local_evidence.get("database_device") != row[16]
+            or local_evidence.get("database_inode") != row[17]
+        ):
+            raise BootstrapReconciliationBlocked(
+                "terminal settlement is not cross-bound to its journal reservation"
+            )
+        trade_id = row[13]
+        if request.filled_quantity > 0:
+            trade = trades_by_id.get(trade_id)
+            if (
+                type(trade_id) is not int
+                or trade is None
+                or trade[1] != request.portfolio_id
+                or trade[2] != request.symbol
+                or trade[3] != request.side.value
+                or trade[4] != int(request.filled_quantity)
+                or _strict_decimal(trade[5], "terminal trade price") != request.fill_price
+            ):
+                raise BootstrapReconciliationBlocked(
+                    "terminal fill lacks its exact local trade row"
+                )
+            terminal_fill_count += 1
+        elif trade_id is not None:
+            raise BootstrapReconciliationBlocked(
+                "unfilled terminal settlement unexpectedly identifies a trade"
+            )
+    return True, True, len(settlement_rows), terminal_fill_count
 
 
 def _validate_legacy_rows(
@@ -410,18 +663,82 @@ def _validate_legacy_rows(
     return active, identities
 
 
+@dataclass(slots=True)
+class _LedgerCollectionSession:
+    evidence: _CollectedLedgerEvidence
+    _database_path: Path
+    _connection: sqlite3.Connection
+    _connection_binding: SQLitePathBinding
+    _path_binding: SQLitePathBinding
+    _journal_path: Path
+    _journal_connection: sqlite3.Connection
+    _journal_connection_binding: SQLitePathBinding
+    _journal_path_binding: SQLitePathBinding
+    _journal_data_version: int
+    _journal_family: tuple[tuple[int, int, int, str], tuple[str, int, int, int, str]]
+    _finalized: bool = False
+
+    def assert_unchanged_after_receiver_claim(self) -> None:
+        if self._finalized:
+            raise BootstrapReconciliationBlocked("ledger collection was already finalized")
+        _assert_collector_owned_ledger_evidence(self.evidence)
+        if int(self._connection.execute("PRAGMA data_version").fetchone()[0]) != (
+            self.evidence.data_version
+        ):
+            raise BootstrapReconciliationBlocked(
+                "ledger changed while reconciliation evidence was staged"
+            )
+        if _wal_fingerprint(self._database_path) != self.evidence.wal_fingerprint:
+            raise BootstrapReconciliationBlocked(
+                "ledger WAL changed while reconciliation evidence was staged"
+            )
+        if int(self._journal_connection.execute("PRAGMA data_version").fetchone()[0]) != (
+            self._journal_data_version
+        ):
+            raise BootstrapReconciliationBlocked(
+                "safety journal changed while reconciliation evidence was staged"
+            )
+        if _journal_family_fingerprint(self._journal_path) != self._journal_family:
+            raise BootstrapReconciliationBlocked(
+                "safety journal files changed while reconciliation evidence was staged"
+            )
+        self._connection_binding.assert_connection_identity(
+            sqlite_connection_file_identity(self._connection)
+        )
+        self._path_binding.assert_path_identity()
+        self._journal_connection_binding.assert_connection_identity(
+            sqlite_connection_file_identity(self._journal_connection)
+        )
+        self._journal_path_binding.assert_path_identity()
+        self._finalized = True
+
+
 @contextmanager
 def _collect_wal_visible_ledger(
     runtime: RuntimeContract,
     *,
     observed_at: datetime,
-) -> Iterator[_CollectedLedgerEvidence]:
-    """Hold one WAL-visible read snapshot through receiver ownership claim."""
+) -> Iterator[_LedgerCollectionSession]:
+    """Hold DB and journal read snapshots through staging and final validation."""
 
     database_path = Path(runtime.database_path)
+    if runtime.safety_journal_path is None or runtime.safety_journal_identity is None:
+        raise BootstrapReconciliationBlocked("runtime safety journal binding is unavailable")
+    journal_path = Path(runtime.safety_journal_path)
+    if (
+        not journal_path.is_absolute()
+        or str(journal_path) != runtime.safety_journal_path
+        or journal_path.parent.resolve(strict=False) / journal_path.name != journal_path
+    ):
+        raise BootstrapReconciliationBlocked(
+            "runtime safety journal path must be absolute and preserve its lexical leaf"
+        )
     binding: SQLitePathBinding | None = None
+    journal_binding: SQLitePathBinding | None = None
     connection: sqlite3.Connection | None = None
+    journal_connection: sqlite3.Connection | None = None
     evidence: _CollectedLedgerEvidence | None = None
+    session: _LedgerCollectionSession | None = None
     try:
         binding = SQLitePathBinding.open_readonly(database_path)
         connection = sqlite3.connect(
@@ -441,6 +758,59 @@ def _collect_wal_visible_ledger(
         data_version = int(connection.execute("PRAGMA data_version").fetchone()[0])
         connection.set_authorizer(_read_only_authorizer)
         connection.execute("BEGIN")
+        connection.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+
+        journal_binding = SQLitePathBinding.open_readonly(journal_path)
+        journal_connection = sqlite3.connect(
+            journal_path.as_uri() + "?mode=ro",
+            uri=True,
+            timeout=1.0,
+            isolation_level=None,
+        )
+        journal_connection.row_factory = sqlite3.Row
+        journal_connection.execute("PRAGMA query_only=ON")
+        if journal_connection.execute("PRAGMA query_only").fetchone()[0] != 1:
+            raise BootstrapReconciliationBlocked(
+                "safety journal query-only mode could not be proven"
+            )
+        journal_connection_binding = journal_binding.bind_sqlite_connection(
+            sqlite_connection_file_identity(journal_connection)
+        )
+        journal_connection_binding.assert_connection_identity(
+            sqlite_connection_file_identity(journal_connection)
+        )
+        journal_data_version = int(journal_connection.execute("PRAGMA data_version").fetchone()[0])
+        journal_connection.execute("BEGIN")
+        journal_snapshot = tuple(
+            tuple(row)
+            for row in journal_connection.execute(
+                "SELECT sequence,chain_hash FROM safety_journal_events ORDER BY sequence"
+            ).fetchall()
+        )
+        journal_family_before = _journal_family_fingerprint(journal_path)
+        journal = SafetyJournal(journal_path)
+        replay_state = journal.replay_and_bind_runtime_path(
+            expected_execution_domain_scope=cast(str, runtime.safety_execution_domain_scope),
+            expected_account_scope=cast(str, runtime.safety_account_scope),
+        )
+        journal_family = _journal_family_fingerprint(journal_path)
+        if journal_family_before != journal_family:
+            raise BootstrapReconciliationBlocked("safety journal changed during replay")
+        if (
+            journal.database_path != journal_path
+            or journal.runtime_path_identity != (journal_binding.device, journal_binding.inode)
+            or len(journal_snapshot) != replay_state.last_sequence
+            or (
+                journal_snapshot
+                and journal_snapshot[-1]
+                != (replay_state.last_sequence, replay_state.last_chain_hash)
+            )
+            or (not journal_snapshot and replay_state.last_chain_hash != "0" * 64)
+        ):
+            raise BootstrapReconciliationBlocked(
+                "safety journal replay is not bound to the held read snapshot"
+            )
+
         ImmutableLedgerReader._validate_schema(connection)
         required_tables = {"account", "equity_history", "portfolios", "positions", "trades"}
         actual_tables = {
@@ -454,6 +824,9 @@ def _collect_wal_visible_ledger(
         portfolio_rows = tuple(
             connection.execute("SELECT id FROM portfolios ORDER BY id").fetchall()
         )
+        portfolios = tuple(str(row[0]) for row in portfolio_rows)
+        canonical_portfolios = _canonical_portfolios(portfolios, "ledger portfolio IDs")
+        _assert_account_schema_and_cardinality(connection, canonical_portfolios)
         account_rows = tuple(
             connection.execute(
                 "SELECT portfolio_id,cash,equity,daily_pnl,realized_pnl,"
@@ -481,13 +854,26 @@ def _collect_wal_visible_ledger(
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
         if integrity is None or tuple(integrity) != ("ok",):
             raise BootstrapReconciliationBlocked("legacy database failed integrity_check")
-        portfolios = tuple(str(row[0]) for row in portfolio_rows)
         active, position_identities = _validate_legacy_rows(
-            portfolios=portfolios,
+            portfolios=canonical_portfolios,
             account_rows=account_rows,
             position_rows=position_rows,
             trade_rows=trade_rows,
             equity_rows=equity_rows,
+        )
+        (
+            local_orders_complete,
+            local_executions_complete,
+            terminal_settlement_count,
+            terminal_fill_count,
+        ) = _crosslink_safety_journal_orders(
+            connection=connection,
+            actual_tables=actual_tables,
+            replay_state=replay_state,
+            trade_rows=trade_rows,
+            runtime=runtime,
+            database_device=binding.device,
+            database_inode=binding.inode,
         )
         legacy_payload = _canonical_legacy_rows(
             account_rows,
@@ -503,8 +889,8 @@ def _collect_wal_visible_ledger(
             broker_executions=True,
             broker_commissions=True,
             ledger_positions=True,
-            ledger_orders=True,
-            ledger_executions=True,
+            ledger_orders=local_orders_complete,
+            ledger_executions=local_executions_complete,
             ledger_cash=True,
         )
         evidence = _CollectedLedgerEvidence(
@@ -514,7 +900,15 @@ def _collect_wal_visible_ledger(
             database_identity=runtime.database_identity,
             database_device=binding.device,
             database_inode=binding.inode,
-            portfolio_ids=_canonical_portfolios(portfolios, "ledger portfolio IDs"),
+            safety_journal_path=str(journal_path),
+            safety_journal_identity=runtime.safety_journal_identity,
+            safety_journal_device=journal_binding.device,
+            safety_journal_inode=journal_binding.inode,
+            safety_journal_last_sequence=replay_state.last_sequence,
+            safety_journal_last_chain_hash=replay_state.last_chain_hash,
+            terminal_settlement_count=terminal_settlement_count,
+            terminal_fill_count=terminal_fill_count,
+            portfolio_ids=canonical_portfolios,
             active_portfolio_ids=active,
             position_identities=position_identities,
             legacy_snapshot_hash=hashlib.sha256(legacy_payload.encode("utf-8")).hexdigest(),
@@ -525,21 +919,25 @@ def _collect_wal_visible_ledger(
             _producer_marker=_LEDGER_PRODUCER_MARKER,
         )
         _register_ledger_evidence(evidence)
-        connection_binding.assert_connection_identity(sqlite_connection_file_identity(connection))
-        binding.assert_path_identity()
-        yield evidence
-        _assert_collector_owned_ledger_evidence(evidence)
-        if int(connection.execute("PRAGMA data_version").fetchone()[0]) != data_version:
+        session = _LedgerCollectionSession(
+            evidence=evidence,
+            _database_path=database_path,
+            _connection=connection,
+            _connection_binding=connection_binding,
+            _path_binding=binding,
+            _journal_path=journal_path,
+            _journal_connection=journal_connection,
+            _journal_connection_binding=journal_connection_binding,
+            _journal_path_binding=journal_binding,
+            _journal_data_version=journal_data_version,
+            _journal_family=journal_family,
+        )
+        yield session
+        if not session._finalized:
             raise BootstrapReconciliationBlocked(
-                "ledger changed while reconciliation evidence was being consumed"
+                "ledger collection was released before final receiver validation"
             )
-        if _wal_fingerprint(database_path) != evidence.wal_fingerprint:
-            raise BootstrapReconciliationBlocked(
-                "ledger WAL changed while reconciliation evidence was being consumed"
-            )
-        connection_binding.assert_connection_identity(sqlite_connection_file_identity(connection))
-        binding.assert_path_identity()
-    except (sqlite3.Error, SQLiteIdentityError, LedgerSafetyError) as exc:
+    except (sqlite3.Error, SQLiteIdentityError, LedgerSafetyError, JournalError) as exc:
         raise BootstrapReconciliationBlocked(
             "WAL-visible immutable ledger collection failed"
         ) from exc
@@ -547,13 +945,15 @@ def _collect_wal_visible_ledger(
         if evidence is not None:
             with _OWNERSHIP_LOCK:
                 _LEDGER_REGISTRY.pop(id(evidence), None)
-        if connection is not None:
-            try:
-                connection.rollback()
-            finally:
-                connection.close()
-        if binding is not None:
-            binding.close()
+        for active_connection in (journal_connection, connection):
+            if active_connection is not None:
+                try:
+                    active_connection.rollback()
+                finally:
+                    active_connection.close()
+        for active_binding in (journal_binding, binding):
+            if active_binding is not None:
+                active_binding.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -567,6 +967,14 @@ class UnsignedBootstrapReconciliation:
     database_identity: str
     database_device: int
     database_inode: int
+    safety_journal_path: str
+    safety_journal_identity: str
+    safety_journal_device: int
+    safety_journal_inode: int
+    safety_journal_last_sequence: int
+    safety_journal_last_chain_hash: str
+    terminal_settlement_count: int
+    terminal_fill_count: int
     portfolio_ids: tuple[str, ...]
     local_position_identities: tuple[tuple[str, str], ...]
     legacy_snapshot_hash: str
@@ -609,6 +1017,11 @@ class UnsignedBootstrapReconciliation:
             "broker_positions_count",
             "broker_open_orders_count",
             "managed_account_count",
+            "safety_journal_device",
+            "safety_journal_inode",
+            "safety_journal_last_sequence",
+            "terminal_settlement_count",
+            "terminal_fill_count",
         ):
             _exact_nonnegative_int(getattr(self, field_name), field_name)
         if (
@@ -622,6 +1035,16 @@ class UnsignedBootstrapReconciliation:
             )
         _canonical_portfolios(self.portfolio_ids, "portfolio_ids")
         _canonical_position_identities(self.local_position_identities)
+        journal_path = Path(self.safety_journal_path)
+        if not journal_path.is_absolute() or str(journal_path) != self.safety_journal_path:
+            raise BootstrapReconciliationBlocked("safety_journal_path must be absolute")
+        _safe_id(self.safety_journal_identity, "safety_journal_identity")
+        _hash(self.safety_journal_last_chain_hash, "safety_journal_last_chain_hash")
+        if (
+            self.safety_journal_inode == 0
+            or self.terminal_fill_count > self.terminal_settlement_count
+        ):
+            raise BootstrapReconciliationBlocked("safety journal provenance is malformed")
         _hash(self.legacy_snapshot_hash, "legacy_snapshot_hash")
         _hash(self.broker_snapshot_hash, "broker_snapshot_hash")
         _hash(self.broker_artifact_hash, "broker_artifact_hash")
@@ -711,8 +1134,16 @@ class UnsignedBootstrapReconciliation:
             "portfolio_ids": list(self.portfolio_ids),
             "reconciliation_status": self.reconciliation_status.value,
             "runtime_fingerprint": self.runtime_fingerprint,
+            "safety_journal_device": self.safety_journal_device,
+            "safety_journal_identity": self.safety_journal_identity,
+            "safety_journal_inode": self.safety_journal_inode,
+            "safety_journal_last_chain_hash": self.safety_journal_last_chain_hash,
+            "safety_journal_last_sequence": self.safety_journal_last_sequence,
+            "safety_journal_path": self.safety_journal_path,
             "schema_version": self.schema_version,
             "status": self.status,
+            "terminal_fill_count": self.terminal_fill_count,
+            "terminal_settlement_count": self.terminal_settlement_count,
         }
 
     @property
@@ -769,13 +1200,19 @@ ReceiverResult = TypeVar("ReceiverResult", covariant=True)
 
 
 class BootstrapReconciliationReceiver(Protocol, Generic[ReceiverResult]):
-    """Receiver must claim the exact result before signing or persistence."""
+    """Core-authenticated two-phase receiver; staging is not publication."""
 
-    def receive_unsigned_bootstrap_reconciliation(
+    def stage_unsigned_bootstrap_reconciliation(
         self,
         result: UnsignedBootstrapReconciliation,
-    ) -> ReceiverResult:
-        """Consume one producer-owned result exactly once."""
+    ) -> object:
+        """Consume ownership first and create only unpublished staged material."""
+
+    def commit_staged_bootstrap_reconciliation(self, stage: object) -> ReceiverResult:
+        """Publish a stage only after the producer finalizes all evidence."""
+
+    def abort_staged_bootstrap_reconciliation(self, stage: object) -> None:
+        """Remove every unpublished artifact associated with a failed stage."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -836,6 +1273,25 @@ def _consume_verified_broker_evidence(
         raise BootstrapReconciliationBlocked("broker evidence is not verifier-owned") from exc
 
 
+def _assert_core_reconciliation_receiver_capability(receiver: object) -> None:
+    """Authenticate the exact factory-issued core signer; no structural fallback."""
+
+    try:
+        from robo_trader.bootstrap_evidence_receivers import (
+            assert_reconciliation_receiver_capability,
+        )
+    except (ImportError, AttributeError) as exc:
+        raise BootstrapReconciliationBlocked(
+            "reconciliation receiver authority is unavailable"
+        ) from exc
+    try:
+        assert_reconciliation_receiver_capability(receiver)
+    except Exception as exc:
+        raise BootstrapReconciliationBlocked(
+            "reconciliation receiver is not core-authenticated"
+        ) from exc
+
+
 def _validate_verified_broker_envelope(
     envelope: VerifiedBrokerEvidenceEnvelope,
     runtime: RuntimeContract,
@@ -866,25 +1322,27 @@ def _validate_verified_broker_envelope(
     return snapshot
 
 
-def _produce(
+def produce_bootstrap_reconciliation(
     verified_broker_evidence: object,
     runtime_contract: RuntimeContract,
     receiver: BootstrapReconciliationReceiver[ReceiverResult],
-    *,
-    clock: Callable[[], datetime],
-    broker_consumer: Callable[[object], VerifiedBrokerEvidenceEnvelope],
 ) -> BootstrapReconciliationDelivery[ReceiverResult]:
+    """Collect, stage, finalize, and publish under fixed internal authorities."""
+
     runtime = _validate_runtime(runtime_contract)
-    envelope = broker_consumer(verified_broker_evidence)
+    _assert_core_reconciliation_receiver_capability(receiver)
+    envelope = _consume_verified_broker_evidence(verified_broker_evidence)
     collected: _CollectedLedgerEvidence | None = None
     result: UnsignedBootstrapReconciliation | None = None
     position_identities: tuple[tuple[str, str], ...] = ()
+    stage: object = _NO_RECEIVER_STAGE
+    committed = False
     try:
-        observed_at = _utc_clock_value(clock, "reconciliation producer clock")
+        observed_at = _utc_clock_value(_system_clock, "reconciliation producer clock")
         snapshot = _validate_verified_broker_envelope(envelope, runtime, observed_at)
-        with _collect_wal_visible_ledger(runtime, observed_at=observed_at) as raw_evidence:
-            collected = _assert_collector_owned_ledger_evidence(raw_evidence)
-            checked_at = _utc_clock_value(clock, "reconciliation producer clock")
+        with _collect_wal_visible_ledger(runtime, observed_at=observed_at) as collection:
+            collected = _assert_collector_owned_ledger_evidence(collection.evidence)
+            checked_at = _utc_clock_value(_system_clock, "reconciliation producer clock")
             if checked_at - observed_at > BOOTSTRAP_RECONCILIATION_MAX_AGE:
                 raise BootstrapReconciliationBlocked("local ledger evidence became stale")
             _validate_verified_broker_envelope(envelope, runtime, checked_at)
@@ -916,6 +1374,14 @@ def _produce(
                 database_identity=collected.database_identity,
                 database_device=collected.database_device,
                 database_inode=collected.database_inode,
+                safety_journal_path=collected.safety_journal_path,
+                safety_journal_identity=collected.safety_journal_identity,
+                safety_journal_device=collected.safety_journal_device,
+                safety_journal_inode=collected.safety_journal_inode,
+                safety_journal_last_sequence=collected.safety_journal_last_sequence,
+                safety_journal_last_chain_hash=collected.safety_journal_last_chain_hash,
+                terminal_settlement_count=collected.terminal_settlement_count,
+                terminal_fill_count=collected.terminal_fill_count,
                 portfolio_ids=collected.portfolio_ids,
                 local_position_identities=collected.position_identities,
                 legacy_snapshot_hash=collected.legacy_snapshot_hash,
@@ -940,86 +1406,31 @@ def _produce(
             )
             _register_result(result)
             position_identities = collected.position_identities
-        if result is None:  # pragma: no cover - defensive invariant
-            raise BootstrapReconciliationBlocked("reconciliation result was not produced")
-        capability = getattr(receiver, "receive_unsigned_bootstrap_reconciliation", None)
-        if not callable(capability):
-            raise BootstrapReconciliationBlocked(
-                "bootstrap reconciliation receiver capability is unavailable"
+            stage = receiver.stage_unsigned_bootstrap_reconciliation(result)
+            with _OWNERSHIP_LOCK:
+                if result._producer_nonce not in _CLAIMED_RESULT_NONCES:
+                    raise BootstrapReconciliationBlocked(
+                        "receiver did not independently claim reconciliation ownership"
+                    )
+                _CLAIMED_RESULT_NONCES.remove(result._producer_nonce)
+            collection.assert_unchanged_after_receiver_claim()
+            receiver_result = receiver.commit_staged_bootstrap_reconciliation(stage)
+            committed = True
+            return BootstrapReconciliationDelivery(
+                receiver_result=receiver_result,
+                local_position_identities=position_identities,
             )
-        receiver_result = capability(result)
-        with _OWNERSHIP_LOCK:
-            if result._producer_nonce not in _CLAIMED_RESULT_NONCES:
+    except BaseException:
+        if stage is not _NO_RECEIVER_STAGE and not committed:
+            try:
+                receiver.abort_staged_bootstrap_reconciliation(stage)
+            except BaseException as exc:
                 raise BootstrapReconciliationBlocked(
-                    "receiver did not independently claim reconciliation ownership"
-                )
-            _CLAIMED_RESULT_NONCES.remove(result._producer_nonce)
-        return BootstrapReconciliationDelivery(
-            receiver_result=receiver_result,
-            local_position_identities=position_identities,
-        )
+                    "reconciliation receiver could not abort its unpublished stage"
+                ) from exc
+        raise
     finally:
         if result is not None:
             with _OWNERSHIP_LOCK:
                 _RESULT_REGISTRY.pop(result._producer_nonce, None)
                 _CLAIMED_RESULT_NONCES.discard(result._producer_nonce)
-
-
-def produce_bootstrap_reconciliation(
-    verified_broker_evidence: object,
-    runtime_contract: RuntimeContract,
-    receiver: BootstrapReconciliationReceiver[ReceiverResult],
-) -> BootstrapReconciliationDelivery[ReceiverResult]:
-    """Produce from internal wall time and fixed freshness policy only."""
-
-    return _produce(
-        verified_broker_evidence,
-        runtime_contract,
-        receiver,
-        clock=_system_clock,
-        broker_consumer=_consume_verified_broker_evidence,
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class _TestProducerCapability:
-    clock: Callable[[], datetime]
-    broker_consumer: Callable[[object], VerifiedBrokerEvidenceEnvelope]
-    _marker: object = field(repr=False)
-
-
-_TEST_CAPABILITY_MARKER = object()
-
-
-def _issue_test_producer_capability(
-    *,
-    clock: Callable[[], datetime],
-    broker_consumer: Callable[[object], VerifiedBrokerEvidenceEnvelope],
-) -> _TestProducerCapability:
-    """Private fixture seam; production has no caller-controlled clock/verifier."""
-
-    return _TestProducerCapability(
-        clock=clock,
-        broker_consumer=broker_consumer,
-        _marker=_TEST_CAPABILITY_MARKER,
-    )
-
-
-def _produce_bootstrap_reconciliation_for_test(
-    verified_broker_evidence: object,
-    runtime_contract: RuntimeContract,
-    receiver: BootstrapReconciliationReceiver[ReceiverResult],
-    capability: _TestProducerCapability,
-) -> BootstrapReconciliationDelivery[ReceiverResult]:
-    if (
-        type(capability) is not _TestProducerCapability
-        or capability._marker is not _TEST_CAPABILITY_MARKER
-    ):
-        raise BootstrapReconciliationBlocked("test producer capability is invalid")
-    return _produce(
-        verified_broker_evidence,
-        runtime_contract,
-        receiver,
-        clock=capability.clock,
-        broker_consumer=capability.broker_consumer,
-    )
