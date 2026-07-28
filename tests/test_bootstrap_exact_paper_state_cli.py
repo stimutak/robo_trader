@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sqlite3
 from pathlib import Path
@@ -9,7 +10,10 @@ from types import SimpleNamespace
 import pytest
 
 import scripts.bootstrap_exact_paper_state as cli
-from robo_trader.financial_state_bootstrap import ExactStateBootstrapError
+from robo_trader.financial_state_bootstrap import (
+    ExactStateBootstrapCommittedBackupInvalid,
+    ExactStateBootstrapError,
+)
 
 
 def _candidate(database_path: Path, *, portfolio_id: str = "default") -> SimpleNamespace:
@@ -327,6 +331,7 @@ async def test_apply_passes_every_authority_to_database(
 def test_wrong_typed_confirmation_blocks_before_backup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     database_path = tmp_path / "ledger.db"
     database_path.touch()
@@ -367,3 +372,80 @@ def test_wrong_typed_confirmation_blocks_before_backup(
     monkeypatch.setattr(cli, "_online_backup", forbidden_backup)
     assert cli.main([]) == 2
     assert called is False
+    assert json.loads(capsys.readouterr().err)["mutated_state"] is False
+
+
+def test_committed_backup_failure_prints_unmistakable_mutated_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database_path = tmp_path / "ledger.db"
+    database_path.touch()
+    identity = "paper:" + cli.hashlib.sha256(str(database_path.resolve()).encode()).hexdigest()[:12]
+    runtime = SimpleNamespace(database_path=str(database_path), database_identity=identity)
+    candidate = _candidate(database_path)
+    candidate.database_identity = identity
+    confirmation = cli._required_confirmation(candidate, runtime, tmp_path / "backup.db")
+    args = argparse.Namespace(
+        command="apply",
+        db_path=database_path,
+        candidate=tmp_path / "candidate.json",
+        reconciliation_evidence=tmp_path / "reconciliation.json",
+        broker_snapshot=tmp_path / "broker.json",
+        protective_marks=[],
+        backup_path=tmp_path / "backup.db",
+        reason="reviewed offline bootstrap",
+        confirm=confirmation,
+        json=True,
+    )
+    binding = SimpleNamespace(candidate=candidate, assert_identity=lambda: None, close=lambda: None)
+    backup = SimpleNamespace(
+        receipt=object(),
+        assert_restorable=lambda: None,
+        report=lambda: {},
+        close=lambda: None,
+    )
+
+    async def prepare(_path: Path) -> None:
+        return None
+
+    async def fail_after_commit(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise ExactStateBootstrapCommittedBackupInvalid(
+            bootstrap_id=candidate.bootstrap_id,
+            candidate_fingerprint=candidate.fingerprint(),
+            detail="sealed backup gained a hard link",
+        )
+
+    monkeypatch.setattr(cli, "_parser", lambda: SimpleNamespace(parse_args=lambda _argv: args))
+    monkeypatch.setattr(cli, "load_runtime_contract_from_env", lambda **_kwargs: runtime)
+    monkeypatch.setattr(cli, "_open_candidate", lambda _path: binding)
+    monkeypatch.setattr(cli, "load_exact_state_bootstrap_evidence", lambda **_kwargs: object())
+    monkeypatch.setattr(cli, "preview", lambda *_args: {"status": "ready"})
+    monkeypatch.setattr(cli, "_assert_stopped", lambda: None)
+    monkeypatch.setattr(cli, "_prepare_exact_schema", prepare)
+    monkeypatch.setattr(cli, "_online_backup", lambda *_args: backup)
+    monkeypatch.setattr(cli, "_apply", fail_after_commit)
+    monkeypatch.setattr(
+        cli,
+        "RuntimeLifecycleLock",
+        lambda: SimpleNamespace(acquire=lambda: True, release=lambda: None),
+    )
+
+    assert cli.main([]) == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    payload = json.loads(captured.err)
+    assert payload == {
+        "authorizes_startup": False,
+        "bootstrap_id": candidate.bootstrap_id,
+        "candidate_fingerprint": candidate.fingerprint(),
+        "detail": "sealed backup gained a hard link",
+        "error": "ExactStateBootstrapCommittedBackupInvalid",
+        "message": "bootstrap committed; rollback backup invalid; no safe retry is permitted",
+        "mutated_state": True,
+        "rollback_backup_valid": False,
+        "safe_retry": False,
+        "schema_version": 1,
+        "status": "COMMITTED_BACKUP_INVALID",
+    }

@@ -33,6 +33,7 @@ from robo_trader.database_async import AsyncTradingDatabase  # noqa: E402
 from robo_trader.financial_state_bootstrap import (  # noqa: E402
     ExactStateBootstrapBackupReceipt,
     ExactStateBootstrapCandidate,
+    ExactStateBootstrapCommittedBackupInvalid,
     ExactStateBootstrapError,
     ExactStateBootstrapEvidence,
     inspect_legacy_state,
@@ -569,6 +570,16 @@ async def _apply(
     }
 
 
+async def _prepare_exact_schema(database_path: Path) -> None:
+    """Apply exact-state migrations before the all-table rollback backup."""
+
+    database = AsyncTradingDatabase(database_path)
+    try:
+        await database.initialize()
+    finally:
+        await database.close()
+
+
 def _required_confirmation(
     candidate: ExactStateBootstrapCandidate,
     runtime_contract: RuntimeContract,
@@ -642,6 +653,9 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 candidate_binding.assert_identity()
                 _assert_stopped()
+                asyncio.run(_prepare_exact_schema(database_path))
+                candidate_binding.assert_identity()
+                report = preview(candidate, database_path, evidence, runtime_contract)
                 backup = _online_backup(database_path, args.backup_path, candidate)
                 candidate_binding.assert_identity()
                 backup.assert_restorable()
@@ -662,6 +676,30 @@ def main(argv: list[str] | None = None) -> int:
                 lock.release()
         print(json.dumps(report, sort_keys=True, separators=(",", ":")))
         return 0
+    except ExactStateBootstrapCommittedBackupInvalid as exc:
+        print(
+            json.dumps(
+                {
+                    "authorizes_startup": False,
+                    "bootstrap_id": exc.bootstrap_id,
+                    "candidate_fingerprint": exc.candidate_fingerprint,
+                    "detail": exc.detail,
+                    "error": type(exc).__name__,
+                    "message": (
+                        "bootstrap committed; rollback backup invalid; no safe retry is permitted"
+                    ),
+                    "mutated_state": True,
+                    "rollback_backup_valid": False,
+                    "safe_retry": False,
+                    "schema_version": 1,
+                    "status": exc.status,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            file=sys.stderr,
+        )
+        return 3
     except Exception as exc:
         print(
             json.dumps(
@@ -669,6 +707,7 @@ def main(argv: list[str] | None = None) -> int:
                     "authorizes_startup": False,
                     "error": type(exc).__name__,
                     "message": str(exc),
+                    "mutated_state": False,
                     "schema_version": 1,
                     "status": "BLOCKED",
                 },

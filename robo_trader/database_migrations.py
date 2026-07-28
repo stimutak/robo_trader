@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable
 import aiosqlite
 
 EXACT_STATE_COMPONENT = "paper_exact_state"
-EXACT_STATE_SCHEMA_VERSION = 1
+EXACT_STATE_SCHEMA_VERSION = 2
 
 
 async def _columns(connection: aiosqlite.Connection, table: str) -> set[str]:
@@ -110,8 +110,41 @@ async def _migration_v1(connection: aiosqlite.Connection) -> None:
     )
 
 
+async def _migration_v2(connection: aiosqlite.Connection) -> None:
+    await connection.execute("""
+        CREATE TABLE IF NOT EXISTS exact_bootstrap_evidence_consumptions (
+            receipt_id TEXT PRIMARY KEY,
+            bootstrap_id TEXT NOT NULL,
+            artifact_kind TEXT NOT NULL CHECK (
+                artifact_kind IN ('broker_snapshot','reconciliation_report','protective_mark')
+            ),
+            producer_id TEXT NOT NULL,
+            artifact_sha256 TEXT NOT NULL,
+            runtime_fingerprint TEXT NOT NULL,
+            account_scope TEXT NOT NULL,
+            consumed_at TEXT NOT NULL,
+            FOREIGN KEY(bootstrap_id) REFERENCES paper_state_bootstraps(bootstrap_id)
+        )
+    """)
+    await connection.execute("""
+        CREATE TRIGGER IF NOT EXISTS exact_bootstrap_evidence_consumptions_no_update
+        BEFORE UPDATE ON exact_bootstrap_evidence_consumptions
+        BEGIN
+            SELECT RAISE(ABORT, 'bootstrap evidence consumptions are append-only');
+        END
+    """)
+    await connection.execute("""
+        CREATE TRIGGER IF NOT EXISTS exact_bootstrap_evidence_consumptions_no_delete
+        BEFORE DELETE ON exact_bootstrap_evidence_consumptions
+        BEGIN
+            SELECT RAISE(ABORT, 'bootstrap evidence consumptions are append-only');
+        END
+    """)
+
+
 _MIGRATIONS: tuple[tuple[int, Callable[[aiosqlite.Connection], Awaitable[None]]], ...] = (
     (1, _migration_v1),
+    (2, _migration_v2),
 )
 
 _EXPECTED_COLUMNS = {
@@ -148,6 +181,16 @@ _EXPECTED_COLUMNS = {
         "operator_action_id": ("TEXT", 0),
         "committed_at": ("TEXT", 0),
     },
+    "exact_bootstrap_evidence_consumptions": {
+        "receipt_id": ("TEXT", 1),
+        "bootstrap_id": ("TEXT", 0),
+        "artifact_kind": ("TEXT", 0),
+        "producer_id": ("TEXT", 0),
+        "artifact_sha256": ("TEXT", 0),
+        "runtime_fingerprint": ("TEXT", 0),
+        "account_scope": ("TEXT", 0),
+        "consumed_at": ("TEXT", 0),
+    },
 }
 
 _EXPECTED_FOREIGN_KEYS = {
@@ -175,6 +218,16 @@ _EXPECTED_FOREIGN_KEYS = {
     "paper_position_settlement_state": {
         (
             "origin_bootstrap_id",
+            "paper_state_bootstraps",
+            "bootstrap_id",
+            "NO ACTION",
+            "NO ACTION",
+            "NONE",
+        ),
+    },
+    "exact_bootstrap_evidence_consumptions": {
+        (
+            "bootstrap_id",
             "paper_state_bootstraps",
             "bootstrap_id",
             "NO ACTION",
@@ -229,6 +282,21 @@ _EXPECTED_TABLE_SQL = {
             FOREIGN KEY(operator_action_id) REFERENCES administrator_actions(action_id)
         )
     """,
+    "exact_bootstrap_evidence_consumptions": """
+        CREATE TABLE exact_bootstrap_evidence_consumptions (
+            receipt_id TEXT PRIMARY KEY,
+            bootstrap_id TEXT NOT NULL,
+            artifact_kind TEXT NOT NULL CHECK (
+                artifact_kind IN ('broker_snapshot','reconciliation_report','protective_mark')
+            ),
+            producer_id TEXT NOT NULL,
+            artifact_sha256 TEXT NOT NULL,
+            runtime_fingerprint TEXT NOT NULL,
+            account_scope TEXT NOT NULL,
+            consumed_at TEXT NOT NULL,
+            FOREIGN KEY(bootstrap_id) REFERENCES paper_state_bootstraps(bootstrap_id)
+        )
+    """,
 }
 
 _EXPECTED_TRIGGER_SQL = {
@@ -258,6 +326,20 @@ _EXPECTED_TRIGGER_SQL = {
         BEFORE DELETE ON paper_state_bootstraps
         BEGIN
             SELECT RAISE(ABORT, 'paper state bootstraps are append-only');
+        END
+    """,
+    "exact_bootstrap_evidence_consumptions_no_update": """
+        CREATE TRIGGER exact_bootstrap_evidence_consumptions_no_update
+        BEFORE UPDATE ON exact_bootstrap_evidence_consumptions
+        BEGIN
+            SELECT RAISE(ABORT, 'bootstrap evidence consumptions are append-only');
+        END
+    """,
+    "exact_bootstrap_evidence_consumptions_no_delete": """
+        CREATE TRIGGER exact_bootstrap_evidence_consumptions_no_delete
+        BEFORE DELETE ON exact_bootstrap_evidence_consumptions
+        BEGIN
+            SELECT RAISE(ABORT, 'bootstrap evidence consumptions are append-only');
         END
     """,
 }
@@ -362,13 +444,16 @@ async def assert_exact_state_schema(connection: aiosqlite.Connection) -> None:
         "SELECT version FROM rt_schema_migrations WHERE component = ? ORDER BY version",
         (EXACT_STATE_COMPONENT,),
     )
-    if [int(row[0]) for row in await migration_rows.fetchall()] != [EXACT_STATE_SCHEMA_VERSION]:
+    if [int(row[0]) for row in await migration_rows.fetchall()] != list(
+        range(1, EXACT_STATE_SCHEMA_VERSION + 1)
+    ):
         raise RuntimeError("exact-state migration version evidence is incomplete or unknown")
 
     required = {
         "rt_schema_migrations",
         "administrator_actions",
         "paper_state_bootstraps",
+        "exact_bootstrap_evidence_consumptions",
         "paper_account_settlement_state",
         "paper_position_settlement_state",
     }
@@ -404,8 +489,7 @@ async def assert_exact_state_schema(connection: aiosqlite.Connection) -> None:
         raise RuntimeError("exact-state bootstrap uniqueness constraints are malformed")
 
     table_sql_rows = await connection.execute(
-        "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name IN (?, ?)",
-        ("administrator_actions", "paper_state_bootstraps"),
+        "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
     )
     table_sql = {str(row[0]): _normalized_sql(row[1]) for row in await table_sql_rows.fetchall()}
     for table, expected_sql in _EXPECTED_TABLE_SQL.items():
@@ -415,9 +499,13 @@ async def assert_exact_state_schema(connection: aiosqlite.Connection) -> None:
     trigger_rows = await connection.execute(
         """
         SELECT name, sql FROM sqlite_master
-        WHERE type = 'trigger' AND tbl_name IN (?, ?)
+        WHERE type = 'trigger' AND tbl_name IN (?, ?, ?)
         """,
-        ("administrator_actions", "paper_state_bootstraps"),
+        (
+            "administrator_actions",
+            "paper_state_bootstraps",
+            "exact_bootstrap_evidence_consumptions",
+        ),
     )
     trigger_sql = {str(row[0]): _normalized_sql(row[1]) for row in await trigger_rows.fetchall()}
     if set(trigger_sql) != set(_EXPECTED_TRIGGER_SQL):

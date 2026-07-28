@@ -35,6 +35,7 @@ from robo_trader.database_validator import DatabaseValidator, ValidationError
 from robo_trader.financial_state_bootstrap import (
     ExactStateBootstrapBackupReceipt,
     ExactStateBootstrapCandidate,
+    ExactStateBootstrapCommittedBackupInvalid,
     ExactStateBootstrapError,
     ExactStateBootstrapEvidence,
     ExactStateBootstrapReceipt,
@@ -1697,6 +1698,18 @@ class AsyncTradingDatabase:
             )
             try:
                 await conn.execute("BEGIN IMMEDIATE")
+                for authentication in evidence.authentication_receipts:
+                    replay = await conn.execute(
+                        """
+                        SELECT bootstrap_id FROM exact_bootstrap_evidence_consumptions
+                        WHERE receipt_id = ?
+                        """,
+                        (authentication.receipt_id,),
+                    )
+                    if await replay.fetchone() is not None:
+                        raise ExactStateBootstrapError(
+                            "bootstrap evidence receipt replay is forbidden"
+                        )
                 cursor = await conn.execute(
                     """
                     SELECT bootstrap_id, candidate_fingerprint, operator_action_id,
@@ -1910,6 +1923,25 @@ class AsyncTradingDatabase:
                         utc_to_text(committed_at),
                     ),
                 )
+                for authentication in evidence.authentication_receipts:
+                    await conn.execute(
+                        """
+                        INSERT INTO exact_bootstrap_evidence_consumptions(
+                            receipt_id,bootstrap_id,artifact_kind,producer_id,
+                            artifact_sha256,runtime_fingerprint,account_scope,consumed_at
+                        ) VALUES (?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            authentication.receipt_id,
+                            candidate.bootstrap_id,
+                            authentication.artifact_kind,
+                            authentication.producer_id,
+                            authentication.artifact_sha256,
+                            authentication.runtime_fingerprint,
+                            authentication.account_scope,
+                            utc_to_text(committed_at),
+                        ),
+                    )
                 if existing_account is None:
                     await conn.execute(
                         """
@@ -1980,13 +2012,20 @@ class AsyncTradingDatabase:
                         "bootstrap database descriptor changed before commit"
                     )
                 await conn.commit()
-                self._paper_settlement_fault("AFTER_EXACT_BOOTSTRAP_COMMIT")
-                self._verify_exact_state_backup(
-                    candidate,
-                    evidence,
-                    backup_receipt,
-                    descriptor,
-                )
+                try:
+                    self._paper_settlement_fault("AFTER_EXACT_BOOTSTRAP_COMMIT")
+                    self._verify_exact_state_backup(
+                        candidate,
+                        evidence,
+                        backup_receipt,
+                        descriptor,
+                    )
+                except Exception as exc:
+                    raise ExactStateBootstrapCommittedBackupInvalid(
+                        bootstrap_id=candidate.bootstrap_id,
+                        candidate_fingerprint=candidate.fingerprint(),
+                        detail=str(exc),
+                    ) from exc
                 return ExactStateBootstrapReceipt(
                     bootstrap_id=candidate.bootstrap_id,
                     candidate_fingerprint=candidate.fingerprint(),

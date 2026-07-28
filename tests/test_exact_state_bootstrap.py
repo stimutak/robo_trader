@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import os
 import shutil
@@ -14,7 +13,16 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from robo_trader.bootstrap_evidence_auth import (
+    PUBLIC_KEY_ENV,
+    BootstrapEvidenceAuthenticationError,
+    emit_broker_snapshot_receipt,
+    emit_protective_mark_receipt,
+    emit_reconciliation_report_receipt,
+)
 from robo_trader.config import RuntimeContract, _derive_safety_account_scope
 from robo_trader.database_async import AsyncTradingDatabase
 from robo_trader.financial_state_bootstrap import (
@@ -22,6 +30,7 @@ from robo_trader.financial_state_bootstrap import (
     ExactBootstrapPosition,
     ExactStateBootstrapBackupReceipt,
     ExactStateBootstrapCandidate,
+    ExactStateBootstrapCommittedBackupInvalid,
     ExactStateBootstrapError,
     inspect_legacy_state,
     load_exact_state_bootstrap_evidence,
@@ -30,13 +39,34 @@ from robo_trader.financial_state_bootstrap import (
 )
 
 ACCOUNT_SCOPE = _derive_safety_account_scope("0123456789abcdef" * 4, "DU_TEST_PAPER")
-SAFETY_SCOPE_KEY = "0123456789abcdef" * 4
-EVIDENCE_AUTH_DOMAIN = b"robotrader-exact-state-bootstrap-evidence-v1\0"
+_TEST_PRIVATE_KEYS: dict[str, Path] = {}
 
 
 @pytest.fixture(autouse=True)
-def _bootstrap_evidence_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SAFETY_ACCOUNT_SCOPE_KEY", SAFETY_SCOPE_KEY)
+def _bootstrap_evidence_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    producers = ("broker_snapshot", "reconciliation_report", "protective_mark")
+    for kind in producers:
+        private_key = Ed25519PrivateKey.generate()
+        private_path = tmp_path / f"{kind}.private.pem"
+        public_path = tmp_path / f"{kind}.public.pem"
+        private_path.write_bytes(
+            private_key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            )
+        )
+        public_path.write_bytes(
+            private_key.public_key().public_bytes(
+                serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        )
+        private_path.chmod(0o400)
+        public_path.chmod(0o400)
+        _TEST_PRIVATE_KEYS[kind] = private_path
+        monkeypatch.setenv(PUBLIC_KEY_ENV[kind], str(public_path))
+    monkeypatch.delenv("SAFETY_ACCOUNT_SCOPE_KEY", raising=False)
 
 
 def _legacy_database(path: Path) -> None:
@@ -152,27 +182,21 @@ def _write_artifact(
     path.write_bytes(raw)
     path.chmod(0o600)
     artifact_hash = hashlib.sha256(raw).hexdigest()
-    issued_text = (issued_at or datetime.now(timezone.utc)).isoformat()
-    body = {
-        "account_scope": payload["account_scope"],
-        "artifact_kind": artifact_kind,
-        "artifact_sha256": artifact_hash,
-        "issued_at": issued_text,
-        "runtime_fingerprint": payload["runtime_fingerprint"],
-        "schema_version": 1,
-    }
-    mac = hmac.new(
-        bytes.fromhex(SAFETY_SCOPE_KEY),
-        EVIDENCE_AUTH_DOMAIN
-        + json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    receipt = dict(body, hmac_sha256=mac)
     receipt_path = path.with_name(path.name + ".auth.json")
-    receipt_path.write_text(
-        json.dumps(receipt, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    if receipt_path.exists():
+        receipt_path.unlink()
+    producer = {
+        "broker_snapshot": emit_broker_snapshot_receipt,
+        "reconciliation_report": emit_reconciliation_report_receipt,
+        "protective_mark": emit_protective_mark_receipt,
+    }[artifact_kind]
+    producer(
+        artifact_path=path,
+        private_key_path=_TEST_PRIVATE_KEYS[artifact_kind],
+        runtime_fingerprint=str(payload["runtime_fingerprint"]),
+        account_scope=str(payload["account_scope"]),
+        issued_at=issued_at,
     )
-    receipt_path.chmod(0o600)
     return artifact_hash
 
 
@@ -359,7 +383,9 @@ def _legacy_rows(path: Path) -> dict[str, list[tuple]]:
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_is_insert_only_exact_and_idempotent(tmp_path: Path) -> None:
+async def test_bootstrap_is_insert_only_exact_and_receipt_replay_is_rejected(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "legacy.db"
     _legacy_database(path)
     candidate, evidence, runtime_contract = _candidate_bundle(path, tmp_path)
@@ -375,14 +401,24 @@ async def test_bootstrap_is_insert_only_exact_and_idempotent(tmp_path: Path) -> 
             operator_reason="Seal the reviewed legacy simulator accounting epoch.",
             runtime_contract=runtime_contract,
         )
-        replay = await database.apply_exact_state_bootstrap(
-            candidate,
-            evidence=evidence,
-            backup_receipt=backup_receipt,
-            operator_reason="Seal the reviewed legacy simulator accounting epoch.",
-            runtime_contract=runtime_contract,
-        )
-        assert replay == receipt
+        with pytest.raises(ExactStateBootstrapError, match="receipt replay"):
+            load_exact_state_bootstrap_evidence(
+                reconciliation_path=tmp_path / "reconciliation.json",
+                broker_snapshot_path=tmp_path / "broker.json",
+                protective_mark_paths=[
+                    tmp_path / "mark-NVDA.json",
+                    tmp_path / "mark-TSLA.json",
+                ],
+                expected_runtime_contract=runtime_contract,
+            )
+        with pytest.raises(ExactStateBootstrapError, match="receipt replay"):
+            await database.apply_exact_state_bootstrap(
+                candidate,
+                evidence=evidence,
+                backup_receipt=backup_receipt,
+                operator_reason="Seal the reviewed legacy simulator accounting epoch.",
+                runtime_contract=runtime_contract,
+            )
         positions = await database.get_positions(runtime_contract=runtime_contract)
         account = await database.get_account_info(runtime_contract=runtime_contract)
     finally:
@@ -399,6 +435,11 @@ async def test_bootstrap_is_insert_only_exact_and_idempotent(tmp_path: Path) -> 
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM paper_state_bootstraps").fetchone() == (1,)
         assert connection.execute("SELECT COUNT(*) FROM administrator_actions").fetchone() == (1,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM exact_bootstrap_evidence_consumptions "
+            "WHERE bootstrap_id=? AND runtime_fingerprint=? AND account_scope=?",
+            (candidate.bootstrap_id, runtime_contract.fingerprint, ACCOUNT_SCOPE),
+        ).fetchone() == (4,)
         assert connection.execute(
             "SELECT COUNT(*) FROM paper_reduction_settlements"
         ).fetchone() == (0,)
@@ -750,6 +791,27 @@ def test_current_authentication_cannot_refresh_thirty_day_old_snapshot(tmp_path:
         )
 
 
+def test_expired_producer_receipt_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    _, _, runtime = _candidate_bundle(path, tmp_path)
+    broker_path = tmp_path / "broker.json"
+    broker = json.loads(broker_path.read_text())
+    _write_artifact(
+        broker_path,
+        broker,
+        artifact_kind="broker_snapshot",
+        issued_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+    )
+    with pytest.raises(ExactStateBootstrapError, match="expired"):
+        load_exact_state_bootstrap_evidence(
+            reconciliation_path=tmp_path / "reconciliation.json",
+            broker_snapshot_path=broker_path,
+            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            expected_runtime_contract=runtime,
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "invalid"),
     [("schema_version", True), ("managed_account_count", True)],
@@ -795,23 +857,127 @@ def test_reconciliation_integer_fields_reject_json_floats(tmp_path: Path, field:
         )
 
 
-def test_fabricated_current_authentication_receipt_is_rejected(tmp_path: Path) -> None:
+def test_fabricated_current_authentication_receipt_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = tmp_path / "legacy.db"
     _legacy_database(path)
     _, _, runtime = _candidate_bundle(path, tmp_path)
     receipt_path = tmp_path / "broker.json.auth.json"
+    monkeypatch.setenv("SAFETY_ACCOUNT_SCOPE_KEY", "fedcba9876543210" * 4)
     receipt = json.loads(receipt_path.read_text())
     receipt["issued_at"] = datetime.now(timezone.utc).isoformat()
-    receipt["hmac_sha256"] = "0" * 64
+    receipt["signature_ed25519"] = "AAAA"
     _write_artifact_receipt = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
-    receipt_path.write_text(_write_artifact_receipt)
     receipt_path.chmod(0o600)
-    with pytest.raises(ExactStateBootstrapError, match="authentication receipt is invalid"):
+    receipt_path.write_text(_write_artifact_receipt)
+    receipt_path.chmod(0o400)
+    with pytest.raises(ExactStateBootstrapError, match="signature is invalid"):
         load_exact_state_bootstrap_evidence(
             reconciliation_path=tmp_path / "reconciliation.json",
             broker_snapshot_path=tmp_path / "broker.json",
             protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
             expected_runtime_contract=runtime,
+        )
+
+
+def test_production_emitters_bind_all_three_distinct_producers(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    _, evidence, _ = _candidate_bundle(path, tmp_path)
+    assert {
+        (receipt.artifact_kind, receipt.producer_id) for receipt in evidence.authentication_receipts
+    } == {
+        ("broker_snapshot", "robotrader-broker-snapshot-producer-v1"),
+        ("reconciliation_report", "robotrader-reconciliation-producer-v1"),
+        ("protective_mark", "robotrader-protective-mark-producer-v1"),
+    }
+    assert len({receipt.receipt_id for receipt in evidence.authentication_receipts}) == 4
+
+
+def test_bootstrap_consumer_refuses_private_signing_capability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    _, _, runtime = _candidate_bundle(path, tmp_path)
+    monkeypatch.setenv(
+        "BOOTSTRAP_BROKER_EVIDENCE_PRIVATE_KEY_PATH",
+        str(_TEST_PRIVATE_KEYS["broker_snapshot"]),
+    )
+    with pytest.raises(ExactStateBootstrapError, match="refuses producer signing-key presence"):
+        load_exact_state_bootstrap_evidence(
+            reconciliation_path=tmp_path / "reconciliation.json",
+            broker_snapshot_path=tmp_path / "broker.json",
+            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            expected_runtime_contract=runtime,
+        )
+
+
+@pytest.mark.parametrize("attack", ["wrong_key", "wrong_kind"])
+def test_wrong_producer_key_or_kind_cannot_authenticate_broker(tmp_path: Path, attack: str) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    _, _, runtime = _candidate_bundle(path, tmp_path)
+    receipt_path = tmp_path / "broker.json.auth.json"
+    receipt_path.unlink()
+    if attack == "wrong_key":
+        emit_broker_snapshot_receipt(
+            artifact_path=tmp_path / "broker.json",
+            private_key_path=_TEST_PRIVATE_KEYS["protective_mark"],
+            runtime_fingerprint=runtime.fingerprint,
+            account_scope=ACCOUNT_SCOPE,
+        )
+    else:
+        emit_protective_mark_receipt(
+            artifact_path=tmp_path / "broker.json",
+            private_key_path=_TEST_PRIVATE_KEYS["protective_mark"],
+            runtime_fingerprint=runtime.fingerprint,
+            account_scope=ACCOUNT_SCOPE,
+        )
+    with pytest.raises(ExactStateBootstrapError, match="wrong key|wrong producer|wrong.*kind"):
+        load_exact_state_bootstrap_evidence(
+            reconciliation_path=tmp_path / "reconciliation.json",
+            broker_snapshot_path=tmp_path / "broker.json",
+            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            expected_runtime_contract=runtime,
+        )
+
+
+@pytest.mark.parametrize("attack", ["writable", "hardlink"])
+def test_public_verification_key_permissions_and_identity_are_strict(
+    tmp_path: Path, attack: str
+) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    _, _, runtime = _candidate_bundle(path, tmp_path)
+    public_path = Path(os.environ[PUBLIC_KEY_ENV["broker_snapshot"]])
+    if attack == "writable":
+        public_path.chmod(0o600)
+    else:
+        os.link(public_path, tmp_path / "broker-public-alias.pem")
+    with pytest.raises(ExactStateBootstrapError, match="sealed owner file"):
+        load_exact_state_bootstrap_evidence(
+            reconciliation_path=tmp_path / "reconciliation.json",
+            broker_snapshot_path=tmp_path / "broker.json",
+            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            expected_runtime_contract=runtime,
+        )
+
+
+def test_producer_private_key_must_be_sealed_owner_readonly(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    _, _, runtime = _candidate_bundle(path, tmp_path)
+    private_path = _TEST_PRIVATE_KEYS["broker_snapshot"]
+    private_path.chmod(0o600)
+    (tmp_path / "broker.json.auth.json").unlink()
+    with pytest.raises(BootstrapEvidenceAuthenticationError, match="sealed owner file"):
+        emit_broker_snapshot_receipt(
+            artifact_path=tmp_path / "broker.json",
+            private_key_path=private_path,
+            runtime_fingerprint=runtime.fingerprint,
+            account_scope=ACCOUNT_SCOPE,
         )
 
 
@@ -821,10 +987,10 @@ async def test_loaded_evidence_copy_cannot_change_authenticated_claims(tmp_path:
     _legacy_database(path)
     candidate, evidence, runtime = _candidate_bundle(path, tmp_path)
     copied = replace(evidence, broker_observed_at=datetime.now(timezone.utc))
-    receipt = _backup_receipt(path, tmp_path / "copy-backup.db", candidate)
     database = AsyncTradingDatabase(path, pool_size=1)
 
     await database.initialize()
+    receipt = _backup_receipt(path, tmp_path / "copy-backup.db", candidate)
     try:
         with pytest.raises(ExactStateBootstrapError, match="not producer-owned"):
             await database.apply_exact_state_bootstrap(
@@ -971,6 +1137,8 @@ async def test_post_commit_alias_corruption_fails_closed(tmp_path: Path) -> None
     path = tmp_path / "legacy.db"
     _legacy_database(path)
     candidate, evidence, runtime = _candidate_bundle(path, tmp_path)
+    database = AsyncTradingDatabase(path, pool_size=1)
+    await database.initialize()
     backup_path = tmp_path / "sealed-backup.db"
     receipt = _backup_receipt(path, backup_path, candidate)
     original = backup_path.stat()
@@ -989,11 +1157,9 @@ async def test_post_commit_alias_corruption_fails_closed(tmp_path: Path) -> None
         alias.chmod(0o400)
         os.utime(alias, ns=(original.st_atime_ns, original.st_mtime_ns))
 
-    database = AsyncTradingDatabase(path, pool_size=1)
-    await database.initialize()
     database._paper_settlement_fault_hook = corrupt_after_commit
     try:
-        with pytest.raises(ExactStateBootstrapError, match="single-link|identity|regular file"):
+        with pytest.raises(ExactStateBootstrapCommittedBackupInvalid) as captured:
             await database.apply_exact_state_bootstrap(
                 candidate,
                 evidence=evidence,
@@ -1001,6 +1167,11 @@ async def test_post_commit_alias_corruption_fails_closed(tmp_path: Path) -> None
                 operator_reason="Prove post-commit backup corruption blocks success.",
                 runtime_contract=runtime,
             )
+        assert captured.value.status == "COMMITTED_BACKUP_INVALID"
+        assert captured.value.mutated_state is True
+        assert captured.value.safe_retry is False
+        assert captured.value.bootstrap_id == candidate.bootstrap_id
+        assert captured.value.candidate_fingerprint == candidate.fingerprint()
     finally:
         await database.close()
     with sqlite3.connect(path) as connection:
@@ -1012,9 +1183,9 @@ async def test_portfolio_upsert_preserves_bootstrap_foreign_key_row(tmp_path: Pa
     path = tmp_path / "legacy.db"
     _legacy_database(path)
     candidate, evidence, runtime = _candidate_bundle(path, tmp_path)
-    receipt = _backup_receipt(path, tmp_path / "backup.db", candidate)
     database = AsyncTradingDatabase(path, pool_size=1)
     await database.initialize()
+    receipt = _backup_receipt(path, tmp_path / "backup.db", candidate)
     try:
         await database.apply_exact_state_bootstrap(
             candidate,

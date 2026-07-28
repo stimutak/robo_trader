@@ -23,6 +23,13 @@ from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from .bootstrap_evidence_auth import (
+    AUTH_SUFFIX,
+    AuthenticatedEvidenceReceipt,
+    BootstrapEvidenceAuthenticationError,
+    public_key_paths_from_consumer_environment,
+    verify_receipt,
+)
 from .runtime_contract_constants import PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
 from .safety.models import decimal_to_fixed, utc_to_text
 from .safety.sqlite_identity import (
@@ -40,8 +47,6 @@ RECONCILIATION_EVIDENCE_STATUS = "BOOTSTRAP_EVIDENCE_COMPLETE"
 MARK_EVIDENCE_SOURCE = "pr3-validated-market-data-v1"
 _EVIDENCE_PRODUCER_MARKER = object()
 _EVIDENCE_OBJECT_KEY = os.urandom(32)
-_EVIDENCE_AUTH_DOMAIN = b"robotrader-exact-state-bootstrap-evidence-v1\0"
-_EVIDENCE_AUTH_SUFFIX = ".auth.json"
 
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _BOOTSTRAP_ID = re.compile(r"^pboot-[0-9a-f]{32}$")
@@ -52,6 +57,28 @@ _SYMBOL = re.compile(r"^[A-Z][A-Z0-9.]{0,9}$")
 
 class ExactStateBootstrapError(ValueError):
     """A candidate cannot safely establish a sealed accounting epoch."""
+
+
+class ExactStateBootstrapCommittedBackupInvalid(ExactStateBootstrapError):
+    """The bootstrap committed, but its required rollback backup became invalid."""
+
+    status = "COMMITTED_BACKUP_INVALID"
+    mutated_state = True
+    safe_retry = False
+
+    def __init__(
+        self,
+        *,
+        bootstrap_id: str,
+        candidate_fingerprint: str,
+        detail: str,
+    ) -> None:
+        self.bootstrap_id = bootstrap_id
+        self.candidate_fingerprint = candidate_fingerprint
+        self.detail = detail
+        super().__init__(
+            "bootstrap committed but rollback backup is invalid; no safe retry is permitted"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,7 +116,7 @@ class ExactStateBootstrapEvidence:
     broker_position_count: int
     broker_open_order_count: int
     marks: tuple[ExactBootstrapMarkEvidence, ...]
-    authentication_issued_at: tuple[datetime, ...]
+    authentication_receipts: tuple[AuthenticatedEvidenceReceipt, ...]
     _producer_marker: object = field(repr=False, compare=False)
     _producer_digest: str = field(default="", repr=False, compare=False)
 
@@ -103,8 +130,19 @@ class ExactStateBootstrapEvidence:
 def _evidence_object_digest(evidence: ExactStateBootstrapEvidence) -> str:
     payload = {
         "account_scope": evidence.account_scope,
-        "authentication_issued_at": [
-            utc_to_text(value) for value in evidence.authentication_issued_at
+        "authentication_receipts": [
+            {
+                "account_scope": receipt.account_scope,
+                "artifact_kind": receipt.artifact_kind,
+                "artifact_sha256": receipt.artifact_sha256,
+                "expires_at": utc_to_text(receipt.expires_at),
+                "issued_at": utc_to_text(receipt.issued_at),
+                "producer_id": receipt.producer_id,
+                "public_key_fingerprint": receipt.public_key_fingerprint,
+                "receipt_id": receipt.receipt_id,
+                "runtime_fingerprint": receipt.runtime_fingerprint,
+            }
+            for receipt in evidence.authentication_receipts
         ],
         "broker_observed_at": utc_to_text(evidence.broker_observed_at),
         "broker_open_order_count": evidence.broker_open_order_count,
@@ -338,27 +376,6 @@ def _verified_json(path: Path, label: str) -> tuple[Mapping[str, Any], str]:
     return raw, hashlib.sha256(payload).hexdigest()
 
 
-def _evidence_authentication_payload(
-    *,
-    artifact_kind: str,
-    artifact_hash: str,
-    runtime_fingerprint: str,
-    account_scope: str,
-    issued_at: str,
-) -> bytes:
-    body = {
-        "account_scope": account_scope,
-        "artifact_kind": artifact_kind,
-        "artifact_sha256": artifact_hash,
-        "issued_at": issued_at,
-        "runtime_fingerprint": runtime_fingerprint,
-        "schema_version": 1,
-    }
-    return _EVIDENCE_AUTH_DOMAIN + json.dumps(body, sort_keys=True, separators=(",", ":")).encode(
-        "utf-8"
-    )
-
-
 def _verify_artifact_authentication(
     *,
     artifact_path: Path,
@@ -366,61 +383,23 @@ def _verify_artifact_authentication(
     artifact_hash: str,
     runtime_fingerprint: str,
     account_scope: str,
-) -> datetime:
+    public_key_path: Path,
+) -> AuthenticatedEvidenceReceipt:
     """Verify a detached producer receipt; plain JSON never grants authority."""
 
-    from .config import _validated_safety_account_scope_key
-    from .utils.secure_config import ConfigValidationError
-
-    receipt_path = artifact_path.with_name(artifact_path.name + _EVIDENCE_AUTH_SUFFIX)
+    receipt_path = artifact_path.with_name(artifact_path.name + AUTH_SUFFIX)
     receipt, _ = _verified_json(receipt_path, f"{artifact_kind} authentication receipt")
-    _exact_keys(
-        receipt,
-        {
-            "schema_version",
-            "artifact_kind",
-            "artifact_sha256",
-            "runtime_fingerprint",
-            "account_scope",
-            "issued_at",
-            "hmac_sha256",
-        },
-        f"{artifact_kind} authentication receipt",
-    )
-    if _json_int(receipt["schema_version"], "authentication schema_version") != 1:
-        raise ExactStateBootstrapError("evidence authentication schema is unsupported")
-    issued_text = _json_string(receipt["issued_at"], "authentication issued_at")
-    issued_at = _utc(issued_text, "authentication issued_at")
-    supplied_mac = _hash(receipt["hmac_sha256"], "authentication hmac_sha256")
-    if (
-        _json_string(receipt["artifact_kind"], "authentication artifact_kind") != artifact_kind
-        or _hash(receipt["artifact_sha256"], "authentication artifact_sha256") != artifact_hash
-        or _json_string(receipt["runtime_fingerprint"], "authentication runtime_fingerprint")
-        != runtime_fingerprint
-        or _json_string(receipt["account_scope"], "authentication account_scope") != account_scope
-    ):
-        raise ExactStateBootstrapError("evidence authentication receipt is cross-bound")
     try:
-        key = _validated_safety_account_scope_key(os.environ.get("SAFETY_ACCOUNT_SCOPE_KEY"))
-    except ConfigValidationError as exc:
-        raise ExactStateBootstrapError(
-            "SAFETY_ACCOUNT_SCOPE_KEY is required to authenticate bootstrap evidence"
-        ) from exc
-    expected_mac = hmac.new(
-        key,
-        _evidence_authentication_payload(
+        return verify_receipt(
+            raw=receipt,
             artifact_kind=artifact_kind,
-            artifact_hash=artifact_hash,
+            artifact_sha256=artifact_hash,
             runtime_fingerprint=runtime_fingerprint,
             account_scope=account_scope,
-            issued_at=issued_text,
-        ),
-        hashlib.sha256,
-    ).hexdigest()
-    if not hmac.compare_digest(supplied_mac, expected_mac):
-        raise ExactStateBootstrapError("evidence authentication receipt is invalid")
-    _assert_fresh_against_wall_clock(issued_at, "evidence authentication receipt")
-    return issued_at
+            public_key_path=public_key_path,
+        )
+    except BootstrapEvidenceAuthenticationError as exc:
+        raise ExactStateBootstrapError(str(exc)) from exc
 
 
 def verified_file_sha256(path: Path, label: str = "file") -> tuple[str, os.stat_result]:
@@ -428,6 +407,45 @@ def verified_file_sha256(path: Path, label: str = "file") -> tuple[str, os.stat_
 
     payload, metadata = _verified_regular_file_bytes(path, label)
     return hashlib.sha256(payload).hexdigest(), metadata
+
+
+def _assert_authentication_receipts_unconsumed(
+    database_path: Path,
+    receipts: Sequence[AuthenticatedEvidenceReceipt],
+) -> None:
+    """Read the append-only source ledger and reject a consumed nonce."""
+
+    binding: SQLitePathBinding | None = None
+    connection: sqlite3.Connection | None = None
+    try:
+        binding = SQLitePathBinding.open_for_initialization(database_path, create=False)
+        connection = sqlite3.connect(database_path.as_uri() + "?mode=ro", uri=True)
+        bound = binding.bind_sqlite_connection(sqlite_connection_file_identity(connection))
+        bound.assert_connection_identity(sqlite_connection_file_identity(connection))
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='exact_bootstrap_evidence_consumptions'"
+        ).fetchone()
+        if exists is None:
+            return
+        for receipt in receipts:
+            consumed = connection.execute(
+                "SELECT 1 FROM exact_bootstrap_evidence_consumptions WHERE receipt_id=?",
+                (receipt.receipt_id,),
+            ).fetchone()
+            if consumed is not None:
+                raise ExactStateBootstrapError("bootstrap evidence receipt replay is forbidden")
+        bound.assert_connection_identity(sqlite_connection_file_identity(connection))
+        binding.assert_path_identity()
+    except (OSError, sqlite3.Error, SQLiteIdentityError) as exc:
+        raise ExactStateBootstrapError(
+            "bootstrap evidence consumption ledger cannot be checked safely"
+        ) from exc
+    finally:
+        if connection is not None:
+            connection.close()
+        if binding is not None:
+            binding.close()
 
 
 def _runtime_contract_values(runtime_contract: object) -> tuple[Path, str, str, str]:
@@ -475,6 +493,10 @@ def load_exact_state_bootstrap_evidence(
 ) -> ExactStateBootstrapEvidence:
     """Load and cross-check the actual offline artifacts used by a bootstrap."""
 
+    try:
+        public_key_paths = public_key_paths_from_consumer_environment()
+    except BootstrapEvidenceAuthenticationError as exc:
+        raise ExactStateBootstrapError(str(exc)) from exc
     database_path, database_identity, runtime_fingerprint, account_scope = _runtime_contract_values(
         expected_runtime_contract
     )
@@ -555,6 +577,7 @@ def load_exact_state_bootstrap_evidence(
         artifact_hash=broker_hash,
         runtime_fingerprint=runtime_fingerprint,
         account_scope=account_scope,
+        public_key_path=public_key_paths["broker_snapshot"],
     )
 
     reconciliation, reconciliation_hash = _verified_json(
@@ -652,6 +675,7 @@ def load_exact_state_bootstrap_evidence(
         artifact_hash=reconciliation_hash,
         runtime_fingerprint=runtime_fingerprint,
         account_scope=account_scope,
+        public_key_path=public_key_paths["reconciliation_report"],
     )
 
     if not isinstance(protective_mark_paths, Sequence) or isinstance(
@@ -659,7 +683,7 @@ def load_exact_state_bootstrap_evidence(
     ):
         raise ExactStateBootstrapError("protective mark paths must be a sequence")
     marks: list[ExactBootstrapMarkEvidence] = []
-    authentication_times = [broker_authenticated_at, reconciliation_authenticated_at]
+    authentication_receipts = [broker_authenticated_at, reconciliation_authenticated_at]
     for mark_path in protective_mark_paths:
         mark, mark_hash = _verified_json(Path(mark_path), "protective mark")
         _exact_keys(
@@ -711,18 +735,20 @@ def load_exact_state_bootstrap_evidence(
                 artifact_hash=mark_hash,
             )
         )
-        authentication_times.append(
+        authentication_receipts.append(
             _verify_artifact_authentication(
                 artifact_path=Path(mark_path),
                 artifact_kind="protective_mark",
                 artifact_hash=mark_hash,
                 runtime_fingerprint=runtime_fingerprint,
                 account_scope=account_scope,
+                public_key_path=public_key_paths["protective_mark"],
             )
         )
     mark_keys = [(mark.portfolio_id, mark.symbol) for mark in marks]
     if mark_keys != sorted(mark_keys) or len(mark_keys) != len(set(mark_keys)):
         raise ExactStateBootstrapError("protective marks must be unique and sorted")
+    _assert_authentication_receipts_unconsumed(database_path, authentication_receipts)
 
     evidence = ExactStateBootstrapEvidence(
         reconciliation_snapshot_id=reconciliation_snapshot_id,
@@ -742,7 +768,7 @@ def load_exact_state_bootstrap_evidence(
         broker_position_count=0,
         broker_open_order_count=0,
         marks=tuple(marks),
-        authentication_issued_at=tuple(authentication_times),
+        authentication_receipts=tuple(authentication_receipts),
         _producer_marker=_EVIDENCE_PRODUCER_MARKER,
     )
     object.__setattr__(evidence, "_producer_digest", _evidence_object_digest(evidence))
@@ -1087,8 +1113,13 @@ def assert_exact_state_bootstrap_evidence(
         if age < timedelta(0) or age > MAX_MARK_AGE:
             raise ExactStateBootstrapError(f"{label} is future or stale")
         _assert_fresh_against_wall_clock(observed, label)
-    for issued_at in evidence.authentication_issued_at:
-        _assert_fresh_against_wall_clock(issued_at, "evidence authentication receipt")
+    receipt_ids = [receipt.receipt_id for receipt in evidence.authentication_receipts]
+    if len(receipt_ids) != len(set(receipt_ids)):
+        raise ExactStateBootstrapError("bootstrap evidence receipt nonce was reused")
+    for receipt in evidence.authentication_receipts:
+        _assert_fresh_against_wall_clock(receipt.issued_at, "evidence authentication receipt")
+        if receipt.expires_at < datetime.now(timezone.utc):
+            raise ExactStateBootstrapError("evidence authentication receipt expired before apply")
     evidence_marks = {(mark.portfolio_id, mark.symbol): mark for mark in evidence.marks}
     candidate_keys = {(candidate.portfolio_id, position.symbol) for position in candidate.positions}
     if set(evidence_marks) != candidate_keys:
