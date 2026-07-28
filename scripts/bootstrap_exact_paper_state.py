@@ -68,6 +68,7 @@ class _RegularFileBinding:
     inode: int
     size: int
     modified_ns: int
+    sealed: bool = False
 
     @classmethod
     def open_readonly(
@@ -87,8 +88,8 @@ class _RegularFileBinding:
             raise ExactStateBootstrapError(f"{label} cannot be opened safely") from exc
         try:
             metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise ExactStateBootstrapError(f"{label} must be a regular file")
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise ExactStateBootstrapError(f"{label} must be a single-link regular file")
             if metadata.st_uid != os.geteuid():
                 raise ExactStateBootstrapError(f"{label} must be owned by this operator")
             if owner_only and stat.S_IMODE(metadata.st_mode) & 0o077:
@@ -132,6 +133,10 @@ class _RegularFileBinding:
             not stat.S_ISREG(guardian.st_mode)
             or stat.S_ISLNK(path_metadata.st_mode)
             or not stat.S_ISREG(path_metadata.st_mode)
+            or guardian.st_nlink != 1
+            or path_metadata.st_nlink != 1
+            or (self.sealed and stat.S_IMODE(guardian.st_mode) & 0o222)
+            or (self.sealed and stat.S_IMODE(path_metadata.st_mode) & 0o222)
             or observed_guardian != expected
             or observed_path != expected
         ):
@@ -254,8 +259,34 @@ class _OnlineBackup:
     row_counts: tuple[tuple[str, int], ...]
     table_hashes: tuple[tuple[str, str], ...]
 
-    def assert_identity(self) -> None:
+    def assert_restorable(self) -> None:
+        """Re-prove the sealed backup, not only its inode metadata."""
+
         self.target_binding.assert_identity()
+        current_hash = hashlib.sha256(self.target_binding.read_bytes()).hexdigest()
+        if not hmac.compare_digest(current_hash, self.receipt.backup_content_hash):
+            raise ExactStateBootstrapError("sealed backup content changed")
+        state = inspect_legacy_state(self.target_binding.path)
+        with sqlite3.connect(self.target_binding.path.as_uri() + "?mode=ro", uri=True) as conn:
+            if conn.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+                raise ExactStateBootstrapError("sealed backup integrity check failed")
+            row_counts, table_hashes = sqlite_table_evidence(conn)
+        self.target_binding.assert_identity()
+        final_hash = hashlib.sha256(self.target_binding.read_bytes()).hexdigest()
+        if (
+            state["snapshot_hash"] != self.receipt.source_snapshot_hash
+            or row_counts != self.receipt.row_counts
+            or table_hashes != self.receipt.table_hashes
+            or (state["database_device"], state["database_inode"])
+            != (self.receipt.backup_device, self.receipt.backup_inode)
+            or not hmac.compare_digest(final_hash, self.receipt.backup_content_hash)
+        ):
+            raise ExactStateBootstrapError("sealed backup no longer restores reviewed state")
+
+    def assert_identity(self) -> None:
+        """Compatibility alias retaining the stronger full verification."""
+
+        self.assert_restorable()
 
     def report(self) -> dict[str, object]:
         return {
@@ -306,6 +337,31 @@ def _refresh_binding_metadata(binding: _RegularFileBinding) -> None:
     binding.assert_identity()
 
 
+def _seal_binding_readonly(binding: _RegularFileBinding) -> None:
+    """Remove write bits and replace the writable guardian with an O_RDONLY fd."""
+
+    os.fsync(binding.descriptor)
+    os.fchmod(binding.descriptor, 0o400)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    replacement = os.open(binding.path, flags)
+    try:
+        metadata = os.fstat(replacement)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or (metadata.st_dev, metadata.st_ino) != (binding.device, binding.inode)
+            or stat.S_IMODE(metadata.st_mode) & 0o222
+        ):
+            raise ExactStateBootstrapError("backup could not be sealed read-only")
+    except BaseException:
+        os.close(replacement)
+        raise
+    os.close(binding.descriptor)
+    binding.descriptor = replacement
+    binding.sealed = True
+    _refresh_binding_metadata(binding)
+
+
 def _make_backup_receipt(
     *,
     source: SQLitePathBinding,
@@ -340,6 +396,9 @@ def _online_backup(
     target_path: Path,
     candidate: ExactStateBootstrapCandidate,
 ) -> _OnlineBackup:
+    source_metadata = os.lstat(source_path)
+    if not stat.S_ISREG(source_metadata.st_mode) or source_metadata.st_nlink != 1:
+        raise ExactStateBootstrapError("backup source must be a single-link regular file")
     source = SQLitePathBinding.open_readonly(source_path)
     target: _RegularFileBinding | None = None
     source_connection: sqlite3.Connection | None = None
@@ -347,9 +406,13 @@ def _online_backup(
     try:
         target = _reserve_backup_target(target_path)
         source.assert_path_identity()
+        if os.lstat(source.path).st_nlink != 1:
+            raise ExactStateBootstrapError("backup source link count changed")
         source_connection = sqlite3.connect(source.path.as_uri() + "?mode=ro", uri=True)
         source = source.bind_sqlite_connection(sqlite_connection_file_identity(source_connection))
         source.assert_connection_identity(sqlite_connection_file_identity(source_connection))
+        if os.lstat(source.path).st_nlink != 1:
+            raise ExactStateBootstrapError("backup source link count changed")
 
         target.assert_identity()
         target_connection = sqlite3.connect(target.path.as_uri() + "?mode=rw", uri=True)
@@ -375,8 +438,7 @@ def _online_backup(
         row_counts, table_hashes = sqlite_table_evidence(target_connection)
         target_connection.close()
         target_connection = None
-        os.fsync(target.descriptor)
-        _refresh_binding_metadata(target)
+        _seal_binding_readonly(target)
         backup_content_hash = hashlib.sha256(target.read_bytes()).hexdigest()
         receipt = _make_backup_receipt(
             source=source,
@@ -532,7 +594,7 @@ def _parser() -> argparse.ArgumentParser:
             "--protective-mark",
             type=Path,
             action="append",
-            required=True,
+            default=[],
             dest="protective_marks",
         )
         child.add_argument("--json", action="store_true", required=True)
@@ -582,7 +644,7 @@ def main(argv: list[str] | None = None) -> int:
                 _assert_stopped()
                 backup = _online_backup(database_path, args.backup_path, candidate)
                 candidate_binding.assert_identity()
-                backup.assert_identity()
+                backup.assert_restorable()
                 report = asyncio.run(
                     _apply(
                         candidate,
@@ -594,7 +656,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
                 candidate_binding.assert_identity()
-                backup.assert_identity()
+                backup.assert_restorable()
                 report["backup"] = backup.report()
             finally:
                 lock.release()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -29,6 +30,13 @@ from robo_trader.financial_state_bootstrap import (
 )
 
 ACCOUNT_SCOPE = _derive_safety_account_scope("0123456789abcdef" * 4, "DU_TEST_PAPER")
+SAFETY_SCOPE_KEY = "0123456789abcdef" * 4
+EVIDENCE_AUTH_DOMAIN = b"robotrader-exact-state-bootstrap-evidence-v1\0"
+
+
+@pytest.fixture(autouse=True)
+def _bootstrap_evidence_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SAFETY_ACCOUNT_SCOPE_KEY", SAFETY_SCOPE_KEY)
 
 
 def _legacy_database(path: Path) -> None:
@@ -133,11 +141,39 @@ def _runtime_contract(path: Path) -> RuntimeContract:
     )
 
 
-def _write_artifact(path: Path, payload: dict[str, object]) -> str:
+def _write_artifact(
+    path: Path,
+    payload: dict[str, object],
+    *,
+    artifact_kind: str,
+    issued_at: datetime | None = None,
+) -> str:
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     path.write_bytes(raw)
     path.chmod(0o600)
-    return hashlib.sha256(raw).hexdigest()
+    artifact_hash = hashlib.sha256(raw).hexdigest()
+    issued_text = (issued_at or datetime.now(timezone.utc)).isoformat()
+    body = {
+        "account_scope": payload["account_scope"],
+        "artifact_kind": artifact_kind,
+        "artifact_sha256": artifact_hash,
+        "issued_at": issued_text,
+        "runtime_fingerprint": payload["runtime_fingerprint"],
+        "schema_version": 1,
+    }
+    mac = hmac.new(
+        bytes.fromhex(SAFETY_SCOPE_KEY),
+        EVIDENCE_AUTH_DOMAIN
+        + json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    receipt = dict(body, hmac_sha256=mac)
+    receipt_path = path.with_name(path.name + ".auth.json")
+    receipt_path.write_text(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+    receipt_path.chmod(0o600)
+    return artifact_hash
 
 
 def _candidate_bundle(
@@ -145,6 +181,7 @@ def _candidate_bundle(
     artifact_root: Path,
     *,
     legacy_hash: str | None = None,
+    flat: bool = False,
 ) -> tuple[ExactStateBootstrapCandidate, object, RuntimeContract]:
     effective = datetime.now(timezone.utc).replace(microsecond=0)
     runtime_contract = _runtime_contract(path)
@@ -168,10 +205,15 @@ def _candidate_bundle(
             "positions": [],
             "open_orders": [],
         },
+        artifact_kind="broker_snapshot",
     )
     mark_specs = (
-        ("NVDA", "326.7", "mark-nvda-v1", 123),
-        ("TSLA", "369.57", "mark-tsla-v1", 456),
+        ()
+        if flat
+        else (
+            ("NVDA", "326.7", "mark-nvda-v1", 123),
+            ("TSLA", "369.57", "mark-tsla-v1", 456),
+        )
     )
     mark_paths: list[Path] = []
     mark_hashes: dict[str, str] = {}
@@ -193,6 +235,7 @@ def _candidate_bundle(
                 "execution_domain_scope": "paper-simulator-v1",
                 "account_scope": ACCOUNT_SCOPE,
             },
+            artifact_kind="protective_mark",
         )
         mark_paths.append(mark_path)
     metadata = path.stat()
@@ -221,6 +264,7 @@ def _candidate_bundle(
             "broker_positions_count": 0,
             "broker_open_orders_count": 0,
         },
+        artifact_kind="reconciliation_report",
     )
     candidate = ExactStateBootstrapCandidate(
         bootstrap_id="pboot-" + ("a" * 32),
@@ -237,30 +281,34 @@ def _candidate_bundle(
         broker_open_order_count=0,
         effective_at=effective,
         account=ExactBootstrapAccount(
-            cash=Decimal("96739.16"),
+            cash=Decimal("100000") if flat else Decimal("96739.16"),
             realized_pnl=Decimal("0"),
             daily_pnl=Decimal("0"),
-            daily_pnl_baseline=Decimal("1039.18"),
+            daily_pnl_baseline=Decimal("0") if flat else Decimal("1039.18"),
             daily_pnl_date=effective.date(),
         ),
         positions=(
-            ExactBootstrapPosition(
-                symbol="NVDA",
-                quantity=9,
-                cost_basis=Decimal("210.96"),
-                mark_price=Decimal("326.70"),
-                mark_observed_at=effective - timedelta(seconds=5),
-                mark_evidence_fingerprint=mark_hashes["NVDA"],
-            ),
-            ExactBootstrapPosition(
-                symbol="TSLA",
-                quantity=2,
-                cost_basis=Decimal("370.81"),
-                # The known-bad legacy 203.45 mark is deliberately not adopted.
-                mark_price=Decimal("369.57"),
-                mark_observed_at=effective - timedelta(seconds=5),
-                mark_evidence_fingerprint=mark_hashes["TSLA"],
-            ),
+            ()
+            if flat
+            else (
+                ExactBootstrapPosition(
+                    symbol="NVDA",
+                    quantity=9,
+                    cost_basis=Decimal("210.96"),
+                    mark_price=Decimal("326.70"),
+                    mark_observed_at=effective - timedelta(seconds=5),
+                    mark_evidence_fingerprint=mark_hashes["NVDA"],
+                ),
+                ExactBootstrapPosition(
+                    symbol="TSLA",
+                    quantity=2,
+                    cost_basis=Decimal("370.81"),
+                    # The known-bad legacy 203.45 mark is deliberately not adopted.
+                    mark_price=Decimal("369.57"),
+                    mark_observed_at=effective - timedelta(seconds=5),
+                    mark_evidence_fingerprint=mark_hashes["TSLA"],
+                ),
+            )
         ),
     )
     evidence = load_exact_state_bootstrap_evidence(
@@ -279,7 +327,7 @@ def _backup_receipt(
 ) -> ExactStateBootstrapBackupReceipt:
     with sqlite3.connect(source) as source_connection, sqlite3.connect(target) as target_connection:
         source_connection.backup(target_connection)
-    target.chmod(0o600)
+    target.chmod(0o400)
     backup_hash, backup_metadata = verified_file_sha256(target, "test backup")
     source_metadata = source.stat()
     with sqlite3.connect(target.as_uri() + "?mode=ro", uri=True) as connection:
@@ -502,7 +550,7 @@ def test_evidence_loader_rejects_tampered_broker_and_wrong_runtime_scope(
     broker_path = tmp_path / "broker.json"
     broker = json.loads(broker_path.read_text(encoding="utf-8"))
     broker["positions"] = [{"symbol": "AAPL", "quantity": "1"}]
-    _write_artifact(broker_path, broker)
+    _write_artifact(broker_path, broker, artifact_kind="broker_snapshot")
 
     with pytest.raises(ExactStateBootstrapError, match="zero paper exposure"):
         load_exact_state_bootstrap_evidence(
@@ -639,10 +687,14 @@ async def test_tampered_backup_blocks_before_bootstrap_rows(tmp_path: Path) -> N
     await database.initialize()
     backup_path = tmp_path / "backup.db"
     receipt = _backup_receipt(path, backup_path, candidate)
-    with sqlite3.connect(backup_path) as connection:
-        connection.execute("UPDATE trades SET price = price + 1 WHERE id = 1")
+    backup_path.chmod(0o600)
+    with backup_path.open("r+b") as stream:
+        stream.seek(100)
+        original = stream.read(1)
+        stream.seek(100)
+        stream.write(bytes([original[0] ^ 0x01]))
     try:
-        with pytest.raises(ExactStateBootstrapError, match="does not restore"):
+        with pytest.raises(ExactStateBootstrapError, match="identity|restore"):
             await database.apply_exact_state_bootstrap(
                 candidate,
                 evidence=evidence,
@@ -654,3 +706,331 @@ async def test_tampered_backup_blocks_before_bootstrap_rows(tmp_path: Path) -> N
         await database.close()
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM paper_state_bootstraps").fetchone() == (0,)
+
+
+def test_external_json_without_authenticated_receipt_has_no_authority(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    _, _, runtime = _candidate_bundle(path, tmp_path)
+    (tmp_path / "broker.json.auth.json").unlink()
+    with pytest.raises(ExactStateBootstrapError, match="authentication receipt"):
+        load_exact_state_bootstrap_evidence(
+            reconciliation_path=tmp_path / "reconciliation.json",
+            broker_snapshot_path=tmp_path / "broker.json",
+            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            expected_runtime_contract=runtime,
+        )
+
+
+def test_current_authentication_cannot_refresh_thirty_day_old_snapshot(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    _, _, runtime = _candidate_bundle(path, tmp_path)
+    broker_path = tmp_path / "broker.json"
+    broker = json.loads(broker_path.read_text())
+    stale = datetime.now(timezone.utc) - timedelta(days=30)
+    broker["observed_at"] = stale.isoformat()
+    broker["broker_time_before"] = (stale - timedelta(seconds=1)).isoformat()
+    broker["broker_time_after"] = (stale + timedelta(seconds=1)).isoformat()
+    broker_hash = _write_artifact(broker_path, broker, artifact_kind="broker_snapshot")
+    reconciliation_path = tmp_path / "reconciliation.json"
+    reconciliation = json.loads(reconciliation_path.read_text())
+    reconciliation["broker_snapshot_hash"] = broker_hash
+    _write_artifact(
+        reconciliation_path,
+        reconciliation,
+        artifact_kind="reconciliation_report",
+    )
+    with pytest.raises(ExactStateBootstrapError, match="wall clock"):
+        load_exact_state_bootstrap_evidence(
+            reconciliation_path=reconciliation_path,
+            broker_snapshot_path=broker_path,
+            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            expected_runtime_contract=runtime,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [("schema_version", True), ("managed_account_count", True)],
+)
+def test_broker_integer_fields_reject_json_booleans(
+    tmp_path: Path, field: str, invalid: object
+) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    _, _, runtime = _candidate_bundle(path, tmp_path)
+    broker_path = tmp_path / "broker.json"
+    broker = json.loads(broker_path.read_text())
+    broker[field] = invalid
+    _write_artifact(broker_path, broker, artifact_kind="broker_snapshot")
+    with pytest.raises(ExactStateBootstrapError, match="JSON integer"):
+        load_exact_state_bootstrap_evidence(
+            reconciliation_path=tmp_path / "reconciliation.json",
+            broker_snapshot_path=broker_path,
+            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            expected_runtime_contract=runtime,
+        )
+
+
+@pytest.mark.parametrize("field", ["broker_positions_count", "database_device", "database_inode"])
+def test_reconciliation_integer_fields_reject_json_floats(tmp_path: Path, field: str) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    _, _, runtime = _candidate_bundle(path, tmp_path)
+    reconciliation_path = tmp_path / "reconciliation.json"
+    reconciliation = json.loads(reconciliation_path.read_text())
+    reconciliation[field] = float(reconciliation[field])
+    _write_artifact(
+        reconciliation_path,
+        reconciliation,
+        artifact_kind="reconciliation_report",
+    )
+    with pytest.raises(ExactStateBootstrapError, match="JSON integer"):
+        load_exact_state_bootstrap_evidence(
+            reconciliation_path=reconciliation_path,
+            broker_snapshot_path=tmp_path / "broker.json",
+            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            expected_runtime_contract=runtime,
+        )
+
+
+def test_fabricated_current_authentication_receipt_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    _, _, runtime = _candidate_bundle(path, tmp_path)
+    receipt_path = tmp_path / "broker.json.auth.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt["issued_at"] = datetime.now(timezone.utc).isoformat()
+    receipt["hmac_sha256"] = "0" * 64
+    _write_artifact_receipt = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    receipt_path.write_text(_write_artifact_receipt)
+    receipt_path.chmod(0o600)
+    with pytest.raises(ExactStateBootstrapError, match="authentication receipt is invalid"):
+        load_exact_state_bootstrap_evidence(
+            reconciliation_path=tmp_path / "reconciliation.json",
+            broker_snapshot_path=tmp_path / "broker.json",
+            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            expected_runtime_contract=runtime,
+        )
+
+
+@pytest.mark.asyncio
+async def test_loaded_evidence_copy_cannot_change_authenticated_claims(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    candidate, evidence, runtime = _candidate_bundle(path, tmp_path)
+    copied = replace(evidence, broker_observed_at=datetime.now(timezone.utc))
+    receipt = _backup_receipt(path, tmp_path / "copy-backup.db", candidate)
+    database = AsyncTradingDatabase(path, pool_size=1)
+
+    await database.initialize()
+    try:
+        with pytest.raises(ExactStateBootstrapError, match="not producer-owned"):
+            await database.apply_exact_state_bootstrap(
+                candidate,
+                evidence=copied,
+                backup_receipt=receipt,
+                operator_reason="Reject copied evidence with changed claims.",
+                runtime_contract=runtime,
+            )
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_flat_fresh_database_bootstraps_and_runtime_lineage_is_true(tmp_path: Path) -> None:
+    path = tmp_path / "fresh.db"
+    database = AsyncTradingDatabase(path, pool_size=1)
+    await database.initialize()
+    await database.close()
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM paper_account_settlement_state"
+        ).fetchone() == (0,)
+    candidate, evidence, runtime = _candidate_bundle(path, tmp_path, flat=True)
+    receipt = _backup_receipt(path, tmp_path / "fresh-backup.db", candidate)
+    database = AsyncTradingDatabase(path, pool_size=1)
+    await database.initialize()
+    try:
+        await database.apply_exact_state_bootstrap(
+            candidate,
+            evidence=evidence,
+            backup_receipt=receipt,
+            operator_reason="Seal a reviewed flat fresh paper ledger.",
+            runtime_contract=runtime,
+        )
+        account = await database.get_account_info(runtime_contract=runtime)
+        positions = await database.get_positions(runtime_contract=runtime)
+    finally:
+        await database.close()
+    assert account["bootstrap_lineage_valid"] is True
+    assert positions == []
+
+
+@pytest.mark.asyncio
+async def test_matching_unlineaged_exact_state_is_adopted_without_value_rewrite(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "upgrade.db"
+    _legacy_database(path)
+    database = AsyncTradingDatabase(path, pool_size=1)
+    await database.initialize()
+    candidate, evidence, runtime = _candidate_bundle(path, tmp_path)
+    async with database.get_connection() as connection:
+        await connection.execute(
+            """
+            INSERT INTO paper_account_settlement_state VALUES
+            ('default','96739.16','0','0','1039.18',?,? ,NULL,NULL)
+            """,
+            (candidate.account.daily_pnl_date.isoformat(), datetime.now(timezone.utc).isoformat()),
+        )
+        for position in candidate.positions:
+            await connection.execute(
+                """
+                INSERT INTO paper_position_settlement_state VALUES
+                ('default',?,?,?,NULL,?,NULL)
+                """,
+                (
+                    position.symbol,
+                    position.public_dict()["cost_basis_text"],
+                    position.public_dict()["mark_price_text"],
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+        await connection.commit()
+    before = None
+    with sqlite3.connect(path) as connection:
+        before = connection.execute(
+            "SELECT cash_text,realized_pnl_text,daily_pnl_text,daily_pnl_baseline_text,daily_pnl_date "
+            "FROM paper_account_settlement_state"
+        ).fetchone()
+    receipt = _backup_receipt(path, tmp_path / "upgrade-backup.db", candidate)
+    try:
+        await database.apply_exact_state_bootstrap(
+            candidate,
+            evidence=evidence,
+            backup_receipt=receipt,
+            operator_reason="Adopt exact current-main state after full evidence review.",
+            runtime_contract=runtime,
+        )
+    finally:
+        await database.close()
+    with sqlite3.connect(path) as connection:
+        after = connection.execute(
+            "SELECT cash_text,realized_pnl_text,daily_pnl_text,daily_pnl_baseline_text,daily_pnl_date "
+            "FROM paper_account_settlement_state"
+        ).fetchone()
+        assert before == after
+        assert connection.execute(
+            "SELECT origin_bootstrap_id FROM paper_account_settlement_state"
+        ).fetchone() == (candidate.bootstrap_id,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM paper_position_settlement_state " "WHERE origin_bootstrap_id = ?",
+            (candidate.bootstrap_id,),
+        ).fetchone() == (2,)
+
+
+@pytest.mark.asyncio
+async def test_mismatched_unlineaged_exact_state_blocks_with_zero_mutation(tmp_path: Path) -> None:
+    path = tmp_path / "upgrade-mismatch.db"
+    _legacy_database(path)
+    database = AsyncTradingDatabase(path, pool_size=1)
+    await database.initialize()
+    candidate, evidence, runtime = _candidate_bundle(path, tmp_path)
+    async with database.get_connection() as connection:
+        await connection.execute(
+            """
+            INSERT INTO paper_account_settlement_state VALUES
+            ('default','1','0','0','1039.18',?,?,NULL,NULL)
+            """,
+            (candidate.account.daily_pnl_date.isoformat(), datetime.now(timezone.utc).isoformat()),
+        )
+        await connection.commit()
+    receipt = _backup_receipt(path, tmp_path / "mismatch-backup.db", candidate)
+    try:
+        with pytest.raises(ExactStateBootstrapError, match="does not exactly match"):
+            await database.apply_exact_state_bootstrap(
+                candidate,
+                evidence=evidence,
+                backup_receipt=receipt,
+                operator_reason="Reject mismatched exact current-main state.",
+                runtime_contract=runtime,
+            )
+    finally:
+        await database.close()
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT cash_text,origin_bootstrap_id FROM paper_account_settlement_state"
+        ).fetchone() == ("1", None)
+        assert connection.execute("SELECT COUNT(*) FROM paper_state_bootstraps").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_post_commit_alias_corruption_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    candidate, evidence, runtime = _candidate_bundle(path, tmp_path)
+    backup_path = tmp_path / "sealed-backup.db"
+    receipt = _backup_receipt(path, backup_path, candidate)
+    original = backup_path.stat()
+    alias = tmp_path / "backup-alias.db"
+
+    def corrupt_after_commit(step: str) -> None:
+        if step != "AFTER_EXACT_BOOTSTRAP_COMMIT":
+            return
+        os.link(backup_path, alias)
+        alias.chmod(0o600)
+        with alias.open("r+b") as stream:
+            stream.seek(100)
+            value = stream.read(1)
+            stream.seek(100)
+            stream.write(bytes([value[0] ^ 1]))
+        alias.chmod(0o400)
+        os.utime(alias, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+    database = AsyncTradingDatabase(path, pool_size=1)
+    await database.initialize()
+    database._paper_settlement_fault_hook = corrupt_after_commit
+    try:
+        with pytest.raises(ExactStateBootstrapError, match="single-link|identity|regular file"):
+            await database.apply_exact_state_bootstrap(
+                candidate,
+                evidence=evidence,
+                backup_receipt=receipt,
+                operator_reason="Prove post-commit backup corruption blocks success.",
+                runtime_contract=runtime,
+            )
+    finally:
+        await database.close()
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM paper_state_bootstraps").fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+async def test_portfolio_upsert_preserves_bootstrap_foreign_key_row(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    candidate, evidence, runtime = _candidate_bundle(path, tmp_path)
+    receipt = _backup_receipt(path, tmp_path / "backup.db", candidate)
+    database = AsyncTradingDatabase(path, pool_size=1)
+    await database.initialize()
+    try:
+        await database.apply_exact_state_bootstrap(
+            candidate,
+            evidence=evidence,
+            backup_receipt=receipt,
+            operator_reason="Seal before updating the portfolio definition.",
+            runtime_contract=runtime,
+        )
+        await database.upsert_portfolio({"id": "default", "name": "Renamed Safely"})
+    finally:
+        await database.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        assert connection.execute("SELECT name FROM portfolios WHERE id='default'").fetchone() == (
+            "Renamed Safely",
+        )
+        assert connection.execute("SELECT bootstrap_id FROM paper_state_bootstraps").fetchone() == (
+            candidate.bootstrap_id,
+        )

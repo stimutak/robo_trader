@@ -1522,24 +1522,10 @@ class AsyncTradingDatabase:
             """)
 
             # Insert default account if not exists
-            default_account = await conn.execute("""
+            await conn.execute("""
                 INSERT OR IGNORE INTO account (portfolio_id, cash, equity)
                 VALUES ('default', 100000, 100000)
             """)
-            if default_account.rowcount == 1:
-                await conn.execute(
-                    """
-                    INSERT OR IGNORE INTO paper_account_settlement_state (
-                        portfolio_id, cash_text, realized_pnl_text, daily_pnl_text,
-                        daily_pnl_baseline_text, daily_pnl_date,
-                        updated_at, source_settlement_id
-                    ) VALUES ('default', '100000', '0', '0', '0', ?, ?, NULL)
-                    """,
-                    (
-                        datetime.now(timezone.utc).date().isoformat(),
-                        utc_to_text(datetime.now(timezone.utc)),
-                    ),
-                )
 
             await conn.commit()
             connection_binding.assert_connection_identity(
@@ -1575,8 +1561,17 @@ class AsyncTradingDatabase:
 
         if type(receipt) is not ExactStateBootstrapBackupReceipt:
             raise ExactStateBootstrapError("bootstrap requires an exact backup receipt")
+        try:
+            source_metadata = os.lstat(self.db_path)
+        except OSError as exc:
+            raise ExactStateBootstrapError("bootstrap source cannot be revalidated") from exc
         if (
             receipt.schema_version != 1
+            or not stat.S_ISREG(source_metadata.st_mode)
+            or stat.S_ISLNK(source_metadata.st_mode)
+            or source_metadata.st_nlink != 1
+            or (source_metadata.st_dev, source_metadata.st_ino)
+            != (descriptor.device, descriptor.inode)
             or receipt.source_path != str(self.db_path)
             or (receipt.source_device, receipt.source_inode)
             != (descriptor.device, descriptor.inode)
@@ -1593,10 +1588,15 @@ class AsyncTradingDatabase:
             backup_path,
             "bootstrap backup",
         )
-        if not hmac.compare_digest(backup_hash, receipt.backup_content_hash) or (
-            backup_metadata.st_dev,
-            backup_metadata.st_ino,
-        ) != (receipt.backup_device, receipt.backup_inode):
+        if (
+            not hmac.compare_digest(backup_hash, receipt.backup_content_hash)
+            or (
+                backup_metadata.st_dev,
+                backup_metadata.st_ino,
+            )
+            != (receipt.backup_device, receipt.backup_inode)
+            or (stat.S_IMODE(backup_metadata.st_mode) & 0o222)
+        ):
             raise ExactStateBootstrapError("bootstrap backup identity or hash changed")
         backup_state = inspect_legacy_state(backup_path)
         backup_binding: Optional[SQLitePathBinding] = None
@@ -1718,6 +1718,12 @@ class AsyncTradingDatabase:
                             "bootstrap identity is already bound to different evidence"
                         )
                     await conn.rollback()
+                    self._verify_exact_state_backup(
+                        candidate,
+                        evidence,
+                        backup_receipt,
+                        descriptor,
+                    )
                     return ExactStateBootstrapReceipt(
                         bootstrap_id=row[0],
                         candidate_fingerprint=row[1],
@@ -1804,21 +1810,56 @@ class AsyncTradingDatabase:
                     raise ExactStateBootstrapError(
                         "paper simulator already has a sealed accounting epoch"
                     )
+                account = candidate.account
                 cursor = await conn.execute(
-                    "SELECT COUNT(*) FROM paper_account_settlement_state WHERE portfolio_id = ?",
+                    """
+                    SELECT cash_text,realized_pnl_text,daily_pnl_text,
+                           daily_pnl_baseline_text,daily_pnl_date,
+                           source_settlement_id,origin_bootstrap_id
+                    FROM paper_account_settlement_state WHERE portfolio_id = ?
+                    """,
                     (candidate.portfolio_id,),
                 )
-                if await cursor.fetchone() != (0,):
+                existing_account = await cursor.fetchone()
+                expected_account = (
+                    decimal_to_fixed(account.cash),
+                    decimal_to_fixed(account.realized_pnl),
+                    decimal_to_fixed(account.daily_pnl),
+                    decimal_to_fixed(account.daily_pnl_baseline),
+                    account.daily_pnl_date.isoformat(),
+                    None,
+                    None,
+                )
+                if existing_account is not None and tuple(existing_account) != expected_account:
                     raise ExactStateBootstrapError(
-                        "exact account state already exists without this bootstrap"
+                        "existing exact account state does not exactly match reviewed candidate"
                     )
+
                 cursor = await conn.execute(
-                    "SELECT COUNT(*) FROM paper_position_settlement_state WHERE portfolio_id = ?",
+                    """
+                    SELECT symbol,cost_basis_text,mark_price_text,
+                           source_settlement_id,origin_bootstrap_id
+                    FROM paper_position_settlement_state
+                    WHERE portfolio_id = ? ORDER BY symbol
+                    """,
                     (candidate.portfolio_id,),
                 )
-                if await cursor.fetchone() != (0,):
+                existing_position_rows = await cursor.fetchall()
+                expected_position_rows = [
+                    (
+                        position.symbol,
+                        decimal_to_fixed(position.cost_basis),
+                        decimal_to_fixed(position.mark_price),
+                        None,
+                        None,
+                    )
+                    for position in candidate.positions
+                ]
+                if existing_position_rows and [tuple(row) for row in existing_position_rows] != (
+                    expected_position_rows
+                ):
                     raise ExactStateBootstrapError(
-                        "exact position state already exists without this bootstrap"
+                        "existing exact position state does not exactly match reviewed candidate"
                     )
 
                 committed_at = datetime.now(timezone.utc)
@@ -1869,49 +1910,83 @@ class AsyncTradingDatabase:
                         utc_to_text(committed_at),
                     ),
                 )
-                account = candidate.account
-                await conn.execute(
-                    """
-                    INSERT INTO paper_account_settlement_state(
-                        portfolio_id, cash_text, realized_pnl_text, daily_pnl_text,
-                        daily_pnl_baseline_text, daily_pnl_date, updated_at,
-                        source_settlement_id, origin_bootstrap_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
-                    """,
-                    (
-                        candidate.portfolio_id,
-                        decimal_to_fixed(account.cash),
-                        decimal_to_fixed(account.realized_pnl),
-                        decimal_to_fixed(account.daily_pnl),
-                        decimal_to_fixed(account.daily_pnl_baseline),
-                        account.daily_pnl_date.isoformat(),
-                        utc_to_text(committed_at),
-                        candidate.bootstrap_id,
-                    ),
-                )
-                for position in candidate.positions:
+                if existing_account is None:
                     await conn.execute(
                         """
+                        INSERT INTO paper_account_settlement_state(
+                            portfolio_id, cash_text, realized_pnl_text, daily_pnl_text,
+                            daily_pnl_baseline_text, daily_pnl_date, updated_at,
+                            source_settlement_id, origin_bootstrap_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                        """,
+                        (
+                            candidate.portfolio_id,
+                            decimal_to_fixed(account.cash),
+                            decimal_to_fixed(account.realized_pnl),
+                            decimal_to_fixed(account.daily_pnl),
+                            decimal_to_fixed(account.daily_pnl_baseline),
+                            account.daily_pnl_date.isoformat(),
+                            utc_to_text(committed_at),
+                            candidate.bootstrap_id,
+                        ),
+                    )
+                else:
+                    adopted = await conn.execute(
+                        """
+                        UPDATE paper_account_settlement_state
+                        SET origin_bootstrap_id = ?
+                        WHERE portfolio_id = ? AND origin_bootstrap_id IS NULL
+                        """,
+                        (candidate.bootstrap_id, candidate.portfolio_id),
+                    )
+                    if adopted.rowcount != 1:
+                        raise ExactStateBootstrapError(
+                            "exact account adoption lost its lineage race"
+                        )
+                if not existing_position_rows:
+                    for position in candidate.positions:
+                        await conn.execute(
+                            """
                         INSERT INTO paper_position_settlement_state(
                             portfolio_id, symbol, cost_basis_text, mark_price_text,
                             source_settlement_id, updated_at, origin_bootstrap_id
                         ) VALUES (?, ?, ?, ?, NULL, ?, ?)
                         """,
-                        (
-                            candidate.portfolio_id,
-                            position.symbol,
-                            decimal_to_fixed(position.cost_basis),
-                            decimal_to_fixed(position.mark_price),
-                            utc_to_text(committed_at),
-                            candidate.bootstrap_id,
-                        ),
+                            (
+                                candidate.portfolio_id,
+                                position.symbol,
+                                decimal_to_fixed(position.cost_basis),
+                                decimal_to_fixed(position.mark_price),
+                                utc_to_text(committed_at),
+                                candidate.bootstrap_id,
+                            ),
+                        )
+                else:
+                    adopted = await conn.execute(
+                        """
+                        UPDATE paper_position_settlement_state
+                        SET origin_bootstrap_id = ?
+                        WHERE portfolio_id = ? AND origin_bootstrap_id IS NULL
+                        """,
+                        (candidate.bootstrap_id, candidate.portfolio_id),
                     )
+                    if adopted.rowcount != len(expected_position_rows):
+                        raise ExactStateBootstrapError(
+                            "exact position adoption lost its lineage race"
+                        )
                 final_descriptor = await self._sqlite_descriptor_identity(conn)
                 if final_descriptor != descriptor:
                     raise ExactStateBootstrapError(
                         "bootstrap database descriptor changed before commit"
                     )
                 await conn.commit()
+                self._paper_settlement_fault("AFTER_EXACT_BOOTSTRAP_COMMIT")
+                self._verify_exact_state_backup(
+                    candidate,
+                    evidence,
+                    backup_receipt,
+                    descriptor,
+                )
                 return ExactStateBootstrapReceipt(
                     bootstrap_id=candidate.bootstrap_id,
                     candidate_fingerprint=candidate.fingerprint(),
@@ -4402,12 +4477,26 @@ class AsyncTradingDatabase:
         async with self.get_connection() as conn:
             await conn.execute(
                 """
-                INSERT OR REPLACE INTO portfolios
+                INSERT INTO portfolios
                     (id, name, starting_cash, symbols, active,
                      max_position_pct, max_daily_loss_pct, max_open_positions,
                      stop_loss_pct, trailing_stop_pct, use_trailing_stop,
                      enabled_strategies, min_confidence, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    starting_cash = excluded.starting_cash,
+                    symbols = excluded.symbols,
+                    active = excluded.active,
+                    max_position_pct = excluded.max_position_pct,
+                    max_daily_loss_pct = excluded.max_daily_loss_pct,
+                    max_open_positions = excluded.max_open_positions,
+                    stop_loss_pct = excluded.stop_loss_pct,
+                    trailing_stop_pct = excluded.trailing_stop_pct,
+                    use_trailing_stop = excluded.use_trailing_stop,
+                    enabled_strategies = excluded.enabled_strategies,
+                    min_confidence = excluded.min_confidence,
+                    updated_at = CURRENT_TIMESTAMP
             """,
                 (
                     portfolio_data["id"],

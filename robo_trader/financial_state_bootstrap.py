@@ -39,6 +39,9 @@ MAX_EVIDENCE_BYTES = 2 * 1024 * 1024
 RECONCILIATION_EVIDENCE_STATUS = "BOOTSTRAP_EVIDENCE_COMPLETE"
 MARK_EVIDENCE_SOURCE = "pr3-validated-market-data-v1"
 _EVIDENCE_PRODUCER_MARKER = object()
+_EVIDENCE_OBJECT_KEY = os.urandom(32)
+_EVIDENCE_AUTH_DOMAIN = b"robotrader-exact-state-bootstrap-evidence-v1\0"
+_EVIDENCE_AUTH_SUFFIX = ".auth.json"
 
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _BOOTSTRAP_ID = re.compile(r"^pboot-[0-9a-f]{32}$")
@@ -86,13 +89,57 @@ class ExactStateBootstrapEvidence:
     broker_position_count: int
     broker_open_order_count: int
     marks: tuple[ExactBootstrapMarkEvidence, ...]
+    authentication_issued_at: tuple[datetime, ...]
     _producer_marker: object = field(repr=False, compare=False)
+    _producer_digest: str = field(default="", repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self._producer_marker is not _EVIDENCE_PRODUCER_MARKER:
             raise ExactStateBootstrapError(
                 "bootstrap evidence must come from the verified artifact loader"
             )
+
+
+def _evidence_object_digest(evidence: ExactStateBootstrapEvidence) -> str:
+    payload = {
+        "account_scope": evidence.account_scope,
+        "authentication_issued_at": [
+            utc_to_text(value) for value in evidence.authentication_issued_at
+        ],
+        "broker_observed_at": utc_to_text(evidence.broker_observed_at),
+        "broker_open_order_count": evidence.broker_open_order_count,
+        "broker_position_count": evidence.broker_position_count,
+        "broker_snapshot_hash": evidence.broker_snapshot_hash,
+        "database_device": evidence.database_device,
+        "database_identity": evidence.database_identity,
+        "database_inode": evidence.database_inode,
+        "database_path": evidence.database_path,
+        "execution_domain_scope": evidence.execution_domain_scope,
+        "legacy_snapshot_hash": evidence.legacy_snapshot_hash,
+        "marks": [
+            {
+                "artifact_hash": mark.artifact_hash,
+                "artifact_path": mark.artifact_path,
+                "con_id": mark.con_id,
+                "observed_at": utc_to_text(mark.observed_at),
+                "portfolio_id": mark.portfolio_id,
+                "price": decimal_to_fixed(mark.price),
+                "source_event_id": mark.source_event_id,
+                "symbol": mark.symbol,
+            }
+            for mark in evidence.marks
+        ],
+        "portfolio_ids": list(evidence.portfolio_ids),
+        "reconciliation_generated_at": utc_to_text(evidence.reconciliation_generated_at),
+        "reconciliation_report_hash": evidence.reconciliation_report_hash,
+        "reconciliation_snapshot_id": evidence.reconciliation_snapshot_id,
+        "runtime_fingerprint": evidence.runtime_fingerprint,
+    }
+    return hmac.new(
+        _EVIDENCE_OBJECT_KEY,
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +162,7 @@ class ExactStateBootstrapBackupReceipt:
     backup_content_hash: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version != 1:
             raise ExactStateBootstrapError("backup receipt schema is unsupported")
         object.__setattr__(self, "created_at", _utc(self.created_at, "backup created_at"))
         for value, label in (
@@ -201,6 +248,30 @@ def _exact_keys(raw: Mapping[str, Any], expected: set[str], label: str) -> None:
         raise ExactStateBootstrapError(f"{label} fields are incomplete or unknown")
 
 
+def _json_string(value: object, label: str) -> str:
+    if type(value) is not str:
+        raise ExactStateBootstrapError(f"{label} must be a JSON string")
+    return value
+
+
+def _json_int(value: object, label: str, *, minimum: int = 0) -> int:
+    if type(value) is not int or value < minimum:
+        raise ExactStateBootstrapError(f"{label} must be a JSON integer")
+    return value
+
+
+def _json_bool(value: object, label: str) -> bool:
+    if type(value) is not bool:
+        raise ExactStateBootstrapError(f"{label} must be a JSON boolean")
+    return value
+
+
+def _assert_fresh_against_wall_clock(observed_at: datetime, label: str) -> None:
+    age = datetime.now(timezone.utc) - observed_at
+    if age < timedelta(0) or age > MAX_MARK_AGE:
+        raise ExactStateBootstrapError(f"{label} is future or stale against wall clock")
+
+
 def _verified_regular_file_bytes(path: Path, label: str) -> tuple[bytes, os.stat_result]:
     """Read one immutable-by-identity, owner-only artifact without following its leaf."""
 
@@ -216,7 +287,7 @@ def _verified_regular_file_bytes(path: Path, label: str) -> tuple[bytes, os.stat
     try:
         descriptor = os.open(protected, flags)
         before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
             raise ExactStateBootstrapError(f"{label} must be a regular file")
         getuid = getattr(os, "getuid", None)
         if getuid is not None and before.st_uid != getuid():
@@ -243,6 +314,9 @@ def _verified_regular_file_bytes(path: Path, label: str) -> tuple[bytes, os.stat
             or (after.st_dev, after.st_ino) != (current.st_dev, current.st_ino)
             or before.st_size != after.st_size
             or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_nlink != 1
+            or after.st_nlink != 1
+            or current.st_nlink != 1
         ):
             raise ExactStateBootstrapError(f"{label} changed while it was read")
         return payload, after
@@ -262,6 +336,91 @@ def _verified_json(path: Path, label: str) -> tuple[Mapping[str, Any], str]:
     if not isinstance(raw, Mapping):
         raise ExactStateBootstrapError(f"{label} must contain a JSON object")
     return raw, hashlib.sha256(payload).hexdigest()
+
+
+def _evidence_authentication_payload(
+    *,
+    artifact_kind: str,
+    artifact_hash: str,
+    runtime_fingerprint: str,
+    account_scope: str,
+    issued_at: str,
+) -> bytes:
+    body = {
+        "account_scope": account_scope,
+        "artifact_kind": artifact_kind,
+        "artifact_sha256": artifact_hash,
+        "issued_at": issued_at,
+        "runtime_fingerprint": runtime_fingerprint,
+        "schema_version": 1,
+    }
+    return _EVIDENCE_AUTH_DOMAIN + json.dumps(body, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+
+
+def _verify_artifact_authentication(
+    *,
+    artifact_path: Path,
+    artifact_kind: str,
+    artifact_hash: str,
+    runtime_fingerprint: str,
+    account_scope: str,
+) -> datetime:
+    """Verify a detached producer receipt; plain JSON never grants authority."""
+
+    from .config import _validated_safety_account_scope_key
+    from .utils.secure_config import ConfigValidationError
+
+    receipt_path = artifact_path.with_name(artifact_path.name + _EVIDENCE_AUTH_SUFFIX)
+    receipt, _ = _verified_json(receipt_path, f"{artifact_kind} authentication receipt")
+    _exact_keys(
+        receipt,
+        {
+            "schema_version",
+            "artifact_kind",
+            "artifact_sha256",
+            "runtime_fingerprint",
+            "account_scope",
+            "issued_at",
+            "hmac_sha256",
+        },
+        f"{artifact_kind} authentication receipt",
+    )
+    if _json_int(receipt["schema_version"], "authentication schema_version") != 1:
+        raise ExactStateBootstrapError("evidence authentication schema is unsupported")
+    issued_text = _json_string(receipt["issued_at"], "authentication issued_at")
+    issued_at = _utc(issued_text, "authentication issued_at")
+    supplied_mac = _hash(receipt["hmac_sha256"], "authentication hmac_sha256")
+    if (
+        _json_string(receipt["artifact_kind"], "authentication artifact_kind") != artifact_kind
+        or _hash(receipt["artifact_sha256"], "authentication artifact_sha256") != artifact_hash
+        or _json_string(receipt["runtime_fingerprint"], "authentication runtime_fingerprint")
+        != runtime_fingerprint
+        or _json_string(receipt["account_scope"], "authentication account_scope") != account_scope
+    ):
+        raise ExactStateBootstrapError("evidence authentication receipt is cross-bound")
+    try:
+        key = _validated_safety_account_scope_key(os.environ.get("SAFETY_ACCOUNT_SCOPE_KEY"))
+    except ConfigValidationError as exc:
+        raise ExactStateBootstrapError(
+            "SAFETY_ACCOUNT_SCOPE_KEY is required to authenticate bootstrap evidence"
+        ) from exc
+    expected_mac = hmac.new(
+        key,
+        _evidence_authentication_payload(
+            artifact_kind=artifact_kind,
+            artifact_hash=artifact_hash,
+            runtime_fingerprint=runtime_fingerprint,
+            account_scope=account_scope,
+            issued_at=issued_text,
+        ),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(supplied_mac, expected_mac):
+        raise ExactStateBootstrapError("evidence authentication receipt is invalid")
+    _assert_fresh_against_wall_clock(issued_at, "evidence authentication receipt")
+    return issued_at
 
 
 def verified_file_sha256(path: Path, label: str = "file") -> tuple[str, os.stat_result]:
@@ -323,8 +482,14 @@ def load_exact_state_bootstrap_evidence(
         database_metadata = os.lstat(database_path)
     except OSError as exc:
         raise ExactStateBootstrapError("runtime database identity cannot be inspected") from exc
-    if stat.S_ISLNK(database_metadata.st_mode) or not stat.S_ISREG(database_metadata.st_mode):
-        raise ExactStateBootstrapError("runtime database must be a non-symlink regular file")
+    if (
+        stat.S_ISLNK(database_metadata.st_mode)
+        or not stat.S_ISREG(database_metadata.st_mode)
+        or database_metadata.st_nlink != 1
+    ):
+        raise ExactStateBootstrapError(
+            "runtime database must be a single-link non-symlink regular file"
+        )
 
     broker, broker_hash = _verified_json(Path(broker_snapshot_path), "broker snapshot")
     _exact_keys(
@@ -347,27 +512,34 @@ def load_exact_state_bootstrap_evidence(
         },
         "broker snapshot",
     )
-    if broker["schema_version"] != 1:
+    if _json_int(broker["schema_version"], "broker schema_version") != 1:
         raise ExactStateBootstrapError("broker snapshot schema is unsupported")
     broker_observed_at = _utc(broker["observed_at"], "broker observed_at")
     broker_time_before = _utc(broker["broker_time_before"], "broker_time_before")
     broker_time_after = _utc(broker["broker_time_after"], "broker_time_after")
     if not broker_time_before <= broker_observed_at <= broker_time_after:
         raise ExactStateBootstrapError("broker snapshot time bounds are inconsistent")
+    _assert_fresh_against_wall_clock(broker_observed_at, "broker snapshot")
     if (
-        broker["runtime_fingerprint"] != runtime_fingerprint
-        or broker["execution_domain_scope"] != PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
-        or not hmac.compare_digest(str(broker["account_scope"]), account_scope)
-        or str(broker["broker_host"]).casefold()
+        _json_string(broker["runtime_fingerprint"], "broker runtime_fingerprint")
+        != runtime_fingerprint
+        or _json_string(broker["execution_domain_scope"], "broker execution_domain_scope")
+        != PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
+        or not hmac.compare_digest(
+            _json_string(broker["account_scope"], "broker account_scope"), account_scope
+        )
+        or _json_string(broker["broker_host"], "broker broker_host").casefold()
         != str(expected_runtime_contract.ibkr_host).casefold()
-        or broker["broker_port"] != 4002
-        or broker["read_only"] is not True
-        or broker["managed_account_count"] != 1
+        or _json_int(broker["broker_port"], "broker broker_port") != 4002
+        or _json_bool(broker["read_only"], "broker read_only") is not True
+        or _json_int(broker["managed_account_count"], "broker managed_account_count") != 1
     ):
         raise ExactStateBootstrapError("broker snapshot is not bound to runtime evidence")
+    if type(broker["positions"]) is not list or type(broker["open_orders"]) is not list:
+        raise ExactStateBootstrapError("broker position/order evidence must be JSON arrays")
     if broker["positions"] != [] or broker["open_orders"] != []:
         raise ExactStateBootstrapError("broker snapshot does not prove zero paper exposure")
-    host = str(broker["broker_host"]).casefold()
+    host = _json_string(broker["broker_host"], "broker broker_host").casefold()
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
@@ -377,6 +549,13 @@ def load_exact_state_bootstrap_evidence(
     ):
         raise ExactStateBootstrapError("broker snapshot is not bound to loopback")
     broker_snapshot_id = _safe_id(broker["snapshot_id"], "broker snapshot_id")
+    broker_authenticated_at = _verify_artifact_authentication(
+        artifact_path=Path(broker_snapshot_path),
+        artifact_kind="broker_snapshot",
+        artifact_hash=broker_hash,
+        runtime_fingerprint=runtime_fingerprint,
+        account_scope=account_scope,
+    )
 
     reconciliation, reconciliation_hash = _verified_json(
         Path(reconciliation_path), "reconciliation report"
@@ -409,34 +588,70 @@ def load_exact_state_bootstrap_evidence(
     )
     portfolio_ids = reconciliation["portfolio_ids"]
     if (
-        reconciliation["schema_version"] != 1
-        or reconciliation["status"] != RECONCILIATION_EVIDENCE_STATUS
-        or reconciliation["authorizes_startup"] is not False
-        or reconciliation["mutated_state"] is not False
-        or reconciliation["managed_account_count"] != 1
-        or reconciliation["broker_positions_count"] != 0
-        or reconciliation["broker_open_orders_count"] != 0
-        or reconciliation["runtime_fingerprint"] != runtime_fingerprint
-        or reconciliation["execution_domain_scope"] != PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
-        or not hmac.compare_digest(str(reconciliation["account_scope"]), account_scope)
-        or reconciliation["database_path"] != str(database_path)
-        or reconciliation["database_identity"] != database_identity
-        or reconciliation["database_device"] != database_metadata.st_dev
-        or reconciliation["database_inode"] != database_metadata.st_ino
-        or reconciliation["broker_snapshot_id"] != broker_snapshot_id
-        or not hmac.compare_digest(str(reconciliation["broker_snapshot_hash"]), broker_hash)
-        or not isinstance(portfolio_ids, list)
+        _json_int(reconciliation["schema_version"], "reconciliation schema_version") != 1
+        or _json_string(reconciliation["status"], "reconciliation status")
+        != RECONCILIATION_EVIDENCE_STATUS
+        or _json_bool(reconciliation["authorizes_startup"], "reconciliation authorizes_startup")
+        is not False
+        or _json_bool(reconciliation["mutated_state"], "reconciliation mutated_state") is not False
+        or _json_int(
+            reconciliation["managed_account_count"], "reconciliation managed_account_count"
+        )
+        != 1
+        or _json_int(
+            reconciliation["broker_positions_count"], "reconciliation broker_positions_count"
+        )
+        != 0
+        or _json_int(
+            reconciliation["broker_open_orders_count"],
+            "reconciliation broker_open_orders_count",
+        )
+        != 0
+        or _json_string(reconciliation["runtime_fingerprint"], "reconciliation runtime_fingerprint")
+        != runtime_fingerprint
+        or _json_string(
+            reconciliation["execution_domain_scope"],
+            "reconciliation execution_domain_scope",
+        )
+        != PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
+        or not hmac.compare_digest(
+            _json_string(reconciliation["account_scope"], "reconciliation account_scope"),
+            account_scope,
+        )
+        or _json_string(reconciliation["database_path"], "reconciliation database_path")
+        != str(database_path)
+        or _json_string(reconciliation["database_identity"], "reconciliation database_identity")
+        != database_identity
+        or _json_int(reconciliation["database_device"], "reconciliation database_device")
+        != database_metadata.st_dev
+        or _json_int(reconciliation["database_inode"], "reconciliation database_inode")
+        != database_metadata.st_ino
+        or _json_string(reconciliation["broker_snapshot_id"], "reconciliation broker_snapshot_id")
+        != broker_snapshot_id
+        or not hmac.compare_digest(
+            _hash(reconciliation["broker_snapshot_hash"], "reconciliation broker_snapshot_hash"),
+            broker_hash,
+        )
+        or type(portfolio_ids) is not list
         or not portfolio_ids
-        or any(not isinstance(value, str) for value in portfolio_ids)
+        or any(type(value) is not str for value in portfolio_ids)
         or portfolio_ids != sorted(set(portfolio_ids))
     ):
         raise ExactStateBootstrapError("reconciliation report is not bound to runtime evidence")
     generated_at = _utc(reconciliation["generated_at"], "reconciliation generated_at")
+    _assert_fresh_against_wall_clock(generated_at, "reconciliation report")
     legacy_snapshot_hash = _hash(
         reconciliation["legacy_snapshot_hash"], "reconciliation legacy_snapshot_hash"
     )
     reconciliation_snapshot_id = _safe_id(
         reconciliation["snapshot_id"], "reconciliation snapshot_id"
+    )
+    reconciliation_authenticated_at = _verify_artifact_authentication(
+        artifact_path=Path(reconciliation_path),
+        artifact_kind="reconciliation_report",
+        artifact_hash=reconciliation_hash,
+        runtime_fingerprint=runtime_fingerprint,
+        account_scope=account_scope,
     )
 
     if not isinstance(protective_mark_paths, Sequence) or isinstance(
@@ -444,6 +659,7 @@ def load_exact_state_bootstrap_evidence(
     ):
         raise ExactStateBootstrapError("protective mark paths must be a sequence")
     marks: list[ExactBootstrapMarkEvidence] = []
+    authentication_times = [broker_authenticated_at, reconciliation_authenticated_at]
     for mark_path in protective_mark_paths:
         mark, mark_hash = _verified_json(Path(mark_path), "protective mark")
         _exact_keys(
@@ -464,36 +680,51 @@ def load_exact_state_bootstrap_evidence(
             "protective mark",
         )
         if (
-            mark["schema_version"] != 1
-            or mark["source"] != MARK_EVIDENCE_SOURCE
-            or mark["runtime_fingerprint"] != runtime_fingerprint
-            or mark["execution_domain_scope"] != PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
-            or not hmac.compare_digest(str(mark["account_scope"]), account_scope)
-            or type(mark["con_id"]) is not int
-            or mark["con_id"] <= 0
+            _json_int(mark["schema_version"], "mark schema_version") != 1
+            or _json_string(mark["source"], "mark source") != MARK_EVIDENCE_SOURCE
+            or _json_string(mark["runtime_fingerprint"], "mark runtime_fingerprint")
+            != runtime_fingerprint
+            or _json_string(mark["execution_domain_scope"], "mark execution_domain_scope")
+            != PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
+            or not hmac.compare_digest(
+                _json_string(mark["account_scope"], "mark account_scope"), account_scope
+            )
+            or _json_int(mark["con_id"], "mark con_id", minimum=1) <= 0
         ):
             raise ExactStateBootstrapError("protective mark lacks PR3/runtime lineage")
         portfolio_id = _safe_id(mark["portfolio_id"], "mark portfolio_id")
-        symbol = str(mark["symbol"]).strip().upper()
-        if mark["symbol"] != symbol or not _SYMBOL.fullmatch(symbol):
+        raw_symbol = _json_string(mark["symbol"], "mark symbol")
+        symbol = raw_symbol.strip().upper()
+        if raw_symbol != symbol or not _SYMBOL.fullmatch(symbol):
             raise ExactStateBootstrapError("protective mark symbol is malformed")
+        mark_observed_at = _utc(mark["observed_at"], "mark observed_at")
+        _assert_fresh_against_wall_clock(mark_observed_at, "protective mark")
         marks.append(
             ExactBootstrapMarkEvidence(
                 portfolio_id=portfolio_id,
                 symbol=symbol,
                 price=_decimal(mark["price_text"], "mark price", positive=True),
-                observed_at=_utc(mark["observed_at"], "mark observed_at"),
+                observed_at=mark_observed_at,
                 source_event_id=_safe_id(mark["source_event_id"], "mark source_event_id"),
                 con_id=mark["con_id"],
                 artifact_path=str(Path(mark_path)),
                 artifact_hash=mark_hash,
             )
         )
+        authentication_times.append(
+            _verify_artifact_authentication(
+                artifact_path=Path(mark_path),
+                artifact_kind="protective_mark",
+                artifact_hash=mark_hash,
+                runtime_fingerprint=runtime_fingerprint,
+                account_scope=account_scope,
+            )
+        )
     mark_keys = [(mark.portfolio_id, mark.symbol) for mark in marks]
-    if not marks or mark_keys != sorted(mark_keys) or len(mark_keys) != len(set(mark_keys)):
-        raise ExactStateBootstrapError("protective marks must be nonempty, unique, and sorted")
+    if mark_keys != sorted(mark_keys) or len(mark_keys) != len(set(mark_keys)):
+        raise ExactStateBootstrapError("protective marks must be unique and sorted")
 
-    return ExactStateBootstrapEvidence(
+    evidence = ExactStateBootstrapEvidence(
         reconciliation_snapshot_id=reconciliation_snapshot_id,
         reconciliation_report_hash=reconciliation_hash,
         broker_snapshot_hash=broker_hash,
@@ -511,8 +742,11 @@ def load_exact_state_bootstrap_evidence(
         broker_position_count=0,
         broker_open_order_count=0,
         marks=tuple(marks),
+        authentication_issued_at=tuple(authentication_times),
         _producer_marker=_EVIDENCE_PRODUCER_MARKER,
     )
+    object.__setattr__(evidence, "_producer_digest", _evidence_object_digest(evidence))
+    return evidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -609,7 +843,7 @@ class ExactStateBootstrapCandidate:
     schema_version: int = BOOTSTRAP_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema_version != BOOTSTRAP_SCHEMA_VERSION:
+        if type(self.schema_version) is not int or self.schema_version != BOOTSTRAP_SCHEMA_VERSION:
             raise ExactStateBootstrapError("unsupported bootstrap schema version")
         if not _BOOTSTRAP_ID.fullmatch(self.bootstrap_id):
             raise ExactStateBootstrapError("bootstrap_id is malformed")
@@ -641,8 +875,6 @@ class ExactStateBootstrapCandidate:
         effective_at = _utc(self.effective_at, "effective_at")
         object.__setattr__(self, "effective_at", effective_at)
         positions = tuple(self.positions)
-        if not positions:
-            raise ExactStateBootstrapError("bootstrap must describe every nonzero legacy position")
         if any(type(position) is not ExactBootstrapPosition for position in positions):
             raise ExactStateBootstrapError("bootstrap positions are malformed")
         symbols = [position.symbol for position in positions]
@@ -720,34 +952,60 @@ class ExactStateBootstrapCandidate:
         account_raw = raw["account"]
         if not isinstance(account_raw, Mapping):
             raise ExactStateBootstrapError("bootstrap account is malformed")
+        _exact_keys(
+            account_raw,
+            {
+                "cash_text",
+                "realized_pnl_text",
+                "daily_pnl_text",
+                "daily_pnl_baseline_text",
+                "daily_pnl_date",
+            },
+            "bootstrap account",
+        )
         try:
-            daily_pnl_date = date.fromisoformat(str(account_raw.get("daily_pnl_date")))
+            daily_pnl_date = date.fromisoformat(
+                _json_string(account_raw["daily_pnl_date"], "daily_pnl_date")
+            )
         except ValueError as exc:
             raise ExactStateBootstrapError("daily_pnl_date is invalid") from exc
         account = ExactBootstrapAccount(
-            cash=account_raw.get("cash_text"),
-            realized_pnl=account_raw.get("realized_pnl_text"),
-            daily_pnl=account_raw.get("daily_pnl_text"),
-            daily_pnl_baseline=account_raw.get("daily_pnl_baseline_text"),
+            cash=account_raw["cash_text"],
+            realized_pnl=account_raw["realized_pnl_text"],
+            daily_pnl=account_raw["daily_pnl_text"],
+            daily_pnl_baseline=account_raw["daily_pnl_baseline_text"],
             daily_pnl_date=daily_pnl_date,
         )
         positions_raw = raw["positions"]
         if not isinstance(positions_raw, list):
             raise ExactStateBootstrapError("bootstrap positions must be a list")
-        positions = tuple(
-            ExactBootstrapPosition(
-                symbol=item["symbol"],
-                quantity=item["quantity"],
-                cost_basis=item["cost_basis_text"],
-                mark_price=item["mark_price_text"],
-                mark_observed_at=item["mark_observed_at"],
-                mark_evidence_fingerprint=item["mark_evidence_fingerprint"],
+        positions_list: list[ExactBootstrapPosition] = []
+        for item in positions_raw:
+            if not isinstance(item, Mapping):
+                raise ExactStateBootstrapError("bootstrap position item is malformed")
+            _exact_keys(
+                item,
+                {
+                    "symbol",
+                    "quantity",
+                    "cost_basis_text",
+                    "mark_price_text",
+                    "mark_observed_at",
+                    "mark_evidence_fingerprint",
+                },
+                "bootstrap position",
             )
-            for item in positions_raw
-            if isinstance(item, Mapping)
-        )
-        if len(positions) != len(positions_raw):
-            raise ExactStateBootstrapError("bootstrap position item is malformed")
+            positions_list.append(
+                ExactBootstrapPosition(
+                    symbol=item["symbol"],
+                    quantity=item["quantity"],
+                    cost_basis=item["cost_basis_text"],
+                    mark_price=item["mark_price_text"],
+                    mark_observed_at=item["mark_observed_at"],
+                    mark_evidence_fingerprint=item["mark_evidence_fingerprint"],
+                )
+            )
+        positions = tuple(positions_list)
         return cls(
             bootstrap_id=raw["bootstrap_id"],
             execution_domain_scope=raw["execution_domain_scope"],
@@ -779,9 +1037,26 @@ def assert_exact_state_bootstrap_evidence(
         raise ExactStateBootstrapError("candidate has the wrong type")
     if type(evidence) is not ExactStateBootstrapEvidence:
         raise ExactStateBootstrapError("bootstrap evidence has the wrong type")
+    if evidence._producer_marker is not _EVIDENCE_PRODUCER_MARKER or not hmac.compare_digest(
+        evidence._producer_digest,
+        _evidence_object_digest(evidence),
+    ):
+        raise ExactStateBootstrapError("bootstrap evidence is not producer-owned")
     database_path, database_identity, runtime_fingerprint, account_scope = _runtime_contract_values(
         runtime_contract
     )
+    try:
+        database_metadata = os.lstat(database_path)
+    except OSError as exc:
+        raise ExactStateBootstrapError("runtime database cannot be revalidated") from exc
+    if (
+        not stat.S_ISREG(database_metadata.st_mode)
+        or stat.S_ISLNK(database_metadata.st_mode)
+        or database_metadata.st_nlink != 1
+        or (database_metadata.st_dev, database_metadata.st_ino)
+        != (evidence.database_device, evidence.database_inode)
+    ):
+        raise ExactStateBootstrapError("runtime database identity or link count changed")
     if (
         candidate.database_path != str(database_path)
         or candidate.database_identity != database_identity
@@ -811,12 +1086,16 @@ def assert_exact_state_bootstrap_evidence(
         age = candidate.effective_at - observed
         if age < timedelta(0) or age > MAX_MARK_AGE:
             raise ExactStateBootstrapError(f"{label} is future or stale")
+        _assert_fresh_against_wall_clock(observed, label)
+    for issued_at in evidence.authentication_issued_at:
+        _assert_fresh_against_wall_clock(issued_at, "evidence authentication receipt")
     evidence_marks = {(mark.portfolio_id, mark.symbol): mark for mark in evidence.marks}
     candidate_keys = {(candidate.portfolio_id, position.symbol) for position in candidate.positions}
     if set(evidence_marks) != candidate_keys:
         raise ExactStateBootstrapError("verified marks do not cover the candidate positions")
     for position in candidate.positions:
         mark = evidence_marks[(candidate.portfolio_id, position.symbol)]
+        _assert_fresh_against_wall_clock(mark.observed_at, f"protective mark for {position.symbol}")
         if (
             mark.price != position.mark_price
             or mark.observed_at != position.mark_observed_at

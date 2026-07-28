@@ -17,7 +17,11 @@ def _candidate(database_path: Path, *, portfolio_id: str = "default") -> SimpleN
         bootstrap_id="pbs-test",
         database_path=str(database_path),
         database_identity="paper:test",
-        legacy_snapshot_hash="a" * 64,
+        legacy_snapshot_hash=(
+            str(cli.inspect_legacy_state(database_path)["snapshot_hash"])
+            if database_path.exists() and database_path.stat().st_size
+            else "a" * 64
+        ),
         reconciliation_snapshot_id="recon-test",
         reconciliation_report_hash="b" * 64,
         broker_snapshot_hash="c" * 64,
@@ -35,16 +39,33 @@ def _legacy_database(path: Path, *, wal: bool = False) -> sqlite3.Connection:
         assert connection.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
         connection.execute("PRAGMA wal_autocheckpoint=0")
     connection.executescript("""
-        CREATE TABLE account (portfolio_id TEXT PRIMARY KEY, cash REAL);
+        CREATE TABLE portfolios (id TEXT PRIMARY KEY, name TEXT);
+        CREATE TABLE account (
+            portfolio_id TEXT PRIMARY KEY, cash REAL, equity REAL,
+            daily_pnl REAL, realized_pnl REAL, unrealized_pnl REAL,
+            timestamp DATETIME
+        );
         CREATE TABLE positions (
-            portfolio_id TEXT, symbol TEXT, quantity INTEGER,
+            portfolio_id TEXT, symbol TEXT, quantity INTEGER, avg_cost REAL,
+            market_price REAL, timestamp DATETIME,
             PRIMARY KEY(portfolio_id, symbol)
         );
-        CREATE TABLE trades (id INTEGER PRIMARY KEY, symbol TEXT);
-        CREATE TABLE equity_history (id INTEGER PRIMARY KEY, equity REAL);
-        INSERT INTO account VALUES ('default', 100000);
-        INSERT INTO trades(symbol) VALUES ('AAPL');
-        INSERT INTO equity_history(equity) VALUES (100000);
+        CREATE TABLE trades (
+            id INTEGER PRIMARY KEY, portfolio_id TEXT, symbol TEXT, side TEXT,
+            quantity INTEGER, price REAL, notional REAL, slippage REAL,
+            commission REAL, pnl REAL, timestamp DATETIME
+        );
+        CREATE TABLE equity_history (
+            id INTEGER PRIMARY KEY, portfolio_id TEXT, date TEXT, equity REAL,
+            cash REAL, positions_value REAL, realized_pnl REAL,
+            unrealized_pnl REAL, timestamp DATETIME
+        );
+        INSERT INTO account VALUES ('default',100000,100000,0,0,0,'2026-07-28');
+        INSERT INTO portfolios VALUES ('default','Default');
+        INSERT INTO trades VALUES
+            (1,'default','AAPL','BUY',1,100,100,0,0,NULL,'2026-07-28');
+        INSERT INTO equity_history VALUES
+            (1,'default','2026-07-28',100000,99900,100,0,0,'2026-07-28');
     """)
     connection.commit()
     return connection
@@ -62,6 +83,9 @@ def test_online_backup_includes_active_wal_and_is_restorable(
     backup = cli._online_backup(source, target, _candidate(source))
     try:
         backup.assert_identity()
+        assert target.stat().st_mode & 0o222 == 0
+        with pytest.raises(OSError):
+            os.write(backup.target_binding.descriptor, b"x")
         assert dict(backup.row_counts)["trades"] == 2
         with sqlite3.connect(target) as restored:
             assert restored.execute("PRAGMA integrity_check").fetchone() == ("ok",)
@@ -80,6 +104,7 @@ def test_online_backup_rejects_source_path_substitution(
 ) -> None:
     source = tmp_path / "source.db"
     _legacy_database(source).close()
+    candidate = _candidate(source)
     original_connect = cli.sqlite3.connect
     replaced = False
 
@@ -93,7 +118,7 @@ def test_online_backup_rejects_source_path_substitution(
 
     monkeypatch.setattr(cli.sqlite3, "connect", substitute_then_connect)
     with pytest.raises(Exception, match="identit"):
-        cli._online_backup(source, tmp_path / "backup.db", _candidate(source))
+        cli._online_backup(source, tmp_path / "backup.db", candidate)
 
 
 def test_online_backup_rejects_target_substitution_and_leaves_file(
@@ -102,6 +127,7 @@ def test_online_backup_rejects_target_substitution_and_leaves_file(
 ) -> None:
     source = tmp_path / "source.db"
     _legacy_database(source).close()
+    candidate = _candidate(source)
     target = tmp_path / "backup.db"
     moved = tmp_path / "reserved-original.db"
     original_connect = cli.sqlite3.connect
@@ -117,7 +143,7 @@ def test_online_backup_rejects_target_substitution_and_leaves_file(
 
     monkeypatch.setattr(cli.sqlite3, "connect", substitute_then_connect)
     with pytest.raises(Exception, match="identit|file is not a database"):
-        cli._online_backup(source, target, _candidate(source))
+        cli._online_backup(source, target, candidate)
     assert target.exists()
     assert target.read_bytes() == b"replacement must remain"
     assert moved.exists()
