@@ -897,6 +897,20 @@ class AsyncRunner:
         Returns:
             (True, reason) if trading should be blocked, else (False, "").
         """
+        # The lock file is the deny-by-default cross-process signal.  It must
+        # be checked independently of the in-memory KillSwitch because another
+        # process can create it after this runner's state was loaded.  A
+        # metadata error is uncertainty about a hard safety signal, so entries
+        # fail closed.  Semantic reductions bypass this entry-only gate above.
+        try:
+            Path("data/kill_switch.lock").lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.error("Kill-switch lock state is unavailable: %s", type(exc).__name__)
+            return True, "Kill switch lock state unavailable"
+        else:
+            return True, "Kill switch lock active"
         try:
             freeze_reason = getattr(self, "_emergency_entry_freeze_reason", None)
             if freeze_reason:
@@ -1720,6 +1734,18 @@ class AsyncRunner:
                     if not self._entry_session_is_canonical(order.symbol, broker_quote):
                         return self._rejected_order_result(
                             "Entry blocked: canonical session evidence expired during final admission"
+                        )
+                    # ``serialize_entry`` and ``portfolio.equity`` both await.
+                    # Recheck the in-memory and cross-process kill-switch state
+                    # at the final synchronous boundary before the one-shot
+                    # entry authority is consumed.  The gateway intentionally
+                    # bypasses PaperExecutor.place_order(), so this preserves
+                    # the terminal lock-file protection formerly supplied by
+                    # BaseExecutor.validate_order().
+                    blocked, reason = self._trading_blocked()
+                    if blocked:
+                        return self._rejected_order_result(
+                            f"Entry blocked at terminal safety gate: {reason}"
                         )
                     with Timer("order_execution", self.monitor):
                         result = gateway.submit_baseline_entry(

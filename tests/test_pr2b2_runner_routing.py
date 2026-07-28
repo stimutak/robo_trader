@@ -515,6 +515,101 @@ async def test_entry_dispatch_occurs_inside_gateway_serialization(
 
 
 @pytest.mark.asyncio
+async def test_entry_terminal_gate_rechecks_lock_file_after_equity_await(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("robo_trader.runner_async.is_extended_hours", lambda: False)
+    (tmp_path / "data").mkdir()
+    gateway, probe = _exact_gateway()
+    runner = _runner(gateway)
+
+    async def equity_then_lock(_prices) -> Decimal:
+        (tmp_path / "data" / "kill_switch.lock").touch()
+        return Decimal("100000")
+
+    runner.portfolio.equity = AsyncMock(side_effect=equity_then_lock)
+
+    result = await _place(runner, _order("BUY"))
+
+    assert result.ok is False
+    assert "terminal safety gate" in result.message
+    assert "kill switch lock active" in result.message.lower()
+    assert probe.enter_count == 1
+    assert probe.exit_count == 1
+    gateway.submit_baseline_entry.assert_not_called()
+    runner.executor.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_entry_terminal_gate_rechecks_in_memory_kill_switch_after_equity_await(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("robo_trader.runner_async.is_extended_hours", lambda: False)
+    gateway, _ = _exact_gateway()
+    runner = _runner(gateway)
+
+    async def equity_then_trigger(_prices) -> Decimal:
+        runner.advanced_risk.kill_switch.triggered = True
+        runner.advanced_risk.kill_switch.trigger_reason = "Loss limit crossed"
+        return Decimal("100000")
+
+    runner.portfolio.equity = AsyncMock(side_effect=equity_then_trigger)
+
+    result = await _place(runner, _order("BUY"))
+
+    assert result.ok is False
+    assert "terminal safety gate" in result.message
+    assert "loss limit crossed" in result.message.lower()
+    gateway.submit_baseline_entry.assert_not_called()
+    runner.executor.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_entry_fails_closed_when_lock_file_state_is_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway, _ = _exact_gateway()
+    runner = _runner(gateway)
+
+    def unreadable_lock(_path: Path):
+        raise PermissionError("lock metadata denied")
+
+    monkeypatch.setattr(Path, "lstat", unreadable_lock)
+
+    result = await _place(runner, _order("BUY"))
+
+    assert result.ok is False
+    assert "lock state unavailable" in result.message.lower()
+    gateway.serialize_entry.assert_not_called()
+    gateway.submit_baseline_entry.assert_not_called()
+    runner.executor.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reduction_still_bypasses_entry_only_lock_file_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "kill_switch.lock").touch()
+    expected = ExecutionResult(True, "gateway reduction filled", 99.5)
+    gateway, _ = _exact_gateway(reduction_result=expected)
+    runner = _runner(gateway)
+
+    result = await _place(runner, _order("SELL"))
+
+    assert result is expected
+    gateway.submit_reduction.assert_awaited_once()
+    gateway.submit_baseline_entry.assert_not_called()
+    runner.executor.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_new_short_rejects_before_gateway_or_executor() -> None:
     gateway, _ = _exact_gateway()
     runner = _runner(gateway)
