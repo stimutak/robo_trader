@@ -62,15 +62,17 @@ class _DecisionReplayTombstones:
         if consumed_at >= expires_at:
             raise EntryRiskContractError("RiskDecision expired before consumption")
 
-        expired_keys = tuple(key for key, expiry in self._entries.items() if expiry <= consumed_at)
-        for key in expired_keys:
-            self._entries.pop(key, None)
-
         if replay_key in self._entries:
             raise EntryRiskContractError("RiskDecision semantic replay detected")
-        if len(self._entries) >= self._limit:
+
+        # A rejected call must not weaken replay protection for any other
+        # decision.  Derive the next registry state without mutating the live
+        # tombstones, then commit it only after every validation succeeds.
+        survivors = {key: expiry for key, expiry in self._entries.items() if expiry > consumed_at}
+        if len(survivors) >= self._limit:
             raise EntryRiskContractError("RiskDecision live replay registry capacity exhausted")
-        self._entries[replay_key] = expires_at
+        survivors[replay_key] = expires_at
+        self._entries = survivors
 
 
 def _build_capability_authority():

@@ -1314,6 +1314,36 @@ def test_invalid_future_consumption_does_not_mutate_live_replay_state() -> None:
         )
 
 
+def test_rejected_replay_does_not_prune_unrelated_expired_tombstone() -> None:
+    tombstones = _DecisionReplayTombstones(3)
+    short_key = ("risk-decision-v1", 1, "portfolio-alpha", "intent-short")
+    long_key = ("risk-decision-v1", 1, "portfolio-alpha", "intent-long")
+    tombstones.record(
+        short_key,
+        expires_at=NOW + timedelta(seconds=2),
+        consumed_at=NOW,
+    )
+    tombstones.record(
+        long_key,
+        expires_at=NOW + timedelta(seconds=10),
+        consumed_at=NOW,
+    )
+
+    with pytest.raises(EntryRiskContractError, match="semantic replay"):
+        tombstones.record(
+            long_key,
+            expires_at=NOW + timedelta(seconds=10),
+            consumed_at=NOW + timedelta(seconds=3),
+        )
+
+    with pytest.raises(EntryRiskContractError, match="semantic replay"):
+        tombstones.record(
+            short_key,
+            expires_at=NOW + timedelta(seconds=2),
+            consumed_at=NOW + timedelta(seconds=1),
+        )
+
+
 def test_risk_decision_cannot_be_consumed_before_evaluation() -> None:
     decision = _decision_with_ids("pre-evaluation-consumption")
 
