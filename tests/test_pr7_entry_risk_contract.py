@@ -2,10 +2,11 @@
 
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_UP, Decimal, Overflow, localcontext
 
 import pytest
 
+from robo_trader.risk import entry_contract as entry_contract_module
 from robo_trader.risk.entry_contract import (
     ENTRY_RISK_CONTRACT_VERSION,
     GATE_A_MAX_POSITION_FRACTION,
@@ -187,6 +188,79 @@ def test_configured_two_percent_cap_floors_quantity_and_never_rounds_up() -> Non
     assert boundary.approved_quantity == 2
     assert boundary.approved_notional_usd == Decimal("1333.34")
     assert boundary.approved_notional_usd <= Decimal("2000")
+
+
+def test_ambient_decimal_context_cannot_round_the_two_percent_cap_up() -> None:
+    equity = Decimal("99999")
+    exact_cap = Decimal("1999.98")
+    evidence = _evidence(
+        portfolio_equity_usd=equity,
+        quote=_quote(price_usd=Decimal("1000")),
+    )
+
+    with localcontext() as context:
+        context.prec = 3
+        context.rounding = ROUND_UP
+        context.Emax = 3
+        context.Emin = -3
+        context.clamp = 1
+        context.traps[Overflow] = False
+        decision = _evaluate(evidence=evidence)
+
+    assert decision.risk_approved is True
+    assert decision.approved_quantity == 1
+    assert decision.approved_notional_usd == Decimal("1000")
+    assert decision.approved_notional_usd <= exact_cap
+    assert decision.limiting_capacity is LimitingCapacity.SYMBOL
+
+
+def test_large_coefficients_remain_exact_under_hostile_ambient_context() -> None:
+    equity = Decimal("9" * 250 + ".99")
+    generous_capacity = Decimal("9" * 252)
+    price = Decimal("1" + "0" * 248)
+    evidence = _evidence(
+        portfolio_equity_usd=equity,
+        cash_available_usd=generous_capacity,
+        buying_power_usd=generous_capacity,
+        current_symbol_gross_notional_usd=Decimal("0.01"),
+        quote=_quote(price_usd=price),
+        liquidity=LiquidityEvidence(
+            complete=True,
+            average_daily_dollar_volume_usd=generous_capacity,
+            observed_at=NOW - timedelta(seconds=1),
+        ),
+    )
+    limits = _limits(max_daily_notional_usd=generous_capacity)
+
+    with localcontext() as context:
+        context.prec = 2
+        context.rounding = ROUND_UP
+        context.Emax = 9
+        context.Emin = -9
+        context.clamp = 1
+        context.traps[Overflow] = False
+        decision = _evaluate(evidence=evidence, limits=limits)
+
+    assert decision.risk_approved is True
+    assert decision.approved_quantity == 1
+    assert decision.approved_notional_usd == price
+    assert decision.limiting_capacity is LimitingCapacity.SYMBOL
+
+
+def test_final_postcondition_checks_every_capacity_not_only_reported_minimum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        entry_contract_module,
+        "_minimum_capacity",
+        lambda capacities: (LimitingCapacity.REQUEST, Decimal("3000")),
+    )
+
+    with pytest.raises(
+        EntryRiskContractError,
+        match="exceeded the exact symbol capacity",
+    ):
+        _evaluate()
 
 
 def test_gate_a_rejects_a_configured_position_cap_above_two_percent() -> None:

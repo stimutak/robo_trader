@@ -12,7 +12,18 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_DOWN, Decimal, InvalidOperation, localcontext
+from decimal import (
+    MAX_EMAX,
+    MAX_PREC,
+    MIN_EMIN,
+    ROUND_DOWN,
+    Context,
+    Decimal,
+    DecimalException,
+    Inexact,
+    Rounded,
+    localcontext,
+)
 from enum import Enum
 from typing import Optional
 
@@ -592,15 +603,99 @@ def _evidence_is_current(
     )
 
 
-def _floor_quantity(capacity_usd: Decimal, price_usd: Decimal) -> int:
+def _isolated_context(required_precision: int) -> Context:
+    if required_precision <= 0 or required_precision > MAX_PREC:
+        raise EntryRiskContractError("exact risk arithmetic precision is unsupported")
+    return Context(
+        prec=max(32, required_precision),
+        rounding=ROUND_DOWN,
+        Emin=MIN_EMIN,
+        Emax=MAX_EMAX,
+        capitals=1,
+        clamp=0,
+    )
+
+
+def _exact_multiply(left: Decimal, right: Decimal, field_name: str) -> Decimal:
+    precision = len(left.as_tuple().digits) + len(right.as_tuple().digits) + 2
     try:
-        digits = len(capacity_usd.as_tuple().digits) + len(price_usd.as_tuple().digits) + 8
-        with localcontext() as context:
-            context.prec = max(32, digits)
+        with localcontext(_isolated_context(precision)) as context:
+            result = left * right
+            if context.flags[Inexact] or context.flags[Rounded]:
+                raise EntryRiskContractError(f"{field_name} multiplication was not exact")
+            return result
+    except (DecimalException, OverflowError, ValueError) as exc:
+        raise EntryRiskContractError(f"{field_name} multiplication failed") from exc
+
+
+def _exact_subtract(left: Decimal, right: Decimal, field_name: str) -> Decimal:
+    left_exponent = int(left.as_tuple().exponent)
+    right_exponent = int(right.as_tuple().exponent)
+    precision = max(left.adjusted(), right.adjusted()) - min(left_exponent, right_exponent) + 3
+    try:
+        with localcontext(_isolated_context(precision)) as context:
+            result = left - right
+            if context.flags[Inexact] or context.flags[Rounded]:
+                raise EntryRiskContractError(f"{field_name} subtraction was not exact")
+            return result
+    except (DecimalException, OverflowError, ValueError) as exc:
+        raise EntryRiskContractError(f"{field_name} subtraction failed") from exc
+
+
+def _exact_ratio_floor(capacity_usd: Decimal, price_usd: Decimal) -> int:
+    capacity_numerator, capacity_denominator = capacity_usd.as_integer_ratio()
+    price_numerator, price_denominator = price_usd.as_integer_ratio()
+    return (capacity_numerator * price_denominator) // (capacity_denominator * price_numerator)
+
+
+def _floor_quantity(capacity_usd: Decimal, price_usd: Decimal) -> int:
+    exact_floor = _exact_ratio_floor(capacity_usd, price_usd)
+    precision = (
+        len(str(exact_floor))
+        + len(capacity_usd.as_tuple().digits)
+        + len(price_usd.as_tuple().digits)
+        + 2
+    )
+    try:
+        with localcontext(_isolated_context(precision)):
             quotient = capacity_usd / price_usd
-            return int(quotient.to_integral_value(rounding=ROUND_DOWN))
-    except (InvalidOperation, OverflowError, ValueError) as exc:
+            rounded = int(quotient.to_integral_value(rounding=ROUND_DOWN))
+    except (DecimalException, OverflowError, ValueError) as exc:
         raise EntryRiskContractError("quantity flooring failed") from exc
+    if rounded != exact_floor:
+        raise EntryRiskContractError("Decimal ROUND_DOWN quantity flooring was not exact")
+    return rounded
+
+
+def _minimum_capacity(
+    capacities: tuple[tuple[LimitingCapacity, Decimal], ...],
+) -> tuple[LimitingCapacity, Decimal]:
+    precision = max(len(value.as_tuple().digits) for _, value in capacities) + 2
+    with localcontext(_isolated_context(precision)):
+        return min(capacities, key=lambda item: item[1])
+
+
+def _assert_approved_within_all_capacities(
+    *,
+    quantity: int,
+    approved_notional_usd: Decimal,
+    price_usd: Decimal,
+    capacities: tuple[tuple[LimitingCapacity, Decimal], ...],
+) -> None:
+    independently_calculated_notional = _exact_multiply(
+        price_usd,
+        Decimal(quantity),
+        "approved_notional_usd postcondition",
+    )
+    if approved_notional_usd != independently_calculated_notional:
+        raise EntryRiskContractError("approved notional postcondition failed")
+    for capacity_name, capacity_usd in capacities:
+        if approved_notional_usd > capacity_usd or quantity > _exact_ratio_floor(
+            capacity_usd, price_usd
+        ):
+            raise EntryRiskContractError(
+                f"approved quantity exceeded the exact {capacity_name.value} capacity"
+            )
 
 
 def evaluate_entry_intent(
@@ -717,40 +812,86 @@ def evaluate_entry_intent(
 
     equity = evidence.portfolio_equity_usd
     capacities = (
-        (LimitingCapacity.REQUEST, equity * intent.requested_position_fraction),
+        (
+            LimitingCapacity.REQUEST,
+            _exact_multiply(
+                equity,
+                intent.requested_position_fraction,
+                "requested position capacity",
+            ),
+        ),
         (
             LimitingCapacity.SYMBOL,
-            equity * limits.max_position_fraction - evidence.current_symbol_gross_notional_usd,
+            _exact_subtract(
+                _exact_multiply(
+                    equity,
+                    limits.max_position_fraction,
+                    "symbol position capacity",
+                ),
+                evidence.current_symbol_gross_notional_usd,
+                "remaining symbol position capacity",
+            ),
         ),
         (
             LimitingCapacity.SECTOR,
-            equity * limits.max_sector_fraction - evidence.current_sector_gross_notional_usd,
+            _exact_subtract(
+                _exact_multiply(
+                    equity,
+                    limits.max_sector_fraction,
+                    "sector position capacity",
+                ),
+                evidence.current_sector_gross_notional_usd,
+                "remaining sector position capacity",
+            ),
         ),
         (
             LimitingCapacity.PORTFOLIO,
-            equity * limits.max_portfolio_gross_fraction - evidence.portfolio_gross_notional_usd,
+            _exact_subtract(
+                _exact_multiply(
+                    equity,
+                    limits.max_portfolio_gross_fraction,
+                    "portfolio gross capacity",
+                ),
+                evidence.portfolio_gross_notional_usd,
+                "remaining portfolio gross capacity",
+            ),
         ),
         (
             LimitingCapacity.LIQUIDITY,
-            evidence.liquidity.average_daily_dollar_volume_usd
-            * limits.max_order_fraction_of_daily_dollar_volume,
+            _exact_multiply(
+                evidence.liquidity.average_daily_dollar_volume_usd,
+                limits.max_order_fraction_of_daily_dollar_volume,
+                "liquidity capacity",
+            ),
         ),
         (LimitingCapacity.CASH, evidence.cash_available_usd),
         (LimitingCapacity.BUYING_POWER, evidence.buying_power_usd),
         (
             LimitingCapacity.DAILY_NOTIONAL,
-            limits.max_daily_notional_usd - evidence.daily_executed_notional_usd,
+            _exact_subtract(
+                limits.max_daily_notional_usd,
+                evidence.daily_executed_notional_usd,
+                "remaining daily notional capacity",
+            ),
         ),
     )
-    limiting_capacity, capacity_usd = min(capacities, key=lambda item: item[1])
+    limiting_capacity, capacity_usd = _minimum_capacity(capacities)
     if capacity_usd <= 0:
         return _rejected(intent, now, [RiskReason.NO_CAPACITY], quote)
     quantity = _floor_quantity(capacity_usd, quote.price_usd)
     if quantity <= 0:
         return _rejected(intent, now, [RiskReason.NO_CAPACITY], quote)
-    approved_notional = quote.price_usd * quantity
-    if approved_notional > capacity_usd:
-        raise EntryRiskContractError("floored quantity exceeded its limiting capacity")
+    approved_notional = _exact_multiply(
+        quote.price_usd,
+        Decimal(quantity),
+        "approved_notional_usd",
+    )
+    _assert_approved_within_all_capacities(
+        quantity=quantity,
+        approved_notional_usd=approved_notional,
+        price_usd=quote.price_usd,
+        capacities=capacities,
+    )
 
     return RiskDecision(
         intent_id=intent.intent_id,
