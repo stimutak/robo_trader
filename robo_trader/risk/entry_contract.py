@@ -44,6 +44,8 @@ def _build_capability_authority():
         int,
         tuple[weakref.ReferenceType[object], type[object], tuple[object, ...]],
     ] = {}
+    consumed_decision_keys: set[tuple[object, ...]] = set()
+    consumed_decision_limit = 4096
     lock = threading.Lock()
 
     def is_sealed(candidate: object) -> bool:
@@ -83,12 +85,58 @@ def _build_capability_authority():
             raise EntryRiskContractError(
                 f"{expected_type.__name__} is altered, copied, forged, or already consumed"
             )
+        try:
+            capability.__post_init__(seal)
+            revalidated_state = _capability_state(capability)
+        except Exception as exc:
+            raise EntryRiskContractError(
+                f"{expected_type.__name__} failed authorization-boundary revalidation"
+            ) from exc
+        if revalidated_state != registered[2]:
+            raise EntryRiskContractError(
+                f"{expected_type.__name__} changed during authorization-boundary revalidation"
+            )
+        if expected_type is RiskDecision:
+            replay_key = _risk_decision_replay_key(capability)
+            with lock:
+                if replay_key in consumed_decision_keys:
+                    raise EntryRiskContractError("RiskDecision semantic replay detected")
+                if len(consumed_decision_keys) >= consumed_decision_limit:
+                    raise EntryRiskContractError("RiskDecision replay registry capacity exhausted")
+                consumed_decision_keys.add(replay_key)
         return capability
 
-    return is_sealed, mint, consume
+    def transfer_decision(decision: RiskDecision) -> ConsumedRiskDecision:
+        return ConsumedRiskDecision(
+            (
+                decision.intent_id,
+                decision.signal_id,
+                decision.portfolio_id,
+                decision.symbol,
+                decision.side,
+                _contract_state(decision.broker_contract),
+                decision.transport_generation,
+                decision.evaluated_at,
+                decision.risk_approved,
+                decision.reasons,
+                decision.approved_quantity,
+                decision.approved_notional_usd,
+                decision.quote_id,
+                decision.limiting_capacity,
+                decision.schema_version,
+            ),
+            _seal=seal,
+        )
+
+    return is_sealed, mint, consume, transfer_decision
 
 
-_is_capability_seal, _mint_capability, _consume_capability = _build_capability_authority()
+(
+    _is_capability_seal,
+    _mint_capability,
+    _consume_capability,
+    _transfer_risk_decision,
+) = _build_capability_authority()
 
 
 class EntryRiskContractError(ValueError):
@@ -190,12 +238,15 @@ def _transport_generation(value: object, field_name: str) -> str:
 
 
 def _timestamp(value: object, field_name: str) -> datetime:
-    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
-        raise EntryRiskContractError(f"{field_name} must be timezone-aware")
+    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
+        raise EntryRiskContractError(f"{field_name} must be an exact timezone-aware datetime")
     try:
-        return value.astimezone(timezone.utc)
+        normalized = value.astimezone(timezone.utc)
     except (OverflowError, ValueError) as exc:
         raise EntryRiskContractError(f"{field_name} is invalid") from exc
+    if type(normalized) is not datetime:
+        raise EntryRiskContractError(f"{field_name} did not normalize to an exact datetime")
+    return normalized
 
 
 def _decimal(
@@ -233,6 +284,32 @@ def _flag(value: object, field_name: str) -> bool:
     return value
 
 
+def _validate_broker_contract(
+    value: object,
+    field_name: str = "broker contract",
+) -> EntryBrokerContractIdentity:
+    if type(value) is not EntryBrokerContractIdentity:
+        raise EntryRiskContractError(f"{field_name} is malformed")
+    try:
+        if type(value.con_id) is not int or value.con_id <= 0:
+            raise EntryRiskContractError(f"{field_name} con_id must be a positive integer")
+        symbol = _symbol(value.symbol)
+        local_symbol = _symbol(value.local_symbol)
+        if local_symbol != symbol:
+            raise EntryRiskContractError(f"{field_name} local_symbol must match symbol")
+        if type(value.security_type) is not str or value.security_type != "STK":
+            raise EntryRiskContractError(f"{field_name} security_type must be STK")
+        if type(value.currency) is not str or value.currency != "USD":
+            raise EntryRiskContractError(f"{field_name} currency must be USD")
+        if type(value.exchange) is not str or value.exchange != "SMART":
+            raise EntryRiskContractError(f"{field_name} exchange must be SMART")
+        _broker_identity(value.primary_exchange, f"{field_name} primary_exchange")
+        _broker_identity(value.trading_class, f"{field_name} trading_class")
+    except AttributeError as exc:
+        raise EntryRiskContractError(f"{field_name} is malformed") from exc
+    return value
+
+
 class _SealedCapability:
     """Copy/pickle guard shared by short-lived one-shot contract records."""
 
@@ -246,6 +323,10 @@ class _SealedCapability:
         raise TypeError(f"{type(self).__name__} cannot be copied")
 
     def __reduce__(self):
+        raise TypeError(f"{type(self).__name__} cannot be pickled")
+
+    def __reduce_ex__(self, protocol: object):
+        del protocol
         raise TypeError(f"{type(self).__name__} cannot be pickled")
 
 
@@ -268,20 +349,7 @@ class EntryBrokerContractIdentity:
     trading_class: str
 
     def __post_init__(self) -> None:
-        if type(self.con_id) is not int or self.con_id <= 0:
-            raise EntryRiskContractError("broker contract con_id must be a positive integer")
-        symbol = _symbol(self.symbol)
-        local_symbol = _symbol(self.local_symbol)
-        if local_symbol != symbol:
-            raise EntryRiskContractError("broker contract local_symbol must match symbol")
-        if type(self.security_type) is not str or self.security_type != "STK":
-            raise EntryRiskContractError("broker contract security_type must be STK")
-        if type(self.currency) is not str or self.currency != "USD":
-            raise EntryRiskContractError("broker contract currency must be USD")
-        if type(self.exchange) is not str or self.exchange != "SMART":
-            raise EntryRiskContractError("broker contract exchange must be SMART")
-        _broker_identity(self.primary_exchange, "broker contract primary_exchange")
-        _broker_identity(self.trading_class, "broker contract trading_class")
+        _validate_broker_contract(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,8 +398,7 @@ class EntrySignal(_SealedCapability):
             "source_data_version",
             _identifier(self.source_data_version, "source_data_version"),
         )
-        if type(self.broker_contract) is not EntryBrokerContractIdentity:
-            raise EntryRiskContractError("signal broker contract is malformed")
+        _validate_broker_contract(self.broker_contract, "signal broker contract")
         if self.broker_contract.symbol != self.symbol:
             raise EntryRiskContractError("signal symbol does not match broker contract")
         object.__setattr__(
@@ -416,8 +483,7 @@ class EntryIntent(_SealedCapability):
         object.__setattr__(self, "symbol", _symbol(self.symbol))
         if type(self.side) is not EntrySide or type(self.source) is not SignalSource:
             raise EntryRiskContractError("entry intent side or source is invalid")
-        if type(self.broker_contract) is not EntryBrokerContractIdentity:
-            raise EntryRiskContractError("entry intent broker contract is malformed")
+        _validate_broker_contract(self.broker_contract, "entry intent broker contract")
         if self.broker_contract.symbol != self.symbol:
             raise EntryRiskContractError("entry intent symbol does not match broker contract")
         object.__setattr__(
@@ -508,8 +574,7 @@ class LiveBrokerQuoteSourceCapability(_SealedCapability):
             _transport_generation(self.transport_generation, "transport_generation"),
         )
         object.__setattr__(self, "symbol", _symbol(self.symbol))
-        if type(self.broker_contract) is not EntryBrokerContractIdentity:
-            raise EntryRiskContractError("quote broker contract is malformed")
+        _validate_broker_contract(self.broker_contract, "quote broker contract")
         if self.broker_contract.symbol != self.symbol:
             raise EntryRiskContractError("quote symbol does not match broker contract")
         object.__setattr__(self, "price_usd", _decimal(self.price_usd, "price_usd", positive=True))
@@ -536,8 +601,7 @@ class RefreshedQuoteEvidence(_SealedCapability):
         for field_name in ("producer_id", "quote_id", "refresh_request_id"):
             object.__setattr__(self, field_name, _identifier(getattr(self, field_name), field_name))
         object.__setattr__(self, "symbol", _symbol(self.symbol))
-        if type(self.broker_contract) is not EntryBrokerContractIdentity:
-            raise EntryRiskContractError("quote broker contract is malformed")
+        _validate_broker_contract(self.broker_contract, "quote broker contract")
         if self.broker_contract.symbol != self.symbol:
             raise EntryRiskContractError("quote symbol does not match broker contract")
         object.__setattr__(
@@ -563,8 +627,7 @@ def produce_live_broker_quote_source(
 ) -> LiveBrokerQuoteSourceCapability:
     """Mint the typed source capability a broker quote producer transfers."""
 
-    if type(broker_contract) is not EntryBrokerContractIdentity:
-        raise EntryRiskContractError("quote source requires an exact broker contract")
+    _validate_broker_contract(broker_contract, "quote source broker contract")
     return _mint_capability(
         LiveBrokerQuoteSourceCapability,
         {
@@ -626,8 +689,7 @@ class CorrelationEvidence(_SealedCapability):
             "source_data_version",
             _identifier(self.source_data_version, "source_data_version"),
         )
-        if type(self.broker_contract) is not EntryBrokerContractIdentity:
-            raise EntryRiskContractError("correlation broker contract is malformed")
+        _validate_broker_contract(self.broker_contract, "correlation broker contract")
         if self.broker_contract.symbol != self.symbol:
             raise EntryRiskContractError("correlation symbol does not match broker contract")
         object.__setattr__(
@@ -698,8 +760,7 @@ class LiquidityEvidence(_SealedCapability):
             "source_data_version",
             _identifier(self.source_data_version, "source_data_version"),
         )
-        if type(self.broker_contract) is not EntryBrokerContractIdentity:
-            raise EntryRiskContractError("liquidity broker contract is malformed")
+        _validate_broker_contract(self.broker_contract, "liquidity broker contract")
         if self.broker_contract.symbol != self.symbol:
             raise EntryRiskContractError("liquidity symbol does not match broker contract")
         object.__setattr__(
@@ -770,8 +831,7 @@ class MLCorroborationEvidence(_SealedCapability):
         for field_name in ("signal_id", "portfolio_id", "source_data_version", "model_id"):
             object.__setattr__(self, field_name, _identifier(getattr(self, field_name), field_name))
         object.__setattr__(self, "symbol", _symbol(self.symbol))
-        if type(self.broker_contract) is not EntryBrokerContractIdentity:
-            raise EntryRiskContractError("ML broker contract is malformed")
+        _validate_broker_contract(self.broker_contract, "ML broker contract")
         if self.broker_contract.symbol != self.symbol:
             raise EntryRiskContractError("ML symbol does not match broker contract")
         object.__setattr__(
@@ -860,19 +920,24 @@ class EntryRiskEvidence(_SealedCapability):
                 "observed_at",
                 _timestamp(self.observed_at, "risk evidence observed_at"),
             )
-        if self.quote is not None and type(self.quote) is not RefreshedQuoteEvidence:
-            raise EntryRiskContractError("quote evidence is malformed")
+        if self.quote is not None:
+            if type(self.quote) is not RefreshedQuoteEvidence:
+                raise EntryRiskContractError("quote evidence is malformed")
+            self.quote.__post_init__(_seal)
         if self.sector is not None:
             object.__setattr__(self, "sector", _sector(self.sector))
-        if self.correlation is not None and type(self.correlation) is not CorrelationEvidence:
-            raise EntryRiskContractError("correlation evidence is malformed")
-        if self.liquidity is not None and type(self.liquidity) is not LiquidityEvidence:
-            raise EntryRiskContractError("liquidity evidence is malformed")
-        if (
-            self.ml_corroboration is not None
-            and type(self.ml_corroboration) is not MLCorroborationEvidence
-        ):
-            raise EntryRiskContractError("ML corroboration evidence is malformed")
+        if self.correlation is not None:
+            if type(self.correlation) is not CorrelationEvidence:
+                raise EntryRiskContractError("correlation evidence is malformed")
+            self.correlation.__post_init__(_seal)
+        if self.liquidity is not None:
+            if type(self.liquidity) is not LiquidityEvidence:
+                raise EntryRiskContractError("liquidity evidence is malformed")
+            self.liquidity.__post_init__(_seal)
+        if self.ml_corroboration is not None:
+            if type(self.ml_corroboration) is not MLCorroborationEvidence:
+                raise EntryRiskContractError("ML corroboration evidence is malformed")
+            self.ml_corroboration.__post_init__(_seal)
         for field_name in (
             "portfolio_equity_usd",
             "cash_available_usd",
@@ -967,7 +1032,7 @@ class EntryRiskLimits:
             "max_position_fraction",
             positive=True,
         )
-        if position > GATE_A_MAX_POSITION_FRACTION:
+        if position > Decimal("0.02"):
             raise EntryRiskContractError("Gate-A position cap cannot exceed 2%")
         object.__setattr__(self, "max_position_fraction", position)
         object.__setattr__(
@@ -1014,7 +1079,7 @@ class EntryRiskLimits:
         )
         for field_name in ("max_quote_age", "max_account_evidence_age"):
             value = getattr(self, field_name)
-            if not isinstance(value, timedelta) or value <= timedelta(0):
+            if type(value) is not timedelta or value <= timedelta(0):
                 raise EntryRiskContractError(f"{field_name} must be a positive timedelta")
 
 
@@ -1062,8 +1127,7 @@ class RiskDecision(_SealedCapability):
         object.__setattr__(self, "symbol", _symbol(self.symbol))
         if type(self.side) is not EntrySide:
             raise EntryRiskContractError("risk decision side is invalid")
-        if type(self.broker_contract) is not EntryBrokerContractIdentity:
-            raise EntryRiskContractError("risk decision broker contract is malformed")
+        _validate_broker_contract(self.broker_contract, "risk decision broker contract")
         if self.broker_contract.symbol != self.symbol:
             raise EntryRiskContractError("risk decision symbol does not match broker contract")
         object.__setattr__(
@@ -1111,6 +1175,106 @@ class RiskDecision(_SealedCapability):
             raise EntryRiskContractError("rejected risk decision cannot approve exposure")
 
 
+class ConsumedRiskDecision(tuple):
+    """Immutable terminal snapshot returned after one semantic decision consume."""
+
+    __slots__ = ()
+    _VALUE_COUNT = 15
+
+    def __new__(
+        cls,
+        values: tuple[object, ...],
+        *,
+        _seal: object = None,
+    ) -> ConsumedRiskDecision:
+        _require_sealed(_seal, "consumed risk decision")
+        if type(values) is not tuple or len(values) != cls._VALUE_COUNT:
+            raise EntryRiskContractError("consumed risk decision snapshot is malformed")
+        return cast(ConsumedRiskDecision, tuple.__new__(cls, values))
+
+    @property
+    def intent_id(self) -> str:
+        return cast(str, self[0])
+
+    @property
+    def signal_id(self) -> str:
+        return cast(str, self[1])
+
+    @property
+    def portfolio_id(self) -> str:
+        return cast(str, self[2])
+
+    @property
+    def symbol(self) -> str:
+        return cast(str, self[3])
+
+    @property
+    def side(self) -> EntrySide:
+        return cast(EntrySide, self[4])
+
+    @property
+    def broker_contract(self) -> tuple[object, ...]:
+        return cast(tuple[object, ...], self[5])
+
+    @property
+    def transport_generation(self) -> str:
+        return cast(str, self[6])
+
+    @property
+    def evaluated_at(self) -> datetime:
+        return cast(datetime, self[7])
+
+    @property
+    def risk_approved(self) -> bool:
+        return cast(bool, self[8])
+
+    @property
+    def reasons(self) -> tuple[RiskReason, ...]:
+        return cast(tuple[RiskReason, ...], self[9])
+
+    @property
+    def approved_quantity(self) -> int:
+        return cast(int, self[10])
+
+    @property
+    def approved_notional_usd(self) -> Decimal:
+        return cast(Decimal, self[11])
+
+    @property
+    def quote_id(self) -> Optional[str]:
+        return cast(Optional[str], self[12])
+
+    @property
+    def limiting_capacity(self) -> Optional[LimitingCapacity]:
+        return cast(Optional[LimitingCapacity], self[13])
+
+    @property
+    def schema_version(self) -> int:
+        return cast(int, self[14])
+
+    @property
+    def authorizes_order_submission(self) -> bool:
+        return False
+
+    @property
+    def runtime_integration_ready(self) -> bool:
+        return False
+
+    def __copy__(self):
+        raise TypeError("ConsumedRiskDecision cannot be copied")
+
+    def __deepcopy__(self, memo: object):
+        del memo
+        raise TypeError("ConsumedRiskDecision cannot be copied")
+
+    def __reduce__(self):
+        raise TypeError("ConsumedRiskDecision cannot be pickled")
+
+    def __reduce_ex__(self, protocol: object):
+        del protocol
+        raise TypeError("ConsumedRiskDecision cannot be pickled")
+
+
 def _rejected(
     intent: EntryIntent,
     evaluated_at: datetime,
@@ -1149,6 +1313,17 @@ def _contract_state(contract: EntryBrokerContractIdentity) -> tuple[object, ...]
         contract.exchange,
         contract.primary_exchange,
         contract.trading_class,
+    )
+
+
+def _risk_decision_replay_key(decision: object) -> tuple[object, ...]:
+    if type(decision) is not RiskDecision:
+        raise EntryRiskContractError("exact RiskDecision is required for replay protection")
+    return (
+        "risk-decision-v1",
+        decision.schema_version,
+        decision.portfolio_id,
+        decision.intent_id,
     )
 
 
@@ -1313,10 +1488,11 @@ def _capability_state(capability: object) -> tuple[object, ...]:
     raise EntryRiskContractError("unknown sealed capability type")
 
 
-def assert_and_consume_risk_decision(decision: object) -> RiskDecision:
+def assert_and_consume_risk_decision(decision: object) -> ConsumedRiskDecision:
     """Consume an exact decision once at a future dormant integration seam."""
 
-    return _consume_capability(decision, RiskDecision)
+    consumed = _consume_capability(decision, RiskDecision)
+    return _transfer_risk_decision(consumed)
 
 
 def _source_enabled(source: SignalSource, flags: EntryFeatureFlags) -> bool:
@@ -1472,8 +1648,14 @@ def evaluate_entry_intent(
         raise EntryRiskContractError("risk evaluation requires exact EntryRiskEvidence")
     if type(limits) is not EntryRiskLimits or type(flags) is not EntryFeatureFlags:
         raise EntryRiskContractError("risk evaluation configuration is malformed")
-    if type(expected_broker_contract) is not EntryBrokerContractIdentity:
-        raise EntryRiskContractError("expected broker contract is missing or malformed")
+    try:
+        limits.__post_init__()
+        flags.__post_init__()
+    except EntryRiskContractError:
+        raise
+    except Exception as exc:
+        raise EntryRiskContractError("risk evaluation configuration is malformed") from exc
+    _validate_broker_contract(expected_broker_contract, "expected broker contract")
     active_generation = _transport_generation(
         expected_transport_generation,
         "expected_transport_generation",
@@ -1615,16 +1797,19 @@ def evaluate_entry_intent(
     if reasons:
         return _rejected(intent, now, reasons, quote)
 
-    assert quote is not None
-    assert evidence.correlation is not None
-    assert evidence.liquidity is not None
-    assert evidence.portfolio_equity_usd is not None
-    assert evidence.cash_available_usd is not None
-    assert evidence.buying_power_usd is not None
-    assert evidence.current_symbol_gross_notional_usd is not None
-    assert evidence.current_sector_gross_notional_usd is not None
-    assert evidence.portfolio_gross_notional_usd is not None
-    assert evidence.daily_executed_notional_usd is not None
+    if (
+        quote is None
+        or evidence.correlation is None
+        or evidence.liquidity is None
+        or evidence.portfolio_equity_usd is None
+        or evidence.cash_available_usd is None
+        or evidence.buying_power_usd is None
+        or evidence.current_symbol_gross_notional_usd is None
+        or evidence.current_sector_gross_notional_usd is None
+        or evidence.portfolio_gross_notional_usd is None
+        or evidence.daily_executed_notional_usd is None
+    ):
+        raise EntryRiskContractError("required risk evidence vanished after validation")
 
     if evidence.correlation.max_absolute_correlation > limits.max_absolute_correlation:
         return _rejected(intent, now, [RiskReason.CORRELATION_LIMIT], quote)
@@ -1742,6 +1927,7 @@ __all__ = [
     "ENTRY_RISK_CONTRACT_VERSION",
     "GATE_A_MAX_POSITION_FRACTION",
     "CorrelationEvidence",
+    "ConsumedRiskDecision",
     "EntryBrokerContractIdentity",
     "EntryFeatureFlags",
     "EntryIntent",

@@ -12,6 +12,7 @@ from robo_trader.risk import entry_contract as entry_contract_module
 from robo_trader.risk.entry_contract import (
     ENTRY_RISK_CONTRACT_VERSION,
     GATE_A_MAX_POSITION_FRACTION,
+    ConsumedRiskDecision,
     CorrelationEvidence,
     EntryBrokerContractIdentity,
     EntryFeatureFlags,
@@ -82,12 +83,18 @@ def _signal(**changes: object) -> EntrySignal:
     return build_entry_signal(**values)  # type: ignore[arg-type]
 
 
-def _intent(**signal_changes: object) -> EntryIntent:
+def _intent(
+    *,
+    intent_id: str = "intent-001",
+    quote_refresh_request_id: str = "refresh-001",
+    created_at: datetime = NOW - timedelta(seconds=5),
+    **signal_changes: object,
+) -> EntryIntent:
     return build_entry_intent(
         _signal(**signal_changes),
-        intent_id="intent-001",
-        quote_refresh_request_id="refresh-001",
-        created_at=NOW - timedelta(seconds=5),
+        intent_id=intent_id,
+        quote_refresh_request_id=quote_refresh_request_id,
+        created_at=created_at,
     )
 
 
@@ -386,6 +393,21 @@ def test_broker_contract_identity_requires_complete_canonical_stock_lineage(
         _contract(**changes)
 
 
+@pytest.mark.parametrize("construction", ["mutated", "raw"])
+def test_broker_contract_is_revalidated_before_capability_mint(construction: str) -> None:
+    valid = _contract()
+    if construction == "mutated":
+        corrupted = valid
+    else:
+        corrupted = object.__new__(EntryBrokerContractIdentity)
+        for field in fields(valid):
+            object.__setattr__(corrupted, field.name, getattr(valid, field.name))
+    object.__setattr__(corrupted, "security_type", "OPT")
+
+    with pytest.raises(EntryRiskContractError, match="security_type must be STK"):
+        _signal(broker_contract=corrupted)
+
+
 @pytest.mark.parametrize(
     ("expected_contract", "expected_generation"),
     [(None, ACTIVE_GENERATION), (_contract(), None), (_contract(), "")],
@@ -559,6 +581,20 @@ def _decision():
     return _evaluate()
 
 
+def _decision_with_ids(suffix: str):
+    refresh_id = f"refresh-{suffix}"
+    intent = _intent(
+        intent_id=f"intent-{suffix}",
+        signal_id=f"sig-{suffix}",
+        quote_refresh_request_id=refresh_id,
+    )
+    quote = _quote(
+        quote_id=f"quote-{suffix}",
+        refresh_request_id=refresh_id,
+    )
+    return _evaluate(intent=intent, evidence=_evidence(quote=quote))
+
+
 @pytest.mark.parametrize(
     "factory",
     [
@@ -677,7 +713,12 @@ def test_signal_intent_evidence_and_decision_are_each_single_use() -> None:
     decision = _evaluate(intent=intent, evidence=evidence)
     with pytest.raises(EntryRiskContractError, match="already consumed"):
         _evaluate(intent=intent, evidence=_evidence())
-    assert assert_and_consume_risk_decision(decision) is decision
+    consumed = assert_and_consume_risk_decision(decision)
+    assert type(consumed) is ConsumedRiskDecision
+    assert consumed.intent_id == decision.intent_id
+    assert consumed.approved_quantity == decision.approved_quantity
+    assert consumed.authorizes_order_submission is False
+    assert consumed.runtime_integration_ready is False
     with pytest.raises(EntryRiskContractError, match="already consumed"):
         assert_and_consume_risk_decision(decision)
 
@@ -696,6 +737,52 @@ def test_mutated_or_replaced_risk_decision_cannot_be_consumed() -> None:
     object.__setattr__(mutated, "approved_quantity", 999)
     with pytest.raises(EntryRiskContractError, match="altered"):
         assert_and_consume_risk_decision(mutated)
+
+
+def test_equivalent_independently_minted_decision_pipeline_is_semantic_replay() -> None:
+    first = _decision_with_ids("semantic-replay")
+    duplicate = _decision_with_ids("semantic-replay")
+
+    assert first is not duplicate
+    assert (first.intent_id, first.signal_id, first.quote_id) == (
+        duplicate.intent_id,
+        duplicate.signal_id,
+        duplicate.quote_id,
+    )
+    assert_and_consume_risk_decision(first)
+    with pytest.raises(EntryRiskContractError, match="semantic replay"):
+        assert_and_consume_risk_decision(duplicate)
+
+
+def test_consumed_decision_is_a_deeply_immutable_non_authorizing_snapshot() -> None:
+    decision = _decision_with_ids("immutable-transfer")
+    consumed = assert_and_consume_risk_decision(decision)
+    alias = consumed
+
+    object.__setattr__(decision, "authorizes_order_submission", True)
+    object.__setattr__(decision, "runtime_integration_ready", True)
+    object.__setattr__(decision.broker_contract, "security_type", "OPT")
+
+    assert alias is consumed
+    assert consumed.authorizes_order_submission is False
+    assert consumed.runtime_integration_ready is False
+    assert consumed.broker_contract[3] == "STK"
+    with pytest.raises((AttributeError, TypeError)):
+        object.__setattr__(consumed, "authorizes_order_submission", True)
+    with pytest.raises(TypeError):
+        consumed.broker_contract[3] = "OPT"  # type: ignore[index]
+
+    for operation in (copy.copy, copy.deepcopy, pickle.dumps, replace):
+        with pytest.raises((EntryRiskContractError, TypeError, ValueError)):
+            operation(consumed)
+    with pytest.raises(EntryRiskContractError, match="factory-only"):
+        ConsumedRiskDecision(tuple(consumed))
+
+    raw = tuple.__new__(ConsumedRiskDecision, tuple(consumed))
+    assert raw.authorizes_order_submission is False
+    assert raw.runtime_integration_ready is False
+    with pytest.raises(EntryRiskContractError, match="exact RiskDecision"):
+        assert_and_consume_risk_decision(raw)
 
 
 def test_configured_two_percent_cap_floors_quantity_and_never_rounds_up() -> None:
@@ -788,6 +875,34 @@ def test_final_postcondition_checks_every_capacity_not_only_reported_minimum(
 def test_gate_a_rejects_a_configured_position_cap_above_two_percent() -> None:
     with pytest.raises(EntryRiskContractError, match="cannot exceed 2%"):
         _limits(max_position_fraction=Decimal("0.0200001"))
+
+
+@pytest.mark.parametrize("construction", ["mutated", "raw"])
+def test_authorization_boundary_revalidates_exact_limits(construction: str) -> None:
+    valid = _limits()
+    if construction == "mutated":
+        corrupted = valid
+    else:
+        corrupted = object.__new__(EntryRiskLimits)
+        for field in fields(valid):
+            object.__setattr__(corrupted, field.name, getattr(valid, field.name))
+    object.__setattr__(corrupted, "max_position_fraction", Decimal("0.50"))
+
+    with pytest.raises(EntryRiskContractError, match="cannot exceed 2%"):
+        _evaluate(limits=corrupted)
+
+
+def test_authorization_boundary_revalidates_flags_and_nested_evidence() -> None:
+    flags = _flags()
+    object.__setattr__(flags, "risk_contract_enabled", 1)
+    with pytest.raises(EntryRiskContractError, match="explicit boolean"):
+        _evaluate(flags=flags)
+
+    evidence = _evidence()
+    assert evidence.correlation is not None
+    object.__setattr__(evidence.correlation, "complete", "yes")
+    with pytest.raises(EntryRiskContractError, match="altered"):
+        _evaluate(evidence=evidence)
 
 
 @pytest.mark.parametrize(
@@ -990,6 +1105,48 @@ def test_expired_intent_and_stale_account_snapshot_fail_closed() -> None:
 
     assert expired_decision.reasons == (RiskReason.INTENT_NOT_ACTIVE,)
     assert stale_decision.reasons == (RiskReason.STALE_ACCOUNT_EVIDENCE,)
+
+
+def test_datetime_subclasses_cannot_override_freshness_authority() -> None:
+    class AdversarialDateTime(datetime):
+        def astimezone(self, tz=None):
+            return self
+
+        def __lt__(self, other):
+            return False
+
+        def __le__(self, other):
+            return True
+
+        def __ge__(self, other):
+            return False
+
+        def __sub__(self, other):
+            return timedelta(0)
+
+    adversarial = AdversarialDateTime.fromtimestamp(NOW.timestamp(), timezone.utc)
+    operations = (
+        lambda: _signal(observed_at=adversarial),
+        lambda: _intent(created_at=adversarial),
+        lambda: _quote(observed_at=adversarial),
+        lambda: _correlation(observed_at=adversarial),
+        lambda: _liquidity(observed_at=adversarial),
+        lambda: _ml(observed_at=adversarial),
+        lambda: _evidence(observed_at=adversarial),
+        lambda: _evaluate(evaluated_at=adversarial),
+    )
+
+    for operation in operations:
+        with pytest.raises(EntryRiskContractError, match="exact timezone-aware datetime"):
+            operation()
+
+
+def test_timedelta_subclasses_are_not_risk_limit_authority() -> None:
+    class AdversarialTimedelta(timedelta):
+        pass
+
+    with pytest.raises(EntryRiskContractError, match="positive timedelta"):
+        _limits(max_quote_age=AdversarialTimedelta(seconds=10))
 
 
 @pytest.mark.parametrize(
