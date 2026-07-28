@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 import pytest_asyncio
 
-from robo_trader.execution import ExecutionResult, PaperExecutor
+from robo_trader.execution import PaperExecutor
 from robo_trader.paper_reduction_gateway import (
     PaperReductionGateway,
     PaperReductionGatewayError,
@@ -426,13 +426,16 @@ async def test_terminal_rejection_releases_once_and_restart_cannot_retry(
     harness = failure_harness
     rejection_calls = 0
 
-    def reject(_executor, _order, *, _capability):
+    def reject(_submitter, _envelope, *, pre_position_quantity):
         nonlocal rejection_calls
-        assert _capability is not None
+        assert pre_position_quantity == Decimal("7")
         rejection_calls += 1
-        return ExecutionResult(False, "injected definitive rejection")
+        return _unfilled_terminal_outcome(
+            order_ref="terminal-rejection-survives-restart",
+            status=LocalPaperOrderStatus.REJECTED,
+        )
 
-    monkeypatch.setattr(PaperExecutor, "_place_simple_order", reject)
+    monkeypatch.setattr(PaperReductionSubmitter, "_submit_once", reject)
     first_executor = PaperExecutor()
     await _bind_runtime(harness, "portfolio-a", first_executor)
     _install_broker_boundary(harness, monkeypatch)

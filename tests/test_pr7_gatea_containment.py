@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import ast
+import copy
 import inspect
+import pickle
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -277,38 +280,140 @@ def test_reduction_capability_cannot_cross_zero(
     assert executor.fills == {}
 
 
-def test_capability_substitution_burns_authority(monkeypatch) -> None:
+def test_reduction_terminal_dispatch_never_calls_mutable_executor_method(monkeypatch) -> None:
     executor = PaperExecutor()
     harness = bind_gateway_reduction_harness(executor, "default")
-    captured = []
-
-    def capture(_order, *, _capability):
-        captured.append(_capability)
-        return SimpleNamespace(ok=False)
-
-    monkeypatch.setattr(executor, "_place_simple_order", capture)
     original = Order("AAPL", 1, "SELL", Decimal("100.0000"))
-    harness.submit(
-        original,
+    dispatch = harness.issue(original, pre_position_quantity=Decimal("1"))
+    monkeypatch.setattr(
+        executor,
+        "_place_simple_order",
+        lambda *_args, **_kwargs: pytest.fail("mutable executor method must not receive authority"),
+    )
+    monkeypatch.setattr(
+        capability_module,
+        "_execute_sealed_paper_fill",
+        lambda *_args, **_kwargs: pytest.fail("captured terminal sink must be immutable"),
+    )
+    monkeypatch.setattr(
+        capability_module,
+        "consume_paper_execution_capability",
+        lambda *_args, **_kwargs: pytest.fail("captured consume primitive must be immutable"),
+    )
+
+    result = _submit_gateway_reduction_once(
+        harness.authority,
+        dispatch,
+        submitter=harness.submitter_identity,
+        order=original,
         pre_position_quantity=Decimal("1"),
     )
-    capability = captured[0]
 
-    substituted = PaperExecutor._place_simple_order(
-        executor,
-        Order("MSFT", 1, "SELL", Decimal("100.0000")),
-        _capability=capability,
-    )
-    replay = PaperExecutor._place_simple_order(
-        executor,
-        original,
-        _capability=capability,
-    )
+    assert result.ok is True
+    assert len(executor.fills) == 1
 
-    assert substituted.ok is False
-    assert "does not match" in substituted.message
+
+def test_terminal_fill_direct_call_without_exact_authority_cannot_fill() -> None:
+    executor = PaperExecutor()
+    order = Order("AAPL", 1, "SELL", Decimal("100.0000"))
+
+    with pytest.raises(PaperExecutionCapabilityError, match="exact submission capability"):
+        capability_module._execute_sealed_paper_fill(executor, order, None)
+    with pytest.raises(PaperExecutionCapabilityError, match="exact submission capability"):
+        capability_module._execute_sealed_paper_fill(executor, order, object())
+    with pytest.raises(PaperExecutionCapabilityError, match="exact consumed"):
+        capability_module._apply_consumed_paper_fill(executor, order, None)
+    with pytest.raises(PaperExecutionCapabilityError, match="exact consumed"):
+        capability_module._apply_consumed_paper_fill(executor, order, object())
+
+    assert executor.fills == {}
+
+
+def test_reduction_traceback_retains_only_burned_capability() -> None:
+    executor = PaperExecutor()
+    harness = bind_gateway_reduction_harness(executor, "default")
+    original = Order("AAPL", 1, "SELL", Decimal("100.0000"))
+    dispatch = harness.issue(original, pre_position_quantity=Decimal("1"))
+
+    class RaisingFills(dict):
+        def __setitem__(self, _key, _value):
+            raise LookupError("injected post-consume fill failure")
+
+    executor.fills = RaisingFills()
+    with pytest.raises(LookupError, match="post-consume") as raised:
+        _submit_gateway_reduction_once(
+            harness.authority,
+            dispatch,
+            submitter=harness.submitter_identity,
+            order=original,
+            pre_position_quantity=Decimal("1"),
+        )
+
+    capability = None
+    traceback = raised.value.__traceback__
+    while traceback is not None:
+        if traceback.tb_frame.f_code.co_name == "_submit_gateway_reduction_once":
+            capability = traceback.tb_frame.f_locals.get("capability")
+        traceback = traceback.tb_next
+    assert capability is not None
+    with pytest.raises(PaperExecutionCapabilityError):
+        copy.copy(capability)
+    with pytest.raises(PaperExecutionCapabilityError):
+        copy.deepcopy(capability)
+    with pytest.raises(PaperExecutionCapabilityError):
+        pickle.dumps(capability)
+    with pytest.raises(TypeError):
+        replace(capability)
+
+    replay = PaperExecutor._place_simple_order(executor, original, _capability=capability)
+
     assert replay.ok is False
     assert "already consumed" in replay.message
+    assert executor.fills == {}
+
+
+def test_reduction_consume_failure_cannot_promote_burned_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = PaperExecutor()
+    harness = bind_gateway_reduction_harness(executor, "default")
+    original = Order("AAPL", 1, "SELL", Decimal("100.0000"))
+    dispatch = harness.issue(original, pre_position_quantity=Decimal("1"))
+    original_fingerprint = capability_module._fingerprint_order
+    fingerprint_calls = 0
+
+    def fail_during_consume(order):
+        nonlocal fingerprint_calls
+        fingerprint_calls += 1
+        if fingerprint_calls == 2:
+            raise LookupError("injected consume validation failure")
+        return original_fingerprint(order)
+
+    monkeypatch.setattr(capability_module, "_fingerprint_order", fail_during_consume)
+    with pytest.raises(LookupError, match="consume validation") as raised:
+        _submit_gateway_reduction_once(
+            harness.authority,
+            dispatch,
+            submitter=harness.submitter_identity,
+            order=original,
+            pre_position_quantity=Decimal("1"),
+        )
+
+    capability = None
+    traceback = raised.value.__traceback__
+    while traceback is not None:
+        candidate = traceback.tb_frame.f_locals.get("capability")
+        if candidate is not None:
+            capability = candidate
+        traceback = traceback.tb_next
+    assert capability is not None
+
+    monkeypatch.setattr(capability_module, "_fingerprint_order", original_fingerprint)
+    replay = PaperExecutor._place_simple_order(executor, original, _capability=capability)
+    assert replay.ok is False
+    assert "already consumed" in replay.message
+    with pytest.raises(PaperExecutionCapabilityError, match="unconsumed|mismatched"):
+        capability_module._apply_consumed_paper_fill(executor, original, capability)
     assert executor.fills == {}
 
 

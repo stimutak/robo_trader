@@ -73,6 +73,7 @@ class GatewayBoundReductionHarness:
             _CAPABILITIES[capability] = _CapabilityRecord(
                 authority=self.authority,
                 executor=self.executor,
+                order=order,
                 portfolio_id=self.portfolio_id,
                 kind=_CapabilityKind.REDUCTION,
                 fingerprint=_fingerprint_order(order),

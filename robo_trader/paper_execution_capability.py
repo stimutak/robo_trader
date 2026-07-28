@@ -10,10 +10,12 @@ coordinator submission adapter and exact pre-position evidence.
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
+import math
 import threading
 import weakref
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 from enum import Enum
 from typing import TYPE_CHECKING, cast
 
@@ -23,6 +25,9 @@ if TYPE_CHECKING:
 
 class PaperExecutionCapabilityError(RuntimeError):
     """A terminal paper submission lacked exact one-shot authority."""
+
+
+_PAPER_FILL_PRICE_TICK = Decimal("0.0001")
 
 
 class _CapabilityKind(Enum):
@@ -52,6 +57,23 @@ class _PaperExecutionCapability:
             )
         return super().__new__(cls)
 
+    def __copy__(self):
+        with _REGISTRY_LOCK:
+            record = _CAPABILITIES.get(self)
+            if type(record) is _CapabilityRecord:
+                record.consumed = True
+        raise PaperExecutionCapabilityError("paper execution capabilities cannot copy")
+
+    def __deepcopy__(self, _memo):
+        return self.__copy__()
+
+    def __reduce__(self):
+        with _REGISTRY_LOCK:
+            record = _CAPABILITIES.get(self)
+            if type(record) is _CapabilityRecord:
+                record.consumed = True
+        raise PaperExecutionCapabilityError("paper execution capabilities cannot serialize")
+
 
 class _GatewayExecutionBindingCapability:
     """Opaque one-shot grant issued only during exact gateway registration."""
@@ -74,6 +96,15 @@ class _GatewayExecutionBindingCapability:
 
     def __deepcopy__(self, _memo):
         return self.__copy__()
+
+    def __reduce__(self):
+        with _REGISTRY_LOCK:
+            record = _GATEWAY_BINDINGS.get(self)
+            if type(record) is _GatewayBindingRecord:
+                record.consumed = True
+        raise PaperExecutionCapabilityError(
+            "gateway execution binding capabilities cannot serialize"
+        )
 
 
 class _GatewayReductionBindingCapability:
@@ -108,6 +139,23 @@ class _BaselineTerminalDispatch:
             raise PaperExecutionCapabilityError("baseline terminal dispatch is issuer-only")
         return super().__new__(cls)
 
+    def __copy__(self):
+        with _REGISTRY_LOCK:
+            record = _BASELINE_DISPATCHES.get(self)
+            if type(record) is _TerminalDispatchRecord:
+                record.consumed = True
+        raise PaperExecutionCapabilityError("baseline terminal dispatch cannot copy")
+
+    def __deepcopy__(self, _memo):
+        return self.__copy__()
+
+    def __reduce__(self):
+        with _REGISTRY_LOCK:
+            record = _BASELINE_DISPATCHES.get(self)
+            if type(record) is _TerminalDispatchRecord:
+                record.consumed = True
+        raise PaperExecutionCapabilityError("baseline terminal dispatch cannot serialize")
+
 
 class _ReductionTerminalDispatch:
     __slots__ = ("__weakref__",)
@@ -117,16 +165,36 @@ class _ReductionTerminalDispatch:
             raise PaperExecutionCapabilityError("reduction terminal dispatch is issuer-only")
         return super().__new__(cls)
 
+    def __copy__(self):
+        with _REGISTRY_LOCK:
+            record = _REDUCTION_DISPATCHES.get(self)
+            if type(record) is _TerminalDispatchRecord:
+                record.consumed = True
+        raise PaperExecutionCapabilityError("reduction terminal dispatch cannot copy")
+
+    def __deepcopy__(self, _memo):
+        return self.__copy__()
+
+    def __reduce__(self):
+        with _REGISTRY_LOCK:
+            record = _REDUCTION_DISPATCHES.get(self)
+            if type(record) is _TerminalDispatchRecord:
+                record.consumed = True
+        raise PaperExecutionCapabilityError("reduction terminal dispatch cannot serialize")
+
 
 @dataclass(slots=True)
 class _CapabilityRecord:
     authority: object
     executor: object
+    order: object
     portfolio_id: str
     kind: _CapabilityKind
     fingerprint: _OrderFingerprint
     pre_position_quantity: Decimal | None
     consumed: bool = False
+    validated: bool = False
+    fill_consumed: bool = False
 
 
 @dataclass(slots=True)
@@ -537,58 +605,66 @@ def _issue_gateway_baseline_terminal_dispatch(
     return dispatch
 
 
-def _submit_gateway_baseline_once(
-    binding: object,
-    dispatch: object,
-    *,
-    gateway: object,
-    runtime_context: object,
-    active_session: object,
-    order: object,
-):
-    """Atomically burn one registered baseline dispatch before submission."""
+def _make_gateway_baseline_submitter(terminal_sink):
+    """Capture the exact terminal sink outside mutable module/executor state."""
 
-    if type(dispatch) is not _BaselineTerminalDispatch:
-        raise PaperExecutionCapabilityError("baseline terminal dispatch is invalid")
-    with _REGISTRY_LOCK:
-        record = _BASELINE_DISPATCHES.get(dispatch)
-        if type(record) is not _TerminalDispatchRecord or record.consumed:
-            raise PaperExecutionCapabilityError(
-                "baseline terminal dispatch is unknown or already consumed"
-            )
-        record.consumed = True
-        expected_binding = record.binding
-        expected_gateway = record.gateway
-        expected_context = record.runtime_context
-        expected_session = record.active_session
-        executor = cast("PaperExecutor", record.executor)
-        portfolio_id = record.portfolio_id
-        expected_fingerprint = record.fingerprint
-        record.binding = None
-        record.gateway = None
-        record.runtime_context = None
-        record.active_session = None
-    fingerprint = _fingerprint_order(order)
-    if (
-        type(binding) is not _GatewayBaselineExecutionBinding
-        or expected_binding is not binding
-        or expected_gateway is not gateway
-        or expected_context is not runtime_context
-        or expected_session is not active_session
-        or fingerprint != expected_fingerprint
+    def _submit_gateway_baseline_once(
+        binding: object,
+        dispatch: object,
+        *,
+        gateway: object,
+        runtime_context: object,
+        active_session: object,
+        order: object,
     ):
-        raise PaperExecutionCapabilityError("baseline terminal dispatch does not match attempt")
-    capability = _PaperExecutionCapability(_token=_CAPABILITY_TOKEN)
-    with _REGISTRY_LOCK:
-        _CAPABILITIES[capability] = _CapabilityRecord(
-            authority=binding,
-            executor=executor,
-            portfolio_id=portfolio_id,
-            kind=_CapabilityKind.BASELINE_ENTRY,
-            fingerprint=fingerprint,
-            pre_position_quantity=None,
-        )
-    return executor._place_simple_order(order, _capability=capability)
+        """Atomically burn one registered baseline dispatch before submission."""
+
+        if type(dispatch) is not _BaselineTerminalDispatch:
+            raise PaperExecutionCapabilityError("baseline terminal dispatch is invalid")
+        with _REGISTRY_LOCK:
+            record = _BASELINE_DISPATCHES.get(dispatch)
+            if type(record) is not _TerminalDispatchRecord or record.consumed:
+                raise PaperExecutionCapabilityError(
+                    "baseline terminal dispatch is unknown or already consumed"
+                )
+            record.consumed = True
+            expected_binding = record.binding
+            expected_gateway = record.gateway
+            expected_context = record.runtime_context
+            expected_session = record.active_session
+            executor = cast("PaperExecutor", record.executor)
+            portfolio_id = record.portfolio_id
+            expected_fingerprint = record.fingerprint
+            record.binding = None
+            record.gateway = None
+            record.runtime_context = None
+            record.active_session = None
+        fingerprint = _fingerprint_order(order)
+        if (
+            type(binding) is not _GatewayBaselineExecutionBinding
+            or expected_binding is not binding
+            or expected_gateway is not gateway
+            or expected_context is not runtime_context
+            or expected_session is not active_session
+            or fingerprint != expected_fingerprint
+        ):
+            raise PaperExecutionCapabilityError("baseline terminal dispatch does not match attempt")
+        capability = _PaperExecutionCapability(_token=_CAPABILITY_TOKEN)
+        with _REGISTRY_LOCK:
+            _CAPABILITIES[capability] = _CapabilityRecord(
+                authority=binding,
+                executor=executor,
+                order=order,
+                portfolio_id=portfolio_id,
+                kind=_CapabilityKind.BASELINE_ENTRY,
+                fingerprint=fingerprint,
+                pre_position_quantity=None,
+            )
+        # The sink is a closure cell, not an executor or module attribute. Its
+        # first operation atomically burns this exact capability.
+        return terminal_sink(executor, order, capability)
+
+    return _submit_gateway_baseline_once
 
 
 def _issue_gateway_reduction_terminal_dispatch(
@@ -661,57 +737,67 @@ def _issue_gateway_reduction_terminal_dispatch(
     return dispatch
 
 
-def _submit_gateway_reduction_once(
-    authority: object,
-    dispatch: object,
-    *,
-    submitter: object,
-    order: object,
-    pre_position_quantity: Decimal,
-):
-    """Atomically burn one submitter-issued reduction dispatch."""
+def _make_gateway_reduction_submitter(terminal_sink):
+    """Capture the exact terminal sink outside mutable module/executor state."""
 
-    if type(dispatch) is not _ReductionTerminalDispatch:
-        raise PaperExecutionCapabilityError("reduction terminal dispatch is invalid")
-    with _REGISTRY_LOCK:
-        record = _REDUCTION_DISPATCHES.get(dispatch)
-        if type(record) is not _TerminalDispatchRecord or record.consumed:
-            raise PaperExecutionCapabilityError(
-                "reduction terminal dispatch is unknown or already consumed"
-            )
-        record.consumed = True
-        expected_authority = record.binding
-        expected_submitter = record.submitter
-        executor = cast("PaperExecutor", record.executor)
-        portfolio_id = record.portfolio_id
-        expected_fingerprint = record.fingerprint
-        expected_pre_position = record.pre_position_quantity
-        record.binding = None
-        record.gateway = None
-        record.runtime_context = None
-        record.submitter = None
-        record.coordinator = None
-    fingerprint = _fingerprint_order(order)
-    _validate_reduction_bounds(fingerprint, pre_position_quantity)
-    if (
-        type(authority) is not PaperReductionExecutionAuthority
-        or expected_authority is not authority
-        or expected_submitter is not submitter
-        or fingerprint != expected_fingerprint
-        or pre_position_quantity != expected_pre_position
+    def _submit_gateway_reduction_once(
+        authority: object,
+        dispatch: object,
+        *,
+        submitter: object,
+        order: object,
+        pre_position_quantity: Decimal,
     ):
-        raise PaperExecutionCapabilityError("reduction terminal dispatch does not match attempt")
-    capability = _PaperExecutionCapability(_token=_CAPABILITY_TOKEN)
-    with _REGISTRY_LOCK:
-        _CAPABILITIES[capability] = _CapabilityRecord(
-            authority=authority,
-            executor=executor,
-            portfolio_id=portfolio_id,
-            kind=_CapabilityKind.REDUCTION,
-            fingerprint=fingerprint,
-            pre_position_quantity=pre_position_quantity,
-        )
-    return executor._place_simple_order(order, _capability=capability)
+        """Atomically burn one submitter-issued reduction dispatch."""
+
+        if type(dispatch) is not _ReductionTerminalDispatch:
+            raise PaperExecutionCapabilityError("reduction terminal dispatch is invalid")
+        with _REGISTRY_LOCK:
+            record = _REDUCTION_DISPATCHES.get(dispatch)
+            if type(record) is not _TerminalDispatchRecord or record.consumed:
+                raise PaperExecutionCapabilityError(
+                    "reduction terminal dispatch is unknown or already consumed"
+                )
+            record.consumed = True
+            expected_authority = record.binding
+            expected_submitter = record.submitter
+            executor = cast("PaperExecutor", record.executor)
+            portfolio_id = record.portfolio_id
+            expected_fingerprint = record.fingerprint
+            expected_pre_position = record.pre_position_quantity
+            record.binding = None
+            record.gateway = None
+            record.runtime_context = None
+            record.submitter = None
+            record.coordinator = None
+        fingerprint = _fingerprint_order(order)
+        _validate_reduction_bounds(fingerprint, pre_position_quantity)
+        if (
+            type(authority) is not PaperReductionExecutionAuthority
+            or expected_authority is not authority
+            or expected_submitter is not submitter
+            or fingerprint != expected_fingerprint
+            or pre_position_quantity != expected_pre_position
+        ):
+            raise PaperExecutionCapabilityError(
+                "reduction terminal dispatch does not match attempt"
+            )
+        capability = _PaperExecutionCapability(_token=_CAPABILITY_TOKEN)
+        with _REGISTRY_LOCK:
+            _CAPABILITIES[capability] = _CapabilityRecord(
+                authority=authority,
+                executor=executor,
+                order=order,
+                portfolio_id=portfolio_id,
+                kind=_CapabilityKind.REDUCTION,
+                fingerprint=fingerprint,
+                pre_position_quantity=pre_position_quantity,
+            )
+        # As above, capability transport ends at a closure-captured sink whose
+        # first operation is the irreversible consume.
+        return terminal_sink(executor, order, capability)
+
+    return _submit_gateway_reduction_once
 
 
 def _validate_gateway_binding_scope(
@@ -772,12 +858,157 @@ def consume_paper_execution_capability(
     if record.kind is _CapabilityKind.BASELINE_ENTRY:
         if fingerprint.side != "BUY" or fingerprint.take_profit is not None:
             raise PaperExecutionCapabilityError("baseline entry capability is malformed")
-        return
-    if record.kind is not _CapabilityKind.REDUCTION:
-        raise PaperExecutionCapabilityError("paper execution capability kind is unsupported")
-    if type(record.pre_position_quantity) is not Decimal:
-        raise PaperExecutionCapabilityError("reduction capability lacks exact position evidence")
-    _validate_reduction_bounds(fingerprint, record.pre_position_quantity)
+    else:
+        if record.kind is not _CapabilityKind.REDUCTION:
+            raise PaperExecutionCapabilityError("paper execution capability kind is unsupported")
+        if type(record.pre_position_quantity) is not Decimal:
+            raise PaperExecutionCapabilityError(
+                "reduction capability lacks exact position evidence"
+            )
+        _validate_reduction_bounds(fingerprint, record.pre_position_quantity)
+    with _REGISTRY_LOCK:
+        current = _CAPABILITIES.get(capability)
+        if current is not record or record.consumed is not True:
+            raise PaperExecutionCapabilityError("paper execution capability state changed")
+        record.validated = True
+
+
+def _apply_consumed_paper_fill(executor: object, order: object, capability: object):
+    """Apply a fill only for an exactly consumed, still-unfilled capability."""
+
+    if type(capability) is not _PaperExecutionCapability:
+        raise PaperExecutionCapabilityError(
+            "paper fill requires an exact consumed submission capability"
+        )
+    with _REGISTRY_LOCK:
+        record = _CAPABILITIES.get(capability)
+        if (
+            type(record) is not _CapabilityRecord
+            or record.consumed is not True
+            or record.validated is not True
+            or record.fill_consumed
+            or record.executor is not executor
+            or record.order is not order
+        ):
+            raise PaperExecutionCapabilityError(
+                "paper fill capability is unknown, unconsumed, mismatched, or already filled"
+            )
+        # Burn the fill edge before any validation, mutable state, or callback
+        # can raise. Retained traceback locals can never replay this fill.
+        record.fill_consumed = True
+
+    fingerprint = _fingerprint_order(order)
+    if record.fingerprint != fingerprint:
+        raise PaperExecutionCapabilityError("paper fill capability order fingerprint changed")
+
+    from .execution import ExecutionResult, Order, PaperExecutor
+
+    if type(executor) is not PaperExecutor or type(order) is not Order:
+        raise PaperExecutionCapabilityError(
+            "sealed paper fill requires the exact executor and order types"
+        )
+
+    base: float | None
+    exact_base: Decimal | None = None
+
+    if order.price is not None:
+        if type(order.price) is Decimal:
+            if not order.price.is_finite() or order.price <= 0:
+                return ExecutionResult(False, "Invalid price for paper execution")
+            exact_base = order.price
+            base = float(exact_base)
+        else:
+            try:
+                base = float(order.price)
+            except (TypeError, ValueError):
+                return ExecutionResult(False, "Invalid price for paper execution")
+        if not math.isfinite(base):
+            return ExecutionResult(False, "Non-finite price for paper execution")
+        if base <= 0:
+            return ExecutionResult(False, "Non-positive price for paper execution")
+        executor._execution_cache[order.symbol] = base
+        executor._execution_cache_ts[order.symbol] = dt.datetime.utcnow()
+    else:
+        base = executor._execution_cache.get(order.symbol)
+        if base is None:
+            return ExecutionResult(False, "No reference price for market order")
+        timestamp = executor._execution_cache_ts.get(order.symbol)
+        if (
+            timestamp is None
+            or (dt.datetime.utcnow() - timestamp).total_seconds()
+            > executor._execution_cache_max_age_seconds
+        ):
+            return ExecutionResult(False, "Stale reference price for market order")
+
+    fill_decimal: Decimal
+    if exact_base is not None:
+        slip_decimal = (
+            exact_base * Decimal(str(executor.slippage_bps)) / Decimal("10000")
+            if executor.slippage_bps
+            else Decimal("0")
+        )
+        unrounded_fill = (
+            exact_base + slip_decimal
+            if order.side.upper() in {"BUY", "BUY_TO_COVER"}
+            else exact_base - slip_decimal
+        )
+        if not unrounded_fill.is_finite() or unrounded_fill <= 0:
+            return ExecutionResult(False, "Invalid paper execution fill")
+        fill_decimal = unrounded_fill.quantize(
+            _PAPER_FILL_PRICE_TICK,
+            rounding=ROUND_HALF_EVEN,
+        )
+        fill = float(fill_decimal)
+    else:
+        slip = base * (executor.slippage_bps / 10_000.0) if executor.slippage_bps else 0.0
+        if order.side.upper() in {"BUY", "BUY_TO_COVER"}:
+            fill = base + slip
+        else:
+            fill = base - slip
+        fill_decimal = Decimal(str(fill))
+    if not math.isfinite(fill) or fill <= 0:
+        return ExecutionResult(False, "Invalid paper execution fill")
+
+    executor.fills[f"{order.symbol}-{len(executor.fills)+1}"] = (
+        dt.datetime.utcnow(),
+        order,
+        fill,
+    )
+    return ExecutionResult(
+        True,
+        "Paper fill",
+        fill,
+        exact_fill_price=fill_decimal,
+    )
+
+
+def _make_sealed_paper_fill_sink(consume, fill_core):
+    """Capture both authority consume and fill core outside module lookups."""
+
+    def _execute_sealed_paper_fill(
+        executor: object,
+        order: object,
+        capability: object,
+    ):
+        # This exact consume is the first operation and cannot be replaced by
+        # mutating the module global after import.
+        consume(executor, order, capability)
+        return fill_core(executor, order, capability)
+
+    return _execute_sealed_paper_fill
+
+
+_execute_sealed_paper_fill = _make_sealed_paper_fill_sink(
+    consume_paper_execution_capability,
+    _apply_consumed_paper_fill,
+)
+
+
+# Capture the terminal sink exactly once. The exported submitter functions are
+# closures whose sink reference is neither an executor method nor a mutable
+# module lookup at submission time.
+_submit_gateway_baseline_once = _make_gateway_baseline_submitter(_execute_sealed_paper_fill)
+_submit_gateway_reduction_once = _make_gateway_reduction_submitter(_execute_sealed_paper_fill)
 
 
 def _fingerprint_order(order: object) -> _OrderFingerprint:

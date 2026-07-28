@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
-import math
 import os
 from dataclasses import dataclass
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 if TYPE_CHECKING:
@@ -15,7 +14,7 @@ from robo_trader.gatea_containment import validate_gate_a_order
 from robo_trader.logger import get_logger
 from robo_trader.paper_execution_capability import (
     PaperExecutionCapabilityError,
-    consume_paper_execution_capability,
+    _execute_sealed_paper_fill,
 )
 
 logger = get_logger(__name__)
@@ -25,7 +24,6 @@ logger = get_logger(__name__)
 # cannot weaken it accidentally. PR 11 will replace this executor with a
 # reviewed broker lifecycle adapter rather than flipping this constant.
 LIVE_TRADING_CAPABILITY_ENABLED = False
-_PAPER_FILL_PRICE_TICK = Decimal("0.0001")
 
 
 @dataclass
@@ -206,130 +204,9 @@ class PaperExecutor(BaseExecutor):
         if not admitted:
             return ExecutionResult(False, reason)
         try:
-            consume_paper_execution_capability(self, order, _capability)
+            return _execute_sealed_paper_fill(self, order, _capability)
         except PaperExecutionCapabilityError as exc:
             return ExecutionResult(False, str(exc))
-
-        base: Optional[float]
-        exact_base: Optional[Decimal] = None
-
-        if order.price is not None:
-            if type(order.price) is Decimal:
-                if not order.price.is_finite() or order.price <= 0:
-                    logger.error(
-                        "Invalid exact price provided for paper order",
-                        symbol=order.symbol,
-                    )
-                    return ExecutionResult(False, "Invalid price for paper execution")
-                exact_base = order.price
-                base = float(exact_base)
-            else:
-                try:
-                    base = float(order.price)
-                except (TypeError, ValueError):
-                    logger.error(
-                        "Invalid price provided for paper order",
-                        symbol=order.symbol,
-                        price=order.price,
-                    )
-                    return ExecutionResult(False, "Invalid price for paper execution")
-            if not math.isfinite(base):
-                logger.error(
-                    "Non-finite price provided for paper order",
-                    symbol=order.symbol,
-                    price=order.price,
-                )
-                return ExecutionResult(False, "Non-finite price for paper execution")
-            if base <= 0:
-                logger.error(
-                    "Non-positive price provided for paper order",
-                    symbol=order.symbol,
-                    price=order.price,
-                )
-                return ExecutionResult(False, "Non-positive price for paper execution")
-            self._execution_cache[order.symbol] = base
-            self._execution_cache_ts[order.symbol] = dt.datetime.utcnow()
-        else:
-            base = self._execution_cache.get(order.symbol)
-            if base is None:
-                logger.error(
-                    "Missing reference price for market order in paper execution",
-                    symbol=order.symbol,
-                )
-                return ExecutionResult(False, "No reference price for market order")
-            # Stale-price fallback guard (TC-L3): if the last cached price is
-            # older than max-age, refuse the order rather than fill at stale data.
-            ts = self._execution_cache_ts.get(order.symbol)
-            if (
-                ts is None
-                or (dt.datetime.utcnow() - ts).total_seconds()
-                > self._execution_cache_max_age_seconds
-            ):
-                logger.error(
-                    "Stale cached reference price for market order in paper execution",
-                    symbol=order.symbol,
-                )
-                return ExecutionResult(False, "Stale reference price for market order")
-
-        fill_decimal: Decimal
-        if exact_base is not None:
-            # The safety adapter passes a bounded, tick-quantized Decimal.
-            # Preserve it through all slippage arithmetic; only the legacy
-            # ExecutionResult boundary converts the final paper fill to float.
-            slip_decimal = (
-                exact_base * Decimal(str(self.slippage_bps)) / Decimal("10000")
-                if self.slippage_bps
-                else Decimal("0")
-            )
-            unrounded_fill = (
-                exact_base + slip_decimal
-                if order.side.upper() in {"BUY", "BUY_TO_COVER"}
-                else exact_base - slip_decimal
-            )
-            if not unrounded_fill.is_finite() or unrounded_fill <= 0:
-                logger.error(
-                    "Paper slippage produced an invalid exact fill",
-                    symbol=order.symbol,
-                )
-                return ExecutionResult(False, "Invalid paper execution fill")
-            # Normalize the simulator's authoritative fill before either the
-            # durable exact-value path or its legacy float compatibility view
-            # observes it. Arbitrary finite float slippage otherwise produces
-            # a high-scale Decimal whose float round-trip no longer matches,
-            # after the fill has already been recorded.
-            fill_decimal = unrounded_fill.quantize(
-                _PAPER_FILL_PRICE_TICK,
-                rounding=ROUND_HALF_EVEN,
-            )
-            fill = float(fill_decimal)
-        else:
-            # Apply symmetric slippage in basis points
-            slip = base * (self.slippage_bps / 10_000.0) if self.slippage_bps else 0.0
-
-            # Handle all order sides including short selling
-            if order.side.upper() in {"BUY", "BUY_TO_COVER"}:
-                fill = base + slip
-            else:  # SELL or SELL_SHORT
-                fill = base - slip
-            fill_decimal = Decimal(str(fill))
-        if not math.isfinite(fill) or fill <= 0:
-            logger.error(
-                "Paper slippage produced an invalid fill",
-                symbol=order.symbol,
-            )
-            return ExecutionResult(False, "Invalid paper execution fill")
-
-        self.fills[f"{order.symbol}-{len(self.fills)+1}"] = (
-            dt.datetime.utcnow(),
-            order,
-            fill,
-        )
-        return ExecutionResult(
-            True,
-            "Paper fill",
-            fill,
-            exact_fill_price=fill_decimal,
-        )
 
     def _place_smart_order(self, order: Order) -> ExecutionResult:
         """Place order using smart execution algorithms."""

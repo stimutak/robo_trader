@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
+import robo_trader.paper_execution_capability as capability_module
 from robo_trader.broker_safety_evidence import (
     BrokerContractSafetySnapshot,
     BrokerSafetyContract,
@@ -926,6 +927,132 @@ async def test_baseline_terminal_dispatch_direct_replay_cannot_fill_twice(
 
     assert first.ok is True
     assert len(executor.fills) == 1
+
+
+@pytest.mark.asyncio
+async def test_baseline_terminal_dispatch_never_calls_mutable_executor_method(
+    harness: GatewayHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = PaperExecutor()
+    handle = await _bind_runtime(harness, "portfolio-a", executor)
+    intent = harness.gateway.issue_baseline_entry_intent(
+        portfolio_id="portfolio-a",
+        symbol=SYMBOL,
+        handle=handle,
+    )
+    now = datetime.now(timezone.utc)
+    quote = BrokerProtectiveQuote(
+        schema_version=1,
+        symbol=SYMBOL,
+        con_id=CON_ID,
+        exchange="SMART",
+        primary_exchange="NASDAQ",
+        currency="USD",
+        security_type="STK",
+        price=Decimal("123.4500"),
+        source_timestamp=now,
+        retrieval_timestamp=now,
+        session=MarketSession.REGULAR,
+        source=MarketDataSource.IBKR_LIVE_LAST_TRADE,
+        source_event_id="entry-mutable-method-test",
+        transport_generation="gateway-generation",
+        market_data_type=1,
+    )
+    harness.gateway._fetch_protective_quotes_locked = AsyncMock(return_value=(quote,))
+    order = Order(SYMBOL, 1, "BUY", quote.price, order_ref="baseline-mutable-method")
+    monkeypatch.setattr(
+        executor,
+        "_place_simple_order",
+        lambda *_args, **_kwargs: pytest.fail("mutable executor method must not receive authority"),
+    )
+    monkeypatch.setattr(
+        capability_module,
+        "_execute_sealed_paper_fill",
+        lambda *_args, **_kwargs: pytest.fail("captured terminal sink must be immutable"),
+    )
+    monkeypatch.setattr(
+        capability_module,
+        "consume_paper_execution_capability",
+        lambda *_args, **_kwargs: pytest.fail("captured consume primitive must be immutable"),
+    )
+
+    async with harness.gateway.serialize_entry(SYMBOL, portfolio_id="portfolio-a"):
+        result = harness.gateway.submit_baseline_entry(
+            order=order,
+            portfolio_id="portfolio-a",
+            intent=intent,
+        )
+
+    assert result.ok is True
+    assert len(executor.fills) == 1
+
+
+@pytest.mark.asyncio
+async def test_baseline_traceback_retains_only_burned_capability(
+    harness: GatewayHarness,
+) -> None:
+    executor = PaperExecutor()
+    handle = await _bind_runtime(harness, "portfolio-a", executor)
+    intent = harness.gateway.issue_baseline_entry_intent(
+        portfolio_id="portfolio-a",
+        symbol=SYMBOL,
+        handle=handle,
+    )
+    now = datetime.now(timezone.utc)
+    quote = BrokerProtectiveQuote(
+        schema_version=1,
+        symbol=SYMBOL,
+        con_id=CON_ID,
+        exchange="SMART",
+        primary_exchange="NASDAQ",
+        currency="USD",
+        security_type="STK",
+        price=Decimal("123.4500"),
+        source_timestamp=now,
+        retrieval_timestamp=now,
+        session=MarketSession.REGULAR,
+        source=MarketDataSource.IBKR_LIVE_LAST_TRADE,
+        source_event_id="entry-traceback-capability-test",
+        transport_generation="gateway-generation",
+        market_data_type=1,
+    )
+    harness.gateway._fetch_protective_quotes_locked = AsyncMock(return_value=(quote,))
+    order = Order(SYMBOL, 1, "BUY", quote.price, order_ref="baseline-traceback")
+
+    class RaisingFills(dict):
+        def __setitem__(self, _key, _value):
+            raise LookupError("injected post-consume fill failure")
+
+    executor.fills = RaisingFills()
+    with pytest.raises(LookupError, match="post-consume") as raised:
+        async with harness.gateway.serialize_entry(SYMBOL, portfolio_id="portfolio-a"):
+            harness.gateway.submit_baseline_entry(
+                order=order,
+                portfolio_id="portfolio-a",
+                intent=intent,
+            )
+
+    capability = None
+    traceback = raised.value.__traceback__
+    while traceback is not None:
+        if traceback.tb_frame.f_code.co_name == "_submit_gateway_baseline_once":
+            capability = traceback.tb_frame.f_locals.get("capability")
+        traceback = traceback.tb_next
+    assert capability is not None
+    with pytest.raises(PaperExecutionCapabilityError):
+        copy.copy(capability)
+    with pytest.raises(PaperExecutionCapabilityError):
+        copy.deepcopy(capability)
+    with pytest.raises(PaperExecutionCapabilityError):
+        pickle.dumps(capability)
+    with pytest.raises(TypeError):
+        replace(capability)
+
+    replay = PaperExecutor._place_simple_order(executor, order, _capability=capability)
+    assert replay.ok is False
+    assert "already consumed" in replay.message
+    assert executor.fills == {}
 
 
 def test_gateway_requires_exact_runtime_coordinator_database_and_executor_binding(
