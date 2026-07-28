@@ -2746,13 +2746,17 @@ class AsyncTradingDatabase:
                     await conn.execute("BEGIN IMMEDIATE")
                     for group_key, group_rows in grouped_rows.items():
                         timestamps = [row["timestamp"] for row in group_rows]
+                        # Both interpolated identifier lists come exclusively
+                        # from the fixed source-code tuples above; row values
+                        # remain bound through SQLite parameters.
+                        existing_query = (
+                            f"SELECT {', '.join(storage_columns)} "  # nosec B608
+                            "FROM canonical_market_data WHERE "
+                            f"{' AND '.join(f'{column} = ?' for column in identity_columns)} "
+                            "AND timestamp BETWEEN ? AND ?"
+                        )
                         existing_cursor = await conn.execute(
-                            f"""
-                            SELECT {", ".join(storage_columns)}
-                            FROM canonical_market_data
-                            WHERE {" AND ".join(f"{column} = ?" for column in identity_columns)}
-                              AND timestamp BETWEEN ? AND ?
-                            """,
+                            existing_query,
                             (*group_key, min(timestamps), max(timestamps)),
                         )
                         existing_rows = {
