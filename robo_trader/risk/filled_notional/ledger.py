@@ -706,12 +706,18 @@ class DailyFilledNotional:
                     self._verify_monotonic_state(state)
                     connection.commit()
             else:
-                created = self._initialize_if_missing()
-                if not created:
-                    recovery_required = self._preflight_existing_schema()
-                else:
+                database_was_missing = self._database_path_is_missing()
+                if database_was_missing:
+                    self._preflight_missing_database_artifacts()
                     recovery_required = False
+                else:
+                    recovery_required = self._preflight_existing_schema()
                 with self._anchor_transition_lock():
+                    created = False
+                    if database_was_missing:
+                        created = self._initialize_if_missing()
+                        if not created:
+                            recovery_required = self._preflight_existing_schema()
                     if recovery_required:
                         self._recover_hot_journal()
                     with self._connection(readonly=True) as connection:
@@ -855,18 +861,18 @@ class DailyFilledNotional:
                 os.close(descriptor)
 
     @contextmanager
-    def _anchor_transition_lock(self) -> Iterator[None]:
+    def _anchor_transition_lock(self, *, create: bool = True) -> Iterator[None]:
         """Serialize database commits through stable-anchor publication."""
 
         descriptor: Optional[int] = None
         with self._anchor_directory_descriptor() as directory_descriptor:
             try:
+                flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+                if create:
+                    flags |= os.O_CREAT
                 descriptor = os.open(
                     self._anchor_lock_name,
-                    os.O_RDWR
-                    | os.O_CREAT
-                    | getattr(os, "O_NOFOLLOW", 0)
-                    | getattr(os, "O_CLOEXEC", 0),
+                    flags,
                     0o600,
                     dir_fd=directory_descriptor,
                 )
@@ -1365,6 +1371,47 @@ class DailyFilledNotional:
         _, trading_day = _canonical_utc(instant)
         return date.fromisoformat(trading_day)
 
+    def _database_path_is_missing(self) -> bool:
+        try:
+            os.lstat(self._path)
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            raise FilledNotionalUnavailable(
+                "filled-notional database identity cannot be inspected safely"
+            ) from exc
+        return False
+
+    def _anchor_artifact_exists(self, name: str) -> bool:
+        with self._anchor_directory_descriptor() as directory_descriptor:
+            try:
+                os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+            except OSError as exc:
+                raise FilledNotionalIntegrityError(
+                    "anchor artifact identity cannot be inspected safely"
+                ) from exc
+        return True
+
+    def _raise_if_anchor_survives_missing_database(self) -> None:
+        if self._database_path_is_missing() and self._anchor_artifact_exists(self._anchor_name):
+            raise FilledNotionalIntegrityError(
+                "main database is absent while anchor survives; preserve it for review"
+            )
+
+    def _preflight_missing_database_artifacts(self) -> None:
+        """Reject preserved evidence before creating a database or transition lock."""
+
+        self._reject_sidecars_without_database()
+        if not self._anchor_artifact_exists(self._anchor_name):
+            return
+        if self._anchor_artifact_exists(self._anchor_lock_name):
+            with self._anchor_transition_lock(create=False):
+                self._raise_if_anchor_survives_missing_database()
+            return
+        self._raise_if_anchor_survives_missing_database()
+
     def _initialize_if_missing(self) -> bool:
         try:
             os.lstat(self._path)
@@ -1373,6 +1420,7 @@ class DailyFilledNotional:
             pass
 
         self._reject_sidecars_without_database()
+        self._raise_if_anchor_survives_missing_database()
 
         binding: Optional[SQLitePathBinding] = None
         connection: Optional[sqlite3.Connection] = None

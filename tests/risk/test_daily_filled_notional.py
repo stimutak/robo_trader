@@ -679,6 +679,61 @@ def test_missing_database_preserves_and_rejects_every_sqlite_sidecar(
         assert marker.read_bytes() == marker_bytes
 
 
+def test_missing_database_with_surviving_anchor_and_lock_creates_nothing(tmp_path):
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+    preserved_database = tmp_path / "preserved-notional.db"
+    path.rename(preserved_database)
+    lock_path = ledger.anchor_path.parent / f".{ledger.anchor_path.name}.lock"
+    assert lock_path.exists()
+    preserved_database_before = _file_snapshot(preserved_database)
+    anchor_before = _file_snapshot(ledger.anchor_path)
+    lock_before = _file_snapshot(lock_path)
+    paths_before = _path_inventory(tmp_path)
+
+    with pytest.raises(
+        FilledNotionalIntegrityError, match="main database is absent while anchor survives"
+    ):
+        _service(path)
+
+    assert not path.exists()
+    assert _file_snapshot(preserved_database) == preserved_database_before
+    assert _file_snapshot(ledger.anchor_path) == anchor_before
+    assert _file_snapshot(lock_path) == lock_before
+    assert _path_inventory(tmp_path) == paths_before
+    assert all(not Path(f"{path}{suffix}").exists() for suffix in ("-wal", "-shm", "-journal"))
+
+
+def test_missing_database_with_surviving_anchor_does_not_create_lock(tmp_path):
+    path = tmp_path / "notional.db"
+    anchor_directory = tmp_path / "protected-anchor"
+    anchor_directory.mkdir(mode=0o700)
+    anchor_path = anchor_directory / "notional.db.anchor"
+    anchor_path.write_bytes(b"preserved-anchor-evidence")
+    os.chmod(anchor_path, 0o600)
+    lock_path = anchor_directory / ".notional.db.anchor.lock"
+    anchor_before = _file_snapshot(anchor_path)
+    paths_before = _path_inventory(tmp_path)
+
+    with pytest.raises(
+        FilledNotionalIntegrityError, match="main database is absent while anchor survives"
+    ):
+        DailyFilledNotional(
+            path,
+            anchor_path=anchor_path,
+            anchor_key=ANCHOR_KEY,
+            monotonic_verifier=TestMonotonicVerifier(),
+            account_id="DU12345",
+            portfolio_id="default",
+        )
+
+    assert not path.exists()
+    assert not lock_path.exists()
+    assert _file_snapshot(anchor_path) == anchor_before
+    assert _path_inventory(tmp_path) == paths_before
+    assert all(not Path(f"{path}{suffix}").exists() for suffix in ("-wal", "-shm", "-journal"))
+
+
 def test_wal_shm_hardlinks_are_rejected_without_mutating_targets(tmp_path):
     path = tmp_path / "notional.db"
     ledger = _service(path)
