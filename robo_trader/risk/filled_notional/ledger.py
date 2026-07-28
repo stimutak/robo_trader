@@ -14,10 +14,12 @@ and tail deletion. One authenticated database event ahead of the anchor is the
 only recoverable crash window (SQLite committed and the atomic anchor replace
 did not finish).
 
-No local-file design can prove a coordinated offline rollback of the database,
-anchor, *and* the external key/monotonic authority. Operators must protect and
-version the anchor independently (for example, immutable backup or a monotonic
-secret service). This module makes no claim beyond that explicit boundary.
+An HMAC does not prove freshness: an attacker who replays an older valid
+database and matching older valid anchor can pass all local checks while the
+HMAC key remains unchanged. Authoritative use therefore requires the caller's
+independent monotonic verifier to reject states older than the last accepted
+state. That verifier must keep its state outside the database/anchor failure
+domain (for example, in an independently operated monotonic service).
 
 The package is dormant: it grants no order, broker, runner, or startup authority.
 """
@@ -261,6 +263,10 @@ class FilledNotionalMigrationRequired(FilledNotionalUnavailable):
     """A preserved older schema requires an explicit reviewed migration."""
 
 
+class _PendingAnchorInProgress(RuntimeError):
+    """A valid pending transition may belong to another active writer."""
+
+
 class FillSide(str, Enum):
     """Economic direction of an actual executed fill."""
 
@@ -300,6 +306,17 @@ class ConflictEvidence:
     claimed_fill_json: str
     observed_at_utc: str
     conflict_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class MonotonicLedgerState:
+    """State that an independent monotonic authority must verify and advance."""
+
+    ledger_id: str
+    fill_count: int
+    fill_head: str
+    conflict_count: int
+    conflict_head: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -543,6 +560,7 @@ class DailyFilledNotional:
         *,
         anchor_path: Path | str,
         anchor_key: bytes,
+        monotonic_verifier: Callable[[MonotonicLedgerState], bool],
         account_id: str,
         portfolio_id: str,
         currency: str = "USD",
@@ -552,6 +570,11 @@ class DailyFilledNotional:
         self._path = lexical_path_preserving_leaf(database_path)
         self._anchor_path = lexical_path_preserving_leaf(anchor_path)
         self._key = self._validate_anchor_key(anchor_key)
+        if not callable(monotonic_verifier):
+            raise FilledNotionalUnavailable(
+                "independent monotonic verifier is required for authoritative accounting"
+            )
+        self._monotonic_verifier = monotonic_verifier
         self._validate_independent_anchor_path()
         self._account_id = _validate_identifier(account_id, "account_id")
         self._portfolio_id = _validate_identifier(portfolio_id, "portfolio_id")
@@ -566,6 +589,8 @@ class DailyFilledNotional:
 
         try:
             created = self._initialize_if_missing()
+            if not created:
+                self._preflight_existing_schema()
             self._recover_hot_journal()
             with self._connection(readonly=True) as connection:
                 state = self._validate_ledger(connection)
@@ -573,6 +598,7 @@ class DailyFilledNotional:
                     anchor = self._create_initial_anchor(state)
                 else:
                     anchor = self._reconcile_anchor(state)
+                self._verify_monotonic_state(state)
                 current_day = self._current_trading_date()
                 total = self._total_for_date(connection, current_day)
         except FilledNotionalError:
@@ -603,14 +629,70 @@ class DailyFilledNotional:
             raise FilledNotionalError("anchor path must differ from the SQLite ledger")
         if self._anchor_path.parent == self._path.parent:
             raise FilledNotionalError("anchor must be stored in a separate protected directory")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        descriptor: Optional[int] = None
         try:
-            metadata = os.lstat(self._anchor_path.parent)
+            descriptor = os.open(self._anchor_path.parent, flags)
+            metadata = os.fstat(descriptor)
+            path_metadata = os.lstat(self._anchor_path.parent)
         except OSError as exc:
             raise FilledNotionalError("anchor directory must already exist") from exc
-        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_mode & 0o022:
-            raise FilledNotionalError(
-                "anchor directory must be a non-group/world-writable directory"
-            )
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_mode & 0o022
+            or (metadata.st_dev, metadata.st_ino) != (path_metadata.st_dev, path_metadata.st_ino)
+        ):
+            raise FilledNotionalError("anchor directory is not safely bindable")
+        self._anchor_name = self._anchor_path.name
+        self._anchor_directory_device = metadata.st_dev
+        self._anchor_directory_inode = metadata.st_ino
+
+    @contextmanager
+    def _anchor_directory_descriptor(self) -> Iterator[int]:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        descriptor: Optional[int] = None
+        expected = (self._anchor_directory_device, self._anchor_directory_inode)
+        try:
+            descriptor = os.open(self._anchor_path.parent, flags)
+            metadata = os.fstat(descriptor)
+            path_metadata = os.lstat(self._anchor_path.parent)
+            if (metadata.st_dev, metadata.st_ino) != expected or (
+                path_metadata.st_dev,
+                path_metadata.st_ino,
+            ) != expected:
+                raise FilledNotionalIntegrityError("anchor directory identity changed")
+            yield descriptor
+            metadata = os.fstat(descriptor)
+            path_metadata = os.lstat(self._anchor_path.parent)
+            if (metadata.st_dev, metadata.st_ino) != expected or (
+                path_metadata.st_dev,
+                path_metadata.st_ino,
+            ) != expected:
+                raise FilledNotionalIntegrityError(
+                    "anchor directory identity changed during operation"
+                )
+        except FilledNotionalError:
+            raise
+        except OSError as exc:
+            raise FilledNotionalIntegrityError(
+                "anchor directory cannot be accessed safely"
+            ) from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
     @property
     def database_path(self) -> Path:
@@ -647,6 +729,8 @@ class DailyFilledNotional:
                 connection.execute("BEGIN IMMEDIATE")
                 before = self._validate_ledger(connection)
                 anchor = self._reconcile_anchor(before)
+                self._assert_no_conflicts(before)
+                self._verify_monotonic_state(before)
                 existing = connection.execute(
                     """
                     SELECT portfolio_id, side, quantity_text, price_text, currency,
@@ -698,6 +782,7 @@ class DailyFilledNotional:
                         self._anchor_for_state(after),
                         expected=pending,
                     )
+                    self._verify_monotonic_state(after)
                 else:
                     self._commit_database(connection)
                     self._anchor = anchor
@@ -727,10 +812,30 @@ class DailyFilledNotional:
         self._require_available()
         try:
             trading_day = self._trading_date(as_of if as_of is not None else self._clock())
-            with self._connection(readonly=True) as connection:
-                state = self._validate_ledger(connection)
-                self._anchor = self._require_exact_anchor(state)
-                return self._total_for_date(connection, trading_day)
+            pending_attempts = 0
+            while True:
+                try:
+                    with self._connection(readonly=True) as connection:
+                        state = self._validate_ledger(connection)
+                        self._anchor = self._require_exact_anchor(state)
+                        self._assert_no_conflicts(state)
+                        self._verify_monotonic_state(state)
+                        return self._total_for_date(connection, trading_day)
+                except _PendingAnchorInProgress:
+                    pending_attempts += 1
+                    if pending_attempts > 3:
+                        raise FilledNotionalUnavailable(
+                            "pending anchor writer did not reach a stable state"
+                        )
+                    try:
+                        self._resolve_pending_anchor()
+                    except sqlite3.OperationalError as exc:
+                        if "locked" not in str(exc).lower():
+                            raise
+                        if pending_attempts == 3:
+                            raise FilledNotionalUnavailable(
+                                "pending anchor writer remained busy"
+                            ) from exc
         except FilledNotionalIntegrityError as exc:
             self._latch_failure(str(exc))
             raise
@@ -750,6 +855,7 @@ class DailyFilledNotional:
         *,
         anchor_path: Path | str,
         anchor_key: bytes,
+        monotonic_verifier: Callable[[MonotonicLedgerState], bool],
     ) -> tuple[ConflictEvidence, ...]:
         """Authenticate and return durable conflict markers without clearing them."""
 
@@ -757,6 +863,7 @@ class DailyFilledNotional:
             database_path,
             anchor_path=anchor_path,
             anchor_key=anchor_key,
+            monotonic_verifier=monotonic_verifier,
             account_id="__review__",
             portfolio_id="__review__",
             _review_only=True,
@@ -884,6 +991,30 @@ class DailyFilledNotional:
                 f"filled-notional accounting is latched unavailable: {self._failed_reason}"
             )
 
+    def _assert_no_conflicts(self, state: _LedgerState) -> None:
+        if state.conflict_count:
+            self._latch_failure("durable conflicting execution evidence requires review")
+            raise FilledNotionalConflict(self._failed_reason)
+
+    def _verify_monotonic_state(self, state: _LedgerState) -> None:
+        candidate = MonotonicLedgerState(
+            ledger_id=state.ledger_id,
+            fill_count=state.fill_count,
+            fill_head=state.fill_head,
+            conflict_count=state.conflict_count,
+            conflict_head=state.conflict_head,
+        )
+        try:
+            accepted = self._monotonic_verifier(candidate)
+        except Exception as exc:
+            raise FilledNotionalUnavailable(
+                "independent monotonic verification failed closed"
+            ) from exc
+        if accepted is not True:
+            raise FilledNotionalIntegrityError(
+                "independent monotonic authority rejected ledger state"
+            )
+
     def _latch_failure(self, reason: str) -> None:
         self._failed_reason = reason
 
@@ -948,15 +1079,46 @@ class DailyFilledNotional:
             connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
             connection.commit()
 
+    def _preflight_existing_schema(self) -> None:
+        """Identify legacy state without permitting SQLite journal recovery."""
+
+        journal = Path(f"{self._path}-journal")
+        try:
+            journal_metadata = os.lstat(journal)
+        except FileNotFoundError:
+            journal_metadata = None
+        if journal_metadata is not None:
+            if stat.S_ISLNK(journal_metadata.st_mode) or not stat.S_ISREG(journal_metadata.st_mode):
+                raise FilledNotionalUnavailable(
+                    "SQLite journal prevents safe read-only schema detection"
+                )
+        try:
+            with self._connection(readonly=True, immutable=True) as connection:
+                self._schema_version(connection)
+        except FilledNotionalMigrationRequired:
+            raise
+        except FilledNotionalError:
+            raise
+        except (OSError, sqlite3.Error, SQLiteIdentityError) as exc:
+            raise FilledNotionalUnavailable(
+                "existing schema cannot be detected without SQLite recovery"
+            ) from exc
+
     @contextmanager
-    def _connection(self, *, readonly: bool) -> Iterator[sqlite3.Connection]:
+    def _connection(
+        self,
+        *,
+        readonly: bool,
+        immutable: bool = False,
+    ) -> Iterator[sqlite3.Connection]:
         binding: Optional[SQLitePathBinding] = None
         connection: Optional[sqlite3.Connection] = None
         try:
             binding = SQLitePathBinding.open_for_initialization(self._path, create=False)
             mode = "ro" if readonly else "rw"
+            immutable_query = "&immutable=1" if immutable else ""
             connection = sqlite3.connect(
-                self._path.as_uri() + f"?mode={mode}",
+                self._path.as_uri() + f"?mode={mode}{immutable_query}",
                 uri=True,
                 timeout=1.0,
                 isolation_level=None,
@@ -1205,26 +1367,71 @@ class DailyFilledNotional:
         )
 
     def _create_initial_anchor(self, state: _LedgerState) -> _Anchor:
-        try:
-            os.lstat(self._anchor_path)
-        except FileNotFoundError:
-            anchor = self._anchor_for_state(state)
-            return self._write_anchor_file(anchor, must_not_exist=True)
+        with self._anchor_directory_descriptor() as directory_descriptor:
+            try:
+                os.stat(
+                    self._anchor_name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                anchor = self._anchor_for_state(state)
+                return self._write_anchor_file(anchor, must_not_exist=True)
         raise FilledNotionalIntegrityError("new ledger anchor path already exists")
 
     def _load_anchor(self) -> _Anchor:
+        descriptor: Optional[int] = None
         try:
-            metadata = os.lstat(self._anchor_path)
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-                raise FilledNotionalIntegrityError("anchor must be a non-symlink regular file")
-            if metadata.st_mode & 0o077:
-                raise FilledNotionalIntegrityError("anchor permissions must be owner-only")
-            raw = self._anchor_path.read_bytes()
+            with self._anchor_directory_descriptor() as directory_descriptor:
+                metadata = os.stat(
+                    self._anchor_name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                    raise FilledNotionalIntegrityError("anchor must be a non-symlink regular file")
+                if metadata.st_mode & 0o077:
+                    raise FilledNotionalIntegrityError("anchor permissions must be owner-only")
+                descriptor = os.open(
+                    self._anchor_name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=directory_descriptor,
+                )
+                opened_metadata = os.fstat(descriptor)
+                if (metadata.st_dev, metadata.st_ino) != (
+                    opened_metadata.st_dev,
+                    opened_metadata.st_ino,
+                ):
+                    raise FilledNotionalIntegrityError("anchor identity changed while opening")
+                chunks: list[bytes] = []
+                size = 0
+                while True:
+                    chunk = os.read(descriptor, 8192)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > 65536:
+                        raise FilledNotionalIntegrityError("anchor file is too large")
+                    chunks.append(chunk)
+                final_metadata = os.stat(
+                    self._anchor_name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                if (metadata.st_dev, metadata.st_ino) != (
+                    final_metadata.st_dev,
+                    final_metadata.st_ino,
+                ):
+                    raise FilledNotionalIntegrityError("anchor identity changed while reading")
+                raw = b"".join(chunks)
             decoded = json.loads(raw.decode("ascii"))
         except FilledNotionalError:
             raise
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise FilledNotionalIntegrityError("anchor cannot be read safely") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
         if type(decoded) is not dict or set(decoded) != {
             "anchor_version",
             "mac",
@@ -1306,9 +1513,30 @@ class DailyFilledNotional:
 
     def _require_exact_anchor(self, state: _LedgerState) -> _Anchor:
         anchor = self._load_anchor()
-        if anchor.pending_state is not None or anchor.state != state:
+        pending = anchor.pending_state
+        if pending is not None:
+            if (
+                pending.ledger_id != anchor.state.ledger_id
+                or pending.database_device != anchor.state.database_device
+                or pending.database_inode != anchor.state.database_inode
+                or state not in (anchor.state, pending)
+            ):
+                raise FilledNotionalIntegrityError(
+                    "pending anchor does not authenticate current ledger state"
+                )
+            raise _PendingAnchorInProgress
+        if anchor.state != state:
             raise FilledNotionalIntegrityError("ledger and durable anchor differ")
         return anchor
+
+    def _resolve_pending_anchor(self) -> None:
+        """Serialize behind a writer and reconcile only authenticated endpoints."""
+
+        with self._connection(readonly=False) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            state = self._validate_ledger(connection)
+            self._anchor = self._reconcile_anchor(state)
+            connection.commit()
 
     def _replace_anchor(self, desired: _Anchor, *, expected: _Anchor) -> _Anchor:
         current = self._load_anchor()
@@ -1319,62 +1547,74 @@ class DailyFilledNotional:
         return self._write_anchor_file(desired, must_not_exist=False)
 
     def _write_anchor_file(self, anchor: _Anchor, *, must_not_exist: bool) -> _Anchor:
-        if must_not_exist:
-            try:
-                os.lstat(self._anchor_path)
-            except FileNotFoundError:
-                pass
-            else:
-                raise FilledNotionalIntegrityError("anchor already exists")
         payload = self._unsigned_anchor_payload(anchor.state, anchor.pending_state)
         payload["mac"] = anchor.mac
         encoded = (_canonical_json(payload) + "\n").encode("ascii")
-        temporary = self._anchor_path.parent / (
-            f".{self._anchor_path.name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
-        )
+        temporary_name = f".{self._anchor_name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
         descriptor: Optional[int] = None
-        directory_descriptor: Optional[int] = None
-        try:
-            descriptor = os.open(
-                temporary,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
-                0o600,
-            )
-            view = memoryview(encoded)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    raise OSError("anchor write made no progress")
-                view = view[written:]
-            os.fsync(descriptor)
-            os.close(descriptor)
-            descriptor = None
-            if must_not_exist:
-                try:
-                    os.link(temporary, self._anchor_path)
-                except FileExistsError as exc:
-                    raise FilledNotionalIntegrityError("anchor already exists") from exc
-                temporary.unlink()
-            else:
-                os.replace(temporary, self._anchor_path)
-            directory_descriptor = os.open(
-                self._anchor_path.parent,
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
-            )
-            os.fsync(directory_descriptor)
-            loaded = self._load_anchor()
-            if loaded != anchor:
-                raise FilledNotionalIntegrityError("atomic anchor verification failed")
-            return loaded
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
-            if directory_descriptor is not None:
-                os.close(directory_descriptor)
+        with self._anchor_directory_descriptor() as directory_descriptor:
             try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
+                if must_not_exist:
+                    try:
+                        os.stat(
+                            self._anchor_name,
+                            dir_fd=directory_descriptor,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        raise FilledNotionalIntegrityError("anchor already exists")
+                descriptor = os.open(
+                    temporary_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+                view = memoryview(encoded)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("anchor write made no progress")
+                    view = view[written:]
+                os.fsync(descriptor)
+                os.close(descriptor)
+                descriptor = None
+                if must_not_exist:
+                    try:
+                        os.link(
+                            temporary_name,
+                            self._anchor_name,
+                            src_dir_fd=directory_descriptor,
+                            dst_dir_fd=directory_descriptor,
+                            follow_symlinks=False,
+                        )
+                    except FileExistsError as exc:
+                        raise FilledNotionalIntegrityError("anchor already exists") from exc
+                    os.unlink(temporary_name, dir_fd=directory_descriptor)
+                else:
+                    os.replace(
+                        temporary_name,
+                        self._anchor_name,
+                        src_dir_fd=directory_descriptor,
+                        dst_dir_fd=directory_descriptor,
+                    )
+                os.fsync(directory_descriptor)
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+                try:
+                    os.unlink(temporary_name, dir_fd=directory_descriptor)
+                except FileNotFoundError:
+                    pass
+        loaded = self._load_anchor()
+        if loaded != anchor:
+            raise FilledNotionalIntegrityError("atomic anchor verification failed")
+        return loaded
 
     def _total_for_date(self, connection: sqlite3.Connection, trading_day: date) -> Decimal:
         rows = connection.execute(

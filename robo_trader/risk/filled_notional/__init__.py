@@ -15,6 +15,7 @@ from .ledger import (
     FilledNotionalMigrationRequired,
     FilledNotionalUnavailable,
     FillSide,
+    MonotonicLedgerState,
 )
 
 __all__ = [
@@ -23,6 +24,7 @@ __all__ = [
     "ExecutedFill",
     "FillAccountingResult",
     "FillSide",
+    "MonotonicLedgerState",
     "FilledNotionalConflict",
     "FilledNotionalError",
     "FilledNotionalIntegrityError",

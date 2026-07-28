@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, getcontext, setcontext
@@ -27,11 +29,40 @@ from robo_trader.risk.filled_notional import (
     FilledNotionalMigrationRequired,
     FilledNotionalUnavailable,
     FillSide,
+    MonotonicLedgerState,
 )
 
 UTC = timezone.utc
 NEW_YORK = ZoneInfo("America/New_York")
 ANCHOR_KEY = b"test-only-independent-anchor-key-32-bytes-minimum"
+_MONOTONIC_VERIFIERS = {}
+
+
+class TestMonotonicVerifier:
+    __test__ = False
+
+    def __init__(self) -> None:
+        self.state: MonotonicLedgerState | None = None
+
+    def __call__(self, candidate: MonotonicLedgerState) -> bool:
+        prior = self.state
+        if prior is None:
+            self.state = candidate
+            return True
+        if candidate == prior:
+            return True
+        if candidate.ledger_id != prior.ledger_id:
+            return False
+        fill_delta = candidate.fill_count - prior.fill_count
+        conflict_delta = candidate.conflict_count - prior.conflict_count
+        if fill_delta < 0 or conflict_delta < 0 or fill_delta + conflict_delta != 1:
+            return False
+        if fill_delta == 0 and candidate.fill_head != prior.fill_head:
+            return False
+        if conflict_delta == 0 and candidate.conflict_head != prior.conflict_head:
+            return False
+        self.state = candidate
+        return True
 
 
 class MutableClock:
@@ -66,13 +97,18 @@ def _service(
     account_id: str = "DU12345",
     portfolio_id: str = "default",
     clock: MutableClock | None = None,
+    monotonic_verifier=None,
 ) -> DailyFilledNotional:
     anchor_directory = path.parent / "protected-anchor"
     anchor_directory.mkdir(mode=0o700, exist_ok=True)
+    verifier = monotonic_verifier or _MONOTONIC_VERIFIERS.setdefault(
+        str(path), TestMonotonicVerifier()
+    )
     return DailyFilledNotional(
         path,
         anchor_path=anchor_directory / f"{path.name}.anchor",
         anchor_key=ANCHOR_KEY,
+        monotonic_verifier=verifier,
         account_id=account_id,
         portfolio_id=portfolio_id,
         clock=clock or MutableClock(datetime(2026, 7, 28, 20, 0, tzinfo=UTC)),
@@ -165,11 +201,33 @@ def test_conflicting_duplicate_fails_closed_and_latches_instance(tmp_path):
         ledger.database_path,
         anchor_path=ledger.anchor_path,
         anchor_key=ANCHOR_KEY,
+        monotonic_verifier=_MONOTONIC_VERIFIERS[str(ledger.database_path)],
     )
     assert len(review) == 1
     assert review[0].broker_execution_id == "broker.exec.1"
     assert review[0].existing_portfolio_id == "default"
     assert review[0].claimed_portfolio_id == "default"
+
+
+def test_preexisting_instances_observe_durable_conflict_on_every_operation(tmp_path):
+    path = tmp_path / "notional.db"
+    writer = _service(path)
+    reader = _service(path)
+    appender = _service(path)
+    original = _fill("shared-conflict")
+    writer.record_fill(original)
+
+    with pytest.raises(FilledNotionalConflict):
+        writer.record_fill(replace(original, price=Decimal("999")))
+    with pytest.raises(FilledNotionalConflict, match="requires review"):
+        reader.current_gross_filled_notional()
+    with pytest.raises(FilledNotionalConflict, match="requires review"):
+        appender.record_fill(_fill("must-not-append"))
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM daily_filled_notional_records"
+        ).fetchone() == (1,)
 
 
 def test_restart_restores_same_day_total_from_append_only_ledger(tmp_path):
@@ -202,6 +260,7 @@ def test_scope_isolated_by_account_and_portfolio(tmp_path):
         path,
         anchor_path=default.anchor_path,
         anchor_key=ANCHOR_KEY,
+        monotonic_verifier=_MONOTONIC_VERIFIERS[str(path)],
     )
     assert review[0].existing_portfolio_id == "default"
     assert review[0].claimed_portfolio_id == "income"
@@ -348,7 +407,7 @@ def test_corrupt_database_fails_closed_without_replacing_it(tmp_path):
     path.write_bytes(contents)
     before = hashlib.sha256(contents).hexdigest()
 
-    with pytest.raises(FilledNotionalUnavailable, match="startup failed closed"):
+    with pytest.raises(FilledNotionalUnavailable, match="cannot be detected"):
         _service(path)
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before
 
@@ -407,6 +466,105 @@ def test_crash_before_database_commit_resolves_pending_anchor_to_old_state(tmp_p
         ).fetchone() == (0,)
 
 
+def test_reader_waits_for_concurrent_pending_writer_without_latching(tmp_path, monkeypatch):
+    path = tmp_path / "notional.db"
+    writer = _service(path)
+    reader = _service(path)
+    pending_ready = threading.Event()
+    reader_reconciling = threading.Event()
+    reader_retrying = threading.Event()
+    release_writer = threading.Event()
+    original_commit = writer._commit_database
+    original_resolve = reader._resolve_pending_anchor
+    resolve_attempts = 0
+    results: list[object] = []
+
+    def gated_commit(connection):
+        pending_ready.set()
+        if not release_writer.wait(timeout=5):
+            raise sqlite3.OperationalError("test timed out waiting to release writer")
+        original_commit(connection)
+
+    def observed_resolve():
+        nonlocal resolve_attempts
+        resolve_attempts += 1
+        reader_reconciling.set()
+        if resolve_attempts == 1:
+            raise sqlite3.OperationalError("database is locked")
+        reader_retrying.set()
+        original_resolve()
+
+    monkeypatch.setattr(writer, "_commit_database", gated_commit)
+    monkeypatch.setattr(reader, "_resolve_pending_anchor", observed_resolve)
+
+    def write() -> None:
+        try:
+            results.append(writer.record_fill(_fill("concurrent-fill")))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            results.append(exc)
+
+    def read() -> None:
+        try:
+            results.append(reader.current_gross_filled_notional())
+        except BaseException as exc:  # pragma: no cover - asserted below
+            results.append(exc)
+
+    writer_thread = threading.Thread(target=write)
+    reader_thread = threading.Thread(target=read)
+    writer_thread.start()
+    assert pending_ready.wait(timeout=5)
+    reader_thread.start()
+    assert reader_reconciling.wait(timeout=5)
+    assert reader_retrying.wait(timeout=5)
+    release_writer.set()
+    writer_thread.join(timeout=5)
+    reader_thread.join(timeout=5)
+
+    assert not writer_thread.is_alive()
+    assert not reader_thread.is_alive()
+    assert not any(isinstance(result, BaseException) for result in results)
+    assert resolve_attempts >= 2
+    assert Decimal("20.5") in results
+    assert reader.current_gross_filled_notional() == Decimal("20.5")
+
+
+def test_invalid_pending_anchor_identity_still_fails_closed(tmp_path):
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+    payload = json.loads(ledger.anchor_path.read_text(encoding="ascii"))
+    payload["pending_state"] = dict(payload["state"])
+    payload["pending_state"]["database_inode"] += 1
+    unsigned = {key: payload[key] for key in payload if key != "mac"}
+    payload["mac"] = ledger_module._keyed_hash(ANCHOR_KEY, unsigned)
+    ledger.anchor_path.write_text(ledger_module._canonical_json(payload) + "\n", encoding="ascii")
+    os.chmod(ledger.anchor_path, 0o600)
+
+    with pytest.raises(FilledNotionalIntegrityError, match="pending anchor"):
+        ledger.current_gross_filled_notional()
+
+
+def test_pending_writer_timeout_is_bounded_and_does_not_latch_reader(tmp_path, monkeypatch):
+    ledger = _service(tmp_path / "notional.db")
+    with ledger._connection(readonly=True) as connection:
+        state = ledger._validate_ledger(connection)
+    ledger._anchor = ledger._replace_anchor(
+        ledger._anchor_for_state(state, pending_state=state),
+        expected=ledger._anchor,
+    )
+    original_resolve = ledger._resolve_pending_anchor
+
+    def always_busy():
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(ledger, "_resolve_pending_anchor", always_busy)
+    with pytest.raises(FilledNotionalUnavailable, match="remained busy"):
+        ledger.current_gross_filled_notional()
+    assert ledger._failed_reason is None
+
+    monkeypatch.setattr(ledger, "_resolve_pending_anchor", original_resolve)
+    assert ledger.current_gross_filled_notional() == Decimal("0")
+
+
 def test_sigkill_hot_journal_is_recovered_rw_before_readonly_validation(tmp_path):
     if not hasattr(signal, "SIGKILL"):
         pytest.skip("SIGKILL unavailable on this host")
@@ -423,6 +581,7 @@ service = DailyFilledNotional(
     {str(path)!r},
     anchor_path={str(ledger.anchor_path)!r},
     anchor_key={ANCHOR_KEY!r},
+    monotonic_verifier=lambda state: True,
     account_id='DU12345',
     portfolio_id='default',
     clock=lambda: datetime(2026, 7, 28, 20, 0, tzinfo=timezone.utc),
@@ -523,6 +682,42 @@ def test_stable_anchor_rollback_is_not_mistaken_for_a_crash_window(tmp_path):
         _service(path)
 
 
+def test_coordinated_old_database_and_anchor_replay_requires_monotonic_rejection(tmp_path):
+    path = tmp_path / "notional.db"
+    verifier = TestMonotonicVerifier()
+    ledger = _service(path, monotonic_verifier=verifier)
+    ledger.record_fill(_fill("one"))
+    old_database = path.read_bytes()
+    old_anchor = ledger.anchor_path.read_bytes()
+    ledger.record_fill(_fill("two"))
+
+    path.write_bytes(old_database)
+    ledger.anchor_path.write_bytes(old_anchor)
+    os.chmod(ledger.anchor_path, 0o600)
+
+    with pytest.raises(FilledNotionalIntegrityError, match="monotonic authority rejected"):
+        _service(path, monotonic_verifier=verifier)
+
+
+def test_authoritative_service_requires_independent_monotonic_verifier(tmp_path):
+    path = tmp_path / "notional.db"
+    anchor_directory = tmp_path / "protected-anchor"
+    anchor_directory.mkdir(mode=0o700)
+
+    with pytest.raises(FilledNotionalUnavailable, match="monotonic verifier is required"):
+        DailyFilledNotional(
+            path,
+            anchor_path=anchor_directory / "notional.db.anchor",
+            anchor_key=ANCHOR_KEY,
+            monotonic_verifier=None,  # type: ignore[arg-type]
+            account_id="DU12345",
+            portfolio_id="default",
+        )
+
+    assert not path.exists()
+    assert not (anchor_directory / "notional.db.anchor").exists()
+
+
 def test_ledger_replacement_is_detected_by_anchor_inode_binding(tmp_path):
     path = tmp_path / "notional.db"
     original = _service(path)
@@ -554,6 +749,61 @@ def test_anchor_replacement_with_other_valid_anchor_fails_closed(tmp_path):
         _service(path)
 
 
+def test_anchor_directory_replacement_cannot_transfer_authority(tmp_path):
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+    ledger.record_fill(_fill("original"))
+    anchor_directory = ledger.anchor_path.parent
+    moved_directory = tmp_path / "original-anchor-directory"
+    original_anchor = ledger.anchor_path.read_bytes()
+
+    os.rename(anchor_directory, moved_directory)
+    anchor_directory.mkdir(mode=0o700)
+    replacement_anchor = anchor_directory / ledger.anchor_path.name
+    replacement_anchor.write_bytes(original_anchor)
+    os.chmod(replacement_anchor, 0o600)
+
+    with pytest.raises(FilledNotionalIntegrityError, match="directory identity changed"):
+        ledger.current_gross_filled_notional()
+    assert replacement_anchor.read_bytes() == original_anchor
+
+
+def test_anchor_directory_swap_during_replace_is_rejected_without_authority_transfer(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+    anchor_directory = ledger.anchor_path.parent
+    moved_directory = tmp_path / "moved-bound-anchor"
+    original_anchor = ledger.anchor_path.read_bytes()
+    real_replace = ledger_module.os.replace
+    swapped = False
+
+    def race_replace(source, destination, *args, **kwargs):
+        nonlocal swapped
+        if not swapped and destination == ledger.anchor_path.name:
+            swapped = True
+            os.rename(anchor_directory, moved_directory)
+            anchor_directory.mkdir(mode=0o700)
+            replacement_anchor = anchor_directory / ledger.anchor_path.name
+            replacement_anchor.write_bytes(original_anchor)
+            os.chmod(replacement_anchor, 0o600)
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(ledger_module.os, "replace", race_replace)
+
+    with pytest.raises(FilledNotionalIntegrityError, match="identity changed during"):
+        ledger.record_fill(_fill("racing-fill"))
+
+    replacement_anchor = anchor_directory / ledger.anchor_path.name
+    assert swapped is True
+    assert replacement_anchor.read_bytes() == original_anchor
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM daily_filled_notional_records"
+        ).fetchone() == (0,)
+
+
 def test_anchor_content_or_external_key_mismatch_fails_closed(tmp_path):
     path = tmp_path / "notional.db"
     ledger = _service(path)
@@ -564,6 +814,7 @@ def test_anchor_content_or_external_key_mismatch_fails_closed(tmp_path):
             path,
             anchor_path=ledger.anchor_path,
             anchor_key=b"different-independent-key-material-32-bytes",
+            monotonic_verifier=_MONOTONIC_VERIFIERS[str(path)],
             account_id="DU12345",
             portfolio_id="default",
         )
@@ -627,6 +878,73 @@ def test_schema_v1_requires_explicit_copy_migration_without_anchor_creation(tmp_
         _service(path)
 
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+    assert not _anchor_path(path).exists()
+
+
+def test_sigkill_v1_hot_journal_is_preserved_byte_for_byte(tmp_path):
+    if not hasattr(signal, "SIGKILL"):
+        pytest.skip("SIGKILL unavailable on this host")
+    path = tmp_path / "legacy-hot-v1.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("""
+            CREATE TABLE daily_filled_notional_schema (
+                singleton INTEGER PRIMARY KEY,
+                schema_version INTEGER NOT NULL
+            )
+            """)
+        connection.execute("INSERT INTO daily_filled_notional_schema VALUES (1, 1)")
+        connection.execute("CREATE TABLE legacy_payload (id INTEGER PRIMARY KEY, value TEXT)")
+        connection.execute("INSERT INTO legacy_payload VALUES (1, 'original')")
+    script = f"""
+import signal
+import sqlite3
+
+connection = sqlite3.connect({str(path)!r}, isolation_level=None)
+connection.execute('PRAGMA journal_mode=DELETE')
+connection.execute('PRAGMA synchronous=FULL')
+connection.execute('BEGIN IMMEDIATE')
+connection.execute("UPDATE legacy_payload SET value = 'uncommitted' WHERE id = 1")
+print('READY', flush=True)
+signal.pause()
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "READY"
+        os.kill(child.pid, signal.SIGKILL)
+        child.wait(timeout=10)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+
+    journal = Path(f"{path}-journal")
+    assert journal.exists() and journal.stat().st_size > 0
+    database_before = path.read_bytes()
+    journal_before = journal.read_bytes()
+    database_stat_before = path.stat()
+    journal_stat_before = journal.stat()
+
+    with pytest.raises(FilledNotionalMigrationRequired, match="reviewed copy migration"):
+        _service(path)
+
+    assert path.read_bytes() == database_before
+    assert journal.read_bytes() == journal_before
+    assert (path.stat().st_ino, path.stat().st_mtime_ns) == (
+        database_stat_before.st_ino,
+        database_stat_before.st_mtime_ns,
+    )
+    assert (journal.stat().st_ino, journal.stat().st_mtime_ns) == (
+        journal_stat_before.st_ino,
+        journal_stat_before.st_mtime_ns,
+    )
     assert not _anchor_path(path).exists()
 
 
