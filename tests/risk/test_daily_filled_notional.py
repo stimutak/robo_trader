@@ -280,26 +280,36 @@ def test_restart_restores_same_day_total_from_append_only_ledger(tmp_path):
     assert restarted.current_gross_filled_notional() == Decimal("30")
 
 
-def test_hot_path_uses_authenticated_checkpoints_without_history_rescans(tmp_path, monkeypatch):
+def test_authoritative_operations_reauthenticate_history(tmp_path, monkeypatch):
     path = tmp_path / "notional.db"
     ledger = _service(path)
+    original_validate_fills = ledger._validate_fills
+    original_validate_conflicts = ledger._validate_conflicts
+    validation_calls = {"fills": 0, "conflicts": 0}
 
-    def forbid_history_scan(*args, **kwargs):
-        pytest.fail("hot accounting path performed an unbounded history scan")
+    def observe_fill_validation(*args, **kwargs):
+        validation_calls["fills"] += 1
+        return original_validate_fills(*args, **kwargs)
 
-    monkeypatch.setattr(ledger, "_validate_fills", forbid_history_scan)
-    monkeypatch.setattr(ledger, "_validate_conflicts", forbid_history_scan)
-    for index in range(400):
+    def observe_conflict_validation(*args, **kwargs):
+        validation_calls["conflicts"] += 1
+        return original_validate_conflicts(*args, **kwargs)
+
+    monkeypatch.setattr(ledger, "_validate_fills", observe_fill_validation)
+    monkeypatch.setattr(ledger, "_validate_conflicts", observe_conflict_validation)
+    for index in range(40):
         ledger.record_fill(_fill(f"bounded-{index}"))
 
-    assert ledger.current_gross_filled_notional() == Decimal("8200")
+    assert ledger.current_gross_filled_notional() == Decimal("820")
+    assert validation_calls["fills"] >= 41
+    assert validation_calls["conflicts"] >= 41
     with sqlite3.connect(path) as connection:
         assert connection.execute(
             "SELECT count(*) FROM daily_filled_notional_checkpoints"
-        ).fetchone() == (401,)
+        ).fetchone() == (41,)
 
     monkeypatch.undo()
-    assert _service(path).restored_gross_filled_notional == Decimal("8200")
+    assert _service(path).restored_gross_filled_notional == Decimal("820")
 
 
 def test_daily_scope_limit_rejects_append_before_any_durable_mutation(tmp_path, monkeypatch):
@@ -1635,6 +1645,26 @@ def test_long_lived_service_rejects_middle_fill_deletion_before_total_read(tmp_p
         connection.execute(ledger_module._TRIGGER_SQL["daily_filled_notional_records_no_delete"])
 
     with pytest.raises(FilledNotionalIntegrityError, match="row counts or sequence spans"):
+        ledger.current_gross_filled_notional()
+
+
+def test_long_lived_service_rejects_middle_fill_rescope_before_total_read(tmp_path):
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+    ledger.record_fill(_fill("scope-one"))
+    ledger.record_fill(_fill("scope-two"))
+    other_portfolio = _service(path, portfolio_id="other")
+    other_portfolio.record_fill(_fill("other-scope-tail"))
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TRIGGER daily_filled_notional_records_no_update")
+        connection.execute(
+            "UPDATE daily_filled_notional_records SET portfolio_id = ? WHERE sequence = 2",
+            ("other",),
+        )
+        connection.execute(ledger_module._TRIGGER_SQL["daily_filled_notional_records_no_update"])
+
+    with pytest.raises(FilledNotionalIntegrityError):
         ledger.current_gross_filled_notional()
 
 

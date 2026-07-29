@@ -11,9 +11,10 @@ an independent secret authority; the key is never stored in the database or
 anchor. The anchor binds the ledger UUID, database device/inode, fill and
 quarantine heads/counts, and the latest append-only checkpoint. Each fill also
 contains an authenticated cumulative count and total for its accounting scope
-and New York trading date. Startup streams and audits the complete history;
-later operations validate bounded checkpoint, tail, and indexed scope state.
-This detects ledger rollback, replacement, tail deletion, and forged totals.
+and New York trading date. Startup and authoritative operations authenticate
+the complete history in addition to the durable checkpoint and indexed scope
+state. This detects ledger rollback, replacement, deletion, re-scoping, and
+forged totals.
 
 An HMAC does not prove freshness: an attacker who replays an older valid
 database and matching older valid anchor can pass all local checks while the
@@ -2107,7 +2108,7 @@ class DailyFilledNotional:
         )
 
     def _validate_checkpointed_state(self, connection: sqlite3.Connection) -> _LedgerState:
-        """Validate bounded authenticated state after the startup full audit."""
+        """Validate authenticated state, including every durable ledger row."""
 
         ledger_id = self._validate_schema(connection)
         row = connection.execute(
@@ -2193,6 +2194,21 @@ class DailyFilledNotional:
         ):
             raise FilledNotionalIntegrityError(
                 "checkpoint row counts or sequence spans do not match ledger state"
+            )
+        authenticated_fill_count, authenticated_fill_head = self._validate_fills(
+            connection, ledger_id
+        )
+        authenticated_conflict_count, authenticated_conflict_head = self._validate_conflicts(
+            connection, ledger_id
+        )
+        if (
+            authenticated_fill_count != fill_count
+            or authenticated_fill_head != fill_head
+            or authenticated_conflict_count != conflict_count
+            or authenticated_conflict_head != conflict_head
+        ):
+            raise FilledNotionalIntegrityError(
+                "checkpoint authenticated rows do not match ledger state"
             )
         if fill_count == 0:
             fill_matches = fill_tail is None and fill_head == _ZERO_HASH
