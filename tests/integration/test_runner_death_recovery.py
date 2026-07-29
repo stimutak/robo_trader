@@ -158,6 +158,8 @@ def test_runner_death_triggers_full_defense_stack(tmp_path, monkeypatch):
     app_mod = _reload_app_with_env(
         monkeypatch,
         DASH_AUTH_ENABLED="false",
+        STRATEGY_ENABLED="baseline_sma",
+        STRATEGY_ENABLED_STRATEGIES="baseline_sma",
     )
     client = app_mod.app.test_client()
 

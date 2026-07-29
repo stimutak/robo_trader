@@ -19,6 +19,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Protocol
 
+from ..gatea_containment import assert_quarantined_alternate_engine
 from ..logger import get_logger
 
 if TYPE_CHECKING:
@@ -121,6 +122,7 @@ class TradeExecutor:
         use_advanced_risk: bool = True,
         use_correlation_sizing: bool = False,
     ):
+        assert_quarantined_alternate_engine("robo_trader.runner.TradeExecutor")
         self.portfolio = portfolio
         self.risk = risk_manager
         self.db = db

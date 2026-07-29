@@ -19,6 +19,12 @@ from typing import Dict, List, Literal, Mapping, Optional
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .gatea_containment import (
+    ALLOWED_STRATEGIES,
+    GateAContainmentError,
+    assert_gate_a_config,
+    validate_gate_a_environment,
+)
 from .logger import get_logger
 from .runtime_contract_constants import PAPER_SAFETY_EXECUTION_DOMAIN_SCOPE
 from .utils.config_validator import ConfigValidator, EnhancedTradingConfig
@@ -601,6 +607,10 @@ class RiskConfig(BaseModel):
     take_profit_pct: float = Field(
         default=0.05, gt=0, le=0.2, description="Default take profit percentage"
     )
+    enable_take_profit: bool = Field(
+        default=False,
+        description="Enable take-profit execution (disabled throughout Gate A)",
+    )
     use_trailing_stop: bool = Field(
         default=True, description="Use trailing stops instead of fixed stops"
     )
@@ -717,8 +727,16 @@ class StrategyConfig(BaseModel):
     """Strategy configuration."""
 
     enabled_strategies: List[str] = Field(
-        default=["momentum", "mean_reversion", "ml_enhanced", "microstructure", "pairs_trading"],
+        default=list(ALLOWED_STRATEGIES),
         description="List of enabled strategies",
+    )
+    enable_ai_discovery: bool = Field(
+        default=False,
+        description="Enable news/AI symbol discovery (disabled throughout Gate A)",
+    )
+    enable_ml_selectors: bool = Field(
+        default=False,
+        description="Enable ML strategy/model selection (disabled throughout Gate A)",
     )
     combination_method: str = Field(
         default="weighted",
@@ -864,6 +882,11 @@ class Config(BaseModel):
         if self.execution.mode == TradingMode.PAPER and not self.ibkr.readonly:
             raise ValueError("Paper mode requires IBKR read-only client permissions")
 
+        try:
+            assert_gate_a_config(self)
+        except GateAContainmentError as exc:
+            raise ValueError(f"Gate-A containment contradiction: {exc}") from exc
+
         # Ensure production has proper monitoring
         if self.environment == Environment.PRODUCTION:
             if not self.monitoring.enable_alerts:
@@ -883,7 +906,7 @@ def load_config_from_env() -> Config:
     - RISK_MAX_POSITION_PCT=0.02
     - DATA_PROVIDER=IBKR
     - IBKR_HOST=127.0.0.1
-    - STRATEGY_ENABLED_STRATEGIES=momentum,mean_reversion
+    - STRATEGY_ENABLED_STRATEGIES=baseline_sma
     - MONITORING_LOG_LEVEL=INFO
 
     Returns:
@@ -893,6 +916,10 @@ def load_config_from_env() -> Config:
         ConfigValidationError: If configuration fails validation
     """
     load_dotenv()
+    try:
+        gate_a_environment = validate_gate_a_environment(os.environ)
+    except GateAContainmentError as exc:
+        raise ConfigValidationError(f"Gate-A containment contradiction: {exc}") from exc
     runtime_contract = load_runtime_contract_from_env()
     logger.info(
         "Validated runtime contract: %s",
@@ -912,6 +939,7 @@ def load_config_from_env() -> Config:
             "position_timeout_hours": int(os.getenv("EXECUTION_POSITION_TIMEOUT", "24")),
             "order_timeout_seconds": int(os.getenv("EXECUTION_ORDER_TIMEOUT", "30")),
             "enable_short_selling": os.getenv("EXECUTION_SHORT_SELLING", "false").lower() == "true",
+            "use_smart_execution": False,
         },
         "risk": {
             # Use validated values for critical risk parameters
@@ -933,6 +961,7 @@ def load_config_from_env() -> Config:
             # Use STOP_LOSS_PERCENT from .env (value is in %, convert to decimal)
             "stop_loss_pct": float(os.getenv("STOP_LOSS_PERCENT", "2.0")) / 100,
             "take_profit_pct": validator.validate_percentage("RISK_TAKE_PROFIT_PCT", 0.05),
+            "enable_take_profit": False,
             # Validated notional limits
             "max_order_notional": (
                 validator.validate_positive_float("RISK_MAX_ORDER_NOTIONAL", 10000, min_value=100)
@@ -977,9 +1006,9 @@ def load_config_from_env() -> Config:
             "ssl_mode": os.getenv("IBKR_SSL_MODE", "auto").strip().lower(),
         },
         "strategy": {
-            "enabled_strategies": os.getenv("STRATEGY_ENABLED", "momentum,mean_reversion").split(
-                ","
-            ),
+            "enabled_strategies": list(gate_a_environment.enabled_strategies),
+            "enable_ai_discovery": False,
+            "enable_ml_selectors": False,
             "combination_method": os.getenv("STRATEGY_COMBINATION", "weighted"),
             "min_confidence": float(os.getenv("STRATEGY_MIN_CONFIDENCE", "0.6")),
             "rebalance_frequency": os.getenv("STRATEGY_REBALANCE", "daily"),
@@ -1051,23 +1080,16 @@ def load_config_from_env() -> Config:
     config = Config(**config_dict)
 
     # Load multi-portfolio configurations
-    try:
-        from .multiuser.portfolio_config import load_portfolio_configs
+    from .multiuser.portfolio_config import load_portfolio_configs
 
+    try:
         portfolio_configs = load_portfolio_configs()
         config.portfolio_configs = [pc.to_dict() for pc in portfolio_configs]
-    except Exception as e:
-        logger.warning(f"Could not load portfolio configs: {e}")
-        # Fall back to single default portfolio
-        config.portfolio_configs = [
-            {
-                "id": "default",
-                "name": "Default Portfolio",
-                "starting_cash": config.default_cash,
-                "symbols": ",".join(config.symbols),
-                "active": True,
-            }
-        ]
+        assert_gate_a_config(config)
+    except (GateAContainmentError, TypeError, ValueError) as exc:
+        raise ConfigValidationError(
+            f"Explicit portfolio configuration violates Gate-A containment: {exc}"
+        ) from exc
 
     return config
 

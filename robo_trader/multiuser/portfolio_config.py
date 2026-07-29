@@ -16,6 +16,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+from ..gatea_containment import validate_gate_a_portfolio_strategies
 from ..logger import get_logger
 
 logger = get_logger(__name__)
@@ -93,6 +94,15 @@ class PortfolioConfig:
     enabled_strategies: Optional[List[str]] = None
     min_confidence: Optional[float] = None
 
+    def __post_init__(self) -> None:
+        if self.enabled_strategies is not None:
+            self.enabled_strategies = list(
+                validate_gate_a_portfolio_strategies(
+                    self.enabled_strategies,
+                    name=f"portfolio '{self.id}' enabled_strategies",
+                )
+            )
+
     def get_risk_param(self, param_name: str, global_default):
         """Get a risk parameter, falling back to global default if not overridden."""
         local_value = getattr(self, param_name, None)
@@ -127,11 +137,14 @@ class PortfolioConfig:
         if isinstance(symbols, str):
             symbols = [s.strip() for s in symbols.split(",") if s.strip()]
 
-        strategies = data.get("enabled_strategies")
-        if isinstance(strategies, str) and strategies:
-            strategies = [s.strip() for s in strategies.split(",") if s.strip()]
-        elif not strategies:
-            strategies = None
+        strategies = None
+        if "enabled_strategies" in data and data["enabled_strategies"] is not None:
+            strategies = list(
+                validate_gate_a_portfolio_strategies(
+                    data["enabled_strategies"],
+                    name=f"portfolio '{data.get('id', 'unknown')}' enabled_strategies",
+                )
+            )
 
         # Validate starting_cash with meaningful error
         try:
@@ -206,7 +219,9 @@ def load_portfolio_configs() -> List[PortfolioConfig]:
     """
     portfolios_json = os.getenv("PORTFOLIOS")
 
-    if portfolios_json:
+    if portfolios_json is not None:
+        if not portfolios_json.strip():
+            raise ValueError("PORTFOLIOS must not be empty when explicitly configured")
         try:
             raw_list = json.loads(portfolios_json)
             if not isinstance(raw_list, list) or len(raw_list) == 0:

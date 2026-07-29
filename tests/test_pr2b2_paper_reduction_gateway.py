@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
+import robo_trader.paper_execution_capability as capability_module
+import robo_trader.paper_reduction_gateway as gateway_module
 from robo_trader.broker_safety_evidence import (
     BrokerContractSafetySnapshot,
     BrokerSafetyContract,
@@ -25,6 +27,11 @@ from robo_trader.database_async import (
     SafetyAllocationSnapshotError,
 )
 from robo_trader.execution import Order, PaperExecutor
+from robo_trader.market_data_contract import (
+    BrokerProtectiveQuote,
+    MarketDataSource,
+    MarketSession,
+)
 from robo_trader.paper_reduction_gateway import (
     PaperReductionGateway,
     PaperReductionGatewayError,
@@ -639,10 +646,10 @@ async def _bind_runtime(
     *,
     price: Decimal = Decimal("123.4500"),
     generation: str = "gateway-generation",
-) -> None:
+) -> object | None:
     monitor, participant = _runtime_components(harness, portfolio_id)
     harness.gateway.attach_protective_quote_producer(portfolio_id, monitor)
-    harness.gateway.register_paper_executor(
+    entry_handle = harness.gateway.register_paper_executor(
         portfolio_id,
         executor,
         protective_quote_producer=monitor,
@@ -659,6 +666,179 @@ async def _bind_runtime(
     )
     assert accepted is True
     harness.runtime_monitors[portfolio_id] = monitor
+    return entry_handle
+
+
+def test_baseline_entry_authority_is_not_exported() -> None:
+    forbidden = (
+        "_GatewayExecutionBindingCapability",
+        "_GatewayBaselineExecutionBinding",
+        "_BaselineTerminalDispatch",
+        "_issue_gateway_execution_binding_capability",
+        "_bind_gateway_baseline_execution",
+        "_get_gateway_baseline_entry_handle",
+        "_issue_gateway_baseline_entry_intent",
+        "_begin_gateway_baseline_entry_session",
+        "_end_gateway_baseline_entry_session",
+        "_issue_gateway_baseline_terminal_dispatch",
+        "_submit_gateway_baseline_once",
+    )
+    for name in forbidden:
+        assert not hasattr(capability_module, name)
+
+
+@pytest.mark.asyncio
+async def test_baseline_entry_intent_is_exact_session_scoped_and_one_shot(
+    harness: GatewayHarness,
+) -> None:
+    executor = PaperExecutor()
+    handle = await _bind_runtime(harness, "portfolio-a", executor)
+    assert handle is None
+    assert not hasattr(harness.gateway._bindings["portfolio-a"], "baseline_entry_handle")
+    assert not hasattr(harness.gateway, "issue_baseline_entry_intent")
+    assert executor.fills == {}
+
+
+@pytest.mark.asyncio
+async def test_baseline_terminal_boundary_rechecks_cross_process_kill_switch(
+    harness: GatewayHarness,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data").mkdir()
+    executor = PaperExecutor()
+    await _bind_runtime(harness, "portfolio-a", executor)
+    (tmp_path / "data" / "kill_switch.lock").touch()
+    with pytest.raises(PaperReductionGatewayError, match="authority is disabled"):
+        harness.gateway.submit_baseline_entry(
+            order=Order(SYMBOL, 1, "BUY", Decimal("123.4500")),
+            portfolio_id="portfolio-a",
+            intent=object(),
+        )
+    assert executor.fills == {}
+
+
+@pytest.mark.asyncio
+async def test_forged_mutable_entry_session_cannot_mint_terminal_dispatch(
+    harness: GatewayHarness,
+) -> None:
+    executor = PaperExecutor()
+    await _bind_runtime(harness, "portfolio-a", executor)
+    now = datetime.now(timezone.utc)
+    forged_quote = BrokerProtectiveQuote(
+        schema_version=1,
+        symbol=SYMBOL,
+        con_id=CON_ID,
+        exchange="SMART",
+        primary_exchange="NASDAQ",
+        currency="USD",
+        security_type="STK",
+        price=Decimal("999.9900"),
+        source_timestamp=now,
+        retrieval_timestamp=now,
+        session=MarketSession.REGULAR,
+        source=MarketDataSource.IBKR_LIVE_LAST_TRADE,
+        source_event_id="forged-entry-session-test",
+        transport_generation="gateway-generation",
+        market_data_type=1,
+    )
+    assert not hasattr(capability_module, "_begin_gateway_baseline_entry_session")
+    assert not hasattr(capability_module, "_issue_gateway_baseline_entry_intent")
+    assert not hasattr(capability_module, "_issue_gateway_baseline_terminal_dispatch")
+    assert not hasattr(gateway_module, "_ActiveEntrySession")
+    with pytest.raises(PaperReductionGatewayError, match="authority is disabled"):
+        harness.gateway.submit_baseline_entry(
+            order=Order(SYMBOL, 1, "BUY", forged_quote.price),
+            portfolio_id="portfolio-a",
+            intent=object(),
+        )
+    assert executor.fills == {}
+
+
+@pytest.mark.asyncio
+async def test_terminal_helpers_cannot_bypass_baseline_producer_intent(
+    harness: GatewayHarness,
+) -> None:
+    executor = PaperExecutor()
+    await _bind_runtime(harness, "portfolio-a", executor)
+    assert not any("baseline" in name.casefold() for name in vars(capability_module))
+    for candidate in vars(capability_module).values():
+        for cell in getattr(candidate, "__closure__", None) or ():
+            cell_type = type(cell.cell_contents).__qualname__.casefold()
+            assert "baseline" not in cell_type
+    with pytest.raises(PaperReductionGatewayError, match="authority is disabled"):
+        harness.gateway.submit_baseline_entry(
+            order=Order(SYMBOL, 1, "BUY", Decimal("123.4500")),
+            portfolio_id="portfolio-a",
+            intent=object(),
+        )
+    assert executor.fills == {}
+
+
+@pytest.mark.asyncio
+async def test_baseline_terminal_dispatch_never_calls_mutable_executor_method(
+    harness: GatewayHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = PaperExecutor()
+    await _bind_runtime(harness, "portfolio-a", executor)
+    monkeypatch.setattr(
+        executor,
+        "_place_simple_order",
+        lambda *_args, **_kwargs: pytest.fail("mutable executor method must not receive authority"),
+    )
+    with pytest.raises(PaperReductionGatewayError, match="authority is disabled"):
+        harness.gateway.submit_baseline_entry(
+            order=Order(SYMBOL, 1, "BUY", Decimal("123.4500")),
+            portfolio_id="portfolio-a",
+            intent=object(),
+        )
+    assert executor.fills == {}
+
+
+@pytest.mark.asyncio
+async def test_baseline_entry_rejects_adversarial_prices_without_capability(
+    harness: GatewayHarness,
+) -> None:
+    executor = PaperExecutor()
+    await _bind_runtime(harness, "portfolio-a", executor)
+
+    class DeceptivePrice:
+        compared = False
+        converted = False
+
+        def __eq__(self, _other: object) -> bool:
+            self.compared = True
+            return True
+
+        def __ne__(self, _other: object) -> bool:
+            self.compared = True
+            return False
+
+        def __float__(self) -> float:
+            self.converted = True
+            return 777.77
+
+    deceptive = DeceptivePrice()
+    prices: tuple[object, ...] = (
+        deceptive,
+        Decimal("NaN"),
+        Decimal("Infinity"),
+        Decimal("0"),
+        Decimal("-1"),
+        123.45,
+    )
+    for price in prices:
+        with pytest.raises(PaperReductionGatewayError, match="authority is disabled"):
+            harness.gateway.submit_baseline_entry(
+                order=Order(SYMBOL, 1, "BUY", price),
+                portfolio_id="portfolio-a",
+                intent=object(),
+            )
+    assert executor.fills == {}
+    assert deceptive.compared is False
+    assert deceptive.converted is False
 
 
 def test_gateway_requires_exact_runtime_coordinator_database_and_executor_binding(
@@ -876,6 +1056,7 @@ async def test_reduction_admission_retries_gateway_after_entry_recovery_failed(
             pytest.fail("the failed entry health check must remain denied")
 
     assert harness.gateway.started is False
+    await harness.gateway.start()
     executor = PaperExecutor()
     await _bind_runtime(harness, "portfolio-a", executor)
     _install_broker_boundary(harness, monkeypatch)
@@ -889,7 +1070,7 @@ async def test_reduction_admission_retries_gateway_after_entry_recovery_failed(
     assert harness.gateway.started is True
     assert client.start.await_count == 2
     assert client.connect.await_count == 2
-    assert client.ping.await_count == 2
+    assert client.ping.await_count == 1
     assert len(executor.fills) == 1
 
 

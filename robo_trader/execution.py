@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
-import math
 import os
 from dataclasses import dataclass
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 if TYPE_CHECKING:
-    from .smart_execution.smart_executor import ExecutionAlgorithm, ExecutionParams, SmartExecutor
+    from .smart_execution.smart_executor import ExecutionAlgorithm, SmartExecutor
 
+from robo_trader.gatea_containment import validate_gate_a_order
 from robo_trader.logger import get_logger
+from robo_trader.paper_execution_capability import (
+    PaperExecutionCapabilityError,
+    _execute_sealed_paper_fill,
+)
 
 logger = get_logger(__name__)
 
@@ -20,7 +24,6 @@ logger = get_logger(__name__)
 # cannot weaken it accidentally. PR 11 will replace this executor with a
 # reviewed broker lifecycle adapter rather than flipping this constant.
 LIVE_TRADING_CAPABILITY_ENABLED = False
-_PAPER_FILL_PRICE_TICK = Decimal("0.0001")
 
 
 @dataclass
@@ -30,6 +33,7 @@ class Order:
     side: str  # "BUY" or "SELL"
     price: Optional[float | Decimal] = None  # None implies market
     order_ref: Optional[str] = None
+    take_profit: Optional[float | Decimal] = None
 
 
 class ExecutionResult:
@@ -58,7 +62,7 @@ class AbstractExecutor:
 class BaseExecutor(AbstractExecutor):
     """Base executor with common functionality for all executor types.
 
-    Provides shared validation, smart execution support, and algorithm selection.
+    Provides shared validation. Smart execution remains quarantined in Gate A.
     """
 
     def __init__(
@@ -66,6 +70,8 @@ class BaseExecutor(AbstractExecutor):
         use_smart_execution: bool = False,
         skip_execution_delays: bool = True,
     ) -> None:
+        if use_smart_execution:
+            raise ValueError("Gate-A containment disables smart execution")
         self.use_smart_execution = use_smart_execution
         self.skip_execution_delays = skip_execution_delays
         self.smart_executor = None
@@ -75,12 +81,6 @@ class BaseExecutor(AbstractExecutor):
         self._execution_cache_ts: Dict[str, dt.datetime] = {}
         self._execution_cache_max_age_seconds: float = 60.0
 
-        # Initialize smart executor if enabled
-        if use_smart_execution:
-            from .smart_execution.smart_executor import SmartExecutor
-
-            self.smart_executor = SmartExecutor()
-
     def validate_order(self, order: Order) -> Optional[ExecutionResult]:
         """Validate order parameters. Returns error result if invalid, None if valid."""
         if order.quantity <= 0:
@@ -89,6 +89,13 @@ class BaseExecutor(AbstractExecutor):
         side = order.side.upper()
         if side not in {"BUY", "SELL", "BUY_TO_COVER", "SELL_SHORT"}:
             return ExecutionResult(False, "Invalid order side")
+
+        admitted, reason = validate_gate_a_order(
+            side=side,
+            take_profit=order.take_profit,
+        )
+        if not admitted:
+            return ExecutionResult(False, reason)
 
         # Check kill switch
         kill_switch_file = "data/kill_switch.lock"
@@ -116,36 +123,7 @@ class BaseExecutor(AbstractExecutor):
 
     async def _execute_smart_order_async(self, order: Order) -> ExecutionResult:
         """Execute order using smart algorithms (async)."""
-        from .smart_execution.smart_executor import ExecutionAlgorithm
-        from .smart_execution.smart_executor import ExecutionParams as ExecParams
-
-        # Select algorithm
-        algorithm = self._select_algorithm(order)
-
-        # Create execution parameters
-        params = ExecParams(
-            algorithm=algorithm,
-            duration_minutes=5 if order.quantity < 1000 else 15,
-            slice_count=min(10, max(1, order.quantity // 100)),
-            max_participation=0.15,
-            urgency=0.7 if order.price else 0.5,
-        )
-
-        # Create and execute plan
-        plan = await self.smart_executor.create_execution_plan(
-            symbol=order.symbol, side=order.side, quantity=order.quantity, params=params
-        )
-
-        # Execute with configurable delays
-        result = await self.smart_executor.execute_plan(
-            plan, self, skip_delays=self.skip_execution_delays
-        )
-
-        # Convert to ExecutionResult
-        if result.success:
-            return ExecutionResult(True, result.message, result.average_price)
-        else:
-            return ExecutionResult(False, result.message)
+        return ExecutionResult(False, "Gate-A containment disables smart execution")
 
     async def execute_order(
         self, symbol: str, side: str, quantity: int, order_type: str, limit_price: float = None
@@ -155,22 +133,22 @@ class BaseExecutor(AbstractExecutor):
 
 
 class PaperExecutor(BaseExecutor):
-    """Enhanced paper executor with smart execution support.
+    """Simple local-paper executor for the Gate-A runtime.
 
     Models symmetric slippage (in basis points) around the limit price for both
-    buy and sell orders. Supports smart execution algorithms when configured.
+    buy and sell orders. Smart execution inputs fail closed.
 
     Args:
         slippage_bps: Slippage in basis points to apply symmetrically to fills.
                       Defaults to 0.0 (no slippage).
-        smart_executor: Optional SmartExecutor for advanced execution algorithms.
-        use_smart_execution: Whether to use smart execution for orders.
+        smart_executor: Rejected while Gate-A containment is active.
+        use_smart_execution: Rejected when true during Gate A.
 
     Attributes:
         fills: Dictionary tracking all executed orders with timestamps and fill prices.
         slippage_bps: Configured slippage in basis points.
-        smart_executor: SmartExecutor instance for advanced algorithms.
-        use_smart_execution: Flag to enable smart execution.
+        smart_executor: Always ``None`` during Gate A.
+        use_smart_execution: Always ``False`` during Gate A.
     """
 
     def __init__(
@@ -180,11 +158,11 @@ class PaperExecutor(BaseExecutor):
         use_smart_execution: bool = False,
         skip_execution_delays: bool = True,
     ) -> None:
+        if smart_executor is not None:
+            raise ValueError("Gate-A containment disables smart execution")
         super().__init__(use_smart_execution, skip_execution_delays)
         self.fills: Dict[str, Tuple[dt.datetime, Order, float]] = {}
         self.slippage_bps = float(slippage_bps)
-        if smart_executor:
-            self.smart_executor = smart_executor
 
     def place_order(self, order: Order) -> ExecutionResult:
         """Place order with optional smart execution."""
@@ -193,9 +171,8 @@ class PaperExecutor(BaseExecutor):
         if validation_result:
             return validation_result
 
-        # Use smart execution if enabled and available
-        if self.use_smart_execution and self.smart_executor:
-            return self._place_smart_order(order)
+        if self.use_smart_execution or self.smart_executor is not None:
+            return ExecutionResult(False, "Gate-A containment disables smart execution")
 
         # Standard paper execution
         return self._place_simple_order(order)
@@ -207,206 +184,43 @@ class PaperExecutor(BaseExecutor):
         if validation_result:
             return validation_result
 
-        # Use smart execution if enabled and available
-        if self.use_smart_execution and self.smart_executor:
-            try:
-                return await self._execute_smart_order_async(order)
-            except Exception as e:
-                logger.warning(
-                    "Smart execution failed, falling back to simple",
-                    error=str(e),
-                    symbol=order.symbol,
-                )
-                return self._place_simple_order(order)
+        if self.use_smart_execution or self.smart_executor is not None:
+            return ExecutionResult(False, "Gate-A containment disables smart execution")
 
         # Standard paper execution
         return self._place_simple_order(order)
 
-    def _place_simple_order(self, order: Order) -> ExecutionResult:
+    def _place_simple_order(
+        self,
+        order: Order,
+        *,
+        _capability: object | None = None,
+    ) -> ExecutionResult:
         """Place order with simple paper execution."""
-        base: Optional[float]
-        exact_base: Optional[Decimal] = None
-
-        if order.price is not None:
-            if type(order.price) is Decimal:
-                if not order.price.is_finite() or order.price <= 0:
-                    logger.error(
-                        "Invalid exact price provided for paper order",
-                        symbol=order.symbol,
-                    )
-                    return ExecutionResult(False, "Invalid price for paper execution")
-                exact_base = order.price
-                base = float(exact_base)
-            else:
-                try:
-                    base = float(order.price)
-                except (TypeError, ValueError):
-                    logger.error(
-                        "Invalid price provided for paper order",
-                        symbol=order.symbol,
-                        price=order.price,
-                    )
-                    return ExecutionResult(False, "Invalid price for paper execution")
-            if not math.isfinite(base):
-                logger.error(
-                    "Non-finite price provided for paper order",
-                    symbol=order.symbol,
-                    price=order.price,
-                )
-                return ExecutionResult(False, "Non-finite price for paper execution")
-            if base <= 0:
-                logger.error(
-                    "Non-positive price provided for paper order",
-                    symbol=order.symbol,
-                    price=order.price,
-                )
-                return ExecutionResult(False, "Non-positive price for paper execution")
-            self._execution_cache[order.symbol] = base
-            self._execution_cache_ts[order.symbol] = dt.datetime.utcnow()
-        else:
-            base = self._execution_cache.get(order.symbol)
-            if base is None:
-                logger.error(
-                    "Missing reference price for market order in paper execution",
-                    symbol=order.symbol,
-                )
-                return ExecutionResult(False, "No reference price for market order")
-            # Stale-price fallback guard (TC-L3): if the last cached price is
-            # older than max-age, refuse the order rather than fill at stale data.
-            ts = self._execution_cache_ts.get(order.symbol)
-            if (
-                ts is None
-                or (dt.datetime.utcnow() - ts).total_seconds()
-                > self._execution_cache_max_age_seconds
-            ):
-                logger.error(
-                    "Stale cached reference price for market order in paper execution",
-                    symbol=order.symbol,
-                )
-                return ExecutionResult(False, "Stale reference price for market order")
-
-        fill_decimal: Decimal
-        if exact_base is not None:
-            # The safety adapter passes a bounded, tick-quantized Decimal.
-            # Preserve it through all slippage arithmetic; only the legacy
-            # ExecutionResult boundary converts the final paper fill to float.
-            slip_decimal = (
-                exact_base * Decimal(str(self.slippage_bps)) / Decimal("10000")
-                if self.slippage_bps
-                else Decimal("0")
-            )
-            unrounded_fill = (
-                exact_base + slip_decimal
-                if order.side.upper() in {"BUY", "BUY_TO_COVER"}
-                else exact_base - slip_decimal
-            )
-            if not unrounded_fill.is_finite() or unrounded_fill <= 0:
-                logger.error(
-                    "Paper slippage produced an invalid exact fill",
-                    symbol=order.symbol,
-                )
-                return ExecutionResult(False, "Invalid paper execution fill")
-            # Normalize the simulator's authoritative fill before either the
-            # durable exact-value path or its legacy float compatibility view
-            # observes it. Arbitrary finite float slippage otherwise produces
-            # a high-scale Decimal whose float round-trip no longer matches,
-            # after the fill has already been recorded.
-            fill_decimal = unrounded_fill.quantize(
-                _PAPER_FILL_PRICE_TICK,
-                rounding=ROUND_HALF_EVEN,
-            )
-            fill = float(fill_decimal)
-        else:
-            # Apply symmetric slippage in basis points
-            slip = base * (self.slippage_bps / 10_000.0) if self.slippage_bps else 0.0
-
-            # Handle all order sides including short selling
-            if order.side.upper() in {"BUY", "BUY_TO_COVER"}:
-                fill = base + slip
-            else:  # SELL or SELL_SHORT
-                fill = base - slip
-            fill_decimal = Decimal(str(fill))
-        if not math.isfinite(fill) or fill <= 0:
-            logger.error(
-                "Paper slippage produced an invalid fill",
-                symbol=order.symbol,
-            )
-            return ExecutionResult(False, "Invalid paper execution fill")
-
-        self.fills[f"{order.symbol}-{len(self.fills)+1}"] = (
-            dt.datetime.utcnow(),
-            order,
-            fill,
+        admitted, reason = validate_gate_a_order(
+            side=order.side,
+            take_profit=order.take_profit,
         )
-        return ExecutionResult(
-            True,
-            "Paper fill",
-            fill,
-            exact_fill_price=fill_decimal,
-        )
+        if not admitted:
+            return ExecutionResult(False, reason)
+        try:
+            return _execute_sealed_paper_fill(self, order, _capability)
+        except PaperExecutionCapabilityError as exc:
+            return ExecutionResult(False, str(exc))
 
     def _place_smart_order(self, order: Order) -> ExecutionResult:
         """Place order using smart execution algorithms."""
-        try:
-            # Check if there's already an event loop running
-            try:
-                loop = asyncio.get_running_loop()
-                # We're in an async context but called synchronously
-                # Log warning and fall back to simple execution
-                logger.warning(
-                    "Smart execution called synchronously from async context, using simple execution",
-                    symbol=order.symbol,
-                )
-                return self._place_simple_order(order)
-            except RuntimeError:
-                # No event loop running, create one
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    result = loop.run_until_complete(self._execute_smart_order_async(order))
-                    return result
-                finally:
-                    loop.close()
-        except Exception as e:
-            # Fallback to simple execution on error
-            logger.warning(
-                "Smart execution failed, falling back to simple", error=str(e), symbol=order.symbol
-            )
-            return self._place_simple_order(order)
+        return ExecutionResult(False, "Gate-A containment disables smart execution")
 
     async def _execute_smart_order_async(self, order: Order) -> ExecutionResult:
         """Execute order using smart algorithms (async)."""
-        result = await super()._execute_smart_order_async(order)
-
-        # Store fill if successful
-        if result.ok:
-            self.fills[f"{order.symbol}-{len(self.fills)+1}"] = (
-                dt.datetime.utcnow(),
-                order,
-                result.fill_price,
-            )
-
-        return result
+        return ExecutionResult(False, "Gate-A containment disables smart execution")
 
     async def execute_order(
         self, symbol: str, side: str, quantity: int, order_type: str, limit_price: float = None
     ) -> Dict[str, Any]:
         """Execute order for smart executor (async method for slices)."""
-        # Create an Order object
-        order = Order(symbol=symbol, quantity=quantity, side=side, price=limit_price)
-
-        # Execute using paper fills
-        result = self._place_simple_order(order)
-
-        # Return in the format expected by smart executor
-        if result.ok:
-            return {
-                "executed_quantity": quantity,
-                "price": result.fill_price,
-                "timestamp": dt.datetime.now(),
-            }
-        else:
-            return {"executed_quantity": 0, "price": 0, "timestamp": dt.datetime.now()}
+        return {"executed_quantity": 0, "price": 0, "timestamp": dt.datetime.now()}
 
 
 class LiveExecutor(BaseExecutor):
