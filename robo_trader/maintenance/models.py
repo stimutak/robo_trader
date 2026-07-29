@@ -10,7 +10,7 @@ from typing import Any, Mapping, Tuple
 class TableEvidence:
     """Deterministic logical evidence for one SQLite table."""
 
-    name: str
+    name_sha256: str
     row_count: int
     content_sha256: str
 
@@ -53,14 +53,14 @@ class DatabaseEvidence:
         for item in tables:
             _require_exact_keys(
                 item,
-                {"name", "row_count", "content_sha256"},
+                {"name_sha256", "row_count", "content_sha256"},
                 "table evidence",
             )
         return cls(
             schema_sha256=_required_string(value, "schema_sha256"),
             tables=tuple(
                 TableEvidence(
-                    name=_required_string(item, "name"),
+                    name_sha256=_required_string(item, "name_sha256"),
                     row_count=_required_int(item, "row_count"),
                     content_sha256=_required_string(item, "content_sha256"),
                 )
@@ -157,6 +157,26 @@ class MigrationDryRunReport:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+SQLiteParameter = str | int | float | bytes | None
+
+
+@dataclass(frozen=True, slots=True)
+class MigrationStep:
+    """One declarative SQL statement for a synthetic-copy dry run."""
+
+    sql: str
+    parameters: tuple[SQLiteParameter, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MigrationPlan:
+    """A bounded public identifier and ordered declarative migration steps."""
+
+    migration_id: str
+    steps: tuple[MigrationStep, ...]
+    target_user_version: int | None = None
 
 
 def _required_string(value: Mapping[str, Any], key: str) -> str:

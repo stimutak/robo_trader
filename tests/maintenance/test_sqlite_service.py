@@ -11,6 +11,8 @@ from pathlib import Path
 import pytest
 
 from robo_trader.maintenance import (
+    MigrationPlan,
+    MigrationStep,
     SQLiteMaintenanceError,
     SQLiteMaintenanceService,
 )
@@ -71,6 +73,11 @@ def test_wal_active_backup_and_clean_room_restore_preserve_multiportfolio_state(
         assert manifest.authorizes_startup is False
         assert stat.S_IMODE(backup.stat().st_mode) == 0o400
         assert stat.S_IMODE(restored.stat().st_mode) == 0o400
+        for database in (backup, restored):
+            assert not any(
+                database.with_name(database.name + suffix).exists()
+                for suffix in ("-journal", "-shm", "-wal")
+            )
         with sqlite3.connect(restored) as connection:
             assert connection.execute(
                 "SELECT portfolio_id,symbol,quantity FROM positions " "ORDER BY portfolio_id,symbol"
@@ -98,6 +105,8 @@ def test_manifest_is_secret_free_portable_and_exclusively_written(tmp_path: Path
     assert str(tmp_path) not in serialized
     assert "credential" not in serialized.lower()
     assert "account" not in serialized.lower()
+    assert "positions" not in serialized.lower()
+    assert "portfolios" not in serialized.lower()
     assert payload["contains_secrets"] is False
     assert payload["mutated_authoritative_state"] is False
     assert payload["authorizes_startup"] is False
@@ -150,6 +159,23 @@ def test_existing_restore_target_is_never_replaced(tmp_path: Path) -> None:
     assert target.read_bytes() == b"do-not-replace"
 
 
+@pytest.mark.parametrize("suffix", ["-journal", "-shm", "-wal"])
+def test_preexisting_target_sidecar_is_preserved_without_main_creation(
+    tmp_path: Path, suffix: str
+) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "target.db"
+    sidecar = target.with_name(target.name + suffix)
+    _create_multiportfolio_database(source).close()
+    sidecar.write_bytes(b"operator-evidence")
+
+    with pytest.raises(SQLiteMaintenanceError, match="new exclusively-created SQLite family"):
+        SQLiteMaintenanceService().backup(source, target)
+
+    assert not target.exists()
+    assert sidecar.read_bytes() == b"operator-evidence"
+
+
 def test_target_cannot_overlap_source_sqlite_companion_family(tmp_path: Path) -> None:
     source = tmp_path / "source.db"
     _create_multiportfolio_database(source).close()
@@ -186,6 +212,51 @@ def test_manifest_detects_backup_corruption_before_clean_room_creation(tmp_path:
     with pytest.raises(SQLiteMaintenanceError):
         service.restore_clean_room(backup, target, manifest)
     assert not target.exists()
+
+
+def test_restore_verifies_and_copies_through_one_bound_source_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    replacement = tmp_path / "replacement.db"
+    parked = tmp_path / "parked.db"
+    target = tmp_path / "restore.db"
+    _create_multiportfolio_database(source).close()
+    service = SQLiteMaintenanceService()
+    manifest = service.backup(source, backup)
+    with sqlite3.connect(replacement) as connection:
+        connection.execute("PRAGMA page_size=8192")
+    _create_multiportfolio_database(replacement).close()
+    with sqlite3.connect(replacement) as connection:
+        connection.execute("VACUUM")
+    assert replacement.read_bytes() != backup.read_bytes()
+    assert service.verify(replacement) == manifest.evidence
+
+    real_connect = service._connect_bound
+    readonly_backup_opens = 0
+
+    def observe_connect(binding, *, readonly, journal_off=False, immutable_readonly=False):
+        nonlocal readonly_backup_opens
+        if readonly and binding.path == backup:
+            readonly_backup_opens += 1
+            if readonly_backup_opens == 2:
+                backup.rename(parked)
+                replacement.rename(backup)
+        return real_connect(
+            binding,
+            readonly=readonly,
+            journal_off=journal_off,
+            immutable_readonly=immutable_readonly,
+        )
+
+    monkeypatch.setattr(service, "_connect_bound", observe_connect)
+    restored = service.restore_clean_room(backup, target, manifest)
+
+    assert readonly_backup_opens == 1
+    assert restored.input_artifact_sha256 == manifest.artifact_sha256
+    assert not parked.exists()
+    assert replacement.exists()
 
 
 def test_interrupted_backup_preserves_source_and_seals_forensic_target(tmp_path: Path) -> None:
@@ -288,16 +359,20 @@ def test_migration_dry_run_changes_only_synthetic_copy(tmp_path: Path) -> None:
     _create_multiportfolio_database(source).close()
     before_bytes = source.read_bytes()
 
-    def migration(connection: sqlite3.Connection) -> None:
-        connection.execute("ALTER TABLE positions ADD COLUMN note TEXT")
-        connection.execute("UPDATE positions SET note='synthetic-only' WHERE portfolio_id='alpha'")
-        connection.execute("PRAGMA user_version=8")
-
     report = SQLiteMaintenanceService().dry_run_migration(
         source,
         target,
-        migration_id="synthetic-v8",
-        migration=migration,
+        plan=MigrationPlan(
+            migration_id="synthetic-v8",
+            steps=(
+                MigrationStep("ALTER TABLE positions ADD COLUMN note TEXT"),
+                MigrationStep(
+                    "UPDATE positions SET note=? WHERE portfolio_id=?",
+                    ("synthetic-only", "alpha"),
+                ),
+            ),
+            target_user_version=8,
+        ),
     )
 
     assert report.outcome == "applied_to_synthetic_copy"
@@ -316,40 +391,54 @@ def test_interrupted_migration_rolls_back_copy_and_preserves_source(tmp_path: Pa
     target = tmp_path / "dry-run.db"
     _create_multiportfolio_database(source).close()
 
-    def migration(connection: sqlite3.Connection) -> None:
-        connection.execute("DELETE FROM positions")
-        raise RuntimeError("simulated interruption")
-
     report = SQLiteMaintenanceService().dry_run_migration(
         source,
         target,
-        migration_id="synthetic-interruption",
-        migration=migration,
+        plan=MigrationPlan(
+            migration_id="synthetic-interruption",
+            steps=(
+                MigrationStep("DELETE FROM positions"),
+                MigrationStep("THIS IS NOT VALID SQL"),
+            ),
+        ),
     )
 
     assert report.outcome == "rolled_back"
-    assert report.error_code == "migration_callback_failed"
+    assert report.error_code == "migration_plan_failed"
     assert report.before == report.after
     assert report.source_unchanged is True
     assert stat.S_IMODE(target.stat().st_mode) == 0o400
 
 
-def test_migration_callback_cannot_attach_or_commit(tmp_path: Path) -> None:
+def test_migration_plan_cannot_attach_or_commit(tmp_path: Path) -> None:
     source = tmp_path / "source.db"
     target = tmp_path / "dry-run.db"
     _create_multiportfolio_database(source).close()
 
-    def migration(connection: sqlite3.Connection) -> None:
-        connection.execute("ATTACH DATABASE ':memory:' AS escaped")
-
     report = SQLiteMaintenanceService().dry_run_migration(
         source,
         target,
-        migration_id="synthetic-attach",
-        migration=migration,
+        plan=MigrationPlan(
+            migration_id="synthetic-attach",
+            steps=(MigrationStep("ATTACH DATABASE ? AS escaped", (str(source),)),),
+        ),
     )
     assert report.outcome == "rolled_back"
     assert report.before == report.after
+    assert report.source_unchanged is True
+
+
+def test_verify_rejects_companions_without_creating_or_rewriting_them(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    _create_multiportfolio_database(source).close()
+    wal = source.with_name(source.name + "-wal")
+    wal.write_bytes(b"preserve-this-evidence")
+    before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+
+    with pytest.raises(SQLiteMaintenanceError, match="sealed database"):
+        SQLiteMaintenanceService().verify(source)
+
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
 
 
 @pytest.mark.asyncio
