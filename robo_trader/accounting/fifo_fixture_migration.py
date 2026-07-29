@@ -523,8 +523,16 @@ def _assert_fixture_target(
 
 
 def _assert_no_temp_fifo_objects(connection: sqlite3.Connection) -> None:
+    protected_tables = tuple(_TABLE_SQL)
+    protected_table_names = "|" + "|".join(protected_tables) + "|"
+    shadow_query = (
+        "SELECT type, name FROM temp.sqlite_master "
+        "WHERE name LIKE 'fifo_%' OR instr(?, '|' || tbl_name || '|') > 0 "
+        "ORDER BY type, name"
+    )
     shadows = connection.execute(
-        "SELECT type, name FROM temp.sqlite_master WHERE name LIKE 'fifo_%' ORDER BY type, name"
+        shadow_query,
+        (protected_table_names,),
     ).fetchall()
     if shadows:
         raise FifoFixtureMigrationError("temporary FIFO objects cannot shadow durable main state")
@@ -571,9 +579,9 @@ def assert_fifo_accounting_schema(
             raise FifoFixtureMigrationError(f"FIFO accounting table {name} is malformed")
 
     rows = connection.execute(
-        "SELECT name, sql FROM main.sqlite_master WHERE type = 'trigger'"
+        "SELECT name, tbl_name, sql FROM main.sqlite_master WHERE type = 'trigger'"
     ).fetchall()
-    actual_triggers = {str(name): _normalize_sql(sql) for name, sql in rows}
+    actual_triggers = {str(name): _normalize_sql(sql) for name, _, sql in rows}
     missing_triggers = set(_TRIGGER_SQL).difference(actual_triggers)
     unexpected_triggers = set(actual_triggers).difference(_TRIGGER_SQL)
     if missing_triggers:
@@ -584,16 +592,32 @@ def assert_fifo_accounting_schema(
         raise FifoFixtureMigrationError(
             f"FIFO fixture contains unexpected trigger {sorted(unexpected_triggers)[0]}"
         )
+    protected_foreign_triggers = {
+        str(name)
+        for name, table, _ in rows
+        if name not in _TRIGGER_SQL and (str(name).startswith("fifo_") or str(table) in _TABLE_SQL)
+    }
+    if protected_foreign_triggers:
+        raise FifoFixtureMigrationError("foreign triggers cannot target FIFO accounting tables")
     for name, statement in _TRIGGER_SQL.items():
         if actual_triggers.get(name) != _normalize_sql(statement):
             raise FifoFixtureMigrationError(f"FIFO accounting trigger {name} is malformed")
 
     unexpected_schema = connection.execute(
-        "SELECT type, name FROM main.sqlite_master "
+        "SELECT type, name, tbl_name FROM main.sqlite_master "
         "WHERE type IN ('view','index') AND name NOT LIKE 'sqlite_%'"
     ).fetchall()
     if unexpected_schema and not allow_other_objects:
         raise FifoFixtureMigrationError("FIFO fixture contains unexpected schema objects")
+    protected_foreign_schema = [
+        row
+        for row in unexpected_schema
+        if str(row[1]).startswith("fifo_") or str(row[2]) in _TABLE_SQL
+    ]
+    if protected_foreign_schema:
+        raise FifoFixtureMigrationError(
+            "foreign schema objects cannot target FIFO accounting tables"
+        )
 
     version_rows = connection.execute(
         "SELECT version,description FROM main.fifo_schema_migrations "

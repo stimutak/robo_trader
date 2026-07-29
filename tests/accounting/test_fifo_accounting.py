@@ -421,6 +421,35 @@ def test_temp_fifo_shadows_created_after_ledger_init_fail_every_operation(connec
     } == before
 
 
+def test_foreign_main_trigger_targeting_fifo_table_is_rejected(connection):
+    connection.execute("CREATE TABLE unrelated_audit(value TEXT NOT NULL)")
+    connection.execute("""
+        CREATE TRIGGER unrelated_capture
+        AFTER INSERT ON fifo_opening_balances
+        BEGIN
+            INSERT INTO unrelated_audit VALUES ('unexpected mutation');
+        END
+        """)
+
+    with pytest.raises(FifoFixtureMigrationError, match="foreign triggers"):
+        FifoLedger(connection, allow_other_objects=True)
+
+    assert connection.execute("SELECT COUNT(*) FROM unrelated_audit").fetchone() == (0,)
+
+
+def test_foreign_temp_trigger_targeting_fifo_table_is_rejected(connection):
+    connection.execute("""
+        CREATE TEMP TRIGGER unrelated_temp_capture
+        BEFORE INSERT ON main.fifo_fills
+        BEGIN
+            SELECT 1;
+        END
+        """)
+
+    with pytest.raises(FifoFixtureMigrationError, match="temporary FIFO"):
+        FifoLedger(connection, allow_other_objects=True)
+
+
 @pytest.mark.parametrize("bad_decimal", ["abc", "01", "1.0", "0", "-1", "1e2", ".5", "5."])
 def test_schema_rejects_noncanonical_or_nonpositive_fill_decimals(connection, ledger, bad_decimal):
     with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint"):

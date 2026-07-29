@@ -181,8 +181,16 @@ async def _assert_fifo_schema(connection: aiosqlite.Connection) -> None:
     foreign_keys = await connection.execute("PRAGMA foreign_keys")
     if await foreign_keys.fetchone() != (1,):
         raise FifoBootstrapError("FIFO accounting requires foreign-key enforcement")
+    protected_tables = tuple(_TABLE_SQL)
+    protected_table_names = "|" + "|".join(protected_tables) + "|"
+    temporary_query = (
+        "SELECT type,name FROM temp.sqlite_master "
+        "WHERE name LIKE 'fifo_%' OR instr(?, '|' || tbl_name || '|') > 0 "
+        "ORDER BY type,name"
+    )
     temporary = await connection.execute(
-        "SELECT type,name FROM temp.sqlite_master WHERE name LIKE 'fifo_%' ORDER BY type,name"
+        temporary_query,
+        (protected_table_names,),
     )
     if await temporary.fetchone() is not None:
         raise FifoBootstrapError("temporary FIFO objects cannot shadow durable state")
@@ -196,9 +204,14 @@ async def _assert_fifo_schema(connection: aiosqlite.Connection) -> None:
     for name, statement in _TABLE_SQL.items():
         if actual_tables[name] != _normalize_sql(statement):
             raise FifoBootstrapError(f"FIFO accounting table {name} is malformed")
-    triggers = await connection.execute(
+    trigger_query = (
         "SELECT name,sql FROM main.sqlite_master "
-        "WHERE type='trigger' AND name LIKE 'fifo_%' ORDER BY name"
+        "WHERE type='trigger' AND "
+        "(name LIKE 'fifo_%' OR instr(?, '|' || tbl_name || '|') > 0) ORDER BY name"
+    )
+    triggers = await connection.execute(
+        trigger_query,
+        (protected_table_names,),
     )
     actual_triggers = {str(name): _normalize_sql(sql) for name, sql in await triggers.fetchall()}
     if set(actual_triggers) != set(_TRIGGER_SQL):
@@ -206,6 +219,17 @@ async def _assert_fifo_schema(connection: aiosqlite.Connection) -> None:
     for name, statement in _TRIGGER_SQL.items():
         if actual_triggers[name] != _normalize_sql(statement):
             raise FifoBootstrapError(f"FIFO accounting trigger {name} is malformed")
+    foreign_schema_query = (
+        "SELECT type,name FROM main.sqlite_master "
+        "WHERE type IN ('view','index') AND name NOT LIKE 'sqlite_%' AND "
+        "(name LIKE 'fifo_%' OR instr(?, '|' || tbl_name || '|') > 0) ORDER BY type,name"
+    )
+    foreign_schema = await connection.execute(
+        foreign_schema_query,
+        (protected_table_names,),
+    )
+    if await foreign_schema.fetchone() is not None:
+        raise FifoBootstrapError("foreign schema objects cannot target FIFO accounting")
     versions = await connection.execute(
         "SELECT version,description FROM fifo_schema_migrations "
         "WHERE component=? ORDER BY version",
