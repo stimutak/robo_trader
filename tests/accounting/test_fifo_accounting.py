@@ -982,7 +982,7 @@ def test_failed_snapshot_insert_rolls_back_fill_commission_matches_and_lots(conn
         with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
             ledger.record_fill(_fill(1, FillSide.BUY, "1", "10", 1))
     finally:
-        connection.set_authorizer(None)
+        connection.set_authorizer(lambda *_arguments: sqlite3.SQLITE_OK)
     for table in (
         "fifo_fills",
         "fifo_commissions",
