@@ -822,6 +822,32 @@ async def test_supported_multiuser_v1_hot_schema_can_settle(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_supported_multiuser_v1_direct_create_schema_can_settle(tmp_path: Path):
+    contract = _runtime_contract(tmp_path)
+    database_path = Path(contract.database_path)
+    with sqlite3.connect(database_path):
+        pass
+    assert await MultiuserMigration(database_path).migrate() is True
+
+    database = AsyncTradingDatabase(database_path, pool_size=1)
+    await database.initialize()
+    try:
+        await _seed(database)
+
+        receipt = await database.commit_paper_reduction_outcome(
+            _request(outcome_at=datetime.now(timezone.utc) - timedelta(seconds=1)),
+            runtime_contract=contract,
+        )
+
+        assert receipt.trade_id is not None
+        position = await database.get_position("AAPL", portfolio_id="portfolio-a")
+        assert position is not None
+        assert position["quantity"] == 3
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
 async def test_fault_after_trade_insert_rolls_back_every_effect(tmp_path: Path):
     contract = _runtime_contract(tmp_path)
     database = AsyncTradingDatabase(Path(contract.database_path), pool_size=1)

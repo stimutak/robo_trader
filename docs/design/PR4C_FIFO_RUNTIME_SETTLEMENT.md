@@ -57,9 +57,11 @@ SQLite does. The audit compares complete canonical table and explicit-index
 DDL, including constraints, uniqueness, foreign keys, defaults, and required
 indexes. SQL normalization preserves quoted literal contents. The exact
 multiuser-v1 compatibility definitions for `positions`, `trades`, and
-`account` are separately allowlisted so an already-supported upgraded ledger
-is not quarantined merely for predating the fresh-database DDL. Every
-settlement statement is explicitly qualified to the durable `main` schema.
+`account` are separately allowlisted for both its populated-table rename path
+and its partially initialized direct-create path, so an already-supported
+upgraded ledger is not quarantined merely for predating the fresh-database
+DDL. Every settlement statement is explicitly qualified to the durable `main`
+schema.
 The FIFO ledger separately performs the same in-transaction protection for all
 FIFO tables and triggers. Thus a temporary settlement-link table cannot divert
 lineage, a same-shaped table cannot substitute altered constraints, and an

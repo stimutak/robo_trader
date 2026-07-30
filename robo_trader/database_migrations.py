@@ -791,6 +791,50 @@ _PAPER_SETTLEMENT_SUPPORTED_LEGACY_TABLE_SQL = {
     """,
 }
 
+# The same reviewed migration also has a direct-create path for a partially
+# initialized database.  SQLite records those table identifiers without the
+# quotes introduced by ALTER TABLE ... RENAME on the populated migration path.
+_PAPER_SETTLEMENT_SUPPORTED_DIRECT_CREATE_TABLE_SQL = {
+    "positions": """
+        CREATE TABLE positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            portfolio_id TEXT NOT NULL DEFAULT 'default',
+            symbol TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            avg_cost REAL NOT NULL,
+            market_price REAL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(portfolio_id, symbol)
+        )
+    """,
+    "trades": """
+        CREATE TABLE trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            portfolio_id TEXT NOT NULL DEFAULT 'default',
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            price REAL NOT NULL,
+            notional REAL DEFAULT 0,
+            slippage REAL DEFAULT 0,
+            commission REAL DEFAULT 0,
+            pnl REAL DEFAULT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+    "account": """
+        CREATE TABLE account (
+            portfolio_id TEXT PRIMARY KEY,
+            cash REAL NOT NULL,
+            equity REAL NOT NULL,
+            daily_pnl REAL DEFAULT 0,
+            realized_pnl REAL DEFAULT 0,
+            unrealized_pnl REAL DEFAULT 0,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+}
+
 _PAPER_SETTLEMENT_HOT_INDEX_SQL = {
     "idx_positions_portfolio": """
         CREATE INDEX idx_positions_portfolio ON positions (portfolio_id)
@@ -1089,6 +1133,9 @@ async def assert_paper_settlement_hot_schema(connection: aiosqlite.Connection) -
         supported_legacy_sql = _PAPER_SETTLEMENT_SUPPORTED_LEGACY_TABLE_SQL.get(name)
         if supported_legacy_sql is not None:
             allowed_definitions.add(_normalized_sql(supported_legacy_sql))
+        direct_create_sql = _PAPER_SETTLEMENT_SUPPORTED_DIRECT_CREATE_TABLE_SQL.get(name)
+        if direct_create_sql is not None:
+            allowed_definitions.add(_normalized_sql(direct_create_sql))
         if table_sql.get(name) not in allowed_definitions:
             raise RuntimeError(f"paper settlement hot table {name} definition is malformed")
 
