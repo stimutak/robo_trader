@@ -374,9 +374,18 @@ async def test_full_empty_position_evidence_chain_is_typed_and_one_shot(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("injected_mode", "error_match"),
+    [
+        (0o400, "changed after retention measurement"),
+        (0o600, "unsafe entry"),
+    ],
+)
 async def test_retention_measurement_change_preserves_unpublished_bundle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    injected_mode: int,
+    error_match: str,
 ) -> None:
     capability = _install_test_trust(monkeypatch, tmp_path)
     database = tmp_path / "ledger.db"
@@ -396,7 +405,7 @@ async def test_retention_measurement_change_preserves_unpublished_bundle(
         measured_size.append(receivers.unpublished_bundle_size_bytes(set()))
         injected = receivers._state.staging_output_directory / "raced-sealed-evidence.json"
         injected.write_bytes(b"operator-evidence-must-survive")
-        injected.chmod(0o400)
+        injected.chmod(injected_mode)
         return ()
 
     original_publish = receiver_core.BootstrapEvidenceReceiverSet.publish_complete_bundle
@@ -416,7 +425,7 @@ async def test_retention_measurement_change_preserves_unpublished_bundle(
 
     with pytest.raises(
         BootstrapEvidenceReceiverError,
-        match="changed after retention measurement",
+        match=error_match,
     ):
         await produce_bootstrap_evidence_bundle(
             runtime_contract=runtime,

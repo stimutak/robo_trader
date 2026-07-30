@@ -726,7 +726,7 @@ Make broker truth visible and authoritative before any broker-writing capability
   suspended-provider recovery, broker-envelope replay, complete account-wide
   protective symbol scope, reduce-only continuity after artifact failures,
   non-destructive retention ceilings, and persisted eligibility expiry.
-- Synthetic and mocked verification on 2026-07-30: `3077 passed, 5 skipped`
+- Synthetic and mocked verification on 2026-07-30: `3078 passed, 5 skipped`
   across the complete pytest suite; Black and Flake8 passed for all changed
   Python files. No trader process, Gateway, broker session, or authoritative
   trading database was started or accessed.

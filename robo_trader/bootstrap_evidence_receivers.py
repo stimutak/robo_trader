@@ -614,6 +614,11 @@ class BootstrapEvidenceReceiverSet:
             os.fsync(state.output_parent_fd)
             completion_payload = _completion_marker_payload(state)
             if expected_bundle_size_bytes is not None:
+                # From this point onward any failure is ambiguous with respect
+                # to same-UID additions inside the final directory. Preserve
+                # every entry and omit the trusted completion marker instead
+                # of rolling back through destructive staging cleanup.
+                preserve_failed_publication = True
                 measurement, artifact_bytes = _sealed_staging_measurement(state)
                 if (
                     type(expected_bundle_size_bytes) is not int
@@ -626,7 +631,6 @@ class BootstrapEvidenceReceiverSet:
                     # it there without a completion marker so injected or
                     # raced contents are preserved for operator inspection,
                     # never loaded, and never deleted as disposable staging.
-                    preserve_failed_publication = True
                     raise BootstrapEvidenceReceiverError(
                         "evidence bundle changed after retention measurement"
                     )
@@ -657,15 +661,17 @@ class BootstrapEvidenceReceiverSet:
                     self._assert_lexical_publication_binding(require_final=True)
                     if secrets.compare_digest(committed_payload, completion_payload):
                         state.published = True
+                        preserve_failed_publication = False
                         return state.final_output_directory
                 except BootstrapEvidenceReceiverError:
                     pass
                 raise
         except BaseException:
-            try:
-                os.unlink(completion_temp, dir_fd=state.staging_output_fd)
-            except FileNotFoundError:
-                pass
+            if not preserve_failed_publication:
+                try:
+                    os.unlink(completion_temp, dir_fd=state.staging_output_fd)
+                except FileNotFoundError:
+                    pass
             if renamed and not preserve_failed_publication:
                 try:
                     _rename_directory_exclusive(
@@ -679,6 +685,7 @@ class BootstrapEvidenceReceiverSet:
                     ) from exc
             raise
         state.published = True
+        preserve_failed_publication = False
         return state.final_output_directory
 
     def unpublished_bundle_size_bytes(
