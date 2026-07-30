@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable
 import aiosqlite
 
 EXACT_STATE_COMPONENT = "paper_exact_state"
-EXACT_STATE_SCHEMA_VERSION = 2
+EXACT_STATE_SCHEMA_VERSION = 3
 
 
 async def _columns(connection: aiosqlite.Connection, table: str) -> set[str]:
@@ -142,9 +142,59 @@ async def _migration_v2(connection: aiosqlite.Connection) -> None:
     """)
 
 
+async def _migration_v3(connection: aiosqlite.Connection) -> None:
+    await connection.execute("""
+        CREATE TABLE IF NOT EXISTS paper_fifo_settlement_links (
+            settlement_id TEXT PRIMARY KEY,
+            request_fingerprint TEXT NOT NULL UNIQUE,
+            epoch_id TEXT NOT NULL,
+            fill_id TEXT NOT NULL UNIQUE,
+            event_sequence INTEGER NOT NULL CHECK (
+                typeof(event_sequence) = 'integer' AND event_sequence > 0
+            ),
+            execution_id TEXT NOT NULL,
+            commission_minor INTEGER NOT NULL CHECK (
+                typeof(commission_minor) = 'integer'
+                AND commission_minor BETWEEN -1000000000000 AND 1000000000000
+            ),
+            commission_currency TEXT NOT NULL CHECK (commission_currency = 'USD'),
+            commission_source TEXT NOT NULL CHECK (
+                commission_source = 'LOCAL_PAPER_EXECUTOR_EXACT_COMMISSION_V1'
+            ),
+            fifo_state_fingerprint TEXT NOT NULL CHECK (
+                length(fifo_state_fingerprint) = 64
+                AND fifo_state_fingerprint = lower(fifo_state_fingerprint)
+                AND fifo_state_fingerprint NOT GLOB '*[^0-9a-f]*'
+            ),
+            committed_at TEXT NOT NULL CHECK (committed_at LIKE '%Z'),
+            UNIQUE(epoch_id, event_sequence),
+            UNIQUE(epoch_id, execution_id),
+            FOREIGN KEY(settlement_id)
+                REFERENCES paper_reduction_settlements(settlement_id),
+            FOREIGN KEY(epoch_id, fill_id)
+                REFERENCES fifo_fills(epoch_id, fill_id)
+        )
+    """)
+    await connection.execute("""
+        CREATE TRIGGER IF NOT EXISTS paper_fifo_settlement_links_no_update
+        BEFORE UPDATE ON paper_fifo_settlement_links
+        BEGIN
+            SELECT RAISE(ABORT, 'paper FIFO settlement links are append-only');
+        END
+    """)
+    await connection.execute("""
+        CREATE TRIGGER IF NOT EXISTS paper_fifo_settlement_links_no_delete
+        BEFORE DELETE ON paper_fifo_settlement_links
+        BEGIN
+            SELECT RAISE(ABORT, 'paper FIFO settlement links are append-only');
+        END
+    """)
+
+
 _MIGRATIONS: tuple[tuple[int, Callable[[aiosqlite.Connection], Awaitable[None]]], ...] = (
     (1, _migration_v1),
     (2, _migration_v2),
+    (3, _migration_v3),
 )
 
 _EXPECTED_COLUMNS = {
@@ -191,6 +241,19 @@ _EXPECTED_COLUMNS = {
         "account_scope": ("TEXT", 0),
         "consumed_at": ("TEXT", 0),
     },
+    "paper_fifo_settlement_links": {
+        "settlement_id": ("TEXT", 1),
+        "request_fingerprint": ("TEXT", 0),
+        "epoch_id": ("TEXT", 0),
+        "fill_id": ("TEXT", 0),
+        "event_sequence": ("INTEGER", 0),
+        "execution_id": ("TEXT", 0),
+        "commission_minor": ("INTEGER", 0),
+        "commission_currency": ("TEXT", 0),
+        "commission_source": ("TEXT", 0),
+        "fifo_state_fingerprint": ("TEXT", 0),
+        "committed_at": ("TEXT", 0),
+    },
 }
 
 _EXPECTED_FOREIGN_KEYS = {
@@ -234,6 +297,18 @@ _EXPECTED_FOREIGN_KEYS = {
             "NO ACTION",
             "NONE",
         ),
+    },
+    "paper_fifo_settlement_links": {
+        (
+            "settlement_id",
+            "paper_reduction_settlements",
+            "settlement_id",
+            "NO ACTION",
+            "NO ACTION",
+            "NONE",
+        ),
+        ("epoch_id", "fifo_fills", "epoch_id", "NO ACTION", "NO ACTION", "NONE"),
+        ("fill_id", "fifo_fills", "fill_id", "NO ACTION", "NO ACTION", "NONE"),
     },
 }
 
@@ -297,6 +372,38 @@ _EXPECTED_TABLE_SQL = {
             FOREIGN KEY(bootstrap_id) REFERENCES paper_state_bootstraps(bootstrap_id)
         )
     """,
+    "paper_fifo_settlement_links": """
+        CREATE TABLE paper_fifo_settlement_links (
+            settlement_id TEXT PRIMARY KEY,
+            request_fingerprint TEXT NOT NULL UNIQUE,
+            epoch_id TEXT NOT NULL,
+            fill_id TEXT NOT NULL UNIQUE,
+            event_sequence INTEGER NOT NULL CHECK (
+                typeof(event_sequence) = 'integer' AND event_sequence > 0
+            ),
+            execution_id TEXT NOT NULL,
+            commission_minor INTEGER NOT NULL CHECK (
+                typeof(commission_minor) = 'integer'
+                AND commission_minor BETWEEN -1000000000000 AND 1000000000000
+            ),
+            commission_currency TEXT NOT NULL CHECK (commission_currency = 'USD'),
+            commission_source TEXT NOT NULL CHECK (
+                commission_source = 'LOCAL_PAPER_EXECUTOR_EXACT_COMMISSION_V1'
+            ),
+            fifo_state_fingerprint TEXT NOT NULL CHECK (
+                length(fifo_state_fingerprint) = 64
+                AND fifo_state_fingerprint = lower(fifo_state_fingerprint)
+                AND fifo_state_fingerprint NOT GLOB '*[^0-9a-f]*'
+            ),
+            committed_at TEXT NOT NULL CHECK (committed_at LIKE '%Z'),
+            UNIQUE(epoch_id, event_sequence),
+            UNIQUE(epoch_id, execution_id),
+            FOREIGN KEY(settlement_id)
+                REFERENCES paper_reduction_settlements(settlement_id),
+            FOREIGN KEY(epoch_id, fill_id)
+                REFERENCES fifo_fills(epoch_id, fill_id)
+        )
+    """,
 }
 
 _EXPECTED_TRIGGER_SQL = {
@@ -340,6 +447,20 @@ _EXPECTED_TRIGGER_SQL = {
         BEFORE DELETE ON exact_bootstrap_evidence_consumptions
         BEGIN
             SELECT RAISE(ABORT, 'bootstrap evidence consumptions are append-only');
+        END
+    """,
+    "paper_fifo_settlement_links_no_update": """
+        CREATE TRIGGER paper_fifo_settlement_links_no_update
+        BEFORE UPDATE ON paper_fifo_settlement_links
+        BEGIN
+            SELECT RAISE(ABORT, 'paper FIFO settlement links are append-only');
+        END
+    """,
+    "paper_fifo_settlement_links_no_delete": """
+        CREATE TRIGGER paper_fifo_settlement_links_no_delete
+        BEFORE DELETE ON paper_fifo_settlement_links
+        BEGIN
+            SELECT RAISE(ABORT, 'paper FIFO settlement links are append-only');
         END
     """,
 }
@@ -454,6 +575,7 @@ async def assert_exact_state_schema(connection: aiosqlite.Connection) -> None:
         "administrator_actions",
         "paper_state_bootstraps",
         "exact_bootstrap_evidence_consumptions",
+        "paper_fifo_settlement_links",
         "paper_account_settlement_state",
         "paper_position_settlement_state",
     }
@@ -480,13 +602,25 @@ async def assert_exact_state_schema(connection: aiosqlite.Connection) -> None:
         if lineage is None or lineage[0] != "TEXT":
             raise RuntimeError(f"exact-state {table} bootstrap lineage is malformed")
 
-    for table, expected in _EXPECTED_FOREIGN_KEYS.items():
-        if not expected.issubset(await _foreign_keys(connection, table)):
+    for table, expected_foreign_keys in _EXPECTED_FOREIGN_KEYS.items():
+        if not expected_foreign_keys.issubset(await _foreign_keys(connection, table)):
             raise RuntimeError(f"exact-state {table} foreign keys are malformed")
 
     unique_sets = await _unique_column_sets(connection, "paper_state_bootstraps")
     if not _EXPECTED_UNIQUE_COLUMN_SETS.issubset(unique_sets):
         raise RuntimeError("exact-state bootstrap uniqueness constraints are malformed")
+    fifo_link_unique_sets = await _unique_column_sets(
+        connection,
+        "paper_fifo_settlement_links",
+    )
+    expected_fifo_link_unique_sets = {
+        frozenset({"request_fingerprint"}),
+        frozenset({"fill_id"}),
+        frozenset({"epoch_id", "event_sequence"}),
+        frozenset({"epoch_id", "execution_id"}),
+    }
+    if not expected_fifo_link_unique_sets.issubset(fifo_link_unique_sets):
+        raise RuntimeError("exact-state FIFO settlement link uniqueness is malformed")
 
     table_sql_rows = await connection.execute(
         "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
@@ -499,12 +633,13 @@ async def assert_exact_state_schema(connection: aiosqlite.Connection) -> None:
     trigger_rows = await connection.execute(
         """
         SELECT name, sql FROM sqlite_master
-        WHERE type = 'trigger' AND tbl_name IN (?, ?, ?)
+        WHERE type = 'trigger' AND tbl_name IN (?, ?, ?, ?)
         """,
         (
             "administrator_actions",
             "paper_state_bootstraps",
             "exact_bootstrap_evidence_consumptions",
+            "paper_fifo_settlement_links",
         ),
     )
     trigger_sql = {str(row[0]): _normalized_sql(row[1]) for row in await trigger_rows.fetchall()}

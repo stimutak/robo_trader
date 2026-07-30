@@ -37,6 +37,7 @@ from robo_trader.safety import (
     TerminalOrderStatus,
 )
 from robo_trader.safety.models import ValidationError, _strict_database_identity
+from tests.fifo_runtime_test_support import install_synthetic_fifo_epoch
 from tests.safety.conftest import make_case
 
 ACCOUNT_SCOPE = "acct_v1_0123456789abcdef0123456789abcdef" "fedcba9876543210fedcba9876543210"
@@ -131,6 +132,15 @@ async def _seed(database: AsyncTradingDatabase) -> None:
         realized_pnl=Decimal("0"),
         portfolio_id="portfolio-b",
     )
+    for portfolio_id in ("portfolio-a", "portfolio-b"):
+        await install_synthetic_fifo_epoch(
+            database,
+            execution_domain_scope=PAPER_EXECUTION_DOMAIN_SCOPE,
+            account_scope=ACCOUNT_SCOPE,
+            portfolio_id=portfolio_id,
+            con_id=265598,
+            symbol="AAPL",
+        )
 
 
 def _quote_payload() -> str:
@@ -190,6 +200,10 @@ def _request(*, outcome_at: datetime) -> PaperTerminalSettlementRequest:
         terminal_status=TerminalOrderStatus.FILLED,
         fill_price=Decimal("101.25"),
         outcome_at=outcome_at,
+        fill_execution_id="lpfill-" + ("8" * 32),
+        fill_commission_minor=0,
+        fill_commission_currency="USD",
+        fill_commission_source="LOCAL_PAPER_EXECUTOR_EXACT_COMMISSION_V1",
     )
 
 

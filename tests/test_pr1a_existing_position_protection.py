@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import subprocess
@@ -18,7 +19,7 @@ import pytest
 
 from robo_trader.config import RuntimeContract
 from robo_trader.database_validator import ValidationError
-from robo_trader.execution import ExecutionResult
+from robo_trader.execution import ExecutionResult, LocalPaperExecutionEvidence
 from robo_trader.paper_reduction_submitter import (
     LocalPaperOrderStatus,
     LocalPaperOutcomeProvenance,
@@ -93,6 +94,7 @@ def _filled_terminal_outcome(
     fill_price: Decimal = Decimal("97.5"),
 ) -> LocalPaperTerminalOutcome:
     quantity = Decimal(order.quantity)
+    observed_at = datetime.now(timezone.utc)
     return LocalPaperTerminalOutcome(
         order_ref=order.order_ref,
         status=LocalPaperOrderStatus.FILLED,
@@ -100,10 +102,20 @@ def _filled_terminal_outcome(
         filled_quantity=quantity,
         remaining_quantity=Decimal("0"),
         exact_fill_price=fill_price,
-        observed_at=datetime.now(timezone.utc),
+        observed_at=observed_at,
         provenance=LocalPaperOutcomeProvenance.LOCAL_PAPER_EXECUTOR,
         terminal=True,
         message="exact local paper fill",
+        fill_evidence=LocalPaperExecutionEvidence(
+            execution_id="lpfill-"
+            + hashlib.sha256(order.order_ref.encode("utf-8")).hexdigest()[:32],
+            filled_quantity=quantity,
+            exact_fill_price=fill_price,
+            commission_minor=0,
+            commission_currency="USD",
+            commission_source="LOCAL_PAPER_EXECUTOR_EXACT_COMMISSION_V1",
+            occurred_at=observed_at,
+        ),
     )
 
 

@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 import pytest_asyncio
 
-from robo_trader.execution import PaperExecutor
+from robo_trader.execution import LocalPaperExecutionEvidence, PaperExecutor
 from robo_trader.paper_reduction_gateway import (
     PaperReductionGateway,
     PaperReductionGatewayError,
@@ -80,6 +80,22 @@ async def _ledger_counts(harness: GatewayHarness) -> tuple[int, int]:
     return trade_count, settlement_count
 
 
+async def _fifo_settlement_counts(harness: GatewayHarness) -> tuple[int, int, int]:
+    async with harness.database.get_connection() as connection:
+        fill_count = (
+            await (await connection.execute("SELECT COUNT(*) FROM fifo_fills")).fetchone()
+        )[0]
+        commission_count = (
+            await (await connection.execute("SELECT COUNT(*) FROM fifo_commissions")).fetchone()
+        )[0]
+        link_count = (
+            await (
+                await connection.execute("SELECT COUNT(*) FROM paper_fifo_settlement_links")
+            ).fetchone()
+        )[0]
+    return fill_count, commission_count, link_count
+
+
 async def _bind_projection(
     harness: GatewayHarness,
     executor: PaperExecutor,
@@ -124,6 +140,20 @@ def _unsafe_outcome(
     status: LocalPaperOrderStatus,
 ) -> LocalPaperTerminalOutcome:
     partial = status is LocalPaperOrderStatus.PARTIALLY_FILLED
+    observed_at = datetime.now(timezone.utc)
+    fill_evidence = (
+        LocalPaperExecutionEvidence(
+            execution_id="lpfill-" + ("9" * 32),
+            filled_quantity=Decimal("1"),
+            exact_fill_price=Decimal("123.45"),
+            commission_minor=0,
+            commission_currency="USD",
+            commission_source="LOCAL_PAPER_EXECUTOR_EXACT_COMMISSION_V1",
+            occurred_at=observed_at,
+        )
+        if partial
+        else None
+    )
     return LocalPaperTerminalOutcome(
         order_ref=order_ref,
         status=status,
@@ -131,10 +161,11 @@ def _unsafe_outcome(
         filled_quantity=Decimal("1") if partial else Decimal("0"),
         remaining_quantity=Decimal("1") if partial else Decimal("2"),
         exact_fill_price=Decimal("123.45") if partial else None,
-        observed_at=datetime.now(timezone.utc),
+        observed_at=observed_at,
         provenance=LocalPaperOutcomeProvenance.LOCAL_PAPER_EXECUTOR,
         terminal=False,
         message=f"injected {status.value.lower()} outcome",
+        fill_evidence=fill_evidence,
     )
 
 
@@ -580,9 +611,14 @@ async def test_database_failure_after_fill_quarantines_without_executor_retry(
 
 
 @pytest.mark.asyncio
-async def test_after_trade_insert_fault_rolls_back_and_blocks_restart(
+@pytest.mark.parametrize(
+    "fault_step",
+    ["AFTER_FIFO_APPEND", "AFTER_TRADE_INSERT", "AFTER_FIFO_LINK_INSERT"],
+)
+async def test_atomic_settlement_fault_rolls_back_fifo_and_blocks_restart(
     failure_harness: GatewayHarness,
     monkeypatch: pytest.MonkeyPatch,
+    fault_step: str,
 ) -> None:
     harness = failure_harness
     executor = PaperExecutor()
@@ -590,14 +626,14 @@ async def test_after_trade_insert_fault_rolls_back_and_blocks_restart(
     _install_broker_boundary(harness, monkeypatch)
 
     def fault(step: str) -> None:
-        if step == "AFTER_TRADE_INSERT":
-            raise RuntimeError("injected AFTER_TRADE_INSERT failure")
+        if step == fault_step:
+            raise RuntimeError(f"injected {fault_step} failure")
 
     harness.database._paper_settlement_fault_hook = fault
     try:
-        with pytest.raises(RuntimeError, match="AFTER_TRADE_INSERT"):
+        with pytest.raises(RuntimeError, match=fault_step):
             await harness.gateway.submit_reduction(
-                order=_order(order_ref="fault-after-trade-insert"),
+                order=_order(order_ref=f"fault-{fault_step.lower()}"),
                 portfolio_id="portfolio-a",
             )
     finally:
@@ -605,6 +641,7 @@ async def test_after_trade_insert_fault_rolls_back_and_blocks_restart(
 
     assert len(executor.fills) == 1
     assert await _ledger_counts(harness) == (0, 0)
+    assert await _fifo_settlement_counts(harness) == (0, 0, 0)
     allocation = await harness.database.get_safety_allocation_snapshot(
         SYMBOL,
         runtime_contract=harness.context.runtime_contract,

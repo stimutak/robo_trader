@@ -61,6 +61,7 @@ from robo_trader.safety_runtime_evidence import (
     assemble_local_paper_safety_evidence,
 )
 from robo_trader.stop_loss_monitor import StopLossMonitor
+from tests.fifo_runtime_test_support import install_synthetic_fifo_epoch
 
 ACCOUNT = "DU1234567"
 SCOPE_KEY = "0123456789abcdef" * 4
@@ -151,6 +152,14 @@ async def _seed_allocations(
             Decimal("100000"),
             realized_pnl=Decimal("0"),
             portfolio_id=portfolio_id,
+        )
+        await install_synthetic_fifo_epoch(
+            database,
+            execution_domain_scope="paper-simulator-v1",
+            account_scope=ACCOUNT_SCOPE,
+            portfolio_id=portfolio_id,
+            con_id=CON_ID,
+            symbol=SYMBOL,
         )
 
 

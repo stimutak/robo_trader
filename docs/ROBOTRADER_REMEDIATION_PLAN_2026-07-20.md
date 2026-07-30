@@ -1,7 +1,7 @@
 # RoboTrader Remediation and Launch Plan
 
 Document date: 2026-07-20
-Last updated: 2026-07-28
+Last updated: 2026-07-30
 Status: Active execution plan; Gate A remains closed
 Source baseline: repository audit at commit `51f0e99`; execution baseline
 `1ae64808ae20956e412e95f17f194776f4851478` on branch `main`
@@ -48,6 +48,15 @@ operator-reviewed bootstrap/application, and restore evidence remain open. PR
 production startup/reconnect/periodic wiring and a current operator-reviewed
 reconciliation remain open. Gate A remains closed, the trader remains stopped,
 and none of these merges authorizes startup.
+
+PR4A's dormant exact FIFO foundation is merged through PR #120. PR4B's
+operator-reviewed legacy-opening bridge is under review as PR #123 at exact
+head `318532e`; it includes sealed opening-manifest count/hash, exact trigger
+body verification, and in-transaction schema revalidation. PR4C
+transactionally connecting producer-owned local-paper fills to FIFO is
+implemented on `codex/pr4c-fifo-settlement`, stacked on that
+exact PR4B head, and is awaiting independent review. These code slices do not
+apply an operational bootstrap, authorize startup, or close Gate A.
 
 ## 1. Purpose
 
@@ -650,6 +659,28 @@ Create a recoverable financial ledger with constrained schema, safe pooling, saf
 - An invalid financial row cannot enter through normal application paths.
 - Backups include WAL state and restore to an integrity-clean database.
 - Every order and fill has durable correlation identifiers.
+
+### PR4C implementation checkpoint (2026-07-30)
+
+The local-paper terminal settlement now appends each producer-authenticated
+fill, exact USD commission, FIFO lots/matches/snapshot, compatibility
+projections, terminal outbox, and immutable settlement-to-FIFO link in one
+SQLite transaction. Exact replay re-authenticates the stored event and link;
+missing epochs, conflicting evidence, projection divergence, and partial writes
+fail closed. Stopped-system recovery also verifies the full FIFO epoch and link
+from its existing query-only snapshot before releasing safety authority.
+
+The full local suite passed 3,036 tests with 5 expected skips and 20 known
+warnings. Detailed design and evidence are recorded in
+`docs/design/PR4C_FIFO_RUNTIME_SETTLEMENT.md` and
+`docs/reviews/PR4C_LOCAL_REVIEW_EVIDENCE_2026-07-30.md`.
+
+This checkpoint does not complete PR4. PR4B must merge first; the reviewed
+bootstrap must then be applied only through the stopped-system operator path,
+and WAL-safe backup/clean-room restore plus current reconciliation evidence
+remain mandatory. The active simulator still emits complete fills only;
+partial order-lifecycle support remains quarantined. Gate A remains closed and
+the trader remains stopped.
 
 ## PR 5 - Add read-only broker reconciliation
 
@@ -1557,8 +1588,11 @@ Update after each merge.
   contract and adversarial tests are present; cumulative Gate-A operational
   evidence remains required.
 - PR 4: The exact-state bootstrap code slice merged through PR #112 as
-  `bccb96b`. Strict FIFO lot accounting, stopped-system operator review and
-  application, and clean-room backup/restore evidence remain open.
+  `bccb96b`, and dormant FIFO PR4A merged through PR #120. PR4B is under review
+  as PR #123 at exact head `318532e`. PR4C transactional runtime FIFO settlement
+  is implemented and awaiting independent review. Stopped-system operator
+  application, WAL-safe clean-room backup/restore, and current reconciliation
+  evidence remain open; no PR4 slice authorizes startup.
 - PR 5: Reconciliation domain and runtime evidence/service foundations merged
   through PR #113 (`6176931`) and PR #115 (`1ae6480`). Production
   startup/reconnect/periodic integration and a current reviewed read-only

@@ -1,9 +1,9 @@
-"""Dormant exact-accounting foundations.
+"""Exact FIFO accounting and its contained local-paper settlement bridge.
 
-Nothing in this package is connected to the trading runtime.  PR4A exposes a
-fixture-only schema migration and a deterministic FIFO projector. PR4B adds a
-separately guarded offline legacy-opening bridge; no runtime path imports this
-package to authorize startup or an order.
+PR4A provides the deterministic ledger, PR4B the separately guarded offline
+legacy-opening bridge, and PR4C the atomic projection of producer-authenticated
+local-paper terminal fills. Nothing here authorizes startup, an IBKR write, or
+a live order.
 """
 
 from .fifo import (
@@ -24,6 +24,16 @@ from .fifo_fixture_migration import (
     assert_fifo_accounting_schema,
     migrate_fifo_fixture_database,
 )
+from .fifo_runtime import (
+    LOCAL_PAPER_COMMISSION_SOURCE,
+    FifoRuntimeProjection,
+    FifoRuntimeSettlementError,
+    RuntimePaperFillEvidence,
+    append_runtime_fill_in_transaction,
+    append_runtime_fill_on_aiosqlite_worker,
+    reduction_side_to_fifo,
+    verify_runtime_fill_in_transaction,
+)
 
 __all__ = [
     "AccountingEpoch",
@@ -38,6 +48,14 @@ __all__ = [
     "FifoAccountingValidationError",
     "FifoLedger",
     "PositionSnapshot",
+    "LOCAL_PAPER_COMMISSION_SOURCE",
+    "FifoRuntimeProjection",
+    "FifoRuntimeSettlementError",
+    "RuntimePaperFillEvidence",
+    "append_runtime_fill_in_transaction",
+    "append_runtime_fill_on_aiosqlite_worker",
+    "reduction_side_to_fifo",
+    "verify_runtime_fill_in_transaction",
     "assert_fifo_accounting_schema",
     "migrate_fifo_fixture_database",
 ]

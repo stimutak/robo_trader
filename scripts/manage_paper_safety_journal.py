@@ -32,6 +32,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from robo_trader.accounting.fifo_runtime import (  # noqa: E402
+    RuntimePaperFillEvidence,
+    reduction_side_to_fifo,
+    verify_runtime_fill_in_transaction,
+)
 from robo_trader.config import (  # noqa: E402
     RuntimeContract,
     _derive_safety_account_scope,
@@ -119,6 +124,18 @@ _SETTLEMENT_PROJECTION_SCHEMA = {
         "source_settlement_id",
         "symbol",
         "updated_at",
+    },
+    "paper_fifo_settlement_links": {
+        "commission_currency",
+        "commission_minor",
+        "commission_source",
+        "epoch_id",
+        "event_sequence",
+        "execution_id",
+        "fifo_state_fingerprint",
+        "fill_id",
+        "request_fingerprint",
+        "settlement_id",
     },
 }
 
@@ -586,7 +603,12 @@ def _linked_settlement_projection_matches(
         return False
 
     if request.filled_quantity > 0:
-        if type(trade_id) is not int or trade_id <= 0 or request.fill_price is None:
+        if (
+            type(trade_id) is not int
+            or trade_id <= 0
+            or request.fill_price is None
+            or request.fill_commission_minor is None
+        ):
             return False
         trade_rows = connection.execute(
             """
@@ -612,6 +634,7 @@ def _linked_settlement_projection_matches(
             trade_timestamp,
         ) = trade_rows[0]
         exact_notional = request.fill_price * request.filled_quantity
+        exact_commission = Decimal(request.fill_commission_minor) / Decimal("100")
         exact_pnl = request.expected_post_realized_pnl - request.expected_pre_realized_pnl
         trade_matches = (
             trade_portfolio == request.portfolio_id
@@ -623,7 +646,7 @@ def _linked_settlement_projection_matches(
             and _float_projection_matches(trade_price, request.fill_price)
             and _float_projection_matches(trade_notional, exact_notional)
             and _float_projection_matches(trade_slippage, Decimal(0))
-            and _float_projection_matches(trade_commission, Decimal(0))
+            and _float_projection_matches(trade_commission, exact_commission)
             and _float_projection_matches(trade_pnl, exact_pnl)
             and trade_timestamp == committed_at
         )
@@ -634,7 +657,7 @@ def _linked_settlement_projection_matches(
             """
             SELECT COUNT(*) FROM trades
             WHERE portfolio_id = ? AND symbol = ? AND side = ? AND quantity = ?
-              AND price = ? AND notional = ? AND slippage = 0 AND commission = 0
+              AND price = ? AND notional = ? AND slippage = 0 AND commission = ?
               AND pnl = ? AND timestamp = ?
             """,
             (
@@ -644,6 +667,7 @@ def _linked_settlement_projection_matches(
                 int(request.filled_quantity),
                 float(request.fill_price),
                 float(exact_notional),
+                float(exact_commission),
                 float(exact_pnl),
                 committed_at,
             ),
@@ -860,6 +884,88 @@ def _linked_settlement_projection_matches(
     return _legacy_timestamp_not_after(account_rows[0][4], exact_committed_at)
 
 
+def _fifo_settlement_projection_matches(
+    connection: sqlite3.Connection,
+    *,
+    settlement_id: object,
+    request_fingerprint: object,
+    request: PaperTerminalSettlementRequest,
+) -> bool:
+    """Authenticate the immutable FIFO event linked to one settlement."""
+
+    if type(settlement_id) is not str or type(request_fingerprint) is not str:
+        return False
+    rows = connection.execute(
+        """
+        SELECT epoch_id,fill_id,event_sequence,execution_id,commission_minor,
+               commission_currency,commission_source,fifo_state_fingerprint
+        FROM paper_fifo_settlement_links WHERE settlement_id=?
+        """,
+        (settlement_id,),
+    ).fetchall()
+    if request.filled_quantity == 0:
+        return not rows
+    if (
+        len(rows) != 1
+        or request.fill_price is None
+        or request.fill_execution_id is None
+        or request.fill_commission_minor is None
+        or request.fill_commission_currency is None
+        or request.fill_commission_source is None
+    ):
+        return False
+    (
+        epoch_id,
+        fill_id,
+        event_sequence,
+        execution_id,
+        commission_minor,
+        commission_currency,
+        commission_source,
+        state_fingerprint,
+    ) = rows[0]
+    try:
+        evidence = RuntimePaperFillEvidence(
+            execution_domain_scope=request.execution_domain_scope,
+            account_scope=request.account_scope,
+            portfolio_id=request.portfolio_id,
+            con_id=request.con_id,
+            symbol=request.symbol,
+            side=reduction_side_to_fifo(request.side.value),
+            quantity=request.filled_quantity,
+            price=request.fill_price,
+            execution_id=request.fill_execution_id,
+            idempotency_key=request_fingerprint,
+            commission_minor=request.fill_commission_minor,
+            commission_currency=request.fill_commission_currency,
+            commission_source=request.fill_commission_source,
+            occurred_at=request.outcome_at,
+        )
+        projection = verify_runtime_fill_in_transaction(connection, evidence)
+    except (sqlite3.Error, RuntimeError, TypeError, ValueError):
+        return False
+    return (
+        epoch_id == projection.epoch_id
+        and fill_id == projection.fill_id
+        and event_sequence == projection.event_sequence
+        and execution_id == request.fill_execution_id
+        and commission_minor == request.fill_commission_minor
+        and commission_currency == request.fill_commission_currency
+        and commission_source == request.fill_commission_source
+        and state_fingerprint == projection.state_fingerprint
+        and projection.replayed
+        and projection.signed_quantity == request.expected_post_position_quantity
+        and (
+            projection.average_cost == request.expected_position_cost_basis
+            if projection.signed_quantity != 0
+            else projection.average_cost is None and projection.open_cost is None
+        )
+        and projection.fill_realized_pnl
+        == request.expected_post_realized_pnl - request.expected_pre_realized_pnl
+        and projection.total_realized_pnl == request.expected_post_realized_pnl
+    )
+
+
 def _local_settlement_correlations(
     contract: RuntimeContract,
     reservations: tuple[ReplayReservation, ...],
@@ -880,6 +986,9 @@ def _local_settlement_correlations(
             uri=True,
             isolation_level=None,
         )
+        connection.execute("PRAGMA foreign_keys = ON")
+        if connection.execute("PRAGMA foreign_keys").fetchone() != (1,):
+            raise RuntimeError("paper allocation ledger foreign keys cannot be enforced")
         connection.execute("PRAGMA query_only = ON")
         if connection.execute("PRAGMA query_only").fetchone() != (1,):
             raise RuntimeError("paper allocation ledger query-only mode cannot be proven")
@@ -1031,6 +1140,12 @@ def _local_settlement_correlations(
                     trade_id=trade_id,
                     committed_at=committed_at,
                     protective_quote_payload=protective_quote_payload,
+                    request=request,
+                )
+                and _fifo_settlement_projection_matches(
+                    connection,
+                    settlement_id=settlement_id,
+                    request_fingerprint=request_fingerprint,
                     request=request,
                 )
             )

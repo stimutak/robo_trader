@@ -484,6 +484,15 @@ class FifoLedger:
         }
 
     def record_fill(self, event: FillEvent) -> FillResult:
+        """Record one fill in a transaction owned by this ledger.
+
+        Runtime settlement must commit the immutable FIFO event and every
+        compatibility projection together.  It uses
+        :meth:`record_fill_in_transaction` while holding its own
+        ``BEGIN IMMEDIATE`` transaction; fixture callers retain this convenient
+        self-contained wrapper.
+        """
+
         _assert_no_temp_fifo_objects(self._connection)
         if type(event) is not FillEvent:
             raise TypeError("event must be FillEvent")
@@ -491,65 +500,83 @@ class FifoLedger:
             raise FifoAccountingError("fill recording requires an idle connection")
         try:
             self._connection.execute("BEGIN IMMEDIATE")
-            assert_fifo_accounting_schema(
-                self._connection,
-                allow_other_objects=self._allow_other_objects,
-            )
-            effective_at = self._require_epoch(event.epoch_id)
-            if event.occurred_at < effective_at:
-                raise FifoAccountingOrderingError("fill event time precedes epoch effective_at")
-            replay = self._existing_fill(event)
-            if replay is not None:
+            result = self.record_fill_in_transaction(event)
+            if result.replayed:
                 self._connection.rollback()
-                return replay
-            self._assert_next_event(event)
-            self._assert_instrument_identity(event)
-            self._connection.execute(
-                """
-                INSERT INTO fifo_fills(
-                    fill_id, epoch_id, event_sequence, execution_id, idempotency_key,
-                    con_id, symbol, side, quantity_text, price_text, occurred_at,
-                    recorded_at, payload_fingerprint
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event.fill_id,
-                    event.epoch_id,
-                    event.event_sequence,
-                    event.execution_id,
-                    event.idempotency_key,
-                    event.con_id,
-                    event.symbol,
-                    event.side.value,
-                    _decimal_text(event.quantity),
-                    _decimal_text(event.price),
-                    _utc_text(event.occurred_at),
-                    _utc_text(event.recorded_at),
-                    event.fingerprint(),
-                ),
-            )
-            self._connection.execute(
-                """
-                INSERT INTO fifo_commissions(
-                    commission_id, epoch_id, fill_id, amount_minor, currency,
-                    minor_unit_exponent, recorded_at
-                ) VALUES (?, ?, ?, ?, 'USD', 2, ?)
-                """,
-                (
-                    event.commission_id,
-                    event.epoch_id,
-                    event.fill_id,
-                    event.commission_minor,
-                    _utc_text(event.recorded_at),
-                ),
-            )
-            result = self._project_fill(event)
+                return result
             self._connection.commit()
             return result
         except BaseException:
             if self._connection.in_transaction:
                 self._connection.rollback()
             raise
+
+    def record_fill_in_transaction(self, event: FillEvent) -> FillResult:
+        """Append one exact fill without committing the caller-owned transaction.
+
+        The caller must already hold a SQLite transaction.  This method never
+        commits or rolls back it, including for exact replay.  Any raised
+        exception therefore leaves transaction disposition to the caller and
+        lets FIFO state remain atomic with its compatibility projections.
+        """
+
+        _assert_no_temp_fifo_objects(self._connection)
+        if type(event) is not FillEvent:
+            raise TypeError("event must be FillEvent")
+        if not self._connection.in_transaction:
+            raise FifoAccountingError("runtime fill recording requires an active transaction")
+        assert_fifo_accounting_schema(
+            self._connection,
+            allow_other_objects=self._allow_other_objects,
+        )
+        effective_at = self._require_epoch(event.epoch_id)
+        if event.occurred_at < effective_at:
+            raise FifoAccountingOrderingError("fill event time precedes epoch effective_at")
+        replay = self._existing_fill(event)
+        if replay is not None:
+            return replay
+        self._assert_next_event(event)
+        self._assert_instrument_identity(event)
+        self._connection.execute(
+            """
+            INSERT INTO fifo_fills(
+                fill_id, epoch_id, event_sequence, execution_id, idempotency_key,
+                con_id, symbol, side, quantity_text, price_text, occurred_at,
+                recorded_at, payload_fingerprint
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.fill_id,
+                event.epoch_id,
+                event.event_sequence,
+                event.execution_id,
+                event.idempotency_key,
+                event.con_id,
+                event.symbol,
+                event.side.value,
+                _decimal_text(event.quantity),
+                _decimal_text(event.price),
+                _utc_text(event.occurred_at),
+                _utc_text(event.recorded_at),
+                event.fingerprint(),
+            ),
+        )
+        self._connection.execute(
+            """
+            INSERT INTO fifo_commissions(
+                commission_id, epoch_id, fill_id, amount_minor, currency,
+                minor_unit_exponent, recorded_at
+            ) VALUES (?, ?, ?, ?, 'USD', 2, ?)
+            """,
+            (
+                event.commission_id,
+                event.epoch_id,
+                event.fill_id,
+                event.commission_minor,
+                _utc_text(event.recorded_at),
+            ),
+        )
+        return self._project_fill(event)
 
     def verify_epoch_integrity(self, epoch_id: str) -> None:
         """Recompute immutable relationships and hash-chain evidence for an epoch."""

@@ -45,6 +45,7 @@ from robo_trader.safety.models import (
 _SCOPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 _SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
 _SETTLEMENT_ID_RE = re.compile(r"^pset-[0-9a-f]{32}$")
+_LOCAL_PAPER_EXECUTION_ID_RE = re.compile(r"^lpfill-[0-9a-f]{32}$")
 
 
 class PaperTerminalSettlementError(RuntimeError):
@@ -91,11 +92,8 @@ def _parse_protective_quote_timestamp(value: object) -> datetime:
         raise ValueError("protective quote timestamp must be text")
     normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
     parsed = datetime.fromisoformat(normalized)
-    if (
-        parsed.tzinfo is None
-        or parsed.utcoffset() is None
-        or parsed.utcoffset().total_seconds() != 0
-    ):
+    offset = parsed.utcoffset()
+    if parsed.tzinfo is None or offset is None or offset.total_seconds() != 0:
         raise ValueError("protective quote timestamp must be UTC")
     return parsed.astimezone(timezone.utc)
 
@@ -152,6 +150,7 @@ class PaperAccountSettlementState:
         fill_price: Optional[Decimal],
         protective_mark_price: Decimal,
         pre_position_quantity: Decimal,
+        commission_minor: int = 0,
     ) -> Tuple[Decimal, Decimal, Decimal]:
         """Return exact cash/P&L after a reduction, without float arithmetic.
 
@@ -170,9 +169,14 @@ class PaperAccountSettlementState:
         )
         if filled < 0:
             raise ValidationError("filled_quantity must be nonnegative")
+        if type(commission_minor) is not int or abs(commission_minor) > 1_000_000_000_000:
+            raise ValidationError("commission_minor is outside the exact allowed range")
+        commission = Decimal(commission_minor).scaleb(-2)
         if filled.is_zero():
             if fill_price is not None:
                 raise ValidationError("unfilled settlement cannot have a fill price")
+            if commission_minor != 0:
+                raise ValidationError("unfilled settlement cannot have a commission")
             return self.cash, self.realized_pnl, self.daily_pnl
         if (
             fill_price is None
@@ -196,7 +200,11 @@ class PaperAccountSettlementState:
         fill = _strict_decimal(fill_price, "fill_price", positive=True)
         notional = _exact_decimal_multiply(fill, filled, "fill notional")
         if side is OrderSide.SELL:
-            post_cash = _exact_decimal_add(self.cash, notional, "post cash")
+            post_cash = _exact_decimal_subtract(
+                _exact_decimal_add(self.cash, notional, "post cash before commission"),
+                commission,
+                "post cash",
+            )
             per_share_pnl = _exact_decimal_subtract(
                 fill,
                 self.position_cost_basis,
@@ -213,7 +221,11 @@ class PaperAccountSettlementState:
                 "long mark change per share",
             )
         elif side is OrderSide.BUY_TO_COVER:
-            post_cash = _exact_decimal_subtract(self.cash, notional, "post cash")
+            post_cash = _exact_decimal_subtract(
+                _exact_decimal_subtract(self.cash, notional, "post cash before commission"),
+                commission,
+                "post cash",
+            )
             per_share_pnl = _exact_decimal_subtract(
                 self.position_cost_basis,
                 fill,
@@ -236,9 +248,14 @@ class PaperAccountSettlementState:
             filled,
             "realized P&L delta",
         )
+        pnl_after_commission = _exact_decimal_subtract(
+            pnl_delta,
+            commission,
+            "realized P&L delta after commission",
+        )
         realized_pnl = _exact_decimal_add(
             self.realized_pnl,
-            pnl_delta,
+            pnl_after_commission,
             "post realized P&L",
         )
         removed_unrealized = _exact_decimal_multiply(
@@ -258,7 +275,7 @@ class PaperAccountSettlementState:
                     mark_revaluation,
                     "daily P&L after mark revaluation",
                 ),
-                pnl_delta,
+                pnl_after_commission,
                 "daily P&L after realized fill",
             ),
             removed_unrealized,
@@ -305,6 +322,10 @@ class PaperTerminalSettlementRequest:
     terminal_status: TerminalOrderStatus
     fill_price: Optional[Decimal]
     outcome_at: datetime
+    fill_execution_id: Optional[str] = None
+    fill_commission_minor: Optional[int] = None
+    fill_commission_currency: Optional[str] = None
+    fill_commission_source: Optional[str] = None
     schema_version: int = MODEL_VERSION
 
     def __post_init__(self) -> None:
@@ -445,6 +466,9 @@ class PaperTerminalSettlementRequest:
             fill_price=self.fill_price,
             protective_mark_price=quote_price,
             pre_position_quantity=pre_position,
+            commission_minor=(
+                0 if self.fill_commission_minor is None else self.fill_commission_minor
+            ),
         )
         _strict_decimal(self.expected_post_cash, "expected_post_cash")
         _strict_decimal(
@@ -471,6 +495,20 @@ class PaperTerminalSettlementRequest:
             if self.fill_price is None:
                 raise ValidationError("FILLED settlement requires an exact fill price")
             _strict_decimal(self.fill_price, "fill_price", positive=True)
+            if (
+                type(self.fill_execution_id) is not str
+                or _LOCAL_PAPER_EXECUTION_ID_RE.fullmatch(self.fill_execution_id) is None
+            ):
+                raise ValidationError("fill_execution_id is malformed")
+            if (
+                type(self.fill_commission_minor) is not int
+                or abs(self.fill_commission_minor) > 1_000_000_000_000
+            ):
+                raise ValidationError("FILLED settlement requires exact commission minor units")
+            if self.fill_commission_currency != "USD":
+                raise ValidationError("FILLED settlement commission currency must be USD")
+            if self.fill_commission_source != "LOCAL_PAPER_EXECUTOR_EXACT_COMMISSION_V1":
+                raise ValidationError("FILLED settlement commission source is not authoritative")
         elif self.terminal_status in {
             TerminalOrderStatus.CANCELLED,
             TerminalOrderStatus.REJECTED,
@@ -481,6 +519,16 @@ class PaperTerminalSettlementRequest:
                 raise ValidationError("unfilled terminal settlement has inconsistent quantities")
             if self.fill_price is not None:
                 raise ValidationError("unfilled terminal settlement cannot contain a fill price")
+            if any(
+                value is not None
+                for value in (
+                    self.fill_execution_id,
+                    self.fill_commission_minor,
+                    self.fill_commission_currency,
+                    self.fill_commission_source,
+                )
+            ):
+                raise ValidationError("unfilled terminal settlement cannot contain fill evidence")
         else:  # pragma: no cover - enum exhaustiveness guard
             raise ValidationError("unsupported paper terminal status")
         object.__setattr__(self, "outcome_at", _strict_utc(self.outcome_at, "outcome_at"))
@@ -511,6 +559,10 @@ class PaperTerminalSettlementRequest:
                     self.expected_pre_position_source_settlement_id
                 ),
                 "fill_price": self.fill_price,
+                "fill_execution_id": self.fill_execution_id,
+                "fill_commission_minor": self.fill_commission_minor,
+                "fill_commission_currency": self.fill_commission_currency,
+                "fill_commission_source": self.fill_commission_source,
                 "filled_quantity": self.filled_quantity,
                 "order_ref": self.order_ref,
                 "outcome_at": self.outcome_at,
@@ -647,6 +699,10 @@ class PaperTerminalSettlementRequest:
                     else parse_fixed_decimal(payload["fill_price"], "fill_price")
                 ),
                 outcome_at=parse_utc_text(payload["outcome_at"], "outcome_at"),
+                fill_execution_id=payload["fill_execution_id"],
+                fill_commission_minor=payload["fill_commission_minor"],
+                fill_commission_currency=payload["fill_commission_currency"],
+                fill_commission_source=payload["fill_commission_source"],
                 schema_version=payload["schema_version"],
             )
         except (KeyError, TypeError, ValueError, ValidationError) as exc:

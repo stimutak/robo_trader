@@ -15,6 +15,19 @@ from pathlib import Path
 import pytest
 
 import scripts.manage_paper_safety_journal as journal_script
+from robo_trader.accounting.fifo import FillSide
+from robo_trader.accounting.fifo_fixture_migration import (
+    _TABLE_SQL,
+    _TRIGGER_SQL,
+    FIFO_ACCOUNTING_COMPONENT,
+    FIFO_ACCOUNTING_MIGRATIONS,
+    _legacy_opening_manifest_hash,
+)
+from robo_trader.accounting.fifo_runtime import (
+    LOCAL_PAPER_COMMISSION_SOURCE,
+    RuntimePaperFillEvidence,
+    append_runtime_fill_in_transaction,
+)
 from robo_trader.config import _derive_safety_account_scope
 from robo_trader.database_async import AsyncTradingDatabase
 from robo_trader.paper_terminal_settlement import (
@@ -175,6 +188,7 @@ def _seed_unresolved_claim(
 
 def _create_settlement_schema(path: Path) -> None:
     with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
         connection.executescript("""
             CREATE TABLE trades (
                 id INTEGER PRIMARY KEY,
@@ -252,6 +266,49 @@ def _create_settlement_schema(path: Path) -> None:
                 schema_version INTEGER NOT NULL
             )
             """)
+        for statement in _TABLE_SQL.values():
+            connection.execute(statement)
+        connection.executemany(
+            """
+            INSERT INTO fifo_schema_migrations(component,version,description,applied_at)
+            VALUES (?,?,?,'2020-01-01T00:00:00.000000Z')
+            """,
+            tuple(
+                (FIFO_ACCOUNTING_COMPONENT, version, description)
+                for version, description in FIFO_ACCOUNTING_MIGRATIONS
+            ),
+        )
+        for statement in _TRIGGER_SQL.values():
+            connection.execute(statement)
+        connection.executescript("""
+            CREATE TABLE paper_fifo_settlement_links (
+                settlement_id TEXT PRIMARY KEY,
+                request_fingerprint TEXT NOT NULL UNIQUE,
+                epoch_id TEXT NOT NULL,
+                fill_id TEXT NOT NULL UNIQUE,
+                event_sequence INTEGER NOT NULL,
+                execution_id TEXT NOT NULL,
+                commission_minor INTEGER NOT NULL,
+                commission_currency TEXT NOT NULL,
+                commission_source TEXT NOT NULL,
+                fifo_state_fingerprint TEXT NOT NULL,
+                committed_at TEXT NOT NULL,
+                UNIQUE(epoch_id,event_sequence),
+                UNIQUE(epoch_id,execution_id),
+                FOREIGN KEY(settlement_id) REFERENCES paper_reduction_settlements(settlement_id),
+                FOREIGN KEY(epoch_id,fill_id) REFERENCES fifo_fills(epoch_id,fill_id)
+            );
+            CREATE TRIGGER paper_fifo_settlement_links_no_update
+            BEFORE UPDATE ON paper_fifo_settlement_links
+            BEGIN
+                SELECT RAISE(ABORT, 'paper FIFO settlement links are append-only');
+            END;
+            CREATE TRIGGER paper_fifo_settlement_links_no_delete
+            BEFORE DELETE ON paper_fifo_settlement_links
+            BEGIN
+                SELECT RAISE(ABORT, 'paper FIFO settlement links are append-only');
+            END;
+            """)
 
 
 def _insert_exact_settlement(
@@ -315,6 +372,10 @@ def _insert_exact_settlement(
         terminal_status=TerminalOrderStatus.FILLED,
         fill_price=Decimal("101.25"),
         outcome_at=datetime.now(timezone.utc) - timedelta(seconds=10),
+        fill_execution_id="lpfill-" + ("8" * 32),
+        fill_commission_minor=0,
+        fill_commission_currency="USD",
+        fill_commission_source=LOCAL_PAPER_COMMISSION_SOURCE,
     )
     database_metadata = ledger_path.stat()
     settlement_id = "pset-" + ("2" * 32)
@@ -342,6 +403,120 @@ def _insert_exact_settlement(
     )
     receipt_fingerprint = hashlib.sha256(receipt_payload.encode("utf-8")).hexdigest()
     with sqlite3.connect(ledger_path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        epoch_id = "fepoch-" + ("1" * 32)
+        effective_at = "2020-01-01T00:00:00.000000Z"
+        opening_balance_id = "fobal-" + ("3" * 32)
+        connection.execute(
+            """
+            INSERT INTO fifo_accounting_epochs VALUES (
+                ?,1,?,?,?,'LEGACY_AGGREGATE_OPENING_BALANCE',?,?,?
+            )
+            """,
+            (
+                epoch_id,
+                request.execution_domain_scope,
+                request.account_scope,
+                request.portfolio_id,
+                "4" * 64,
+                effective_at,
+                effective_at,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO fifo_epoch_account_baselines VALUES (?,?,?,?,?,?,?)",
+            (
+                epoch_id,
+                "10000",
+                "0",
+                "0",
+                "0",
+                request.expected_daily_pnl_date,
+                effective_at,
+            ),
+        )
+        manifest_row = (
+            opening_balance_id,
+            "flot-" + ("a" * 32),
+            request.con_id,
+            request.symbol,
+            "LONG",
+            "5",
+            "100",
+            "100",
+            effective_at,
+            "9" * 64,
+            0,
+            0,
+            effective_at,
+        )
+        connection.execute(
+            "INSERT INTO fifo_legacy_bootstrap_lineage VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                epoch_id,
+                "pboot-" + ("5" * 32),
+                "4" * 64,
+                1,
+                _legacy_opening_manifest_hash([manifest_row]),
+                "status-reconciliation",
+                "6" * 64,
+                "7" * 64,
+                "8" * 64,
+                "status-administrator-action",
+                effective_at,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO fifo_opening_balances VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                opening_balance_id,
+                epoch_id,
+                request.con_id,
+                request.symbol,
+                "LONG",
+                "5",
+                "100",
+                "100",
+                effective_at,
+                "9" * 64,
+                effective_at,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO fifo_lot_openings VALUES (
+                ?,?,NULL,?,0,?,?,?,'5','100',0,0,?
+            )
+            """,
+            (
+                "flot-" + ("a" * 32),
+                epoch_id,
+                opening_balance_id,
+                request.con_id,
+                request.symbol,
+                "LONG",
+                effective_at,
+            ),
+        )
+        fifo_projection = append_runtime_fill_in_transaction(
+            connection,
+            RuntimePaperFillEvidence(
+                execution_domain_scope=request.execution_domain_scope,
+                account_scope=request.account_scope,
+                portfolio_id=request.portfolio_id,
+                con_id=request.con_id,
+                symbol=request.symbol,
+                side=FillSide.SELL,
+                quantity=request.filled_quantity,
+                price=request.fill_price,
+                execution_id=request.fill_execution_id,
+                idempotency_key=request.fingerprint(),
+                commission_minor=request.fill_commission_minor,
+                commission_currency=request.fill_commission_currency,
+                commission_source=request.fill_commission_source,
+                occurred_at=request.outcome_at,
+            ),
+        )
         connection.execute(
             """
             INSERT INTO trades (
@@ -473,6 +648,24 @@ def _insert_exact_settlement(
                 request.expected_daily_pnl_date,
                 committed_at,
                 settlement_id,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO paper_fifo_settlement_links VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                settlement_id,
+                request.fingerprint(),
+                fifo_projection.epoch_id,
+                fifo_projection.fill_id,
+                fifo_projection.event_sequence,
+                request.fill_execution_id,
+                request.fill_commission_minor,
+                request.fill_commission_currency,
+                request.fill_commission_source,
+                fifo_projection.state_fingerprint,
+                committed_at,
             ),
         )
     return request
@@ -736,6 +929,8 @@ def test_status_rejects_nonmatching_local_settlement_receipt(tmp_path: Path) -> 
         "TAMPERED_ACCOUNT_SOURCE",
         "TAMPERED_LEGACY_ACCOUNT",
         "AMBIGUOUS_TRADE",
+        "TAMPERED_FIFO_LINK",
+        "MISSING_FIFO_LINK_SCHEMA",
         "MISSING_MARK_SCHEMA",
         "MISSING_ACCOUNT_BASELINE_SCHEMA",
         "OUTBOX_ONLY",
@@ -813,6 +1008,14 @@ def test_status_and_recovery_reject_partial_or_forged_atomic_projection(
                          slippage, commission, pnl, timestamp
                   FROM trades WHERE id = 7
                 """)
+        elif corruption == "TAMPERED_FIFO_LINK":
+            connection.execute("DROP TRIGGER paper_fifo_settlement_links_no_update")
+            connection.execute(
+                "UPDATE paper_fifo_settlement_links SET fifo_state_fingerprint = ?",
+                ("0" * 64,),
+            )
+        elif corruption == "MISSING_FIFO_LINK_SCHEMA":
+            connection.execute("DROP TABLE paper_fifo_settlement_links")
         elif corruption == "MISSING_MARK_SCHEMA":
             connection.execute(
                 "ALTER TABLE paper_position_settlement_state DROP COLUMN mark_price_text"
@@ -838,7 +1041,13 @@ def test_status_and_recovery_reject_partial_or_forged_atomic_projection(
     item = journal_script.paper_safety_status(environ)["unresolved_reservations"][0]
     expected_status = (
         "SCHEMA_MISSING"
-        if corruption in {"OUTBOX_ONLY", "MISSING_MARK_SCHEMA", "MISSING_ACCOUNT_BASELINE_SCHEMA"}
+        if corruption
+        in {
+            "OUTBOX_ONLY",
+            "MISSING_MARK_SCHEMA",
+            "MISSING_ACCOUNT_BASELINE_SCHEMA",
+            "MISSING_FIFO_LINK_SCHEMA",
+        }
         else "MISMATCH"
     )
     assert item["local_settlement_status"] == expected_status

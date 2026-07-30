@@ -14,7 +14,12 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Optional
 
-from .execution import ExecutionResult, Order, PaperExecutor
+from .execution import (
+    ExecutionResult,
+    LocalPaperExecutionEvidence,
+    Order,
+    PaperExecutor,
+)
 from .paper_execution_capability import (
     PaperReductionExecutionAuthority,
     _attach_gateway_reduction_submitter,
@@ -87,6 +92,7 @@ class LocalPaperTerminalOutcome:
     provenance: LocalPaperOutcomeProvenance
     terminal: bool
     message: str
+    fill_evidence: LocalPaperExecutionEvidence | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -139,6 +145,7 @@ class LocalPaperTerminalOutcome:
                 raise PaperReductionSubmissionError(
                     "FILLED outcome requires an exact positive price"
                 )
+            self._validate_fill_evidence()
         elif self.status in {
             LocalPaperOrderStatus.REJECTED,
             LocalPaperOrderStatus.CANCELLED,
@@ -153,6 +160,10 @@ class LocalPaperTerminalOutcome:
             ):
                 raise PaperReductionSubmissionError(
                     "unfilled terminal outcome must not carry a fill"
+                )
+            if self.fill_evidence is not None:
+                raise PaperReductionSubmissionError(
+                    "unfilled terminal outcome must not carry execution evidence"
                 )
         elif self.status is LocalPaperOrderStatus.PARTIALLY_FILLED:
             if self.terminal is not False:
@@ -171,6 +182,7 @@ class LocalPaperTerminalOutcome:
                 raise PaperReductionSubmissionError(
                     "PARTIALLY_FILLED outcome requires an exact positive price"
                 )
+            self._validate_fill_evidence()
         elif self.status in {
             LocalPaperOrderStatus.SUBMITTED,
             LocalPaperOrderStatus.UNKNOWN,
@@ -187,6 +199,25 @@ class LocalPaperTerminalOutcome:
                 raise PaperReductionSubmissionError(
                     "submitted or unknown outcome cannot claim a fill"
                 )
+            if self.fill_evidence is not None:
+                raise PaperReductionSubmissionError(
+                    "submitted or unknown outcome cannot carry execution evidence"
+                )
+
+    def _validate_fill_evidence(self) -> None:
+        evidence = self.fill_evidence
+        if type(evidence) is not LocalPaperExecutionEvidence:
+            raise PaperReductionSubmissionError(
+                "positive paper outcome requires producer-owned fill evidence"
+            )
+        if (
+            evidence.filled_quantity != self.filled_quantity
+            or evidence.exact_fill_price != self.exact_fill_price
+            or evidence.occurred_at != self.observed_at
+        ):
+            raise PaperReductionSubmissionError(
+                "paper fill evidence does not match the observed outcome"
+            )
 
     @property
     def ok(self) -> bool:
@@ -419,17 +450,37 @@ def _terminal_outcome(
             raise PaperReductionSubmissionError(
                 "successful execution result requires a matching exact Decimal fill"
             )
+        evidence = result.local_paper_evidence
+        if type(evidence) is not LocalPaperExecutionEvidence:
+            raise PaperReductionSubmissionError(
+                "successful execution result requires exact local-paper fill evidence"
+            )
+        if (
+            evidence.filled_quantity != descriptor.quantity
+            or evidence.exact_fill_price != exact_fill_price
+        ):
+            raise PaperReductionSubmissionError(
+                "local-paper fill evidence does not match the submitted allocation"
+            )
     elif result.fill_price is not None:
         raise PaperReductionSubmissionError("rejected execution result must not carry a fill price")
     elif result.exact_fill_price is not None:
         raise PaperReductionSubmissionError(
             "rejected execution result must not carry an exact fill"
         )
+    elif result.local_paper_evidence is not None:
+        raise PaperReductionSubmissionError(
+            "rejected execution result must not carry paper fill evidence"
+        )
 
     requested = descriptor.quantity
     if type(requested) is not Decimal or not requested.is_finite() or requested <= 0:
         raise PaperReductionSubmissionError("descriptor quantity is malformed after submission")
-    observed_at = datetime.now(timezone.utc)
+    observed_at = (
+        result.local_paper_evidence.occurred_at
+        if result.ok and result.local_paper_evidence is not None
+        else datetime.now(timezone.utc)
+    )
     if result.ok:
         return LocalPaperTerminalOutcome(
             order_ref=descriptor.order_ref,
@@ -442,6 +493,7 @@ def _terminal_outcome(
             provenance=LocalPaperOutcomeProvenance.LOCAL_PAPER_EXECUTOR,
             terminal=True,
             message=result.message,
+            fill_evidence=result.local_paper_evidence,
         )
     return LocalPaperTerminalOutcome(
         order_ref=descriptor.order_ref,

@@ -9,6 +9,7 @@ implementation integrity, never as isolation from hostile same-process code.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import math
 import threading
 import weakref
@@ -464,7 +465,12 @@ def _build_sealed_capability_runtime():
         if expected_fingerprint != fingerprint:
             raise PaperExecutionCapabilityError("paper fill capability order fingerprint changed")
 
-        from .execution import ExecutionResult, Order, PaperExecutor
+        from .execution import (
+            ExecutionResult,
+            LocalPaperExecutionEvidence,
+            Order,
+            PaperExecutor,
+        )
 
         if type(executor) is not PaperExecutor or type(order) is not Order:
             raise PaperExecutionCapabilityError(
@@ -520,8 +526,36 @@ def _build_sealed_capability_runtime():
             fill_decimal = Decimal(str(fill))
         if not math.isfinite(fill) or fill <= 0:
             return ExecutionResult(False, "Invalid paper execution fill")
+        occurred_at = dt.datetime.now(dt.timezone.utc)
+        if type(order.order_ref) is not str or not order.order_ref:
+            raise PaperExecutionCapabilityError(
+                "sealed paper execution requires a durable order reference"
+            )
+        execution_material = "\x1f".join(
+            (
+                order.order_ref,
+                order.symbol,
+                order.side,
+                str(order.quantity),
+            )
+        )
+        execution_id = (
+            "lpfill-" + hashlib.sha256(execution_material.encode("utf-8")).hexdigest()[:32]
+        )
+        evidence = LocalPaperExecutionEvidence(
+            execution_id=execution_id,
+            filled_quantity=Decimal(order.quantity),
+            exact_fill_price=fill_decimal,
+            # The current local-paper executor's explicit cost model has no
+            # commission.  Zero is producer evidence here, not a database
+            # default or a value inferred after execution.
+            commission_minor=0,
+            commission_currency="USD",
+            commission_source="LOCAL_PAPER_EXECUTOR_EXACT_COMMISSION_V1",
+            occurred_at=occurred_at,
+        )
         executor.fills[f"{order.symbol}-{len(executor.fills)+1}"] = (
-            dt.datetime.utcnow(),
+            occurred_at,
             order,
             fill,
         )
@@ -530,6 +564,7 @@ def _build_sealed_capability_runtime():
             "Paper fill",
             fill,
             exact_fill_price=fill_decimal,
+            local_paper_evidence=evidence,
         )
 
     def execute_sealed_paper_fill(executor, order, capability):
