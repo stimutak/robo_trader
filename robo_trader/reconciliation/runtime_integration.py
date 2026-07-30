@@ -9,6 +9,7 @@ or broker state and never grants order authority.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -31,7 +32,11 @@ from robo_trader.bootstrap_mark_producer import (
 )
 from robo_trader.config import RuntimeContract
 from robo_trader.database_migrations import assert_exact_state_schema
-from robo_trader.financial_state_bootstrap import load_exact_state_bootstrap_evidence
+from robo_trader.financial_state_bootstrap import (
+    ExactStateBootstrapCandidate,
+    load_exact_state_bootstrap_evidence,
+)
+from robo_trader.reconciliation_migrations import assert_reconciliation_schema
 from robo_trader.safety.sqlite_identity import SQLitePathBinding, lexical_path_preserving_leaf
 
 from .bootstrap_producer import produce_bootstrap_reconciliation
@@ -53,6 +58,18 @@ _CAPABILITY_DIRECTORY_ENV = "RT_RECONCILIATION_SIGNING_CAPABILITY_DIR"
 _EVIDENCE_ROOT_ENV = "RT_RECONCILIATION_EVIDENCE_ROOT"
 _STATUS_PATH_ENV = "RT_RECONCILIATION_STATUS_PATH"
 _STATUS_FILENAME = "reconciliation_runtime_status.json"
+_STATUS_FIELDS = {
+    "schema_version",
+    "owner_binding",
+    "state",
+    "trigger",
+    "completed_at",
+    "eligible_until",
+    "entry_eligible",
+    "quarantined",
+    "run_id",
+    "snapshot_id",
+}
 
 
 class RuntimeReconciliationIntegrationError(RuntimeError):
@@ -132,6 +149,22 @@ def _assert_status_path_is_unprotected(
         )
 
 
+def _status_owner_binding(runtime: RuntimeContract, status_path: Path) -> str:
+    payload = (
+        "robotrader-reconciliation-status-v1\0" + runtime.fingerprint + "\0" + str(status_path)
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _valid_status_owner_binding(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value == value.lower()
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 async def assert_runtime_bootstrap_ready(runtime_context: RuntimeSafetyContext) -> None:
     """Read-only proof that every portfolio has complete exact bootstrap lineage."""
 
@@ -149,12 +182,15 @@ async def assert_runtime_bootstrap_ready(runtime_context: RuntimeSafetyContext) 
         await connection.execute("PRAGMA query_only = ON")
         await connection.execute("PRAGMA foreign_keys = ON")
         await assert_exact_state_schema(connection)
+        await assert_reconciliation_schema(connection)
         binding.assert_path_identity()
 
         cursor = await connection.execute("""
             SELECT p.id, b.bootstrap_id, b.execution_domain_scope, b.account_scope,
                    b.database_path, b.database_identity, b.database_device,
-                   b.database_inode, a.origin_bootstrap_id
+                   b.database_inode, a.origin_bootstrap_id,
+                   b.candidate_payload_json, b.broker_snapshot_hash,
+                   b.reconciliation_report_hash
             FROM portfolios AS p
             LEFT JOIN paper_state_bootstraps AS b ON b.portfolio_id = p.id
             LEFT JOIN paper_account_settlement_state AS a ON a.portfolio_id = p.id
@@ -164,6 +200,8 @@ async def assert_runtime_bootstrap_ready(runtime_context: RuntimeSafetyContext) 
         if not portfolio_rows:
             raise RuntimeReconciliationIntegrationError("runtime portfolio state is unavailable")
         bootstrap_ids: dict[str, str] = {}
+        expected_receipts: dict[str, dict[str, list[str]]] = {}
+        expected_positions: set[tuple[str, str]] = set()
         for row in portfolio_rows:
             portfolio_id, bootstrap_id = row[0], row[1]
             if (
@@ -180,6 +218,32 @@ async def assert_runtime_bootstrap_ready(runtime_context: RuntimeSafetyContext) 
                     "exact bootstrap lineage is missing or mismatched"
                 )
             bootstrap_ids[portfolio_id] = bootstrap_id
+            try:
+                candidate_raw = json.loads(row[9])
+                candidate = ExactStateBootstrapCandidate.from_mapping(candidate_raw)
+            except Exception as exc:
+                raise RuntimeReconciliationIntegrationError(
+                    "exact bootstrap candidate is missing or malformed"
+                ) from exc
+            if (
+                candidate.bootstrap_id != bootstrap_id
+                or candidate.portfolio_id != portfolio_id
+                or candidate.database_path != contract.database_path
+                or candidate.database_identity != contract.database_identity
+            ):
+                raise RuntimeReconciliationIntegrationError(
+                    "exact bootstrap candidate lineage is mismatched"
+                )
+            expected_positions.update(
+                (portfolio_id, position.symbol) for position in candidate.positions
+            )
+            expected_receipts[bootstrap_id] = {
+                "broker_snapshot": [str(row[10])],
+                "reconciliation_report": [str(row[11])],
+                "protective_mark": [
+                    position.mark_evidence_fingerprint for position in candidate.positions
+                ],
+            }
 
         cursor = await connection.execute("""
             SELECT p.portfolio_id, p.symbol, s.cost_basis_text, s.mark_price_text,
@@ -191,6 +255,7 @@ async def assert_runtime_bootstrap_ready(runtime_context: RuntimeSafetyContext) 
             ORDER BY p.portfolio_id, p.symbol
             """)
         position_rows = await cursor.fetchall()
+        observed_positions: set[tuple[str, str]] = set()
         for row in position_rows:
             if (
                 row[0] not in bootstrap_ids
@@ -203,19 +268,48 @@ async def assert_runtime_bootstrap_ready(runtime_context: RuntimeSafetyContext) 
                 raise RuntimeReconciliationIntegrationError(
                     "exact position bootstrap state is missing or partial"
                 )
+            observed_positions.add((row[0], row[1]))
+        if observed_positions != expected_positions:
+            raise RuntimeReconciliationIntegrationError(
+                "exact position bootstrap coverage is missing or mismatched"
+            )
 
         cursor = await connection.execute("""
-            SELECT b.bootstrap_id,
-                   SUM(CASE WHEN c.artifact_kind = 'broker_snapshot' THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN c.artifact_kind = 'reconciliation_report' THEN 1 ELSE 0 END)
-            FROM paper_state_bootstraps AS b
-            LEFT JOIN exact_bootstrap_evidence_consumptions AS c
-              ON c.bootstrap_id = b.bootstrap_id
-            GROUP BY b.bootstrap_id
+            SELECT bootstrap_id, artifact_kind, artifact_sha256,
+                   runtime_fingerprint, account_scope
+            FROM exact_bootstrap_evidence_consumptions
+            ORDER BY bootstrap_id, artifact_kind, receipt_id
             """)
         receipt_rows = await cursor.fetchall()
-        if len(receipt_rows) != len(bootstrap_ids) or any(
-            row[1] != 1 or row[2] != 1 for row in receipt_rows
+        observed_receipts: dict[str, dict[str, list[str]]] = {
+            bootstrap_id: {
+                "broker_snapshot": [],
+                "reconciliation_report": [],
+                "protective_mark": [],
+            }
+            for bootstrap_id in bootstrap_ids.values()
+        }
+        for (
+            bootstrap_id,
+            artifact_kind,
+            artifact_hash,
+            runtime_fingerprint,
+            account_scope,
+        ) in receipt_rows:
+            if (
+                bootstrap_id not in observed_receipts
+                or artifact_kind not in observed_receipts[bootstrap_id]
+                or runtime_fingerprint != contract.fingerprint
+                or account_scope != contract.safety_account_scope
+            ):
+                raise RuntimeReconciliationIntegrationError(
+                    "exact bootstrap authentication receipt lineage is mismatched"
+                )
+            observed_receipts[bootstrap_id][artifact_kind].append(artifact_hash)
+        if any(
+            {kind: sorted(hashes) for kind, hashes in observed_receipts[bootstrap_id].items()}
+            != {kind: sorted(hashes) for kind, hashes in expected_receipts[bootstrap_id].items()}
+            for bootstrap_id in expected_receipts
         ):
             raise RuntimeReconciliationIntegrationError(
                 "exact bootstrap authentication receipts are incomplete"
@@ -376,9 +470,24 @@ class ProductionRuntimeEvidenceSource:
 class RuntimeReconciliationController:
     """Fail-closed service facade plus sanitized cross-process status."""
 
-    def __init__(self, service: ReconciliationService, *, status_path: Path) -> None:
+    def __init__(
+        self,
+        service: ReconciliationService,
+        *,
+        status_path: Path,
+        status_owner_binding: str | None = None,
+    ) -> None:
         self._service = service
         self._status_path = status_path
+        self._status_owner_binding = (
+            status_owner_binding
+            if status_owner_binding is not None
+            else hashlib.sha256(secrets.token_bytes(32)).hexdigest()
+        )
+        if not _valid_status_owner_binding(self._status_owner_binding):
+            raise RuntimeReconciliationIntegrationError(
+                "reconciliation status owner binding is malformed"
+            )
         self._status_available = True
 
     @property
@@ -425,6 +534,7 @@ class RuntimeReconciliationController:
     def _publish_outcome(self, outcome: ReconciliationServiceOutcome) -> None:
         payload = {
             "schema_version": 1,
+            "owner_binding": self._status_owner_binding,
             "state": outcome.state.value,
             "trigger": outcome.trigger.value,
             "completed_at": outcome.completed_at.isoformat(),
@@ -435,7 +545,11 @@ class RuntimeReconciliationController:
             "snapshot_id": outcome.persisted.snapshot_id,
         }
         try:
-            _write_status(self._status_path, payload)
+            _write_status(
+                self._status_path,
+                payload,
+                owner_binding=self._status_owner_binding,
+            )
         except Exception as exc:
             self._status_available = False
             raise RuntimeReconciliationIntegrationError(
@@ -447,6 +561,7 @@ class RuntimeReconciliationController:
         self._status_available = False
         payload = {
             "schema_version": 1,
+            "owner_binding": self._status_owner_binding,
             "state": state,
             "trigger": None,
             "completed_at": None,
@@ -457,12 +572,77 @@ class RuntimeReconciliationController:
             "snapshot_id": None,
         }
         try:
-            _write_status(self._status_path, payload)
+            _write_status(
+                self._status_path,
+                payload,
+                owner_binding=self._status_owner_binding,
+            )
         except Exception:
             pass
 
 
-def _write_status(path: Path, payload: dict[str, object]) -> None:
+def _read_owned_status_descriptor(descriptor: int, owner_binding: str) -> None:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size > 16 * 1024
+    ):
+        raise RuntimeReconciliationIntegrationError(
+            "existing reconciliation status artifact is not owner-bound"
+        )
+    encoded = os.read(descriptor, 16 * 1024 + 1)
+    if len(encoded) != metadata.st_size:
+        raise RuntimeReconciliationIntegrationError(
+            "existing reconciliation status artifact changed while inspected"
+        )
+    try:
+        prior = json.loads(encoded.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeReconciliationIntegrationError(
+            "existing reconciliation status artifact is malformed"
+        ) from exc
+    if (
+        type(prior) is not dict
+        or set(prior) != _STATUS_FIELDS
+        or prior.get("schema_version") != 1
+        or prior.get("owner_binding") != owner_binding
+        or not isinstance(prior.get("state"), str)
+        or not prior.get("state")
+        or (prior.get("trigger") is not None and not isinstance(prior.get("trigger"), str))
+        or type(prior.get("entry_eligible")) is not bool
+        or type(prior.get("quarantined")) is not bool
+        or prior.get("entry_eligible") is prior.get("quarantined")
+        or any(
+            value is not None and not isinstance(value, str)
+            for value in (
+                prior.get("completed_at"),
+                prior.get("eligible_until"),
+                prior.get("run_id"),
+                prior.get("snapshot_id"),
+            )
+        )
+    ):
+        raise RuntimeReconciliationIntegrationError(
+            "existing reconciliation status artifact belongs to another owner"
+        )
+
+
+def _write_status(
+    path: Path,
+    payload: dict[str, object],
+    *,
+    owner_binding: str | None = None,
+) -> None:
+    binding = owner_binding if owner_binding is not None else payload.get("owner_binding")
+    if not _valid_status_owner_binding(binding):
+        raise RuntimeReconciliationIntegrationError(
+            "reconciliation status owner binding is malformed"
+        )
+    if set(payload) != _STATUS_FIELDS or payload.get("owner_binding") != binding:
+        raise RuntimeReconciliationIntegrationError("reconciliation status payload is malformed")
     parent = path.parent
     parent_descriptor = os.open(
         parent,
@@ -478,7 +658,43 @@ def _write_status(path: Path, payload: dict[str, object]) -> None:
     temporary_name = f".{path.name}.stage-{secrets.token_hex(16)}"
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii")
     descriptor = -1
+    prior_descriptor = -1
+    prior_identity: tuple[int, int] | None = None
     try:
+        try:
+            prior_descriptor = os.open(
+                path.name,
+                os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_descriptor,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            _read_owned_status_descriptor(prior_descriptor, binding)
+            prior_metadata = os.fstat(prior_descriptor)
+            prior_identity = (prior_metadata.st_dev, prior_metadata.st_ino)
+            os.lseek(prior_descriptor, 0, os.SEEK_SET)
+            os.ftruncate(prior_descriptor, 0)
+            offset = 0
+            while offset < len(encoded):
+                written = os.write(prior_descriptor, encoded[offset:])
+                if written <= 0:
+                    raise RuntimeReconciliationIntegrationError(
+                        "reconciliation status write did not complete"
+                    )
+                offset += written
+            os.fsync(prior_descriptor)
+            current = os.stat(
+                path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (current.st_dev, current.st_ino) != prior_identity:
+                raise RuntimeReconciliationIntegrationError(
+                    "existing reconciliation status artifact changed during publication"
+                )
+            os.fsync(parent_descriptor)
+            return
         descriptor = os.open(
             temporary_name,
             os.O_WRONLY
@@ -500,16 +716,20 @@ def _write_status(path: Path, payload: dict[str, object]) -> None:
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = -1
-        os.replace(
+        os.link(
             temporary_name,
             path.name,
             src_dir_fd=parent_descriptor,
             dst_dir_fd=parent_descriptor,
+            follow_symlinks=False,
         )
+        os.unlink(temporary_name, dir_fd=parent_descriptor)
         os.fsync(parent_descriptor)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+        if prior_descriptor >= 0:
+            os.close(prior_descriptor)
         try:
             os.unlink(temporary_name, dir_fd=parent_descriptor)
         except FileNotFoundError:
@@ -547,20 +767,11 @@ def read_runtime_reconciliation_status(path: Path) -> dict[str, object]:
         if len(encoded) != metadata.st_size:
             return unavailable
         payload = json.loads(encoded.decode("ascii"))
-        allowed = {
-            "schema_version",
-            "state",
-            "trigger",
-            "completed_at",
-            "eligible_until",
-            "entry_eligible",
-            "quarantined",
-            "run_id",
-            "snapshot_id",
-        }
-        if type(payload) is not dict or set(payload) != allowed:
+        if type(payload) is not dict or set(payload) != _STATUS_FIELDS:
             return unavailable
-        if payload["schema_version"] != 1:
+        if payload["schema_version"] != 1 or not _valid_status_owner_binding(
+            payload["owner_binding"]
+        ):
             return unavailable
         entry_eligible = payload["entry_eligible"]
         quarantined = payload["quarantined"]
@@ -660,6 +871,7 @@ async def build_runtime_reconciliation_controller(
         controller = RuntimeReconciliationController(
             service,
             status_path=status_path,
+            status_owner_binding=_status_owner_binding(runtime, status_path),
         )
         return controller, provider
     except BaseException:

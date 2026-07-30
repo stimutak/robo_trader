@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,6 +24,8 @@ from robo_trader.reconciliation.runtime_integration import (
 )
 
 ACCOUNT_SCOPE = "acct_v1_0123456789abcdef0123456789abcdef" "fedcba9876543210fedcba9876543210"
+STATUS_OWNER_BINDING = "a" * 64
+BOOTSTRAP_ID = "pboot-" + "1" * 32
 
 
 def _runtime(database: Path) -> RuntimeContract:
@@ -236,6 +239,9 @@ async def test_controller_publishes_only_sanitized_status_and_age(tmp_path: Path
     assert "run-safe" not in str(status)
     assert "snapshot-safe" not in str(status)
 
+    await controller.reconcile_reconnect()
+    assert read_runtime_reconciliation_status(status_path)["state"] == "ready"
+
 
 @pytest.mark.asyncio
 async def test_status_publication_failure_blocks_entry_eligibility(tmp_path: Path) -> None:
@@ -282,6 +288,7 @@ def test_expired_or_malformed_persisted_eligibility_is_quarantined(
         status_path,
         {
             "schema_version": 1,
+            "owner_binding": STATUS_OWNER_BINDING,
             "state": "ready",
             "trigger": "startup",
             "completed_at": (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat(),
@@ -291,6 +298,7 @@ def test_expired_or_malformed_persisted_eligibility_is_quarantined(
             "run_id": "not-exposed",
             "snapshot_id": "not-exposed",
         },
+        owner_binding=STATUS_OWNER_BINDING,
     )
 
     status = read_runtime_reconciliation_status(status_path)
@@ -421,8 +429,50 @@ def _readiness_database(
     *,
     include_bootstrap: bool,
     include_reconciliation_receipt: bool = True,
+    include_position: bool = False,
 ) -> None:
     with sqlite3.connect(database) as connection:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        candidate = {
+            "schema_version": 1,
+            "bootstrap_id": BOOTSTRAP_ID,
+            "execution_domain_scope": runtime.safety_execution_domain_scope,
+            "account_scope": runtime.safety_account_scope,
+            "portfolio_id": "default",
+            "reconciliation_snapshot_id": "snapshot-1",
+            "reconciliation_report_hash": "b" * 64,
+            "broker_snapshot_hash": "c" * 64,
+            "legacy_snapshot_hash": "d" * 64,
+            "database_path": runtime.database_path,
+            "database_identity": runtime.database_identity,
+            "effective_at": now.isoformat(),
+            "broker_position_count": 0,
+            "broker_open_order_count": 0,
+            "account": {
+                "cash_text": "1000",
+                "realized_pnl_text": "0",
+                "daily_pnl_text": "0",
+                "daily_pnl_baseline_text": "0",
+                "daily_pnl_date": now.date().isoformat(),
+            },
+            "positions": (
+                [
+                    {
+                        "con_id": 265598,
+                        "symbol": "AAPL",
+                        "quantity": 1,
+                        "cost_basis_text": "100",
+                        "mark_price_text": "110",
+                        "mark_observed_at": now.isoformat(),
+                        "mark_evidence_fingerprint": "e" * 64,
+                    }
+                ]
+                if include_position
+                else []
+            ),
+        }
+        if include_position:
+            candidate["account"]["daily_pnl_text"] = "10"  # type: ignore[index]
         connection.executescript("""
             CREATE TABLE portfolios(id TEXT PRIMARY KEY);
             CREATE TABLE paper_state_bootstraps(
@@ -433,7 +483,10 @@ def _readiness_database(
                 database_path TEXT,
                 database_identity TEXT,
                 database_device INTEGER,
-                database_inode INTEGER
+                database_inode INTEGER,
+                candidate_payload_json TEXT,
+                broker_snapshot_hash TEXT,
+                reconciliation_report_hash TEXT
             );
             CREATE TABLE paper_account_settlement_state(
                 portfolio_id TEXT PRIMARY KEY,
@@ -452,17 +505,21 @@ def _readiness_database(
                 origin_bootstrap_id TEXT
             );
             CREATE TABLE exact_bootstrap_evidence_consumptions(
+                receipt_id TEXT,
                 bootstrap_id TEXT,
-                artifact_kind TEXT
+                artifact_kind TEXT,
+                artifact_sha256 TEXT,
+                runtime_fingerprint TEXT,
+                account_scope TEXT
             );
             INSERT INTO portfolios VALUES ('default');
             """)
         if include_bootstrap:
             metadata = database.stat()
             connection.execute(
-                "INSERT INTO paper_state_bootstraps VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO paper_state_bootstraps VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    "bootstrap-1",
+                    BOOTSTRAP_ID,
                     runtime.safety_execution_domain_scope,
                     runtime.safety_account_scope,
                     "default",
@@ -470,20 +527,58 @@ def _readiness_database(
                     runtime.database_identity,
                     metadata.st_dev,
                     metadata.st_ino,
+                    json.dumps(candidate, sort_keys=True, separators=(",", ":")),
+                    "c" * 64,
+                    "b" * 64,
                 ),
             )
             connection.execute(
                 "INSERT INTO paper_account_settlement_state VALUES (?,?)",
-                ("default", "bootstrap-1"),
+                ("default", BOOTSTRAP_ID),
             )
+            if include_position:
+                connection.execute(
+                    "INSERT INTO positions VALUES (?,?,?)",
+                    ("default", "AAPL", 1),
+                )
+                connection.execute(
+                    "INSERT INTO paper_position_settlement_state VALUES (?,?,?,?,?)",
+                    ("default", "AAPL", "100", "110", BOOTSTRAP_ID),
+                )
             connection.execute(
-                "INSERT INTO exact_bootstrap_evidence_consumptions VALUES (?,?)",
-                ("bootstrap-1", "broker_snapshot"),
+                "INSERT INTO exact_bootstrap_evidence_consumptions VALUES (?,?,?,?,?,?)",
+                (
+                    "receipt-broker",
+                    BOOTSTRAP_ID,
+                    "broker_snapshot",
+                    "c" * 64,
+                    runtime.fingerprint,
+                    runtime.safety_account_scope,
+                ),
             )
             if include_reconciliation_receipt:
                 connection.execute(
-                    "INSERT INTO exact_bootstrap_evidence_consumptions VALUES (?,?)",
-                    ("bootstrap-1", "reconciliation_report"),
+                    "INSERT INTO exact_bootstrap_evidence_consumptions VALUES (?,?,?,?,?,?)",
+                    (
+                        "receipt-reconciliation",
+                        BOOTSTRAP_ID,
+                        "reconciliation_report",
+                        "b" * 64,
+                        runtime.fingerprint,
+                        runtime.safety_account_scope,
+                    ),
+                )
+            if include_position:
+                connection.execute(
+                    "INSERT INTO exact_bootstrap_evidence_consumptions VALUES (?,?,?,?,?,?)",
+                    (
+                        "receipt-mark",
+                        BOOTSTRAP_ID,
+                        "protective_mark",
+                        "e" * 64,
+                        runtime.fingerprint,
+                        runtime.safety_account_scope,
+                    ),
                 )
 
 
@@ -519,6 +614,12 @@ async def test_bootstrap_and_receipt_readiness_is_fail_closed(
     )
     schema_assertion = AsyncMock()
     monkeypatch.setattr(integration, "assert_exact_state_schema", schema_assertion)
+    reconciliation_schema_assertion = AsyncMock()
+    monkeypatch.setattr(
+        integration,
+        "assert_reconciliation_schema",
+        reconciliation_schema_assertion,
+    )
 
     if should_pass:
         await assert_runtime_bootstrap_ready(context)
@@ -527,3 +628,170 @@ async def test_bootstrap_and_receipt_readiness_is_fail_closed(
             await assert_runtime_bootstrap_ready(context)
 
     schema_assertion.assert_awaited_once()
+    reconciliation_schema_assertion.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "receipt_mutation",
+    ["missing", "duplicate", "extra", "wrong-bootstrap"],
+)
+async def test_position_protective_receipts_require_exact_bootstrap_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    receipt_mutation: str,
+) -> None:
+    database = tmp_path / "ledger.db"
+    runtime = _runtime(database)
+    _readiness_database(
+        database,
+        runtime,
+        include_bootstrap=True,
+        include_position=True,
+    )
+    with sqlite3.connect(database) as connection:
+        if receipt_mutation == "missing":
+            connection.execute(
+                "DELETE FROM exact_bootstrap_evidence_consumptions "
+                "WHERE artifact_kind='protective_mark'"
+            )
+        elif receipt_mutation == "wrong-bootstrap":
+            connection.execute(
+                "UPDATE exact_bootstrap_evidence_consumptions SET bootstrap_id=? "
+                "WHERE artifact_kind='protective_mark'",
+                ("pboot-" + "2" * 32,),
+            )
+        else:
+            connection.execute(
+                "INSERT INTO exact_bootstrap_evidence_consumptions VALUES (?,?,?,?,?,?)",
+                (
+                    "receipt-mark-extra",
+                    BOOTSTRAP_ID,
+                    "protective_mark",
+                    "e" * 64 if receipt_mutation == "duplicate" else "f" * 64,
+                    runtime.fingerprint,
+                    runtime.safety_account_scope,
+                ),
+            )
+    context = SimpleNamespace(runtime_contract=runtime)
+    monkeypatch.setattr(
+        integration,
+        "assert_validated_runtime_safety_context",
+        lambda value: value,
+    )
+    monkeypatch.setattr(integration, "assert_exact_state_schema", AsyncMock())
+    monkeypatch.setattr(integration, "assert_reconciliation_schema", AsyncMock())
+
+    with pytest.raises(RuntimeReconciliationIntegrationError):
+        await assert_runtime_bootstrap_ready(context)
+
+
+@pytest.mark.asyncio
+async def test_position_protective_receipt_exact_coverage_is_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "ledger.db"
+    runtime = _runtime(database)
+    _readiness_database(
+        database,
+        runtime,
+        include_bootstrap=True,
+        include_position=True,
+    )
+    context = SimpleNamespace(runtime_contract=runtime)
+    monkeypatch.setattr(
+        integration,
+        "assert_validated_runtime_safety_context",
+        lambda value: value,
+    )
+    monkeypatch.setattr(integration, "assert_exact_state_schema", AsyncMock())
+    monkeypatch.setattr(integration, "assert_reconciliation_schema", AsyncMock())
+
+    await assert_runtime_bootstrap_ready(context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schema_state", ["absent", "partial"])
+async def test_runtime_schema_assertion_is_byte_preserving_and_precedes_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    schema_state: str,
+) -> None:
+    database = tmp_path / "ledger.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE portfolios(id TEXT PRIMARY KEY)")
+        if schema_state == "partial":
+            connection.execute("CREATE TABLE rt_schema_migrations(component TEXT, version INTEGER)")
+    before = database.read_bytes()
+    runtime = _runtime(database)
+    context = SimpleNamespace(runtime_contract=runtime)
+    capability_directory = tmp_path / "capabilities"
+    evidence_root = tmp_path / "evidence"
+    capability_directory.mkdir(mode=0o700)
+    evidence_root.mkdir(mode=0o700)
+    monkeypatch.setenv(
+        "RT_RECONCILIATION_SIGNING_CAPABILITY_DIR",
+        str(capability_directory),
+    )
+    monkeypatch.setenv("RT_RECONCILIATION_EVIDENCE_ROOT", str(evidence_root))
+    monkeypatch.setattr(
+        integration,
+        "assert_validated_runtime_safety_context",
+        lambda value: value,
+    )
+    monkeypatch.setattr(integration, "assert_exact_state_schema", AsyncMock())
+    provider = AsyncMock()
+    monkeypatch.setattr(integration, "build_diagnostic_provider", provider)
+
+    with pytest.raises(RuntimeReconciliationIntegrationError):
+        await build_runtime_reconciliation_controller(context)
+
+    assert database.read_bytes() == before
+    assert not Path(f"{database}-wal").exists()
+    assert not Path(f"{database}-shm").exists()
+    provider.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing_kind", ["unrelated", "other-owner"])
+async def test_status_publication_never_replaces_unrelated_existing_file(
+    tmp_path: Path,
+    existing_kind: str,
+) -> None:
+    status_path = tmp_path / "status.json"
+    if existing_kind == "unrelated":
+        status_path.write_bytes(b"irreplaceable unrelated state")
+    else:
+        other_payload = {
+            "schema_version": 1,
+            "owner_binding": "b" * 64,
+            "state": "quarantined",
+            "trigger": None,
+            "completed_at": None,
+            "eligible_until": None,
+            "entry_eligible": False,
+            "quarantined": True,
+            "run_id": None,
+            "snapshot_id": None,
+        }
+        status_path.write_text(
+            json.dumps(other_payload, sort_keys=True, separators=(",", ":")),
+            encoding="ascii",
+        )
+    status_path.chmod(0o600)
+    before = status_path.read_bytes()
+    controller = RuntimeReconciliationController(
+        _Service(_outcome(datetime.now(timezone.utc))),
+        status_path=status_path,
+        status_owner_binding=STATUS_OWNER_BINDING,
+    )
+
+    with pytest.raises(
+        RuntimeReconciliationIntegrationError,
+        match="status publication failed closed",
+    ):
+        await controller.reconcile_startup()
+
+    assert status_path.read_bytes() == before
+    assert controller.entry_eligible() is False

@@ -1805,7 +1805,7 @@ async def await_cleanup_required(cleanup: Awaitable[None]) -> bool:
 async def build_diagnostic_provider(
     runtime: RuntimeSafetyContext,
     *,
-    transport_factory=SubprocessIBKRClient,
+    transport_factory=None,
 ) -> IBKRDiagnosticSnapshotProvider:
     """Start a dedicated paper/read-only transport or fail closed and reap it."""
     connection = runtime.diagnostic_connection
@@ -1819,7 +1819,12 @@ async def build_diagnostic_provider(
         raise BrokerEvidenceError("diagnostic broker runtime fingerprint is unavailable")
     if type(account_scope) is not str or not account_scope:
         raise BrokerEvidenceError("diagnostic broker account scope is unavailable")
-    transport = transport_factory()
+    if transport_factory is None:
+        transport = SubprocessIBKRClient(
+            worker_runtime_environment=runtime_contract.environment,
+        )
+    else:
+        transport = transport_factory()
     try:
         await transport.start()
         connected = await transport.connect(

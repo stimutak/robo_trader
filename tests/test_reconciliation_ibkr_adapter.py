@@ -753,6 +753,7 @@ def _runtime():
         runtime_contract=SimpleNamespace(
             safety_account_scope=ACCOUNT_SCOPE,
             fingerprint=RUNTIME_FINGERPRINT,
+            environment="dev",
         ),
         diagnostic_connection=SimpleNamespace(
             host="127.0.0.1",
@@ -762,6 +763,41 @@ def _runtime():
         ),
         expected_account_for_provider=ACCOUNT,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_environment", ["dev", "test", "production"])
+async def test_default_diagnostic_transport_receives_validated_worker_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_environment: str,
+) -> None:
+    observed: list[object] = []
+    if runtime_environment == "production":
+        production_transport = SubprocessIBKRClient(worker_runtime_environment=runtime_environment)
+        assert production_transport._worker_synthetic_account_environment == ""
+
+    class _EnvironmentCapturingTransport:
+        def __init__(self, *, worker_runtime_environment: object = None) -> None:
+            observed.append(worker_runtime_environment)
+
+        async def start(self) -> None:
+            raise RuntimeError("stop after constructor proof")
+
+        async def stop(self) -> None:
+            return None
+
+    runtime = _runtime()
+    runtime.runtime_contract.environment = runtime_environment
+    monkeypatch.setattr(
+        adapter_module,
+        "SubprocessIBKRClient",
+        _EnvironmentCapturingTransport,
+    )
+
+    with pytest.raises(BrokerEvidenceError, match="initialization failed"):
+        await build_diagnostic_provider(runtime)
+
+    assert observed == [runtime_environment]
 
 
 @pytest.mark.asyncio
