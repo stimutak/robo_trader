@@ -300,14 +300,21 @@ class SQLiteMaintenanceService:
         progress_hook: ProgressHook | None = None,
         max_copy_seconds: float = 120.0,
         max_migration_seconds: float = 30.0,
+        max_migration_growth_bytes: int = 64 * 1024 * 1024,
     ) -> None:
         if not math.isfinite(max_copy_seconds) or not 1.0 <= max_copy_seconds <= 3600.0:
             raise ValueError("max_copy_seconds must be between 1 and 3600")
         if not math.isfinite(max_migration_seconds) or not 0.01 <= max_migration_seconds <= 3600.0:
             raise ValueError("max_migration_seconds must be between 0.01 and 3600")
+        if (
+            type(max_migration_growth_bytes) is not int
+            or not 1024 * 1024 <= max_migration_growth_bytes <= 1024 * 1024 * 1024
+        ):
+            raise ValueError("max_migration_growth_bytes must be between 1 MiB and 1 GiB")
         self._progress_hook = progress_hook
         self._max_copy_seconds = max_copy_seconds
         self._max_migration_seconds = max_migration_seconds
+        self._max_migration_growth_bytes = max_migration_growth_bytes
 
     def verify(
         self,
@@ -412,21 +419,39 @@ class SQLiteMaintenanceService:
         ) -> tuple[DatabaseEvidence, str, str | None]:
             outcome = "applied_to_synthetic_copy"
             error_code: str | None = None
+            page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+            page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
+            growth_pages = math.ceil(self._max_migration_growth_bytes / page_size)
+            maximum_page_count = page_count + growth_pages
+            configured_maximum = int(
+                connection.execute(f"PRAGMA max_page_count={maximum_page_count}").fetchone()[0]
+            )
+            if configured_maximum != maximum_page_count:
+                raise SQLiteMaintenanceError("synthetic migration growth limit is unavailable")
             connection.execute("BEGIN IMMEDIATE")
             connection.set_authorizer(_migration_authorizer)
             migration_started = time.monotonic()
 
+            def migration_deadline_exceeded() -> bool:
+                return time.monotonic() - migration_started > self._max_migration_seconds
+
             def enforce_migration_deadline() -> int:
-                return int(time.monotonic() - migration_started > self._max_migration_seconds)
+                return int(migration_deadline_exceeded())
 
             try:
                 connection.set_progress_handler(enforce_migration_deadline, 1000)
                 try:
                     for step in plan.steps:
                         connection.execute(step.sql, step.parameters)
+                        if migration_deadline_exceeded():
+                            raise SQLiteMaintenanceError("migration exceeded its deadline")
                     if plan.target_user_version is not None:
                         connection.execute(f"PRAGMA user_version={plan.target_user_version}")
+                    if migration_deadline_exceeded():
+                        raise SQLiteMaintenanceError("migration exceeded its deadline")
                     interim = _database_evidence(connection)
+                    if migration_deadline_exceeded():
+                        raise SQLiteMaintenanceError("migration exceeded its deadline")
                     if interim.integrity_check != "ok" or interim.foreign_key_violations:
                         raise SQLiteMaintenanceError("migration produced invalid SQLite state")
                 finally:
@@ -445,18 +470,30 @@ class SQLiteMaintenanceService:
             connection.set_authorizer(_post_migration_authorizer)
             return before, outcome, error_code
 
+        def capture_final_source_evidence(
+            _manifest: MaintenanceManifest,
+            migration_result: object | None,
+        ) -> tuple[DatabaseEvidence, str, str | None, DatabaseEvidence]:
+            if not isinstance(migration_result, tuple) or len(migration_result) != 3:
+                raise SQLiteMaintenanceError("migration result is unavailable")
+            before, outcome, error_code = migration_result
+            if not isinstance(before, DatabaseEvidence):
+                raise SQLiteMaintenanceError("migration evidence is unavailable")
+            source_after = self._live_source_evidence(source_path)
+            return before, outcome, error_code, source_after
+
         copy_manifest, migration_result = self._online_copy(
             source_path,
             synthetic_target_path,
             operation="backup",
             target_hook=apply_plan,
+            pre_publish_hook=capture_final_source_evidence,
         )
-        if not isinstance(migration_result, tuple) or len(migration_result) != 3:
+        if not isinstance(migration_result, tuple) or len(migration_result) != 4:
             raise SQLiteMaintenanceError("migration result is unavailable")
-        before, outcome, error_code = migration_result
+        before, outcome, error_code, source_after = migration_result
 
         after = copy_manifest.evidence
-        source_after = self._live_source_evidence(source_path)
         source_unchanged = before == source_after
         if not source_unchanged:
             outcome = "source_changed_fail_closed"
@@ -638,6 +675,7 @@ class SQLiteMaintenanceService:
         operation: str,
         expected_source_manifest: MaintenanceManifest | None = None,
         target_hook: Callable[[sqlite3.Connection, DatabaseEvidence], object] | None = None,
+        pre_publish_hook: Callable[[MaintenanceManifest, object | None], object] | None = None,
         manifest_reservation: _ManifestReservation | None = None,
     ) -> tuple[MaintenanceManifest, object | None]:
         source_candidate = _absolute_canonical_path(source_path)
@@ -728,6 +766,11 @@ class SQLiteMaintenanceService:
 
             source_connection.backup(target_connection, pages=64, progress=progress, sleep=0.001)
             target_connection.commit()
+            # SQLite's backup API may advance/reset the destination schema
+            # cookie as it replaces the in-memory destination. Preserve the
+            # bound source snapshot's cookie so evidence and the serialized
+            # artifact describe the same complete database state.
+            target_connection.execute(f"PRAGMA schema_version={source_evidence.schema_version}")
             source.assert_connection_identity(sqlite_connection_file_identity(source_connection))
             _assert_single_link(source)
             staged_target.assert_identity()
@@ -786,6 +829,8 @@ class SQLiteMaintenanceService:
                     else None
                 ),
             )
+            if pre_publish_hook is not None:
+                hook_result = pre_publish_hook(manifest, hook_result)
             if manifest_reservation is not None:
                 self.write_reserved_manifest(manifest, manifest_reservation)
             staged_target.publish()
@@ -948,6 +993,8 @@ def _validate_migration_plan(plan: MigrationPlan) -> None:
             or len(step.parameters) > 1024
         ):
             raise SQLiteMaintenanceError("migration plan contains an invalid step")
+        if re.search(r"\b(?:length|printf|substr)\b", step.sql, flags=re.IGNORECASE):
+            raise SQLiteMaintenanceError("migration plan calls a reserved SQLite function")
         for parameter in step.parameters:
             if type(parameter) not in (str, int, float, bytes, type(None)):
                 raise SQLiteMaintenanceError("migration step parameter type is unsupported")
@@ -973,22 +1020,26 @@ def _database_evidence(connection: sqlite3.Connection) -> DatabaseEvidence:
         raise SQLiteMaintenanceError("database contains foreign-key violations")
 
     schema_rows = connection.execute(
-        "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master "
-        "ORDER BY type,name,tbl_name,COALESCE(sql,'')"
+        "SELECT type,name,tbl_name,sql FROM sqlite_master " "ORDER BY type,name,tbl_name,sql"
     ).fetchall()
     schema_hash = _hash_rows(schema_rows)
-    table_names = [
+    all_table_names = [
         str(row[0])
         for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND (name NOT LIKE 'sqlite_%' OR name='sqlite_sequence' "
-            "OR name GLOB 'sqlite_stat*') "
-            "ORDER BY name"
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         ).fetchall()
+    ]
+    table_names = [
+        name
+        for name in all_table_names
+        if not name.startswith("sqlite_")
+        or name == "sqlite_sequence"
+        or name.startswith("sqlite_stat")
     ]
     tables = tuple(_table_evidence(connection, name) for name in table_names)
     application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    schema_version = int(connection.execute("PRAGMA schema_version").fetchone()[0])
     return DatabaseEvidence(
         schema_sha256=schema_hash,
         tables=tables,
@@ -997,6 +1048,7 @@ def _database_evidence(connection: sqlite3.Connection) -> DatabaseEvidence:
         foreign_key_violations=0,
         application_id=application_id,
         user_version=user_version,
+        schema_version=schema_version,
     )
 
 
@@ -1082,7 +1134,7 @@ def _migration_authorizer(
     arg1: str | None,
     arg2: str | None,
     _db: str | None,
-    _trigger: str | None,
+    trigger: str | None,
 ) -> int:
     denied = {
         sqlite3.SQLITE_ATTACH,
@@ -1101,18 +1153,31 @@ def _migration_authorizer(
         "table_xinfo",
         "user_version",
     }
-    native_code_functions = {"fts3_tokenizer", "load_extension"}
+    readonly_pragmas = {"schema_version"}
+    # SQLite's own ALTER TABLE implementation invokes these while rewriting
+    # sqlite_master. Plans are lexically barred from naming them, and calls
+    # reached through database triggers remain denied.
+    allowed_internal_functions = {"length", "printf", "substr"}
     function_name = arg2 if isinstance(arg2, str) else arg1
     if (
         action in denied
         or (
             action == sqlite3.SQLITE_PRAGMA
-            and (not isinstance(arg1, str) or arg1.lower() not in allowed_pragmas)
+            and (
+                not isinstance(arg1, str)
+                or (
+                    arg1.lower() not in allowed_pragmas
+                    and not (arg1.lower() in readonly_pragmas and arg2 is None)
+                )
+            )
         )
         or (
             action == sqlite3.SQLITE_FUNCTION
-            and isinstance(function_name, str)
-            and function_name.lower() in native_code_functions
+            and (
+                not isinstance(function_name, str)
+                or function_name.lower() not in allowed_internal_functions
+                or trigger is not None
+            )
         )
     ):
         return sqlite3.SQLITE_DENY

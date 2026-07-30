@@ -614,6 +614,7 @@ def test_restore_verifies_and_copies_through_one_bound_source_open(
     _create_multiportfolio_database(replacement).close()
     with sqlite3.connect(replacement) as connection:
         connection.execute("VACUUM")
+        connection.execute(f"PRAGMA schema_version={manifest.evidence.schema_version}")
     assert replacement.read_bytes() != backup.read_bytes()
     assert service.verify(replacement) == manifest.evidence
 
@@ -932,6 +933,55 @@ def test_migration_plan_deadline_interrupts_and_rolls_back(tmp_path: Path) -> No
     assert report.source_unchanged is True
 
 
+def test_migration_denies_native_function_that_can_evade_vm_deadline(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    _create_multiportfolio_database(source).close()
+
+    report = SQLiteMaintenanceService(max_migration_seconds=0.01).dry_run_migration(
+        source,
+        target,
+        plan=MigrationPlan(
+            migration_id="deny-native-allocation",
+            steps=(
+                MigrationStep("CREATE TABLE oversized_payload (value BLOB NOT NULL)"),
+                MigrationStep("INSERT INTO oversized_payload VALUES (randomblob(50000000))"),
+            ),
+        ),
+    )
+
+    assert report.outcome == "rolled_back"
+    assert report.error_code == "migration_plan_failed"
+    assert report.before == report.after
+    assert report.source_unchanged is True
+    assert target.stat().st_size < 50_000_000
+
+
+def test_migration_growth_is_capped_by_synthetic_database_page_limit(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    _create_multiportfolio_database(source).close()
+    payload = b"x" * 700_000
+
+    report = SQLiteMaintenanceService(max_migration_growth_bytes=1024 * 1024).dry_run_migration(
+        source,
+        target,
+        plan=MigrationPlan(
+            migration_id="bounded-synthetic-growth",
+            steps=(
+                MigrationStep("CREATE TABLE bounded_payload (value BLOB NOT NULL)"),
+                MigrationStep("INSERT INTO bounded_payload VALUES (?)", (payload,)),
+                MigrationStep("INSERT INTO bounded_payload VALUES (?)", (payload,)),
+            ),
+        ),
+    )
+
+    assert report.outcome == "rolled_back"
+    assert report.error_code == "migration_plan_failed"
+    assert report.before == report.after
+    assert report.source_unchanged is True
+
+
 def test_migration_authorizer_denies_native_pointer_and_virtual_table_actions(
     tmp_path: Path,
 ) -> None:
@@ -943,6 +993,9 @@ def test_migration_authorizer_denies_native_pointer_and_virtual_table_actions(
     assert (
         authorizer(sqlite3.SQLITE_FUNCTION, None, "load_extension", None, None)
         == sqlite3.SQLITE_DENY
+    )
+    assert (
+        authorizer(sqlite3.SQLITE_FUNCTION, None, "randomblob", None, None) == sqlite3.SQLITE_DENY
     )
     assert (
         authorizer(sqlite3.SQLITE_CREATE_VTABLE, "docs", "fts3", "main", None)
@@ -1005,6 +1058,56 @@ def test_migration_plan_cannot_change_untracked_schema_cookie(tmp_path: Path) ->
     assert report.source_unchanged is True
     with sqlite3.connect(target) as connection:
         assert connection.execute("PRAGMA schema_version").fetchone() != (999,)
+
+
+def test_migration_evidence_tracks_schema_cookie_after_transient_ddl(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    _create_multiportfolio_database(source).close()
+
+    report = SQLiteMaintenanceService().dry_run_migration(
+        source,
+        target,
+        plan=MigrationPlan(
+            migration_id="transient-ddl-schema-cookie",
+            steps=(
+                MigrationStep("CREATE TABLE transient_table (id INTEGER PRIMARY KEY)"),
+                MigrationStep("DROP TABLE transient_table"),
+            ),
+        ),
+    )
+
+    assert report.outcome == "applied_to_synthetic_copy"
+    assert report.before.schema_sha256 == report.after.schema_sha256
+    assert report.after.schema_version > report.before.schema_version
+    assert report.before != report.after
+
+
+def test_final_source_evidence_failure_prevents_synthetic_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    _create_multiportfolio_database(source).close()
+    service = SQLiteMaintenanceService()
+
+    def fail_final_evidence(_source_path: Path | str):
+        raise SQLiteMaintenanceError("injected final evidence failure")
+
+    monkeypatch.setattr(service, "_live_source_evidence", fail_final_evidence)
+
+    with pytest.raises(SQLiteMaintenanceError, match="final evidence failure"):
+        service.dry_run_migration(
+            source,
+            target,
+            plan=MigrationPlan(
+                migration_id="final-evidence-failure",
+                steps=(MigrationStep("ALTER TABLE positions ADD COLUMN note TEXT"),),
+            ),
+        )
+
+    assert not target.exists()
+    assert list(tmp_path.glob(f".{target.name}.robo-trader-stage-*")) == []
 
 
 def test_migration_uses_the_copy_connection_without_a_writable_reopen(

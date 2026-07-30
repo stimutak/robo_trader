@@ -112,10 +112,13 @@ service-owned transaction on the same in-memory connection used to create and
 verify the copy; there is no writable reopen gap or filesystem SQLite target.
 Plan-supplied
 transaction control, `ATTACH`, and `DETACH` are denied. Success and rollback
-reports include before/after schema, row counts, content hashes, integrity
-state, and a source-unchanged result. Final report evidence and the artifact
-digest come directly from the descriptor-bound manifest captured before atomic
-publication; the report never reopens the published target.
+reports include before/after schema, SQLite schema cookie, row counts, content
+hashes, integrity state, and a source-unchanged result. SQLite's backup API can
+reset the destination schema cookie, so the service copies the bound source
+snapshot's cookie into the in-memory target before migration and evidence
+capture. Final report evidence and the artifact digest come directly from the
+descriptor-bound manifest captured before atomic publication; the report never
+reopens the published target.
 
 Table evidence includes an exposed SQLite rowid where one exists and persistent
 `sqlite_stat*` planner-statistics tables. Delete/reinsert changes that preserve
@@ -124,16 +127,30 @@ before/after or source-unchanged comparison.
 
 Migration authorization permits only the read/evidence PRAGMAs the service
 requires plus the evidence-tracked `application_id` and `user_version` values.
-All other PRAGMAs, including `schema_version`, path, journaling, checkpoint,
-schema-trust, and process-global allocator controls, are denied. Native-pointer
-functions (`fts3_tokenizer` and `load_extension`), virtual-table DDL, savepoints,
-and caller-controlled transaction operations are also denied before execution.
+`schema_version` is readable for evidence but caller writes are denied. All
+other PRAGMAs, including path, journaling, checkpoint, schema-trust, and
+process-global allocator controls, are denied. Plan-invoked SQL functions,
+including `randomblob`, `fts3_tokenizer`, and `load_extension`, virtual-table
+DDL, savepoints, and caller-controlled transaction operations are also denied
+before execution. SQLite's internal `length`, `printf`, and `substr` calls are
+permitted only so its own `ALTER TABLE` implementation can rewrite the schema;
+plans are rejected if they name those reserved functions, and trigger/view
+calls remain denied.
 Parameter binding failures, including integers outside SQLite's signed 64-bit
 range, roll back and produce the same secret-free `migration_plan_failed`
 report as SQL execution failures.
 Migration execution also has a SQLite progress-handler deadline (30 seconds by
-default, configurable on the service); exceeding it interrupts the statement,
-rolls back the service-owned transaction, and returns `migration_plan_failed`.
+default, configurable on the service), checked again after each statement and
+before commit. Statements that exceed the deadline roll back even if a native
+SQLite operation returns without invoking the VM progress handler. The
+synthetic database can grow by at most 64 MiB by default (configurable from
+1 MiB to 1 GiB) through SQLite's per-database page limit. Exceeding either bound
+returns `migration_plan_failed`.
+
+The final bound live-source evidence check runs after the synthetic bytes and
+manifest have been verified but before the anonymous target is published. If
+that evidence capture fails, publication does not occur and closing the
+anonymous descriptor leaves no target artifact.
 
 Active WAL sources are supported. Initial and final source evidence is captured
 from bound SQLite read snapshots rather than by requiring a companion-free main

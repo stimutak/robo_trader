@@ -32,23 +32,25 @@ Focused maintenance, legacy migration, and database-isolation matrix:
 ```text
 python3 -m pytest tests/maintenance/test_sqlite_service.py \
   tests/test_multiuser.py tests/security/test_db_isolation.py -q --tb=short
-224 passed
+228 passed
 ```
 
-The PR 4D maintenance module has 57 direct tests covering active WAL state,
+The PR 4D maintenance module has 61 direct tests covering active WAL state,
 multiportfolio preservation, backup/restore manifests, clean-room equivalence,
 corruption, preexisting targets, symlinks, hardlinks, companion files,
 substitution races, backup/restore interruption, migration rollback,
 declarative-plan containment, hidden-rowid source-change detection,
 planner-statistics evidence, bounded migration execution, `WITHOUT ROWID` and
 shadowed-rowid compatibility, native-pointer and virtual-table denial,
-schema-cookie protection, CLI output, and legacy quarantine.
+schema-cookie protection and tracking, native-function denial, bounded
+synthetic database growth, pre-publication final-evidence failure, CLI output,
+and legacy quarantine.
 
 Final full repository regression:
 
 ```text
 python3 -m pytest tests/ -q --tb=short
-3102 passed, 5 skipped, 20 known warnings in 79.38s
+3106 passed, 5 skipped, 20 known warnings in 178.63s
 ```
 
 After PR 4C merged to `main`, that exact head was merge-integrated into this
@@ -153,6 +155,17 @@ claiming isolation that an in-process filesystem library cannot provide:
 - Migration plans cannot change SQLite's process-global hard or soft heap
   limits. Oversized integer binding failures are converted into the same
   rollback-only, secret-free failure report as rejected SQL.
+- Database evidence includes SQLite's schema cookie, so transient create/drop
+  sequences cannot hide a schema-generation change behind identical final DDL.
+  The bound source cookie is preserved across SQLite's in-memory backup reset.
+- Plan-invoked SQL functions are denied, including native functions that can
+  allocate or execute without reaching the VM progress callback. SQLite's
+  internal ALTER TABLE helper calls are reserved from plan SQL. The deadline is
+  rechecked after each statement, and a per-database page ceiling limits
+  synthetic growth to 64 MiB by default.
+- Final live-source evidence is captured after the descriptor-bound synthetic
+  artifact is verified but before publication. A failed final evidence read
+  closes the still-anonymous artifact and leaves no target path.
 - Every CLI report path is checked against the full main/`-wal`/`-shm`/
   `-journal` family of each source, backup, and target database. Backup and
   restore manifest paths are exclusively reserved, fully written, fsynced,
@@ -165,8 +178,8 @@ claiming isolation that an in-process filesystem library cannot provide:
 Current verification:
 
 ```text
-focused maintenance + multiuser + DB isolation: 224 passed
-full repository: 3102 passed, 5 skipped, 20 known warnings
+focused maintenance + multiuser + DB isolation: 228 passed
+full repository: 3106 passed, 5 skipped, 20 known warnings
 PR 4C settlement integration file: 30 passed
 Python 3.10 direct authorizer commit/rollback probe: passed
 Black, isort, flake8, Bandit, mypy, and git diff checks on changed scope: passed

@@ -26,6 +26,7 @@ class DatabaseEvidence:
     foreign_key_violations: int
     application_id: int
     user_version: int
+    schema_version: int
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -42,6 +43,7 @@ class DatabaseEvidence:
                 "foreign_key_violations",
                 "application_id",
                 "user_version",
+                "schema_version",
             },
             "database evidence",
         )
@@ -71,6 +73,7 @@ class DatabaseEvidence:
             foreign_key_violations=_required_int(value, "foreign_key_violations"),
             application_id=_required_int(value, "application_id"),
             user_version=_required_int(value, "user_version"),
+            schema_version=_required_int(value, "schema_version"),
         )
 
 
