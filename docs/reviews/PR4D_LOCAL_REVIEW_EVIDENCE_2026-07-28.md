@@ -108,9 +108,16 @@ claiming isolation that an in-process filesystem library cannot provide:
   that guarantee impossible for an in-process library. The reviewed operating
   boundary now requires an exclusive maintenance window; stronger adversarial
   isolation requires a dedicated OS identity, container, or sandbox.
-- A cleanly closed database that retains `journal_mode=WAL` but has no sidecars
-  is opened immutably. The service therefore does not create `-wal`/`-shm`
-  companions and then reject its own identity check.
+- A cleanly closed database that retains `journal_mode=WAL` is opened with
+  normal SQLite locking. Safe companions created while establishing the bound
+  connection are adopted and monitored, preventing both self-rejection and the
+  torn snapshots caused by incorrectly inferring immutability from absent
+  sidecars. Only manifest-verified sealed restore input uses immutable mode.
+- The exact descriptor bytes are read back and deserialized before publication.
+  Their integrity, foreign-key, schema, row-count, and table-hash evidence must
+  match the in-memory copy, and the manifest digest must match the same byte
+  snapshot. A valid alternate database injected through a retained writable
+  descriptor therefore fails before publication.
 - Publication fsyncs the bound parent-directory descriptor and revalidates both
   the lexical parent and published target afterward. Parent replacement causes
   a failed operation rather than a false successful manifest.
@@ -138,8 +145,8 @@ claiming isolation that an in-process filesystem library cannot provide:
 Current verification:
 
 ```text
-focused maintenance + multiuser + DB isolation: 203 passed
-full repository: 3055 passed, 5 skipped, 20 known warnings
+focused maintenance + multiuser + DB isolation: 205 passed
+full repository: 3057 passed, 5 skipped, 20 known warnings
 Python 3.10 direct authorizer commit/rollback probe: passed
 Black, isort, flake8, Bandit, mypy, and git diff checks on changed scope: passed
 ```

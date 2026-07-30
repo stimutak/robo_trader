@@ -120,7 +120,7 @@ def test_wal_checkpoint_during_online_backup_is_not_treated_as_source_mutation(
     assert SQLiteMaintenanceService().verify(target) == manifest.evidence
 
 
-def test_cleanly_closed_wal_source_does_not_create_service_sidecars(
+def test_cleanly_closed_wal_source_accounts_for_connection_sidecars(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source.db"
@@ -145,7 +145,102 @@ def test_cleanly_closed_wal_source_does_not_create_service_sidecars(
     assert service.verify(backup) == manifest.evidence
     assert report.source_unchanged is True
     assert report.outcome == "applied_to_synthetic_copy"
-    assert not any(path.exists() for path in companions)
+    for companion in companions:
+        if companion.exists():
+            metadata = companion.lstat()
+            assert stat.S_ISREG(metadata.st_mode)
+            assert metadata.st_nlink == 1
+
+
+def test_companion_free_wal_backup_is_one_atomic_committed_state(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    writer = _create_multiportfolio_database(source, wal=True)
+    writer.execute("CREATE TABLE atomic_rows (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
+    writer.executemany(
+        "INSERT INTO atomic_rows(id, value) VALUES (?, 0)",
+        ((row_id,) for row_id in range(30_000)),
+    )
+    writer.commit()
+    writer.close()
+    assert not source.with_name(source.name + "-wal").exists()
+    update_committed = False
+
+    def commit_atomic_update(_operation: str, _remaining: int, _total: int) -> None:
+        nonlocal update_committed
+        if update_committed:
+            return
+        concurrent = sqlite3.connect(source, timeout=10.0)
+        try:
+            concurrent.execute("BEGIN IMMEDIATE")
+            concurrent.execute("UPDATE atomic_rows SET value = 1")
+            concurrent.commit()
+            concurrent.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+            update_committed = True
+        finally:
+            concurrent.close()
+
+    manifest = SQLiteMaintenanceService(progress_hook=commit_atomic_update).backup(source, backup)
+
+    assert update_committed
+    with sqlite3.connect(backup) as connection:
+        committed_states = connection.execute(
+            "SELECT value, COUNT(*) FROM atomic_rows GROUP BY value ORDER BY value"
+        ).fetchall()
+    assert committed_states in ([(0, 30_000)], [(1, 30_000)])
+    assert SQLiteMaintenanceService().verify(backup) == manifest.evidence
+
+
+def test_descriptor_byte_corruption_fails_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "backup.db"
+    alternate = tmp_path / "alternate.db"
+    _create_multiportfolio_database(source).close()
+    alternate_connection = _create_multiportfolio_database(alternate)
+    alternate_connection.execute(
+        "UPDATE positions SET quantity = 999 WHERE portfolio_id = 'alpha' AND symbol = 'AAPL'"
+    )
+    alternate_connection.commit()
+    alternate_connection.close()
+    alternate_image = alternate.read_bytes()
+    retained_descriptor: int | None = None
+    service = SQLiteMaintenanceService()
+    real_stage = service._stage_target
+    real_seal = sqlite_service_module._StagedTarget.seal_readonly
+
+    def capture_stage(requested_path):
+        nonlocal retained_descriptor
+        staged = real_stage(requested_path)
+        retained_descriptor = os.dup(staged.guardian_file_descriptor)
+        return staged
+
+    def corrupt_after_seal(staged) -> None:
+        real_seal(staged)
+        assert retained_descriptor is not None
+        os.ftruncate(retained_descriptor, len(alternate_image))
+        os.pwrite(retained_descriptor, alternate_image, 0)
+
+    monkeypatch.setattr(service, "_stage_target", capture_stage)
+    monkeypatch.setattr(
+        sqlite_service_module._StagedTarget,
+        "seal_readonly",
+        corrupt_after_seal,
+    )
+    try:
+        with pytest.raises(
+            SQLiteMaintenanceError,
+            match="descriptor-bound artifact evidence differs",
+        ):
+            service.backup(source, target)
+    finally:
+        if retained_descriptor is not None:
+            os.close(retained_descriptor)
+
+    assert not target.exists()
 
 
 def test_manifest_is_secret_free_portable_and_exclusively_written(tmp_path: Path) -> None:

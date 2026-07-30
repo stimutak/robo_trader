@@ -34,6 +34,7 @@ from robo_trader.safety.sqlite_identity import (
     SQLiteIdentityError,
     SQLitePathBinding,
     lexical_path_preserving_leaf,
+    sqlite_connection_deserialize,
     sqlite_connection_file_identity,
     sqlite_connection_serialize,
 )
@@ -89,6 +90,14 @@ class _StagedTarget:
     def digest(self) -> tuple[str, int]:
         self.assert_identity()
         result = _descriptor_digest(self.guardian_file_descriptor)
+        self.assert_identity()
+        return result
+
+    def read_database_image(self) -> bytes:
+        """Read one stable snapshot of the descriptor-bound staged bytes."""
+
+        self.assert_identity()
+        result = _descriptor_payload(self.guardian_file_descriptor)
         self.assert_identity()
         return result
 
@@ -386,21 +395,17 @@ class SQLiteMaintenanceService:
         """Capture logical evidence from a bound read snapshot, including WAL state."""
 
         source_candidate = _absolute_canonical_path(source_path)
-        companions = _safe_companion_identities(source_candidate)
+        initial_companions = _safe_companion_identities(source_candidate)
         source = self._open_source(source_candidate)
         connection: sqlite3.Connection | None = None
         try:
             connection, source = self._connect_bound(
                 source,
                 readonly=True,
-                # A cleanly closed WAL database has no companions, but a
-                # conventional read-only open may create its own -wal/-shm
-                # files.  Immutable mode is safe only in the companion-free
-                # case and keeps the identity set stable while we inspect it.
-                immutable_readonly=not companions,
             )
             connection.execute("BEGIN")
             evidence = _database_evidence(connection)
+            companions = _adopt_connection_companions(source.path, initial_companions)
             source.assert_connection_identity(sqlite_connection_file_identity(connection))
             _assert_single_link(source)
             _assert_companion_identities(source.path, companions)
@@ -500,20 +505,28 @@ class SQLiteMaintenanceService:
         target_candidate = _absolute_canonical_path(target_path)
         if _sqlite_resource_family(source_candidate) & _sqlite_resource_family(target_candidate):
             raise SQLiteMaintenanceError("source and target SQLite resource families overlap")
-        source_companions = _safe_companion_identities(source_candidate)
+        initial_source_companions = _safe_companion_identities(source_candidate)
+        if expected_source_manifest is not None and initial_source_companions:
+            raise SQLiteMaintenanceError(
+                "manifest restore requires a sealed database without SQLite companions"
+            )
         source = self._open_source(source_candidate)
         source_connection: sqlite3.Connection | None = None
         try:
             source_connection, source = self._connect_bound(
                 source,
                 readonly=True,
-                # Manifest restore inputs are sealed standalone artifacts.
-                # A companion-free WAL database is likewise checkpointed and
-                # can be opened immutably, avoiding service-created sidecars.
-                immutable_readonly=(expected_source_manifest is not None or not source_companions),
+                # Only a manifest-verified standalone artifact is immutable.
+                # Ordinary sources need SQLite locking even when a cleanly
+                # closed WAL database initially has no companion files.
+                immutable_readonly=expected_source_manifest is not None,
             )
             source_connection.execute("BEGIN")
             source_evidence = _database_evidence(source_connection)
+            source_companions = _adopt_connection_companions(
+                source.path,
+                initial_source_companions,
+            )
             source_artifact_sha256: str | None = None
             source_artifact_size: int | None = None
             if expected_source_manifest is not None:
@@ -595,13 +608,26 @@ class SQLiteMaintenanceService:
                 hook_result = target_hook(target_connection, evidence)
                 staged_target.assert_identity()
                 evidence = _database_evidence(target_connection)
-            database_image = sqlite_connection_serialize(target_connection)
+            database_image = _standalone_database_image(
+                sqlite_connection_serialize(target_connection)
+            )
             target_connection.close()
             target_connection = None
             staged_target.write_database_image(database_image)
             staged_target.seal_readonly()
             os.fsync(staged_target.parent_file_descriptor)
+            artifact_image = staged_target.read_database_image()
+            artifact_evidence = _database_image_evidence(artifact_image)
+            if artifact_evidence != evidence:
+                raise SQLiteMaintenanceError(
+                    "descriptor-bound artifact evidence differs from copied database"
+                )
+            expected_artifact_sha256 = hashlib.sha256(artifact_image).hexdigest()
             artifact_sha256, artifact_size = staged_target.digest()
+            if artifact_sha256 != expected_artifact_sha256 or artifact_size != len(artifact_image):
+                raise SQLiteMaintenanceError(
+                    "descriptor-bound artifact changed during verification"
+                )
             manifest = MaintenanceManifest(
                 manifest_version=1,
                 operation=operation,
@@ -1103,6 +1129,18 @@ def _assert_companion_identities(
         raise SQLiteMaintenanceError("SQLite companion identity changed during operation")
 
 
+def _adopt_connection_companions(
+    path: Path,
+    initial: Mapping[str, tuple[int, int]],
+) -> dict[str, tuple[int, int]]:
+    """Adopt safe companions created by a normal bound SQLite connection."""
+
+    current = _safe_companion_identities(path)
+    if any(current.get(suffix) != identity for suffix, identity in initial.items()):
+        raise SQLiteMaintenanceError("SQLite companion identity changed during connection open")
+    return current
+
+
 def _descriptor_digest(descriptor: int) -> tuple[str, int]:
     metadata = os.fstat(descriptor)
     digest = hashlib.sha256()
@@ -1118,6 +1156,55 @@ def _descriptor_digest(descriptor: int) -> tuple[str, int]:
     if any(getattr(metadata, field) != getattr(after, field) for field in stable):
         raise SQLiteMaintenanceError("database changed while hashing")
     return digest.hexdigest(), metadata.st_size
+
+
+def _descriptor_payload(descriptor: int) -> bytes:
+    metadata = os.fstat(descriptor)
+    chunks: list[bytes] = []
+    offset = 0
+    while offset < metadata.st_size:
+        chunk = os.pread(descriptor, min(128 * 1024, metadata.st_size - offset), offset)
+        if not chunk:
+            raise SQLiteMaintenanceError("database ended while reading")
+        chunks.append(chunk)
+        offset += len(chunk)
+    after = os.fstat(descriptor)
+    stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(metadata, field) != getattr(after, field) for field in stable):
+        raise SQLiteMaintenanceError("database changed while reading")
+    return b"".join(chunks)
+
+
+def _database_image_evidence(payload: bytes) -> DatabaseEvidence:
+    connection = sqlite3.connect(":memory:", timeout=10.0)
+    retained_buffer: object | None = None
+    try:
+        retained_buffer = sqlite_connection_deserialize(connection, payload)
+        evidence = _database_evidence(connection)
+        if evidence.integrity_check != "ok" or evidence.foreign_key_violations:
+            raise SQLiteMaintenanceError("descriptor-bound artifact is invalid")
+        return evidence
+    finally:
+        # Keep the ctypes allocation alive until SQLite has finished reading it.
+        _ = retained_buffer
+        connection.close()
+
+
+def _standalone_database_image(payload: bytes) -> bytes:
+    """Convert a serialized WAL-header snapshot into a standalone DB image."""
+
+    if len(payload) < 100 or payload[:16] != b"SQLite format 3\x00":
+        raise SQLiteMaintenanceError("serialized database has an invalid SQLite header")
+    if payload[18] not in (1, 2) or payload[19] not in (1, 2):
+        raise SQLiteMaintenanceError("serialized database has invalid journal header bytes")
+    standalone = bytearray(payload)
+    # Bytes 18 and 19 are the SQLite file-format read/write versions. A value
+    # of 2 requests WAL and therefore a sidecar namespace; the serialized image
+    # already contains the complete committed snapshot, so publish it in the
+    # standalone rollback-journal format instead.
+    standalone[18] = 1
+    standalone[19] = 1
+    return bytes(standalone)
 
 
 def _fsync_directory(path: Path) -> None:

@@ -14,13 +14,14 @@ import sys
 import sysconfig
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import _sqlite3
 
 _SQLITE_FCNTL_FILE_POINTER = 7
 _SQLITE_FCNTL_VFS_POINTER = 27
 _SQLITE_OK = 0
+_SQLITE_DESERIALIZE_READONLY = 4
 _SQLITE_C_API = None
 _SQLITE_UNIX_VFS_NAMES = frozenset(
     {
@@ -165,6 +166,53 @@ def sqlite_connection_serialize(connection: sqlite3.Connection) -> bytes:
         return ctypes.string_at(serialized, size.value)
     finally:
         sqlite_free(serialized)
+
+
+def sqlite_connection_deserialize(
+    connection: sqlite3.Connection,
+    payload: bytes,
+) -> Any:
+    """Install ``payload`` as an in-memory main database and retain its buffer.
+
+    The returned ctypes buffer must remain alive until the connection is
+    closed.  Keeping ownership in Python avoids version-sensitive ownership
+    behavior in ``SQLITE_DESERIALIZE_FREEONCLOSE`` and supports CPython 3.10,
+    whose sqlite3 module does not expose ``Connection.deserialize``.
+    """
+
+    if type(connection) is not sqlite3.Connection:
+        raise SQLiteIdentityError("connection must be an exact sqlite3.Connection")
+    if not isinstance(payload, bytes) or not payload:
+        raise SQLiteIdentityError("database image must be non-empty bytes")
+    api = _sqlite_c_api()
+    try:
+        deserialize = api.sqlite3_deserialize
+    except AttributeError as exc:
+        raise SQLiteIdentityError("active SQLite library cannot deserialize databases") from exc
+    deserialize.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.c_longlong,
+        ctypes.c_longlong,
+        ctypes.c_uint,
+    )
+    deserialize.restype = ctypes.c_int
+    pointer = _CPythonSQLiteConnectionHead.from_address(id(connection)).db
+    if not pointer:
+        raise SQLiteIdentityError("connection has no active SQLite handle")
+    retained_buffer = ctypes.create_string_buffer(payload, len(payload))
+    result = deserialize(
+        pointer,
+        b"main",
+        ctypes.cast(retained_buffer, ctypes.c_void_p),
+        len(payload),
+        len(payload),
+        _SQLITE_DESERIALIZE_READONLY,
+    )
+    if result != _SQLITE_OK:
+        raise SQLiteIdentityError("SQLite could not deserialize the database image")
+    return retained_buffer
 
 
 def sqlite_connection_file_identity(

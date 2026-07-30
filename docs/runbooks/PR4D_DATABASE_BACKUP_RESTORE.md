@@ -51,10 +51,13 @@ credentials, account identifiers, or broker configuration. They always state
 `contains_secrets=false`, `mutated_authoritative_state=false`, and
 `authorizes_startup=false`.
 
-If backup, restore, or verification is interrupted, the source remains
-untouched. The unlinked partial inode disappears when its held descriptor is
-closed; the requested output path remains absent, there is no successful
-manifest, and no partial file can be mistaken for a usable artifact.
+If backup, restore, or verification is interrupted, the authoritative main-file
+bytes and committed logical state are not modified. A normal read connection to
+a WAL-mode source may create SQLite-managed `-wal`/`-shm` companions; the
+service validates and preserves them and never deletes them. The unlinked
+partial output inode disappears when its held descriptor is closed; the
+requested output path remains absent, there is no successful manifest, and no
+partial file can be mistaken for a usable artifact.
 
 ## Commands
 
@@ -101,6 +104,22 @@ from bound SQLite read snapshots rather than by requiring a companion-free main
 file. Normal checkpoints may change the physical main-file bytes while the held
 read snapshot remains logically consistent; backup therefore does not treat a
 checkpoint as authoritative data mutation.
+
+A companion-free source is not assumed immutable. Ordinary backup and migration
+sources use SQLite's normal locking even when a cleanly closed database retains
+`journal_mode=WAL`; safe `-wal`/`-shm` files created while establishing the bound
+connection are adopted into the identity set and monitored for the operation.
+Only a companion-free, manifest-verified restore artifact uses SQLite immutable
+mode. This preserves atomic snapshot semantics if a legitimate writer begins
+after the initial filesystem inspection.
+
+Before publication, the service reads the exact descriptor-bound bytes back,
+deserializes that byte snapshot into SQLite memory, reruns integrity,
+foreign-key, schema, row-count, and deterministic table-hash evidence, and
+requires it to equal the evidence captured from the copied database. The
+manifest digest is then required to match that same byte snapshot. This catches
+retained-descriptor corruption within the supported trusted-identity boundary;
+OS-identity isolation remains the deployment requirement described above.
 
 ## Legacy multiuser migration quarantine
 
