@@ -38,8 +38,8 @@ python -m pytest tests/maintenance/test_sqlite_service.py \
 The PR 4D maintenance module has 30 direct tests covering active WAL state,
 multiportfolio preservation, backup/restore manifests, clean-room equivalence,
 corruption, preexisting targets, symlinks, hardlinks, companion files,
-substitution races, backup/restore interruption, migration rollback, callback
-containment, CLI output, and legacy quarantine.
+substitution races, backup/restore interruption, migration rollback,
+declarative-plan containment, CLI output, and legacy quarantine.
 
 Final full repository regression:
 
@@ -76,8 +76,9 @@ type debt.
   online copy progress. Backup and restore artifacts are integrity-checked,
   foreign-key-checked, logically hashed, raw-file hashed, fsynced, and sealed
   read-only.
-- Failed or interrupted outputs are retained read-only for forensic inspection
-  and have no successful manifest. They are never promoted or reused.
+- Failed or interrupted staged outputs are retained read-only inside their
+  private staging directory for forensic inspection and have no successful
+  manifest. They are never promoted or reused.
 - Declarative migration plans run only against the new synthetic copy in a
   service-owned transaction. Transaction control, `ATTACH`, `DETACH`, and
   dangerous path/schema pragmas are denied; failures roll back and return a
@@ -85,20 +86,23 @@ type debt.
 
 ## 2026-07-30 exact-review follow-up
 
-Three additional exact-head P1 findings and the Python 3.10 CI failures were
+Five additional exact-head P1 findings and the Python 3.10 CI failures were
 remediated without touching authoritative data or runtime services:
 
-- Sidecar release now distinguishes a reservation SQLite consumed itself by
-  checking the still-open descriptor's zero link count. Remaining reservations
-  are atomically moved with the platform's no-replace rename into an exclusive
-  sibling quarantine directory. The service performs no pathname unlink and
-  leaves zero-byte tombstones in place.
-- A substitution between pathname inspection and the atomic claim is preserved,
-  restored to its original name when that can be done without replacement, and
-  causes the operation to fail closed.
+- SQLite now operates only in a fresh, unpredictable, owner-only staging
+  directory. It never opens the requested output path or any public sidecar
+  pathname. After close, the sealed main inode is published with an atomic
+  no-replace rename; the service performs no pathname unlink.
+- A public `-wal`, `-shm`, or `-journal` substitution while SQLite is active is
+  preserved byte-for-byte and causes publication to fail closed. This closes
+  the Linux behavior where SQLite itself could unlink a replacement before a
+  later reservation check.
 - A migration plan runs on the same descriptor-bound target connection used by
   the online copy. The synthetic database is never reopened writable between
   copy verification and migration.
+- Migration report evidence and artifact hash come directly from the final
+  descriptor-bound copy manifest. The published target is not reopened, so a
+  later path substitution cannot change what artifact the report describes.
 - Service-owned commit and rollback replace the restrictive plan authorizer
   with a completion-only policy. This avoids Python 3.10's unsupported
   `set_authorizer(None)` behavior without allowing plan-supplied transaction

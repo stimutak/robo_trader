@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import secrets
 import sqlite3
 import stat
 import sys
@@ -44,77 +45,40 @@ class SQLiteMaintenanceError(RuntimeError):
 
 
 @dataclass(slots=True)
-class _TargetReservation:
-    """Exclusive reservation for a new database and all SQLite sidecar names."""
+class _StagedTarget:
+    """Private SQLite namespace published only after the connection is closed."""
 
     binding: SQLitePathBinding
-    companions: dict[Path, tuple[int, int, int]]
-    quarantine_directory: Path
+    requested_path: Path
+    staging_directory: Path
+    published: bool = False
 
-    def release(self) -> None:
-        """Relinquish sidecar names without ever unlinking a re-resolved path.
+    def publish(self) -> None:
+        """Publish the sealed main inode without exposing SQLite to target sidecars."""
 
-        SQLite is allowed to consume an empty reservation itself.  Reservations
-        that remain are moved with a kernel-enforced no-replace rename into the
-        operation's private quarantine directory.  They are deliberately left
-        there as zero-byte tombstones: POSIX has no pathname unlink primitive
-        that is bound to an already-open descriptor, so deleting them would
-        reintroduce a check/use race against same-user pathname substitution.
-        """
-
-        error: SQLiteMaintenanceError | None = None
-        for path, (descriptor, device, inode) in self.companions.items():
-            try:
-                descriptor_metadata = os.fstat(descriptor)
-                if (
-                    not stat.S_ISREG(descriptor_metadata.st_mode)
-                    or descriptor_metadata.st_size != 0
-                    or (descriptor_metadata.st_dev, descriptor_metadata.st_ino) != (device, inode)
-                ):
-                    raise SQLiteMaintenanceError(
-                        "target SQLite sidecar reservation changed during operation"
-                    )
-                try:
-                    os.lstat(path)
-                except FileNotFoundError:
-                    if descriptor_metadata.st_nlink != 0:
-                        raise SQLiteMaintenanceError(
-                            "target SQLite sidecar reservation moved during operation"
-                        )
-                    continue
-
-                tombstone = self.quarantine_directory / path.name
-                _rename_noreplace(path, tombstone)
-                tombstone_metadata = os.lstat(tombstone)
-                descriptor_after = os.fstat(descriptor)
-                if (
-                    not stat.S_ISREG(tombstone_metadata.st_mode)
-                    or (tombstone_metadata.st_dev, tombstone_metadata.st_ino) != (device, inode)
-                    or (descriptor_after.st_dev, descriptor_after.st_ino) != (device, inode)
-                    or descriptor_after.st_nlink != 1
-                    or descriptor_after.st_size != 0
-                ):
-                    # The atomically claimed object was not ours.  Restore it
-                    # to its original name without overwriting any new racer;
-                    # if that name is already occupied, both objects remain
-                    # preserved and the operation still fails closed.
-                    try:
-                        _rename_noreplace(tombstone, path)
-                    except (OSError, SQLiteMaintenanceError):
-                        pass
-                    raise SQLiteMaintenanceError(
-                        "target SQLite sidecar pathname was substituted during operation"
-                    )
-            except (OSError, SQLiteMaintenanceError) as exc:
-                error = SQLiteMaintenanceError(
-                    "target SQLite sidecar reservation could not be released safely"
-                )
-                error.__cause__ = exc
-            finally:
-                os.close(descriptor)
-        self.companions.clear()
-        if error is not None:
-            raise error
+        self.binding.assert_path_identity()
+        if _safe_companion_identities(self.binding.path):
+            raise SQLiteMaintenanceError("private staged SQLite database retained companion files")
+        _assert_target_family_absent(self.requested_path)
+        _rename_noreplace(self.binding.path, self.requested_path)
+        self.published = True
+        descriptor_metadata = os.fstat(self.binding.guardian_file_descriptor)
+        path_metadata = os.lstat(self.requested_path)
+        expected = (self.binding.device, self.binding.inode)
+        if (
+            not stat.S_ISREG(descriptor_metadata.st_mode)
+            or descriptor_metadata.st_nlink != 1
+            or (descriptor_metadata.st_dev, descriptor_metadata.st_ino) != expected
+            or stat.S_ISLNK(path_metadata.st_mode)
+            or not stat.S_ISREG(path_metadata.st_mode)
+            or (path_metadata.st_dev, path_metadata.st_ino) != expected
+        ):
+            raise SQLiteMaintenanceError("published database identity changed")
+        if _safe_companion_identities(self.requested_path):
+            raise SQLiteMaintenanceError(
+                "target SQLite companion appeared during atomic publication"
+            )
+        _fsync_directory(self.requested_path.parent)
 
 
 class SQLiteMaintenanceService:
@@ -264,7 +228,7 @@ class SQLiteMaintenanceService:
             connection.set_authorizer(_post_migration_authorizer)
             return before, outcome, error_code
 
-        _copy_manifest, migration_result = self._online_copy(
+        copy_manifest, migration_result = self._online_copy(
             source_path,
             synthetic_target_path,
             operation="backup",
@@ -275,14 +239,13 @@ class SQLiteMaintenanceService:
             raise SQLiteMaintenanceError("migration result is unavailable")
         before, outcome, error_code = migration_result
 
-        after = self.verify(synthetic_target_path)
+        after = copy_manifest.evidence
         source_after = self.verify(source_path)
         source_after_hash, _ = _path_digest(_absolute_canonical_path(source_path))
         source_unchanged = source_before == source_after and source_before_hash == source_after_hash
         if not source_unchanged:
             outcome = "source_changed_fail_closed"
             error_code = "authoritative_source_changed"
-        artifact_sha256, _ = _path_digest(_absolute_canonical_path(synthetic_target_path))
         return MigrationDryRunReport(
             report_version=1,
             migration_id=plan.migration_id,
@@ -291,7 +254,7 @@ class SQLiteMaintenanceService:
             before=before,
             after=after,
             source_unchanged=source_unchanged,
-            target_artifact_sha256=artifact_sha256,
+            target_artifact_sha256=copy_manifest.artifact_sha256,
             error_code=error_code,
         )
 
@@ -403,8 +366,8 @@ class SQLiteMaintenanceService:
                 or expected_source_manifest.evidence != source_evidence
             ):
                 raise SQLiteMaintenanceError("copy source does not match the supplied manifest")
-            reservation = self._reserve_target(target_candidate)
-            target = reservation.binding
+            staged_target = self._stage_target(target_candidate)
+            target = staged_target.binding
         except (sqlite3.Error, SQLiteIdentityError, OSError) as exc:
             if source_connection is not None:
                 source_connection.close()
@@ -487,12 +450,7 @@ class SQLiteMaintenanceService:
                 artifact_size=artifact_size,
                 evidence=evidence,
             )
-            reservation.release()
-            if _safe_companion_identities(target.path):
-                raise SQLiteMaintenanceError(
-                    "target SQLite companions appeared after reservation release"
-                )
-            _fsync_directory(target.path.parent)
+            staged_target.publish()
             succeeded = True
             return manifest, hook_result
         except (sqlite3.Error, SQLiteIdentityError, OSError) as exc:
@@ -505,8 +463,6 @@ class SQLiteMaintenanceService:
             try:
                 if not succeeded:
                     _seal_forensic_target(target)
-                if reservation.companions:
-                    reservation.release()
             finally:
                 source.close()
                 target.close()
@@ -538,7 +494,7 @@ class SQLiteMaintenanceService:
         return binding
 
     @staticmethod
-    def _reserve_target(target_path: Path | str) -> _TargetReservation:
+    def _stage_target(target_path: Path | str) -> _StagedTarget:
         path = _absolute_canonical_path(target_path)
         try:
             parent = os.lstat(path.parent)
@@ -546,47 +502,35 @@ class SQLiteMaintenanceService:
             raise SQLiteMaintenanceError("target parent does not exist") from exc
         if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
             raise SQLiteMaintenanceError("target parent must be a non-symlink directory")
-        family = _sqlite_resource_family(path)
-        for member in family:
+        _assert_target_family_absent(path)
+        for _attempt in range(4):
+            staging_directory = path.parent / (
+                f".{path.name}.robo-trader-stage-{secrets.token_hex(16)}"
+            )
             try:
-                os.lstat(member)
-            except FileNotFoundError:
+                os.mkdir(staging_directory, 0o700)
+            except FileExistsError:
                 continue
             except OSError as exc:
-                raise SQLiteMaintenanceError("target SQLite family cannot be inspected") from exc
-            raise SQLiteMaintenanceError("target must be a new exclusively-created SQLite family")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-        companions: dict[Path, tuple[int, int, int]] = {}
-        binding: SQLitePathBinding | None = None
-        quarantine_directory = path.parent / f".{path.name}.robo-trader-reservations"
-        try:
-            os.mkdir(quarantine_directory, 0o700)
-            for suffix in ("-journal", "-shm", "-wal"):
-                companion = path.with_name(path.name + suffix)
-                descriptor = os.open(companion, flags, 0o400)
-                metadata = os.fstat(descriptor)
-                companions[companion] = (descriptor, metadata.st_dev, metadata.st_ino)
-            binding = SQLitePathBinding.open_for_initialization(path, create=True)
-            return _TargetReservation(
-                binding=binding,
-                companions=companions,
-                quarantine_directory=quarantine_directory,
-            )
-        except Exception as exc:
-            if binding is not None:
-                binding.close()
-            reservation = _TargetReservation(  # type: ignore[arg-type]
-                binding=binding,
-                companions=companions,
-                quarantine_directory=quarantine_directory,
-            )
+                raise SQLiteMaintenanceError(
+                    "private target staging directory cannot be created"
+                ) from exc
+            staged_path = staging_directory / "database.db"
             try:
-                reservation.release()
-            except SQLiteMaintenanceError:
-                pass
-            raise SQLiteMaintenanceError(
-                "target must be a new exclusively-created SQLite family"
-            ) from exc
+                binding = SQLitePathBinding.open_for_initialization(
+                    staged_path,
+                    create=True,
+                )
+            except SQLiteIdentityError as exc:
+                raise SQLiteMaintenanceError(
+                    "private staged database identity cannot be established"
+                ) from exc
+            return _StagedTarget(
+                binding=binding,
+                requested_path=path,
+                staging_directory=staging_directory,
+            )
+        raise SQLiteMaintenanceError("private target staging name could not be reserved")
 
     @staticmethod
     def _connect_bound(
@@ -932,6 +876,17 @@ def _sqlite_resource_family(path: Path) -> frozenset[Path]:
             path.with_name(path.name + "-wal"),
         }
     )
+
+
+def _assert_target_family_absent(path: Path) -> None:
+    for member in _sqlite_resource_family(path):
+        try:
+            os.lstat(member)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise SQLiteMaintenanceError("target SQLite family cannot be inspected") from exc
+        raise SQLiteMaintenanceError("target must be a new exclusively-created SQLite family")
 
 
 def _safe_companion_identities(path: Path) -> dict[str, tuple[int, int]]:

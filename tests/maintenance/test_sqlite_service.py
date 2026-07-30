@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -177,62 +178,42 @@ def test_preexisting_target_sidecar_is_preserved_without_main_creation(
     assert sidecar.read_bytes() == b"operator-evidence"
 
 
-def test_release_accepts_only_sqlite_consumed_sidecar_reservations(tmp_path: Path) -> None:
-    target = tmp_path / "target.db"
-    reservation = SQLiteMaintenanceService._reserve_target(target)
-    consumed = target.with_name(target.name + "-wal")
-    try:
-        # Model SQLite's Linux WAL close behavior: it removes its own empty
-        # reservation while the maintenance service still holds the descriptor.
-        os.unlink(consumed)
-        reservation.release()
-    finally:
-        reservation.binding.close()
-
-    assert not consumed.exists()
-    assert not any(
-        target.with_name(target.name + suffix).exists() for suffix in ("-journal", "-shm", "-wal")
-    )
-
-
-def test_release_never_deletes_sidecar_substituted_after_check(
+def test_sqlite_uses_private_namespace_and_never_unlinks_public_wal_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    source = tmp_path / "source.db"
     target = tmp_path / "target.db"
-    displaced = tmp_path / "original-reservation"
+    public_wal = target.with_name(target.name + "-wal")
     protected_payload = b"irreplaceable-user-evidence"
-    reservation = SQLiteMaintenanceService._reserve_target(target)
-    raced_path = target.with_name(target.name + "-journal")
-    real_rename_noreplace = sqlite_service_module._rename_noreplace
-    raced = False
+    writer = _create_multiportfolio_database(source, wal=True)
+    service = SQLiteMaintenanceService()
+    real_connect = service._connect_bound
+    writable_paths: list[Path] = []
 
-    def substitute_before_atomic_claim(source: Path, destination: Path) -> None:
-        nonlocal raced
-        if source == raced_path and not raced:
-            raced = True
-            source.rename(displaced)
-            source.write_bytes(protected_payload)
-        real_rename_noreplace(source, destination)
+    def observe_connect(binding, *, readonly, journal_off=False, immutable_readonly=False):
+        if not readonly:
+            writable_paths.append(binding.path)
+            public_wal.write_bytes(protected_payload)
+        return real_connect(
+            binding,
+            readonly=readonly,
+            journal_off=journal_off,
+            immutable_readonly=immutable_readonly,
+        )
 
-    monkeypatch.setattr(
-        sqlite_service_module,
-        "_rename_noreplace",
-        substitute_before_atomic_claim,
-    )
+    monkeypatch.setattr(service, "_connect_bound", observe_connect)
     try:
-        with pytest.raises(SQLiteMaintenanceError, match="could not be released safely"):
-            reservation.release()
+        with pytest.raises(SQLiteMaintenanceError, match="new exclusively-created SQLite family"):
+            service.backup(source, target)
     finally:
-        reservation.binding.close()
+        writer.close()
 
-    preserved = [
-        path
-        for path in tmp_path.rglob("*")
-        if path.is_file() and path.read_bytes() == protected_payload
-    ]
-    assert preserved, "the substituted user file must be preserved, never unlinked"
-    assert raced_path.read_bytes() == protected_payload
-    assert displaced.exists()
+    assert writable_paths
+    assert all(path != target and path.parent != target.parent for path in writable_paths)
+    assert stat.S_IMODE(writable_paths[0].parent.stat().st_mode) == 0o700
+    assert writable_paths[0].parent.name.startswith(f".{target.name}.robo-trader-stage-")
+    assert public_wal.read_bytes() == protected_payload
+    assert not target.exists()
 
 
 def test_target_cannot_overlap_source_sqlite_companion_family(tmp_path: Path) -> None:
@@ -331,8 +312,10 @@ def test_interrupted_backup_preserves_source_and_seals_forensic_target(tmp_path:
         SQLiteMaintenanceService(progress_hook=interrupt).backup(source, target)
 
     assert source.read_bytes() == before
-    assert target.exists()
-    assert stat.S_IMODE(target.stat().st_mode) == 0o400
+    assert not target.exists()
+    forensic_targets = list(tmp_path.glob(f".{target.name}.robo-trader-stage-*/database.db"))
+    assert len(forensic_targets) == 1
+    assert stat.S_IMODE(forensic_targets[0].stat().st_mode) == 0o400
 
 
 def test_manifest_with_unknown_field_is_rejected(tmp_path: Path) -> None:
@@ -353,7 +336,6 @@ def test_manifest_with_unknown_field_is_rejected(tmp_path: Path) -> None:
 def test_target_substitution_during_backup_fails_descriptor_check(tmp_path: Path) -> None:
     source = tmp_path / "source.db"
     target = tmp_path / "target.db"
-    displaced = tmp_path / "displaced.db"
     _create_multiportfolio_database(source).close()
     invoked = False
 
@@ -362,32 +344,45 @@ def test_target_substitution_during_backup_fails_descriptor_check(tmp_path: Path
         if invoked:
             return
         invoked = True
-        target.rename(displaced)
         target.symlink_to(source)
 
-    with pytest.raises(SQLiteMaintenanceError, match="failed closed"):
+    with pytest.raises(SQLiteMaintenanceError, match="new exclusively-created"):
         SQLiteMaintenanceService(progress_hook=replace_target).backup(source, target)
     assert source.exists()
-    assert displaced.exists()
+    assert target.is_symlink()
 
 
-def test_hardlink_race_during_backup_fails_closed(tmp_path: Path) -> None:
+def test_hardlink_race_during_backup_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     source = tmp_path / "source.db"
     target = tmp_path / "target.db"
     alias = tmp_path / "target-alias.db"
     _create_multiportfolio_database(source).close()
+    service = SQLiteMaintenanceService()
+    real_stage = service._stage_target
+    staged_path: Path | None = None
     invoked = False
+
+    def capture_stage(requested_path):
+        nonlocal staged_path
+        staged = real_stage(requested_path)
+        staged_path = staged.binding.path
+        return staged
 
     def add_link(_operation: str, _remaining: int, _total: int) -> None:
         nonlocal invoked
         if not invoked:
             invoked = True
-            os.link(target, alias)
+            assert staged_path is not None
+            os.link(staged_path, alias)
 
+    monkeypatch.setattr(service, "_stage_target", capture_stage)
     with pytest.raises(SQLiteMaintenanceError, match="another filesystem link"):
-        SQLiteMaintenanceService(progress_hook=add_link).backup(source, target)
+        service._progress_hook = add_link
+        service.backup(source, target)
     assert source.exists()
-    assert target.exists()
+    assert not target.exists()
     assert alias.exists()
 
 
@@ -408,8 +403,10 @@ def test_interrupted_restore_preserves_backup_and_seals_target(tmp_path: Path) -
             backup, target, manifest
         )
     assert backup.read_bytes() == backup_before
-    assert target.exists()
-    assert stat.S_IMODE(target.stat().st_mode) == 0o400
+    assert not target.exists()
+    forensic_targets = list(tmp_path.glob(f".{target.name}.robo-trader-stage-*/database.db"))
+    assert len(forensic_targets) == 1
+    assert stat.S_IMODE(forensic_targets[0].stat().st_mode) == 0o400
 
 
 def test_migration_dry_run_changes_only_synthetic_copy(tmp_path: Path) -> None:
@@ -453,12 +450,13 @@ def test_migration_uses_the_copy_connection_without_a_writable_reopen(
     _create_multiportfolio_database(source).close()
     service = SQLiteMaintenanceService()
     real_connect = service._connect_bound
-    writable_target_opens = 0
+    writable_paths: list[Path] = []
+    all_opened_paths: list[Path] = []
 
     def count_connect(binding, *, readonly, journal_off=False, immutable_readonly=False):
-        nonlocal writable_target_opens
-        if binding.path == target and not readonly:
-            writable_target_opens += 1
+        all_opened_paths.append(binding.path)
+        if not readonly:
+            writable_paths.append(binding.path)
         return real_connect(
             binding,
             readonly=readonly,
@@ -477,7 +475,51 @@ def test_migration_uses_the_copy_connection_without_a_writable_reopen(
     )
 
     assert report.outcome == "applied_to_synthetic_copy"
-    assert writable_target_opens == 1
+    assert len(writable_paths) == 1
+    assert writable_paths[0] != target
+    assert writable_paths[0].parent != target.parent
+    assert target not in all_opened_paths
+
+
+def test_migration_report_remains_bound_to_manifest_after_target_substitution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    parked = tmp_path / "bound-copy.db"
+    replacement = tmp_path / "replacement.db"
+    _create_multiportfolio_database(source).close()
+    replacement_connection = _create_multiportfolio_database(replacement)
+    replacement_connection.execute("INSERT INTO positions VALUES ('alpha', 'TSLA', 99)")
+    replacement_connection.commit()
+    replacement_connection.close()
+    service = SQLiteMaintenanceService()
+    real_online_copy = service._online_copy
+    captured_manifest = None
+
+    def substitute_after_bound_copy(*args, **kwargs):
+        nonlocal captured_manifest
+        manifest, result = real_online_copy(*args, **kwargs)
+        captured_manifest = manifest
+        target.rename(parked)
+        replacement.rename(target)
+        return manifest, result
+
+    monkeypatch.setattr(service, "_online_copy", substitute_after_bound_copy)
+    report = service.dry_run_migration(
+        source,
+        target,
+        plan=MigrationPlan(
+            migration_id="bound-final-report",
+            steps=(MigrationStep("ALTER TABLE positions ADD COLUMN note TEXT"),),
+        ),
+    )
+
+    assert captured_manifest is not None
+    assert report.after == captured_manifest.evidence
+    assert report.target_artifact_sha256 == captured_manifest.artifact_sha256
+    assert report.target_artifact_sha256 == hashlib.sha256(parked.read_bytes()).hexdigest()
+    assert report.target_artifact_sha256 != hashlib.sha256(target.read_bytes()).hexdigest()
 
 
 def test_service_transaction_completion_policy_is_python310_compatible() -> None:
