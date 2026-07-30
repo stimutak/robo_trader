@@ -1168,7 +1168,7 @@ def _schema_function_calls(connection: sqlite3.Connection) -> tuple[str, ...]:
             "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL"
         ).fetchall()
     ]
-    combined_schema = "\n".join(schema_fragments)
+    combined_schema = _schema_sql_without_comments("\n".join(schema_fragments))
     found: list[str] = []
     for name in sorted(function_names):
         escaped = re.escape(name)
@@ -1179,6 +1179,62 @@ def _schema_function_calls(connection: sqlite3.Connection) -> tuple[str, ...]:
         ):
             found.append(name)
     return tuple(found)
+
+
+def _schema_sql_without_comments(sql: str) -> str:
+    """Replace SQLite comments outside quoted tokens with whitespace."""
+
+    normalized: list[str] = []
+    index = 0
+    quote: str | None = None
+    while index < len(sql):
+        character = sql[index]
+        if quote is not None:
+            normalized.append(character)
+            if quote == "[":
+                if character == "]":
+                    quote = None
+                index += 1
+                continue
+            if character == quote:
+                if index + 1 < len(sql) and sql[index + 1] == quote:
+                    normalized.append(sql[index + 1])
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+        if character in {"'", '"', "`"}:
+            quote = character
+            normalized.append(character)
+            index += 1
+            continue
+        if character == "[":
+            quote = character
+            normalized.append(character)
+            index += 1
+            continue
+        if sql.startswith("--", index):
+            normalized.extend((" ", " "))
+            index += 2
+            while index < len(sql) and sql[index] not in {"\r", "\n"}:
+                normalized.append(" ")
+                index += 1
+            continue
+        if sql.startswith("/*", index):
+            normalized.extend((" ", " "))
+            index += 2
+            while index < len(sql):
+                if sql.startswith("*/", index):
+                    normalized.extend((" ", " "))
+                    index += 2
+                    break
+                normalized.append(sql[index] if sql[index] in {"\r", "\n"} else " ")
+                index += 1
+            continue
+        normalized.append(character)
+        index += 1
+    return "".join(normalized)
 
 
 def _single_check(connection: sqlite3.Connection, pragma: str) -> str:

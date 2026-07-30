@@ -32,10 +32,10 @@ Focused maintenance, legacy migration, and database-isolation matrix:
 ```text
 python3 -m pytest tests/maintenance/test_sqlite_service.py \
   tests/test_multiuser.py tests/security/test_db_isolation.py -q --tb=short
-232 passed
+234 passed
 ```
 
-The PR 4D maintenance module has 65 direct tests covering active WAL state,
+The PR 4D maintenance module has 67 direct tests covering active WAL state,
 multiportfolio preservation, backup/restore manifests, clean-room equivalence,
 corruption, preexisting targets, symlinks, hardlinks, companion files,
 substitution races, backup/restore interruption, migration rollback,
@@ -46,12 +46,14 @@ schema-cookie protection and tracking, native-function denial, bounded
 synthetic database growth, pre-publication final-evidence failure, CLI output,
 embedded-schema-function rejection, per-opcode deadline enforcement, TEMP
 storage containment, narrow migration-grammar rejection, and legacy quarantine.
+Block and line comments between a copied-schema function name and its opening
+parenthesis are normalized before screening and covered by integration tests.
 
 Final full repository regression:
 
 ```text
 python3 -m pytest tests/ -q --tb=short
-3110 passed, 5 skipped, 20 known warnings in 82.67s
+3112 passed, 5 skipped, 20 known warnings in 80.35s
 ```
 
 After PR 4C merged to `main`, that exact head was merge-integrated into this

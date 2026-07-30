@@ -1104,6 +1104,36 @@ def test_migration_rejects_functions_embedded_in_source_schema(tmp_path: Path) -
     assert report.source_unchanged is True
 
 
+@pytest.mark.parametrize("separator", ["/**/", "-- split token\n"])
+def test_migration_rejects_commented_schema_function_calls(
+    tmp_path: Path,
+    separator: str,
+) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    with sqlite3.connect(source) as connection:
+        connection.execute(
+            "CREATE TABLE guarded ("
+            f"value INTEGER NOT NULL CHECK(randomblob{separator}(50000000) IS NOT NULL)"
+            ")"
+        )
+        assert sqlite_service_module._schema_function_calls(connection) == ("randomblob",)
+
+    report = SQLiteMaintenanceService(max_migration_seconds=0.01).dry_run_migration(
+        source,
+        target,
+        plan=MigrationPlan(
+            migration_id="reject-commented-schema-function",
+            steps=(MigrationStep("INSERT INTO guarded(value) VALUES (?)", (1,)),),
+        ),
+    )
+
+    assert report.outcome == "rolled_back"
+    assert report.error_code == "migration_plan_failed"
+    assert report.before == report.after
+    assert report.source_unchanged is True
+
+
 def test_migration_authorizer_denies_native_pointer_and_virtual_table_actions(
     tmp_path: Path,
 ) -> None:

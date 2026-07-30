@@ -176,11 +176,13 @@ other resource or execution failures return `migration_plan_failed`.
 SQLite does not consistently send authorizer callbacks for functions embedded
 in copied CHECK constraints, generated columns, defaults, expression indexes,
 views, or triggers. Before any plan write, the service compares persistent
-schema SQL with the isolated connection's registered function list. A named
-schema function makes the dry run return `migration_plan_failed` without
-executing the plan. This conservative fail-closed policy can reject a harmless
-schema expression; such a migration needs a separately reviewed adapter rather
-than a bypass.
+schema SQL with the isolated connection's registered function list. SQLite
+block and line comments outside quoted tokens are normalized to whitespace
+before matching, so comments between a function name and `(` cannot bypass the
+screen. A named schema function makes the dry run return
+`migration_plan_failed` without executing the plan. This conservative
+fail-closed policy can reject a harmless schema expression; such a migration
+needs a separately reviewed adapter rather than a bypass.
 
 The final bound live-source evidence check runs after the synthetic bytes and
 manifest have been verified but before the anonymous target is published. If
