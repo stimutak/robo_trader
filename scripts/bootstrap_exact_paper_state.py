@@ -37,6 +37,7 @@ from robo_trader.financial_state_bootstrap import (  # noqa: E402
     ExactStateBootstrapCommittedBackupInvalid,
     ExactStateBootstrapError,
     ExactStateBootstrapEvidence,
+    assert_exact_state_bootstrap_evidence,
     inspect_legacy_state,
     load_exact_state_bootstrap_evidence,
     sqlite_table_evidence,
@@ -510,6 +511,7 @@ def preview(
         if runtime_contract is None:
             raise ExactStateBootstrapError("runtime contract is required with evidence")
         _validate_evidence_binding(candidate, evidence, runtime_contract)
+        assert_exact_state_bootstrap_evidence(candidate, evidence, runtime_contract)
     legacy = inspect_legacy_state(database_path)
     if legacy["snapshot_hash"] != candidate.legacy_snapshot_hash:
         raise ExactStateBootstrapError("legacy ledger differs from the reviewed candidate")
@@ -527,10 +529,12 @@ def preview(
         raise ExactStateBootstrapError(
             "candidate does not cover every nonzero position in its portfolio"
         )
+    fifo_plan = candidate.fifo_bootstrap_plan()
     return {
         "authorizes_startup": False,
         "bootstrap_id": candidate.bootstrap_id,
         "candidate_fingerprint": candidate.fingerprint(),
+        "fifo": fifo_plan.public_dict(),
         "legacy_snapshot_hash": candidate.legacy_snapshot_hash,
         "position_count": len(candidate.positions),
         "schema_version": 1,

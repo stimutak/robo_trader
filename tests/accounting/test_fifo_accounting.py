@@ -138,7 +138,7 @@ def test_fixture_migration_is_exact_idempotent_and_foreign_keys_are_on(connectio
     assert connection.execute("PRAGMA foreign_keys").fetchone() == (1,)
     assert connection.execute(
         "SELECT version FROM fifo_schema_migrations WHERE component='fifo_accounting'"
-    ).fetchall() == [(1,)]
+    ).fetchall() == [(1,), (2,)]
 
 
 def test_fixture_migration_rejects_production_style_filename(tmp_path):
@@ -366,7 +366,7 @@ def test_integer_minor_units_reject_fractional_real_storage(connection, ledger):
         connection.execute(
             """
             INSERT INTO fifo_lot_openings VALUES(
-                ?, ?, ?, 0, ?, ?, 'LONG', '1', '10', 1.5, 1, ?
+                ?, ?, ?, NULL, 0, ?, ?, 'LONG', '1', '10', 1.5, 1, ?
             )
             """,
             (
@@ -419,6 +419,35 @@ def test_temp_fifo_shadows_created_after_ledger_init_fail_every_operation(connec
         table: connection.execute(f"SELECT COUNT(*) FROM main.{table}").fetchone()[0]
         for table in tables
     } == before
+
+
+def test_foreign_main_trigger_targeting_fifo_table_is_rejected(connection):
+    connection.execute("CREATE TABLE unrelated_audit(value TEXT NOT NULL)")
+    connection.execute("""
+        CREATE TRIGGER unrelated_capture
+        AFTER INSERT ON fifo_opening_balances
+        BEGIN
+            INSERT INTO unrelated_audit VALUES ('unexpected mutation');
+        END
+        """)
+
+    with pytest.raises(FifoFixtureMigrationError, match="foreign triggers"):
+        FifoLedger(connection, allow_other_objects=True)
+
+    assert connection.execute("SELECT COUNT(*) FROM unrelated_audit").fetchone() == (0,)
+
+
+def test_foreign_temp_trigger_targeting_fifo_table_is_rejected(connection):
+    connection.execute("""
+        CREATE TEMP TRIGGER unrelated_temp_capture
+        BEFORE INSERT ON main.fifo_fills
+        BEGIN
+            SELECT 1;
+        END
+        """)
+
+    with pytest.raises(FifoFixtureMigrationError, match="temporary FIFO"):
+        FifoLedger(connection, allow_other_objects=True)
 
 
 @pytest.mark.parametrize("bad_decimal", ["abc", "01", "1.0", "0", "-1", "1e2", ".5", "5."])
@@ -785,7 +814,7 @@ def test_integrity_verifier_binds_opening_direction_to_source_fill(connection, l
     connection.execute(
         """
         INSERT INTO fifo_lot_openings VALUES(
-            ?, ?, ?, 0, ?, ?, 'SHORT', '2', '10', 0, 1, ?
+            ?, ?, ?, NULL, 0, ?, ?, 'SHORT', '2', '10', 0, 1, ?
         )
         """,
         (

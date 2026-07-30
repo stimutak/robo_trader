@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
 from .bootstrap_evidence_auth import (
     AUTH_SUFFIX,
@@ -48,6 +48,9 @@ from .safety.sqlite_identity import (
     lexical_path_preserving_leaf,
     sqlite_connection_file_identity,
 )
+
+if TYPE_CHECKING:
+    from .accounting.fifo_bootstrap import LegacyFifoBootstrapPlan
 
 BOOTSTRAP_SCHEMA_VERSION = 1
 BOOTSTRAP_ID_PREFIX = "pboot-"
@@ -1623,6 +1626,7 @@ def assert_verified_exact_state_reconciliation_evidence(
 @dataclass(frozen=True, slots=True)
 class ExactBootstrapPosition:
     symbol: str
+    con_id: int
     quantity: int
     cost_basis: Decimal
     mark_price: Decimal
@@ -1633,6 +1637,10 @@ class ExactBootstrapPosition:
         symbol = str(self.symbol).strip().upper()
         if not _SYMBOL.fullmatch(symbol):
             raise ExactStateBootstrapError("bootstrap position symbol is malformed")
+        if type(self.con_id) is not int or self.con_id <= 0:
+            raise ExactStateBootstrapError(
+                "bootstrap position requires a positive authenticated con_id"
+            )
         if isinstance(self.quantity, bool) or type(self.quantity) is not int or self.quantity == 0:
             raise ExactStateBootstrapError("bootstrap position quantity must be a nonzero integer")
         object.__setattr__(self, "symbol", symbol)
@@ -1655,6 +1663,7 @@ class ExactBootstrapPosition:
 
     def public_dict(self) -> dict[str, object]:
         return {
+            "con_id": self.con_id,
             "cost_basis_text": decimal_to_fixed(self.cost_basis),
             "mark_evidence_fingerprint": self.mark_evidence_fingerprint,
             "mark_observed_at": utc_to_text(self.mark_observed_at),
@@ -1751,6 +1760,11 @@ class ExactStateBootstrapCandidate:
         symbols = [position.symbol for position in positions]
         if len(symbols) != len(set(symbols)) or symbols != sorted(symbols):
             raise ExactStateBootstrapError("bootstrap positions must be unique and sorted")
+        con_ids = [position.con_id for position in positions]
+        if len(con_ids) != len(set(con_ids)):
+            raise ExactStateBootstrapError(
+                "bootstrap positions must have unique authenticated con_id values"
+            )
         for position in positions:
             age = effective_at - position.mark_observed_at
             if age < timedelta(0) or age > MAX_MARK_AGE:
@@ -1795,6 +1809,31 @@ class ExactStateBootstrapCandidate:
 
     def fingerprint(self) -> str:
         return hashlib.sha256(self.canonical_payload().encode("utf-8")).hexdigest()
+
+    def fifo_bootstrap_plan(self) -> "LegacyFifoBootstrapPlan":
+        """Return the deterministic non-fill FIFO epoch proposed by this candidate."""
+
+        from .accounting.fifo_bootstrap import build_legacy_fifo_bootstrap_plan
+
+        account = self.account.public_dict()
+        return build_legacy_fifo_bootstrap_plan(
+            bootstrap_id=self.bootstrap_id,
+            candidate_fingerprint=self.fingerprint(),
+            execution_domain_scope=self.execution_domain_scope,
+            account_scope=self.account_scope,
+            portfolio_id=self.portfolio_id,
+            effective_at=utc_to_text(self.effective_at),
+            reconciliation_snapshot_id=self.reconciliation_snapshot_id,
+            reconciliation_report_hash=self.reconciliation_report_hash,
+            broker_snapshot_hash=self.broker_snapshot_hash,
+            legacy_snapshot_hash=self.legacy_snapshot_hash,
+            cash_text=account["cash_text"],
+            realized_pnl_text=account["realized_pnl_text"],
+            daily_pnl_text=account["daily_pnl_text"],
+            daily_pnl_baseline_text=account["daily_pnl_baseline_text"],
+            daily_pnl_date=account["daily_pnl_date"],
+            positions=[position.public_dict() for position in self.positions],
+        )
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "ExactStateBootstrapCandidate":
@@ -1857,6 +1896,7 @@ class ExactStateBootstrapCandidate:
             _exact_keys(
                 item,
                 {
+                    "con_id",
                     "symbol",
                     "quantity",
                     "cost_basis_text",
@@ -1869,6 +1909,7 @@ class ExactStateBootstrapCandidate:
             positions_list.append(
                 ExactBootstrapPosition(
                     symbol=item["symbol"],
+                    con_id=item["con_id"],
                     quantity=item["quantity"],
                     cost_basis=item["cost_basis_text"],
                     mark_price=item["mark_price_text"],
@@ -2059,7 +2100,8 @@ def assert_exact_state_bootstrap_evidence(
         mark = evidence_marks[(candidate.portfolio_id, position.symbol)]
         _assert_fresh_against_wall_clock(mark.observed_at, f"protective mark for {position.symbol}")
         if (
-            mark.price != position.mark_price
+            mark.con_id != position.con_id
+            or mark.price != position.mark_price
             or mark.observed_at != position.mark_observed_at
             or not hmac.compare_digest(
                 mark.artifact_hash,
