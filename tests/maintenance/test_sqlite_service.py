@@ -894,7 +894,12 @@ def test_migration_evidence_includes_persistent_planner_statistics(tmp_path: Pat
         target,
         plan=MigrationPlan(
             migration_id="planner-statistics-change",
-            steps=(MigrationStep("DELETE FROM sqlite_stat1"),),
+            steps=(
+                MigrationStep(
+                    "UPDATE sqlite_stat1 SET stat=? WHERE tbl=?",
+                    ("999 1", "analyzed_rows"),
+                ),
+            ),
         ),
     )
 
@@ -902,25 +907,33 @@ def test_migration_evidence_includes_persistent_planner_statistics(tmp_path: Pat
     assert report.before != report.after
     assert report.source_unchanged is True
     with sqlite3.connect(target) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM sqlite_stat1").fetchone() == (0,)
+        assert connection.execute(
+            "SELECT stat FROM sqlite_stat1 WHERE tbl='analyzed_rows'"
+        ).fetchone() == ("999 1",)
 
 
 def test_migration_plan_deadline_interrupts_and_rolls_back(tmp_path: Path) -> None:
     source = tmp_path / "source.db"
     target = tmp_path / "dry-run.db"
-    _create_multiportfolio_database(source).close()
+    with sqlite3.connect(source) as connection:
+        connection.execute(
+            "CREATE TABLE deadline_rows (id INTEGER PRIMARY KEY, marker INTEGER, value TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO deadline_rows(id, marker, value) VALUES (?, 1, 'before')",
+            ((row_id,) for row_id in range(100_000)),
+        )
     started = time.monotonic()
 
     report = SQLiteMaintenanceService(max_migration_seconds=0.01).dry_run_migration(
         source,
         target,
         plan=MigrationPlan(
-            migration_id="bounded-recursive-query",
+            migration_id="bounded-bulk-update",
             steps=(
                 MigrationStep(
-                    "WITH RECURSIVE unbounded(value) AS ("
-                    "VALUES(1) UNION ALL SELECT value+1 FROM unbounded"
-                    ") SELECT sum(value) FROM unbounded"
+                    "UPDATE deadline_rows SET value=? WHERE marker=?",
+                    ("after", 1),
                 ),
             ),
         ),
@@ -938,23 +951,72 @@ def test_migration_denies_native_function_that_can_evade_vm_deadline(tmp_path: P
     target = tmp_path / "dry-run.db"
     _create_multiportfolio_database(source).close()
 
-    report = SQLiteMaintenanceService(max_migration_seconds=0.01).dry_run_migration(
-        source,
-        target,
-        plan=MigrationPlan(
-            migration_id="deny-native-allocation",
-            steps=(
-                MigrationStep("CREATE TABLE oversized_payload (value BLOB NOT NULL)"),
-                MigrationStep("INSERT INTO oversized_payload VALUES (randomblob(50000000))"),
+    with pytest.raises(SQLiteMaintenanceError, match="supported grammar"):
+        SQLiteMaintenanceService(max_migration_seconds=0.01).dry_run_migration(
+            source,
+            target,
+            plan=MigrationPlan(
+                migration_id="deny-native-allocation",
+                steps=(
+                    MigrationStep("CREATE TABLE oversized_payload (value BLOB NOT NULL)"),
+                    MigrationStep(
+                        "INSERT INTO oversized_payload(value) VALUES (randomblob(50000000))"
+                    ),
+                ),
             ),
-        ),
+        )
+
+    assert not target.exists()
+
+
+def test_migration_grammar_rejects_unreviewed_sql_shapes_before_copy(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    _create_multiportfolio_database(source).close()
+    unsupported = (
+        "UPDATE positions SET quantity=?",
+        "INSERT INTO positions(portfolio_id,symbol,quantity) SELECT ?,?,?",
+        "CREATE TABLE escaped (value TEXT CHECK(value <> ''))",
+        'ALTER TABLE "positions" ADD COLUMN note TEXT',
+        "SELECT 1 -- comment",
+        "DELETE FROM positions WHERE portfolio_id='alpha'",
+        "BEGIN",
     )
 
-    assert report.outcome == "rolled_back"
-    assert report.error_code == "migration_plan_failed"
-    assert report.before == report.after
-    assert report.source_unchanged is True
-    assert target.stat().st_size < 50_000_000
+    for index, sql in enumerate(unsupported):
+        target = tmp_path / f"rejected-{index}.db"
+        parameters = tuple(1 for _ in range(sql.count("?")))
+        with pytest.raises(SQLiteMaintenanceError, match="supported grammar"):
+            SQLiteMaintenanceService().dry_run_migration(
+                source,
+                target,
+                plan=MigrationPlan(
+                    migration_id=f"rejected-shape-{index}",
+                    steps=(MigrationStep(sql, parameters),),
+                ),
+            )
+        assert not target.exists()
+
+
+def test_migration_deadline_checks_every_vm_opcode_between_allocations(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    _create_multiportfolio_database(source).close()
+    payload = b"x" * (1024 * 1024)
+    expression = "||".join("?1" for _ in range(40))
+    started = time.monotonic()
+
+    with pytest.raises(SQLiteMaintenanceError, match="supported grammar"):
+        SQLiteMaintenanceService(max_migration_seconds=0.01).dry_run_migration(
+            source,
+            target,
+            plan=MigrationPlan(
+                migration_id="bounded-between-opcodes",
+                steps=(MigrationStep(f"SELECT {expression}", (payload,)),),
+            ),
+        )
+
+    assert time.monotonic() - started < 2.0
+    assert not target.exists()
 
 
 def test_migration_growth_is_capped_by_synthetic_database_page_limit(tmp_path: Path) -> None:
@@ -970,12 +1032,61 @@ def test_migration_growth_is_capped_by_synthetic_database_page_limit(tmp_path: P
             migration_id="bounded-synthetic-growth",
             steps=(
                 MigrationStep("CREATE TABLE bounded_payload (value BLOB NOT NULL)"),
-                MigrationStep("INSERT INTO bounded_payload VALUES (?)", (payload,)),
-                MigrationStep("INSERT INTO bounded_payload VALUES (?)", (payload,)),
+                MigrationStep("INSERT INTO bounded_payload(value) VALUES (?)", (payload,)),
+                MigrationStep("INSERT INTO bounded_payload(value) VALUES (?)", (payload,)),
             ),
         ),
     )
 
+    assert report.outcome == "rolled_back"
+    assert report.error_code == "migration_plan_failed"
+    assert report.before == report.after
+    assert report.source_unchanged is True
+
+
+def test_migration_temp_schema_writes_are_denied_and_capped(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    _create_multiportfolio_database(source).close()
+    payload = b"x" * (3 * 1024 * 1024)
+
+    with pytest.raises(SQLiteMaintenanceError, match="supported grammar"):
+        SQLiteMaintenanceService(max_migration_growth_bytes=1024 * 1024).dry_run_migration(
+            source,
+            target,
+            plan=MigrationPlan(
+                migration_id="deny-temp-growth",
+                steps=(
+                    MigrationStep("CREATE TEMP TABLE escaped_growth (value BLOB NOT NULL)"),
+                    MigrationStep("INSERT INTO escaped_growth(value) VALUES (?)", (payload,)),
+                ),
+            ),
+        )
+
+    assert not target.exists()
+
+
+def test_migration_rejects_functions_embedded_in_source_schema(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    with sqlite3.connect(source) as connection:
+        connection.execute(
+            "CREATE TABLE guarded ("
+            "value INTEGER NOT NULL CHECK(length(randomblob(50000000)) > 0)"
+            ")"
+        )
+    started = time.monotonic()
+
+    report = SQLiteMaintenanceService(max_migration_seconds=0.01).dry_run_migration(
+        source,
+        target,
+        plan=MigrationPlan(
+            migration_id="reject-schema-function",
+            steps=(MigrationStep("INSERT INTO guarded(value) VALUES (?)", (1,)),),
+        ),
+    )
+
+    assert time.monotonic() - started < 2.0
     assert report.outcome == "rolled_back"
     assert report.error_code == "migration_plan_failed"
     assert report.before == report.after
@@ -1008,24 +1119,22 @@ def test_migration_authorizer_denies_native_pointer_and_virtual_table_actions(
     source = tmp_path / "source.db"
     target = tmp_path / "dry-run.db"
     _create_multiportfolio_database(source).close()
-    report = SQLiteMaintenanceService().dry_run_migration(
-        source,
-        target,
-        plan=MigrationPlan(
-            migration_id="deny-native-pointer-function",
-            steps=(
-                MigrationStep(
-                    "SELECT fts3_tokenizer('unsafe', ?)",
-                    (b"\x42" * 8,),
+    with pytest.raises(SQLiteMaintenanceError, match="supported grammar"):
+        SQLiteMaintenanceService().dry_run_migration(
+            source,
+            target,
+            plan=MigrationPlan(
+                migration_id="deny-native-pointer-function",
+                steps=(
+                    MigrationStep(
+                        "SELECT fts3_tokenizer('unsafe', ?)",
+                        (b"\x42" * 8,),
+                    ),
                 ),
             ),
-        ),
-    )
+        )
 
-    assert report.outcome == "rolled_back"
-    assert report.error_code == "migration_plan_failed"
-    assert report.before == report.after
-    assert report.source_unchanged is True
+    assert not target.exists()
 
 
 def test_migration_plan_cannot_change_untracked_schema_cookie(tmp_path: Path) -> None:
@@ -1043,21 +1152,17 @@ def test_migration_plan_cannot_change_untracked_schema_cookie(tmp_path: Path) ->
         == sqlite3.SQLITE_DENY
     )
 
-    report = SQLiteMaintenanceService().dry_run_migration(
-        source,
-        target,
-        plan=MigrationPlan(
-            migration_id="deny-schema-cookie",
-            steps=(MigrationStep("PRAGMA schema_version=999"),),
-        ),
-    )
+    with pytest.raises(SQLiteMaintenanceError, match="supported grammar"):
+        SQLiteMaintenanceService().dry_run_migration(
+            source,
+            target,
+            plan=MigrationPlan(
+                migration_id="deny-schema-cookie",
+                steps=(MigrationStep("PRAGMA schema_version=999"),),
+            ),
+        )
 
-    assert report.outcome == "rolled_back"
-    assert report.error_code == "migration_plan_failed"
-    assert report.before == report.after
-    assert report.source_unchanged is True
-    with sqlite3.connect(target) as connection:
-        assert connection.execute("PRAGMA schema_version").fetchone() != (999,)
+    assert not target.exists()
 
 
 def test_migration_evidence_tracks_schema_cookie_after_transient_ddl(tmp_path: Path) -> None:
@@ -1205,8 +1310,14 @@ def test_interrupted_migration_rolls_back_copy_and_preserves_source(tmp_path: Pa
         plan=MigrationPlan(
             migration_id="synthetic-interruption",
             steps=(
-                MigrationStep("DELETE FROM positions"),
-                MigrationStep("THIS IS NOT VALID SQL"),
+                MigrationStep(
+                    "UPDATE positions SET quantity=? WHERE portfolio_id=?",
+                    (99, "alpha"),
+                ),
+                MigrationStep(
+                    "UPDATE missing_table SET value=? WHERE id=?",
+                    ("unreachable", 1),
+                ),
             ),
         ),
     )
@@ -1223,17 +1334,16 @@ def test_migration_plan_cannot_attach_or_commit(tmp_path: Path) -> None:
     target = tmp_path / "dry-run.db"
     _create_multiportfolio_database(source).close()
 
-    report = SQLiteMaintenanceService().dry_run_migration(
-        source,
-        target,
-        plan=MigrationPlan(
-            migration_id="synthetic-attach",
-            steps=(MigrationStep("ATTACH DATABASE ? AS escaped", (str(source),)),),
-        ),
-    )
-    assert report.outcome == "rolled_back"
-    assert report.before == report.after
-    assert report.source_unchanged is True
+    with pytest.raises(SQLiteMaintenanceError, match="supported grammar"):
+        SQLiteMaintenanceService().dry_run_migration(
+            source,
+            target,
+            plan=MigrationPlan(
+                migration_id="synthetic-attach",
+                steps=(MigrationStep("ATTACH DATABASE ? AS escaped", (str(source),)),),
+            ),
+        )
+    assert not target.exists()
 
 
 @pytest.mark.parametrize("pragma", ["hard_heap_limit", "soft_heap_limit"])
@@ -1247,21 +1357,19 @@ def test_migration_plan_cannot_change_process_global_heap_limits(
 
     with sqlite3.connect(":memory:") as observer:
         before_limit = observer.execute(f"PRAGMA {pragma}").fetchone()
-        report = SQLiteMaintenanceService().dry_run_migration(
-            source,
-            target,
-            plan=MigrationPlan(
-                migration_id=f"deny-{pragma.replace('_', '-')}",
-                steps=(MigrationStep(f"PRAGMA {pragma}=1048576"),),
-            ),
-        )
+        with pytest.raises(SQLiteMaintenanceError, match="supported grammar"):
+            SQLiteMaintenanceService().dry_run_migration(
+                source,
+                target,
+                plan=MigrationPlan(
+                    migration_id=f"deny-{pragma.replace('_', '-')}",
+                    steps=(MigrationStep(f"PRAGMA {pragma}=1048576"),),
+                ),
+            )
         after_limit = observer.execute(f"PRAGMA {pragma}").fetchone()
 
-    assert report.outcome == "rolled_back"
-    assert report.error_code == "migration_plan_failed"
-    assert report.before == report.after
-    assert report.source_unchanged is True
     assert after_limit == before_limit
+    assert not target.exists()
 
 
 def test_migration_oversized_integer_parameter_rolls_back_with_report(tmp_path: Path) -> None:
@@ -1276,8 +1384,8 @@ def test_migration_oversized_integer_parameter_rolls_back_with_report(tmp_path: 
             migration_id="oversized-integer",
             steps=(
                 MigrationStep(
-                    "UPDATE positions SET quantity=? WHERE portfolio_id='alpha'",
-                    (2**100,),
+                    "UPDATE positions SET quantity=? WHERE portfolio_id=?",
+                    (2**100, "alpha"),
                 ),
             ),
         ),

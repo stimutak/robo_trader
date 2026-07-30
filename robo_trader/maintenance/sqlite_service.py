@@ -419,6 +419,10 @@ class SQLiteMaintenanceService:
         ) -> tuple[DatabaseEvidence, str, str | None]:
             outcome = "applied_to_synthetic_copy"
             error_code: str | None = None
+            plan_can_write = any(step.sql.strip().upper() != "SELECT 1" for step in plan.steps)
+            if plan_can_write and _schema_function_calls(connection):
+                connection.set_authorizer(_post_migration_authorizer)
+                return before, "rolled_back", "migration_plan_failed"
             page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
             page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
             growth_pages = math.ceil(self._max_migration_growth_bytes / page_size)
@@ -428,6 +432,19 @@ class SQLiteMaintenanceService:
             )
             if configured_maximum != maximum_page_count:
                 raise SQLiteMaintenanceError("synthetic migration growth limit is unavailable")
+            temp_page_size = int(connection.execute("PRAGMA temp.page_size").fetchone()[0])
+            temp_page_count = int(connection.execute("PRAGMA temp.page_count").fetchone()[0])
+            temp_growth_pages = math.ceil(self._max_migration_growth_bytes / temp_page_size)
+            maximum_temp_page_count = temp_page_count + temp_growth_pages
+            configured_temp_maximum = int(
+                connection.execute(
+                    f"PRAGMA temp.max_page_count={maximum_temp_page_count}"
+                ).fetchone()[0]
+            )
+            if configured_temp_maximum != maximum_temp_page_count:
+                raise SQLiteMaintenanceError(
+                    "synthetic migration temporary growth limit is unavailable"
+                )
             connection.execute("BEGIN IMMEDIATE")
             connection.set_authorizer(_migration_authorizer)
             migration_started = time.monotonic()
@@ -439,7 +456,7 @@ class SQLiteMaintenanceService:
                 return int(migration_deadline_exceeded())
 
             try:
-                connection.set_progress_handler(enforce_migration_deadline, 1000)
+                connection.set_progress_handler(enforce_migration_deadline, 1)
                 try:
                     for step in plan.steps:
                         connection.execute(step.sql, step.parameters)
@@ -983,6 +1000,7 @@ def _validate_migration_plan(plan: MigrationPlan) -> None:
         raise SQLiteMaintenanceError("migration plan has an invalid public identifier")
     if type(plan.steps) is not tuple or not 1 <= len(plan.steps) <= 256:
         raise SQLiteMaintenanceError("migration plan must contain 1-256 ordered steps")
+    total_parameter_bytes = 0
     for step in plan.steps:
         if (
             type(step) is not MigrationStep
@@ -993,21 +1011,90 @@ def _validate_migration_plan(plan: MigrationPlan) -> None:
             or len(step.parameters) > 1024
         ):
             raise SQLiteMaintenanceError("migration plan contains an invalid step")
-        if re.search(r"\b(?:length|printf|substr)\b", step.sql, flags=re.IGNORECASE):
-            raise SQLiteMaintenanceError("migration plan calls a reserved SQLite function")
+        _validate_migration_statement(step)
         for parameter in step.parameters:
             if type(parameter) not in (str, int, float, bytes, type(None)):
                 raise SQLiteMaintenanceError("migration step parameter type is unsupported")
             if isinstance(parameter, float) and not math.isfinite(parameter):
                 raise SQLiteMaintenanceError("migration step parameter must be finite")
-            if isinstance(parameter, (str, bytes)) and len(parameter) > 4 * 1024 * 1024:
+            if isinstance(parameter, str):
+                parameter_size = len(parameter.encode("utf-8"))
+            elif isinstance(parameter, bytes):
+                parameter_size = len(parameter)
+            else:
+                parameter_size = 0
+            if parameter_size > 4 * 1024 * 1024:
                 raise SQLiteMaintenanceError("migration step parameter is too large")
+            total_parameter_bytes += parameter_size
+            if total_parameter_bytes > 16 * 1024 * 1024:
+                raise SQLiteMaintenanceError("migration plan parameters are too large")
     if plan.target_user_version is not None and (
         isinstance(plan.target_user_version, bool)
         or not isinstance(plan.target_user_version, int)
         or not 0 <= plan.target_user_version <= 2_147_483_647
     ):
         raise SQLiteMaintenanceError("migration target user version is invalid")
+
+
+_MIGRATION_IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*"
+_MIGRATION_TYPE = r"(?:INTEGER|REAL|TEXT|BLOB|NUMERIC)"
+_MIGRATION_LITERAL = r"(?:NULL|[-+]?(?:\d+(?:\.\d*)?|\.\d+)|'(?:''|[^'])*')"
+_MIGRATION_COLUMN = (
+    rf"{_MIGRATION_IDENTIFIER}\s+{_MIGRATION_TYPE}"
+    rf"(?:\s+PRIMARY\s+KEY)?(?:\s+NOT\s+NULL)?"
+    rf"(?:\s+DEFAULT\s+{_MIGRATION_LITERAL})?"
+)
+_MIGRATION_STATEMENTS = (
+    re.compile(r"SELECT\s+1", re.IGNORECASE | re.ASCII),
+    re.compile(
+        rf"CREATE\s+TABLE\s+{_MIGRATION_IDENTIFIER}\s*\(\s*"
+        rf"{_MIGRATION_COLUMN}(?:\s*,\s*{_MIGRATION_COLUMN})*\s*\)",
+        re.IGNORECASE | re.ASCII,
+    ),
+    re.compile(
+        rf"DROP\s+TABLE\s+{_MIGRATION_IDENTIFIER}",
+        re.IGNORECASE | re.ASCII,
+    ),
+    re.compile(
+        rf"ALTER\s+TABLE\s+{_MIGRATION_IDENTIFIER}\s+ADD\s+COLUMN\s+" rf"{_MIGRATION_COLUMN}",
+        re.IGNORECASE | re.ASCII,
+    ),
+    re.compile(
+        rf"INSERT\s+INTO\s+{_MIGRATION_IDENTIFIER}\s*\(\s*"
+        rf"{_MIGRATION_IDENTIFIER}(?:\s*,\s*{_MIGRATION_IDENTIFIER})*\s*\)"
+        rf"\s+VALUES\s*\(\s*\?(?:\s*,\s*\?)*\s*\)",
+        re.IGNORECASE | re.ASCII,
+    ),
+    re.compile(
+        rf"UPDATE\s+{_MIGRATION_IDENTIFIER}\s+SET\s+{_MIGRATION_IDENTIFIER}\s*=\s*\?"
+        rf"\s+WHERE\s+{_MIGRATION_IDENTIFIER}\s*=\s*\?"
+        rf"(?:\s+AND\s+{_MIGRATION_IDENTIFIER}\s*=\s*\?)*",
+        re.IGNORECASE | re.ASCII,
+    ),
+    re.compile(
+        rf"DELETE\s+FROM\s+{_MIGRATION_IDENTIFIER}"
+        rf"\s+WHERE\s+{_MIGRATION_IDENTIFIER}\s*=\s*\?"
+        rf"(?:\s+AND\s+{_MIGRATION_IDENTIFIER}\s*=\s*\?)*",
+        re.IGNORECASE | re.ASCII,
+    ),
+)
+
+
+def _validate_migration_statement(step: MigrationStep) -> None:
+    """Accept only the small reviewed migration grammar.
+
+    SQLite's authorizer and resource limits remain defense in depth; raw SQL is
+    not treated as a sandbox. Identifiers are simple ASCII names, values in DML
+    are parameters, UPDATE/DELETE require equality predicates, and schema
+    expressions, TEMP objects, PRAGMAs, functions, comments, and transaction
+    controls have no grammar production.
+    """
+
+    statement = step.sql.strip()
+    if not any(pattern.fullmatch(statement) for pattern in _MIGRATION_STATEMENTS):
+        raise SQLiteMaintenanceError("migration statement is outside the supported grammar")
+    if statement.count("?") != len(step.parameters):
+        raise SQLiteMaintenanceError("migration statement parameter count does not match")
 
 
 def _database_evidence(connection: sqlite3.Connection) -> DatabaseEvidence:
@@ -1050,6 +1137,40 @@ def _database_evidence(connection: sqlite3.Connection) -> DatabaseEvidence:
         user_version=user_version,
         schema_version=schema_version,
     )
+
+
+def _schema_function_calls(connection: sqlite3.Connection) -> tuple[str, ...]:
+    """Find callable SQLite functions embedded in persistent schema SQL.
+
+    SQLite does not consistently emit an authorizer callback while evaluating
+    functions stored in CHECK constraints, generated columns, defaults,
+    expression indexes, views, or triggers. A synthetic migration therefore
+    fails closed before plan writes when the copied schema names any function
+    registered on this isolated connection.
+    """
+
+    function_names = {
+        str(row[0]).casefold()
+        for row in connection.execute("PRAGMA function_list").fetchall()
+        if row and isinstance(row[0], str) and row[0]
+    }
+    schema_fragments = [
+        str(row[0])
+        for row in connection.execute(
+            "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL"
+        ).fetchall()
+    ]
+    combined_schema = "\n".join(schema_fragments)
+    found: list[str] = []
+    for name in sorted(function_names):
+        escaped = re.escape(name)
+        if re.search(
+            rf'(?<![A-Za-z0-9_])(?:["`\[])?{escaped}(?:["`\]])?\s*\(',
+            combined_schema,
+            flags=re.IGNORECASE,
+        ):
+            found.append(name)
+    return tuple(found)
 
 
 def _single_check(connection: sqlite3.Connection, pragma: str) -> str:
@@ -1138,8 +1259,16 @@ def _migration_authorizer(
 ) -> int:
     denied = {
         sqlite3.SQLITE_ATTACH,
+        sqlite3.SQLITE_CREATE_TEMP_INDEX,
+        sqlite3.SQLITE_CREATE_TEMP_TABLE,
+        sqlite3.SQLITE_CREATE_TEMP_TRIGGER,
+        sqlite3.SQLITE_CREATE_TEMP_VIEW,
         sqlite3.SQLITE_CREATE_VTABLE,
         sqlite3.SQLITE_DETACH,
+        sqlite3.SQLITE_DROP_TEMP_INDEX,
+        sqlite3.SQLITE_DROP_TEMP_TABLE,
+        sqlite3.SQLITE_DROP_TEMP_TRIGGER,
+        sqlite3.SQLITE_DROP_TEMP_VIEW,
         sqlite3.SQLITE_DROP_VTABLE,
         sqlite3.SQLITE_SAVEPOINT,
         sqlite3.SQLITE_TRANSACTION,

@@ -32,10 +32,10 @@ Focused maintenance, legacy migration, and database-isolation matrix:
 ```text
 python3 -m pytest tests/maintenance/test_sqlite_service.py \
   tests/test_multiuser.py tests/security/test_db_isolation.py -q --tb=short
-228 passed
+232 passed
 ```
 
-The PR 4D maintenance module has 61 direct tests covering active WAL state,
+The PR 4D maintenance module has 65 direct tests covering active WAL state,
 multiportfolio preservation, backup/restore manifests, clean-room equivalence,
 corruption, preexisting targets, symlinks, hardlinks, companion files,
 substitution races, backup/restore interruption, migration rollback,
@@ -44,13 +44,14 @@ planner-statistics evidence, bounded migration execution, `WITHOUT ROWID` and
 shadowed-rowid compatibility, native-pointer and virtual-table denial,
 schema-cookie protection and tracking, native-function denial, bounded
 synthetic database growth, pre-publication final-evidence failure, CLI output,
-and legacy quarantine.
+embedded-schema-function rejection, per-opcode deadline enforcement, TEMP
+storage containment, narrow migration-grammar rejection, and legacy quarantine.
 
 Final full repository regression:
 
 ```text
 python3 -m pytest tests/ -q --tb=short
-3106 passed, 5 skipped, 20 known warnings in 178.63s
+3110 passed, 5 skipped, 20 known warnings in 85.92s
 ```
 
 After PR 4C merged to `main`, that exact head was merge-integrated into this
@@ -161,8 +162,19 @@ claiming isolation that an in-process filesystem library cannot provide:
 - Plan-invoked SQL functions are denied, including native functions that can
   allocate or execute without reaching the VM progress callback. SQLite's
   internal ALTER TABLE helper calls are reserved from plan SQL. The deadline is
-  rechecked after each statement, and a per-database page ceiling limits
-  synthetic growth to 64 MiB by default.
+  checked after every VM opcode and after each statement. Separate main and
+  temporary page ceilings limit synthetic growth to 64 MiB each by default,
+  and plan-controlled TEMP DDL is denied.
+- Migration plans are not arbitrary SQL. Full-match validation permits only a
+  small documented grammar of basic DDL plus parameter-only INSERT and
+  predicate-required UPDATE/DELETE. Functions, expressions, comments,
+  subqueries, PRAGMAs, TEMP objects, transaction control, and quoted
+  identifiers fail before source/target access. The authorizer and resource
+  controls are defense in depth rather than a claimed complete SQL sandbox.
+- Functions embedded in persistent source schema can execute without an
+  authorizer callback. The service now detects registered function names in
+  copied schema SQL before plan execution and returns a rollback-only failure
+  report rather than evaluating the schema expression.
 - Final live-source evidence is captured after the descriptor-bound synthetic
   artifact is verified but before publication. A failed final evidence read
   closes the still-anonymous artifact and leaves no target path.
@@ -178,8 +190,8 @@ claiming isolation that an in-process filesystem library cannot provide:
 Current verification:
 
 ```text
-focused maintenance + multiuser + DB isolation: 228 passed
-full repository: 3106 passed, 5 skipped, 20 known warnings
+focused maintenance + multiuser + DB isolation: 232 passed
+full repository: 3110 passed, 5 skipped, 20 known warnings
 PR 4C settlement integration file: 30 passed
 Python 3.10 direct authorizer commit/rollback probe: passed
 Black, isort, flake8, Bandit, mypy, and git diff checks on changed scope: passed

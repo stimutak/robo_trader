@@ -120,13 +120,35 @@ capture. Final report evidence and the artifact digest come directly from the
 descriptor-bound manifest captured before atomic publication; the report never
 reopens the published target.
 
+`MigrationStep` is not an arbitrary-SQL sandbox. Before opening the source or
+creating a synthetic target, the service requires every statement to match one
+of these exact, full-string templates:
+
+- `SELECT 1` for a no-op probe;
+- simple-identifier `CREATE TABLE`, `DROP TABLE`, or `ALTER TABLE ... ADD
+  COLUMN`, with columns limited to SQLite's five basic storage classes and
+  literal-only basic constraints;
+- parameter-only `INSERT ... (columns) VALUES (...)`;
+- single-column parameterized `UPDATE` or `DELETE` with one or more required
+  equality predicates in `WHERE`.
+
+Identifiers are unquoted ASCII names. DML values must be `?` parameters.
+Comments, schema expressions, functions, subqueries, compound statements,
+TEMP objects, PRAGMAs, transaction control, and every other SQL shape are
+rejected before the copy begins. Parameters are limited to 4 MiB individually
+and 16 MiB across a plan. The SQLite authorizer, per-opcode deadline, and page
+limits remain defense in depth; they are not claimed as a complete SQL
+sandbox. A migration outside this grammar needs a separately reviewed typed
+adapter.
+
 Table evidence includes an exposed SQLite rowid where one exists and persistent
 `sqlite_stat*` planner-statistics tables. Delete/reinsert changes that preserve
 visible values and changes produced by `ANALYZE` therefore cannot evade the
 before/after or source-unchanged comparison.
 
-Migration authorization permits only the read/evidence PRAGMAs the service
-requires plus the evidence-tracked `application_id` and `user_version` values.
+Defense-in-depth migration authorization permits only the read/evidence
+PRAGMAs the service requires plus the evidence-tracked `application_id` and
+`user_version` values.
 `schema_version` is readable for evidence but caller writes are denied. All
 other PRAGMAs, including path, journaling, checkpoint, schema-trust, and
 process-global allocator controls, are denied. Plan-invoked SQL functions,
@@ -142,10 +164,22 @@ report as SQL execution failures.
 Migration execution also has a SQLite progress-handler deadline (30 seconds by
 default, configurable on the service), checked again after each statement and
 before commit. Statements that exceed the deadline roll back even if a native
-SQLite operation returns without invoking the VM progress handler. The
-synthetic database can grow by at most 64 MiB by default (configurable from
-1 MiB to 1 GiB) through SQLite's per-database page limit. Exceeding either bound
+SQLite operation returns without invoking the VM progress handler. The handler
+runs after every VM opcode so repeated concatenations and similar low-opcode
+allocation chains cannot accumulate between checks. The main and temporary
+synthetic databases can each grow by at most 64 MiB by default (configurable
+from 1 MiB to 1 GiB) through separate SQLite page limits. Plan-controlled TEMP
+DDL is denied as an additional boundary. Exceeding either time or storage bound
 returns `migration_plan_failed`.
+
+SQLite does not consistently send authorizer callbacks for functions embedded
+in copied CHECK constraints, generated columns, defaults, expression indexes,
+views, or triggers. Before any plan write, the service compares persistent
+schema SQL with the isolated connection's registered function list. A named
+schema function makes the dry run return `migration_plan_failed` without
+executing the plan. This conservative fail-closed policy can reject a harmless
+schema expression; such a migration needs a separately reviewed adapter rather
+than a bypass.
 
 The final bound live-source evidence check runs after the synthetic bytes and
 manifest have been verified but before the anonymous target is published. If

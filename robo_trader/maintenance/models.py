@@ -167,7 +167,7 @@ SQLiteParameter = str | int | float | bytes | None
 
 @dataclass(frozen=True, slots=True)
 class MigrationStep:
-    """One declarative SQL statement for a synthetic-copy dry run."""
+    """One statement in the maintenance service's narrow migration grammar."""
 
     sql: str
     parameters: tuple[SQLiteParameter, ...] = ()
