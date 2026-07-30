@@ -11,7 +11,12 @@ import pytest
 
 from robo_trader.accounting import AccountingEpoch, FifoAccountingConflict, FifoLedger
 from robo_trader.accounting.fifo import FillSide
-from robo_trader.accounting.fifo_fixture_migration import migrate_fifo_fixture_database
+from robo_trader.accounting.fifo_fixture_migration import (
+    _TABLE_SQL,
+    _TRIGGER_SQL,
+    FifoFixtureMigrationError,
+    migrate_fifo_fixture_database,
+)
 from robo_trader.accounting.fifo_runtime import (
     LOCAL_PAPER_COMMISSION_SOURCE,
     FifoRuntimeSettlementError,
@@ -229,6 +234,36 @@ def test_epoch_realized_pnl_is_independent_of_ambient_decimal_precision() -> Non
         assert projection.fill_realized_pnl == Decimal("-12345.66")
         assert projection.epoch_realized_pnl == Decimal("0.01")
         assert projection.total_realized_pnl == Decimal("0.01")
+    finally:
+        connection.close()
+
+
+def test_runtime_fill_rejects_case_changed_fifo_constraint_before_writing() -> None:
+    connection, effective = _connection()
+    try:
+        connection.execute("DROP TABLE fifo_commissions")
+        connection.execute(_TABLE_SQL["fifo_commissions"].replace("'USD'", "'usd'"))
+        for name, statement in _TRIGGER_SQL.items():
+            if name.startswith("fifo_commissions_no_"):
+                connection.execute(statement)
+
+        connection.execute("BEGIN IMMEDIATE")
+        with pytest.raises(FifoFixtureMigrationError, match="fifo_commissions is malformed"):
+            append_runtime_fill_in_transaction(
+                connection,
+                _evidence(
+                    1,
+                    side=FillSide.BUY,
+                    quantity="1",
+                    price="100",
+                    commission_minor=0,
+                    occurred_at=effective,
+                ),
+            )
+        connection.rollback()
+
+        assert connection.execute("SELECT COUNT(*) FROM fifo_fills").fetchone() == (0,)
+        assert connection.execute("SELECT COUNT(*) FROM fifo_commissions").fetchone() == (0,)
     finally:
         connection.close()
 

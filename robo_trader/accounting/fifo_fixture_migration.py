@@ -503,9 +503,42 @@ _TRIGGER_SQL.update(
 
 
 def _normalize_sql(value: object) -> str:
-    if not isinstance(value, str):
+    if not isinstance(value, str) or not value.strip():
         return ""
-    return re.sub(r"\s+", " ", value.strip().lower())
+    normalized: list[str] = []
+    quote_end: Optional[str] = None
+    pending_space = False
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if quote_end is not None:
+            normalized.append(character)
+            if character == quote_end:
+                if quote_end in {"'", '"', "`"} and index + 1 < len(value):
+                    if value[index + 1] == quote_end:
+                        normalized.append(value[index + 1])
+                        index += 2
+                        continue
+                quote_end = None
+            index += 1
+            continue
+        if character in {"'", '"', "`", "["}:
+            if pending_space and normalized:
+                normalized.append(" ")
+            pending_space = False
+            quote_end = "]" if character == "[" else character
+            normalized.append(character)
+        elif character.isspace():
+            pending_space = True
+        else:
+            if pending_space and normalized:
+                normalized.append(" ")
+            pending_space = False
+            normalized.append(character.lower())
+        index += 1
+    if quote_end is not None:
+        return ""
+    return "".join(normalized).strip()
 
 
 def _database_path(connection: sqlite3.Connection) -> Optional[Path]:

@@ -63,9 +63,12 @@ upgraded ledger is not quarantined merely for predating the fresh-database
 DDL. Every settlement statement is explicitly qualified to the durable `main`
 schema.
 The FIFO ledger separately performs the same in-transaction protection for all
-FIFO tables and triggers. Thus a temporary settlement-link table cannot divert
-lineage, a same-shaped table cannot substitute altered constraints, and an
-injected trade trigger cannot add an unreviewed compatibility row after
+FIFO tables and triggers. Its SQL normalization folds syntax outside quotes but
+preserves quoted literals exactly, so a case-changed commission constraint
+cannot authenticate as canonical and then reject the emitted uppercase
+currency after mutation begins. Thus a temporary settlement-link table cannot
+divert lineage, a same-shaped table cannot substitute altered constraints, and
+an injected trade trigger cannot add an unreviewed compatibility row after
 projection checks.
 
 Every fill-local and epoch-wide realized-P&L subtotal is accumulated in an
