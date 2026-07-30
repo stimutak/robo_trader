@@ -841,6 +841,60 @@ def test_migration_plan_cannot_attach_or_commit(tmp_path: Path) -> None:
     assert report.source_unchanged is True
 
 
+@pytest.mark.parametrize("pragma", ["hard_heap_limit", "soft_heap_limit"])
+def test_migration_plan_cannot_change_process_global_heap_limits(
+    tmp_path: Path,
+    pragma: str,
+) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    _create_multiportfolio_database(source).close()
+
+    with sqlite3.connect(":memory:") as observer:
+        before_limit = observer.execute(f"PRAGMA {pragma}").fetchone()
+        report = SQLiteMaintenanceService().dry_run_migration(
+            source,
+            target,
+            plan=MigrationPlan(
+                migration_id=f"deny-{pragma.replace('_', '-')}",
+                steps=(MigrationStep(f"PRAGMA {pragma}=1048576"),),
+            ),
+        )
+        after_limit = observer.execute(f"PRAGMA {pragma}").fetchone()
+
+    assert report.outcome == "rolled_back"
+    assert report.error_code == "migration_plan_failed"
+    assert report.before == report.after
+    assert report.source_unchanged is True
+    assert after_limit == before_limit
+
+
+def test_migration_oversized_integer_parameter_rolls_back_with_report(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    _create_multiportfolio_database(source).close()
+
+    report = SQLiteMaintenanceService().dry_run_migration(
+        source,
+        target,
+        plan=MigrationPlan(
+            migration_id="oversized-integer",
+            steps=(
+                MigrationStep(
+                    "UPDATE positions SET quantity=? WHERE portfolio_id='alpha'",
+                    (2**100,),
+                ),
+            ),
+        ),
+    )
+
+    assert report.outcome == "rolled_back"
+    assert report.error_code == "migration_plan_failed"
+    assert report.before == report.after
+    assert report.source_unchanged is True
+    assert stat.S_IMODE(target.stat().st_mode) == 0o400
+
+
 def test_verify_rejects_companions_without_creating_or_rewriting_them(tmp_path: Path) -> None:
     source = tmp_path / "source.db"
     _create_multiportfolio_database(source).close()
@@ -943,3 +997,118 @@ def test_cli_backup_verify_and_restore_are_non_authorizing(tmp_path: Path) -> No
         )
         assert completed.returncode == 0, completed.stderr
         assert json.loads(completed.stdout)["authorizes_startup"] is False
+
+
+def test_cli_reserves_backup_manifest_before_database_publication(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    manifest = tmp_path / "backup.json"
+    _create_multiportfolio_database(source).close()
+    manifest.write_bytes(b"operator-owned-report")
+    script = Path(__file__).resolve().parents[2] / "scripts" / "database_maintenance.py"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "backup",
+            "--source",
+            str(source),
+            "--target",
+            str(backup),
+            "--manifest",
+            str(manifest),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert completed.returncode == 2
+    assert not backup.exists()
+    assert manifest.read_bytes() == b"operator-owned-report"
+
+
+def test_cli_reserves_restore_manifest_before_database_publication(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    backup_manifest = tmp_path / "backup.json"
+    target = tmp_path / "restore.db"
+    restore_manifest = tmp_path / "restore.json"
+    _create_multiportfolio_database(source).close()
+    service = SQLiteMaintenanceService()
+    manifest = service.backup(source, backup)
+    service.write_manifest(manifest, backup_manifest)
+    restore_manifest.write_bytes(b"operator-owned-report")
+    script = Path(__file__).resolve().parents[2] / "scripts" / "database_maintenance.py"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "restore-clean-room",
+            "--backup",
+            str(backup),
+            "--backup-manifest",
+            str(backup_manifest),
+            "--target",
+            str(target),
+            "--restore-manifest",
+            str(restore_manifest),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert completed.returncode == 2
+    assert not target.exists()
+    assert restore_manifest.read_bytes() == b"operator-owned-report"
+
+
+@pytest.mark.parametrize(
+    ("family_owner", "suffix"),
+    [
+        ("source", "-wal"),
+        ("target", ""),
+        ("target", "-journal"),
+        ("target", "-shm"),
+        ("target", "-wal"),
+    ],
+)
+def test_cli_rejects_manifest_in_database_resource_family(
+    tmp_path: Path,
+    family_owner: str,
+    suffix: str,
+) -> None:
+    source = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    owner = source if family_owner == "source" else backup
+    manifest = owner.with_name(owner.name + suffix)
+    _create_multiportfolio_database(source).close()
+    script = Path(__file__).resolve().parents[2] / "scripts" / "database_maintenance.py"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "backup",
+            "--source",
+            str(source),
+            "--target",
+            str(backup),
+            "--manifest",
+            str(manifest),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert completed.returncode == 2
+    assert "report path overlaps a SQLite resource family" in completed.stderr
+    assert not backup.exists()
+    assert not manifest.exists()

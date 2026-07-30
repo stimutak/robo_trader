@@ -49,15 +49,23 @@ The supported operations are:
 Reports and manifests contain no paths, row values, environment values,
 credentials, account identifiers, or broker configuration. They always state
 `contains_secrets=false`, `mutated_authoritative_state=false`, and
-`authorizes_startup=false`.
+`authorizes_startup=false`. A report path must be distinct from every database
+main path and its `-wal`, `-shm`, and `-journal` resource family. Backup and
+restore commands exclusively reserve their output-manifest path before the
+database artifact can be published, so an existing or unwritable report target
+cannot leave an orphan database artifact.
 
 If backup, restore, or verification is interrupted, the authoritative main-file
 bytes and committed logical state are not modified. A normal read connection to
 a WAL-mode source may create SQLite-managed `-wal`/`-shm` companions; the
 service validates and preserves them and never deletes them. The unlinked
 partial output inode disappears when its held descriptor is closed; the
-requested output path remains absent, there is no successful manifest, and no
-partial file can be mistaken for a usable artifact.
+requested database output path remains absent and no partial database can be
+mistaken for a usable artifact. The command-line tool leaves its exclusively
+created, owner-only manifest reservation in place as a failure marker. It may
+be empty or contain incomplete JSON, but the command returns nonzero and
+`load_manifest` rejects it. Operators must inspect that marker and choose a new
+output path; this service never deletes or reuses it.
 
 ## Commands
 
@@ -98,6 +106,12 @@ reports include before/after schema, row counts, content hashes, integrity
 state, and a source-unchanged result. Final report evidence and the artifact
 digest come directly from the descriptor-bound manifest captured before atomic
 publication; the report never reopens the published target.
+
+Migration authorization also denies SQLite pragmas that can affect paths,
+journaling, schema trust, checkpoints, or process-global allocator limits,
+including `hard_heap_limit` and `soft_heap_limit`. Parameter binding failures,
+including integers outside SQLite's signed 64-bit range, roll back and produce
+the same secret-free `migration_plan_failed` report as SQL execution failures.
 
 Active WAL sources are supported. Initial and final source evidence is captured
 from bound SQLite read snapshots rather than by requiring a companion-free main

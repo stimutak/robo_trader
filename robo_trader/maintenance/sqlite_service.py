@@ -226,6 +226,71 @@ class _StagedTarget:
             ) from errors[0]
 
 
+@dataclass(slots=True)
+class _ManifestReservation:
+    """Exclusive manifest pathname held open before a database is published."""
+
+    requested_path: Path
+    parent_file_descriptor: int
+    guardian_file_descriptor: int
+    device: int
+    inode: int
+    completed: bool = False
+    closed: bool = False
+
+    def assert_identity(self) -> None:
+        if self.closed:
+            raise SQLiteMaintenanceError("manifest reservation is closed")
+        parent = os.fstat(self.parent_file_descriptor)
+        current_parent = os.lstat(self.requested_path.parent)
+        guardian = os.fstat(self.guardian_file_descriptor)
+        current = os.stat(
+            self.requested_path.name,
+            dir_fd=self.parent_file_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or stat.S_ISLNK(current_parent.st_mode)
+            or not stat.S_ISDIR(current_parent.st_mode)
+            or (parent.st_dev, parent.st_ino) != (current_parent.st_dev, current_parent.st_ino)
+            or not stat.S_ISREG(guardian.st_mode)
+            or guardian.st_nlink != 1
+            or (guardian.st_dev, guardian.st_ino) != (self.device, self.inode)
+            or not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino) != (self.device, self.inode)
+        ):
+            raise SQLiteMaintenanceError("manifest reservation identity changed")
+
+    def write_payload(self, payload: bytes) -> None:
+        self.assert_identity()
+        if self.completed or os.fstat(self.guardian_file_descriptor).st_size != 0:
+            raise SQLiteMaintenanceError("manifest reservation is not empty")
+        os.lseek(self.guardian_file_descriptor, 0, os.SEEK_SET)
+        _write_all(self.guardian_file_descriptor, payload)
+        os.fsync(self.guardian_file_descriptor)
+        os.fchmod(self.guardian_file_descriptor, 0o400)
+        os.fsync(self.guardian_file_descriptor)
+        os.fsync(self.parent_file_descriptor)
+        self.assert_identity()
+        self.completed = True
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        errors: list[OSError] = []
+        for descriptor in (self.guardian_file_descriptor, self.parent_file_descriptor):
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                errors.append(exc)
+        if errors:
+            raise SQLiteMaintenanceError(
+                "manifest reservation descriptor was already closed"
+            ) from errors[0]
+
+
 class SQLiteMaintenanceService:
     """Operate only on explicit, descriptor-bound SQLite files."""
 
@@ -349,7 +414,7 @@ class SQLiteMaintenanceService:
                 interim = _database_evidence(connection)
                 if interim.integrity_check != "ok" or interim.foreign_key_violations:
                     raise SQLiteMaintenanceError("migration produced invalid SQLite state")
-            except (sqlite3.Error, SQLiteMaintenanceError):
+            except (sqlite3.Error, SQLiteMaintenanceError, OverflowError):
                 # Python 3.10 cannot reliably disable an authorizer by passing
                 # None.  Replace it with a completion-only policy before the
                 # service-owned rollback instead.
@@ -424,36 +489,92 @@ class SQLiteMaintenanceService:
     ) -> None:
         """Write one canonical JSON report to an exclusive owner-only path."""
 
+        reservation = self.reserve_manifest(target_path)
+        try:
+            self.write_reserved_manifest(manifest, reservation)
+        finally:
+            reservation.close()
+
+    def reserve_manifest(self, target_path: Path | str) -> _ManifestReservation:
+        """Reserve a manifest pathname before publishing its database artifact."""
+
         path = _absolute_canonical_path(target_path)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+            raise SQLiteMaintenanceError("platform lacks descriptor-relative manifest isolation")
+        parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
         try:
-            descriptor = os.open(path, flags, 0o600)
+            parent_descriptor = os.open(path.parent, parent_flags)
         except OSError as exc:
-            raise SQLiteMaintenanceError("manifest target must be a new exclusive path") from exc
+            raise SQLiteMaintenanceError("manifest parent cannot be opened safely") from exc
+        descriptor: int | None = None
         try:
-            payload = (
-                json.dumps(manifest.to_dict(), sort_keys=True, separators=(",", ":")).encode(
-                    "utf-8"
-                )
-                + b"\n"
-            )
-            _write_all(descriptor, payload)
-            os.fsync(descriptor)
-            os.fchmod(descriptor, 0o400)
-            os.fsync(descriptor)
-            _fsync_directory(path.parent)
-            metadata = os.fstat(descriptor)
-            current = os.lstat(path)
+            parent = os.fstat(parent_descriptor)
+            current_parent = os.lstat(path.parent)
             if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_nlink != 1
-                or (metadata.st_dev, metadata.st_ino) != (current.st_dev, current.st_ino)
+                not stat.S_ISDIR(parent.st_mode)
+                or stat.S_ISLNK(current_parent.st_mode)
+                or not stat.S_ISDIR(current_parent.st_mode)
+                or (parent.st_dev, parent.st_ino) != (current_parent.st_dev, current_parent.st_ino)
             ):
-                raise SQLiteMaintenanceError("manifest identity changed while writing")
+                raise SQLiteMaintenanceError("manifest parent identity changed")
+            flags = (
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+            )
+            descriptor = os.open(path.name, flags, 0o600, dir_fd=parent_descriptor)
+            metadata = os.fstat(descriptor)
+            reservation = _ManifestReservation(
+                requested_path=path,
+                parent_file_descriptor=parent_descriptor,
+                guardian_file_descriptor=descriptor,
+                device=metadata.st_dev,
+                inode=metadata.st_ino,
+            )
+            reservation.assert_identity()
+            os.fsync(parent_descriptor)
+            reservation.assert_identity()
+            return reservation
+        except OSError as exc:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(parent_descriptor)
+            raise SQLiteMaintenanceError("manifest target must be a new exclusive path") from exc
+        except BaseException:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(parent_descriptor)
+            raise
+
+    @staticmethod
+    def write_reserved_manifest(
+        manifest: MaintenanceManifest | MigrationDryRunReport,
+        reservation: _ManifestReservation,
+    ) -> None:
+        """Finish one already-reserved manifest without reopening its pathname."""
+
+        payload = (
+            json.dumps(manifest.to_dict(), sort_keys=True, separators=(",", ":")).encode("utf-8")
+            + b"\n"
+        )
+        try:
+            reservation.write_payload(payload)
         except OSError as exc:
             raise SQLiteMaintenanceError("manifest write failed closed") from exc
-        finally:
-            os.close(descriptor)
+
+    @staticmethod
+    def assert_report_paths_disjoint(
+        *,
+        database_paths: Sequence[Path | str],
+        report_paths: Sequence[Path | str],
+    ) -> None:
+        """Reject reports that alias a database or any SQLite companion path."""
+
+        databases = tuple(_absolute_canonical_path(path) for path in database_paths)
+        reports = tuple(_absolute_canonical_path(path) for path in report_paths)
+        if len(set(reports)) != len(reports):
+            raise SQLiteMaintenanceError("report paths must be distinct")
+        database_resources = set().union(*(_sqlite_resource_family(path) for path in databases))
+        if any(report in database_resources for report in reports):
+            raise SQLiteMaintenanceError("report path overlaps a SQLite resource family")
 
     def load_manifest(self, path: Path | str) -> MaintenanceManifest:
         """Load a bounded, single-link manifest without following its leaf."""
@@ -919,7 +1040,9 @@ def _migration_authorizer(
     }
     dangerous_pragmas = {
         "data_store_directory",
+        "hard_heap_limit",
         "journal_mode",
+        "soft_heap_limit",
         "temp_store_directory",
         "wal_checkpoint",
         "writable_schema",

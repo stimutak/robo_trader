@@ -47,10 +47,23 @@ def main(argv: list[str] | None = None) -> int:
     service = SQLiteMaintenanceService()
     try:
         if args.command == "backup":
-            backup_manifest = service.backup(args.source, args.target)
-            service.write_manifest(backup_manifest, args.manifest)
+            service.assert_report_paths_disjoint(
+                database_paths=(args.source, args.target),
+                report_paths=(args.manifest,),
+            )
+            reservation = service.reserve_manifest(args.manifest)
+            try:
+                backup_manifest = service.backup(args.source, args.target)
+                service.write_reserved_manifest(backup_manifest, reservation)
+            finally:
+                reservation.close()
             payload = backup_manifest.to_dict()
         elif args.command == "verify":
+            if args.manifest:
+                service.assert_report_paths_disjoint(
+                    database_paths=(args.database,),
+                    report_paths=(args.manifest,),
+                )
             expected_manifest = service.load_manifest(args.manifest) if args.manifest else None
             evidence = service.verify(args.database, expected_manifest)
             payload = {
@@ -62,9 +75,21 @@ def main(argv: list[str] | None = None) -> int:
                 "authorizes_startup": False,
             }
         else:
-            expected_backup = service.load_manifest(args.backup_manifest)
-            restore_manifest = service.restore_clean_room(args.backup, args.target, expected_backup)
-            service.write_manifest(restore_manifest, args.restore_manifest)
+            service.assert_report_paths_disjoint(
+                database_paths=(args.backup, args.target),
+                report_paths=(args.backup_manifest, args.restore_manifest),
+            )
+            reservation = service.reserve_manifest(args.restore_manifest)
+            try:
+                expected_backup = service.load_manifest(args.backup_manifest)
+                restore_manifest = service.restore_clean_room(
+                    args.backup,
+                    args.target,
+                    expected_backup,
+                )
+                service.write_reserved_manifest(restore_manifest, reservation)
+            finally:
+                reservation.close()
             payload = restore_manifest.to_dict()
     except SQLiteMaintenanceError as exc:
         print(

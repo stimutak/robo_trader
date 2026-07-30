@@ -30,12 +30,12 @@ Branch: `codex/pr4d-backup-restore`
 Focused maintenance, legacy migration, and database-isolation matrix:
 
 ```text
-python -m pytest tests/maintenance/test_sqlite_service.py \
+python3 -m pytest tests/maintenance/test_sqlite_service.py \
   tests/test_multiuser.py tests/security/test_db_isolation.py -q --tb=short
-188 passed
+215 passed
 ```
 
-The PR 4D maintenance module has 30 direct tests covering active WAL state,
+The PR 4D maintenance module has 48 direct tests covering active WAL state,
 multiportfolio preservation, backup/restore manifests, clean-room equivalence,
 corruption, preexisting targets, symlinks, hardlinks, companion files,
 substitution races, backup/restore interruption, migration rollback,
@@ -44,19 +44,19 @@ declarative-plan containment, CLI output, and legacy quarantine.
 Final full repository regression:
 
 ```text
-python -m pytest tests/ -q --tb=short
-2854 passed, 5 skipped, 20 known warnings in 189.19s
+python3 -m pytest tests/ -q --tb=short
+3067 passed, 5 skipped, 20 known warnings in 80.90s
 ```
 
 Static checks:
 
 ```text
-python -m black --check <changed Python paths>
-python -m isort --check-only <changed Python paths>
-python -m flake8 <changed Python paths>
-python -m bandit -q -r robo_trader/maintenance \
+python3 -m black --check <changed Python paths>
+python3 -m isort --check-only <changed Python paths>
+python3 -m flake8 <changed Python paths>
+python3 -m bandit -q -r robo_trader/maintenance \
   scripts/database_maintenance.py robo_trader/multiuser/migration.py
-python -m mypy --follow-imports=skip --ignore-missing-imports \
+python3 -m mypy --follow-imports=skip --ignore-missing-imports \
   robo_trader/maintenance/models.py \
   robo_trader/maintenance/sqlite_service.py \
   scripts/database_maintenance.py robo_trader/multiuser/migration.py
@@ -141,12 +141,22 @@ claiming isolation that an in-process filesystem library cannot provide:
   with a completion-only policy. This avoids Python 3.10's unsupported
   `set_authorizer(None)` behavior without allowing plan-supplied transaction
   control.
+- Migration plans cannot change SQLite's process-global hard or soft heap
+  limits. Oversized integer binding failures are converted into the same
+  rollback-only, secret-free failure report as rejected SQL.
+- Every CLI report path is checked against the full main/`-wal`/`-shm`/
+  `-journal` family of each source, backup, and target database. Backup and
+  restore manifest paths are exclusively reserved and descriptor-bound before
+  database publication, so an existing or unwritable report path cannot leave
+  a new orphan database artifact.
+- All documented Python invocations use the project-required `python3`
+  executable name.
 
 Current verification:
 
 ```text
-focused maintenance + multiuser + DB isolation: 205 passed
-full repository: 3057 passed, 5 skipped, 20 known warnings
+focused maintenance + multiuser + DB isolation: 215 passed
+full repository: 3067 passed, 5 skipped, 20 known warnings
 Python 3.10 direct authorizer commit/rollback probe: passed
 Black, isort, flake8, Bandit, mypy, and git diff checks on changed scope: passed
 ```
