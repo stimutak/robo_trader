@@ -8,10 +8,12 @@ be applied to an operational ledger.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import sqlite3
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 FIFO_ACCOUNTING_COMPONENT = "fifo_accounting"
 FIFO_ACCOUNTING_SCHEMA_VERSION = 2
@@ -25,6 +27,14 @@ FIXTURE_DATABASE_SUFFIX = ".fifo-fixture.sqlite3"
 
 class FifoFixtureMigrationError(RuntimeError):
     """A fixture database cannot safely accept the FIFO schema."""
+
+
+def _legacy_opening_manifest_hash(rows: Sequence[Sequence[object]]) -> str:
+    """Bind one sealed candidate to its complete ordered opening-lot set."""
+
+    payload = [list(row) for row in rows]
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("ascii")).hexdigest()
 
 
 def _positive_decimal_check(column: str) -> str:
@@ -94,6 +104,14 @@ _TABLE_SQL = {
                 length(candidate_fingerprint) = 64
                 AND candidate_fingerprint = lower(candidate_fingerprint)
                 AND candidate_fingerprint NOT GLOB '*[^0-9a-f]*'
+            ),
+            opening_manifest_count INTEGER NOT NULL CHECK (
+                typeof(opening_manifest_count) = 'integer' AND opening_manifest_count >= 0
+            ),
+            opening_manifest_hash TEXT NOT NULL CHECK (
+                length(opening_manifest_hash) = 64
+                AND opening_manifest_hash = lower(opening_manifest_hash)
+                AND opening_manifest_hash NOT GLOB '*[^0-9a-f]*'
             ),
             reconciliation_snapshot_id TEXT NOT NULL CHECK (
                 length(trim(reconciliation_snapshot_id)) > 0
@@ -522,19 +540,47 @@ def _assert_fixture_target(
         raise FifoFixtureMigrationError("fixture database must not have hard link aliases")
 
 
+def _trigger_references_fifo_table(sql: object) -> bool:
+    if type(sql) is not str:
+        return False
+    return any(
+        re.search(rf"(?<![a-z0-9_]){re.escape(table)}(?![a-z0-9_])", sql, re.IGNORECASE) is not None
+        for table in _TABLE_SQL
+    )
+
+
+def _foreign_fifo_triggers(rows: Sequence[Sequence[object]]) -> set[str]:
+    return {
+        str(name)
+        for name, table, sql in rows
+        if str(name) not in _TRIGGER_SQL
+        and (
+            str(name).lower().startswith("fifo_")
+            or str(table).lower() in _TABLE_SQL
+            or _trigger_references_fifo_table(sql)
+        )
+    }
+
+
 def _assert_no_temp_fifo_objects(connection: sqlite3.Connection) -> None:
     protected_tables = tuple(_TABLE_SQL)
     protected_table_names = "|" + "|".join(protected_tables) + "|"
     shadow_query = (
-        "SELECT type, name FROM temp.sqlite_master "
+        "SELECT type, name, tbl_name, sql FROM temp.sqlite_master "
         "WHERE name LIKE 'fifo_%' OR instr(?, '|' || tbl_name || '|') > 0 "
+        "OR type = 'trigger' "
         "ORDER BY type, name"
     )
     shadows = connection.execute(
         shadow_query,
         (protected_table_names,),
     ).fetchall()
-    if shadows:
+    if any(
+        str(row[1]).lower().startswith("fifo_")
+        or str(row[2]).lower() in _TABLE_SQL
+        or (str(row[0]) == "trigger" and _trigger_references_fifo_table(row[3]))
+        for row in shadows
+    ):
         raise FifoFixtureMigrationError("temporary FIFO objects cannot shadow durable main state")
 
 
@@ -592,11 +638,7 @@ def assert_fifo_accounting_schema(
         raise FifoFixtureMigrationError(
             f"FIFO fixture contains unexpected trigger {sorted(unexpected_triggers)[0]}"
         )
-    protected_foreign_triggers = {
-        str(name)
-        for name, table, _ in rows
-        if name not in _TRIGGER_SQL and (str(name).startswith("fifo_") or str(table) in _TABLE_SQL)
-    }
+    protected_foreign_triggers = _foreign_fifo_triggers(rows)
     if protected_foreign_triggers:
         raise FifoFixtureMigrationError("foreign triggers cannot target FIFO accounting tables")
     for name, statement in _TRIGGER_SQL.items():
@@ -612,7 +654,7 @@ def assert_fifo_accounting_schema(
     protected_foreign_schema = [
         row
         for row in unexpected_schema
-        if str(row[1]).startswith("fifo_") or str(row[2]) in _TABLE_SQL
+        if str(row[1]).lower().startswith("fifo_") or str(row[2]).lower() in _TABLE_SQL
     ]
     if protected_foreign_schema:
         raise FifoFixtureMigrationError(

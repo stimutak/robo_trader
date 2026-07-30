@@ -437,6 +437,20 @@ def test_foreign_main_trigger_targeting_fifo_table_is_rejected(connection):
     assert connection.execute("SELECT COUNT(*) FROM unrelated_audit").fetchone() == (0,)
 
 
+def test_foreign_main_trigger_body_referencing_fifo_table_is_rejected(connection):
+    connection.execute("CREATE TABLE unrelated_source(value TEXT NOT NULL)")
+    connection.execute("""
+        CREATE TRIGGER unrelated_fifo_injector
+        AFTER INSERT ON unrelated_source
+        BEGIN
+            INSERT INTO fifo_opening_balances(opening_balance_id) VALUES ('forged');
+        END
+        """)
+
+    with pytest.raises(FifoFixtureMigrationError, match="foreign triggers"):
+        FifoLedger(connection, allow_other_objects=True)
+
+
 def test_foreign_temp_trigger_targeting_fifo_table_is_rejected(connection):
     connection.execute("""
         CREATE TEMP TRIGGER unrelated_temp_capture

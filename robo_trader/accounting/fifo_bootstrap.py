@@ -19,7 +19,10 @@ from .fifo_fixture_migration import (
     _TRIGGER_SQL,
     FIFO_ACCOUNTING_COMPONENT,
     FIFO_ACCOUNTING_MIGRATIONS,
+    _foreign_fifo_triggers,
+    _legacy_opening_manifest_hash,
     _normalize_sql,
+    _trigger_references_fifo_table,
 )
 
 
@@ -82,6 +85,7 @@ class LegacyFifoBootstrapPlan:
     opening_balances: tuple[LegacyOpeningBalance, ...]
 
     def public_dict(self) -> dict[str, object]:
+        opening_manifest_rows = _opening_manifest_rows(self)
         return {
             "account_baseline": {
                 "cash_text": self.cash_text,
@@ -96,10 +100,33 @@ class LegacyFifoBootstrapPlan:
             "authorizes_startup": False,
             "opening_balances": [value.public_dict() for value in self.opening_balances],
             "opening_commission_semantics": "UNKNOWN_PRE_EPOCH_HISTORY_NOT_RECONSTRUCTED",
+            "opening_manifest_count": len(opening_manifest_rows),
+            "opening_manifest_hash": _legacy_opening_manifest_hash(opening_manifest_rows),
             "origin_kind": "LEGACY_AGGREGATE_OPENING_BALANCE",
             "pre_epoch_history_reconstructed": False,
             "synthetic_fill_count": 0,
         }
+
+
+def _opening_manifest_rows(plan: LegacyFifoBootstrapPlan) -> list[tuple[object, ...]]:
+    return [
+        (
+            opening.opening_balance_id,
+            opening.lot_id,
+            opening.con_id,
+            opening.symbol,
+            opening.direction,
+            opening.opened_quantity_text,
+            opening.cost_basis_text,
+            opening.mark_price_text,
+            opening.mark_observed_at,
+            opening.mark_evidence_fingerprint,
+            0,
+            0,
+            plan.effective_at,
+        )
+        for opening in plan.opening_balances
+    ]
 
 
 def build_legacy_fifo_bootstrap_plan(
@@ -184,15 +211,21 @@ async def _assert_fifo_schema(connection: aiosqlite.Connection) -> None:
     protected_tables = tuple(_TABLE_SQL)
     protected_table_names = "|" + "|".join(protected_tables) + "|"
     temporary_query = (
-        "SELECT type,name FROM temp.sqlite_master "
+        "SELECT type,name,tbl_name,sql FROM temp.sqlite_master "
         "WHERE name LIKE 'fifo_%' OR instr(?, '|' || tbl_name || '|') > 0 "
-        "ORDER BY type,name"
+        "OR type='trigger' ORDER BY type,name"
     )
     temporary = await connection.execute(
         temporary_query,
         (protected_table_names,),
     )
-    if await temporary.fetchone() is not None:
+    temporary_rows = await temporary.fetchall()
+    if any(
+        str(row[1]).lower().startswith("fifo_")
+        or str(row[2]).lower() in _TABLE_SQL
+        or (str(row[0]) == "trigger" and _trigger_references_fifo_table(row[3]))
+        for row in temporary_rows
+    ):
         raise FifoBootstrapError("temporary FIFO objects cannot shadow durable state")
     tables = await connection.execute(
         "SELECT name,sql FROM main.sqlite_master "
@@ -204,16 +237,15 @@ async def _assert_fifo_schema(connection: aiosqlite.Connection) -> None:
     for name, statement in _TABLE_SQL.items():
         if actual_tables[name] != _normalize_sql(statement):
             raise FifoBootstrapError(f"FIFO accounting table {name} is malformed")
-    trigger_query = (
-        "SELECT name,sql FROM main.sqlite_master "
-        "WHERE type='trigger' AND "
-        "(name LIKE 'fifo_%' OR instr(?, '|' || tbl_name || '|') > 0) ORDER BY name"
-    )
     triggers = await connection.execute(
-        trigger_query,
-        (protected_table_names,),
+        "SELECT name,tbl_name,sql FROM main.sqlite_master " "WHERE type='trigger' ORDER BY name"
     )
-    actual_triggers = {str(name): _normalize_sql(sql) for name, sql in await triggers.fetchall()}
+    trigger_rows = await triggers.fetchall()
+    if _foreign_fifo_triggers(trigger_rows):
+        raise FifoBootstrapError("foreign triggers cannot reference FIFO accounting tables")
+    actual_triggers = {
+        str(name): _normalize_sql(sql) for name, _, sql in trigger_rows if str(name) in _TRIGGER_SQL
+    }
     if set(actual_triggers) != set(_TRIGGER_SQL):
         raise FifoBootstrapError("FIFO accounting trigger set is incomplete or unknown")
     for name, statement in _TRIGGER_SQL.items():
@@ -258,6 +290,11 @@ async def prepare_fifo_accounting_schema_in_transaction(
     if existing:
         await _assert_fifo_schema(connection)
         return
+    triggers = await connection.execute(
+        "SELECT name,tbl_name,sql FROM main.sqlite_master " "WHERE type='trigger' ORDER BY name"
+    )
+    if _foreign_fifo_triggers(await triggers.fetchall()):
+        raise FifoBootstrapError("foreign triggers cannot reference FIFO accounting tables")
     for statement in _TABLE_SQL.values():
         await connection.execute(statement)
     await connection.executemany(
@@ -291,6 +328,8 @@ async def append_legacy_fifo_bootstrap_in_transaction(
     if type(operator_action_id) is not str or not operator_action_id:
         raise FifoBootstrapError("legacy FIFO bootstrap requires an administrator action")
     await _assert_fifo_schema(connection)
+    expected_openings = _opening_manifest_rows(plan)
+    opening_manifest_hash = _legacy_opening_manifest_hash(expected_openings)
     existing = await connection.execute(
         """
         SELECT epoch_id FROM fifo_accounting_epochs
@@ -329,15 +368,18 @@ async def append_legacy_fifo_bootstrap_in_transaction(
     await connection.execute(
         """
         INSERT INTO fifo_legacy_bootstrap_lineage(
-            epoch_id,bootstrap_id,candidate_fingerprint,reconciliation_snapshot_id,
+            epoch_id,bootstrap_id,candidate_fingerprint,
+            opening_manifest_count,opening_manifest_hash,reconciliation_snapshot_id,
             reconciliation_report_hash,broker_snapshot_hash,legacy_snapshot_hash,
             operator_action_id,recorded_at
-        ) VALUES (?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             plan.epoch_id,
             plan.bootstrap_id,
             plan.candidate_fingerprint,
+            len(expected_openings),
+            opening_manifest_hash,
             plan.reconciliation_snapshot_id,
             plan.reconciliation_report_hash,
             plan.broker_snapshot_hash,
@@ -421,7 +463,8 @@ async def append_legacy_fifo_bootstrap_in_transaction(
     lineage = await connection.execute(
         """
         SELECT e.origin_kind,e.source_fingerprint,l.bootstrap_id,
-               l.candidate_fingerprint,l.reconciliation_snapshot_id,
+               l.candidate_fingerprint,l.opening_manifest_count,
+               l.opening_manifest_hash,l.reconciliation_snapshot_id,
                l.reconciliation_report_hash,l.broker_snapshot_hash,
                l.legacy_snapshot_hash,l.operator_action_id,
                p.candidate_fingerprint,p.operator_action_id,a.evidence_hash
@@ -438,6 +481,8 @@ async def append_legacy_fifo_bootstrap_in_transaction(
         plan.candidate_fingerprint,
         plan.bootstrap_id,
         plan.candidate_fingerprint,
+        len(expected_openings),
+        opening_manifest_hash,
         plan.reconciliation_snapshot_id,
         plan.reconciliation_report_hash,
         plan.broker_snapshot_hash,
@@ -469,7 +514,7 @@ async def append_legacy_fifo_bootstrap_in_transaction(
         SELECT b.opening_balance_id,l.lot_id,b.con_id,b.symbol,b.direction,
                b.opened_quantity_text,b.cost_basis_text,b.mark_price_text,
                b.mark_observed_at,b.mark_evidence_fingerprint,
-               l.opening_commission_minor,l.opened_sequence
+               l.opening_commission_minor,l.opened_sequence,l.opened_at
         FROM fifo_opening_balances b
         JOIN fifo_lot_openings l
           ON l.epoch_id=b.epoch_id AND l.opening_balance_id=b.opening_balance_id
@@ -477,22 +522,5 @@ async def append_legacy_fifo_bootstrap_in_transaction(
         """,
         (plan.epoch_id,),
     )
-    expected_openings = [
-        (
-            opening.opening_balance_id,
-            opening.lot_id,
-            opening.con_id,
-            opening.symbol,
-            opening.direction,
-            opening.opened_quantity_text,
-            opening.cost_basis_text,
-            opening.mark_price_text,
-            opening.mark_observed_at,
-            opening.mark_evidence_fingerprint,
-            0,
-            0,
-        )
-        for opening in plan.opening_balances
-    ]
     if await openings.fetchall() != expected_openings:
         raise FifoBootstrapError("FIFO opening balances changed during append")
