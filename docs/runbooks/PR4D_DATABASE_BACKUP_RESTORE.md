@@ -12,8 +12,12 @@ link count, and stable identity while a snapshot is running. SQLite never opens
 the requested output path or any other filesystem target. Online backup and
 migration run in an in-memory SQLite database. The service serializes the exact
 finished image into an `O_EXCL|O_NOFOLLOW` file created with `openat` beneath a
-bound `O_DIRECTORY|O_NOFOLLOW` parent descriptor, then publishes that inode
-with descriptor-relative atomic no-replace rename. A public `-wal`, `-shm`, or
+bound `O_DIRECTORY|O_NOFOLLOW` parent descriptor. The named staged inode starts
+with mode `000`, so another process cannot retain a writable descriptor before
+it is sealed read-only. The service then publishes that inode with
+descriptor-relative atomic no-replace rename and fsyncs the already-bound
+parent descriptor. The published descriptor is digested again and its lexical
+parent and target identities are revalidated before success. A public `-wal`, `-shm`, or
 `-journal` path is therefore never touched or deleted by the service or its
 SQLite connection. There is no staging directory that a concurrent process
 can replace with a symlink.
@@ -80,6 +84,12 @@ reports include before/after schema, row counts, content hashes, integrity
 state, and a source-unchanged result. Final report evidence and the artifact
 digest come directly from the descriptor-bound manifest captured before atomic
 publication; the report never reopens the published target.
+
+Active WAL sources are supported. Initial and final source evidence is captured
+from bound SQLite read snapshots rather than by requiring a companion-free main
+file. Normal checkpoints may change the physical main-file bytes while the held
+read snapshot remains logically consistent; backup therefore does not treat a
+checkpoint as authoritative data mutation.
 
 ## Legacy multiuser migration quarantine
 

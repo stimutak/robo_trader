@@ -119,6 +119,15 @@ class _StagedTarget:
             self.requested_path.name,
         )
         self.published = True
+        self._assert_published_identity()
+        os.fsync(self.parent_file_descriptor)
+        self._assert_published_identity()
+
+    def _assert_published_identity(self) -> None:
+        """Bind the requested lexical path to the published inode and parent."""
+
+        parent = os.fstat(self.parent_file_descriptor)
+        current_parent = os.lstat(self.requested_path.parent)
         descriptor_metadata = os.fstat(self.guardian_file_descriptor)
         path_metadata = os.lstat(self.requested_path)
         bound_metadata = os.stat(
@@ -128,7 +137,11 @@ class _StagedTarget:
         )
         expected = (self.device, self.inode)
         if (
-            not stat.S_ISREG(descriptor_metadata.st_mode)
+            not stat.S_ISDIR(parent.st_mode)
+            or stat.S_ISLNK(current_parent.st_mode)
+            or not stat.S_ISDIR(current_parent.st_mode)
+            or (parent.st_dev, parent.st_ino) != (current_parent.st_dev, current_parent.st_ino)
+            or not stat.S_ISREG(descriptor_metadata.st_mode)
             or descriptor_metadata.st_nlink != 1
             or (descriptor_metadata.st_dev, descriptor_metadata.st_ino) != expected
             or stat.S_ISLNK(path_metadata.st_mode)
@@ -143,7 +156,18 @@ class _StagedTarget:
             raise SQLiteMaintenanceError(
                 "target SQLite companion appeared during atomic publication"
             )
-        _fsync_directory(self.requested_path.parent)
+        current_parent_after = os.lstat(self.requested_path.parent)
+        path_after = os.lstat(self.requested_path)
+        if (
+            stat.S_ISLNK(current_parent_after.st_mode)
+            or not stat.S_ISDIR(current_parent_after.st_mode)
+            or (current_parent_after.st_dev, current_parent_after.st_ino)
+            != (parent.st_dev, parent.st_ino)
+            or stat.S_ISLNK(path_after.st_mode)
+            or not stat.S_ISREG(path_after.st_mode)
+            or (path_after.st_dev, path_after.st_ino) != expected
+        ):
+            raise SQLiteMaintenanceError("published database identity changed")
 
     def seal_forensic(self) -> None:
         try:
@@ -279,16 +303,6 @@ class SQLiteMaintenanceService:
         """
 
         _validate_migration_plan(plan)
-        source_before = self.verify(source_path)
-        source_before_hash, source_before_size = _path_digest(_absolute_canonical_path(source_path))
-        source_manifest = MaintenanceManifest(
-            manifest_version=1,
-            operation="backup",
-            created_at=_utc_now(),
-            artifact_sha256=source_before_hash,
-            artifact_size=source_before_size,
-            evidence=source_before,
-        )
 
         def apply_plan(
             connection: sqlite3.Connection,
@@ -324,7 +338,6 @@ class SQLiteMaintenanceService:
             source_path,
             synthetic_target_path,
             operation="backup",
-            expected_source_manifest=source_manifest,
             target_hook=apply_plan,
         )
         if not isinstance(migration_result, tuple) or len(migration_result) != 3:
@@ -332,9 +345,8 @@ class SQLiteMaintenanceService:
         before, outcome, error_code = migration_result
 
         after = copy_manifest.evidence
-        source_after = self.verify(source_path)
-        source_after_hash, _ = _path_digest(_absolute_canonical_path(source_path))
-        source_unchanged = source_before == source_after and source_before_hash == source_after_hash
+        source_after = self._live_source_evidence(source_path)
+        source_unchanged = before == source_after
         if not source_unchanged:
             outcome = "source_changed_fail_closed"
             error_code = "authoritative_source_changed"
@@ -349,6 +361,28 @@ class SQLiteMaintenanceService:
             target_artifact_sha256=copy_manifest.artifact_sha256,
             error_code=error_code,
         )
+
+    def _live_source_evidence(self, source_path: Path | str) -> DatabaseEvidence:
+        """Capture logical evidence from a bound read snapshot, including WAL state."""
+
+        source_candidate = _absolute_canonical_path(source_path)
+        companions = _safe_companion_identities(source_candidate)
+        source = self._open_source(source_candidate)
+        connection: sqlite3.Connection | None = None
+        try:
+            connection, source = self._connect_bound(source, readonly=True)
+            connection.execute("BEGIN")
+            evidence = _database_evidence(connection)
+            source.assert_connection_identity(sqlite_connection_file_identity(connection))
+            _assert_single_link(source)
+            _assert_companion_identities(source.path, companions)
+            return evidence
+        except (sqlite3.Error, SQLiteIdentityError, OSError) as exc:
+            raise SQLiteMaintenanceError("live SQLite evidence failed closed") from exc
+        finally:
+            if connection is not None:
+                connection.close()
+            source.close()
 
     def write_manifest(
         self,
@@ -449,15 +483,18 @@ class SQLiteMaintenanceService:
             )
             source_connection.execute("BEGIN")
             source_evidence = _database_evidence(source_connection)
-            source_artifact_sha256, source_artifact_size = _descriptor_digest(
-                source.guardian_file_descriptor
-            )
-            if expected_source_manifest is not None and (
-                expected_source_manifest.artifact_sha256 != source_artifact_sha256
-                or expected_source_manifest.artifact_size != source_artifact_size
-                or expected_source_manifest.evidence != source_evidence
-            ):
-                raise SQLiteMaintenanceError("copy source does not match the supplied manifest")
+            source_artifact_sha256: str | None = None
+            source_artifact_size: int | None = None
+            if expected_source_manifest is not None:
+                source_artifact_sha256, source_artifact_size = _descriptor_digest(
+                    source.guardian_file_descriptor
+                )
+                if (
+                    expected_source_manifest.artifact_sha256 != source_artifact_sha256
+                    or expected_source_manifest.artifact_size != source_artifact_size
+                    or expected_source_manifest.evidence != source_evidence
+                ):
+                    raise SQLiteMaintenanceError("copy source does not match the supplied manifest")
             staged_target = self._stage_target(target_candidate)
         except (sqlite3.Error, SQLiteIdentityError, OSError) as exc:
             if source_connection is not None:
@@ -507,14 +544,15 @@ class SQLiteMaintenanceService:
             staged_target.assert_identity()
             _assert_companion_identities(source.path, source_companions)
             evidence = _database_evidence(target_connection)
-            final_source_sha256, final_source_size = _descriptor_digest(
-                source.guardian_file_descriptor
-            )
-            if (
-                final_source_sha256 != source_artifact_sha256
-                or final_source_size != source_artifact_size
-            ):
-                raise SQLiteMaintenanceError("copy source changed during operation")
+            if expected_source_manifest is not None:
+                final_source_sha256, final_source_size = _descriptor_digest(
+                    source.guardian_file_descriptor
+                )
+                if (
+                    final_source_sha256 != source_artifact_sha256
+                    or final_source_size != source_artifact_size
+                ):
+                    raise SQLiteMaintenanceError("copy source changed during operation")
             if (
                 expected_source_manifest is not None
                 and evidence != expected_source_manifest.evidence
@@ -542,6 +580,15 @@ class SQLiteMaintenanceService:
                 evidence=evidence,
             )
             staged_target.publish()
+            published_sha256, published_size = _descriptor_digest(
+                staged_target.guardian_file_descriptor
+            )
+            staged_target._assert_published_identity()
+            if (
+                published_sha256 != manifest.artifact_sha256
+                or published_size != manifest.artifact_size
+            ):
+                raise SQLiteMaintenanceError("published database changed after manifest capture")
             succeeded = True
             return manifest, hook_result
         except (sqlite3.Error, SQLiteIdentityError, OSError) as exc:
@@ -612,7 +659,7 @@ class SQLiteMaintenanceService:
                     guardian = os.open(
                         staging_name,
                         flags,
-                        0o600,
+                        0o000,
                         dir_fd=parent_file_descriptor,
                     )
                 except FileExistsError:

@@ -86,7 +86,7 @@ type debt.
 
 ## 2026-07-30 exact-review follow-up
 
-Six additional exact-head P1 findings and the Python 3.10 CI failures were
+Ten additional exact-head P1 findings and the Python 3.10 CI failures were
 remediated without touching authoritative data or runtime services:
 
 - SQLite now operates only in memory. It never opens the requested output path,
@@ -98,6 +98,18 @@ remediated without touching authoritative data or runtime services:
 - A planted staging-name symlink cannot redirect SQLite into an attacker-owned
   directory because no filesystem target connection exists. Exclusive file
   creation refuses the symlink and preserves planted `database.db-wal` bytes.
+- The staged file is born with mode `000`; only the already-held guardian
+  descriptor can write the serialized image. A concurrent writable open is
+  denied before the inode is sealed and digested.
+- Publication fsyncs the bound parent-directory descriptor and revalidates both
+  the lexical parent and published target afterward. Parent replacement causes
+  a failed operation rather than a false successful manifest.
+- Migration dry runs capture before/after logical evidence through bound,
+  WAL-aware read snapshots, so a normally active RoboTrader WAL source is
+  accepted without relaxing source-change detection.
+- A normal WAL checkpoint may change physical main-file bytes while SQLite's
+  held read snapshot remains consistent. Online backup now relies on that bound
+  logical snapshot instead of incorrectly rejecting checkpointed bytes.
 - A public `-wal`, `-shm`, or `-journal` substitution while SQLite is active is
   preserved byte-for-byte and causes publication to fail closed. This closes
   the Linux behavior where SQLite itself could unlink a replacement before a
@@ -116,8 +128,8 @@ remediated without touching authoritative data or runtime services:
 Current verification:
 
 ```text
-focused maintenance + multiuser + DB isolation: 198 passed
-full repository: 3037 passed, 5 skipped, 20 known warnings
+focused maintenance + multiuser + DB isolation: 202 passed
+full repository: 3054 passed, 5 skipped, 20 known warnings
 Python 3.10 direct authorizer commit/rollback probe: passed
 Black, isort, flake8, Bandit, mypy, and git diff checks on changed scope: passed
 ```

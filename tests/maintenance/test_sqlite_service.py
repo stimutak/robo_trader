@@ -93,6 +93,33 @@ def test_wal_active_backup_and_clean_room_restore_preserve_multiportfolio_state(
         writer.close()
 
 
+def test_wal_checkpoint_during_online_backup_is_not_treated_as_source_mutation(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "backup.db"
+    writer = _create_multiportfolio_database(source, wal=True)
+    writer.execute("INSERT INTO positions VALUES ('alpha', 'NVDA', 4)")
+    writer.commit()
+    main_before_checkpoint = source.read_bytes()
+    checkpointed = False
+
+    def checkpoint(_operation: str, _remaining: int, _total: int) -> None:
+        nonlocal checkpointed
+        if not checkpointed:
+            checkpointed = True
+            writer.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+
+    try:
+        manifest = SQLiteMaintenanceService(progress_hook=checkpoint).backup(source, target)
+    finally:
+        writer.close()
+
+    assert checkpointed
+    assert source.read_bytes() != main_before_checkpoint
+    assert SQLiteMaintenanceService().verify(target) == manifest.evidence
+
+
 def test_manifest_is_secret_free_portable_and_exclusively_written(tmp_path: Path) -> None:
     source = tmp_path / "source.db"
     backup = tmp_path / "backup.db"
@@ -232,6 +259,89 @@ def test_staging_symlink_cannot_redirect_sqlite_into_attacker_directory(
 
     assert planted_wal.read_bytes() == b"irreplaceable-user-data"
     assert not target.exists()
+
+
+def test_named_staging_inode_cannot_be_opened_writable_before_sealing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "target.db"
+    _create_multiportfolio_database(source).close()
+    service = SQLiteMaintenanceService()
+    real_stage = service._stage_target
+    staged_target = None
+    attempted = False
+
+    def capture_stage(requested_path):
+        nonlocal staged_target
+        staged_target = real_stage(requested_path)
+        return staged_target
+
+    def attempt_writable_open(_operation: str, _remaining: int, _total: int) -> None:
+        nonlocal attempted
+        if not attempted:
+            attempted = True
+            assert staged_target is not None
+            with pytest.raises(PermissionError):
+                os.open(staged_target.forensic_path, os.O_RDWR)
+
+    monkeypatch.setattr(service, "_stage_target", capture_stage)
+    service._progress_hook = attempt_writable_open
+    manifest = service.backup(source, target)
+
+    assert attempted
+    assert hashlib.sha256(target.read_bytes()).hexdigest() == manifest.artifact_sha256
+
+
+def test_parent_replacement_during_publication_fsync_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.db"
+    output_parent = tmp_path / "output"
+    parked_parent = tmp_path / "parked-output"
+    output_parent.mkdir()
+    target = output_parent / "target.db"
+    _create_multiportfolio_database(source).close()
+    service = SQLiteMaintenanceService()
+    real_stage = service._stage_target
+    real_fsync = sqlite_service_module.os.fsync
+    staged_target = None
+    replaced = False
+    replacement_payload = b"unrelated-user-file"
+
+    def capture_stage(requested_path):
+        nonlocal staged_target
+        staged_target = real_stage(requested_path)
+        return staged_target
+
+    def replace_parent_on_publication_fsync(descriptor: int) -> None:
+        nonlocal replaced
+        if staged_target is not None and descriptor == staged_target.parent_file_descriptor:
+            try:
+                os.stat(
+                    target.name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                if not replaced:
+                    replaced = True
+                    output_parent.rename(parked_parent)
+                    output_parent.mkdir()
+                    target.write_bytes(replacement_payload)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(service, "_stage_target", capture_stage)
+    monkeypatch.setattr(sqlite_service_module.os, "fsync", replace_parent_on_publication_fsync)
+
+    with pytest.raises(SQLiteMaintenanceError, match="published database identity changed"):
+        service.backup(source, target)
+
+    assert replaced
+    assert target.read_bytes() == replacement_payload
+    assert (parked_parent / target.name).exists()
 
 
 def test_target_cannot_overlap_source_sqlite_companion_family(tmp_path: Path) -> None:
@@ -458,6 +568,31 @@ def test_migration_dry_run_changes_only_synthetic_copy(tmp_path: Path) -> None:
     with sqlite3.connect(source) as connection:
         columns = connection.execute("PRAGMA table_info(positions)").fetchall()
         assert "note" not in {row[1] for row in columns}
+
+
+def test_migration_dry_run_accepts_active_wal_source(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    writer = _create_multiportfolio_database(source, wal=True)
+    writer.execute("INSERT INTO positions VALUES ('alpha', 'NVDA', 4)")
+    writer.commit()
+    assert source.with_name(source.name + "-wal").exists()
+
+    try:
+        report = SQLiteMaintenanceService().dry_run_migration(
+            source,
+            target,
+            plan=MigrationPlan(
+                migration_id="active-wal",
+                steps=(MigrationStep("ALTER TABLE positions ADD COLUMN note TEXT"),),
+            ),
+        )
+    finally:
+        writer.close()
+
+    assert report.outcome == "applied_to_synthetic_copy"
+    assert report.source_unchanged is True
+    assert report.before != report.after
 
 
 def test_migration_uses_the_copy_connection_without_a_writable_reopen(
