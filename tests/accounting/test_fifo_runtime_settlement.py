@@ -49,14 +49,16 @@ def _evidence(
     price: str,
     commission_minor: int,
     occurred_at: datetime,
+    con_id: int = 265598,
+    symbol: str = "AAPL",
 ) -> RuntimePaperFillEvidence:
     identity = hashlib.sha256(f"runtime-fill-{sequence}".encode()).hexdigest()
     return RuntimePaperFillEvidence(
         execution_domain_scope="paper-simulator-v1",
         account_scope="acct_v1_" + ("2" * 64),
         portfolio_id="portfolio-a",
-        con_id=265598,
-        symbol="AAPL",
+        con_id=con_id,
+        symbol=symbol,
         side=side,
         quantity=Decimal(quantity),
         price=Decimal(price),
@@ -119,6 +121,63 @@ def test_partial_fills_and_commissions_project_exact_fifo() -> None:
         connection.close()
 
 
+def test_epoch_realized_pnl_accumulates_across_symbols() -> None:
+    connection, effective = _connection()
+    try:
+        events = (
+            _evidence(
+                1,
+                side=FillSide.BUY,
+                quantity="1",
+                price="100",
+                commission_minor=0,
+                occurred_at=effective,
+            ),
+            _evidence(
+                2,
+                side=FillSide.SELL,
+                quantity="1",
+                price="110",
+                commission_minor=0,
+                occurred_at=effective + timedelta(seconds=1),
+            ),
+            _evidence(
+                3,
+                side=FillSide.BUY,
+                quantity="1",
+                price="100",
+                commission_minor=0,
+                occurred_at=effective + timedelta(seconds=2),
+                con_id=272093,
+                symbol="MSFT",
+            ),
+            _evidence(
+                4,
+                side=FillSide.SELL,
+                quantity="1",
+                price="120",
+                commission_minor=0,
+                occurred_at=effective + timedelta(seconds=3),
+                con_id=272093,
+                symbol="MSFT",
+            ),
+        )
+        projections = []
+        for event in events:
+            connection.execute("BEGIN IMMEDIATE")
+            projections.append(append_runtime_fill_in_transaction(connection, event))
+            connection.commit()
+
+        first_close, second_close = projections[1], projections[3]
+        assert first_close.fill_realized_pnl == Decimal("10")
+        assert first_close.epoch_realized_pnl == Decimal("10")
+        assert second_close.fill_realized_pnl == Decimal("20")
+        assert second_close.epoch_realized_pnl == Decimal("30")
+        assert second_close.total_realized_pnl == Decimal("30")
+    finally:
+        connection.close()
+
+
 def test_exact_replay_is_read_only_and_conflict_fails_closed() -> None:
     connection, effective = _connection()
     evidence = _evidence(
@@ -151,10 +210,7 @@ def test_exact_replay_is_read_only_and_conflict_fails_closed() -> None:
 
         conflicting = RuntimePaperFillEvidence(
             **{
-                **{
-                    field: getattr(evidence, field)
-                    for field in evidence.__dataclass_fields__
-                },
+                **{field: getattr(evidence, field) for field in evidence.__dataclass_fields__},
                 "price": Decimal("11"),
             }
         )

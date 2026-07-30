@@ -2,7 +2,7 @@
 
 Date: 2026-07-30
 Branch: `codex/pr4c-fifo-settlement`
-Stack base: PR4B exact head `318532e`
+Base: `main` including merged PR4B
 
 ## Scope reviewed
 
@@ -23,7 +23,15 @@ Stack base: PR4B exact head `318532e`
 - Terminal failure-injection and recovery-status suite: `66 passed`.
 - Focused runtime FIFO tests cover multiple partial fill events, exact
   commission allocation, a rebate, deterministic replay, conflicting replay,
-  missing-epoch refusal, and transaction rollback.
+  missing-epoch refusal, transaction rollback, and account-wide realized P&L
+  accumulation across multiple symbols.
+- End-to-end settlement proves that a later AAPL reduction preserves earlier
+  MSFT realized P&L in the same epoch instead of replacing the account total
+  with the current instrument's cumulative snapshot.
+- Hot-schema regressions prove that a temporary
+  `paper_fifo_settlement_links` shadow and a persistent `AFTER INSERT` trade
+  injection trigger both fail before mutation, with no fill, commission,
+  compatibility trade, settlement, or link partially committed.
 - Settlement failure injection covers failures immediately after FIFO append,
   after compatibility trade insertion, and after immutable FIFO-link insertion;
   every case leaves zero fill, commission, trade, settlement, and link rows.

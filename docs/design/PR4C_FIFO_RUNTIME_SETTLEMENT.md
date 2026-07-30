@@ -45,7 +45,18 @@ transaction, preserving PR4B's schema-substitution protection.
 The FIFO projection supplies the compatibility trade P&L, remaining quantity,
 remaining cost, average cost, and total realized P&L. Settlement refuses to
 commit if those values differ from the already-authorized exact terminal
-request.
+request. Total realized P&L is the epoch baseline plus every lot match through
+the current event sequence across all instruments; an instrument-local
+snapshot is never treated as the account-wide total.
+
+After acquiring the immediate write lock and before appending a fill, the
+settlement path re-authenticates every non-FIFO table and trigger it can mutate.
+It rejects temporary shadows and any persistent hot-table trigger other than
+the exact append-only guards. Every settlement statement is explicitly
+qualified to the durable `main` schema. The FIFO ledger separately performs
+the same in-transaction protection for all FIFO tables and triggers. Thus a
+temporary settlement-link table cannot divert lineage and an injected trade
+trigger cannot add an unreviewed compatibility row after projection checks.
 
 `paper_fifo_settlement_links` binds each terminal settlement to exactly one
 FIFO fill, sequence, execution ID, commission source, and state fingerprint.

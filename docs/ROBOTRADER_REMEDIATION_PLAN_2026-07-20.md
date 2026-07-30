@@ -669,6 +669,10 @@ SQLite transaction. Exact replay re-authenticates the stored event and link;
 missing epochs, conflicting evidence, projection divergence, and partial writes
 fail closed. Stopped-system recovery also verifies the full FIFO epoch and link
 from its existing query-only snapshot before releasing safety authority.
+Epoch realized P&L is accumulated across every instrument through the current
+event sequence. The locked settlement transaction also rejects temporary
+shadows and foreign persistent triggers on all hot settlement tables before it
+writes, and all such statements explicitly target the durable `main` schema.
 
 The full local suite passed 3,036 tests with 5 expected skips and 20 known
 warnings. Detailed design and evidence are recorded in

@@ -182,6 +182,20 @@ def _projection_from_result(
     fill_realized = Decimal("0")
     for row in realized_rows:
         fill_realized += _parse_decimal(row[0], "runtime fill realized P&L")
+    epoch_realized_rows = connection.execute(
+        """
+        SELECT m.realized_pnl_text
+        FROM fifo_lot_matches AS m
+        JOIN fifo_fills AS f
+          ON f.epoch_id=m.epoch_id AND f.fill_id=m.closing_fill_id
+        WHERE m.epoch_id=? AND f.event_sequence<=?
+        ORDER BY f.event_sequence,m.match_ordinal
+        """,
+        (epoch_id, event_sequence),
+    ).fetchall()
+    epoch_realized = Decimal("0")
+    for row in epoch_realized_rows:
+        epoch_realized += _parse_decimal(row[0], "FIFO epoch realized P&L")
     baseline_row = connection.execute(
         "SELECT realized_pnl_text FROM fifo_epoch_account_baselines WHERE epoch_id=?",
         (epoch_id,),
@@ -203,7 +217,7 @@ def _projection_from_result(
         raise FifoAccountingValidationError("flat FIFO position retained open cost")
     with localcontext() as context:
         context.prec = 96
-        total_realized = baseline_realized + snapshot.cumulative_realized_pnl
+        total_realized = baseline_realized + epoch_realized
     _decimal_text(total_realized)
     return FifoRuntimeProjection(
         epoch_id=epoch_id,
@@ -213,7 +227,7 @@ def _projection_from_result(
         open_cost=snapshot.open_cost,
         average_cost=average_cost,
         fill_realized_pnl=fill_realized,
-        epoch_realized_pnl=snapshot.cumulative_realized_pnl,
+        epoch_realized_pnl=epoch_realized,
         baseline_realized_pnl=baseline_realized,
         total_realized_pnl=total_realized,
         cumulative_commission_minor=snapshot.cumulative_commission_minor,

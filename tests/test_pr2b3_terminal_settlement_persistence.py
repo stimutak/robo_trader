@@ -15,6 +15,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from robo_trader.accounting.fifo import FillSide
+from robo_trader.accounting.fifo_runtime import (
+    LOCAL_PAPER_COMMISSION_SOURCE,
+    RuntimePaperFillEvidence,
+    append_runtime_fill_on_aiosqlite_worker,
+)
 from robo_trader.config import RuntimeContract
 from robo_trader.database_async import AsyncTradingDatabase
 from robo_trader.database_validator import ValidationError as DatabaseValidationError
@@ -205,6 +211,55 @@ def _request(*, outcome_at: datetime) -> PaperTerminalSettlementRequest:
         fill_commission_currency="USD",
         fill_commission_source="LOCAL_PAPER_EXECUTOR_EXACT_COMMISSION_V1",
     )
+
+
+def _runtime_evidence(
+    *,
+    sequence: int,
+    side: FillSide,
+    occurred_at: datetime,
+) -> RuntimePaperFillEvidence:
+    identity = hashlib.sha256(f"prior-msft-fill-{sequence}".encode()).hexdigest()
+    return RuntimePaperFillEvidence(
+        execution_domain_scope=PAPER_EXECUTION_DOMAIN_SCOPE,
+        account_scope=ACCOUNT_SCOPE,
+        portfolio_id="portfolio-a",
+        con_id=272093,
+        symbol="MSFT",
+        side=side,
+        quantity=Decimal("1"),
+        price=Decimal("100") if side is FillSide.BUY else Decimal("110"),
+        execution_id=f"lpfill-{identity[:32]}",
+        idempotency_key=identity,
+        commission_minor=0,
+        commission_currency="USD",
+        commission_source=LOCAL_PAPER_COMMISSION_SOURCE,
+        occurred_at=occurred_at,
+    )
+
+
+async def _assert_no_partial_settlement(database: AsyncTradingDatabase) -> None:
+    async with database.get_connection() as connection:
+        counts = await (await connection.execute("""
+                SELECT
+                    (SELECT COUNT(*) FROM main.fifo_fills),
+                    (SELECT COUNT(*) FROM main.fifo_commissions),
+                    (SELECT COUNT(*) FROM main.trades),
+                    (SELECT COUNT(*) FROM main.paper_reduction_settlements),
+                    (SELECT COUNT(*) FROM main.paper_fifo_settlement_links)
+                """)).fetchone()
+        position = await (await connection.execute("""
+                SELECT quantity FROM main.positions
+                WHERE portfolio_id='portfolio-a' AND symbol='AAPL'
+                """)).fetchone()
+        account = await (await connection.execute("""
+                SELECT cash_text,realized_pnl_text,daily_pnl_text,source_settlement_id
+                FROM main.paper_account_settlement_state
+                WHERE portfolio_id='portfolio-a'
+                """)).fetchone()
+    assert counts == (0, 0, 0, 0, 0)
+    assert position == (5,)
+    assert account == ("100000", "0", "0", None)
 
 
 def test_protective_quote_timestamp_accepts_canonical_z_utc_text() -> None:
@@ -485,6 +540,143 @@ async def test_atomic_settlement_exact_replay_has_no_duplicate_mutation(tmp_path
                 replace(request, order_ref="different-close-reference"),
                 runtime_contract=contract,
             )
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_cross_symbol_realized_pnl_settles_against_epoch_total(tmp_path: Path):
+    contract = _runtime_contract(tmp_path)
+    database = AsyncTradingDatabase(Path(contract.database_path), pool_size=1)
+    await database.initialize()
+    try:
+        await _seed(database)
+        now = datetime.now(timezone.utc)
+        for evidence in (
+            _runtime_evidence(
+                sequence=1,
+                side=FillSide.BUY,
+                occurred_at=now - timedelta(seconds=4),
+            ),
+            _runtime_evidence(
+                sequence=2,
+                side=FillSide.SELL,
+                occurred_at=now - timedelta(seconds=3),
+            ),
+        ):
+            async with database.get_connection() as connection:
+                await connection.execute("BEGIN IMMEDIATE")
+                await append_runtime_fill_on_aiosqlite_worker(connection, evidence)
+                await connection.commit()
+
+        await database.update_account(
+            cash=Decimal("100010"),
+            equity=Decimal("100010"),
+            daily_pnl=Decimal("10"),
+            realized_pnl=Decimal("10"),
+            unrealized_pnl=Decimal("0"),
+            daily_pnl_baseline=Decimal("0"),
+            portfolio_id="portfolio-a",
+        )
+        request = replace(
+            _request(outcome_at=now - timedelta(seconds=1)),
+            expected_pre_cash=Decimal("100010"),
+            expected_post_cash=Decimal("100212.50"),
+            expected_pre_realized_pnl=Decimal("10"),
+            expected_post_realized_pnl=Decimal("12.50"),
+            expected_pre_daily_pnl=Decimal("10"),
+            expected_post_daily_pnl=Decimal("12.50"),
+        )
+
+        receipt = await database.commit_paper_reduction_outcome(
+            request,
+            runtime_contract=contract,
+        )
+
+        account = await database.get_account_info(portfolio_id="portfolio-a")
+        assert account["realized_pnl_exact"] == Decimal("12.5")
+        assert account["daily_pnl_exact"] == Decimal("12.5")
+        async with database.get_connection() as connection:
+            link = await (
+                await connection.execute(
+                    """
+                    SELECT epoch_id,event_sequence
+                    FROM main.paper_fifo_settlement_links
+                    WHERE settlement_id=?
+                    """,
+                    (receipt.settlement_id,),
+                )
+            ).fetchone()
+            realized_rows = await (
+                await connection.execute(
+                    """
+                    SELECT m.realized_pnl_text
+                    FROM main.fifo_lot_matches AS m
+                    JOIN main.fifo_fills AS f
+                      ON f.epoch_id=m.epoch_id AND f.fill_id=m.closing_fill_id
+                    WHERE m.epoch_id=? AND f.event_sequence<=?
+                    """,
+                    link,
+                )
+            ).fetchall()
+        assert sum((Decimal(row[0]) for row in realized_rows), Decimal("0")) == Decimal("12.5")
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_temp_fifo_link_shadow_fails_closed_before_any_mutation(tmp_path: Path):
+    contract = _runtime_contract(tmp_path)
+    database = AsyncTradingDatabase(Path(contract.database_path), pool_size=1)
+    await database.initialize()
+    try:
+        await _seed(database)
+        async with database.get_connection() as connection:
+            await connection.execute(
+                "CREATE TEMP TABLE paper_fifo_settlement_links(settlement_id TEXT)"
+            )
+
+        with pytest.raises(PaperTerminalSettlementError, match="hot schema"):
+            await database.commit_paper_reduction_outcome(
+                _request(outcome_at=datetime.now(timezone.utc) - timedelta(seconds=1)),
+                runtime_contract=contract,
+            )
+
+        await _assert_no_partial_settlement(database)
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_persistent_trade_trigger_fails_closed_before_any_mutation(tmp_path: Path):
+    contract = _runtime_contract(tmp_path)
+    database = AsyncTradingDatabase(Path(contract.database_path), pool_size=1)
+    await database.initialize()
+    try:
+        await _seed(database)
+        async with database.get_connection() as connection:
+            await connection.execute("""
+                CREATE TRIGGER inject_second_trade_after_settlement
+                AFTER INSERT ON main.trades
+                BEGIN
+                    INSERT INTO trades(
+                        portfolio_id,symbol,side,quantity,price,notional,
+                        slippage,commission,pnl,timestamp
+                    ) VALUES(
+                        NEW.portfolio_id,'MSFT','SELL',1,1,1,0,0,0,
+                        '2026-07-30T12:00:00Z'
+                    );
+                END
+                """)
+            await connection.commit()
+
+        with pytest.raises(PaperTerminalSettlementError, match="hot schema"):
+            await database.commit_paper_reduction_outcome(
+                _request(outcome_at=datetime.now(timezone.utc) - timedelta(seconds=1)),
+                runtime_contract=contract,
+            )
+
+        await _assert_no_partial_settlement(database)
     finally:
         await database.close()
 

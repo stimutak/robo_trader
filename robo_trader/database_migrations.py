@@ -17,7 +17,8 @@ EXACT_STATE_SCHEMA_VERSION = 3
 
 
 async def _columns(connection: aiosqlite.Connection, table: str) -> set[str]:
-    cursor = await connection.execute(f"PRAGMA table_info({table})")
+    quoted = '"' + table.replace('"', '""') + '"'
+    cursor = await connection.execute(f"PRAGMA main.table_info({quoted})")
     return {str(row[1]) for row in await cursor.fetchall()}
 
 
@@ -465,6 +466,189 @@ _EXPECTED_TRIGGER_SQL = {
     """,
 }
 
+_PAPER_SETTLEMENT_HOT_COLUMNS = {
+    "trades": {
+        "id",
+        "portfolio_id",
+        "symbol",
+        "side",
+        "quantity",
+        "price",
+        "notional",
+        "slippage",
+        "commission",
+        "pnl",
+        "timestamp",
+    },
+    "positions": {
+        "id",
+        "portfolio_id",
+        "symbol",
+        "quantity",
+        "avg_cost",
+        "market_price",
+        "timestamp",
+    },
+    "account": {
+        "portfolio_id",
+        "cash",
+        "equity",
+        "daily_pnl",
+        "realized_pnl",
+        "unrealized_pnl",
+        "timestamp",
+    },
+    "paper_reduction_settlements": {
+        "settlement_id",
+        "execution_domain_scope",
+        "account_scope",
+        "portfolio_id",
+        "con_id",
+        "symbol",
+        "reservation_id",
+        "claim_id",
+        "order_ref",
+        "protective_quote_payload",
+        "request_fingerprint",
+        "request_payload_json",
+        "terminal_status",
+        "trade_id",
+        "database_path",
+        "database_identity",
+        "database_device",
+        "database_inode",
+        "committed_at",
+        "receipt_fingerprint",
+        "schema_version",
+    },
+    "paper_account_settlement_state": {
+        "portfolio_id",
+        "cash_text",
+        "realized_pnl_text",
+        "daily_pnl_text",
+        "daily_pnl_baseline_text",
+        "daily_pnl_date",
+        "updated_at",
+        "source_settlement_id",
+        "origin_bootstrap_id",
+    },
+    "paper_position_settlement_state": {
+        "portfolio_id",
+        "symbol",
+        "cost_basis_text",
+        "mark_price_text",
+        "source_settlement_id",
+        "updated_at",
+        "origin_bootstrap_id",
+    },
+    "paper_fifo_settlement_links": set(_EXPECTED_COLUMNS["paper_fifo_settlement_links"]),
+}
+
+_PAPER_SETTLEMENT_HOT_COLUMN_TYPES = {
+    "trades": {
+        "id": ("INTEGER", 1),
+        "portfolio_id": ("TEXT", 0),
+        "symbol": ("TEXT", 0),
+        "side": ("TEXT", 0),
+        "quantity": ("INTEGER", 0),
+        "price": ("REAL", 0),
+        "notional": ("REAL", 0),
+        "slippage": ("REAL", 0),
+        "commission": ("REAL", 0),
+        "pnl": ("REAL", 0),
+        "timestamp": ("DATETIME", 0),
+    },
+    "positions": {
+        "id": ("INTEGER", 1),
+        "portfolio_id": ("TEXT", 0),
+        "symbol": ("TEXT", 0),
+        "quantity": ("INTEGER", 0),
+        "avg_cost": ("REAL", 0),
+        "market_price": ("REAL", 0),
+        "timestamp": ("DATETIME", 0),
+    },
+    "account": {
+        "portfolio_id": ("TEXT", 1),
+        "cash": ("REAL", 0),
+        "equity": ("REAL", 0),
+        "daily_pnl": ("REAL", 0),
+        "realized_pnl": ("REAL", 0),
+        "unrealized_pnl": ("REAL", 0),
+        "timestamp": ("DATETIME", 0),
+    },
+    "paper_reduction_settlements": {
+        "settlement_id": ("TEXT", 1),
+        "execution_domain_scope": ("TEXT", 0),
+        "account_scope": ("TEXT", 0),
+        "portfolio_id": ("TEXT", 0),
+        "con_id": ("INTEGER", 0),
+        "symbol": ("TEXT", 0),
+        "reservation_id": ("TEXT", 0),
+        "claim_id": ("TEXT", 0),
+        "order_ref": ("TEXT", 0),
+        "protective_quote_payload": ("TEXT", 0),
+        "request_fingerprint": ("TEXT", 0),
+        "request_payload_json": ("TEXT", 0),
+        "terminal_status": ("TEXT", 0),
+        "trade_id": ("INTEGER", 0),
+        "database_path": ("TEXT", 0),
+        "database_identity": ("TEXT", 0),
+        "database_device": ("INTEGER", 0),
+        "database_inode": ("INTEGER", 0),
+        "committed_at": ("TEXT", 0),
+        "receipt_fingerprint": ("TEXT", 0),
+        "schema_version": ("INTEGER", 0),
+    },
+    "paper_account_settlement_state": {
+        "portfolio_id": ("TEXT", 1),
+        "cash_text": ("TEXT", 0),
+        "realized_pnl_text": ("TEXT", 0),
+        "daily_pnl_text": ("TEXT", 0),
+        "daily_pnl_baseline_text": ("TEXT", 0),
+        "daily_pnl_date": ("TEXT", 0),
+        "updated_at": ("TEXT", 0),
+        "source_settlement_id": ("TEXT", 0),
+        "origin_bootstrap_id": ("TEXT", 0),
+    },
+    "paper_position_settlement_state": {
+        "portfolio_id": ("TEXT", 1),
+        "symbol": ("TEXT", 2),
+        "cost_basis_text": ("TEXT", 0),
+        "mark_price_text": ("TEXT", 0),
+        "source_settlement_id": ("TEXT", 0),
+        "updated_at": ("TEXT", 0),
+        "origin_bootstrap_id": ("TEXT", 0),
+    },
+    "paper_fifo_settlement_links": dict(_EXPECTED_COLUMNS["paper_fifo_settlement_links"]),
+}
+
+_PAPER_REDUCTION_SETTLEMENT_TRIGGER_SQL = {
+    "paper_reduction_settlements_no_update": """
+        CREATE TRIGGER paper_reduction_settlements_no_update
+        BEFORE UPDATE ON paper_reduction_settlements
+        BEGIN
+            SELECT RAISE(ABORT, 'paper reduction settlements are append-only');
+        END
+    """,
+    "paper_reduction_settlements_no_delete": """
+        CREATE TRIGGER paper_reduction_settlements_no_delete
+        BEFORE DELETE ON paper_reduction_settlements
+        BEGIN
+            SELECT RAISE(ABORT, 'paper reduction settlements are append-only');
+        END
+    """,
+}
+
+_PAPER_SETTLEMENT_HOT_TRIGGER_SQL = {
+    **_PAPER_REDUCTION_SETTLEMENT_TRIGGER_SQL,
+    "paper_fifo_settlement_links_no_update": _EXPECTED_TRIGGER_SQL[
+        "paper_fifo_settlement_links_no_update"
+    ],
+    "paper_fifo_settlement_links_no_delete": _EXPECTED_TRIGGER_SQL[
+        "paper_fifo_settlement_links_no_delete"
+    ],
+}
+
 
 def _normalized_sql(value: object) -> str:
     if not isinstance(value, str) or not value.strip():
@@ -476,7 +660,8 @@ async def _table_info(
     connection: aiosqlite.Connection,
     table: str,
 ) -> dict[str, tuple[str, int, int]]:
-    cursor = await connection.execute(f"PRAGMA table_info({table})")
+    quoted = '"' + table.replace('"', '""') + '"'
+    cursor = await connection.execute(f"PRAGMA main.table_info({quoted})")
     return {
         str(row[1]): (str(row[2]).upper(), int(row[3]), int(row[5]))
         for row in await cursor.fetchall()
@@ -487,7 +672,8 @@ async def _foreign_keys(
     connection: aiosqlite.Connection,
     table: str,
 ) -> set[tuple[str, str, str, str, str, str]]:
-    cursor = await connection.execute(f"PRAGMA foreign_key_list({table})")
+    quoted = '"' + table.replace('"', '""') + '"'
+    cursor = await connection.execute(f"PRAGMA main.foreign_key_list({quoted})")
     return {
         (
             str(row[3]),
@@ -505,13 +691,15 @@ async def _unique_column_sets(
     connection: aiosqlite.Connection,
     table: str,
 ) -> set[frozenset[str]]:
-    cursor = await connection.execute(f"PRAGMA index_list({table})")
+    quoted = '"' + table.replace('"', '""') + '"'
+    cursor = await connection.execute(f"PRAGMA main.index_list({quoted})")
     indexes = await cursor.fetchall()
     result: set[frozenset[str]] = set()
     for index in indexes:
         if int(index[2]) != 1:
             continue
-        detail = await connection.execute(f"PRAGMA index_info({index[1]})")
+        index_name = '"' + str(index[1]).replace('"', '""') + '"'
+        detail = await connection.execute(f"PRAGMA main.index_info({index_name})")
         result.add(frozenset(str(row[2]) for row in await detail.fetchall()))
     return result
 
@@ -562,7 +750,7 @@ async def assert_exact_state_schema(connection: aiosqlite.Connection) -> None:
         raise RuntimeError("exact-state schema requires foreign-key enforcement")
 
     migration_rows = await connection.execute(
-        "SELECT version FROM rt_schema_migrations WHERE component = ? ORDER BY version",
+        "SELECT version FROM main.rt_schema_migrations WHERE component = ? ORDER BY version",
         (EXACT_STATE_COMPONENT,),
     )
     if [int(row[0]) for row in await migration_rows.fetchall()] != list(
@@ -579,7 +767,7 @@ async def assert_exact_state_schema(connection: aiosqlite.Connection) -> None:
         "paper_account_settlement_state",
         "paper_position_settlement_state",
     }
-    cursor = await connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    cursor = await connection.execute("SELECT name FROM main.sqlite_master WHERE type = 'table'")
     tables = {str(row[0]) for row in await cursor.fetchall()}
     if not required.issubset(tables):
         raise RuntimeError("exact-state schema is incomplete")
@@ -623,7 +811,7 @@ async def assert_exact_state_schema(connection: aiosqlite.Connection) -> None:
         raise RuntimeError("exact-state FIFO settlement link uniqueness is malformed")
 
     table_sql_rows = await connection.execute(
-        "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+        "SELECT name, sql FROM main.sqlite_master WHERE type = 'table'"
     )
     table_sql = {str(row[0]): _normalized_sql(row[1]) for row in await table_sql_rows.fetchall()}
     for table, expected_sql in _EXPECTED_TABLE_SQL.items():
@@ -632,7 +820,7 @@ async def assert_exact_state_schema(connection: aiosqlite.Connection) -> None:
 
     trigger_rows = await connection.execute(
         """
-        SELECT name, sql FROM sqlite_master
+        SELECT name, sql FROM main.sqlite_master
         WHERE type = 'trigger' AND tbl_name IN (?, ?, ?, ?)
         """,
         (
@@ -649,6 +837,60 @@ async def assert_exact_state_schema(connection: aiosqlite.Connection) -> None:
         if trigger_sql.get(name) != _normalized_sql(expected_sql):
             raise RuntimeError(f"exact-state trigger {name} is missing or malformed")
 
-    violations = await connection.execute("PRAGMA foreign_key_check")
+    violations = await connection.execute("PRAGMA main.foreign_key_check")
     if await violations.fetchone() is not None:
         raise RuntimeError("exact-state schema contains foreign-key violations")
+
+
+async def assert_paper_settlement_hot_schema(connection: aiosqlite.Connection) -> None:
+    """Revalidate every table and trigger touched by terminal settlement.
+
+    The caller holds ``BEGIN IMMEDIATE``.  Main-schema qualification prevents
+    temporary objects from redirecting a statement, while this audit rejects
+    both temp shadows and any persistent trigger capable of adding side
+    effects to the atomic settlement transaction.
+    """
+
+    if not connection.in_transaction:
+        raise RuntimeError("paper settlement schema audit requires an active transaction")
+    await assert_exact_state_schema(connection)
+
+    hot_tables = frozenset(_PAPER_SETTLEMENT_HOT_COLUMNS)
+    temporary = await connection.execute(
+        "SELECT type,name,tbl_name FROM temp.sqlite_master ORDER BY type,name"
+    )
+    for object_type, name, table_name in await temporary.fetchall():
+        if str(name).lower() in hot_tables or (
+            str(object_type).lower() == "trigger" and str(table_name).lower() in hot_tables
+        ):
+            raise RuntimeError("temporary objects cannot shadow paper settlement state")
+
+    main_tables = await connection.execute("SELECT name FROM main.sqlite_master WHERE type='table'")
+    present = {str(row[0]) for row in await main_tables.fetchall()}
+    if not hot_tables.issubset(present):
+        raise RuntimeError("paper settlement hot schema is incomplete")
+    for table, required_columns in _PAPER_SETTLEMENT_HOT_COLUMNS.items():
+        actual = await _table_info(connection, table)
+        if set(actual) != required_columns:
+            raise RuntimeError(f"paper settlement hot table {table} is malformed")
+        for column, (expected_type, expected_primary_key) in _PAPER_SETTLEMENT_HOT_COLUMN_TYPES[
+            table
+        ].items():
+            actual_type, _, actual_primary_key = actual[column]
+            if actual_type != expected_type or actual_primary_key != expected_primary_key:
+                raise RuntimeError(f"paper settlement hot table {table} is malformed")
+
+    triggers = await connection.execute(
+        """
+        SELECT name,sql FROM main.sqlite_master
+        WHERE type='trigger' AND tbl_name IN (?,?,?,?,?,?,?)
+        ORDER BY name
+        """,
+        tuple(sorted(hot_tables)),
+    )
+    trigger_sql = {str(name): _normalized_sql(sql) for name, sql in await triggers.fetchall()}
+    if set(trigger_sql) != set(_PAPER_SETTLEMENT_HOT_TRIGGER_SQL):
+        raise RuntimeError("paper settlement hot-table trigger set is malformed")
+    for name, expected_sql in _PAPER_SETTLEMENT_HOT_TRIGGER_SQL.items():
+        if trigger_sql.get(name) != _normalized_sql(expected_sql):
+            raise RuntimeError(f"paper settlement trigger {name} is malformed")

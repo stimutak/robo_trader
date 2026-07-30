@@ -42,6 +42,7 @@ from robo_trader.accounting.fifo_runtime import (
 from robo_trader.database_migrations import (
     apply_exact_state_migrations,
     assert_exact_state_schema,
+    assert_paper_settlement_hot_schema,
 )
 from robo_trader.database_validator import DatabaseValidator, ValidationError
 from robo_trader.financial_state_bootstrap import (
@@ -2585,6 +2586,12 @@ class AsyncTradingDatabase:
                 raise PaperTerminalSettlementError("settlement database identity cannot be proven")
             try:
                 await conn.execute("BEGIN IMMEDIATE")
+                try:
+                    await assert_paper_settlement_hot_schema(conn)
+                except RuntimeError as exc:
+                    raise PaperTerminalSettlementError(
+                        "paper settlement hot schema cannot be authenticated"
+                    ) from exc
                 self._paper_settlement_fault("AFTER_BEGIN")
 
                 # Search every durable idempotency identity together. A
@@ -2596,7 +2603,7 @@ class AsyncTradingDatabase:
                            protective_quote_payload, trade_id, database_path, database_identity,
                            database_device, database_inode, committed_at,
                            receipt_fingerprint, schema_version
-                    FROM paper_reduction_settlements
+                    FROM main.paper_reduction_settlements
                     WHERE reservation_id = ? OR claim_id = ? OR (
                         execution_domain_scope = ? AND account_scope = ? AND order_ref = ?
                     )
@@ -2644,7 +2651,7 @@ class AsyncTradingDatabase:
                             SELECT request_fingerprint,epoch_id,fill_id,event_sequence,
                                    execution_id,commission_minor,commission_currency,
                                    commission_source,fifo_state_fingerprint
-                            FROM paper_fifo_settlement_links WHERE settlement_id=?
+                            FROM main.paper_fifo_settlement_links WHERE settlement_id=?
                             """,
                             (receipt.settlement_id,),
                         )
@@ -2665,7 +2672,7 @@ class AsyncTradingDatabase:
                             )
                     else:
                         link = await conn.execute(
-                            "SELECT 1 FROM paper_fifo_settlement_links WHERE settlement_id=?",
+                            "SELECT 1 FROM main.paper_fifo_settlement_links WHERE settlement_id=?",
                             (receipt.settlement_id,),
                         )
                         if await link.fetchone() is not None:
@@ -2676,7 +2683,7 @@ class AsyncTradingDatabase:
                     return receipt
 
                 cursor = await conn.execute(
-                    "SELECT id FROM portfolios WHERE id = ?",
+                    "SELECT id FROM main.portfolios WHERE id = ?",
                     (portfolio_id,),
                 )
                 if await cursor.fetchone() is None:
@@ -2687,7 +2694,7 @@ class AsyncTradingDatabase:
                 cursor = await conn.execute(
                     """
                     SELECT quantity, typeof(quantity), avg_cost, market_price
-                    FROM positions
+                    FROM main.positions
                     WHERE portfolio_id = ? AND symbol = ?
                     """,
                     (portfolio_id, symbol),
@@ -2712,7 +2719,7 @@ class AsyncTradingDatabase:
                 cursor = await conn.execute(
                     """
                     SELECT quantity, typeof(quantity)
-                    FROM positions WHERE symbol = ?
+                    FROM main.positions WHERE symbol = ?
                     """,
                     (symbol,),
                 )
@@ -2734,7 +2741,7 @@ class AsyncTradingDatabase:
                     """
                     SELECT cash_text, realized_pnl_text, daily_pnl_text,
                            daily_pnl_baseline_text, daily_pnl_date
-                    FROM paper_account_settlement_state
+                    FROM main.paper_account_settlement_state
                     WHERE portfolio_id = ?
                     """,
                     (portfolio_id,),
@@ -2772,7 +2779,7 @@ class AsyncTradingDatabase:
                         "current paper account differs from the requested pre-account state"
                     )
                 cursor = await conn.execute(
-                    "SELECT 1 FROM account WHERE portfolio_id = ?",
+                    "SELECT 1 FROM main.account WHERE portfolio_id = ?",
                     (portfolio_id,),
                 )
                 if await cursor.fetchone() is None:
@@ -2808,7 +2815,7 @@ class AsyncTradingDatabase:
                         """
                         SELECT cost_basis_text, mark_price_text,
                                source_settlement_id
-                        FROM paper_position_settlement_state
+                        FROM main.paper_position_settlement_state
                         WHERE portfolio_id = ? AND symbol = ?
                         """,
                         (portfolio_id, symbol),
@@ -2886,7 +2893,7 @@ class AsyncTradingDatabase:
                     exact_notional = request.fill_price * request.filled_quantity
                     cursor = await conn.execute(
                         """
-                        INSERT INTO trades (
+                        INSERT INTO main.trades (
                             portfolio_id, symbol, side, quantity, price, notional,
                             slippage, commission, pnl, timestamp
                         ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
@@ -2911,7 +2918,7 @@ class AsyncTradingDatabase:
                     self._paper_settlement_fault("AFTER_TRADE_INSERT")
                     await conn.execute(
                         """
-                        UPDATE positions
+                        UPDATE main.positions
                         SET quantity = ?, avg_cost = ?, market_price = ?, timestamp = ?
                         WHERE portfolio_id = ? AND symbol = ?
                         """,
@@ -2932,7 +2939,7 @@ class AsyncTradingDatabase:
 
                     await conn.execute(
                         """
-                        UPDATE account
+                        UPDATE main.account
                         SET cash = ?, realized_pnl = ?, daily_pnl = ?,
                             unrealized_pnl = ?, timestamp = ?
                         WHERE portfolio_id = ?
@@ -2952,7 +2959,7 @@ class AsyncTradingDatabase:
                     )
                     await conn.execute(
                         """
-                        UPDATE paper_account_settlement_state
+                        UPDATE main.paper_account_settlement_state
                         SET cash_text = ?, realized_pnl_text = ?, daily_pnl_text = ?,
                             updated_at = ?,
                             source_settlement_id = NULL
@@ -2971,7 +2978,7 @@ class AsyncTradingDatabase:
                 cursor = await conn.execute(
                     """
                     SELECT quantity, typeof(quantity)
-                    FROM positions WHERE symbol = ?
+                    FROM main.positions WHERE symbol = ?
                     """,
                     (symbol,),
                 )
@@ -3002,7 +3009,7 @@ class AsyncTradingDatabase:
                 )
                 await conn.execute(
                     """
-                    INSERT INTO paper_reduction_settlements (
+                    INSERT INTO main.paper_reduction_settlements (
                         settlement_id, execution_domain_scope, account_scope,
                         portfolio_id, con_id, symbol, reservation_id, claim_id,
                         order_ref, protective_quote_payload, request_fingerprint,
@@ -3043,7 +3050,7 @@ class AsyncTradingDatabase:
                         )
                     await conn.execute(
                         """
-                        UPDATE paper_position_settlement_state
+                        UPDATE main.paper_position_settlement_state
                         SET cost_basis_text = ?, mark_price_text = ?, source_settlement_id = ?,
                             updated_at = ?
                         WHERE portfolio_id = ? AND symbol = ?
@@ -3063,7 +3070,7 @@ class AsyncTradingDatabase:
                     )
                     await conn.execute(
                         """
-                        INSERT INTO paper_fifo_settlement_links(
+                        INSERT INTO main.paper_fifo_settlement_links(
                             settlement_id,request_fingerprint,epoch_id,fill_id,
                             event_sequence,execution_id,commission_minor,
                             commission_currency,commission_source,
@@ -3088,7 +3095,7 @@ class AsyncTradingDatabase:
                 self._paper_settlement_fault("AFTER_SETTLEMENT_INSERT")
                 await conn.execute(
                     """
-                    UPDATE paper_account_settlement_state
+                    UPDATE main.paper_account_settlement_state
                     SET source_settlement_id = ?
                     WHERE portfolio_id = ?
                     """,
