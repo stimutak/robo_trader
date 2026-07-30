@@ -649,6 +649,122 @@ _PAPER_SETTLEMENT_HOT_TRIGGER_SQL = {
     ],
 }
 
+_PAPER_SETTLEMENT_HOT_TABLE_SQL = {
+    "trades": """
+        CREATE TABLE trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            portfolio_id TEXT NOT NULL DEFAULT 'default',
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            price REAL NOT NULL,
+            notional REAL DEFAULT 0,
+            slippage REAL DEFAULT 0,
+            commission REAL DEFAULT 0,
+            pnl REAL DEFAULT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+    "positions": """
+        CREATE TABLE positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            portfolio_id TEXT NOT NULL DEFAULT 'default',
+            symbol TEXT NOT NULL CHECK (length(symbol) BETWEEN 1 AND 32),
+            quantity INTEGER NOT NULL,
+            avg_cost REAL NOT NULL,
+            market_price REAL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(portfolio_id, symbol)
+        )
+    """,
+    "account": """
+        CREATE TABLE account (
+            portfolio_id TEXT PRIMARY KEY DEFAULT 'default',
+            cash REAL NOT NULL,
+            equity REAL NOT NULL,
+            daily_pnl REAL DEFAULT 0,
+            realized_pnl REAL DEFAULT 0,
+            unrealized_pnl REAL DEFAULT 0,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+    "paper_reduction_settlements": """
+        CREATE TABLE paper_reduction_settlements (
+            settlement_id TEXT PRIMARY KEY,
+            execution_domain_scope TEXT NOT NULL,
+            account_scope TEXT NOT NULL,
+            portfolio_id TEXT NOT NULL,
+            con_id INTEGER NOT NULL CHECK (con_id > 0),
+            symbol TEXT NOT NULL,
+            reservation_id TEXT NOT NULL UNIQUE,
+            claim_id TEXT NOT NULL UNIQUE,
+            order_ref TEXT NOT NULL,
+            protective_quote_payload TEXT NOT NULL,
+            request_fingerprint TEXT NOT NULL,
+            request_payload_json TEXT NOT NULL,
+            terminal_status TEXT NOT NULL,
+            trade_id INTEGER,
+            database_path TEXT NOT NULL,
+            database_identity TEXT NOT NULL,
+            database_device INTEGER NOT NULL,
+            database_inode INTEGER NOT NULL,
+            committed_at TEXT NOT NULL,
+            receipt_fingerprint TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            UNIQUE(execution_domain_scope, account_scope, order_ref),
+            FOREIGN KEY(trade_id) REFERENCES trades(id)
+        )
+    """,
+    "paper_account_settlement_state": """
+        CREATE TABLE paper_account_settlement_state (
+            portfolio_id TEXT PRIMARY KEY,
+            cash_text TEXT NOT NULL,
+            realized_pnl_text TEXT NOT NULL,
+            daily_pnl_text TEXT NOT NULL,
+            daily_pnl_baseline_text TEXT NOT NULL,
+            daily_pnl_date TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            source_settlement_id TEXT,
+            origin_bootstrap_id TEXT REFERENCES paper_state_bootstraps(bootstrap_id),
+            FOREIGN KEY(source_settlement_id)
+                REFERENCES paper_reduction_settlements(settlement_id)
+        )
+    """,
+    "paper_position_settlement_state": """
+        CREATE TABLE paper_position_settlement_state (
+            portfolio_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            cost_basis_text TEXT NOT NULL,
+            mark_price_text TEXT,
+            source_settlement_id TEXT,
+            updated_at TEXT NOT NULL,
+            origin_bootstrap_id TEXT REFERENCES paper_state_bootstraps(bootstrap_id),
+            PRIMARY KEY (portfolio_id, symbol),
+            FOREIGN KEY(source_settlement_id)
+                REFERENCES paper_reduction_settlements(settlement_id)
+        )
+    """,
+    "paper_fifo_settlement_links": _EXPECTED_TABLE_SQL["paper_fifo_settlement_links"],
+}
+
+_PAPER_SETTLEMENT_HOT_INDEX_SQL = {
+    "idx_positions_portfolio": """
+        CREATE INDEX idx_positions_portfolio ON positions (portfolio_id)
+    """,
+    "idx_trades_portfolio": """
+        CREATE INDEX idx_trades_portfolio ON trades (portfolio_id)
+    """,
+    "idx_trades_portfolio_symbol": """
+        CREATE INDEX idx_trades_portfolio_symbol
+        ON trades (portfolio_id, symbol, timestamp DESC)
+    """,
+    "idx_paper_reduction_settlement_scope": """
+        CREATE INDEX idx_paper_reduction_settlement_scope
+        ON paper_reduction_settlements
+           (execution_domain_scope, account_scope, portfolio_id, symbol)
+    """,
+}
+
 
 def _normalized_sql(value: object) -> str:
     if not isinstance(value, str) or not value.strip():
@@ -880,10 +996,41 @@ async def assert_paper_settlement_hot_schema(connection: aiosqlite.Connection) -
             if actual_type != expected_type or actual_primary_key != expected_primary_key:
                 raise RuntimeError(f"paper settlement hot table {table} is malformed")
 
+    table_rows = await connection.execute(
+        """
+        SELECT name,sql FROM main.sqlite_master
+        WHERE type='table' AND lower(name) IN (?,?,?,?,?,?,?)
+        ORDER BY name
+        """,
+        tuple(sorted(hot_tables)),
+    )
+    table_sql = {str(name): _normalized_sql(sql) for name, sql in await table_rows.fetchall()}
+    if set(table_sql) != set(_PAPER_SETTLEMENT_HOT_TABLE_SQL):
+        raise RuntimeError("paper settlement hot-table definition set is malformed")
+    for name, expected_sql in _PAPER_SETTLEMENT_HOT_TABLE_SQL.items():
+        if table_sql.get(name) != _normalized_sql(expected_sql):
+            raise RuntimeError(f"paper settlement hot table {name} definition is malformed")
+
+    index_rows = await connection.execute(
+        """
+        SELECT name,sql FROM main.sqlite_master
+        WHERE type='index' AND name NOT LIKE 'sqlite_autoindex_%'
+          AND lower(tbl_name) IN (?,?,?,?,?,?,?)
+        ORDER BY name
+        """,
+        tuple(sorted(hot_tables)),
+    )
+    index_sql = {str(name): _normalized_sql(sql) for name, sql in await index_rows.fetchall()}
+    if set(index_sql) != set(_PAPER_SETTLEMENT_HOT_INDEX_SQL):
+        raise RuntimeError("paper settlement hot-table index set is malformed")
+    for name, expected_sql in _PAPER_SETTLEMENT_HOT_INDEX_SQL.items():
+        if index_sql.get(name) != _normalized_sql(expected_sql):
+            raise RuntimeError(f"paper settlement hot-table index {name} is malformed")
+
     triggers = await connection.execute(
         """
         SELECT name,sql FROM main.sqlite_master
-        WHERE type='trigger' AND tbl_name IN (?,?,?,?,?,?,?)
+        WHERE type='trigger' AND lower(tbl_name) IN (?,?,?,?,?,?,?)
         ORDER BY name
         """,
         tuple(sorted(hot_tables)),

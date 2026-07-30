@@ -17,9 +17,9 @@ Base: `main` at `4c7ea47`, including merged PR4B
 
 ## Local verification
 
-- Full repository suite: `3042 passed, 5 skipped, 20 warnings`.
+- Full repository suite: `3044 passed, 5 skipped, 20 warnings`.
 - Combined FIFO, migration, exact-bootstrap, settlement, failure-injection,
-  and recovery-status matrix: `215 passed`.
+  and recovery-status matrix: `217 passed`.
 - Existing-position and stop-event suite: `168 passed`.
 - Migration, exact bootstrap, and FIFO foundation suite: `120 passed`.
 - Terminal failure-injection and recovery-status suite: `66 passed`.
@@ -34,6 +34,9 @@ Base: `main` at `4c7ea47`, including merged PR4B
   `paper_fifo_settlement_links` shadow and a persistent `AFTER INSERT` trade
   injection trigger both fail before mutation, with no fill, commission,
   compatibility trade, settlement, or link partially committed.
+- The persistent-trigger regression uses SQLite's case-insensitive `Trades`
+  spelling, and complete-definition regressions reject both a same-column
+  replacement table with an added `CHECK` and a malformed hot-table index.
 - Settlement failure injection covers failures immediately after FIFO append,
   after compatibility trade insertion, and after immutable FIFO-link insertion;
   every case leaves zero fill, commission, trade, settlement, and link rows.

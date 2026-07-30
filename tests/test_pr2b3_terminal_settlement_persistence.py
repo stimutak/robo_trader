@@ -648,7 +648,7 @@ async def test_temp_fifo_link_shadow_fails_closed_before_any_mutation(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_persistent_trade_trigger_fails_closed_before_any_mutation(tmp_path: Path):
+async def test_mixed_case_persistent_trade_trigger_fails_before_any_mutation(tmp_path: Path):
     contract = _runtime_contract(tmp_path)
     database = AsyncTradingDatabase(Path(contract.database_path), pool_size=1)
     await database.initialize()
@@ -657,7 +657,7 @@ async def test_persistent_trade_trigger_fails_closed_before_any_mutation(tmp_pat
         async with database.get_connection() as connection:
             await connection.execute("""
                 CREATE TRIGGER inject_second_trade_after_settlement
-                AFTER INSERT ON main.trades
+                AFTER INSERT ON main.Trades
                 BEGIN
                     INSERT INTO trades(
                         portfolio_id,symbol,side,quantity,price,notional,
@@ -667,6 +667,78 @@ async def test_persistent_trade_trigger_fails_closed_before_any_mutation(tmp_pat
                         '2026-07-30T12:00:00Z'
                     );
                 END
+                """)
+            await connection.commit()
+
+        with pytest.raises(PaperTerminalSettlementError, match="hot schema"):
+            await database.commit_paper_reduction_outcome(
+                _request(outcome_at=datetime.now(timezone.utc) - timedelta(seconds=1)),
+                runtime_contract=contract,
+            )
+
+        await _assert_no_partial_settlement(database)
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_same_shape_trade_table_with_extra_check_fails_before_mutation(tmp_path: Path):
+    contract = _runtime_contract(tmp_path)
+    database = AsyncTradingDatabase(Path(contract.database_path), pool_size=1)
+    await database.initialize()
+    try:
+        await _seed(database)
+        async with database.get_connection() as connection:
+            await connection.execute("PRAGMA foreign_keys=OFF")
+            await connection.execute("DROP TABLE main.trades")
+            await connection.execute("""
+                CREATE TABLE main.trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    portfolio_id TEXT NOT NULL DEFAULT 'default',
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    price REAL NOT NULL,
+                    notional REAL DEFAULT 0,
+                    slippage REAL DEFAULT 0,
+                    commission REAL DEFAULT 0,
+                    pnl REAL DEFAULT NULL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    CHECK (symbol <> 'AAPL')
+                )
+                """)
+            await connection.execute("""
+                CREATE INDEX idx_trades_portfolio ON trades (portfolio_id)
+                """)
+            await connection.execute("""
+                CREATE INDEX idx_trades_portfolio_symbol
+                ON trades (portfolio_id, symbol, timestamp DESC)
+                """)
+            await connection.commit()
+            await connection.execute("PRAGMA foreign_keys=ON")
+
+        with pytest.raises(PaperTerminalSettlementError, match="hot schema"):
+            await database.commit_paper_reduction_outcome(
+                _request(outcome_at=datetime.now(timezone.utc) - timedelta(seconds=1)),
+                runtime_contract=contract,
+            )
+
+        await _assert_no_partial_settlement(database)
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_malformed_hot_table_index_fails_before_mutation(tmp_path: Path):
+    contract = _runtime_contract(tmp_path)
+    database = AsyncTradingDatabase(Path(contract.database_path), pool_size=1)
+    await database.initialize()
+    try:
+        await _seed(database)
+        async with database.get_connection() as connection:
+            await connection.execute("DROP INDEX main.idx_trades_portfolio_symbol")
+            await connection.execute("""
+                CREATE INDEX idx_trades_portfolio_symbol ON trades (symbol)
                 """)
             await connection.commit()
 
