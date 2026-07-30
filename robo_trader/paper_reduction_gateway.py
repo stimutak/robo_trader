@@ -43,6 +43,7 @@ from .protective_quote_evidence import (
     ProtectiveQuoteSource,
     assert_current_authoritative_protective_quote,
 )
+from .reconciliation.ibkr_adapter import IBKRDiagnosticSnapshotProvider
 from .reconciliation.identity import (
     RuntimeSafetyContext,
     assert_validated_runtime_safety_context,
@@ -95,6 +96,7 @@ class PaperReductionGateway:
         coordinator: SafetyRuntimeCoordinator,
         database: AsyncTradingDatabase,
         *,
+        diagnostic_provider: IBKRDiagnosticSnapshotProvider | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
@@ -141,9 +143,21 @@ class PaperReductionGateway:
                 "shared safety database does not match the runtime ledger path"
             )
         self._database = database
-        self._client = SubprocessIBKRClient(
-            worker_runtime_environment=self._runtime_context.runtime_contract.environment,
-        )
+        self._diagnostic_provider = diagnostic_provider
+        self._owns_diagnostic_client = diagnostic_provider is None
+        if diagnostic_provider is None:
+            self._client = SubprocessIBKRClient(
+                worker_runtime_environment=self._runtime_context.runtime_contract.environment,
+            )
+        else:
+            try:
+                self._client = diagnostic_provider._shared_gateway_transport(
+                    runtime_context=self._runtime_context,
+                )
+            except Exception as exc:
+                raise PaperReductionGatewayError(
+                    "shared diagnostic provider binding is invalid"
+                ) from exc
         self._account_order_gate = asyncio.Lock()
         self._bindings: dict[str, _PaperRuntimeBinding] = {}
         self._active_runtime_binding_session: _PaperRuntimeBindingSession | None = None
@@ -209,14 +223,25 @@ class PaperReductionGateway:
             context = assert_validated_runtime_safety_context(self._runtime_context)
             connection = context.diagnostic_connection
             try:
-                await self._client.start()
-                connected = await self._client.connect(
-                    host=connection.host,
-                    port=connection.port,
-                    client_id=connection.client_id,
-                    readonly=connection.readonly,
-                    timeout=30.0,
-                )
+                if getattr(self, "_owns_diagnostic_client", True):
+                    await self._client.start()
+                    connected = await self._client.connect(
+                        host=connection.host,
+                        port=connection.port,
+                        client_id=connection.client_id,
+                        readonly=connection.readonly,
+                        timeout=30.0,
+                    )
+                else:
+                    provider = self._diagnostic_provider
+                    if type(provider) is not IBKRDiagnosticSnapshotProvider:
+                        raise PaperReductionGatewayError(
+                            "shared diagnostic provider is unavailable"
+                        )
+                    self._client = provider._shared_gateway_transport(
+                        runtime_context=context,
+                    )
+                    connected = await self._client.ping()
                 if connected is not True:
                     raise PaperReductionGatewayError(
                         "diagnostic broker connection was not established"
@@ -249,7 +274,14 @@ class PaperReductionGateway:
         if subscribed is not None:
             subscribed.clear()
 
-        task = asyncio.create_task(self._client.stop())
+        if getattr(self, "_owns_diagnostic_client", True):
+            cleanup = self._client.stop()
+        else:
+            provider = self._diagnostic_provider
+            if type(provider) is not IBKRDiagnosticSnapshotProvider:
+                raise PaperReductionGatewayError("shared diagnostic provider is unavailable")
+            cleanup = provider.suspend()
+        task = asyncio.create_task(cleanup)
         cancellation: asyncio.CancelledError | None = None
         stop_failure: BaseException | None = None
         while not task.done():
@@ -558,7 +590,8 @@ class PaperReductionGateway:
                     pass
             await self._invalidate_protective_quote_producers()
             try:
-                await self._stop_client_owned()
+                if getattr(self, "_owns_diagnostic_client", True):
+                    await self._stop_client_owned()
             finally:
                 self._started = False
                 self._diagnostic_recovery_required = False
@@ -572,15 +605,22 @@ class PaperReductionGateway:
         try:
             context = assert_validated_runtime_safety_context(self._runtime_context)
             connection = context.diagnostic_connection
-            await self._stop_client_owned()
-            await self._client.start()
-            connected = await self._client.connect(
-                host=connection.host,
-                port=connection.port,
-                client_id=connection.client_id,
-                readonly=connection.readonly,
-                timeout=30.0,
-            )
+            if getattr(self, "_owns_diagnostic_client", True):
+                await self._stop_client_owned()
+                await self._client.start()
+                connected = await self._client.connect(
+                    host=connection.host,
+                    port=connection.port,
+                    client_id=connection.client_id,
+                    readonly=connection.readonly,
+                    timeout=30.0,
+                )
+            else:
+                provider = self._diagnostic_provider
+                if type(provider) is not IBKRDiagnosticSnapshotProvider:
+                    raise PaperReductionGatewayError("shared diagnostic provider is unavailable")
+                await provider.refresh()
+                connected = True
             if connected is not True or await self._client.ping() is not True:
                 raise PaperReductionGatewayError("diagnostic broker connection did not recover")
         except BaseException as error:
@@ -593,11 +633,13 @@ class PaperReductionGateway:
     async def refresh_diagnostic_connection(self) -> None:
         """Replace stale broker state before order admission can resume.
 
-        The runner and this gateway intentionally own separate read-only IBKR
-        clients.  A runner recovery therefore cannot prove that the gateway's
-        diagnostic session survived the same outage.  Hold the account-wide
-        gate, mark this boundary unavailable before the first await, and only
-        restore ``started`` after a fresh connect and active ping both succeed.
+        The gateway borrows the reconciliation provider's read-only generation
+        in production. A runner recovery therefore must replace that shared
+        diagnostic generation before either reconciliation or reductions may
+        resume. Hold the account-wide gate, mark this boundary unavailable
+        before the first await, and only restore ``started`` after a fresh
+        connect and active ping both succeed. Legacy isolated construction
+        retains the independently owned-client path for compatibility.
         """
 
         require_paper_terminal_settlement_ready()

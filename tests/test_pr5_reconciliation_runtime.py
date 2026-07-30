@@ -10,6 +10,7 @@ import weakref
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 
 import aiosqlite
@@ -315,6 +316,7 @@ async def _service(
     database_path = (tmp_path / "reconciliation.sqlite3").resolve()
     source = _EvidenceSource(database_path, snapshot or _snapshot(), comparison or _comparison())
     persistence = ReconciliationPersistence(database_path)
+    await persistence.migrate_for_operator(operator_confirmed=True)
     service = ReconciliationService(
         evidence_source=source,
         persistence=persistence,
@@ -362,7 +364,7 @@ async def test_component_migration_preserves_unrelated_schema_and_rows(tmp_path)
         await connection.commit()
     persistence = ReconciliationPersistence(database_path)
 
-    await persistence.initialize()
+    await persistence.migrate_for_operator(operator_confirmed=True)
     await persistence.initialize()
 
     with sqlite3.connect(database_path) as connection:
@@ -372,6 +374,35 @@ async def test_component_migration_preserves_unrelated_schema_and_rows(tmp_path)
         assert connection.execute(
             "SELECT component, version FROM rt_schema_migrations"
         ).fetchall() == [(RECONCILIATION_COMPONENT, 1), (RECONCILIATION_COMPONENT, 2)]
+
+
+@pytest.mark.asyncio
+async def test_runtime_initialize_is_read_only_and_operator_migration_is_explicit(
+    tmp_path,
+) -> None:
+    database_path = (tmp_path / "reconciliation.sqlite3").resolve()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE irreplaceable_history(value TEXT NOT NULL)")
+        connection.execute("INSERT INTO irreplaceable_history VALUES ('preserve-me')")
+    persistence = ReconciliationPersistence(database_path)
+    before = database_path.read_bytes()
+
+    with pytest.raises(ReconciliationPersistenceError, match="schema is unavailable"):
+        await persistence.initialize()
+
+    assert database_path.read_bytes() == before
+    assert not Path(f"{database_path}-wal").exists()
+    assert not Path(f"{database_path}-shm").exists()
+    with pytest.raises(ReconciliationPersistenceError, match="operator confirmation"):
+        await persistence.migrate_for_operator(operator_confirmed=False)
+    assert database_path.read_bytes() == before
+
+    await persistence.migrate_for_operator(operator_confirmed=True)
+    await persistence.initialize()
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT * FROM irreplaceable_history").fetchall() == [
+            ("preserve-me",)
+        ]
 
 
 @pytest.mark.asyncio
@@ -458,7 +489,7 @@ async def test_exact_old_v1_schema_upgrades_additively_without_row_loss(tmp_path
         )
         await connection.commit()
 
-    await ReconciliationPersistence(database_path).initialize()
+    await ReconciliationPersistence(database_path).migrate_for_operator(operator_confirmed=True)
 
     with sqlite3.connect(database_path) as connection:
         assert connection.execute(
@@ -585,7 +616,7 @@ async def test_v2_constraint_mutation_matrix_fails_closed(
 ) -> None:
     database_path = (tmp_path / "reconciliation.sqlite3").resolve()
     persistence = ReconciliationPersistence(database_path)
-    await persistence.initialize()
+    await persistence.migrate_for_operator(operator_confirmed=True)
     _rewrite_table_definition(database_path, table, old, new)
 
     with pytest.raises((RuntimeError, sqlite3.DatabaseError), match="malformed"):
@@ -647,7 +678,7 @@ async def test_v1_constraint_mutation_matrix_fails_closed(
 ) -> None:
     database_path = (tmp_path / "reconciliation.sqlite3").resolve()
     persistence = ReconciliationPersistence(database_path)
-    await persistence.initialize()
+    await persistence.migrate_for_operator(operator_confirmed=True)
     _rewrite_table_definition(database_path, table, old, new)
 
     with pytest.raises((RuntimeError, sqlite3.DatabaseError), match="malformed"):
@@ -667,7 +698,7 @@ async def test_v1_constraint_mutation_matrix_fails_closed(
 async def test_every_v1_append_only_trigger_is_exact(tmp_path, table: str) -> None:
     database_path = (tmp_path / "reconciliation.sqlite3").resolve()
     persistence = ReconciliationPersistence(database_path)
-    await persistence.initialize()
+    await persistence.migrate_for_operator(operator_confirmed=True)
     trigger = f"{table}_no_delete"
     _rewrite_schema_definition(
         database_path,
@@ -706,7 +737,7 @@ async def test_every_v2_append_only_trigger_is_exact(
 ) -> None:
     database_path = (tmp_path / "reconciliation.sqlite3").resolve()
     persistence = ReconciliationPersistence(database_path)
-    await persistence.initialize()
+    await persistence.migrate_for_operator(operator_confirmed=True)
     trigger = f"{table}_{suffix}"
     _rewrite_schema_definition(
         database_path,
@@ -724,7 +755,7 @@ async def test_every_v2_append_only_trigger_is_exact(
 async def test_v2_composite_identity_index_mutation_fails_closed(tmp_path) -> None:
     database_path = (tmp_path / "reconciliation.sqlite3").resolve()
     persistence = ReconciliationPersistence(database_path)
-    await persistence.initialize()
+    await persistence.migrate_for_operator(operator_confirmed=True)
     with sqlite3.connect(database_path) as connection:
         connection.execute("DROP INDEX rt_reconciliation_differences_run_difference_uq")
         connection.execute(
@@ -752,7 +783,7 @@ async def test_v2_duplicate_null_identity_probe_fails_closed(
 ) -> None:
     database_path = (tmp_path / "reconciliation.sqlite3").resolve()
     persistence = ReconciliationPersistence(database_path)
-    await persistence.initialize()
+    await persistence.migrate_for_operator(operator_confirmed=True)
     constrained = f"{identity_column} TEXT PRIMARY KEY NOT NULL"
     nullable = f"{identity_column} TEXT PRIMARY KEY"
     _rewrite_table_definition(database_path, table, constrained, nullable)
@@ -914,7 +945,7 @@ async def test_partial_migration_fails_closed_without_using_runtime_state(tmp_pa
 @pytest.mark.asyncio
 async def test_duplicate_append_is_idempotent_not_a_duplicate_callback(tmp_path) -> None:
     persistence = ReconciliationPersistence((tmp_path / "reconciliation.sqlite3").resolve())
-    await persistence.initialize()
+    await persistence.migrate_for_operator(operator_confirmed=True)
     snapshot = _snapshot()
     verdict = evaluate_paper_simulator_reconciliation(
         snapshot,

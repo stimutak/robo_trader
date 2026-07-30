@@ -30,6 +30,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from robo_trader.connection_health import ConnectionHealth, HealthStatus
+from robo_trader.reconciliation.runtime_integration import RuntimeReconciliationController
 from robo_trader.runner_async import AsyncRunner
 
 
@@ -58,6 +59,9 @@ def make_runner_for_recovery(initialize_succeeds_on=None):
     runner.subprocess_client.stop = AsyncMock()
     runner.health = None
     runner._safe_disconnect = AsyncMock()
+    reconciliation = object.__new__(RuntimeReconciliationController)
+    reconciliation.reconcile_reconnect = AsyncMock()
+    runner.reconciliation_controller = reconciliation
 
     if initialize_succeeds_on is None:
         runner.initialize_connection = AsyncMock()

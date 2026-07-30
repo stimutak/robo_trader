@@ -553,6 +553,7 @@ async def _collect(
     con_id: int = 265598,
     transport_generation: str = "generation-1",
     source_event_id: str | None = None,
+    active_symbols: tuple[str, ...] | None = None,
 ) -> tuple[UnsignedBootstrapProtectiveMark, object]:
     sink = receiver or Receiver()
     result = await collect_and_produce_bootstrap_protective_mark(
@@ -565,6 +566,7 @@ async def _collect(
         expected_con_id=con_id,
         expected_transport_generation=transport_generation,
         expected_source_event_id=source_event_id,
+        expected_active_symbols=active_symbols,
     )
     return result, sink
 
@@ -586,6 +588,22 @@ async def test_collector_uses_real_typed_path_before_receiver_delivery(database:
     evidence = monitor.get_protective_quote_evidence("AAPL")
     assert evidence is not None
     assert evidence.quote_id == result.protective_quote_id
+
+
+@pytest.mark.asyncio
+async def test_collector_preserves_complete_account_protective_symbol_scope(
+    database: Path,
+) -> None:
+    source = QuoteSource((_broker_quote(),))
+
+    await _collect(
+        source,
+        _monitor(database),
+        database,
+        active_symbols=("AAPL", "MSFT"),
+    )
+
+    assert source.requests == [(("AAPL",), ("AAPL", "MSFT"))]
 
 
 @pytest.mark.asyncio
@@ -1414,6 +1432,7 @@ def test_interface_has_no_price_path_json_signer_or_key_capability() -> None:
         "expected_con_id",
         "expected_transport_generation",
         "expected_source_event_id",
+        "expected_active_symbols",
     }
     assert all(
         fragment not in name

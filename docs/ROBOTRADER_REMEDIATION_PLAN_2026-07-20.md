@@ -44,10 +44,11 @@ terminal-settlement readiness gate. PR 2B.3 merged through PR #107 as
 `017f43e`. PR 3 merged through PR #111 as `8596920`. The PR 4 exact-state
 bootstrap code slice merged through PR #112 as `bccb96b`; strict FIFO,
 operator-reviewed bootstrap/application, and restore evidence remain open. PR
-5 foundations merged through PR #113 (`6176931`) and PR #115 (`1ae6480`);
-production startup/reconnect/periodic wiring and a current operator-reviewed
-reconciliation remain open. Gate A remains closed, the trader remains stopped,
-and none of these merges authorizes startup.
+5 foundations merged through PR #113 (`6176931`) and PR #115 (`1ae6480`). The
+PR 5 runtime-integration draft adds fail-closed startup, reconnect, and periodic
+reconciliation plus sanitized dashboard status. A current operator-reviewed
+broker reconciliation remains open. Gate A remains closed, the trader remains
+stopped, and none of these merges or draft changes authorizes startup.
 
 PR4A's dormant exact FIFO foundation is merged through PR #120. PR4B's
 operator-reviewed legacy-opening bridge is under review as PR #123 at exact
@@ -725,6 +726,58 @@ Make broker truth visible and authoritative before any broker-writing capability
 - Wrong account, wrong quantity, stale cash, unknown order, and reconnect scenarios.
 - Database unavailable or partially migrated.
 - Operator resolution without destructive replacement.
+
+### Runtime-integration draft evidence (2026-07-30)
+
+- Startup, reconnect, and fixed-period triggers use one read-only diagnostic
+  provider and publish a fresh, one-shot signed reconciliation result from the
+  same broker transport generation. An exact provider-generation lease is held
+  from snapshot collection through protective marks and publication, so health
+  refresh, suspension, and close cannot splice two generations into one bundle.
+- Runtime database and bootstrap-receipt readiness are verified read-only before
+  broker collection; absent, partial, or unauthenticated state fails closed
+  without schema repair or data mutation.
+- Risk-increasing entries require a fresh eligible reconciliation. Quarantine
+  preserves the existing semantic reduce-only path so protective reductions are
+  not stranded.
+- Every protective-mark request carries the complete unique account-wide set
+  of active position symbols, so reconciliation cannot cancel another
+  position's shared-worker quote subscription.
+- Dashboard status exposes only sanitized reconciliation state, age, trigger,
+  and quarantine/eligibility fields; signing-capability paths and broker
+  evidence are not exposed. Existing owned status is replaced only through an
+  atomic, fully synced inode exchange; unrelated targets are restored rather
+  than overwritten, and a crash leaves a complete old or new artifact.
+- Published evidence is never auto-deleted, moved, or rewritten. The runtime
+  applies a non-destructive ceiling before publication (defaults: 10,000
+  runtime bundles and 2 GiB, configurable with
+  `RT_RECONCILIATION_EVIDENCE_MAX_BUNDLES` and
+  `RT_RECONCILIATION_EVIDENCE_MAX_BYTES`). Reaching either ceiling quarantines
+  new entries while portfolio cycles continue through reduce-only gates; an
+  operator-reviewed archival action is required before evidence collection can
+  resume. Every admission performs a fresh held-root usage scan, excluding
+  only the exact device/inode binding of its own current staging directory, so
+  externally added bundles cannot hide behind cached counters. A non-blocking
+  POSIX lock on the held evidence-root directory serializes that final scan
+  through completion-marker publication across cooperating processes. The
+  receiver binds admission to the exact sealed entry identities,
+  hashes, and final completion-marker bytes immediately before publication.
+  Completion-marker schema v2 commits that exact artifact manifest, and the
+  loader rejects any added, replaced, removed, or rewritten directory entry;
+  any pre-marker raced bundle is left incomplete and preserved for inspection.
+  Active/bootstrap/audit lineage remains intact.
+- Adversarial regressions cover protected and raced status targets,
+  suspended-provider recovery, broker-envelope replay, complete account-wide
+  protective symbol scope, reduce-only continuity after artifact failures,
+  non-destructive retention ceilings, and persisted eligibility expiry.
+- Synthetic and mocked verification on 2026-07-30: `3082 passed, 5 skipped`
+  across the complete pytest suite; Black and Flake8 passed for all changed
+  Python files. No trader process, Gateway, broker session, or authoritative
+  trading database was started or accessed.
+- Operational evidence is still required: provision the owner-only signing and
+  evidence directories, run the authoritative launcher under supervision, and
+  obtain operator review of a current broker reconciliation. Those actions are
+  not authorized by this draft, and Gate A remains closed.
 
 ### Done means
 

@@ -252,10 +252,17 @@ class VerifiedBrokerEvidenceEnvelope:
         raise TypeError("verified broker envelope cannot be pickled")
 
 
-_VerifiedBrokerRegistryEntry = tuple[
-    weakref.ReferenceType[VerifiedBrokerEvidenceEnvelope],
-    str,
-]
+@dataclass(frozen=True, slots=True)
+class _VerifiedBrokerRegistryEntry:
+    reference: weakref.ReferenceType[VerifiedBrokerEvidenceEnvelope]
+    digest: str
+    phase: str
+
+
+_BROKER_PHASE_PRODUCER_READY = "producer_ready"
+_BROKER_PHASE_PRODUCER_CONSUMED = "producer_consumed"
+_BROKER_PHASE_RUNTIME_READY = "runtime_ready"
+_BROKER_PHASE_RUNTIME_CONSUMED = "runtime_consumed"
 _VERIFIED_BROKER_REGISTRY: dict[int, _VerifiedBrokerRegistryEntry] = {}
 
 
@@ -288,14 +295,18 @@ def _register_verified_broker_envelope(
     def discard(reference: weakref.ReferenceType[VerifiedBrokerEvidenceEnvelope]) -> None:
         with _VERIFIED_BROKER_REGISTRY_LOCK:
             current = _VERIFIED_BROKER_REGISTRY.get(object_id)
-            if current is not None and current[0] is reference:
+            if current is not None and current.reference is reference:
                 _VERIFIED_BROKER_REGISTRY.pop(object_id, None)
 
     reference = weakref.ref(envelope, discard)
     with _VERIFIED_BROKER_REGISTRY_LOCK:
-        _VERIFIED_BROKER_REGISTRY[object_id] = (
-            reference,
-            _verified_broker_digest(envelope),
+        current = _VERIFIED_BROKER_REGISTRY.get(object_id)
+        if current is not None and current.reference() is not None:
+            raise BootstrapEvidenceReceiverError("verified broker envelope is already registered")
+        _VERIFIED_BROKER_REGISTRY[object_id] = _VerifiedBrokerRegistryEntry(
+            reference=reference,
+            digest=_verified_broker_digest(envelope),
+            phase=_BROKER_PHASE_PRODUCER_READY,
         )
     return envelope
 
@@ -309,16 +320,62 @@ def assert_and_consume_verified_broker_evidence(
         raise BootstrapEvidenceReceiverError("exact verified broker envelope is required")
     digest = _verified_broker_digest(envelope)
     with _VERIFIED_BROKER_REGISTRY_LOCK:
-        registered = _VERIFIED_BROKER_REGISTRY.pop(id(envelope), None)
+        registered = _VERIFIED_BROKER_REGISTRY.get(id(envelope))
         if (
             registered is None
-            or registered[0]() is not envelope
+            or registered.reference() is not envelope
             or envelope._marker is not _VERIFIED_BROKER_MARKER
-            or not secrets.compare_digest(registered[1], digest)
+            or not secrets.compare_digest(registered.digest, digest)
+            or registered.phase not in {_BROKER_PHASE_PRODUCER_READY, _BROKER_PHASE_RUNTIME_READY}
         ):
             raise BootstrapEvidenceReceiverError(
                 "verified broker envelope is forged, changed, or already consumed"
             )
+        phase = (
+            _BROKER_PHASE_PRODUCER_CONSUMED
+            if registered.phase == _BROKER_PHASE_PRODUCER_READY
+            else _BROKER_PHASE_RUNTIME_CONSUMED
+        )
+        _VERIFIED_BROKER_REGISTRY[id(envelope)] = _VerifiedBrokerRegistryEntry(
+            reference=registered.reference,
+            digest=registered.digest,
+            phase=phase,
+        )
+    return envelope
+
+
+def _handoff_consumed_verified_broker_evidence_to_runtime(
+    envelope: VerifiedBrokerEvidenceEnvelope,
+) -> VerifiedBrokerEvidenceEnvelope:
+    """Re-register the producer-consumed envelope for one runtime bind.
+
+    The bootstrap reconciliation producer consumes the signer-owned envelope
+    before it inspects any broker field.  After the signed reconciliation stage
+    commits, runtime still needs to consume that *same* broker generation while
+    binding the report to the exact database inode.  This private handoff keeps
+    the lineage one-shot without collecting a second snapshot.
+    """
+
+    if type(envelope) is not VerifiedBrokerEvidenceEnvelope:
+        raise BootstrapEvidenceReceiverError("exact verified broker envelope is required")
+    digest = _verified_broker_digest(envelope)
+    with _VERIFIED_BROKER_REGISTRY_LOCK:
+        registered = _VERIFIED_BROKER_REGISTRY.get(id(envelope))
+        if (
+            registered is None
+            or registered.reference() is not envelope
+            or envelope._marker is not _VERIFIED_BROKER_MARKER
+            or not secrets.compare_digest(registered.digest, digest)
+            or registered.phase != _BROKER_PHASE_PRODUCER_CONSUMED
+        ):
+            raise BootstrapEvidenceReceiverError(
+                "verified broker envelope was not producer-consumed or was already handed off"
+            )
+        _VERIFIED_BROKER_REGISTRY[id(envelope)] = _VerifiedBrokerRegistryEntry(
+            reference=registered.reference,
+            digest=registered.digest,
+            phase=_BROKER_PHASE_RUNTIME_READY,
+        )
     return envelope
 
 
@@ -360,6 +417,7 @@ class _BundleBindings:
     broker_positions_count: int | None = None
     broker_open_orders_count: int | None = None
     marks: set[tuple[str, str]] = field(default_factory=set)
+    retention_measurement: tuple[tuple[str, int, int, int, str], ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,6 +457,65 @@ class _StagedProtectiveMarkEvidence:
     marker: object = field(repr=False, compare=False)
 
 
+def _completion_marker_payload(
+    state: _BundleBindings,
+    measurement: tuple[tuple[str, int, int, int, str], ...],
+) -> bytes:
+    return json.dumps(
+        {
+            "artifact_manifest": [
+                {
+                    "device": device,
+                    "filename": filename,
+                    "inode": inode,
+                    "sha256": digest,
+                    "size_bytes": size_bytes,
+                }
+                for filename, device, inode, size_bytes, digest in measurement
+            ],
+            "bundle_id": state.bundle_id,
+            "publication_directory": str(state.final_output_directory),
+            "publication_nonce": state.publication_nonce,
+            "schema_version": 2,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _sealed_staging_measurement(
+    state: _BundleBindings,
+) -> tuple[tuple[tuple[str, int, int, int, str], ...], int]:
+    entries: list[tuple[str, int, int, int, str]] = []
+    total = 0
+    for name in os.listdir(state.staging_output_fd):
+        metadata = os.stat(
+            name,
+            dir_fd=state.staging_output_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o400
+        ):
+            raise BootstrapEvidenceReceiverError("unpublished evidence contains an unsafe entry")
+        payload = _read_sealed_file_at(state.staging_output_fd, name)
+        entries.append(
+            (
+                name,
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                hashlib.sha256(payload).hexdigest(),
+            )
+        )
+        total += len(payload)
+    return tuple(sorted(entries)), total
+
+
 @dataclass(frozen=True, slots=True)
 class BootstrapEvidenceReceiverSet:
     broker_snapshot: "BrokerSnapshotEvidenceReceiver"
@@ -436,6 +553,8 @@ class BootstrapEvidenceReceiverSet:
     def publish_complete_bundle(
         self,
         expected_marks: set[tuple[str, str]],
+        *,
+        expected_bundle_size_bytes: int | None = None,
     ) -> Path:
         """Atomically publish the complete, provider-closed evidence directory."""
 
@@ -482,6 +601,7 @@ class BootstrapEvidenceReceiverSet:
                 "evidence publication paths changed or final output already exists"
             )
         renamed = False
+        preserve_failed_publication = False
         completion_temp = f".{_COMPLETION_MARKER_FILENAME}.stage-{secrets.token_hex(32)}"
         try:
             os.fsync(state.staging_output_fd)
@@ -505,17 +625,28 @@ class BootstrapEvidenceReceiverSet:
                 )
             self._assert_lexical_publication_binding(require_final=True)
             os.fsync(state.output_parent_fd)
-            completion_payload = json.dumps(
-                {
-                    "bundle_id": state.bundle_id,
-                    "publication_directory": str(state.final_output_directory),
-                    "publication_nonce": state.publication_nonce,
-                    "schema_version": 1,
-                },
-                ensure_ascii=True,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
+            # From this point onward any failure is ambiguous with respect to
+            # same-UID additions inside the final directory. Preserve every
+            # entry and omit the trusted completion marker instead of rolling
+            # back through destructive staging cleanup.
+            preserve_failed_publication = True
+            measurement, artifact_bytes = _sealed_staging_measurement(state)
+            completion_payload = _completion_marker_payload(state, measurement)
+            if expected_bundle_size_bytes is not None:
+                if (
+                    type(expected_bundle_size_bytes) is not int
+                    or expected_bundle_size_bytes <= 0
+                    or state.retention_measurement is None
+                    or measurement != state.retention_measurement
+                    or artifact_bytes + len(completion_payload) != expected_bundle_size_bytes
+                ):
+                    # The directory is already at its final random name. Leave
+                    # it there without a completion marker so injected or
+                    # raced contents are preserved for operator inspection,
+                    # never loaded, and never deleted as disposable staging.
+                    raise BootstrapEvidenceReceiverError(
+                        "evidence bundle changed after retention measurement"
+                    )
             _write_new_sealed_file_at(
                 state.staging_output_fd,
                 completion_temp,
@@ -543,16 +674,18 @@ class BootstrapEvidenceReceiverSet:
                     self._assert_lexical_publication_binding(require_final=True)
                     if secrets.compare_digest(committed_payload, completion_payload):
                         state.published = True
+                        preserve_failed_publication = False
                         return state.final_output_directory
                 except BootstrapEvidenceReceiverError:
                     pass
                 raise
         except BaseException:
-            try:
-                os.unlink(completion_temp, dir_fd=state.staging_output_fd)
-            except FileNotFoundError:
-                pass
-            if renamed:
+            if not preserve_failed_publication:
+                try:
+                    os.unlink(completion_temp, dir_fd=state.staging_output_fd)
+                except FileNotFoundError:
+                    pass
+            if renamed and not preserve_failed_publication:
                 try:
                     _rename_directory_exclusive(
                         state.output_parent_fd,
@@ -565,7 +698,54 @@ class BootstrapEvidenceReceiverSet:
                     ) from exc
             raise
         state.published = True
+        preserve_failed_publication = False
         return state.final_output_directory
+
+    def unpublished_bundle_size_bytes(
+        self,
+        expected_marks: set[tuple[str, str]],
+    ) -> int:
+        """Return exact final bytes, including the not-yet-written completion marker."""
+
+        self.assert_complete(expected_marks)
+        state = self._state
+        if state.published:
+            raise BootstrapEvidenceReceiverError("evidence bundle was already published")
+        self._assert_lexical_publication_binding(require_final=False)
+        measurement, total = _sealed_staging_measurement(state)
+        state.retention_measurement = measurement
+        return total + len(_completion_marker_payload(state, measurement))
+
+    def unpublished_bundle_directory_binding(self) -> tuple[str, int, int]:
+        """Return the exact staging directory identity for retention exclusion."""
+
+        state = self._state
+        if state.published:
+            raise BootstrapEvidenceReceiverError("evidence bundle was already published")
+        self._assert_lexical_publication_binding(require_final=False)
+        held = os.fstat(state.staging_output_fd)
+        try:
+            current = os.stat(
+                state.staging_output_directory.name,
+                dir_fd=state.output_parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise BootstrapEvidenceReceiverError(
+                "evidence staging directory cannot be bound for retention"
+            ) from exc
+        if (
+            not stat.S_ISDIR(held.st_mode)
+            or held.st_uid != os.geteuid()
+            or stat.S_IMODE(held.st_mode) != 0o700
+            or (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino)
+            or (held.st_dev, held.st_ino)
+            != (state.staging_output_device, state.staging_output_inode)
+        ):
+            raise BootstrapEvidenceReceiverError(
+                "evidence staging directory changed before retention admission"
+            )
+        return state.staging_output_directory.name, held.st_dev, held.st_ino
 
     def _assert_lexical_publication_binding(self, *, require_final: bool) -> None:
         state = self._state
