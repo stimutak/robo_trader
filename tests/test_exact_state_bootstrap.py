@@ -20,8 +20,16 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 import robo_trader.bootstrap_evidence_auth as evidence_auth
-from robo_trader.accounting.fifo import FifoLedger, FillEvent, FillSide
-from robo_trader.accounting.fifo_bootstrap import prepare_fifo_accounting_schema_in_transaction
+from robo_trader.accounting.fifo import (
+    FifoAccountingValidationError,
+    FifoLedger,
+    FillEvent,
+    FillSide,
+)
+from robo_trader.accounting.fifo_bootstrap import (
+    FifoBootstrapError,
+    prepare_fifo_accounting_schema_in_transaction,
+)
 from robo_trader.config import RuntimeContract, _derive_safety_account_scope
 from robo_trader.database_async import AsyncTradingDatabase
 from robo_trader.financial_state_bootstrap import (
@@ -797,6 +805,90 @@ async def test_fifo_bootstrap_supports_truthful_post_epoch_fifo_without_syntheti
             "SELECT COUNT(*) FROM fifo_fills WHERE epoch_id=?",
             (plan.epoch_id,),
         ).fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+async def test_fifo_integrity_rejects_opening_pair_outside_sealed_candidate(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    candidate, evidence, runtime_contract = _candidate_bundle(path, tmp_path)
+    backup_receipt = _backup_receipt(path, tmp_path / "backup.db", candidate)
+    database = AsyncTradingDatabase(path, pool_size=1)
+    try:
+        await database.apply_exact_state_bootstrap_offline_atomic(
+            candidate,
+            evidence=evidence,
+            backup_receipt=backup_receipt,
+            operator_reason="Seal the exact reviewed opening set before integrity testing.",
+            runtime_contract=runtime_contract,
+        )
+    finally:
+        await database.close()
+
+    plan = candidate.fifo_bootstrap_plan()
+    effective_at = candidate.effective_at.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        opening_id = "fobal-" + "e" * 32
+        lot_id = "flot-" + "e" * 32
+        connection.execute(
+            """
+            INSERT INTO fifo_opening_balances(
+                opening_balance_id,epoch_id,con_id,symbol,direction,
+                opened_quantity_text,cost_basis_text,mark_price_text,
+                mark_observed_at,mark_evidence_fingerprint,recorded_at
+            ) VALUES (?,?,789,'AMD','LONG','1','100','100',?,?,?)
+            """,
+            (opening_id, plan.epoch_id, effective_at, "e" * 64, effective_at),
+        )
+        connection.execute(
+            """
+            INSERT INTO fifo_lot_openings(
+                lot_id,epoch_id,opening_fill_id,opening_balance_id,lot_ordinal,
+                con_id,symbol,direction,opened_quantity_text,open_price_text,
+                opening_commission_minor,opened_sequence,opened_at
+            ) VALUES (?,?,NULL,?,0,789,'AMD','LONG','1','100',0,0,?)
+            """,
+            (lot_id, plan.epoch_id, opening_id, effective_at),
+        )
+        connection.commit()
+
+        ledger = FifoLedger(connection, allow_other_objects=True)
+        with pytest.raises(
+            FifoAccountingValidationError,
+            match="sealed candidate manifest",
+        ):
+            ledger.verify_epoch_integrity(plan.epoch_id)
+
+
+@pytest.mark.asyncio
+async def test_fifo_schema_creation_rejects_foreign_trigger_body_reference(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "foreign-trigger.db"
+    async with aiosqlite.connect(path) as connection:
+        await connection.execute("PRAGMA foreign_keys=ON")
+        await connection.execute("CREATE TABLE unrelated_source(value INTEGER)")
+        await connection.execute("""
+            CREATE TRIGGER inject_fifo_after_unrelated_insert
+            AFTER INSERT ON unrelated_source
+            BEGIN
+                INSERT INTO fifo_opening_balances(opening_balance_id) VALUES ('forged');
+            END
+            """)
+        await connection.execute("BEGIN IMMEDIATE")
+        with pytest.raises(FifoBootstrapError, match="foreign triggers"):
+            await prepare_fifo_accounting_schema_in_transaction(
+                connection,
+                applied_at="2026-07-28T14:00:00.000000Z",
+            )
+        fifo_objects = await connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'fifo_%'"
+        )
+        assert await fifo_objects.fetchone() == (0,)
+        await connection.rollback()
 
 
 @pytest.mark.asyncio

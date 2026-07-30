@@ -17,7 +17,11 @@ from decimal import Decimal, InvalidOperation, localcontext
 from enum import Enum
 from typing import Optional, Sequence
 
-from .fifo_fixture_migration import _assert_no_temp_fifo_objects, assert_fifo_accounting_schema
+from .fifo_fixture_migration import (
+    _assert_no_temp_fifo_objects,
+    _legacy_opening_manifest_hash,
+    assert_fifo_accounting_schema,
+)
 
 _ID_PATTERNS = {
     "epoch_id": re.compile(r"^fepoch-[0-9a-f]{32}$"),
@@ -974,7 +978,8 @@ class FifoLedger:
     def _verify_legacy_epoch_shape(self, epoch_id: str) -> None:
         lineage_rows = self._connection.execute(
             """
-            SELECT e.source_fingerprint,l.candidate_fingerprint,e.effective_at
+            SELECT e.source_fingerprint,l.candidate_fingerprint,e.effective_at,
+                   l.opening_manifest_count,l.opening_manifest_hash
             FROM fifo_accounting_epochs e
             JOIN fifo_legacy_bootstrap_lineage l ON l.epoch_id=e.epoch_id
             WHERE e.epoch_id=?
@@ -994,13 +999,18 @@ class FifoLedger:
                 "legacy epoch lacks one sealed lineage and account baseline"
             )
         effective_at = _parse_utc(lineage_rows[0][2], "legacy epoch effective_at")
+        manifest_count = _stored_int(lineage_rows[0][3], "legacy opening manifest count")
+        manifest_hash = str(lineage_rows[0][4])
+        if manifest_count < 0 or _HASH.fullmatch(manifest_hash) is None:
+            raise FifoAccountingValidationError("legacy opening manifest is malformed")
         balances = self._connection.execute(
             """
-            SELECT b.opening_balance_id,b.con_id,b.symbol,b.direction,
-                   b.opened_quantity_text,b.cost_basis_text,l.opening_balance_id,
-                   l.con_id,l.symbol,l.direction,l.opened_quantity_text,l.open_price_text,
+            SELECT b.opening_balance_id,l.lot_id,b.con_id,b.symbol,b.direction,
+                   b.opened_quantity_text,b.cost_basis_text,b.mark_price_text,
+                   b.mark_observed_at,b.mark_evidence_fingerprint,
                    l.opening_commission_minor,l.opened_sequence,l.opened_at,
-                   b.mark_observed_at
+                   l.opening_balance_id,l.con_id,l.symbol,l.direction,
+                   l.opened_quantity_text,l.open_price_text
             FROM fifo_opening_balances b
             LEFT JOIN fifo_lot_openings l
               ON l.epoch_id=b.epoch_id AND l.opening_balance_id=b.opening_balance_id
@@ -1019,16 +1029,25 @@ class FifoLedger:
             raise FifoAccountingValidationError(
                 "legacy opening balances do not map one-to-one to opening lots"
             )
+        if len(balances) != manifest_count:
+            raise FifoAccountingValidationError(
+                "legacy opening rows do not match the sealed candidate manifest"
+            )
+        manifest_rows = [tuple(row[:13]) for row in balances]
+        if _legacy_opening_manifest_hash(manifest_rows) != manifest_hash:
+            raise FifoAccountingValidationError(
+                "legacy opening rows do not match the sealed candidate manifest"
+            )
         for row in balances:
-            if row[6] is None or tuple(row[1:6]) != tuple(row[7:12]):
+            if row[13] is None or tuple(row[2:7]) != tuple(row[14:19]):
                 raise FifoAccountingValidationError(
                     "legacy opening balance differs from its exact opening lot"
                 )
             if (
-                _stored_int(row[12], "legacy opening commission") != 0
-                or _stored_int(row[13], "legacy opened_sequence") != 0
-                or _parse_utc(row[14], "legacy opened_at") != effective_at
-                or _parse_utc(row[15], "legacy mark_observed_at") > effective_at
+                _stored_int(row[10], "legacy opening commission") != 0
+                or _stored_int(row[11], "legacy opened_sequence") != 0
+                or _parse_utc(row[12], "legacy opened_at") != effective_at
+                or _parse_utc(row[8], "legacy mark_observed_at") > effective_at
             ):
                 raise FifoAccountingValidationError(
                     "legacy opening lot must not reconstruct pre-epoch commissions"
