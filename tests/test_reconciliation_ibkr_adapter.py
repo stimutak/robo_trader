@@ -550,6 +550,28 @@ async def test_quote_source_rejects_copy_wrong_runtime_reconnect_and_cleanup(mon
         )
 
 
+@pytest.mark.asyncio
+async def test_factory_provider_refreshes_one_shared_read_only_transport(monkeypatch):
+    provider, transport, runtime = await _factory_provider(monkeypatch)
+    transport.ping = AsyncMock(return_value=True)
+
+    shared = provider._shared_gateway_transport(runtime_context=runtime)
+    await provider.refresh()
+
+    assert shared is transport
+    transport.stop.assert_awaited_once_with()
+    transport.start.assert_awaited()
+    transport.connect.assert_awaited_with(
+        host="127.0.0.1",
+        port=4002,
+        client_id=997,
+        readonly=True,
+        timeout=30.0,
+    )
+    transport.ping.assert_awaited_once_with()
+    assert provider._shared_gateway_transport(runtime_context=runtime) is transport
+
+
 @pytest.mark.parametrize(
     "mutate",
     [

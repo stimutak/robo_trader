@@ -32,6 +32,7 @@ import pytest
 
 from robo_trader.connection_health import ConnectionHealth, HealthStatus
 from robo_trader.runner_async import AsyncRunner
+from robo_trader.reconciliation.runtime_integration import RuntimeReconciliationController
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -56,6 +57,9 @@ def _make_runner():
 
     # health is set by _attach_health_monitor; start as None
     runner.health = None
+    reconciliation = object.__new__(RuntimeReconciliationController)
+    reconciliation.reconcile_reconnect = AsyncMock()
+    runner.reconciliation_controller = reconciliation
 
     return runner
 

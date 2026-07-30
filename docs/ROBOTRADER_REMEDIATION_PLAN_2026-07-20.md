@@ -44,10 +44,11 @@ terminal-settlement readiness gate. PR 2B.3 merged through PR #107 as
 `017f43e`. PR 3 merged through PR #111 as `8596920`. The PR 4 exact-state
 bootstrap code slice merged through PR #112 as `bccb96b`; strict FIFO,
 operator-reviewed bootstrap/application, and restore evidence remain open. PR
-5 foundations merged through PR #113 (`6176931`) and PR #115 (`1ae6480`);
-production startup/reconnect/periodic wiring and a current operator-reviewed
-reconciliation remain open. Gate A remains closed, the trader remains stopped,
-and none of these merges authorizes startup.
+5 foundations merged through PR #113 (`6176931`) and PR #115 (`1ae6480`). The
+PR 5 runtime-integration draft adds fail-closed startup, reconnect, and periodic
+reconciliation plus sanitized dashboard status. A current operator-reviewed
+broker reconciliation remains open. Gate A remains closed, the trader remains
+stopped, and none of these merges or draft changes authorizes startup.
 
 ## 1. Purpose
 
@@ -690,6 +691,29 @@ Make broker truth visible and authoritative before any broker-writing capability
 - Wrong account, wrong quantity, stale cash, unknown order, and reconnect scenarios.
 - Database unavailable or partially migrated.
 - Operator resolution without destructive replacement.
+
+### Runtime-integration draft evidence (2026-07-30)
+
+- Startup, reconnect, and fixed-period triggers use one read-only diagnostic
+  provider and publish a fresh, one-shot signed reconciliation result from the
+  same broker transport generation.
+- Runtime database and bootstrap-receipt readiness are verified read-only before
+  broker collection; absent, partial, or unauthenticated state fails closed
+  without schema repair or data mutation.
+- Risk-increasing entries require a fresh eligible reconciliation. Quarantine
+  preserves the existing semantic reduce-only path so protective reductions are
+  not stranded.
+- Dashboard status exposes only sanitized reconciliation state, age, trigger,
+  and quarantine/eligibility fields; signing-capability paths and broker
+  evidence are not exposed.
+- Synthetic and mocked verification on 2026-07-30: `3029 passed, 5 skipped`
+  across the complete pytest suite; Black and Flake8 passed for all changed
+  Python files. No trader process, Gateway, broker session, or authoritative
+  trading database was started or accessed.
+- Operational evidence is still required: provision the owner-only signing and
+  evidence directories, run the authoritative launcher under supervision, and
+  obtain operator review of a current broker reconciliation. Those actions are
+  not authorized by this draft, and Gate A remains closed.
 
 ### Done means
 

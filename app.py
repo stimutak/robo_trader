@@ -5318,6 +5318,17 @@ def api_runner_status():
             healthy = False
 
         audit = _read_runner_exit_audit()
+        from robo_trader.reconciliation.runtime_integration import (
+            read_runtime_reconciliation_status,
+            runtime_reconciliation_status_path,
+        )
+
+        reconciliation = read_runtime_reconciliation_status(
+            runtime_reconciliation_status_path(
+                runtime_contract,
+                os.environ,
+            )
+        )
 
         return (
             jsonify(
@@ -5327,6 +5338,7 @@ def api_runner_status():
                     "last_market_update_seconds_ago": seconds_ago_out,
                     "stale_threshold_seconds": RUNNER_STALE_SECONDS,
                     "exit_audit": audit,
+                    "reconciliation": reconciliation,
                 }
             ),
             200,

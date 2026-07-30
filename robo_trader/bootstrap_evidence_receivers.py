@@ -322,6 +322,26 @@ def assert_and_consume_verified_broker_evidence(
     return envelope
 
 
+def _handoff_consumed_verified_broker_evidence_to_runtime(
+    envelope: VerifiedBrokerEvidenceEnvelope,
+) -> VerifiedBrokerEvidenceEnvelope:
+    """Re-register the producer-consumed envelope for one runtime bind.
+
+    The bootstrap reconciliation producer consumes the signer-owned envelope
+    before it inspects any broker field.  After the signed reconciliation stage
+    commits, runtime still needs to consume that *same* broker generation while
+    binding the report to the exact database inode.  This private handoff keeps
+    the lineage one-shot without collecting a second snapshot.
+    """
+
+    if type(envelope) is not VerifiedBrokerEvidenceEnvelope:
+        raise BootstrapEvidenceReceiverError("exact verified broker envelope is required")
+    with _VERIFIED_BROKER_REGISTRY_LOCK:
+        if id(envelope) in _VERIFIED_BROKER_REGISTRY:
+            raise BootstrapEvidenceReceiverError("verified broker envelope is already registered")
+    return _register_verified_broker_envelope(envelope)
+
+
 @dataclass(slots=True)
 class _BundleBindings:
     bundle_id: str

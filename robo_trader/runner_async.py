@@ -86,6 +86,10 @@ from .reconciliation.identity import (
     resolve_environment,
     validate_runtime_safety,
 )
+from .reconciliation.runtime_integration import (
+    RuntimeReconciliationController,
+    build_runtime_reconciliation_controller,
+)
 from .utils.robust_connection import (
     CircuitBreakerConfig,
     connect_ibkr_robust,
@@ -494,6 +498,7 @@ class AsyncRunner:
         safety_runtime: Optional[SafetyRuntimeCoordinator] = None,
         shared_database: Optional[AsyncTradingDatabase] = None,
         paper_reduction_gateway: Optional[PaperReductionGateway] = None,
+        reconciliation_controller: Optional[RuntimeReconciliationController] = None,
     ):
         assert_gate_a_runner_options(
             use_ml_strategy=use_ml_strategy,
@@ -518,6 +523,7 @@ class AsyncRunner:
         self._shared_database = shared_database
         self._owns_database = shared_database is None
         self.paper_reduction_gateway = paper_reduction_gateway
+        self.reconciliation_controller = reconciliation_controller
         self._baseline_entry_handle = None
         self.portfolio_id = portfolio_id
         self.duration = duration
@@ -926,8 +932,15 @@ class AsyncRunner:
             ):
                 reason = self.advanced_risk.kill_switch.trigger_reason or "Kill switch active"
                 return True, f"Kill switch active: {reason}"
+            reconciliation = getattr(self, "reconciliation_controller", None)
+            if (
+                type(reconciliation) is not RuntimeReconciliationController
+                or not reconciliation.entry_eligible()
+            ):
+                return True, "Runtime reconciliation is unavailable, stale, or quarantined"
         except Exception as exc:  # pragma: no cover - defensive
             logger.error(f"Error in _trading_blocked: {exc}")
+            return True, "Risk-increasing entry safety state is unavailable"
         return False, ""
 
     @staticmethod
@@ -7419,11 +7432,14 @@ class AsyncRunner:
                         raise RuntimeError(
                             "connection recovery requires the exact paper reduction gateway"
                         )
-                    # The runner and gateway own distinct diagnostic clients.
-                    # Recovery is incomplete until both have fresh read-only
-                    # sessions; otherwise entries could resume while broker-
-                    # bound reductions remain unavailable.
+                    # The gateway and reconciliation service share one owned
+                    # diagnostic generation. Recovery is incomplete until that
+                    # read-only generation is replaced.
                     await gateway.refresh_diagnostic_connection()
+                reconciliation = getattr(self, "reconciliation_controller", None)
+                if type(reconciliation) is not RuntimeReconciliationController:
+                    raise RuntimeError("runtime reconciliation controller is unavailable")
+                await reconciliation.reconcile_reconnect()
                 health = getattr(self, "health", None)
                 if health is not None:
                     # initialize_connection installs a new monitor whose
@@ -7498,6 +7514,37 @@ class AsyncRunner:
 class _PaperOrderRuntimeResources:
     database: AsyncTradingDatabase
     gateway: PaperReductionGateway
+    reconciliation: RuntimeReconciliationController
+
+
+async def _close_partial_paper_order_runtime(
+    database: AsyncTradingDatabase,
+    gateway: Optional[PaperReductionGateway],
+    reconciliation: Optional[RuntimeReconciliationController],
+) -> None:
+    """Reap every acquired startup resource while preserving first failure."""
+
+    first_failure: Optional[BaseException] = None
+    cleanups = (
+        None if gateway is None else gateway.close,
+        None if reconciliation is None else reconciliation.close,
+        database.close,
+    )
+    for cleanup in cleanups:
+        if cleanup is None:
+            continue
+        try:
+            await cleanup()
+        except BaseException as error:
+            if first_failure is None:
+                first_failure = error
+            else:
+                logger.error(
+                    "event=paper_order_runtime_additional_cleanup_failed",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+    if first_failure is not None:
+        raise first_failure.with_traceback(first_failure.__traceback__)
 
 
 async def _start_paper_order_runtime(
@@ -7512,34 +7559,50 @@ async def _start_paper_order_runtime(
         raise RuntimeError("started paper safety coordinator is required")
     database = AsyncTradingDatabase(Path(context.runtime_contract.database_path))
     gateway: Optional[PaperReductionGateway] = None
+    reconciliation: Optional[RuntimeReconciliationController] = None
     try:
+        reconciliation, diagnostic_provider = await build_runtime_reconciliation_controller(context)
         await database.initialize()
         gateway = PaperReductionGateway(
             context,
             safety_runtime,
             database,
+            diagnostic_provider=diagnostic_provider,
         )
         await gateway.start()
+        await reconciliation.reconcile_startup()
     except BaseException as startup_error:
         try:
             await _await_cleanup_owned(
-                database.close(),
-                failure_event="paper_order_runtime_database_cleanup_failed_during_startup",
+                _close_partial_paper_order_runtime(
+                    database,
+                    gateway,
+                    reconciliation,
+                ),
+                failure_event="paper_order_runtime_cleanup_failed_during_startup",
             )
         except BaseException:
-            logger.exception("event=paper_order_runtime_database_cleanup_failed_during_startup")
+            logger.exception("event=paper_order_runtime_cleanup_failed_during_startup")
         raise startup_error.with_traceback(startup_error.__traceback__)
-    if gateway is None:
-        missing_gateway = RuntimeError("paper reduction gateway startup returned no gateway")
+    if gateway is None or reconciliation is None:
+        missing_gateway = RuntimeError("paper order runtime startup returned partial resources")
         try:
             await _await_cleanup_owned(
-                database.close(),
-                failure_event="paper_order_runtime_database_cleanup_failed_without_gateway",
+                _close_partial_paper_order_runtime(
+                    database,
+                    gateway,
+                    reconciliation,
+                ),
+                failure_event="paper_order_runtime_cleanup_failed_without_gateway",
             )
         except BaseException:
-            logger.exception("event=paper_order_runtime_database_cleanup_failed_without_gateway")
+            logger.exception("event=paper_order_runtime_cleanup_failed_without_gateway")
         raise missing_gateway
-    return _PaperOrderRuntimeResources(database=database, gateway=gateway)
+    return _PaperOrderRuntimeResources(
+        database=database,
+        gateway=gateway,
+        reconciliation=reconciliation,
+    )
 
 
 async def _close_paper_order_runtime(
@@ -7550,7 +7613,10 @@ async def _close_paper_order_runtime(
     try:
         await resources.gateway.close()
     finally:
-        await resources.database.close()
+        try:
+            await resources.reconciliation.close()
+        finally:
+            await resources.database.close()
 
 
 async def _await_cleanup_owned(
@@ -7667,6 +7733,7 @@ async def run_once(
             safety_runtime=safety_runtime,
             shared_database=resources.database,
             paper_reduction_gateway=resources.gateway,
+            reconciliation_controller=resources.reconciliation,
         )
         await runner.run(symbols)
     finally:
@@ -7911,6 +7978,8 @@ async def run_continuous(
                     f"Starting trading cycle at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
                 )
 
+                await resources.reconciliation.reconcile_periodic_if_due()
+
                 # Load portfolio configurations
                 from .multiuser.portfolio_config import load_portfolio_configs
 
@@ -7950,6 +8019,7 @@ async def run_continuous(
                             safety_runtime=safety_runtime,
                             shared_database=resources.database,
                             paper_reduction_gateway=resources.gateway,
+                            reconciliation_controller=resources.reconciliation,
                         )
                         await _setup_continuous_runner(new_runner)
                         runners[portfolio_id] = new_runner

@@ -25,6 +25,7 @@ import pytest
 
 from robo_trader import connection_health
 from robo_trader.runner_async import AsyncRunner
+from robo_trader.reconciliation.runtime_integration import RuntimeReconciliationController
 
 
 def _make_runner_for_recovery() -> AsyncRunner:
@@ -45,6 +46,9 @@ def _make_runner_for_recovery() -> AsyncRunner:
     # Inner-loop helpers called by recover_connection on success.
     runner._rewarm_stop_loss_prices_after_recovery = AsyncMock()
     runner._maybe_auto_reset_kill_switch_after_recovery = MagicMock()
+    reconciliation = object.__new__(RuntimeReconciliationController)
+    reconciliation.reconcile_reconnect = AsyncMock()
+    runner.reconciliation_controller = reconciliation
     return runner
 
 

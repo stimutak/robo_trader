@@ -34,6 +34,7 @@ from .domain import (
 )
 from .errors import BrokerEvidenceError
 from .identity import (
+    DiagnosticConnectionContract,
     RuntimeSafetyContext,
     assert_validated_runtime_safety_context,
     mask_account_identifier,
@@ -1288,7 +1289,8 @@ def _factory_provider_digest(
         (
             f"{id(provider)}|{id(provider._transport)}|{id(provider._runtime_contract)}|"
             f"{provider._runtime_fingerprint}|{provider._account_scope}|"
-            f"{provider._expected_account}|{transport_generation}"
+            f"{provider._expected_account}|{id(provider._diagnostic_connection)}|"
+            f"{transport_generation}"
         ).encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
@@ -1334,6 +1336,7 @@ def assert_factory_owned_diagnostic_provider(
         or type(provider._transport) is not SubprocessIBKRClient
         or entry.transport is not provider._transport
         or entry.runtime_contract is not provider._runtime_contract
+        or provider._diagnostic_connection is None
     ):
         raise BrokerEvidenceError("diagnostic provider is not factory-owned")
     try:
@@ -1539,6 +1542,7 @@ class IBKRDiagnosticSnapshotProvider:
         "_account_scope",
         "_runtime_contract",
         "_runtime_fingerprint",
+        "_diagnostic_connection",
         "_factory_marker",
         "_closed",
     )
@@ -1551,6 +1555,7 @@ class IBKRDiagnosticSnapshotProvider:
         account_scope: str | None = None,
         runtime_contract: object = None,
         runtime_fingerprint: str | None = None,
+        diagnostic_connection: DiagnosticConnectionContract | None = None,
         _factory_marker: object = None,
     ) -> None:
         self._transport = transport
@@ -1558,6 +1563,7 @@ class IBKRDiagnosticSnapshotProvider:
         self._account_scope = account_scope
         self._runtime_contract = runtime_contract
         self._runtime_fingerprint = runtime_fingerprint
+        self._diagnostic_connection = diagnostic_connection
         self._factory_marker = _factory_marker
         self._closed = False
 
@@ -1645,9 +1651,75 @@ class IBKRDiagnosticSnapshotProvider:
         return source
 
     async def close(self) -> None:
+        if self._closed:
+            return
         self._closed = True
         _invalidate_factory_provider(self)
         await _stop_transport_required(self._transport)
+
+    async def suspend(self) -> None:
+        """Stop the current generation while retaining factory ownership."""
+
+        if self._closed:
+            return
+        try:
+            assert_factory_owned_diagnostic_provider(self)
+        except BaseException:
+            await _stop_transport_required(self._transport)
+            raise
+        await _stop_transport_required(self._transport)
+
+    async def refresh(self) -> None:
+        """Replace the owned read-only transport generation in place."""
+
+        assert_factory_owned_diagnostic_provider(self)
+        connection = self._diagnostic_connection
+        if connection is None:
+            raise BrokerEvidenceError("diagnostic connection binding is unavailable")
+        _invalidate_factory_provider(self)
+        try:
+            await _stop_transport_required(self._transport)
+            await self._transport.start()
+            connected = await self._transport.connect(
+                host=connection.host,
+                port=connection.port,
+                client_id=connection.client_id,
+                readonly=connection.readonly,
+                timeout=30.0,
+            )
+            if connected is not True or await self._transport.ping() is not True:
+                raise BrokerEvidenceError("diagnostic broker connection did not recover")
+            _register_factory_provider(
+                self,
+                transport=self._transport,
+                runtime_contract=self._runtime_contract,
+            )
+        except BaseException:
+            self._closed = True
+            try:
+                await await_cleanup_required(_stop_transport_required(self._transport))
+            except Exception as cleanup_exc:
+                raise BrokerEvidenceError(
+                    "diagnostic broker recovery cleanup failed"
+                ) from cleanup_exc
+            raise
+
+    def _shared_gateway_transport(
+        self,
+        *,
+        runtime_context: RuntimeSafetyContext,
+    ) -> SubprocessIBKRClient:
+        """Return the exact read-only client only to the in-process gateway."""
+
+        provider = assert_factory_owned_diagnostic_provider(self)
+        context = assert_validated_runtime_safety_context(runtime_context)
+        if provider._runtime_contract is not context.runtime_contract:
+            raise BrokerEvidenceError("diagnostic provider runtime binding changed")
+        if provider._diagnostic_connection is not context.diagnostic_connection:
+            raise BrokerEvidenceError("diagnostic connection binding changed")
+        if type(provider._transport) is not SubprocessIBKRClient:
+            raise BrokerEvidenceError("diagnostic provider transport is not shareable")
+        return provider._transport
 
 
 async def _stop_transport_required(
@@ -1737,6 +1809,7 @@ async def build_diagnostic_provider(
         account_scope=account_scope,
         runtime_contract=runtime_contract,
         runtime_fingerprint=runtime_fingerprint,
+        diagnostic_connection=connection,
         _factory_marker=_FACTORY_PROVIDER_MARKER,
     )
     if type(transport) is SubprocessIBKRClient:

@@ -21,6 +21,7 @@ from robo_trader.paper_reduction_gateway import PaperReductionGateway
 from robo_trader.protective_quote_evidence import ProtectiveQuoteSource
 from robo_trader.risk_manager import Position
 from robo_trader.runner_async import AsyncRunner
+from robo_trader.reconciliation.runtime_integration import RuntimeReconciliationController
 from robo_trader.stop_loss_monitor import StopLossMonitor
 
 
@@ -39,6 +40,9 @@ def make_runner_for_recovery(initialize_succeeds_on=None):
     runner.subprocess_client.stop = AsyncMock()
 
     runner._safe_disconnect = AsyncMock()
+    reconciliation = object.__new__(RuntimeReconciliationController)
+    reconciliation.reconcile_reconnect = AsyncMock()
+    runner.reconciliation_controller = reconciliation
 
     if initialize_succeeds_on is None:
         runner.initialize_connection = AsyncMock()
@@ -76,6 +80,7 @@ async def test_recovery_refreshes_separate_paper_gateway_before_success():
 
     assert result is True
     gateway.refresh_diagnostic_connection.assert_awaited_once()
+    runner.reconciliation_controller.reconcile_reconnect.assert_awaited_once()
 
 
 @pytest.mark.asyncio
