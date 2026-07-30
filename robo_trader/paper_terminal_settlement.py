@@ -43,6 +43,14 @@ from robo_trader.safety.models import (
 )
 
 _SCOPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+_FILL_EVIDENCE_PAYLOAD_FIELDS = frozenset(
+    {
+        "fill_execution_id",
+        "fill_commission_minor",
+        "fill_commission_currency",
+        "fill_commission_source",
+    }
+)
 _SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
 _SETTLEMENT_ID_RE = re.compile(r"^pset-[0-9a-f]{32}$")
 _LOCAL_PAPER_EXECUTION_ID_RE = re.compile(r"^lpfill-[0-9a-f]{32}$")
@@ -327,6 +335,12 @@ class PaperTerminalSettlementRequest:
     fill_commission_currency: Optional[str] = None
     fill_commission_source: Optional[str] = None
     schema_version: int = MODEL_VERSION
+    _persisted_canonical_payload: Optional[str] = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != MODEL_VERSION:
@@ -533,7 +547,7 @@ class PaperTerminalSettlementRequest:
             raise ValidationError("unsupported paper terminal status")
         object.__setattr__(self, "outcome_at", _strict_utc(self.outcome_at, "outcome_at"))
 
-    def canonical_payload(self) -> str:
+    def _current_canonical_payload(self) -> str:
         return canonical_json(
             {
                 "account_scope": self.account_scope,
@@ -580,8 +594,18 @@ class PaperTerminalSettlementRequest:
             }
         )
 
+    def canonical_payload(self) -> str:
+        if self._persisted_canonical_payload is not None:
+            return self._persisted_canonical_payload
+        return self._current_canonical_payload()
+
     def fingerprint(self) -> str:
         return sha256_text(self.canonical_payload())
+
+    def semantic_fingerprint(self) -> str:
+        """Fingerprint the current field set, independent of legacy serialization."""
+
+        return sha256_text(self._current_canonical_payload())
 
     @property
     def protective_mark_price(self) -> Decimal:
@@ -608,8 +632,21 @@ class PaperTerminalSettlementRequest:
             raise PaperTerminalSettlementError("stored settlement request is malformed") from exc
         if not isinstance(payload, dict) or canonical_json(payload) != payload_json:
             raise PaperTerminalSettlementError("stored settlement request is not canonical")
+        present_fill_fields = _FILL_EVIDENCE_PAYLOAD_FIELDS.intersection(payload)
+        legacy_zero_fill = not present_fill_fields
+        if present_fill_fields and present_fill_fields != _FILL_EVIDENCE_PAYLOAD_FIELDS:
+            raise PaperTerminalSettlementError(
+                "stored settlement request has partial fill evidence fields"
+            )
+        if legacy_zero_fill and payload.get("terminal_status") not in {
+            TerminalOrderStatus.CANCELLED.value,
+            TerminalOrderStatus.REJECTED.value,
+        }:
+            raise PaperTerminalSettlementError(
+                "legacy settlement request is not an admitted zero-fill outcome"
+            )
         try:
-            return cls(
+            request = cls(
                 execution_domain_scope=payload["execution_domain_scope"],
                 account_scope=payload["account_scope"],
                 portfolio_id=payload["portfolio_id"],
@@ -699,14 +736,17 @@ class PaperTerminalSettlementRequest:
                     else parse_fixed_decimal(payload["fill_price"], "fill_price")
                 ),
                 outcome_at=parse_utc_text(payload["outcome_at"], "outcome_at"),
-                fill_execution_id=payload["fill_execution_id"],
-                fill_commission_minor=payload["fill_commission_minor"],
-                fill_commission_currency=payload["fill_commission_currency"],
-                fill_commission_source=payload["fill_commission_source"],
+                fill_execution_id=payload.get("fill_execution_id"),
+                fill_commission_minor=payload.get("fill_commission_minor"),
+                fill_commission_currency=payload.get("fill_commission_currency"),
+                fill_commission_source=payload.get("fill_commission_source"),
                 schema_version=payload["schema_version"],
             )
         except (KeyError, TypeError, ValueError, ValidationError) as exc:
             raise PaperTerminalSettlementError("stored settlement request is invalid") from exc
+        if legacy_zero_fill:
+            object.__setattr__(request, "_persisted_canonical_payload", payload_json)
+        return request
 
 
 _RECEIPT_PRODUCER_MARKER = object()

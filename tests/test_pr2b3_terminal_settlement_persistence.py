@@ -43,7 +43,11 @@ from robo_trader.safety import (
     StateTransitionError,
     TerminalOrderStatus,
 )
-from robo_trader.safety.models import ValidationError, _strict_database_identity
+from robo_trader.safety.models import (
+    ValidationError,
+    _strict_database_identity,
+    canonical_json,
+)
 from tests.fifo_runtime_test_support import install_synthetic_fifo_epoch
 from tests.safety.conftest import make_case
 from tests.test_multiuser import create_legacy_schema
@@ -223,6 +227,94 @@ def _request(*, outcome_at: datetime) -> PaperTerminalSettlementRequest:
     )
 
 
+def _zero_fill_request(
+    *,
+    outcome_at: datetime,
+    terminal_status: TerminalOrderStatus,
+) -> PaperTerminalSettlementRequest:
+    return replace(
+        _request(outcome_at=outcome_at),
+        filled_quantity=Decimal("0"),
+        remaining_quantity=Decimal("2"),
+        expected_post_position_quantity=Decimal("5"),
+        expected_post_aggregate_quantity=Decimal("10"),
+        expected_post_cash=Decimal("100000"),
+        expected_post_realized_pnl=Decimal("0"),
+        expected_post_daily_pnl=Decimal("0"),
+        terminal_status=terminal_status,
+        fill_price=None,
+        fill_execution_id=None,
+        fill_commission_minor=None,
+        fill_commission_currency=None,
+        fill_commission_source=None,
+    )
+
+
+async def _rewrite_as_legacy_zero_fill_payload(
+    database: AsyncTradingDatabase,
+    settlement_id: str,
+) -> str:
+    async with database.get_connection() as connection:
+        row = await (
+            await connection.execute(
+                """
+                SELECT request_payload_json,trade_id,database_path,database_identity,
+                       database_device,database_inode,committed_at,schema_version
+                FROM main.paper_reduction_settlements WHERE settlement_id=?
+                """,
+                (settlement_id,),
+            )
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(row[0])
+        for field_name in (
+            "fill_execution_id",
+            "fill_commission_minor",
+            "fill_commission_currency",
+            "fill_commission_source",
+        ):
+            payload.pop(field_name)
+        legacy_payload = canonical_json(payload)
+        request_fingerprint = hashlib.sha256(legacy_payload.encode("utf-8")).hexdigest()
+        receipt_payload = canonical_json(
+            {
+                "committed_at": row[6],
+                "database_device": row[4],
+                "database_identity": row[3],
+                "database_inode": row[5],
+                "database_path": row[2],
+                "request_fingerprint": request_fingerprint,
+                "schema_version": row[7],
+                "settlement_id": settlement_id,
+                "trade_id": row[1],
+            }
+        )
+        receipt_fingerprint = hashlib.sha256(receipt_payload.encode("utf-8")).hexdigest()
+        await connection.execute("DROP TRIGGER main.paper_reduction_settlements_no_update")
+        await connection.execute(
+            """
+            UPDATE main.paper_reduction_settlements
+            SET request_fingerprint=?,request_payload_json=?,receipt_fingerprint=?
+            WHERE settlement_id=?
+            """,
+            (
+                request_fingerprint,
+                legacy_payload,
+                receipt_fingerprint,
+                settlement_id,
+            ),
+        )
+        await connection.execute("""
+            CREATE TRIGGER main.paper_reduction_settlements_no_update
+            BEFORE UPDATE ON paper_reduction_settlements
+            BEGIN
+                SELECT RAISE(ABORT, 'paper reduction settlements are append-only');
+            END
+            """)
+        await connection.commit()
+    return request_fingerprint
+
+
 def _runtime_evidence(
     *,
     sequence: int,
@@ -270,6 +362,32 @@ async def _assert_no_partial_settlement(database: AsyncTradingDatabase) -> None:
     assert counts == (0, 0, 0, 0, 0)
     assert position == (5,)
     assert account == ("100000", "0", "0", None)
+
+
+def test_legacy_v1_payload_admission_is_zero_fill_only() -> None:
+    filled_payload = json.loads(_request(outcome_at=datetime.now(timezone.utc)).canonical_payload())
+    for field_name in (
+        "fill_execution_id",
+        "fill_commission_minor",
+        "fill_commission_currency",
+        "fill_commission_source",
+    ):
+        filled_payload.pop(field_name)
+    with pytest.raises(
+        PaperTerminalSettlementError,
+        match="not an admitted zero-fill outcome",
+    ):
+        PaperTerminalSettlementRequest.from_canonical_payload(canonical_json(filled_payload))
+
+    zero_fill_payload = json.loads(
+        _zero_fill_request(
+            outcome_at=datetime.now(timezone.utc),
+            terminal_status=TerminalOrderStatus.CANCELLED,
+        ).canonical_payload()
+    )
+    zero_fill_payload.pop("fill_execution_id")
+    with pytest.raises(PaperTerminalSettlementError, match="partial fill evidence"):
+        PaperTerminalSettlementRequest.from_canonical_payload(canonical_json(zero_fill_payload))
 
 
 def test_protective_quote_timestamp_accepts_canonical_z_utc_text() -> None:
@@ -687,6 +805,56 @@ async def test_expected_fifo_delta_is_independent_of_ambient_decimal_precision(
         assert fifo_delta == ("-12345.66",)
     finally:
         await database.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_status",
+    [TerminalOrderStatus.CANCELLED, TerminalOrderStatus.REJECTED],
+)
+async def test_legacy_v1_zero_fill_payload_replays_without_fifo_lineage(
+    tmp_path: Path,
+    terminal_status: TerminalOrderStatus,
+):
+    contract = _runtime_contract(tmp_path)
+    database = AsyncTradingDatabase(Path(contract.database_path), pool_size=1)
+    await database.initialize()
+    await _seed(database)
+    request = _zero_fill_request(
+        outcome_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        terminal_status=terminal_status,
+    )
+    receipt = await database.commit_paper_reduction_outcome(
+        request,
+        runtime_contract=contract,
+    )
+    legacy_fingerprint = await _rewrite_as_legacy_zero_fill_payload(
+        database,
+        receipt.settlement_id,
+    )
+    await database.close()
+
+    restarted = AsyncTradingDatabase(Path(contract.database_path), pool_size=1)
+    await restarted.initialize()
+    try:
+        replay = await restarted.commit_paper_reduction_outcome(
+            request,
+            runtime_contract=contract,
+        )
+
+        assert replay.settlement_id == receipt.settlement_id
+        assert replay.request.fingerprint() == legacy_fingerprint
+        assert replay.request.semantic_fingerprint() == request.semantic_fingerprint()
+        async with restarted.get_connection() as connection:
+            counts = await (await connection.execute("""
+                    SELECT
+                        (SELECT COUNT(*) FROM main.trades),
+                        (SELECT COUNT(*) FROM main.paper_reduction_settlements),
+                        (SELECT COUNT(*) FROM main.paper_fifo_settlement_links)
+                    """)).fetchone()
+        assert counts == (0, 1, 0)
+    finally:
+        await restarted.close()
 
 
 @pytest.mark.asyncio

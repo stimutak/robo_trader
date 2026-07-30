@@ -834,6 +834,62 @@ def _resign_settlement_receipt(connection: sqlite3.Connection) -> None:
     )
 
 
+def _rewrite_zero_fill_settlement_as_legacy_v1(ledger_path: Path) -> str:
+    with sqlite3.connect(ledger_path) as connection:
+        row = connection.execute("""
+            SELECT settlement_id,request_payload_json,trade_id,database_path,
+                   database_identity,database_device,database_inode,committed_at,
+                   schema_version
+            FROM paper_reduction_settlements
+            """).fetchone()
+        assert row is not None
+        payload = json.loads(row[1])
+        for field_name in (
+            "fill_execution_id",
+            "fill_commission_minor",
+            "fill_commission_currency",
+            "fill_commission_source",
+        ):
+            payload.pop(field_name)
+        legacy_payload = canonical_json(payload)
+        request_fingerprint = hashlib.sha256(legacy_payload.encode("utf-8")).hexdigest()
+        receipt_payload = canonical_json(
+            {
+                "committed_at": row[7],
+                "database_device": row[5],
+                "database_identity": row[4],
+                "database_inode": row[6],
+                "database_path": row[3],
+                "request_fingerprint": request_fingerprint,
+                "schema_version": row[8],
+                "settlement_id": row[0],
+                "trade_id": row[2],
+            }
+        )
+        connection.execute("DROP TRIGGER paper_reduction_settlements_no_update")
+        connection.execute(
+            """
+            UPDATE paper_reduction_settlements
+            SET request_fingerprint=?,request_payload_json=?,receipt_fingerprint=?
+            """,
+            (
+                request_fingerprint,
+                legacy_payload,
+                hashlib.sha256(receipt_payload.encode("utf-8")).hexdigest(),
+            ),
+        )
+        connection.execute("""
+            CREATE TRIGGER paper_reduction_settlements_no_update
+            BEFORE UPDATE ON paper_reduction_settlements
+            BEGIN
+                SELECT RAISE(ABORT, 'paper reduction settlements are append-only');
+            END
+            """)
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    return request_fingerprint
+
+
 def test_status_json_is_redacted_exact_and_strictly_read_only(
     tmp_path: Path,
     monkeypatch,
@@ -1163,6 +1219,40 @@ async def test_zero_fill_commit_release_failure_recovers_offline_exactly_once(
     assert _sqlite_durable_snapshot(ledger_path) == before_ledger
     assert request.terminal_status is terminal_status
     assert receipt.request.fingerprint() == request.fingerprint()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_status",
+    [TerminalOrderStatus.CANCELLED, TerminalOrderStatus.REJECTED],
+)
+async def test_legacy_v1_zero_fill_payload_recovers_offline_exactly_once(
+    tmp_path: Path,
+    monkeypatch,
+    terminal_status: TerminalOrderStatus,
+) -> None:
+    environ, reservation, request, _ = await _commit_zero_fill_case(
+        tmp_path,
+        terminal_status,
+    )
+    ledger_path = Path(environ["RT_DB_PATH"])
+    journal_path = Path(environ["SAFETY_JOURNAL_PATH"])
+    legacy_fingerprint = _rewrite_zero_fill_settlement_as_legacy_v1(ledger_path)
+    before_ledger = _sqlite_durable_snapshot(ledger_path)
+
+    item = journal_script.paper_safety_status(environ)["unresolved_reservations"][0]
+    assert item["local_settlement_status"] == "MATCH"
+    _enable_stopped_offline_recovery(monkeypatch)
+    recovered = journal_script.recover_exact_local_paper_settlement(
+        environ,
+        confirmation=journal_script.RECOVER_CONFIRMATION,
+    )
+
+    assert len(legacy_fingerprint) == 64
+    assert recovered.terminal_sequence > 0
+    assert SafetyJournal(journal_path).replay().active_reservations == ()
+    assert _sqlite_durable_snapshot(ledger_path) == before_ledger
+    assert request.filled_quantity == 0
 
 
 @pytest.mark.asyncio

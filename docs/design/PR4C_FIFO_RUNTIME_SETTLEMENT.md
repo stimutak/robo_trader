@@ -77,6 +77,13 @@ Decimal subtraction.
 `paper_fifo_settlement_links` binds each terminal settlement to exactly one
 FIFO fill, sequence, execution ID, commission source, and state fingerprint.
 It is append-only and protected by uniqueness and composite foreign keys.
+Legacy schema-v1 `CANCELLED` and `REJECTED` payloads written before fill
+evidence fields were serialized remain fingerprint-authenticated and
+replayable. Their stored canonical payload is preserved for request and receipt
+authentication while a current-form semantic fingerprint permits idempotent
+online comparison. This compatibility path admits only zero-fill outcomes;
+filled payloads without the complete producer evidence remain invalid, and
+offline recovery still requires the absence of a FIFO settlement link.
 
 An exact retry authenticates the existing event payload, complete epoch, and
 link, then returns the original terminal receipt without adding a fill or

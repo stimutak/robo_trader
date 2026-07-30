@@ -2624,7 +2624,7 @@ class AsyncTradingDatabase:
                     )
                 if replay_rows:
                     receipt = self._paper_settlement_receipt_from_row(replay_rows[0])
-                    if receipt.request.fingerprint() != request.fingerprint():
+                    if receipt.request.semantic_fingerprint() != request.semantic_fingerprint():
                         raise PaperTerminalSettlementConflict(
                             "paper settlement identity is bound to a different request"
                         )
