@@ -7,6 +7,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -873,6 +874,62 @@ def test_evidence_handles_without_rowid_and_shadowed_rowid_aliases(
     manifest = service.backup(source, target)
 
     assert service.verify(target) == manifest.evidence
+
+
+def test_migration_evidence_includes_persistent_planner_statistics(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    with sqlite3.connect(source) as connection:
+        connection.executescript("""
+            CREATE TABLE analyzed_rows (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            CREATE INDEX idx_analyzed_rows_value ON analyzed_rows(value);
+            INSERT INTO analyzed_rows VALUES (1, 'alpha'), (2, 'beta'), (3, 'beta');
+            ANALYZE;
+            """)
+        assert connection.execute("SELECT COUNT(*) FROM sqlite_stat1").fetchone() == (1,)
+
+    report = SQLiteMaintenanceService().dry_run_migration(
+        source,
+        target,
+        plan=MigrationPlan(
+            migration_id="planner-statistics-change",
+            steps=(MigrationStep("DELETE FROM sqlite_stat1"),),
+        ),
+    )
+
+    assert report.outcome == "applied_to_synthetic_copy"
+    assert report.before != report.after
+    assert report.source_unchanged is True
+    with sqlite3.connect(target) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM sqlite_stat1").fetchone() == (0,)
+
+
+def test_migration_plan_deadline_interrupts_and_rolls_back(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    _create_multiportfolio_database(source).close()
+    started = time.monotonic()
+
+    report = SQLiteMaintenanceService(max_migration_seconds=0.01).dry_run_migration(
+        source,
+        target,
+        plan=MigrationPlan(
+            migration_id="bounded-recursive-query",
+            steps=(
+                MigrationStep(
+                    "WITH RECURSIVE unbounded(value) AS ("
+                    "VALUES(1) UNION ALL SELECT value+1 FROM unbounded"
+                    ") SELECT sum(value) FROM unbounded"
+                ),
+            ),
+        ),
+    )
+
+    assert time.monotonic() - started < 2.0
+    assert report.outcome == "rolled_back"
+    assert report.error_code == "migration_plan_failed"
+    assert report.before == report.after
+    assert report.source_unchanged is True
 
 
 def test_migration_uses_the_copy_connection_without_a_writable_reopen(

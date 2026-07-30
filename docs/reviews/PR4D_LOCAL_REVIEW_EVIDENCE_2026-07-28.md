@@ -32,22 +32,22 @@ Focused maintenance, legacy migration, and database-isolation matrix:
 ```text
 python3 -m pytest tests/maintenance/test_sqlite_service.py \
   tests/test_multiuser.py tests/security/test_db_isolation.py -q --tb=short
-220 passed
+222 passed
 ```
 
-The PR 4D maintenance module has 53 direct tests covering active WAL state,
+The PR 4D maintenance module has 55 direct tests covering active WAL state,
 multiportfolio preservation, backup/restore manifests, clean-room equivalence,
 corruption, preexisting targets, symlinks, hardlinks, companion files,
 substitution races, backup/restore interruption, migration rollback,
 declarative-plan containment, hidden-rowid source-change detection,
-`WITHOUT ROWID` and shadowed-rowid compatibility, CLI output, and legacy
-quarantine.
+planner-statistics evidence, bounded migration execution, `WITHOUT ROWID` and
+shadowed-rowid compatibility, CLI output, and legacy quarantine.
 
 Final full repository regression:
 
 ```text
 python3 -m pytest tests/ -q --tb=short
-3098 passed, 5 skipped, 20 known warnings in 83.40s
+3100 passed, 5 skipped, 20 known warnings in 82.61s
 ```
 
 After PR 4C merged to `main`, that exact head was merge-integrated into this
@@ -164,8 +164,8 @@ claiming isolation that an in-process filesystem library cannot provide:
 Current verification:
 
 ```text
-focused maintenance + multiuser + DB isolation: 220 passed
-full repository: 3098 passed, 5 skipped, 20 known warnings
+focused maintenance + multiuser + DB isolation: 222 passed
+full repository: 3100 passed, 5 skipped, 20 known warnings
 PR 4C settlement integration file: 30 passed
 Python 3.10 direct authorizer commit/rollback probe: passed
 Black, isort, flake8, Bandit, mypy, and git diff checks on changed scope: passed

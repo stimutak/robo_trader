@@ -117,11 +117,19 @@ state, and a source-unchanged result. Final report evidence and the artifact
 digest come directly from the descriptor-bound manifest captured before atomic
 publication; the report never reopens the published target.
 
+Table evidence includes an exposed SQLite rowid where one exists and persistent
+`sqlite_stat*` planner-statistics tables. Delete/reinsert changes that preserve
+visible values and changes produced by `ANALYZE` therefore cannot evade the
+before/after or source-unchanged comparison.
+
 Migration authorization also denies SQLite pragmas that can affect paths,
 journaling, schema trust, checkpoints, or process-global allocator limits,
 including `hard_heap_limit` and `soft_heap_limit`. Parameter binding failures,
 including integers outside SQLite's signed 64-bit range, roll back and produce
 the same secret-free `migration_plan_failed` report as SQL execution failures.
+Migration execution also has a SQLite progress-handler deadline (30 seconds by
+default, configurable on the service); exceeding it interrupts the statement,
+rolls back the service-owned transaction, and returns `migration_plan_failed`.
 
 Active WAL sources are supported. Initial and final source evidence is captured
 from bound SQLite read snapshots rather than by requiring a companion-free main

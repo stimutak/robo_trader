@@ -299,11 +299,15 @@ class SQLiteMaintenanceService:
         *,
         progress_hook: ProgressHook | None = None,
         max_copy_seconds: float = 120.0,
+        max_migration_seconds: float = 30.0,
     ) -> None:
         if not math.isfinite(max_copy_seconds) or not 1.0 <= max_copy_seconds <= 3600.0:
             raise ValueError("max_copy_seconds must be between 1 and 3600")
+        if not math.isfinite(max_migration_seconds) or not 0.01 <= max_migration_seconds <= 3600.0:
+            raise ValueError("max_migration_seconds must be between 0.01 and 3600")
         self._progress_hook = progress_hook
         self._max_copy_seconds = max_copy_seconds
+        self._max_migration_seconds = max_migration_seconds
 
     def verify(
         self,
@@ -410,14 +414,23 @@ class SQLiteMaintenanceService:
             error_code: str | None = None
             connection.execute("BEGIN IMMEDIATE")
             connection.set_authorizer(_migration_authorizer)
+            migration_started = time.monotonic()
+
+            def enforce_migration_deadline() -> int:
+                return int(time.monotonic() - migration_started > self._max_migration_seconds)
+
             try:
-                for step in plan.steps:
-                    connection.execute(step.sql, step.parameters)
-                if plan.target_user_version is not None:
-                    connection.execute(f"PRAGMA user_version={plan.target_user_version}")
-                interim = _database_evidence(connection)
-                if interim.integrity_check != "ok" or interim.foreign_key_violations:
-                    raise SQLiteMaintenanceError("migration produced invalid SQLite state")
+                connection.set_progress_handler(enforce_migration_deadline, 1000)
+                try:
+                    for step in plan.steps:
+                        connection.execute(step.sql, step.parameters)
+                    if plan.target_user_version is not None:
+                        connection.execute(f"PRAGMA user_version={plan.target_user_version}")
+                    interim = _database_evidence(connection)
+                    if interim.integrity_check != "ok" or interim.foreign_key_violations:
+                        raise SQLiteMaintenanceError("migration produced invalid SQLite state")
+                finally:
+                    connection.set_progress_handler(None, 0)
             except (sqlite3.Error, SQLiteMaintenanceError, OverflowError):
                 # Python 3.10 cannot reliably disable an authorizer by passing
                 # None.  Replace it with a completion-only policy before the
@@ -968,7 +981,8 @@ def _database_evidence(connection: sqlite3.Connection) -> DatabaseEvidence:
         str(row[0])
         for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND (name NOT LIKE 'sqlite_%' OR name='sqlite_sequence') "
+            "AND (name NOT LIKE 'sqlite_%' OR name='sqlite_sequence' "
+            "OR name GLOB 'sqlite_stat*') "
             "ORDER BY name"
         ).fetchall()
     ]
