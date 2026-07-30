@@ -11,13 +11,13 @@ SQLite `-wal`, `-shm`, and `-journal` companions are checked for safe type,
 link count, and stable identity while a snapshot is running. SQLite never opens
 the requested output path or any other filesystem target. Online backup and
 migration run in an in-memory SQLite database. The service serializes the exact
-finished image into an `O_EXCL|O_NOFOLLOW` file created with `openat` beneath a
-bound `O_DIRECTORY|O_NOFOLLOW` parent descriptor. The named staged inode starts
-with mode `000`, so another process cannot retain a writable descriptor before
-it is sealed read-only. The service then publishes that inode with
-descriptor-relative atomic no-replace rename and fsyncs the already-bound
-parent descriptor. The published descriptor is digested again and its lexical
-parent and target identities are revalidated before success. A public `-wal`, `-shm`, or
+finished image into an unlinked regular-file inode (`st_nlink == 0`) on the
+target filesystem. Linux uses `O_TMPFILE` and descriptor-only
+`linkat(AT_EMPTY_PATH)` publication; macOS uses an unlinked temporary descriptor
+and `fclonefileat`. Unsupported filesystems and platforms fail closed. The
+service fsyncs the already-bound parent descriptor after publication. The
+published descriptor is digested again and its lexical parent and target
+identities are revalidated before success. A public `-wal`, `-shm`, or
 `-journal` path is therefore never touched or deleted by the service or its
 SQLite connection. There is no staging directory that a concurrent process
 can replace with a symlink.
@@ -40,10 +40,9 @@ credentials, account identifiers, or broker configuration. They always state
 `authorizes_startup=false`.
 
 If backup, restore, or verification is interrupted, the source remains
-untouched. Any interrupted staged database is retained read-only in its private
-randomly named file for forensic inspection; the requested output path remains
-absent, there is no successful manifest, and the partial file cannot be reused
-as a target.
+untouched. The anonymous partial inode disappears when its held descriptor is
+closed; the requested output path remains absent, there is no successful
+manifest, and no partial file can be mistaken for a usable artifact.
 
 ## Commands
 

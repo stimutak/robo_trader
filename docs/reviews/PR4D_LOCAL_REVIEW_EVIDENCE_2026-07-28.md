@@ -76,9 +76,9 @@ type debt.
   online copy progress. Backup and restore artifacts are integrity-checked,
   foreign-key-checked, logically hashed, raw-file hashed, fsynced, and sealed
   read-only.
-- Failed or interrupted staged outputs are retained as randomly named,
-  read-only files for forensic inspection and have no successful manifest.
-  They are never promoted or reused.
+- Failed or interrupted anonymous outputs disappear when their held descriptor
+  closes and have no successful manifest or requested target path. They are
+  never promoted or reused.
 - Declarative migration plans run only against the new synthetic copy in a
   service-owned transaction. Transaction control, `ATTACH`, `DETACH`, and
   dangerous path/schema pragmas are denied; failures roll back and return a
@@ -86,21 +86,21 @@ type debt.
 
 ## 2026-07-30 exact-review follow-up
 
-Ten additional exact-head P1 findings and the Python 3.10 CI failures were
+Eleven additional exact-head P1 findings and the Python 3.10 CI failures were
 remediated without touching authoritative data or runtime services:
 
 - SQLite now operates only in memory. It never opens the requested output path,
   a staging-directory path, or any public sidecar pathname. The exact finished
-  image is serialized into an exclusive file created with `openat` under a
-  bound parent-directory descriptor. The sealed inode is published with a
-  descriptor-relative atomic no-replace rename; the service performs no
-  pathname unlink.
+  image is serialized into an unlinked inode on the target filesystem. Linux
+  publishes its `O_TMPFILE` inode with `linkat(AT_EMPTY_PATH)`; macOS publishes
+  from an unlinked descriptor with `fclonefileat`. Unsupported topology fails
+  closed, and the service performs no pathname unlink.
 - A planted staging-name symlink cannot redirect SQLite into an attacker-owned
   directory because no filesystem target connection exists. Exclusive file
   creation refuses the symlink and preserves planted `database.db-wal` bytes.
-- The staged file is born with mode `000`; only the already-held guardian
-  descriptor can write the serialized image. A concurrent writable open is
-  denied before the inode is sealed and digested.
+- The staged inode has no pathname or directory entry (`st_nlink == 0`) before
+  publication. A same-user process therefore has no staging name to chmod,
+  open, hard-link, rename, or retain for post-digest mutation.
 - Publication fsyncs the bound parent-directory descriptor and revalidates both
   the lexical parent and published target afterward. Parent replacement causes
   a failed operation rather than a false successful manifest.

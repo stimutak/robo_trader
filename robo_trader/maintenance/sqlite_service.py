@@ -12,10 +12,10 @@ import json
 import math
 import os
 import re
-import secrets
 import sqlite3
 import stat
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -47,40 +47,28 @@ class SQLiteMaintenanceError(RuntimeError):
 
 @dataclass(slots=True)
 class _StagedTarget:
-    """Descriptor-bound artifact that SQLite never opens by pathname."""
+    """Unlinked artifact published from its descriptor after verification."""
 
     requested_path: Path
     parent_file_descriptor: int
-    staging_name: str
     guardian_file_descriptor: int
     device: int
     inode: int
     published: bool = False
 
-    @property
-    def forensic_path(self) -> Path:
-        return self.requested_path.parent / self.staging_name
-
     def assert_identity(self) -> None:
         parent = os.fstat(self.parent_file_descriptor)
         current_parent = os.lstat(self.requested_path.parent)
         guardian = os.fstat(self.guardian_file_descriptor)
-        staged = os.stat(
-            self.staging_name,
-            dir_fd=self.parent_file_descriptor,
-            follow_symlinks=False,
-        )
+        expected_links = 1 if self.published else 0
         if (
             not stat.S_ISDIR(parent.st_mode)
             or stat.S_ISLNK(current_parent.st_mode)
             or not stat.S_ISDIR(current_parent.st_mode)
             or (parent.st_dev, parent.st_ino) != (current_parent.st_dev, current_parent.st_ino)
             or not stat.S_ISREG(guardian.st_mode)
-            or guardian.st_nlink != 1
+            or guardian.st_nlink != expected_links
             or (guardian.st_dev, guardian.st_ino) != (self.device, self.inode)
-            or stat.S_ISLNK(staged.st_mode)
-            or not stat.S_ISREG(staged.st_mode)
-            or (staged.st_dev, staged.st_ino) != (self.device, self.inode)
         ):
             raise SQLiteMaintenanceError("staged database identity changed")
 
@@ -105,21 +93,53 @@ class _StagedTarget:
         return result
 
     def publish(self) -> None:
-        """Publish the sealed main inode with descriptor-relative no-replace rename."""
+        """Publish the anonymous image without resolving a source pathname."""
 
         self.assert_identity()
         _assert_target_family_absent_at(
             self.parent_file_descriptor,
             self.requested_path.name,
         )
-        _rename_noreplace_at(
-            self.parent_file_descriptor,
-            self.staging_name,
+        if sys.platform.startswith("linux"):
+            _link_anonymous_at(
+                self.guardian_file_descriptor,
+                self.parent_file_descriptor,
+                self.requested_path.name,
+            )
+        elif sys.platform == "darwin":
+            self._clone_anonymous_on_macos()
+        else:
+            raise SQLiteMaintenanceError("platform cannot publish an anonymous database safely")
+        self.published = True
+        self._assert_published_identity()
+
+    def _clone_anonymous_on_macos(self) -> None:
+        """Clone an unlinked source fd into an exclusive APFS destination."""
+
+        _fclonefileat(
+            self.guardian_file_descriptor,
             self.parent_file_descriptor,
             self.requested_path.name,
         )
-        self.published = True
-        self._assert_published_identity()
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        published_descriptor = os.open(
+            self.requested_path.name,
+            flags,
+            dir_fd=self.parent_file_descriptor,
+        )
+        try:
+            source_digest = _descriptor_digest(self.guardian_file_descriptor)
+            published_digest = _descriptor_digest(published_descriptor)
+            metadata = os.fstat(published_descriptor)
+            if source_digest != published_digest or not stat.S_ISREG(metadata.st_mode):
+                raise SQLiteMaintenanceError("published clone differs from anonymous source")
+        except BaseException:
+            os.close(published_descriptor)
+            raise
+        os.close(self.guardian_file_descriptor)
+        self.guardian_file_descriptor = published_descriptor
+        self.device = metadata.st_dev
+        self.inode = metadata.st_ino
         os.fsync(self.parent_file_descriptor)
         self._assert_published_identity()
 
@@ -652,47 +672,31 @@ class SQLiteMaintenanceService:
             ):
                 raise SQLiteMaintenanceError("target parent identity changed")
             _assert_target_family_absent_at(parent_file_descriptor, path.name)
-            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-            for _attempt in range(4):
-                staging_name = f".{path.name}.robo-trader-stage-{secrets.token_hex(16)}"
-                try:
-                    guardian = os.open(
-                        staging_name,
-                        flags,
-                        0o000,
-                        dir_fd=parent_file_descriptor,
-                    )
-                except FileExistsError:
-                    continue
-                except OSError as exc:
+            guardian = _open_anonymous_target(parent_file_descriptor, path.parent)
+            try:
+                metadata = os.fstat(guardian)
+                current_parent = os.lstat(path.parent)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 0
+                    or metadata.st_dev != parent.st_dev
+                    or stat.S_ISLNK(current_parent.st_mode)
+                    or (current_parent.st_dev, current_parent.st_ino)
+                    != (parent.st_dev, parent.st_ino)
+                ):
                     raise SQLiteMaintenanceError(
-                        "private staged database cannot be created"
-                    ) from exc
-                try:
-                    metadata = os.fstat(guardian)
-                    staged = os.stat(
-                        staging_name,
-                        dir_fd=parent_file_descriptor,
-                        follow_symlinks=False,
+                        "anonymous staged database identity cannot be established"
                     )
-                    if (
-                        not stat.S_ISREG(metadata.st_mode)
-                        or metadata.st_nlink != 1
-                        or (metadata.st_dev, metadata.st_ino) != (staged.st_dev, staged.st_ino)
-                    ):
-                        raise SQLiteMaintenanceError("private staged database identity changed")
-                    return _StagedTarget(
-                        requested_path=path,
-                        parent_file_descriptor=parent_file_descriptor,
-                        staging_name=staging_name,
-                        guardian_file_descriptor=guardian,
-                        device=metadata.st_dev,
-                        inode=metadata.st_ino,
-                    )
-                except BaseException:
-                    os.close(guardian)
-                    raise
-            raise SQLiteMaintenanceError("private target staging name could not be reserved")
+                return _StagedTarget(
+                    requested_path=path,
+                    parent_file_descriptor=parent_file_descriptor,
+                    guardian_file_descriptor=guardian,
+                    device=metadata.st_dev,
+                    inode=metadata.st_ino,
+                )
+            except BaseException:
+                os.close(guardian)
+                raise
         except BaseException:
             os.close(parent_file_descriptor)
             raise
@@ -947,71 +951,67 @@ def _post_migration_authorizer(
     return _migration_authorizer(action, arg1, arg2, database, trigger)
 
 
-def _rename_noreplace_at(
-    source_directory_descriptor: int,
-    source_name: str,
-    target_directory_descriptor: int,
-    target_name: str,
-) -> None:
-    """Atomically move a pathname without replacing any destination.
+def _open_anonymous_target(parent_descriptor: int, parent_path: Path) -> int:
+    """Create an unlinked regular file on the target filesystem."""
 
-    Python does not expose the platform no-replace rename flags.  Maintenance
-    fails closed on unsupported Unix VFS platforms instead of falling back to
-    ``rename(2)``, whose overwrite behavior could destroy an interposed file.
-    """
+    if sys.platform.startswith("linux"):
+        temporary_flag = getattr(os, "O_TMPFILE", 0)
+        if not temporary_flag:
+            raise SQLiteMaintenanceError("filesystem lacks anonymous file creation")
+        flags = os.O_RDWR | temporary_flag | getattr(os, "O_CLOEXEC", 0)
+        try:
+            return os.open(".", flags, 0o600, dir_fd=parent_descriptor)
+        except OSError as exc:
+            raise SQLiteMaintenanceError(
+                "target filesystem cannot create a publishable anonymous file"
+            ) from exc
+    if sys.platform == "darwin":
+        try:
+            temporary = tempfile.TemporaryFile(mode="w+b", dir=parent_path)
+            descriptor = os.dup(temporary.fileno())
+            temporary.close()
+            return descriptor
+        except OSError as exc:
+            raise SQLiteMaintenanceError(
+                "target filesystem cannot create an anonymous file"
+            ) from exc
+    raise SQLiteMaintenanceError("platform cannot create an anonymous database safely")
+
+
+def _link_anonymous_at(source_descriptor: int, target_directory: int, target_name: str) -> None:
+    """Publish one Linux O_TMPFILE inode without resolving a source name."""
 
     libc = ctypes.CDLL(None, use_errno=True)
-    source_bytes = os.fsencode(source_name)
-    target_bytes = os.fsencode(target_name)
-    if sys.platform.startswith("linux"):
-        try:
-            rename = libc.renameat2
-        except AttributeError as exc:
-            raise SQLiteMaintenanceError(
-                "platform cannot quarantine a reservation without replacement"
-            ) from exc
-        rename.argtypes = (
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        )
-        rename.restype = ctypes.c_int
-        result = rename(
-            source_directory_descriptor,
-            source_bytes,
-            target_directory_descriptor,
-            target_bytes,
-            1,
-        )
-    elif sys.platform == "darwin":
-        try:
-            rename = libc.renameatx_np
-        except AttributeError as exc:
-            raise SQLiteMaintenanceError(
-                "platform cannot quarantine a reservation without replacement"
-            ) from exc
-        rename.argtypes = (
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        )
-        rename.restype = ctypes.c_int
-        result = rename(
-            source_directory_descriptor,
-            source_bytes,
-            target_directory_descriptor,
-            target_bytes,
-            0x00000004,
-        )
-    else:
-        raise SQLiteMaintenanceError("platform cannot quarantine a reservation without replacement")
-    if result != 0:
+    try:
+        link = libc.linkat
+    except AttributeError as exc:
+        raise SQLiteMaintenanceError("platform cannot publish an anonymous file") from exc
+    link.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+    )
+    link.restype = ctypes.c_int
+    if link(source_descriptor, b"", target_directory, os.fsencode(target_name), 0x1000) != 0:
         error_number = ctypes.get_errno()
-        raise OSError(error_number, os.strerror(error_number), source_name)
+        raise OSError(error_number, os.strerror(error_number), target_name)
+
+
+def _fclonefileat(source_descriptor: int, target_directory: int, target_name: str) -> None:
+    """Publish a macOS clone from an unlinked source descriptor."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        clone = libc.fclonefileat
+    except AttributeError as exc:
+        raise SQLiteMaintenanceError("platform cannot clone an anonymous file") from exc
+    clone.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    clone.restype = ctypes.c_int
+    if clone(source_descriptor, target_directory, os.fsencode(target_name), 0x0001) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), target_name)
 
 
 def _assert_single_link(binding: SQLitePathBinding) -> None:

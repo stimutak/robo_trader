@@ -231,13 +231,11 @@ def test_sqlite_uses_private_namespace_and_never_unlinks_public_wal_replacement(
     assert public_wal.read_bytes() == protected_payload
     assert not target.exists()
     forensic_targets = list(tmp_path.glob(f".{target.name}.robo-trader-stage-*"))
-    assert len(forensic_targets) == 1
-    assert forensic_targets[0].is_file()
-    assert stat.S_IMODE(forensic_targets[0].stat().st_mode) == 0o400
+    assert forensic_targets == []
 
 
 def test_staging_symlink_cannot_redirect_sqlite_into_attacker_directory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     source = tmp_path / "source.db"
     target = tmp_path / "target.db"
@@ -245,23 +243,20 @@ def test_staging_symlink_cannot_redirect_sqlite_into_attacker_directory(
     attacker_directory.mkdir()
     planted_wal = attacker_directory / "database.db-wal"
     planted_wal.write_bytes(b"irreplaceable-user-data")
-    token = "a" * 32
-    staged_name = f".{target.name}.robo-trader-stage-{token}"
+    staged_name = f".{target.name}.robo-trader-stage-{'a' * 32}"
     (tmp_path / staged_name).symlink_to(attacker_directory, target_is_directory=True)
     writer = _create_multiportfolio_database(source, wal=True)
-    monkeypatch.setattr(sqlite_service_module.secrets, "token_hex", lambda _size: token)
 
     try:
-        with pytest.raises(SQLiteMaintenanceError, match="staging name could not be reserved"):
-            SQLiteMaintenanceService().backup(source, target)
+        manifest = SQLiteMaintenanceService().backup(source, target)
     finally:
         writer.close()
 
     assert planted_wal.read_bytes() == b"irreplaceable-user-data"
-    assert not target.exists()
+    assert SQLiteMaintenanceService().verify(target) == manifest.evidence
 
 
-def test_named_staging_inode_cannot_be_opened_writable_before_sealing(
+def test_anonymous_staging_cannot_be_located_chmodded_or_opened(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "source.db"
@@ -271,6 +266,8 @@ def test_named_staging_inode_cannot_be_opened_writable_before_sealing(
     real_stage = service._stage_target
     staged_target = None
     attempted = False
+    located_paths: list[Path] = []
+    baseline_entries = set(tmp_path.iterdir())
 
     def capture_stage(requested_path):
         nonlocal staged_target
@@ -282,14 +279,19 @@ def test_named_staging_inode_cannot_be_opened_writable_before_sealing(
         if not attempted:
             attempted = True
             assert staged_target is not None
-            with pytest.raises(PermissionError):
-                os.open(staged_target.forensic_path, os.O_RDWR)
+            assert os.fstat(staged_target.guardian_file_descriptor).st_nlink == 0
+            located_paths.extend(set(tmp_path.iterdir()) - baseline_entries)
+            for path in located_paths:
+                path.chmod(0o600)
+                descriptor = os.open(path, os.O_RDWR)
+                os.close(descriptor)
 
     monkeypatch.setattr(service, "_stage_target", capture_stage)
     service._progress_hook = attempt_writable_open
     manifest = service.backup(source, target)
 
     assert attempted
+    assert located_paths == []
     assert hashlib.sha256(target.read_bytes()).hexdigest() == manifest.artifact_sha256
 
 
@@ -442,8 +444,7 @@ def test_interrupted_backup_preserves_source_and_seals_forensic_target(tmp_path:
     assert source.read_bytes() == before
     assert not target.exists()
     forensic_targets = list(tmp_path.glob(f".{target.name}.robo-trader-stage-*"))
-    assert len(forensic_targets) == 1
-    assert stat.S_IMODE(forensic_targets[0].stat().st_mode) == 0o400
+    assert forensic_targets == []
 
 
 def test_manifest_with_unknown_field_is_rejected(tmp_path: Path) -> None:
@@ -480,38 +481,35 @@ def test_target_substitution_during_backup_fails_descriptor_check(tmp_path: Path
     assert target.is_symlink()
 
 
-def test_hardlink_race_during_backup_fails_closed(
+def test_anonymous_staging_has_no_path_for_hardlink_race(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "source.db"
     target = tmp_path / "target.db"
-    alias = tmp_path / "target-alias.db"
     _create_multiportfolio_database(source).close()
     service = SQLiteMaintenanceService()
     real_stage = service._stage_target
-    staged_path: Path | None = None
+    staged_target = None
     invoked = False
 
     def capture_stage(requested_path):
-        nonlocal staged_path
-        staged = real_stage(requested_path)
-        staged_path = staged.forensic_path
-        return staged
+        nonlocal staged_target
+        staged_target = real_stage(requested_path)
+        return staged_target
 
-    def add_link(_operation: str, _remaining: int, _total: int) -> None:
+    def attempt_link(_operation: str, _remaining: int, _total: int) -> None:
         nonlocal invoked
         if not invoked:
             invoked = True
-            assert staged_path is not None
-            os.link(staged_path, alias)
+            assert staged_target is not None
+            assert os.fstat(staged_target.guardian_file_descriptor).st_nlink == 0
+            assert list(tmp_path.glob(f".{target.name}.robo-trader-stage-*")) == []
 
     monkeypatch.setattr(service, "_stage_target", capture_stage)
-    with pytest.raises(SQLiteMaintenanceError, match="staged database identity changed"):
-        service._progress_hook = add_link
-        service.backup(source, target)
+    service._progress_hook = attempt_link
+    service.backup(source, target)
     assert source.exists()
-    assert not target.exists()
-    assert alias.exists()
+    assert target.exists()
 
 
 def test_interrupted_restore_preserves_backup_and_seals_target(tmp_path: Path) -> None:
@@ -533,8 +531,7 @@ def test_interrupted_restore_preserves_backup_and_seals_target(tmp_path: Path) -
     assert backup.read_bytes() == backup_before
     assert not target.exists()
     forensic_targets = list(tmp_path.glob(f".{target.name}.robo-trader-stage-*"))
-    assert len(forensic_targets) == 1
-    assert stat.S_IMODE(forensic_targets[0].stat().st_mode) == 0o400
+    assert forensic_targets == []
 
 
 def test_migration_dry_run_changes_only_synthetic_copy(tmp_path: Path) -> None:
