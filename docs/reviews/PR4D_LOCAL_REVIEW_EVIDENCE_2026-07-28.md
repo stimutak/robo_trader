@@ -47,8 +47,14 @@ Final full repository regression:
 
 ```text
 python3 -m pytest tests/ -q --tb=short
-3072 passed, 5 skipped, 20 known warnings in 78.67s
+3098 passed, 5 skipped, 20 known warnings in 83.40s
 ```
+
+After PR 4C merged to `main`, that exact head was merge-integrated into this
+branch. Its two settlement compatibility tests now install a synthetic copy of
+the historical multiuser-v1 result directly under `tests/`; they do not invoke
+or re-enable the quarantined in-place migrator. The complete settlement file
+passes 30 tests on the combined tree.
 
 Static checks:
 
@@ -159,7 +165,8 @@ Current verification:
 
 ```text
 focused maintenance + multiuser + DB isolation: 220 passed
-full repository: 3072 passed, 5 skipped, 20 known warnings
+full repository: 3098 passed, 5 skipped, 20 known warnings
+PR 4C settlement integration file: 30 passed
 Python 3.10 direct authorizer commit/rollback probe: passed
 Black, isort, flake8, Bandit, mypy, and git diff checks on changed scope: passed
 ```
