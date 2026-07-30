@@ -43,11 +43,11 @@ from .protective_quote_evidence import (
     ProtectiveQuoteSource,
     assert_current_authoritative_protective_quote,
 )
+from .reconciliation.ibkr_adapter import IBKRDiagnosticSnapshotProvider
 from .reconciliation.identity import (
     RuntimeSafetyContext,
     assert_validated_runtime_safety_context,
 )
-from .reconciliation.ibkr_adapter import IBKRDiagnosticSnapshotProvider
 from .safety import (
     OrderSide,
     OrderType,
