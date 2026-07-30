@@ -932,6 +932,81 @@ def test_migration_plan_deadline_interrupts_and_rolls_back(tmp_path: Path) -> No
     assert report.source_unchanged is True
 
 
+def test_migration_authorizer_denies_native_pointer_and_virtual_table_actions(
+    tmp_path: Path,
+) -> None:
+    authorizer = sqlite_service_module._migration_authorizer
+    assert (
+        authorizer(sqlite3.SQLITE_FUNCTION, None, "fts3_tokenizer", None, None)
+        == sqlite3.SQLITE_DENY
+    )
+    assert (
+        authorizer(sqlite3.SQLITE_FUNCTION, None, "load_extension", None, None)
+        == sqlite3.SQLITE_DENY
+    )
+    assert (
+        authorizer(sqlite3.SQLITE_CREATE_VTABLE, "docs", "fts3", "main", None)
+        == sqlite3.SQLITE_DENY
+    )
+    assert (
+        authorizer(sqlite3.SQLITE_DROP_VTABLE, "docs", "fts3", "main", None) == sqlite3.SQLITE_DENY
+    )
+
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    _create_multiportfolio_database(source).close()
+    report = SQLiteMaintenanceService().dry_run_migration(
+        source,
+        target,
+        plan=MigrationPlan(
+            migration_id="deny-native-pointer-function",
+            steps=(
+                MigrationStep(
+                    "SELECT fts3_tokenizer('unsafe', ?)",
+                    (b"\x42" * 8,),
+                ),
+            ),
+        ),
+    )
+
+    assert report.outcome == "rolled_back"
+    assert report.error_code == "migration_plan_failed"
+    assert report.before == report.after
+    assert report.source_unchanged is True
+
+
+def test_migration_plan_cannot_change_untracked_schema_cookie(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    _create_multiportfolio_database(source).close()
+    assert (
+        sqlite_service_module._migration_authorizer(
+            sqlite3.SQLITE_PRAGMA,
+            "schema_version",
+            "999",
+            "main",
+            None,
+        )
+        == sqlite3.SQLITE_DENY
+    )
+
+    report = SQLiteMaintenanceService().dry_run_migration(
+        source,
+        target,
+        plan=MigrationPlan(
+            migration_id="deny-schema-cookie",
+            steps=(MigrationStep("PRAGMA schema_version=999"),),
+        ),
+    )
+
+    assert report.outcome == "rolled_back"
+    assert report.error_code == "migration_plan_failed"
+    assert report.before == report.after
+    assert report.source_unchanged is True
+    with sqlite3.connect(target) as connection:
+        assert connection.execute("PRAGMA schema_version").fetchone() != (999,)
+
+
 def test_migration_uses_the_copy_connection_without_a_writable_reopen(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -122,11 +122,15 @@ Table evidence includes an exposed SQLite rowid where one exists and persistent
 visible values and changes produced by `ANALYZE` therefore cannot evade the
 before/after or source-unchanged comparison.
 
-Migration authorization also denies SQLite pragmas that can affect paths,
-journaling, schema trust, checkpoints, or process-global allocator limits,
-including `hard_heap_limit` and `soft_heap_limit`. Parameter binding failures,
-including integers outside SQLite's signed 64-bit range, roll back and produce
-the same secret-free `migration_plan_failed` report as SQL execution failures.
+Migration authorization permits only the read/evidence PRAGMAs the service
+requires plus the evidence-tracked `application_id` and `user_version` values.
+All other PRAGMAs, including `schema_version`, path, journaling, checkpoint,
+schema-trust, and process-global allocator controls, are denied. Native-pointer
+functions (`fts3_tokenizer` and `load_extension`), virtual-table DDL, savepoints,
+and caller-controlled transaction operations are also denied before execution.
+Parameter binding failures, including integers outside SQLite's signed 64-bit
+range, roll back and produce the same secret-free `migration_plan_failed`
+report as SQL execution failures.
 Migration execution also has a SQLite progress-handler deadline (30 seconds by
 default, configurable on the service); exceeding it interrupts the statement,
 rolls back the service-owned transaction, and returns `migration_plan_failed`.

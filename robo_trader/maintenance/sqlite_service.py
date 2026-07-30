@@ -1080,28 +1080,40 @@ def _encode_value(value: object) -> object:
 def _migration_authorizer(
     action: int,
     arg1: str | None,
-    _arg2: str | None,
+    arg2: str | None,
     _db: str | None,
     _trigger: str | None,
 ) -> int:
     denied = {
         sqlite3.SQLITE_ATTACH,
+        sqlite3.SQLITE_CREATE_VTABLE,
         sqlite3.SQLITE_DETACH,
+        sqlite3.SQLITE_DROP_VTABLE,
+        sqlite3.SQLITE_SAVEPOINT,
         sqlite3.SQLITE_TRANSACTION,
     }
-    dangerous_pragmas = {
-        "data_store_directory",
-        "hard_heap_limit",
-        "journal_mode",
-        "soft_heap_limit",
-        "temp_store_directory",
-        "wal_checkpoint",
-        "writable_schema",
+    allowed_pragmas = {
+        "application_id",
+        "foreign_key_check",
+        "integrity_check",
+        "page_count",
+        "quick_check",
+        "table_xinfo",
+        "user_version",
     }
-    if action in denied or (
-        action == sqlite3.SQLITE_PRAGMA
-        and isinstance(arg1, str)
-        and arg1.lower() in dangerous_pragmas
+    native_code_functions = {"fts3_tokenizer", "load_extension"}
+    function_name = arg2 if isinstance(arg2, str) else arg1
+    if (
+        action in denied
+        or (
+            action == sqlite3.SQLITE_PRAGMA
+            and (not isinstance(arg1, str) or arg1.lower() not in allowed_pragmas)
+        )
+        or (
+            action == sqlite3.SQLITE_FUNCTION
+            and isinstance(function_name, str)
+            and function_name.lower() in native_code_functions
+        )
     ):
         return sqlite3.SQLITE_DENY
     return sqlite3.SQLITE_OK
