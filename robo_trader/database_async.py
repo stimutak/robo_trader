@@ -27,14 +27,22 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import aiosqlite
 
+from robo_trader.accounting.fifo import FifoAccountingError
 from robo_trader.accounting.fifo_bootstrap import (
     FifoBootstrapError,
     append_legacy_fifo_bootstrap_in_transaction,
     prepare_fifo_accounting_schema_in_transaction,
 )
+from robo_trader.accounting.fifo_runtime import (
+    FifoRuntimeProjection,
+    RuntimePaperFillEvidence,
+    append_runtime_fill_on_aiosqlite_worker,
+    reduction_side_to_fifo,
+)
 from robo_trader.database_migrations import (
     apply_exact_state_migrations,
     assert_exact_state_schema,
+    assert_paper_settlement_hot_schema,
 )
 from robo_trader.database_validator import DatabaseValidator, ValidationError
 from robo_trader.financial_state_bootstrap import (
@@ -71,6 +79,7 @@ from robo_trader.paper_terminal_settlement import (
 )
 from robo_trader.safety.models import (
     MODEL_VERSION,
+    _exact_decimal_subtract,
     _strict_decimal,
     decimal_to_fixed,
     parse_fixed_decimal,
@@ -93,6 +102,39 @@ DB_PATH = lexical_path_preserving_leaf(Path(os.getenv("RT_DB_PATH", "trading_dat
 
 # Default portfolio ID for backward compatibility
 DEFAULT_PORTFOLIO_ID = "default"
+
+
+def _fifo_evidence_from_terminal_request(
+    request: PaperTerminalSettlementRequest,
+) -> RuntimePaperFillEvidence:
+    """Require producer-owned fill fields before entering the FIFO ledger."""
+
+    if (
+        request.fill_price is None
+        or request.fill_execution_id is None
+        or request.fill_commission_minor is None
+        or request.fill_commission_currency is None
+        or request.fill_commission_source is None
+    ):
+        raise PaperTerminalSettlementError(
+            "filled paper settlement lacks exact producer execution evidence"
+        )
+    return RuntimePaperFillEvidence(
+        execution_domain_scope=request.execution_domain_scope,
+        account_scope=request.account_scope,
+        portfolio_id=request.portfolio_id,
+        con_id=request.con_id,
+        symbol=request.symbol,
+        side=reduction_side_to_fifo(request.side.value),
+        quantity=request.filled_quantity,
+        price=request.fill_price,
+        execution_id=request.fill_execution_id,
+        idempotency_key=request.fingerprint(),
+        commission_minor=request.fill_commission_minor,
+        commission_currency=request.fill_commission_currency,
+        commission_source=request.fill_commission_source,
+        occurred_at=request.outcome_at,
+    )
 
 
 class SafetyAllocationSnapshotError(ValidationError):
@@ -2545,6 +2587,12 @@ class AsyncTradingDatabase:
                 raise PaperTerminalSettlementError("settlement database identity cannot be proven")
             try:
                 await conn.execute("BEGIN IMMEDIATE")
+                try:
+                    await assert_paper_settlement_hot_schema(conn)
+                except RuntimeError as exc:
+                    raise PaperTerminalSettlementError(
+                        "paper settlement hot schema cannot be authenticated"
+                    ) from exc
                 self._paper_settlement_fault("AFTER_BEGIN")
 
                 # Search every durable idempotency identity together. A
@@ -2556,7 +2604,7 @@ class AsyncTradingDatabase:
                            protective_quote_payload, trade_id, database_path, database_identity,
                            database_device, database_inode, committed_at,
                            receipt_fingerprint, schema_version
-                    FROM paper_reduction_settlements
+                    FROM main.paper_reduction_settlements
                     WHERE reservation_id = ? OR claim_id = ? OR (
                         execution_domain_scope = ? AND account_scope = ? AND order_ref = ?
                     )
@@ -2576,7 +2624,7 @@ class AsyncTradingDatabase:
                     )
                 if replay_rows:
                     receipt = self._paper_settlement_receipt_from_row(replay_rows[0])
-                    if receipt.request.fingerprint() != request.fingerprint():
+                    if receipt.request.semantic_fingerprint() != request.semantic_fingerprint():
                         raise PaperTerminalSettlementConflict(
                             "paper settlement identity is bound to a different request"
                         )
@@ -2589,11 +2637,54 @@ class AsyncTradingDatabase:
                         raise PaperTerminalSettlementError(
                             "persisted settlement database provenance changed"
                         )
+                    if request.filled_quantity > 0:
+                        try:
+                            replay_fifo_projection = await append_runtime_fill_on_aiosqlite_worker(
+                                conn,
+                                _fifo_evidence_from_terminal_request(request),
+                            )
+                        except FifoAccountingError as exc:
+                            raise PaperTerminalSettlementError(
+                                "persisted FIFO fill cannot be authenticated"
+                            ) from exc
+                        link = await conn.execute(
+                            """
+                            SELECT request_fingerprint,epoch_id,fill_id,event_sequence,
+                                   execution_id,commission_minor,commission_currency,
+                                   commission_source,fifo_state_fingerprint
+                            FROM main.paper_fifo_settlement_links WHERE settlement_id=?
+                            """,
+                            (receipt.settlement_id,),
+                        )
+                        expected_link = (
+                            request.fingerprint(),
+                            replay_fifo_projection.epoch_id,
+                            replay_fifo_projection.fill_id,
+                            replay_fifo_projection.event_sequence,
+                            request.fill_execution_id,
+                            request.fill_commission_minor,
+                            request.fill_commission_currency,
+                            request.fill_commission_source,
+                            replay_fifo_projection.state_fingerprint,
+                        )
+                        if await link.fetchone() != expected_link:
+                            raise PaperTerminalSettlementError(
+                                "persisted settlement FIFO lineage changed"
+                            )
+                    else:
+                        link = await conn.execute(
+                            "SELECT 1 FROM main.paper_fifo_settlement_links WHERE settlement_id=?",
+                            (receipt.settlement_id,),
+                        )
+                        if await link.fetchone() is not None:
+                            raise PaperTerminalSettlementError(
+                                "unfilled settlement unexpectedly claims a FIFO event"
+                            )
                     await conn.rollback()
                     return receipt
 
                 cursor = await conn.execute(
-                    "SELECT id FROM portfolios WHERE id = ?",
+                    "SELECT id FROM main.portfolios WHERE id = ?",
                     (portfolio_id,),
                 )
                 if await cursor.fetchone() is None:
@@ -2604,7 +2695,7 @@ class AsyncTradingDatabase:
                 cursor = await conn.execute(
                     """
                     SELECT quantity, typeof(quantity), avg_cost, market_price
-                    FROM positions
+                    FROM main.positions
                     WHERE portfolio_id = ? AND symbol = ?
                     """,
                     (portfolio_id, symbol),
@@ -2629,7 +2720,7 @@ class AsyncTradingDatabase:
                 cursor = await conn.execute(
                     """
                     SELECT quantity, typeof(quantity)
-                    FROM positions WHERE symbol = ?
+                    FROM main.positions WHERE symbol = ?
                     """,
                     (symbol,),
                 )
@@ -2651,7 +2742,7 @@ class AsyncTradingDatabase:
                     """
                     SELECT cash_text, realized_pnl_text, daily_pnl_text,
                            daily_pnl_baseline_text, daily_pnl_date
-                    FROM paper_account_settlement_state
+                    FROM main.paper_account_settlement_state
                     WHERE portfolio_id = ?
                     """,
                     (portfolio_id,),
@@ -2689,7 +2780,7 @@ class AsyncTradingDatabase:
                         "current paper account differs from the requested pre-account state"
                     )
                 cursor = await conn.execute(
-                    "SELECT 1 FROM account WHERE portfolio_id = ?",
+                    "SELECT 1 FROM main.account WHERE portfolio_id = ?",
                     (portfolio_id,),
                 )
                 if await cursor.fetchone() is None:
@@ -2698,9 +2789,18 @@ class AsyncTradingDatabase:
                     )
 
                 trade_id: Optional[int] = None
+                fifo_projection: Optional[FifoRuntimeProjection] = None
                 committed_at = datetime.now(timezone.utc)
                 if request.filled_quantity > 0:
-                    if position_row is None or avg_cost is None or request.fill_price is None:
+                    commission_minor = request.fill_commission_minor
+                    expected_cost_basis = request.expected_position_cost_basis
+                    if (
+                        position_row is None
+                        or avg_cost is None
+                        or request.fill_price is None
+                        or type(commission_minor) is not int
+                        or expected_cost_basis is None
+                    ):
                         raise PaperTerminalSettlementError(
                             "filled reduction has no authoritative local cost basis"
                         )
@@ -2716,7 +2816,7 @@ class AsyncTradingDatabase:
                         """
                         SELECT cost_basis_text, mark_price_text,
                                source_settlement_id
-                        FROM paper_position_settlement_state
+                        FROM main.paper_position_settlement_state
                         WHERE portfolio_id = ? AND symbol = ?
                         """,
                         (portfolio_id, symbol),
@@ -2735,7 +2835,7 @@ class AsyncTradingDatabase:
                         raise PaperTerminalSettlementError(
                             "exact paper position cost basis is malformed"
                         ) from exc
-                    if stored_cost_basis != request.expected_position_cost_basis:
+                    if stored_cost_basis != expected_cost_basis:
                         raise PaperTerminalSettlementConflict(
                             "paper position cost basis differs from settlement request"
                         )
@@ -2760,16 +2860,46 @@ class AsyncTradingDatabase:
                         raise PaperTerminalSettlementConflict(
                             "paper position mark source differs from settlement request"
                         )
-                    exact_pnl = (
-                        request.expected_post_realized_pnl - request.expected_pre_realized_pnl
+                    try:
+                        fifo_projection = await append_runtime_fill_on_aiosqlite_worker(
+                            conn,
+                            _fifo_evidence_from_terminal_request(request),
+                        )
+                    except FifoAccountingError as exc:
+                        raise PaperTerminalSettlementError(
+                            "exact FIFO settlement failed closed"
+                        ) from exc
+                    self._paper_settlement_fault("AFTER_FIFO_APPEND")
+                    expected_fifo_pnl = _exact_decimal_subtract(
+                        request.expected_post_realized_pnl,
+                        request.expected_pre_realized_pnl,
+                        "expected FIFO realized P&L",
                     )
+                    if (
+                        fifo_projection.replayed
+                        or fifo_projection.signed_quantity
+                        != request.expected_post_position_quantity
+                        or fifo_projection.fill_realized_pnl != expected_fifo_pnl
+                        or fifo_projection.total_realized_pnl != request.expected_post_realized_pnl
+                    ):
+                        raise PaperTerminalSettlementConflict(
+                            "FIFO projection differs from the requested exact settlement"
+                        )
+                    if request.expected_post_position_quantity != 0 and (
+                        fifo_projection.average_cost is None
+                        or fifo_projection.average_cost != expected_cost_basis
+                    ):
+                        raise PaperTerminalSettlementConflict(
+                            "FIFO remaining cost basis differs from exact position authority"
+                        )
+                    exact_pnl = fifo_projection.fill_realized_pnl
                     exact_notional = request.fill_price * request.filled_quantity
                     cursor = await conn.execute(
                         """
-                        INSERT INTO trades (
+                        INSERT INTO main.trades (
                             portfolio_id, symbol, side, quantity, price, notional,
                             slippage, commission, pnl, timestamp
-                        ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
                         """,
                         (
                             portfolio_id,
@@ -2778,6 +2908,7 @@ class AsyncTradingDatabase:
                             quantity_int,
                             price_float,
                             float(exact_notional),
+                            float(Decimal(commission_minor).scaleb(-2)),
                             float(exact_pnl),
                             utc_to_text(committed_at),
                         ),
@@ -2790,13 +2921,17 @@ class AsyncTradingDatabase:
                     self._paper_settlement_fault("AFTER_TRADE_INSERT")
                     await conn.execute(
                         """
-                        UPDATE positions
+                        UPDATE main.positions
                         SET quantity = ?, avg_cost = ?, market_price = ?, timestamp = ?
                         WHERE portfolio_id = ? AND symbol = ?
                         """,
                         (
                             int(request.expected_post_position_quantity),
-                            avg_cost,
+                            (
+                                avg_cost
+                                if fifo_projection.average_cost is None
+                                else float(fifo_projection.average_cost)
+                            ),
                             protective_mark_float,
                             utc_to_text(committed_at),
                             portfolio_id,
@@ -2807,7 +2942,7 @@ class AsyncTradingDatabase:
 
                     await conn.execute(
                         """
-                        UPDATE account
+                        UPDATE main.account
                         SET cash = ?, realized_pnl = ?, daily_pnl = ?,
                             unrealized_pnl = ?, timestamp = ?
                         WHERE portfolio_id = ?
@@ -2827,7 +2962,7 @@ class AsyncTradingDatabase:
                     )
                     await conn.execute(
                         """
-                        UPDATE paper_account_settlement_state
+                        UPDATE main.paper_account_settlement_state
                         SET cash_text = ?, realized_pnl_text = ?, daily_pnl_text = ?,
                             updated_at = ?,
                             source_settlement_id = NULL
@@ -2846,7 +2981,7 @@ class AsyncTradingDatabase:
                 cursor = await conn.execute(
                     """
                     SELECT quantity, typeof(quantity)
-                    FROM positions WHERE symbol = ?
+                    FROM main.positions WHERE symbol = ?
                     """,
                     (symbol,),
                 )
@@ -2877,7 +3012,7 @@ class AsyncTradingDatabase:
                 )
                 await conn.execute(
                     """
-                    INSERT INTO paper_reduction_settlements (
+                    INSERT INTO main.paper_reduction_settlements (
                         settlement_id, execution_domain_scope, account_scope,
                         portfolio_id, con_id, symbol, reservation_id, claim_id,
                         order_ref, protective_quote_payload, request_fingerprint,
@@ -2912,14 +3047,23 @@ class AsyncTradingDatabase:
                     ),
                 )
                 if request.filled_quantity > 0:
+                    if fifo_projection is None:
+                        raise PaperTerminalSettlementError(
+                            "filled settlement lost its FIFO projection before commit"
+                        )
                     await conn.execute(
                         """
-                        UPDATE paper_position_settlement_state
-                        SET mark_price_text = ?, source_settlement_id = ?,
+                        UPDATE main.paper_position_settlement_state
+                        SET cost_basis_text = ?, mark_price_text = ?, source_settlement_id = ?,
                             updated_at = ?
                         WHERE portfolio_id = ? AND symbol = ?
                         """,
                         (
+                            (
+                                decimal_to_fixed(expected_cost_basis)
+                                if fifo_projection.average_cost is None
+                                else decimal_to_fixed(fifo_projection.average_cost)
+                            ),
                             decimal_to_fixed(request.protective_mark_price),
                             settlement_id,
                             utc_to_text(committed_at),
@@ -2927,10 +3071,34 @@ class AsyncTradingDatabase:
                             symbol,
                         ),
                     )
+                    await conn.execute(
+                        """
+                        INSERT INTO main.paper_fifo_settlement_links(
+                            settlement_id,request_fingerprint,epoch_id,fill_id,
+                            event_sequence,execution_id,commission_minor,
+                            commission_currency,commission_source,
+                            fifo_state_fingerprint,committed_at
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            settlement_id,
+                            request.fingerprint(),
+                            fifo_projection.epoch_id,
+                            fifo_projection.fill_id,
+                            fifo_projection.event_sequence,
+                            request.fill_execution_id,
+                            request.fill_commission_minor,
+                            request.fill_commission_currency,
+                            request.fill_commission_source,
+                            fifo_projection.state_fingerprint,
+                            utc_to_text(committed_at),
+                        ),
+                    )
+                    self._paper_settlement_fault("AFTER_FIFO_LINK_INSERT")
                 self._paper_settlement_fault("AFTER_SETTLEMENT_INSERT")
                 await conn.execute(
                     """
-                    UPDATE paper_account_settlement_state
+                    UPDATE main.paper_account_settlement_state
                     SET source_settlement_id = ?
                     WHERE portfolio_id = ?
                     """,

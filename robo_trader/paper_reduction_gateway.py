@@ -1139,6 +1139,9 @@ class PaperReductionGateway:
             fill_price=outcome.exact_fill_price,
             protective_mark_price=final_quote.price,
             pre_position_quantity=pre_position,
+            commission_minor=(
+                0 if outcome.fill_evidence is None else outcome.fill_evidence.commission_minor
+            ),
         )
         settlement_request = PaperTerminalSettlementRequest(
             execution_domain_scope=authorization.claim.execution_domain_scope,
@@ -1177,6 +1180,18 @@ class PaperReductionGateway:
             terminal_status=terminal_status,
             fill_price=outcome.exact_fill_price,
             outcome_at=outcome.observed_at,
+            fill_execution_id=(
+                None if outcome.fill_evidence is None else outcome.fill_evidence.execution_id
+            ),
+            fill_commission_minor=(
+                None if outcome.fill_evidence is None else outcome.fill_evidence.commission_minor
+            ),
+            fill_commission_currency=(
+                None if outcome.fill_evidence is None else outcome.fill_evidence.commission_currency
+            ),
+            fill_commission_source=(
+                None if outcome.fill_evidence is None else outcome.fill_evidence.commission_source
+            ),
         )
         receipt = await self._database.commit_paper_reduction_outcome(
             settlement_request,

@@ -36,6 +36,54 @@ class Order:
     take_profit: Optional[float | Decimal] = None
 
 
+@dataclass(frozen=True, slots=True)
+class LocalPaperExecutionEvidence:
+    """Exact evidence emitted only when the sealed paper sink fills an order."""
+
+    execution_id: str
+    filled_quantity: Decimal
+    exact_fill_price: Decimal
+    commission_minor: int
+    commission_currency: str
+    commission_source: str
+    occurred_at: dt.datetime
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.execution_id) is not str
+            or not self.execution_id.startswith("lpfill-")
+            or len(self.execution_id) != 39
+            or any(character not in "0123456789abcdef" for character in self.execution_id[7:])
+        ):
+            raise ValueError("local paper execution_id is malformed")
+        if (
+            type(self.filled_quantity) is not Decimal
+            or not self.filled_quantity.is_finite()
+            or self.filled_quantity <= 0
+        ):
+            raise ValueError("local paper filled_quantity must be exact and positive")
+        if (
+            type(self.exact_fill_price) is not Decimal
+            or not self.exact_fill_price.is_finite()
+            or self.exact_fill_price <= 0
+        ):
+            raise ValueError("local paper fill price must be exact and positive")
+        if type(self.commission_minor) is not int:
+            raise ValueError("local paper commission must be exact integer minor units")
+        if self.commission_currency != "USD":
+            raise ValueError("local paper commission currency must be USD")
+        if self.commission_source != "LOCAL_PAPER_EXECUTOR_EXACT_COMMISSION_V1":
+            raise ValueError("local paper commission source is malformed")
+        offset = self.occurred_at.utcoffset() if type(self.occurred_at) is dt.datetime else None
+        if (
+            type(self.occurred_at) is not dt.datetime
+            or self.occurred_at.tzinfo is None
+            or offset is None
+            or offset.total_seconds() != 0
+        ):
+            raise ValueError("local paper execution time must be timezone-aware UTC")
+
+
 class ExecutionResult:
     def __init__(
         self,
@@ -44,6 +92,7 @@ class ExecutionResult:
         fill_price: Optional[float] = None,
         *,
         exact_fill_price: Optional[Decimal] = None,
+        local_paper_evidence: Optional[LocalPaperExecutionEvidence] = None,
     ) -> None:
         self.ok = ok
         self.message = message
@@ -52,6 +101,7 @@ class ExecutionResult:
         # their existing float-only contract and therefore cannot masquerade as
         # exact terminal paper evidence.
         self.exact_fill_price = exact_fill_price
+        self.local_paper_evidence = local_paper_evidence
 
 
 class AbstractExecutor:
