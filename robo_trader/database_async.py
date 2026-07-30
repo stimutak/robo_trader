@@ -79,6 +79,7 @@ from robo_trader.paper_terminal_settlement import (
 )
 from robo_trader.safety.models import (
     MODEL_VERSION,
+    _exact_decimal_subtract,
     _strict_decimal,
     decimal_to_fixed,
     parse_fixed_decimal,
@@ -2869,8 +2870,10 @@ class AsyncTradingDatabase:
                             "exact FIFO settlement failed closed"
                         ) from exc
                     self._paper_settlement_fault("AFTER_FIFO_APPEND")
-                    expected_fifo_pnl = (
-                        request.expected_post_realized_pnl - request.expected_pre_realized_pnl
+                    expected_fifo_pnl = _exact_decimal_subtract(
+                        request.expected_post_realized_pnl,
+                        request.expected_pre_realized_pnl,
+                        "expected FIFO realized P&L",
                     )
                     if (
                         fifo_projection.replayed

@@ -70,7 +70,9 @@ projection checks.
 
 Every fill-local and epoch-wide realized-P&L subtotal is accumulated in an
 explicit 96-digit local Decimal context, independent of same-process ambient
-context changes.
+context changes. The transaction-side expected realized-P&L delta is likewise
+computed with the shared exact safety arithmetic helper rather than ambient
+Decimal subtraction.
 
 `paper_fifo_settlement_links` binds each terminal settlement to exactly one
 FIFO fill, sequence, execution ID, commission source, and state fingerprint.

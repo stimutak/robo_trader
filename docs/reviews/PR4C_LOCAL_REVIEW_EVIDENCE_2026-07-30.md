@@ -17,9 +17,9 @@ Base: `main` at `4c7ea47`, including merged PR4B
 
 ## Local verification
 
-- Full repository suite: `3048 passed, 5 skipped, 20 warnings`.
+- Full repository suite: `3049 passed, 5 skipped, 20 warnings`.
 - Combined FIFO, migration, exact-bootstrap, settlement, failure-injection,
-  and recovery-status matrix: `221 passed`.
+  and recovery-status matrix: `222 passed`.
 - Existing-position and stop-event suite: `168 passed`.
 - Migration, exact bootstrap, and FIFO foundation suite: `120 passed`.
 - Terminal failure-injection and recovery-status suite: `66 passed`.
@@ -43,7 +43,9 @@ Base: `main` at `4c7ea47`, including merged PR4B
   direct-create migrations is accepted as an exact alternate schema and
   completes an end-to-end settlement. FIFO subtotal tests also lower the
   ambient Decimal precision and prove the 96-digit local context preserves an
-  exact cross-symbol result.
+  exact cross-symbol result. The transaction-side expected FIFO delta uses the
+  exact safety arithmetic helper; under precision 6, an end-to-end settlement
+  preserves the exact `12345.67` to `0.01` transition and `-12345.66` delta.
 - Settlement failure injection covers failures immediately after FIFO append,
   after compatibility trade insertion, and after immutable FIFO-link insertion;
   every case leaves zero fill, commission, trade, settlement, and link rows.

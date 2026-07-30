@@ -9,7 +9,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -113,7 +113,13 @@ def _runtime_contract(tmp_path: Path) -> RuntimeContract:
     )
 
 
-async def _seed(database: AsyncTradingDatabase) -> None:
+async def _seed(
+    database: AsyncTradingDatabase,
+    *,
+    position_cost: Decimal = Decimal("100"),
+    realized_pnl: Decimal = Decimal("0"),
+    daily_pnl: Decimal = Decimal("0"),
+) -> None:
     async with database.get_connection() as connection:
         await connection.executemany(
             "INSERT INTO portfolios (id, name) VALUES (?, ?)",
@@ -124,20 +130,22 @@ async def _seed(database: AsyncTradingDatabase) -> None:
         await database.update_position(
             "AAPL",
             5,
-            Decimal("100"),
+            position_cost,
             Decimal("100"),
             portfolio_id=portfolio_id,
         )
     await database.update_account(
         Decimal("100000"),
         Decimal("100000"),
-        realized_pnl=Decimal("0"),
+        daily_pnl=daily_pnl,
+        realized_pnl=realized_pnl,
         portfolio_id="portfolio-a",
     )
     await database.update_account(
         Decimal("100000"),
         Decimal("100000"),
-        realized_pnl=Decimal("0"),
+        daily_pnl=daily_pnl,
+        realized_pnl=realized_pnl,
         portfolio_id="portfolio-b",
     )
     for portfolio_id in ("portfolio-a", "portfolio-b"):
@@ -622,6 +630,61 @@ async def test_cross_symbol_realized_pnl_settles_against_epoch_total(tmp_path: P
                 )
             ).fetchall()
         assert sum((Decimal(row[0]) for row in realized_rows), Decimal("0")) == Decimal("12.5")
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_expected_fifo_delta_is_independent_of_ambient_decimal_precision(
+    tmp_path: Path,
+):
+    contract = _runtime_contract(tmp_path)
+    database = AsyncTradingDatabase(Path(contract.database_path), pool_size=1)
+    await database.initialize()
+    try:
+        await _seed(
+            database,
+            position_cost=Decimal("10000"),
+            realized_pnl=Decimal("12345.67"),
+            daily_pnl=Decimal("12345.67"),
+        )
+        request = replace(
+            _request(outcome_at=datetime.now(timezone.utc) - timedelta(seconds=1)),
+            expected_post_cash=Decimal("107654.34"),
+            expected_pre_realized_pnl=Decimal("12345.67"),
+            expected_post_realized_pnl=Decimal("0.01"),
+            expected_pre_daily_pnl=Decimal("12345.67"),
+            expected_post_daily_pnl=Decimal("19800.01"),
+            expected_position_cost_basis=Decimal("10000"),
+            fill_price=Decimal("3827.17"),
+        )
+
+        with localcontext() as context:
+            context.prec = 6
+            receipt = await database.commit_paper_reduction_outcome(
+                request,
+                runtime_contract=contract,
+            )
+
+        assert receipt.pre_realized_pnl == Decimal("12345.67")
+        assert receipt.post_realized_pnl == Decimal("0.01")
+        account = await database.get_account_info(portfolio_id="portfolio-a")
+        assert account["realized_pnl_exact"] == Decimal("0.01")
+        async with database.get_connection() as connection:
+            fifo_delta = await (
+                await connection.execute(
+                    """
+                    SELECT match.realized_pnl_text
+                    FROM main.paper_fifo_settlement_links AS link
+                    JOIN main.fifo_lot_matches AS match
+                      ON match.epoch_id=link.epoch_id
+                     AND match.closing_fill_id=link.fill_id
+                    WHERE link.settlement_id=?
+                    """,
+                    (receipt.settlement_id,),
+                )
+            ).fetchone()
+        assert fifo_delta == ("-12345.66",)
     finally:
         await database.close()
 
