@@ -68,8 +68,14 @@ created, owner-only manifest reservation in place as a failure marker. It may
 be empty or contain incomplete JSON, but the command returns nonzero and
 `load_manifest` rejects it. Operators must inspect that marker and choose a new
 output path; this service never deletes or reuses it. If database publication
-itself fails after the manifest is complete, the valid manifest remains but its
-referenced database path is absent and verification fails closed.
+fails before the target is linked or cloned, the complete manifest remains and
+the database path is absent. If publication fails after that link or clone—for
+example, during the directory `fsync` or final identity check—the service
+deliberately preserves both the complete manifest and the published database as
+forensic artifacts while returning nonzero. Operators must inspect both,
+must not treat them as a successful operation even if a later verification
+passes, and must choose new output paths rather than deleting or reusing either
+artifact.
 
 ## Commands
 
