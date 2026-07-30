@@ -1017,6 +1017,77 @@ def test_status_atomic_exchange_restores_raced_unrelated_target(
     assert held_owned.is_file()
 
 
+def test_status_failed_race_rollback_preserves_displaced_unrelated_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_path = tmp_path / "status.json"
+    payload = {
+        "schema_version": 1,
+        "owner_binding": STATUS_OWNER_BINDING,
+        "state": "quarantined",
+        "trigger": None,
+        "completed_at": None,
+        "eligible_until": None,
+        "entry_eligible": False,
+        "quarantined": True,
+        "run_id": None,
+        "snapshot_id": None,
+    }
+    integration._write_status(
+        status_path,
+        payload,
+        owner_binding=STATUS_OWNER_BINDING,
+    )
+    held_owned = tmp_path / "held-owned-status.json"
+    real_exchange = integration._exchange_status_entries
+    calls = 0
+
+    def race_then_fail_rollback(parent_descriptor: int, left: str, right: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            os.rename(
+                right,
+                held_owned.name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+            raced = os.open(
+                right,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+            os.write(raced, b"unrelated-raced-state")
+            os.close(raced)
+            real_exchange(parent_descriptor, left, right)
+            return
+        raise OSError("simulated rollback failure")
+
+    monkeypatch.setattr(
+        integration,
+        "_exchange_status_entries",
+        race_then_fail_rollback,
+    )
+
+    with pytest.raises(
+        RuntimeReconciliationIntegrationError,
+        match="displaced inode was preserved",
+    ):
+        integration._write_status(
+            status_path,
+            dict(payload, state="ready"),
+            owner_binding=STATUS_OWNER_BINDING,
+        )
+
+    displaced = list(tmp_path.glob(".status.json.stage-*"))
+    assert calls == 2
+    assert len(displaced) == 1
+    assert displaced[0].read_bytes() == b"unrelated-raced-state"
+    assert held_owned.is_file()
+
+
 def test_first_status_publication_race_never_replaces_unrelated_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -319,13 +319,15 @@ async def test_full_empty_position_evidence_chain_is_typed_and_one_shot(
     database = tmp_path / "ledger.db"
     _ledger(database)
     runtime = _runtime(database)
+    output = tmp_path / ("evidence-" + "é" * 40)
     receivers = create_bootstrap_evidence_receivers(
         runtime_contract=runtime,
         capability_directory=capability,
-        output_directory=tmp_path / "evidence",
+        output_directory=output,
     )
     result = _broker_result(datetime.now(timezone.utc) - timedelta(milliseconds=50))
     provider = _Provider(result)
+    predicted_bundle_size: list[int] = []
 
     async def no_marks(**kwargs: object) -> tuple:
         assert kwargs["mark_identities"] == ()
@@ -337,6 +339,7 @@ async def test_full_empty_position_evidence_chain_is_typed_and_one_shot(
         )
         assert type(mark_identity) is ProtectiveMarkBundleIdentity
         assert mark_identity.reconciliation_snapshot_id.startswith("bootstrap-reconciliation-v1-")
+        predicted_bundle_size.append(receivers.unpublished_bundle_size_bytes(set()))
         provider.events.append("marks")
         return ()
 
@@ -351,11 +354,12 @@ async def test_full_empty_position_evidence_chain_is_typed_and_one_shot(
     assert provider.events == ["snapshot", "quote-source", "marks", "close"]
     assert report["authorizes_startup"] is False
     assert report["status"] == "EVIDENCE_COMPLETE_GATE_A_STILL_CLOSED"
-    assert (tmp_path / "evidence" / "broker_snapshot.json").stat().st_mode & 0o777 == 0o400
-    assert (tmp_path / "evidence" / "reconciliation_report.json").is_file()
+    assert (output / "broker_snapshot.json").stat().st_mode & 0o777 == 0o400
+    assert (output / "reconciliation_report.json").is_file()
+    assert predicted_bundle_size == [sum(path.stat().st_size for path in output.iterdir())]
     loaded = load_exact_state_bootstrap_evidence(
-        reconciliation_path=tmp_path / "evidence" / "reconciliation_report.json",
-        broker_snapshot_path=tmp_path / "evidence" / "broker_snapshot.json",
+        reconciliation_path=output / "reconciliation_report.json",
+        broker_snapshot_path=output / "broker_snapshot.json",
         protective_mark_paths=[],
         expected_runtime_contract=runtime,
     )

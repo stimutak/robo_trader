@@ -64,7 +64,6 @@ _EVIDENCE_MAX_BYTES_ENV = "RT_RECONCILIATION_EVIDENCE_MAX_BYTES"
 _STATUS_FILENAME = "reconciliation_runtime_status.json"
 _DEFAULT_EVIDENCE_MAX_BUNDLES = 10_000
 _DEFAULT_EVIDENCE_MAX_BYTES = 2 * 1024 * 1024 * 1024
-_COMPLETION_MARKER_RESERVE_BYTES = 4 * 1024
 _RUNTIME_BUNDLE_PREFIX = "runtime-reconciliation-"
 _STATUS_FIELDS = {
     "schema_version",
@@ -558,8 +557,8 @@ class ProductionRuntimeEvidenceSource:
             ) = _published_evidence_usage(self._evidence_root)
         if (
             self._published_bundle_count >= self._max_published_bundles
-            or self._published_evidence_bytes + staged_bytes + _COMPLETION_MARKER_RESERVE_BYTES
-            > self._max_published_bytes
+            or self._published_evidence_bytes >= self._max_published_bytes
+            or self._published_evidence_bytes + staged_bytes > self._max_published_bytes
         ):
             raise RuntimeReconciliationIntegrationError(
                 "reconciliation evidence retention ceiling reached; "
@@ -666,7 +665,7 @@ class ProductionRuntimeEvidenceSource:
             assert self._published_bundle_count is not None
             assert self._published_evidence_bytes is not None
             self._published_bundle_count += 1
-            self._published_evidence_bytes += staged_bytes + _COMPLETION_MARKER_RESERVE_BYTES
+            self._published_evidence_bytes += staged_bytes
             broker_path = receivers.published_artifact_path(broker_artifact)
             reconciliation_path = receivers.published_artifact_path(reconciliation_artifact)
             mark_paths = tuple(receivers.published_artifact_path(mark) for mark in mark_artifacts)
@@ -896,6 +895,7 @@ def _write_status(
     descriptor = -1
     prior_descriptor = -1
     prior_identity: tuple[int, int] | None = None
+    preserve_temporary = False
     try:
         try:
             prior_descriptor = os.open(
@@ -949,17 +949,26 @@ def _write_status(
             # never a partial status, and a raced unrelated target can be put
             # back rather than overwritten.
             _exchange_status_entries(parent_descriptor, temporary_name, path.name)
+            preserve_temporary = True
             displaced = os.stat(
                 temporary_name,
                 dir_fd=parent_descriptor,
                 follow_symlinks=False,
             )
             if (displaced.st_dev, displaced.st_ino) != prior_identity:
-                _exchange_status_entries(parent_descriptor, temporary_name, path.name)
+                try:
+                    _exchange_status_entries(parent_descriptor, temporary_name, path.name)
+                except BaseException as rollback_error:
+                    raise RuntimeReconciliationIntegrationError(
+                        "raced reconciliation status target could not be restored; "
+                        "displaced inode was preserved"
+                    ) from rollback_error
+                preserve_temporary = False
                 raise RuntimeReconciliationIntegrationError(
                     "existing reconciliation status artifact changed during publication"
                 )
             os.unlink(temporary_name, dir_fd=parent_descriptor)
+            preserve_temporary = False
         os.fsync(parent_descriptor)
     finally:
         if descriptor >= 0:
@@ -967,7 +976,8 @@ def _write_status(
         if prior_descriptor >= 0:
             os.close(prior_descriptor)
         try:
-            os.unlink(temporary_name, dir_fd=parent_descriptor)
+            if not preserve_temporary:
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
         except FileNotFoundError:
             pass
         finally:

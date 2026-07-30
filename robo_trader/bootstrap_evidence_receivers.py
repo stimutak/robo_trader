@@ -456,6 +456,20 @@ class _StagedProtectiveMarkEvidence:
     marker: object = field(repr=False, compare=False)
 
 
+def _completion_marker_payload(state: _BundleBindings) -> bytes:
+    return json.dumps(
+        {
+            "bundle_id": state.bundle_id,
+            "publication_directory": str(state.final_output_directory),
+            "publication_nonce": state.publication_nonce,
+            "schema_version": 1,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
 @dataclass(frozen=True, slots=True)
 class BootstrapEvidenceReceiverSet:
     broker_snapshot: "BrokerSnapshotEvidenceReceiver"
@@ -562,17 +576,7 @@ class BootstrapEvidenceReceiverSet:
                 )
             self._assert_lexical_publication_binding(require_final=True)
             os.fsync(state.output_parent_fd)
-            completion_payload = json.dumps(
-                {
-                    "bundle_id": state.bundle_id,
-                    "publication_directory": str(state.final_output_directory),
-                    "publication_nonce": state.publication_nonce,
-                    "schema_version": 1,
-                },
-                ensure_ascii=True,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
+            completion_payload = _completion_marker_payload(state)
             _write_new_sealed_file_at(
                 state.staging_output_fd,
                 completion_temp,
@@ -628,7 +632,7 @@ class BootstrapEvidenceReceiverSet:
         self,
         expected_marks: set[tuple[str, str]],
     ) -> int:
-        """Return the exact sealed staging size before irreversible publication."""
+        """Return exact final bytes, including the not-yet-written completion marker."""
 
         self.assert_complete(expected_marks)
         state = self._state
@@ -652,7 +656,7 @@ class BootstrapEvidenceReceiverSet:
                     "unpublished evidence contains an unsafe entry"
                 )
             total += metadata.st_size
-        return total
+        return total + len(_completion_marker_payload(state))
 
     def _assert_lexical_publication_binding(self, *, require_final: bool) -> None:
         state = self._state
