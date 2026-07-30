@@ -267,6 +267,96 @@ def test_manifest_is_secret_free_portable_and_exclusively_written(tmp_path: Path
         service.write_manifest(manifest, manifest_path)
 
 
+def test_restore_manifest_is_complete_before_database_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    target = tmp_path / "restore.db"
+    restore_manifest_path = tmp_path / "restore.json"
+    _create_multiportfolio_database(source).close()
+    service = SQLiteMaintenanceService()
+    backup_manifest = service.backup(source, backup)
+    reservation = service.reserve_manifest(restore_manifest_path)
+    real_publish = sqlite_service_module._StagedTarget.publish
+    inspected = False
+
+    def inspect_manifest_before_publish(staged_target) -> None:
+        nonlocal inspected
+        payload = json.loads(restore_manifest_path.read_text())
+        assert payload["operation"] == "restore"
+        assert payload["input_artifact_sha256"] == backup_manifest.artifact_sha256
+        assert stat.S_IMODE(restore_manifest_path.stat().st_mode) == 0o400
+        inspected = True
+        real_publish(staged_target)
+
+    monkeypatch.setattr(
+        sqlite_service_module._StagedTarget,
+        "publish",
+        inspect_manifest_before_publish,
+    )
+    try:
+        restore_manifest = service.restore_clean_room(
+            backup,
+            target,
+            backup_manifest,
+            manifest_reservation=reservation,
+        )
+    finally:
+        reservation.close()
+
+    assert inspected
+    assert service.load_manifest(restore_manifest_path) == restore_manifest
+    assert target.exists()
+
+
+@pytest.mark.parametrize("operation", ["backup", "restore"])
+def test_reserved_manifest_write_failure_prevents_database_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    source = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    target = backup
+    report_path = tmp_path / f"{operation}.json"
+    _create_multiportfolio_database(source).close()
+    service = SQLiteMaintenanceService()
+    backup_manifest = None
+    if operation == "restore":
+        backup_manifest = service.backup(source, backup)
+        target = tmp_path / "restore.db"
+    reservation = service.reserve_manifest(report_path)
+
+    def fail_manifest_write(_descriptor: int, _payload: bytes) -> None:
+        raise OSError("synthetic manifest I/O failure")
+
+    monkeypatch.setattr(sqlite_service_module, "_write_all", fail_manifest_write)
+    try:
+        with pytest.raises(SQLiteMaintenanceError, match="manifest write failed closed"):
+            if operation == "backup":
+                service.backup(
+                    source,
+                    target,
+                    manifest_reservation=reservation,
+                )
+            else:
+                assert backup_manifest is not None
+                service.restore_clean_room(
+                    backup,
+                    target,
+                    backup_manifest,
+                    manifest_reservation=reservation,
+                )
+    finally:
+        reservation.close()
+
+    assert not target.exists()
+    assert report_path.exists()
+    assert report_path.stat().st_size == 0
+
+
 @pytest.mark.parametrize("kind", ["source_symlink", "source_hardlink", "target_symlink"])
 def test_aliases_fail_closed(tmp_path: Path, kind: str) -> None:
     source = tmp_path / "source.db"

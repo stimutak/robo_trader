@@ -53,8 +53,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             reservation = service.reserve_manifest(args.manifest)
             try:
-                backup_manifest = service.backup(args.source, args.target)
-                service.write_reserved_manifest(backup_manifest, reservation)
+                backup_manifest = service.backup(
+                    args.source,
+                    args.target,
+                    manifest_reservation=reservation,
+                )
             finally:
                 reservation.close()
             payload = backup_manifest.to_dict()
@@ -86,8 +89,8 @@ def main(argv: list[str] | None = None) -> int:
                     args.backup,
                     args.target,
                     expected_backup,
+                    manifest_reservation=reservation,
                 )
-                service.write_reserved_manifest(restore_manifest, reservation)
             finally:
                 reservation.close()
             payload = restore_manifest.to_dict()

@@ -52,8 +52,10 @@ credentials, account identifiers, or broker configuration. They always state
 `authorizes_startup=false`. A report path must be distinct from every database
 main path and its `-wal`, `-shm`, and `-journal` resource family. Backup and
 restore commands exclusively reserve their output-manifest path before the
-database artifact can be published, so an existing or unwritable report target
-cannot leave an orphan database artifact.
+database artifact can be published. The complete JSON is then written, fsynced,
+sealed read-only, and identity-checked through that reservation before the
+database descriptor is published, so an existing, unwritable, or failed report
+target cannot leave an orphan database artifact.
 
 If backup, restore, or verification is interrupted, the authoritative main-file
 bytes and committed logical state are not modified. A normal read connection to
@@ -65,7 +67,9 @@ mistaken for a usable artifact. The command-line tool leaves its exclusively
 created, owner-only manifest reservation in place as a failure marker. It may
 be empty or contain incomplete JSON, but the command returns nonzero and
 `load_manifest` rejects it. Operators must inspect that marker and choose a new
-output path; this service never deletes or reuses it.
+output path; this service never deletes or reuses it. If database publication
+itself fails after the manifest is complete, the valid manifest remains but its
+referenced database path is absent and verification fails closed.
 
 ## Commands
 

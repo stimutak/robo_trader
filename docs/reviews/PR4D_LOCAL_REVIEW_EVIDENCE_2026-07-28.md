@@ -32,10 +32,10 @@ Focused maintenance, legacy migration, and database-isolation matrix:
 ```text
 python3 -m pytest tests/maintenance/test_sqlite_service.py \
   tests/test_multiuser.py tests/security/test_db_isolation.py -q --tb=short
-215 passed
+218 passed
 ```
 
-The PR 4D maintenance module has 48 direct tests covering active WAL state,
+The PR 4D maintenance module has 51 direct tests covering active WAL state,
 multiportfolio preservation, backup/restore manifests, clean-room equivalence,
 corruption, preexisting targets, symlinks, hardlinks, companion files,
 substitution races, backup/restore interruption, migration rollback,
@@ -45,7 +45,7 @@ Final full repository regression:
 
 ```text
 python3 -m pytest tests/ -q --tb=short
-3067 passed, 5 skipped, 20 known warnings in 80.90s
+3070 passed, 5 skipped, 20 known warnings in 95.79s
 ```
 
 Static checks:
@@ -146,17 +146,18 @@ claiming isolation that an in-process filesystem library cannot provide:
   rollback-only, secret-free failure report as rejected SQL.
 - Every CLI report path is checked against the full main/`-wal`/`-shm`/
   `-journal` family of each source, backup, and target database. Backup and
-  restore manifest paths are exclusively reserved and descriptor-bound before
-  database publication, so an existing or unwritable report path cannot leave
-  a new orphan database artifact.
+  restore manifest paths are exclusively reserved, fully written, fsynced,
+  sealed read-only, and descriptor-checked before database publication. An
+  existing, unwritable, or failed report path therefore cannot leave a new
+  orphan database artifact.
 - All documented Python invocations use the project-required `python3`
   executable name.
 
 Current verification:
 
 ```text
-focused maintenance + multiuser + DB isolation: 215 passed
-full repository: 3067 passed, 5 skipped, 20 known warnings
+focused maintenance + multiuser + DB isolation: 218 passed
+full repository: 3070 passed, 5 skipped, 20 known warnings
 Python 3.10 direct authorizer commit/rollback probe: passed
 Black, isort, flake8, Bandit, mypy, and git diff checks on changed scope: passed
 ```

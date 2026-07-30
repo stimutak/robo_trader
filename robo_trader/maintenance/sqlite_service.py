@@ -348,10 +348,17 @@ class SQLiteMaintenanceService:
         self,
         source_path: Path | str,
         target_path: Path | str,
+        *,
+        manifest_reservation: _ManifestReservation | None = None,
     ) -> MaintenanceManifest:
         """Create and verify a WAL-safe snapshot at an exclusive new path."""
 
-        manifest, _ = self._online_copy(source_path, target_path, operation="backup")
+        manifest, _ = self._online_copy(
+            source_path,
+            target_path,
+            operation="backup",
+            manifest_reservation=manifest_reservation,
+        )
         return manifest
 
     def restore_clean_room(
@@ -359,6 +366,8 @@ class SQLiteMaintenanceService:
         backup_path: Path | str,
         target_path: Path | str,
         manifest: MaintenanceManifest,
+        *,
+        manifest_reservation: _ManifestReservation | None = None,
     ) -> MaintenanceManifest:
         """Restore a verified backup only into an exclusive clean-room path."""
 
@@ -369,18 +378,13 @@ class SQLiteMaintenanceService:
             target_path,
             operation="restore",
             expected_source_manifest=manifest,
+            manifest_reservation=manifest_reservation,
         )
         if restored.evidence != manifest.evidence:
             raise SQLiteMaintenanceError("clean-room restore evidence differs from backup")
-        return MaintenanceManifest(
-            manifest_version=restored.manifest_version,
-            operation="restore",
-            created_at=restored.created_at,
-            artifact_sha256=restored.artifact_sha256,
-            artifact_size=restored.artifact_size,
-            evidence=restored.evidence,
-            input_artifact_sha256=manifest.artifact_sha256,
-        )
+        if restored.input_artifact_sha256 != manifest.artifact_sha256:
+            raise SQLiteMaintenanceError("clean-room restore input digest is unavailable")
+        return restored
 
     def dry_run_migration(
         self,
@@ -621,11 +625,18 @@ class SQLiteMaintenanceService:
         operation: str,
         expected_source_manifest: MaintenanceManifest | None = None,
         target_hook: Callable[[sqlite3.Connection, DatabaseEvidence], object] | None = None,
+        manifest_reservation: _ManifestReservation | None = None,
     ) -> tuple[MaintenanceManifest, object | None]:
         source_candidate = _absolute_canonical_path(source_path)
         target_candidate = _absolute_canonical_path(target_path)
         if _sqlite_resource_family(source_candidate) & _sqlite_resource_family(target_candidate):
             raise SQLiteMaintenanceError("source and target SQLite resource families overlap")
+        if manifest_reservation is not None:
+            self.assert_report_paths_disjoint(
+                database_paths=(source_candidate, target_candidate),
+                report_paths=(manifest_reservation.requested_path,),
+            )
+            manifest_reservation.assert_identity()
         initial_source_companions = _safe_companion_identities(source_candidate)
         if expected_source_manifest is not None and initial_source_companions:
             raise SQLiteMaintenanceError(
@@ -756,7 +767,14 @@ class SQLiteMaintenanceService:
                 artifact_sha256=artifact_sha256,
                 artifact_size=artifact_size,
                 evidence=evidence,
+                input_artifact_sha256=(
+                    expected_source_manifest.artifact_sha256
+                    if operation == "restore" and expected_source_manifest is not None
+                    else None
+                ),
             )
+            if manifest_reservation is not None:
+                self.write_reserved_manifest(manifest, manifest_reservation)
             staged_target.publish()
             published_sha256, published_size = _descriptor_digest(
                 staged_target.guardian_file_descriptor
