@@ -1,8 +1,9 @@
 """Dormant exact-accounting foundations.
 
 Nothing in this package is connected to the trading runtime.  PR4A exposes a
-fixture-only schema migration and a deterministic FIFO projector so the ledger
-contract can be reviewed before any operational database is eligible to use it.
+fixture-only schema migration and a deterministic FIFO projector. PR4B adds a
+separately guarded offline legacy-opening bridge; no runtime path imports this
+package to authorize startup or an order.
 """
 
 from .fifo import (

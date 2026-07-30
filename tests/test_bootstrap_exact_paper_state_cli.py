@@ -253,6 +253,7 @@ def test_preview_scopes_position_coverage_to_candidate_portfolio(
     database_path = tmp_path / "ledger.db"
     candidate = _candidate(database_path, portfolio_id="alpha")
     candidate.positions = (SimpleNamespace(symbol="AAPL", quantity=2),)
+    candidate.fifo_bootstrap_plan = lambda: SimpleNamespace(public_dict=lambda: {})
     monkeypatch.setattr(
         cli,
         "inspect_legacy_state",
