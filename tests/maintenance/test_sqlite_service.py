@@ -16,6 +16,7 @@ from robo_trader.maintenance import (
     SQLiteMaintenanceError,
     SQLiteMaintenanceService,
 )
+from robo_trader.maintenance import sqlite_service as sqlite_service_module
 from robo_trader.multiuser.migration import (
     LegacyMultiuserMigrationDisabled,
     MultiuserMigration,
@@ -174,6 +175,64 @@ def test_preexisting_target_sidecar_is_preserved_without_main_creation(
 
     assert not target.exists()
     assert sidecar.read_bytes() == b"operator-evidence"
+
+
+def test_release_accepts_only_sqlite_consumed_sidecar_reservations(tmp_path: Path) -> None:
+    target = tmp_path / "target.db"
+    reservation = SQLiteMaintenanceService._reserve_target(target)
+    consumed = target.with_name(target.name + "-wal")
+    try:
+        # Model SQLite's Linux WAL close behavior: it removes its own empty
+        # reservation while the maintenance service still holds the descriptor.
+        os.unlink(consumed)
+        reservation.release()
+    finally:
+        reservation.binding.close()
+
+    assert not consumed.exists()
+    assert not any(
+        target.with_name(target.name + suffix).exists() for suffix in ("-journal", "-shm", "-wal")
+    )
+
+
+def test_release_never_deletes_sidecar_substituted_after_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target.db"
+    displaced = tmp_path / "original-reservation"
+    protected_payload = b"irreplaceable-user-evidence"
+    reservation = SQLiteMaintenanceService._reserve_target(target)
+    raced_path = target.with_name(target.name + "-journal")
+    real_rename_noreplace = sqlite_service_module._rename_noreplace
+    raced = False
+
+    def substitute_before_atomic_claim(source: Path, destination: Path) -> None:
+        nonlocal raced
+        if source == raced_path and not raced:
+            raced = True
+            source.rename(displaced)
+            source.write_bytes(protected_payload)
+        real_rename_noreplace(source, destination)
+
+    monkeypatch.setattr(
+        sqlite_service_module,
+        "_rename_noreplace",
+        substitute_before_atomic_claim,
+    )
+    try:
+        with pytest.raises(SQLiteMaintenanceError, match="could not be released safely"):
+            reservation.release()
+    finally:
+        reservation.binding.close()
+
+    preserved = [
+        path
+        for path in tmp_path.rglob("*")
+        if path.is_file() and path.read_bytes() == protected_payload
+    ]
+    assert preserved, "the substituted user file must be preserved, never unlinked"
+    assert raced_path.read_bytes() == protected_payload
+    assert displaced.exists()
 
 
 def test_target_cannot_overlap_source_sqlite_companion_family(tmp_path: Path) -> None:
@@ -384,6 +443,47 @@ def test_migration_dry_run_changes_only_synthetic_copy(tmp_path: Path) -> None:
     with sqlite3.connect(source) as connection:
         columns = connection.execute("PRAGMA table_info(positions)").fetchall()
         assert "note" not in {row[1] for row in columns}
+
+
+def test_migration_uses_the_copy_connection_without_a_writable_reopen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    _create_multiportfolio_database(source).close()
+    service = SQLiteMaintenanceService()
+    real_connect = service._connect_bound
+    writable_target_opens = 0
+
+    def count_connect(binding, *, readonly, journal_off=False, immutable_readonly=False):
+        nonlocal writable_target_opens
+        if binding.path == target and not readonly:
+            writable_target_opens += 1
+        return real_connect(
+            binding,
+            readonly=readonly,
+            journal_off=journal_off,
+            immutable_readonly=immutable_readonly,
+        )
+
+    monkeypatch.setattr(service, "_connect_bound", count_connect)
+    report = service.dry_run_migration(
+        source,
+        target,
+        plan=MigrationPlan(
+            migration_id="single-bound-target",
+            steps=(MigrationStep("ALTER TABLE positions ADD COLUMN note TEXT"),),
+        ),
+    )
+
+    assert report.outcome == "applied_to_synthetic_copy"
+    assert writable_target_opens == 1
+
+
+def test_service_transaction_completion_policy_is_python310_compatible() -> None:
+    arguments = (sqlite3.SQLITE_TRANSACTION, "COMMIT", None, None, None)
+    assert sqlite_service_module._migration_authorizer(*arguments) == sqlite3.SQLITE_DENY
+    assert sqlite_service_module._migration_completion_authorizer(*arguments) == sqlite3.SQLITE_OK
 
 
 def test_interrupted_migration_rolls_back_copy_and_preserves_source(tmp_path: Path) -> None:

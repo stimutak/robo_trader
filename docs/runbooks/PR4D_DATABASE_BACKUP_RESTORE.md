@@ -8,7 +8,13 @@ over another path, or rolls back by replacing an authoritative ledger. Every
 output path must be absolute, canonical, and nonexistent. Existing files,
 symlink leaves, hard-linked databases, and path substitution fail closed.
 SQLite `-wal`, `-shm`, and `-journal` companions are checked for safe type,
-link count, and stable identity while a snapshot is running.
+link count, and stable identity while a snapshot is running. The output family
+is reserved before SQLite opens the target. SQLite-consumed empty reservations
+are recognized through their still-open descriptors; remaining reservations
+are atomically moved, without replacement or unlinking, into a sibling
+`.TARGET.robo-trader-reservations/` directory as zero-byte safety tombstones.
+The maintenance service intentionally never deletes that directory or its
+tombstones.
 
 The supported operations are:
 
@@ -18,9 +24,9 @@ The supported operations are:
   verification;
 - restoration of a manifest-verified backup into a different, exclusively
   created clean-room path;
-- library-level migration dry runs on synthetic copies. No production
-  migration is registered with the command-line tool; a reviewed callback is
-  required so arbitrary code cannot be selected from command-line input.
+- library-level migration dry runs on synthetic copies through a bounded,
+  declarative `MigrationPlan`. No production migration is registered with the
+  command-line tool, and callers never receive the SQLite connection.
 
 Reports and manifests contain no paths, row values, environment values,
 credentials, account identifiers, or broker configuration. They always state
@@ -61,10 +67,12 @@ startup.
 ## Migration dry runs
 
 `SQLiteMaintenanceService.dry_run_migration(...)` first creates a SQLite online
-snapshot at a new synthetic path. The reviewed callback runs within a service-
-owned transaction against that copy only. Transaction control, `ATTACH`, and
-`DETACH` are denied. Success and rollback reports include before/after schema,
-row counts, content hashes, integrity state, and a source-unchanged result.
+snapshot at a new synthetic path. The declarative plan runs within a
+service-owned transaction on the same descriptor-bound connection used to
+create and verify the copy; there is no writable reopen gap. Plan-supplied
+transaction control, `ATTACH`, and `DETACH` are denied. Success and rollback
+reports include before/after schema, row counts, content hashes, integrity
+state, and a source-unchanged result.
 
 ## Legacy multiuser migration quarantine
 

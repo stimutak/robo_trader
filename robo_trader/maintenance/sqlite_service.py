@@ -6,6 +6,7 @@ startup authority, or operation that replaces an existing database path.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import math
@@ -13,6 +14,7 @@ import os
 import re
 import sqlite3
 import stat
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -47,24 +49,62 @@ class _TargetReservation:
 
     binding: SQLitePathBinding
     companions: dict[Path, tuple[int, int, int]]
+    quarantine_directory: Path
 
     def release(self) -> None:
+        """Relinquish sidecar names without ever unlinking a re-resolved path.
+
+        SQLite is allowed to consume an empty reservation itself.  Reservations
+        that remain are moved with a kernel-enforced no-replace rename into the
+        operation's private quarantine directory.  They are deliberately left
+        there as zero-byte tombstones: POSIX has no pathname unlink primitive
+        that is bound to an already-open descriptor, so deleting them would
+        reintroduce a check/use race against same-user pathname substitution.
+        """
+
         error: SQLiteMaintenanceError | None = None
         for path, (descriptor, device, inode) in self.companions.items():
             try:
                 descriptor_metadata = os.fstat(descriptor)
-                path_metadata = os.lstat(path)
                 if (
                     not stat.S_ISREG(descriptor_metadata.st_mode)
-                    or descriptor_metadata.st_nlink != 1
                     or descriptor_metadata.st_size != 0
                     or (descriptor_metadata.st_dev, descriptor_metadata.st_ino) != (device, inode)
-                    or (path_metadata.st_dev, path_metadata.st_ino) != (device, inode)
                 ):
                     raise SQLiteMaintenanceError(
                         "target SQLite sidecar reservation changed during operation"
                     )
-                os.unlink(path)
+                try:
+                    os.lstat(path)
+                except FileNotFoundError:
+                    if descriptor_metadata.st_nlink != 0:
+                        raise SQLiteMaintenanceError(
+                            "target SQLite sidecar reservation moved during operation"
+                        )
+                    continue
+
+                tombstone = self.quarantine_directory / path.name
+                _rename_noreplace(path, tombstone)
+                tombstone_metadata = os.lstat(tombstone)
+                descriptor_after = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(tombstone_metadata.st_mode)
+                    or (tombstone_metadata.st_dev, tombstone_metadata.st_ino) != (device, inode)
+                    or (descriptor_after.st_dev, descriptor_after.st_ino) != (device, inode)
+                    or descriptor_after.st_nlink != 1
+                    or descriptor_after.st_size != 0
+                ):
+                    # The atomically claimed object was not ours.  Restore it
+                    # to its original name without overwriting any new racer;
+                    # if that name is already occupied, both objects remain
+                    # preserved and the operation still fails closed.
+                    try:
+                        _rename_noreplace(tombstone, path)
+                    except (OSError, SQLiteMaintenanceError):
+                        pass
+                    raise SQLiteMaintenanceError(
+                        "target SQLite sidecar pathname was substituted during operation"
+                    )
             except (OSError, SQLiteMaintenanceError) as exc:
                 error = SQLiteMaintenanceError(
                     "target SQLite sidecar reservation could not be released safely"
@@ -137,7 +177,8 @@ class SQLiteMaintenanceService:
     ) -> MaintenanceManifest:
         """Create and verify a WAL-safe snapshot at an exclusive new path."""
 
-        return self._online_copy(source_path, target_path, operation="backup")
+        manifest, _ = self._online_copy(source_path, target_path, operation="backup")
+        return manifest
 
     def restore_clean_room(
         self,
@@ -149,7 +190,7 @@ class SQLiteMaintenanceService:
 
         if manifest.operation != "backup":
             raise SQLiteMaintenanceError("clean-room restore requires a backup manifest")
-        restored = self._online_copy(
+        restored, _ = self._online_copy(
             backup_path,
             target_path,
             operation="restore",
@@ -192,20 +233,13 @@ class SQLiteMaintenanceService:
             artifact_size=source_before_size,
             evidence=source_before,
         )
-        self._online_copy(
-            source_path,
-            synthetic_target_path,
-            operation="backup",
-            seal=False,
-            expected_source_manifest=source_manifest,
-        )
-        target = self._open_source(synthetic_target_path, writable=True)
-        connection: sqlite3.Connection | None = None
-        outcome = "applied_to_synthetic_copy"
-        error_code: str | None = None
-        try:
-            connection, target = self._connect_bound(target, readonly=False)
-            before = _database_evidence(connection)
+
+        def apply_plan(
+            connection: sqlite3.Connection,
+            before: DatabaseEvidence,
+        ) -> tuple[DatabaseEvidence, str, str | None]:
+            outcome = "applied_to_synthetic_copy"
+            error_code: str | None = None
             connection.execute("BEGIN IMMEDIATE")
             connection.set_authorizer(_migration_authorizer)
             try:
@@ -216,23 +250,30 @@ class SQLiteMaintenanceService:
                 interim = _database_evidence(connection)
                 if interim.integrity_check != "ok" or interim.foreign_key_violations:
                     raise SQLiteMaintenanceError("migration produced invalid SQLite state")
-            except BaseException:
-                connection.set_authorizer(None)
+            except (sqlite3.Error, SQLiteMaintenanceError):
+                # Python 3.10 cannot reliably disable an authorizer by passing
+                # None.  Replace it with a completion-only policy before the
+                # service-owned rollback instead.
+                connection.set_authorizer(_migration_completion_authorizer)
                 connection.rollback()
                 outcome = "rolled_back"
                 error_code = "migration_plan_failed"
             else:
-                connection.set_authorizer(None)
+                connection.set_authorizer(_migration_completion_authorizer)
                 connection.commit()
-            target.assert_connection_identity(sqlite_connection_file_identity(connection))
-        finally:
-            if connection is not None:
-                connection.close()
-            try:
-                _seal_readonly(target)
-                _fsync_directory(target.path.parent)
-            finally:
-                target.close()
+            connection.set_authorizer(_post_migration_authorizer)
+            return before, outcome, error_code
+
+        _copy_manifest, migration_result = self._online_copy(
+            source_path,
+            synthetic_target_path,
+            operation="backup",
+            expected_source_manifest=source_manifest,
+            target_hook=apply_plan,
+        )
+        if not isinstance(migration_result, tuple) or len(migration_result) != 3:
+            raise SQLiteMaintenanceError("migration result is unavailable")
+        before, outcome, error_code = migration_result
 
         after = self.verify(synthetic_target_path)
         source_after = self.verify(source_path)
@@ -335,9 +376,9 @@ class SQLiteMaintenanceService:
         target_path: Path | str,
         *,
         operation: str,
-        seal: bool = True,
         expected_source_manifest: MaintenanceManifest | None = None,
-    ) -> MaintenanceManifest:
+        target_hook: Callable[[sqlite3.Connection, DatabaseEvidence], object] | None = None,
+    ) -> tuple[MaintenanceManifest, object | None]:
         source_candidate = _absolute_canonical_path(source_path)
         target_candidate = _absolute_canonical_path(target_path)
         if _sqlite_resource_family(source_candidate) & _sqlite_resource_family(target_candidate):
@@ -420,13 +461,21 @@ class SQLiteMaintenanceService:
                 and evidence != expected_source_manifest.evidence
             ):
                 raise SQLiteMaintenanceError("copied evidence differs from supplied manifest")
+            hook_result: object | None = None
+            if target_hook is not None:
+                target.assert_connection_identity(
+                    sqlite_connection_file_identity(target_connection)
+                )
+                _assert_single_link(target)
+                hook_result = target_hook(target_connection, evidence)
+                target.assert_connection_identity(
+                    sqlite_connection_file_identity(target_connection)
+                )
+                _assert_single_link(target)
+                evidence = _database_evidence(target_connection)
             target_connection.close()
             target_connection = None
-            if seal:
-                _seal_readonly(target)
-            else:
-                os.fsync(target.guardian_file_descriptor)
-                _assert_single_link(target)
+            _seal_readonly(target)
             _fsync_directory(target.path.parent)
             artifact_sha256, artifact_size = _descriptor_digest(target.guardian_file_descriptor)
             target.assert_path_identity()
@@ -445,7 +494,7 @@ class SQLiteMaintenanceService:
                 )
             _fsync_directory(target.path.parent)
             succeeded = True
-            return manifest
+            return manifest, hook_result
         except (sqlite3.Error, SQLiteIdentityError, OSError) as exc:
             raise SQLiteMaintenanceError("SQLite online copy failed closed") from exc
         finally:
@@ -509,18 +558,28 @@ class SQLiteMaintenanceService:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
         companions: dict[Path, tuple[int, int, int]] = {}
         binding: SQLitePathBinding | None = None
+        quarantine_directory = path.parent / f".{path.name}.robo-trader-reservations"
         try:
+            os.mkdir(quarantine_directory, 0o700)
             for suffix in ("-journal", "-shm", "-wal"):
                 companion = path.with_name(path.name + suffix)
                 descriptor = os.open(companion, flags, 0o400)
                 metadata = os.fstat(descriptor)
                 companions[companion] = (descriptor, metadata.st_dev, metadata.st_ino)
             binding = SQLitePathBinding.open_for_initialization(path, create=True)
-            return _TargetReservation(binding=binding, companions=companions)
+            return _TargetReservation(
+                binding=binding,
+                companions=companions,
+                quarantine_directory=quarantine_directory,
+            )
         except Exception as exc:
             if binding is not None:
                 binding.close()
-            reservation = _TargetReservation(binding=binding, companions=companions)  # type: ignore[arg-type]
+            reservation = _TargetReservation(  # type: ignore[arg-type]
+                binding=binding,
+                companions=companions,
+                quarantine_directory=quarantine_directory,
+            )
             try:
                 reservation.release()
             except SQLiteMaintenanceError:
@@ -722,6 +781,112 @@ def _migration_authorizer(
     ):
         return sqlite3.SQLITE_DENY
     return sqlite3.SQLITE_OK
+
+
+def _migration_completion_authorizer(
+    action: int,
+    arg1: str | None,
+    arg2: str | None,
+    database: str | None,
+    trigger: str | None,
+) -> int:
+    """Permit only the service-owned transaction completion operation."""
+
+    if action == sqlite3.SQLITE_TRANSACTION:
+        return sqlite3.SQLITE_OK
+    return _migration_authorizer(action, arg1, arg2, database, trigger)
+
+
+def _post_migration_authorizer(
+    action: int,
+    arg1: str | None,
+    arg2: str | None,
+    database: str | None,
+    trigger: str | None,
+) -> int:
+    """Make the still-bound connection read-only for final evidence capture."""
+
+    write_actions = {
+        sqlite3.SQLITE_ALTER_TABLE,
+        sqlite3.SQLITE_ANALYZE,
+        sqlite3.SQLITE_CREATE_INDEX,
+        sqlite3.SQLITE_CREATE_TABLE,
+        sqlite3.SQLITE_CREATE_TEMP_INDEX,
+        sqlite3.SQLITE_CREATE_TEMP_TABLE,
+        sqlite3.SQLITE_CREATE_TEMP_TRIGGER,
+        sqlite3.SQLITE_CREATE_TEMP_VIEW,
+        sqlite3.SQLITE_CREATE_TRIGGER,
+        sqlite3.SQLITE_CREATE_VIEW,
+        sqlite3.SQLITE_CREATE_VTABLE,
+        sqlite3.SQLITE_DELETE,
+        sqlite3.SQLITE_DROP_INDEX,
+        sqlite3.SQLITE_DROP_TABLE,
+        sqlite3.SQLITE_DROP_TEMP_INDEX,
+        sqlite3.SQLITE_DROP_TEMP_TABLE,
+        sqlite3.SQLITE_DROP_TEMP_TRIGGER,
+        sqlite3.SQLITE_DROP_TEMP_VIEW,
+        sqlite3.SQLITE_DROP_TRIGGER,
+        sqlite3.SQLITE_DROP_VIEW,
+        sqlite3.SQLITE_DROP_VTABLE,
+        sqlite3.SQLITE_INSERT,
+        sqlite3.SQLITE_REINDEX,
+        sqlite3.SQLITE_SAVEPOINT,
+        sqlite3.SQLITE_UPDATE,
+    }
+    if action in write_actions:
+        return sqlite3.SQLITE_DENY
+    return _migration_authorizer(action, arg1, arg2, database, trigger)
+
+
+def _rename_noreplace(source: Path, target: Path) -> None:
+    """Atomically move a pathname without replacing any destination.
+
+    Python does not expose the platform no-replace rename flags.  Maintenance
+    fails closed on unsupported Unix VFS platforms instead of falling back to
+    ``rename(2)``, whose overwrite behavior could destroy an interposed file.
+    """
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    at_fdcwd = -100
+    source_bytes = os.fsencode(source)
+    target_bytes = os.fsencode(target)
+    if sys.platform.startswith("linux"):
+        try:
+            rename = libc.renameat2
+        except AttributeError as exc:
+            raise SQLiteMaintenanceError(
+                "platform cannot quarantine a reservation without replacement"
+            ) from exc
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename.restype = ctypes.c_int
+        result = rename(at_fdcwd, source_bytes, at_fdcwd, target_bytes, 1)
+    elif sys.platform == "darwin":
+        try:
+            rename = libc.renameatx_np
+        except AttributeError as exc:
+            raise SQLiteMaintenanceError(
+                "platform cannot quarantine a reservation without replacement"
+            ) from exc
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename.restype = ctypes.c_int
+        result = rename(at_fdcwd, source_bytes, at_fdcwd, target_bytes, 0x00000004)
+    else:
+        raise SQLiteMaintenanceError("platform cannot quarantine a reservation without replacement")
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), str(source))
 
 
 def _assert_single_link(binding: SQLitePathBinding) -> None:

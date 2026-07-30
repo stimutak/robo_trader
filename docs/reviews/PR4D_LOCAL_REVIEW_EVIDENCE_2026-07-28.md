@@ -35,7 +35,7 @@ python -m pytest tests/maintenance/test_sqlite_service.py \
 188 passed
 ```
 
-The new PR 4D maintenance module has 21 direct tests covering active WAL state,
+The PR 4D maintenance module has 30 direct tests covering active WAL state,
 multiportfolio preservation, backup/restore manifests, clean-room equivalence,
 corruption, preexisting targets, symlinks, hardlinks, companion files,
 substitution races, backup/restore interruption, migration rollback, callback
@@ -78,7 +78,40 @@ type debt.
   read-only.
 - Failed or interrupted outputs are retained read-only for forensic inspection
   and have no successful manifest. They are never promoted or reused.
-- Migration callbacks run only against the new synthetic copy in a
+- Declarative migration plans run only against the new synthetic copy in a
   service-owned transaction. Transaction control, `ATTACH`, `DETACH`, and
   dangerous path/schema pragmas are denied; failures roll back and return a
   secret-free report.
+
+## 2026-07-30 exact-review follow-up
+
+Three additional exact-head P1 findings and the Python 3.10 CI failures were
+remediated without touching authoritative data or runtime services:
+
+- Sidecar release now distinguishes a reservation SQLite consumed itself by
+  checking the still-open descriptor's zero link count. Remaining reservations
+  are atomically moved with the platform's no-replace rename into an exclusive
+  sibling quarantine directory. The service performs no pathname unlink and
+  leaves zero-byte tombstones in place.
+- A substitution between pathname inspection and the atomic claim is preserved,
+  restored to its original name when that can be done without replacement, and
+  causes the operation to fail closed.
+- A migration plan runs on the same descriptor-bound target connection used by
+  the online copy. The synthetic database is never reopened writable between
+  copy verification and migration.
+- Service-owned commit and rollback replace the restrictive plan authorizer
+  with a completion-only policy. This avoids Python 3.10's unsupported
+  `set_authorizer(None)` behavior without allowing plan-supplied transaction
+  control.
+
+Current verification:
+
+```text
+focused maintenance + multiuser + DB isolation: 197 passed
+full repository: 3036 passed, 5 skipped, 20 known warnings
+Python 3.10 direct authorizer commit/rollback probe: passed
+Black, isort, flake8, Bandit, mypy, and git diff checks on changed scope: passed
+```
+
+Repository-wide Black and flake8 remain red only for pre-existing files outside
+this PR's changed scope; those unrelated files were not modified.
