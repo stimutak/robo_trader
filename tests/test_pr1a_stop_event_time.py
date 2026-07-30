@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from robo_trader.execution import LocalPaperExecutionEvidence
 from robo_trader.paper_reduction_submitter import (
     LocalPaperOrderStatus,
     LocalPaperOutcomeProvenance,
@@ -29,17 +31,29 @@ def _monitor() -> StopLossMonitor:
 
 def _filled_terminal_outcome(order, fill_price: float) -> LocalPaperTerminalOutcome:
     quantity = Decimal(order.quantity)
+    exact_fill_price = Decimal(str(fill_price))
+    observed_at = datetime.now(timezone.utc)
     return LocalPaperTerminalOutcome(
         order_ref=order.order_ref,
         status=LocalPaperOrderStatus.FILLED,
         requested_quantity=quantity,
         filled_quantity=quantity,
         remaining_quantity=Decimal("0"),
-        exact_fill_price=Decimal(str(fill_price)),
-        observed_at=datetime.now(timezone.utc),
+        exact_fill_price=exact_fill_price,
+        observed_at=observed_at,
         provenance=LocalPaperOutcomeProvenance.LOCAL_PAPER_EXECUTOR,
         terminal=True,
         message="exact local paper fill",
+        fill_evidence=LocalPaperExecutionEvidence(
+            execution_id="lpfill-"
+            + hashlib.sha256(order.order_ref.encode("utf-8")).hexdigest()[:32],
+            filled_quantity=quantity,
+            exact_fill_price=exact_fill_price,
+            commission_minor=0,
+            commission_currency="USD",
+            commission_source="LOCAL_PAPER_EXECUTOR_EXACT_COMMISSION_V1",
+            occurred_at=observed_at,
+        ),
     )
 
 

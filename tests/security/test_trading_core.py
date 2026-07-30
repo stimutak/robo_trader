@@ -19,7 +19,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from robo_trader.execution import ExecutionResult, Order, PaperExecutor
+from robo_trader.execution import (
+    ExecutionResult,
+    LocalPaperExecutionEvidence,
+    Order,
+    PaperExecutor,
+)
 from robo_trader.paper_reduction_submitter import (
     LocalPaperOrderStatus,
     LocalPaperOutcomeProvenance,
@@ -66,6 +71,16 @@ def _filled_terminal_outcome(
     """Return exact local-paper terminal evidence for monitor-only tests."""
 
     quantity = Decimal(order.quantity)
+    observed_at = datetime.now(timezone.utc)
+    fill_evidence = LocalPaperExecutionEvidence(
+        execution_id="lpfill-" + hashlib.sha256(order.order_ref.encode("utf-8")).hexdigest()[:32],
+        filled_quantity=quantity,
+        exact_fill_price=fill_price,
+        commission_minor=0,
+        commission_currency="USD",
+        commission_source="LOCAL_PAPER_EXECUTOR_EXACT_COMMISSION_V1",
+        occurred_at=observed_at,
+    )
     return LocalPaperTerminalOutcome(
         order_ref=order.order_ref,
         status=LocalPaperOrderStatus.FILLED,
@@ -73,10 +88,11 @@ def _filled_terminal_outcome(
         filled_quantity=quantity,
         remaining_quantity=Decimal("0"),
         exact_fill_price=fill_price,
-        observed_at=datetime.now(timezone.utc),
+        observed_at=observed_at,
         provenance=LocalPaperOutcomeProvenance.LOCAL_PAPER_EXECUTOR,
         terminal=True,
         message="exact local paper fill",
+        fill_evidence=fill_evidence,
     )
 
 
@@ -1138,6 +1154,10 @@ def _paper_settlement_request(
         terminal_status=TerminalOrderStatus.FILLED,
         fill_price=fill_price,
         outcome_at=datetime(2026, 7, 25, 14, 30, tzinfo=timezone.utc),
+        fill_execution_id="lpfill-" + ("8" * 32),
+        fill_commission_minor=0,
+        fill_commission_currency="USD",
+        fill_commission_source="LOCAL_PAPER_EXECUTOR_EXACT_COMMISSION_V1",
     )
 
 
