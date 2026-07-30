@@ -175,8 +175,13 @@ other resource or execution failures return `migration_plan_failed`.
 
 SQLite does not consistently send authorizer callbacks for functions embedded
 in copied CHECK constraints, generated columns, defaults, expression indexes,
-views, or triggers. Before any plan write, the service compares persistent
-schema SQL with the isolated connection's registered function list. SQLite
+views, or triggers. Before any row evidence for a write-capable plan, the
+service compares the bound source's persistent schema SQL with the isolated
+connection's registered function list. VIRTUAL generated values are derived
+from that schema plus stored base columns and are excluded from row hashing, so
+evidence cannot evaluate their native functions; ordinary columns and STORED
+generated values remain included. The copied target is screened again before
+any plan write. SQLite
 block and line comments outside quoted tokens are normalized to whitespace
 before matching, so comments between a function name and `(` cannot bypass the
 screen. Matching follows SQLite's line-comment rule: a bare carriage return

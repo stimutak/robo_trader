@@ -412,6 +412,13 @@ class SQLiteMaintenanceService:
         """
 
         _validate_migration_plan(plan)
+        plan_can_write = any(step.sql.strip().upper() != "SELECT 1" for step in plan.steps)
+        source_schema_functions: tuple[str, ...] = ()
+
+        def screen_source_schema(connection: sqlite3.Connection) -> None:
+            nonlocal source_schema_functions
+            if plan_can_write:
+                source_schema_functions = _schema_function_calls(connection)
 
         def apply_plan(
             connection: sqlite3.Connection,
@@ -419,8 +426,7 @@ class SQLiteMaintenanceService:
         ) -> tuple[DatabaseEvidence, str, str | None]:
             outcome = "applied_to_synthetic_copy"
             error_code: str | None = None
-            plan_can_write = any(step.sql.strip().upper() != "SELECT 1" for step in plan.steps)
-            if plan_can_write and _schema_function_calls(connection):
+            if plan_can_write and (source_schema_functions or _schema_function_calls(connection)):
                 connection.set_authorizer(_post_migration_authorizer)
                 return before, "rolled_back", "migration_plan_failed"
             page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
@@ -511,6 +517,7 @@ class SQLiteMaintenanceService:
             source_path,
             synthetic_target_path,
             operation="backup",
+            source_pre_evidence_hook=screen_source_schema,
             target_hook=apply_plan,
             pre_publish_hook=capture_final_source_evidence,
         )
@@ -699,6 +706,7 @@ class SQLiteMaintenanceService:
         *,
         operation: str,
         expected_source_manifest: MaintenanceManifest | None = None,
+        source_pre_evidence_hook: Callable[[sqlite3.Connection], None] | None = None,
         target_hook: Callable[[sqlite3.Connection, DatabaseEvidence], object] | None = None,
         pre_publish_hook: Callable[[MaintenanceManifest, object | None], object] | None = None,
         manifest_reservation: _ManifestReservation | None = None,
@@ -730,6 +738,8 @@ class SQLiteMaintenanceService:
                 immutable_readonly=expected_source_manifest is not None,
             )
             source_connection.execute("BEGIN")
+            if source_pre_evidence_hook is not None:
+                source_pre_evidence_hook(source_connection)
             source_evidence = _database_evidence(source_connection)
             source_companions = _adopt_connection_companions(
                 source.path,
@@ -1248,26 +1258,37 @@ def _table_evidence(connection: sqlite3.Connection, table_name: str) -> TableEvi
     quoted = '"' + table_name.replace('"', '""') + '"'
     # The identifier comes only from sqlite_master and is escaped as a quoted
     # SQLite identifier; DB-API parameters cannot represent identifiers.
-    column_names = {
-        str(row[1]).casefold()
-        for row in connection.execute(f"PRAGMA table_xinfo({quoted})").fetchall()  # nosec B608
-    }
+    column_rows = connection.execute(f"PRAGMA table_xinfo({quoted})").fetchall()  # nosec B608
+    column_names = {str(row[1]).casefold() for row in column_rows}
+    # VIRTUAL generated values are derived from schema SQL plus stored base
+    # columns. Selecting them would evaluate schema functions during evidence
+    # capture, before a migration can fail closed. Preserve ordinary and STORED
+    # generated values; keep virtual-table hidden columns excluded as SELECT *
+    # did historically.
+    stored_column_names = [str(row[1]) for row in column_rows if int(row[6]) in {0, 3}]
+    if not stored_column_names:
+        raise SQLiteMaintenanceError("table has no stored evidence columns")
+    stored_projection = ",".join(
+        '"' + column_name.replace('"', '""') + '"' for column_name in stored_column_names
+    )
     rowid_alias = next(
         (alias for alias in ("rowid", "_rowid_", "oid") if alias not in column_names),
         None,
     )
     if rowid_alias is None:
-        cursor = connection.execute(f"SELECT * FROM {quoted}")  # nosec B608
+        cursor = connection.execute(f"SELECT {stored_projection} FROM {quoted}")  # nosec B608
     else:
         try:
             # An unshadowed SQLite rowid alias captures row identity that is
             # intentionally omitted by SELECT *. WITHOUT ROWID tables reject
             # the alias and use their complete declared primary key instead.
-            cursor = connection.execute(f"SELECT {rowid_alias},* FROM {quoted}")  # nosec B608
+            cursor = connection.execute(
+                f"SELECT {rowid_alias},{stored_projection} FROM {quoted}"  # nosec B608
+            )
         except sqlite3.OperationalError as exc:
             if "no such column" not in str(exc).casefold():
                 raise
-            cursor = connection.execute(f"SELECT * FROM {quoted}")  # nosec B608
+            cursor = connection.execute(f"SELECT {stored_projection} FROM {quoted}")  # nosec B608
     row_hashes: list[bytes] = []
     row_count = 0
     for row in cursor:

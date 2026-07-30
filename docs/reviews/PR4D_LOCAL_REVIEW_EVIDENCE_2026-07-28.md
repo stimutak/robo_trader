@@ -32,10 +32,10 @@ Focused maintenance, legacy migration, and database-isolation matrix:
 ```text
 python3 -m pytest tests/maintenance/test_sqlite_service.py \
   tests/test_multiuser.py tests/security/test_db_isolation.py -q --tb=short
-235 passed
+236 passed
 ```
 
-The PR 4D maintenance module has 68 direct tests covering active WAL state,
+The PR 4D maintenance module has 69 direct tests covering active WAL state,
 multiportfolio preservation, backup/restore manifests, clean-room equivalence,
 corruption, preexisting targets, symlinks, hardlinks, companion files,
 substitution races, backup/restore interruption, migration rollback,
@@ -50,12 +50,16 @@ Block and line comments between a copied-schema function name and its opening
 parenthesis are normalized before screening and covered by integration tests.
 Line comments follow SQLite's lexer and continue through a bare carriage return
 until line-feed; an apply-success regression prevents conservative false alarms.
+Write-capable plans screen the bound source schema before row evidence. VIRTUAL
+generated values are excluded from row hashes because schema plus stored base
+columns fully determine them; ordinary and STORED generated values remain
+covered. A tracked-order regression covers a native allocating expression.
 
 Final full repository regression:
 
 ```text
 python3 -m pytest tests/ -q --tb=short
-3113 passed, 5 skipped, 20 known warnings in 92.14s
+3114 passed, 5 skipped, 20 known warnings in 123.99s
 ```
 
 After PR 4C merged to `main`, that exact head was merge-integrated into this

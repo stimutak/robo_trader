@@ -1104,6 +1104,67 @@ def test_migration_rejects_functions_embedded_in_source_schema(tmp_path: Path) -
     assert report.source_unchanged is True
 
 
+def test_migration_screens_virtual_generated_functions_before_row_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    with sqlite3.connect(source) as connection:
+        connection.execute(
+            "CREATE TABLE generated_rows ("
+            "base INTEGER NOT NULL,"
+            "inflated TEXT GENERATED ALWAYS AS (hex(zeroblob(2000000))) VIRTUAL"
+            ")"
+        )
+        connection.execute("INSERT INTO generated_rows(base) VALUES (1)")
+
+    events: list[str] = []
+    original_schema_function_calls = sqlite_service_module._schema_function_calls
+    original_database_evidence = sqlite_service_module._database_evidence
+
+    def tracked_schema_function_calls(connection: sqlite3.Connection) -> tuple[str, ...]:
+        events.append("schema_screen")
+        return original_schema_function_calls(connection)
+
+    def tracked_database_evidence(
+        connection: sqlite3.Connection,
+    ) -> sqlite_service_module.DatabaseEvidence:
+        events.append("row_evidence")
+        return original_database_evidence(connection)
+
+    monkeypatch.setattr(
+        sqlite_service_module,
+        "_schema_function_calls",
+        tracked_schema_function_calls,
+    )
+    monkeypatch.setattr(
+        sqlite_service_module,
+        "_database_evidence",
+        tracked_database_evidence,
+    )
+
+    report = SQLiteMaintenanceService(max_migration_seconds=0.01).dry_run_migration(
+        source,
+        target,
+        plan=MigrationPlan(
+            migration_id="screen-before-generated-evidence",
+            steps=(
+                MigrationStep(
+                    "UPDATE generated_rows SET base=? WHERE base=?",
+                    (2, 1),
+                ),
+            ),
+        ),
+    )
+
+    assert events[:2] == ["schema_screen", "row_evidence"]
+    assert report.outcome == "rolled_back"
+    assert report.error_code == "migration_plan_failed"
+    assert report.before == report.after
+    assert report.source_unchanged is True
+
+
 @pytest.mark.parametrize("separator", ["/**/", "-- split token\n"])
 def test_migration_rejects_commented_schema_function_calls(
     tmp_path: Path,
