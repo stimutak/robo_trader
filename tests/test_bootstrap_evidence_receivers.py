@@ -1088,3 +1088,80 @@ async def test_completion_rename_success_then_error_resolves_as_committed(
         expected_runtime_contract=runtime,
     )
     assert loaded.marks == ()
+
+    broker_path = Path(str(report["broker_snapshot"]))
+    replacement = output / ".same-broker-new-inode"
+    replacement.write_bytes(broker_path.read_bytes())
+    replacement.chmod(0o400)
+    os.replace(replacement, broker_path)
+    with pytest.raises(
+        ExactStateBootstrapError,
+        match="entry does not match the completion manifest",
+    ):
+        load_exact_state_bootstrap_evidence(
+            reconciliation_path=Path(str(report["reconciliation_report"])),
+            broker_snapshot_path=broker_path,
+            protective_mark_paths=[],
+            expected_runtime_contract=runtime,
+        )
+
+
+@pytest.mark.asyncio
+async def test_completion_manifest_rejects_file_injected_before_marker_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _install_test_trust(monkeypatch, tmp_path)
+    database = tmp_path / "ledger.db"
+    _ledger(database)
+    runtime = _runtime(database)
+    output = tmp_path / "evidence"
+    receivers = create_bootstrap_evidence_receivers(
+        runtime_contract=runtime,
+        capability_directory=capability,
+        output_directory=output,
+    )
+    provider = _Provider(_broker_result(datetime.now(timezone.utc) - timedelta(milliseconds=50)))
+    real_write = receiver_core._write_new_sealed_file_at
+    injected = False
+
+    def inject_before_completion_write(
+        directory_fd: int,
+        filename: str,
+        payload: bytes,
+    ) -> None:
+        nonlocal injected
+        if not injected and filename.startswith(".bundle_complete.json.stage-"):
+            injected = True
+            path = output / "raced-after-measurement.json"
+            path.write_bytes(b"preserve-untrusted-raced-evidence")
+            path.chmod(0o400)
+        real_write(directory_fd, filename, payload)
+
+    monkeypatch.setattr(receiver_core, "_write_new_sealed_file_at", inject_before_completion_write)
+
+    async def no_marks(**_kwargs: object) -> tuple:
+        return ()
+
+    report = await produce_bootstrap_evidence_bundle(
+        runtime_contract=runtime,
+        snapshot_provider=provider,
+        receivers=receivers,
+        protective_mark_collector=no_marks,
+    )
+
+    assert injected is True
+    assert (output / "raced-after-measurement.json").read_bytes() == (
+        b"preserve-untrusted-raced-evidence"
+    )
+    assert (output / "bundle_complete.json").is_file()
+    with pytest.raises(
+        ExactStateBootstrapError,
+        match="entries do not match the completion manifest",
+    ):
+        load_exact_state_bootstrap_evidence(
+            reconciliation_path=Path(str(report["reconciliation_report"])),
+            broker_snapshot_path=Path(str(report["broker_snapshot"])),
+            protective_mark_paths=[],
+            expected_runtime_contract=runtime,
+        )

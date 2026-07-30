@@ -457,13 +457,26 @@ class _StagedProtectiveMarkEvidence:
     marker: object = field(repr=False, compare=False)
 
 
-def _completion_marker_payload(state: _BundleBindings) -> bytes:
+def _completion_marker_payload(
+    state: _BundleBindings,
+    measurement: tuple[tuple[str, int, int, int, str], ...],
+) -> bytes:
     return json.dumps(
         {
+            "artifact_manifest": [
+                {
+                    "device": device,
+                    "filename": filename,
+                    "inode": inode,
+                    "sha256": digest,
+                    "size_bytes": size_bytes,
+                }
+                for filename, device, inode, size_bytes, digest in measurement
+            ],
             "bundle_id": state.bundle_id,
             "publication_directory": str(state.final_output_directory),
             "publication_nonce": state.publication_nonce,
-            "schema_version": 1,
+            "schema_version": 2,
         },
         ensure_ascii=True,
         separators=(",", ":"),
@@ -612,14 +625,14 @@ class BootstrapEvidenceReceiverSet:
                 )
             self._assert_lexical_publication_binding(require_final=True)
             os.fsync(state.output_parent_fd)
-            completion_payload = _completion_marker_payload(state)
+            # From this point onward any failure is ambiguous with respect to
+            # same-UID additions inside the final directory. Preserve every
+            # entry and omit the trusted completion marker instead of rolling
+            # back through destructive staging cleanup.
+            preserve_failed_publication = True
+            measurement, artifact_bytes = _sealed_staging_measurement(state)
+            completion_payload = _completion_marker_payload(state, measurement)
             if expected_bundle_size_bytes is not None:
-                # From this point onward any failure is ambiguous with respect
-                # to same-UID additions inside the final directory. Preserve
-                # every entry and omit the trusted completion marker instead
-                # of rolling back through destructive staging cleanup.
-                preserve_failed_publication = True
-                measurement, artifact_bytes = _sealed_staging_measurement(state)
                 if (
                     type(expected_bundle_size_bytes) is not int
                     or expected_bundle_size_bytes <= 0
@@ -701,7 +714,7 @@ class BootstrapEvidenceReceiverSet:
         self._assert_lexical_publication_binding(require_final=False)
         measurement, total = _sealed_staging_measurement(state)
         state.retention_measurement = measurement
-        return total + len(_completion_marker_payload(state))
+        return total + len(_completion_marker_payload(state, measurement))
 
     def _assert_lexical_publication_binding(self, *, require_final: bool) -> None:
         state = self._state
