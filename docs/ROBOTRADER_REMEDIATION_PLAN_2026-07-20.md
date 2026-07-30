@@ -703,12 +703,27 @@ Make broker truth visible and authoritative before any broker-writing capability
 - Risk-increasing entries require a fresh eligible reconciliation. Quarantine
   preserves the existing semantic reduce-only path so protective reductions are
   not stranded.
+- Every protective-mark request carries the complete unique account-wide set
+  of active position symbols, so reconciliation cannot cancel another
+  position's shared-worker quote subscription.
 - Dashboard status exposes only sanitized reconciliation state, age, trigger,
   and quarantine/eligibility fields; signing-capability paths and broker
-  evidence are not exposed.
-- Adversarial regressions cover protected status targets, suspended-provider
-  recovery, broker-envelope replay, and persisted eligibility expiry.
-- Synthetic and mocked verification on 2026-07-30: `3037 passed, 5 skipped`
+  evidence are not exposed. Existing owned status is replaced only through an
+  atomic, fully synced inode exchange; unrelated targets are restored rather
+  than overwritten, and a crash leaves a complete old or new artifact.
+- Published evidence is never auto-deleted, moved, or rewritten. The runtime
+  applies a non-destructive ceiling before publication (defaults: 10,000
+  runtime bundles and 2 GiB, configurable with
+  `RT_RECONCILIATION_EVIDENCE_MAX_BUNDLES` and
+  `RT_RECONCILIATION_EVIDENCE_MAX_BYTES`). Reaching either ceiling quarantines
+  new entries while portfolio cycles continue through reduce-only gates; an
+  operator-reviewed archival action is required before evidence collection can
+  resume. Active/bootstrap/audit lineage remains intact.
+- Adversarial regressions cover protected and raced status targets,
+  suspended-provider recovery, broker-envelope replay, complete account-wide
+  protective symbol scope, reduce-only continuity after artifact failures,
+  non-destructive retention ceilings, and persisted eligibility expiry.
+- Synthetic and mocked verification on 2026-07-30: `3074 passed, 5 skipped`
   across the complete pytest suite; Black and Flake8 passed for all changed
   Python files. No trader process, Gateway, broker session, or authoritative
   trading database was started or accessed.

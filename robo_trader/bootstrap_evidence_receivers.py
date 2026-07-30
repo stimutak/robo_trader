@@ -624,6 +624,36 @@ class BootstrapEvidenceReceiverSet:
         state.published = True
         return state.final_output_directory
 
+    def unpublished_bundle_size_bytes(
+        self,
+        expected_marks: set[tuple[str, str]],
+    ) -> int:
+        """Return the exact sealed staging size before irreversible publication."""
+
+        self.assert_complete(expected_marks)
+        state = self._state
+        if state.published:
+            raise BootstrapEvidenceReceiverError("evidence bundle was already published")
+        self._assert_lexical_publication_binding(require_final=False)
+        total = 0
+        for name in os.listdir(state.staging_output_fd):
+            metadata = os.stat(
+                name,
+                dir_fd=state.staging_output_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o400
+            ):
+                raise BootstrapEvidenceReceiverError(
+                    "unpublished evidence contains an unsafe entry"
+                )
+            total += metadata.st_size
+        return total
+
     def _assert_lexical_publication_binding(self, *, require_final: bool) -> None:
         state = self._state
         lexical_parent_fd: int | None = None

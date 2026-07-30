@@ -7978,7 +7978,19 @@ async def run_continuous(
                     f"Starting trading cycle at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
                 )
 
-                await resources.reconciliation.reconcile_periodic_if_due()
+                try:
+                    await resources.reconciliation.reconcile_periodic_if_due()
+                except Exception as reconciliation_error:
+                    # The controller has already revoked entry eligibility and
+                    # attempted to publish quarantine.  Keep the portfolio
+                    # cycles alive so their controller-backed entry gate still
+                    # blocks BUYs while semantic SELL/reduction paths remain
+                    # available.
+                    logger.exception(
+                        "event=periodic_reconciliation_failed "
+                        "action=continue_reduce_only error=%r",
+                        reconciliation_error,
+                    )
 
                 # Load portfolio configurations
                 from .multiuser.portfolio_config import load_portfolio_configs

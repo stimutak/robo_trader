@@ -946,6 +946,72 @@ async def test_continuous_reuses_one_account_coordinator_for_portfolio_runners(t
 
 
 @pytest.mark.asyncio
+async def test_periodic_reconciliation_failure_keeps_reduce_only_cycle_running(tmp_path):
+    cfg = _cfg(tmp_path)
+    SafetyJournal(Path(cfg.runtime_contract.safety_journal_path)).initialize(
+        execution_domain_scope=cfg.runtime_contract.safety_execution_domain_scope,
+        account_scope=cfg.runtime_contract.safety_account_scope,
+    )
+    coordinator = _start_paper_safety_runtime(cfg)
+    reconciliation = _reconciliation_resource()
+    reconciliation.reconcile_periodic_if_due.side_effect = RuntimeError(
+        "status artifact unavailable"
+    )
+    resources = SimpleNamespace(database=object(), gateway=object(), reconciliation=reconciliation)
+    runner = MagicMock()
+    runner.recovery_in_progress = False
+    runner._recovery_exhausted = False
+    runner.health = None
+    runner.run = AsyncMock()
+    runner.cleanup = AsyncMock()
+    portfolio = SimpleNamespace(
+        id="default",
+        name="Default",
+        starting_cash=100000,
+        symbols=["AAPL"],
+        active=True,
+    )
+
+    with (
+        patch("signal.signal"),
+        patch("robo_trader.runner_async.RuntimeSafetyContext", object),
+        patch(
+            "robo_trader.runner_async._start_paper_order_runtime",
+            new_callable=AsyncMock,
+            return_value=resources,
+        ),
+        patch(
+            "robo_trader.runner_async._close_paper_order_runtime",
+            new_callable=AsyncMock,
+        ),
+        patch("robo_trader.runner_async.AsyncRunner", return_value=runner),
+        patch("robo_trader.runner_async._setup_continuous_runner", new_callable=AsyncMock),
+        patch("robo_trader.runner_async.is_trading_allowed", return_value=True),
+        patch(
+            "robo_trader.multiuser.portfolio_config.load_portfolio_configs",
+            return_value=[portfolio],
+        ),
+        patch(
+            "robo_trader.runner_async.sleep_unless_shutdown",
+            new_callable=AsyncMock,
+            side_effect=asyncio.CancelledError,
+        ),
+        patch("robo_trader.runner_async._write_exit_audit"),
+        patch("robo_trader.runner_async._fire_runner_exit_alert"),
+    ):
+        await run_continuous(
+            symbols=["AAPL"],
+            interval_seconds=1,
+            safety_runtime=coordinator,
+            runtime_context=object(),
+        )
+
+    reconciliation.reconcile_periodic_if_due.assert_awaited_once_with()
+    runner.run.assert_awaited_once_with(["AAPL"])
+    runner.cleanup.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
 async def test_continuous_closes_shared_runtime_after_runner_cleanup_cancellation(
     tmp_path,
 ) -> None:

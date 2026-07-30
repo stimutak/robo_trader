@@ -9,12 +9,14 @@ or broker state and never grants order authority.
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import hashlib
 import json
 import math
 import os
 import secrets
 import stat
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
@@ -57,7 +59,13 @@ from .service import ReconciliationService, ReconciliationServiceOutcome
 _CAPABILITY_DIRECTORY_ENV = "RT_RECONCILIATION_SIGNING_CAPABILITY_DIR"
 _EVIDENCE_ROOT_ENV = "RT_RECONCILIATION_EVIDENCE_ROOT"
 _STATUS_PATH_ENV = "RT_RECONCILIATION_STATUS_PATH"
+_EVIDENCE_MAX_BUNDLES_ENV = "RT_RECONCILIATION_EVIDENCE_MAX_BUNDLES"
+_EVIDENCE_MAX_BYTES_ENV = "RT_RECONCILIATION_EVIDENCE_MAX_BYTES"
 _STATUS_FILENAME = "reconciliation_runtime_status.json"
+_DEFAULT_EVIDENCE_MAX_BUNDLES = 10_000
+_DEFAULT_EVIDENCE_MAX_BYTES = 2 * 1024 * 1024 * 1024
+_COMPLETION_MARKER_RESERVE_BYTES = 4 * 1024
+_RUNTIME_BUNDLE_PREFIX = "runtime-reconciliation-"
 _STATUS_FIELDS = {
     "schema_version",
     "owner_binding",
@@ -99,6 +107,120 @@ def _require_private_directory(path: Path, label: str) -> None:
         raise RuntimeReconciliationIntegrationError(
             f"{label} must be an owner-only non-symlink directory"
         )
+
+
+def _configured_positive_limit(
+    environment: Mapping[str, str],
+    name: str,
+    default: int,
+) -> int:
+    raw = environment.get(name)
+    if raw is None or raw == "":
+        return default
+    if raw != raw.strip() or not raw.isascii() or not raw.isdecimal():
+        raise RuntimeReconciliationIntegrationError(f"{name} must be a positive integer")
+    value = int(raw)
+    if value <= 0 or value > 2**63 - 1:
+        raise RuntimeReconciliationIntegrationError(f"{name} must be a positive integer")
+    return value
+
+
+def _runtime_bundle_name(name: str) -> bool:
+    if not name.startswith(_RUNTIME_BUNDLE_PREFIX):
+        return False
+    suffix = name[len(_RUNTIME_BUNDLE_PREFIX) :]
+    return (
+        len(suffix) == 48
+        and suffix == suffix.lower()
+        and all(character in "0123456789abcdef" for character in suffix)
+    )
+
+
+def _runtime_staging_bundle_name(name: str) -> bool:
+    prefix = "." + _RUNTIME_BUNDLE_PREFIX
+    separator = ".unpublished-"
+    if not name.startswith(prefix) or separator not in name:
+        return False
+    final_suffix, staging_suffix = name[len(prefix) :].split(separator, 1)
+    return (
+        len(final_suffix) == 48
+        and len(staging_suffix) == 64
+        and final_suffix == final_suffix.lower()
+        and staging_suffix == staging_suffix.lower()
+        and all(character in "0123456789abcdef" for character in final_suffix)
+        and all(character in "0123456789abcdef" for character in staging_suffix)
+    )
+
+
+def _published_evidence_usage(evidence_root: Path) -> tuple[int, int]:
+    """Measure every runtime-owned bundle without mutating audit evidence."""
+
+    root_descriptor = os.open(
+        evidence_root,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    count = 0
+    total = 0
+    try:
+        root_metadata = os.fstat(root_descriptor)
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        ):
+            raise RuntimeReconciliationIntegrationError(
+                "reconciliation evidence root changed identity"
+            )
+        for name in os.listdir(root_descriptor):
+            if not (_runtime_bundle_name(name) or _runtime_staging_bundle_name(name)):
+                continue
+            bundle_metadata = os.stat(
+                name,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(bundle_metadata.st_mode)
+                or bundle_metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(bundle_metadata.st_mode) != 0o700
+            ):
+                raise RuntimeReconciliationIntegrationError(
+                    "published reconciliation evidence bundle is unsafe"
+                )
+            bundle_descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=root_descriptor,
+            )
+            try:
+                for artifact_name in os.listdir(bundle_descriptor):
+                    artifact = os.stat(
+                        artifact_name,
+                        dir_fd=bundle_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        not stat.S_ISREG(artifact.st_mode)
+                        or artifact.st_uid != os.geteuid()
+                        or artifact.st_nlink != 1
+                        or stat.S_IMODE(artifact.st_mode) != 0o400
+                    ):
+                        raise RuntimeReconciliationIntegrationError(
+                            "published reconciliation evidence artifact is unsafe"
+                        )
+                    total += artifact.st_size
+            finally:
+                os.close(bundle_descriptor)
+            count += 1
+    finally:
+        os.close(root_descriptor)
+    return count, total
 
 
 def runtime_reconciliation_status_path(
@@ -163,6 +285,84 @@ def _valid_status_owner_binding(value: object) -> bool:
         and value == value.lower()
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def _exchange_status_entries(parent_descriptor: int, left: str, right: str) -> None:
+    """Atomically exchange sibling names without overwriting either inode."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    left_bytes = os.fsencode(left)
+    right_bytes = os.fsencode(right)
+    if sys.platform == "darwin":
+        rename_exchange = getattr(libc, "renameatx_np", None)
+        if rename_exchange is None:  # pragma: no cover - supported macOS invariant
+            raise RuntimeReconciliationIntegrationError(
+                "atomic reconciliation status exchange is unavailable"
+            )
+        result = rename_exchange(
+            ctypes.c_int(parent_descriptor),
+            ctypes.c_char_p(left_bytes),
+            ctypes.c_int(parent_descriptor),
+            ctypes.c_char_p(right_bytes),
+            ctypes.c_uint(0x00000002),
+        )
+    else:
+        rename_exchange = getattr(libc, "renameat2", None)
+        if rename_exchange is None:
+            raise RuntimeReconciliationIntegrationError(
+                "atomic reconciliation status exchange is unavailable"
+            )
+        result = rename_exchange(
+            ctypes.c_int(parent_descriptor),
+            ctypes.c_char_p(left_bytes),
+            ctypes.c_int(parent_descriptor),
+            ctypes.c_char_p(right_bytes),
+            ctypes.c_uint(2),
+        )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise RuntimeReconciliationIntegrationError(
+            "atomic reconciliation status exchange failed"
+        ) from OSError(error_number, os.strerror(error_number), right)
+
+
+def _publish_status_exclusive(parent_descriptor: int, source: str, target: str) -> None:
+    """Atomically publish one sibling name without replacing an existing target."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    target_bytes = os.fsencode(target)
+    if sys.platform == "darwin":
+        rename_exclusive = getattr(libc, "renameatx_np", None)
+        if rename_exclusive is None:  # pragma: no cover - supported macOS invariant
+            raise RuntimeReconciliationIntegrationError(
+                "exclusive reconciliation status publication is unavailable"
+            )
+        result = rename_exclusive(
+            ctypes.c_int(parent_descriptor),
+            ctypes.c_char_p(source_bytes),
+            ctypes.c_int(parent_descriptor),
+            ctypes.c_char_p(target_bytes),
+            ctypes.c_uint(0x00000004),
+        )
+    else:
+        rename_exclusive = getattr(libc, "renameat2", None)
+        if rename_exclusive is None:
+            raise RuntimeReconciliationIntegrationError(
+                "exclusive reconciliation status publication is unavailable"
+            )
+        result = rename_exclusive(
+            ctypes.c_int(parent_descriptor),
+            ctypes.c_char_p(source_bytes),
+            ctypes.c_int(parent_descriptor),
+            ctypes.c_char_p(target_bytes),
+            ctypes.c_uint(1),
+        )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise RuntimeReconciliationIntegrationError(
+            "exclusive reconciliation status publication failed"
+        ) from OSError(error_number, os.strerror(error_number), target)
 
 
 async def assert_runtime_bootstrap_ready(runtime_context: RuntimeSafetyContext) -> None:
@@ -328,12 +528,43 @@ class ProductionRuntimeEvidenceSource:
         provider: IBKRDiagnosticSnapshotProvider,
         capability_directory: Path,
         evidence_root: Path,
+        max_published_bundles: int = _DEFAULT_EVIDENCE_MAX_BUNDLES,
+        max_published_bytes: int = _DEFAULT_EVIDENCE_MAX_BYTES,
     ) -> None:
         self._runtime_context = assert_validated_runtime_safety_context(runtime_context)
         self._provider = provider
         self._capability_directory = capability_directory
         self._evidence_root = evidence_root
+        if (
+            type(max_published_bundles) is not int
+            or max_published_bundles <= 0
+            or type(max_published_bytes) is not int
+            or max_published_bytes <= 0
+        ):
+            raise RuntimeReconciliationIntegrationError(
+                "reconciliation evidence retention limits are invalid"
+            )
+        self._max_published_bundles = max_published_bundles
+        self._max_published_bytes = max_published_bytes
+        self._published_bundle_count: int | None = None
+        self._published_evidence_bytes: int | None = None
         self._closed = False
+
+    def _assert_retention_capacity(self, *, staged_bytes: int = 0) -> None:
+        if self._published_bundle_count is None or self._published_evidence_bytes is None:
+            (
+                self._published_bundle_count,
+                self._published_evidence_bytes,
+            ) = _published_evidence_usage(self._evidence_root)
+        if (
+            self._published_bundle_count >= self._max_published_bundles
+            or self._published_evidence_bytes + staged_bytes + _COMPLETION_MARKER_RESERVE_BYTES
+            > self._max_published_bytes
+        ):
+            raise RuntimeReconciliationIntegrationError(
+                "reconciliation evidence retention ceiling reached; "
+                "operator archival is required"
+            )
 
     async def collect_verified_evidence(
         self,
@@ -355,6 +586,7 @@ class ProductionRuntimeEvidenceSource:
             raise RuntimeReconciliationIntegrationError("exact runtime contract is required")
         _require_private_directory(self._capability_directory, "signing capability directory")
         _require_private_directory(self._evidence_root, "reconciliation evidence root")
+        self._assert_retention_capacity()
         output = self._evidence_root / ("runtime-reconciliation-" + secrets.token_hex(24))
         receivers: BootstrapEvidenceReceiverSet | None = None
         published = False
@@ -385,10 +617,13 @@ class ProductionRuntimeEvidenceSource:
                 runtime_contract=runtime,
             )
             mark_artifacts: list[SealedBootstrapEvidenceArtifact] = []
+            active_symbols = tuple(
+                sorted({symbol for _, symbol in delivery.local_position_identities})
+            )
             for portfolio_id, symbol in delivery.local_position_identities:
                 discovery = await quote_source.get_protective_quotes(
                     (symbol,),
-                    active_symbols=(symbol,),
+                    active_symbols=active_symbols,
                 )
                 if type(discovery) is not tuple or len(discovery) != 1:
                     raise RuntimeReconciliationIntegrationError(
@@ -415,6 +650,7 @@ class ProductionRuntimeEvidenceSource:
                     expected_symbol=symbol,
                     expected_con_id=quote.con_id,
                     expected_transport_generation=quote_identity.transport_generation,
+                    expected_active_symbols=active_symbols,
                 )
                 if type(mark) is not SealedBootstrapEvidenceArtifact:
                     raise RuntimeReconciliationIntegrationError(
@@ -423,8 +659,14 @@ class ProductionRuntimeEvidenceSource:
                 mark_artifacts.append(mark)
             expected_marks = set(delivery.local_position_identities)
             receivers.assert_complete(expected_marks)
+            staged_bytes = receivers.unpublished_bundle_size_bytes(expected_marks)
+            self._assert_retention_capacity(staged_bytes=staged_bytes)
             receivers.publish_complete_bundle(expected_marks)
             published = True
+            assert self._published_bundle_count is not None
+            assert self._published_evidence_bytes is not None
+            self._published_bundle_count += 1
+            self._published_evidence_bytes += staged_bytes + _COMPLETION_MARKER_RESERVE_BYTES
             broker_path = receivers.published_artifact_path(broker_artifact)
             reconciliation_path = receivers.published_artifact_path(reconciliation_artifact)
             mark_paths = tuple(receivers.published_artifact_path(mark) for mark in mark_artifacts)
@@ -642,7 +884,11 @@ def _write_status(
         | getattr(os, "O_NOFOLLOW", 0),
     )
     metadata = os.fstat(parent_descriptor)
-    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
         os.close(parent_descriptor)
         raise RuntimeReconciliationIntegrationError("status directory is unavailable")
     temporary_name = f".{path.name}.stage-{secrets.token_hex(16)}"
@@ -663,28 +909,6 @@ def _write_status(
             _read_owned_status_descriptor(prior_descriptor, binding)
             prior_metadata = os.fstat(prior_descriptor)
             prior_identity = (prior_metadata.st_dev, prior_metadata.st_ino)
-            os.lseek(prior_descriptor, 0, os.SEEK_SET)
-            os.ftruncate(prior_descriptor, 0)
-            offset = 0
-            while offset < len(encoded):
-                written = os.write(prior_descriptor, encoded[offset:])
-                if written <= 0:
-                    raise RuntimeReconciliationIntegrationError(
-                        "reconciliation status write did not complete"
-                    )
-                offset += written
-            os.fsync(prior_descriptor)
-            current = os.stat(
-                path.name,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-            if (current.st_dev, current.st_ino) != prior_identity:
-                raise RuntimeReconciliationIntegrationError(
-                    "existing reconciliation status artifact changed during publication"
-                )
-            os.fsync(parent_descriptor)
-            return
         descriptor = os.open(
             temporary_name,
             os.O_WRONLY
@@ -706,14 +930,36 @@ def _write_status(
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = -1
-        os.link(
-            temporary_name,
-            path.name,
-            src_dir_fd=parent_descriptor,
-            dst_dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-        os.unlink(temporary_name, dir_fd=parent_descriptor)
+        if prior_identity is None:
+            # Exclusive rename is crash-safe and no-replace: the target is
+            # either absent or one complete inode, with no two-link window.
+            _publish_status_exclusive(parent_descriptor, temporary_name, path.name)
+        else:
+            current = os.stat(
+                path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (current.st_dev, current.st_ino) != prior_identity:
+                raise RuntimeReconciliationIntegrationError(
+                    "existing reconciliation status artifact changed during publication"
+                )
+            # Exchange preserves both complete inodes until the displaced one
+            # is authenticated. A crash can expose either complete version,
+            # never a partial status, and a raced unrelated target can be put
+            # back rather than overwritten.
+            _exchange_status_entries(parent_descriptor, temporary_name, path.name)
+            displaced = os.stat(
+                temporary_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (displaced.st_dev, displaced.st_ino) != prior_identity:
+                _exchange_status_entries(parent_descriptor, temporary_name, path.name)
+                raise RuntimeReconciliationIntegrationError(
+                    "existing reconciliation status artifact changed during publication"
+                )
+            os.unlink(temporary_name, dir_fd=parent_descriptor)
         os.fsync(parent_descriptor)
     finally:
         if descriptor >= 0:
@@ -838,6 +1084,16 @@ async def build_runtime_reconciliation_controller(
     _require_private_directory(capability_directory, "signing capability directory")
     _require_private_directory(evidence_root, "reconciliation evidence root")
     status_path = runtime_reconciliation_status_path(runtime, environment)
+    max_published_bundles = _configured_positive_limit(
+        environment,
+        _EVIDENCE_MAX_BUNDLES_ENV,
+        _DEFAULT_EVIDENCE_MAX_BUNDLES,
+    )
+    max_published_bytes = _configured_positive_limit(
+        environment,
+        _EVIDENCE_MAX_BYTES_ENV,
+        _DEFAULT_EVIDENCE_MAX_BYTES,
+    )
     _assert_status_path_is_unprotected(
         status_path,
         runtime_contract=runtime,
@@ -852,6 +1108,8 @@ async def build_runtime_reconciliation_controller(
             provider=provider,
             capability_directory=capability_directory,
             evidence_root=evidence_root,
+            max_published_bundles=max_published_bundles,
+            max_published_bytes=max_published_bytes,
         )
         service = ReconciliationService(
             evidence_source=source,

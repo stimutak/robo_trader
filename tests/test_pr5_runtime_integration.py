@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -112,13 +113,25 @@ async def test_source_uses_one_broker_generation_through_marks_and_runtime_bind(
     runtime_handoff = object()
     exact_state = object()
     bound_runtime_evidence = object()
-    quote = SimpleNamespace(
-        symbol="AAPL",
-        con_id=265598,
-        transport_generation="generation-1",
-    )
+    quotes = {
+        "AAPL": SimpleNamespace(
+            symbol="AAPL",
+            con_id=265598,
+            transport_generation="generation-1",
+        ),
+        "MSFT": SimpleNamespace(
+            symbol="MSFT",
+            con_id=272093,
+            transport_generation="generation-1",
+        ),
+    }
+
+    async def collect_quote(symbols, *, active_symbols):
+        assert active_symbols == ("AAPL", "MSFT")
+        return (quotes[symbols[0]],)
+
     quote_source = SimpleNamespace(
-        get_protective_quotes=AsyncMock(return_value=(quote,)),
+        get_protective_quotes=AsyncMock(side_effect=collect_quote),
     )
     provider = SimpleNamespace(
         produce_normalized_snapshot=AsyncMock(return_value=broker_envelope),
@@ -134,6 +147,7 @@ async def test_source_uses_one_broker_generation_through_marks_and_runtime_bind(
         reconciliation_report=object(),
         protective_mark=object(),
         assert_complete=MagicMock(),
+        unpublished_bundle_size_bytes=MagicMock(return_value=1024),
         publish_complete_bundle=MagicMock(),
         published_artifact_path=MagicMock(
             side_effect=lambda artifact: tmp_path / artifact.artifact_path.name
@@ -143,7 +157,7 @@ async def test_source_uses_one_broker_generation_through_marks_and_runtime_bind(
     )
     delivery = SimpleNamespace(
         receiver_result=reconciliation_artifact,
-        local_position_identities=(("default", "AAPL"),),
+        local_position_identities=(("default", "AAPL"), ("growth", "MSFT")),
         verified_broker_evidence=runtime_handoff,
     )
     produce = MagicMock(return_value=delivery)
@@ -200,9 +214,17 @@ async def test_source_uses_one_broker_generation_through_marks_and_runtime_bind(
         receivers.reconciliation_report,
     )
     provider.issue_protective_quote_source.assert_called_once_with(runtime_contract=runtime)
-    quote_source.get_protective_quotes.assert_awaited_once_with(
-        ("AAPL",),
-        active_symbols=("AAPL",),
+    assert quote_source.get_protective_quotes.await_args_list == [
+        call(("AAPL",), active_symbols=("AAPL", "MSFT")),
+        call(("MSFT",), active_symbols=("AAPL", "MSFT")),
+    ]
+    assert collect_mark.await_args_list[0].kwargs["expected_active_symbols"] == (
+        "AAPL",
+        "MSFT",
+    )
+    assert collect_mark.await_args_list[1].kwargs["expected_active_symbols"] == (
+        "AAPL",
+        "MSFT",
     )
     bind.assert_called_once_with(
         runtime_handoff,
@@ -215,6 +237,60 @@ async def test_source_uses_one_broker_generation_through_marks_and_runtime_bind(
 
     await source.close()
     provider.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("max_bundles", "max_bytes"),
+    [(1, 1024 * 1024), (100, 5)],
+)
+async def test_evidence_retention_ceiling_quarantines_without_deleting_audit_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    max_bundles: int,
+    max_bytes: int,
+) -> None:
+    database = tmp_path / "ledger.db"
+    database.touch()
+    runtime = _runtime(database)
+    context = SimpleNamespace(runtime_contract=runtime)
+    monkeypatch.setattr(
+        integration,
+        "assert_validated_runtime_safety_context",
+        lambda value: value,
+    )
+    capability_directory = tmp_path / "capabilities"
+    evidence_root = tmp_path / "evidence"
+    capability_directory.mkdir(mode=0o700)
+    evidence_root.mkdir(mode=0o700)
+    bundle = evidence_root / ("runtime-reconciliation-" + "a" * 48)
+    bundle.mkdir(mode=0o700)
+    artifact = bundle / "bundle_complete.json"
+    artifact.write_bytes(b"audit-lineage")
+    artifact.chmod(0o400)
+    before = artifact.read_bytes()
+    provider = SimpleNamespace(
+        produce_normalized_snapshot=AsyncMock(),
+        close=AsyncMock(),
+    )
+    source = ProductionRuntimeEvidenceSource(
+        runtime_context=context,
+        provider=provider,
+        capability_directory=capability_directory,
+        evidence_root=evidence_root,
+        max_published_bundles=max_bundles,
+        max_published_bytes=max_bytes,
+    )
+
+    with pytest.raises(
+        RuntimeReconciliationIntegrationError,
+        match="retention ceiling reached",
+    ):
+        await source.collect_verified_evidence(max_age_seconds=30.0)
+
+    assert artifact.read_bytes() == before
+    assert bundle.is_dir()
+    provider.produce_normalized_snapshot.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -835,3 +911,153 @@ async def test_status_publication_never_replaces_unrelated_existing_file(
 
     assert status_path.read_bytes() == before
     assert controller.entry_eligible() is False
+
+
+def test_status_republication_failure_preserves_complete_prior_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_path = tmp_path / "status.json"
+    first_payload = {
+        "schema_version": 1,
+        "owner_binding": STATUS_OWNER_BINDING,
+        "state": "ready",
+        "trigger": "startup",
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "eligible_until": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+        "entry_eligible": True,
+        "quarantined": False,
+        "run_id": "run-first",
+        "snapshot_id": "snapshot-first",
+    }
+    integration._write_status(
+        status_path,
+        first_payload,
+        owner_binding=STATUS_OWNER_BINDING,
+    )
+    prior = status_path.read_bytes()
+
+    def fail_exchange(*args, **kwargs):
+        raise OSError("simulated crash boundary")
+
+    monkeypatch.setattr(integration, "_exchange_status_entries", fail_exchange)
+    second_payload = dict(first_payload, run_id="run-second", snapshot_id="snapshot-second")
+
+    with pytest.raises(OSError, match="simulated crash boundary"):
+        integration._write_status(
+            status_path,
+            second_payload,
+            owner_binding=STATUS_OWNER_BINDING,
+        )
+
+    assert status_path.read_bytes() == prior
+    assert not list(tmp_path.glob(".status.json.stage-*"))
+
+
+def test_status_atomic_exchange_restores_raced_unrelated_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_path = tmp_path / "status.json"
+    payload = {
+        "schema_version": 1,
+        "owner_binding": STATUS_OWNER_BINDING,
+        "state": "quarantined",
+        "trigger": None,
+        "completed_at": None,
+        "eligible_until": None,
+        "entry_eligible": False,
+        "quarantined": True,
+        "run_id": None,
+        "snapshot_id": None,
+    }
+    integration._write_status(
+        status_path,
+        payload,
+        owner_binding=STATUS_OWNER_BINDING,
+    )
+    held_owned = tmp_path / "held-owned-status.json"
+    real_exchange = integration._exchange_status_entries
+    calls = 0
+
+    def race_then_exchange(parent_descriptor: int, left: str, right: str) -> None:
+        nonlocal calls
+        if calls == 0:
+            os.rename(
+                right,
+                held_owned.name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+            raced = os.open(
+                right,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+            os.write(raced, b"unrelated-raced-state")
+            os.close(raced)
+        calls += 1
+        real_exchange(parent_descriptor, left, right)
+
+    monkeypatch.setattr(integration, "_exchange_status_entries", race_then_exchange)
+
+    with pytest.raises(
+        RuntimeReconciliationIntegrationError,
+        match="changed during publication",
+    ):
+        integration._write_status(
+            status_path,
+            dict(payload, state="ready"),
+            owner_binding=STATUS_OWNER_BINDING,
+        )
+
+    assert calls == 2
+    assert status_path.read_bytes() == b"unrelated-raced-state"
+    assert held_owned.is_file()
+
+
+def test_first_status_publication_race_never_replaces_unrelated_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_path = tmp_path / "status.json"
+    payload = {
+        "schema_version": 1,
+        "owner_binding": STATUS_OWNER_BINDING,
+        "state": "quarantined",
+        "trigger": None,
+        "completed_at": None,
+        "eligible_until": None,
+        "entry_eligible": False,
+        "quarantined": True,
+        "run_id": None,
+        "snapshot_id": None,
+    }
+    real_publish = integration._publish_status_exclusive
+
+    def race_then_publish(parent_descriptor: int, source: str, target: str) -> None:
+        raced = os.open(
+            target,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        os.write(raced, b"unrelated-raced-state")
+        os.close(raced)
+        real_publish(parent_descriptor, source, target)
+
+    monkeypatch.setattr(integration, "_publish_status_exclusive", race_then_publish)
+
+    with pytest.raises(
+        RuntimeReconciliationIntegrationError,
+        match="exclusive reconciliation status publication failed",
+    ):
+        integration._write_status(
+            status_path,
+            payload,
+            owner_binding=STATUS_OWNER_BINDING,
+        )
+
+    assert status_path.read_bytes() == b"unrelated-raced-state"
+    assert not list(tmp_path.glob(".status.json.stage-*"))
