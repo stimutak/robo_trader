@@ -120,6 +120,34 @@ def test_wal_checkpoint_during_online_backup_is_not_treated_as_source_mutation(
     assert SQLiteMaintenanceService().verify(target) == manifest.evidence
 
 
+def test_cleanly_closed_wal_source_does_not_create_service_sidecars(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    synthetic = tmp_path / "synthetic.db"
+    writer = _create_multiportfolio_database(source, wal=True)
+    writer.close()
+    companions = tuple(source.with_name(source.name + suffix) for suffix in ("-wal", "-shm"))
+    assert not any(path.exists() for path in companions)
+
+    service = SQLiteMaintenanceService()
+    manifest = service.backup(source, backup)
+    report = service.dry_run_migration(
+        source,
+        synthetic,
+        plan=MigrationPlan(
+            migration_id="clean-wal-noop",
+            steps=(MigrationStep(sql="SELECT 1"),),
+        ),
+    )
+
+    assert service.verify(backup) == manifest.evidence
+    assert report.source_unchanged is True
+    assert report.outcome == "applied_to_synthetic_copy"
+    assert not any(path.exists() for path in companions)
+
+
 def test_manifest_is_secret_free_portable_and_exclusively_written(tmp_path: Path) -> None:
     source = tmp_path / "source.db"
     backup = tmp_path / "backup.db"
@@ -256,7 +284,7 @@ def test_staging_symlink_cannot_redirect_sqlite_into_attacker_directory(
     assert SQLiteMaintenanceService().verify(target) == manifest.evidence
 
 
-def test_anonymous_staging_cannot_be_located_chmodded_or_opened(
+def test_no_persistent_staging_path_is_exposed_during_copy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "source.db"

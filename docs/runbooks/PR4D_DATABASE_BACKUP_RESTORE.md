@@ -22,6 +22,18 @@ identities are revalidated before success. A public `-wal`, `-shm`, or
 SQLite connection. There is no staging directory that a concurrent process
 can replace with a symlink.
 
+This is a filesystem pathname-integrity boundary, not isolation from actively
+hostile code running as the same operating-system user. On Linux, such a process
+may be able to inspect another process's file descriptors through `/proc`; on
+macOS, creation of the temporary file used to obtain an unlinked descriptor can
+be observed before unlinking. A hostile same-user process can also modify a
+published artifact or its destination directory. Backup and restore therefore
+require an exclusive maintenance window with no untrusted process running as
+the maintenance user. Environments that need protection from hostile local
+code must run this tooling under a dedicated OS identity, container, or sandbox
+whose output directory is inaccessible to the trader and other user processes.
+The in-process library cannot honestly provide that stronger isolation.
+
 The supported operations are:
 
 - a SQLite online backup, including committed WAL state, into an exclusively
@@ -40,7 +52,7 @@ credentials, account identifiers, or broker configuration. They always state
 `authorizes_startup=false`.
 
 If backup, restore, or verification is interrupted, the source remains
-untouched. The anonymous partial inode disappears when its held descriptor is
+untouched. The unlinked partial inode disappears when its held descriptor is
 closed; the requested output path remains absent, there is no successful
 manifest, and no partial file can be mistaken for a usable artifact.
 

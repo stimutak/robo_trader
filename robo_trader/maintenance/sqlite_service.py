@@ -112,6 +112,8 @@ class _StagedTarget:
             raise SQLiteMaintenanceError("platform cannot publish an anonymous database safely")
         self.published = True
         self._assert_published_identity()
+        os.fsync(self.parent_file_descriptor)
+        self._assert_published_identity()
 
     def _clone_anonymous_on_macos(self) -> None:
         """Clone an unlinked source fd into an exclusive APFS destination."""
@@ -140,8 +142,6 @@ class _StagedTarget:
         self.guardian_file_descriptor = published_descriptor
         self.device = metadata.st_dev
         self.inode = metadata.st_ino
-        os.fsync(self.parent_file_descriptor)
-        self._assert_published_identity()
 
     def _assert_published_identity(self) -> None:
         """Bind the requested lexical path to the published inode and parent."""
@@ -390,7 +390,15 @@ class SQLiteMaintenanceService:
         source = self._open_source(source_candidate)
         connection: sqlite3.Connection | None = None
         try:
-            connection, source = self._connect_bound(source, readonly=True)
+            connection, source = self._connect_bound(
+                source,
+                readonly=True,
+                # A cleanly closed WAL database has no companions, but a
+                # conventional read-only open may create its own -wal/-shm
+                # files.  Immutable mode is safe only in the companion-free
+                # case and keeps the identity set stable while we inspect it.
+                immutable_readonly=not companions,
+            )
             connection.execute("BEGIN")
             evidence = _database_evidence(connection)
             source.assert_connection_identity(sqlite_connection_file_identity(connection))
@@ -499,7 +507,10 @@ class SQLiteMaintenanceService:
             source_connection, source = self._connect_bound(
                 source,
                 readonly=True,
-                immutable_readonly=expected_source_manifest is not None,
+                # Manifest restore inputs are sealed standalone artifacts.
+                # A companion-free WAL database is likewise checkpointed and
+                # can be opened immutably, avoiding service-created sidecars.
+                immutable_readonly=(expected_source_manifest is not None or not source_companions),
             )
             source_connection.execute("BEGIN")
             source_evidence = _database_evidence(source_connection)

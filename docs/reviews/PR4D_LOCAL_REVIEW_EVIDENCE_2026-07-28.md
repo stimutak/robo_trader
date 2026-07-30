@@ -86,8 +86,10 @@ type debt.
 
 ## 2026-07-30 exact-review follow-up
 
-Eleven additional exact-head P1 findings and the Python 3.10 CI failures were
-remediated without touching authoritative data or runtime services:
+The exact-head P1 findings and Python 3.10 CI failures were addressed without
+touching authoritative data or runtime services. The latest same-UID attacker
+reports were handled by correcting the documented trust boundary rather than
+claiming isolation that an in-process filesystem library cannot provide:
 
 - SQLite now operates only in memory. It never opens the requested output path,
   a staging-directory path, or any public sidecar pathname. The exact finished
@@ -98,9 +100,17 @@ remediated without touching authoritative data or runtime services:
 - A planted staging-name symlink cannot redirect SQLite into an attacker-owned
   directory because no filesystem target connection exists. Exclusive file
   creation refuses the symlink and preserves planted `database.db-wal` bytes.
-- The staged inode has no pathname or directory entry (`st_nlink == 0`) before
-  publication. A same-user process therefore has no staging name to chmod,
-  open, hard-link, rename, or retain for post-digest mutation.
+- The staged inode has no persistent directory entry (`st_nlink == 0`) before
+  publication, which removes the prior pathname substitution and hard-link
+  races. This is not claimed to isolate the service from actively hostile code
+  running under the same OS user: Linux `/proc` descriptor access, macOS's
+  temporary-file creation window, and post-publication directory access make
+  that guarantee impossible for an in-process library. The reviewed operating
+  boundary now requires an exclusive maintenance window; stronger adversarial
+  isolation requires a dedicated OS identity, container, or sandbox.
+- A cleanly closed database that retains `journal_mode=WAL` but has no sidecars
+  is opened immutably. The service therefore does not create `-wal`/`-shm`
+  companions and then reject its own identity check.
 - Publication fsyncs the bound parent-directory descriptor and revalidates both
   the lexical parent and published target afterward. Parent replacement causes
   a failed operation rather than a false successful manifest.
@@ -128,8 +138,8 @@ remediated without touching authoritative data or runtime services:
 Current verification:
 
 ```text
-focused maintenance + multiuser + DB isolation: 202 passed
-full repository: 3054 passed, 5 skipped, 20 known warnings
+focused maintenance + multiuser + DB isolation: 203 passed
+full repository: 3055 passed, 5 skipped, 20 known warnings
 Python 3.10 direct authorizer commit/rollback probe: passed
 Black, isort, flake8, Bandit, mypy, and git diff checks on changed scope: passed
 ```
