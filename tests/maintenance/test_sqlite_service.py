@@ -805,6 +805,76 @@ def test_migration_dry_run_accepts_active_wal_source(tmp_path: Path) -> None:
     assert report.before != report.after
 
 
+def test_migration_detects_hidden_rowid_change_with_same_visible_values(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    with sqlite3.connect(source) as connection:
+        assert connection.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+        connection.execute("CREATE TABLE rowid_records (value TEXT NOT NULL)")
+        connection.executemany(
+            "INSERT INTO rowid_records(value) VALUES (?)",
+            (("alpha",), ("beta",)),
+        )
+
+    changed = False
+
+    def replace_one_row(_operation: str, _remaining: int, _total: int) -> None:
+        nonlocal changed
+        if changed:
+            return
+        with sqlite3.connect(source) as writer:
+            writer.execute("DELETE FROM rowid_records WHERE rowid=1")
+            writer.execute("INSERT INTO rowid_records(value) VALUES ('alpha')")
+        changed = True
+
+    report = SQLiteMaintenanceService(progress_hook=replace_one_row).dry_run_migration(
+        source,
+        target,
+        plan=MigrationPlan(
+            migration_id="rowid-source-change",
+            steps=(MigrationStep("SELECT 1"),),
+        ),
+    )
+
+    with sqlite3.connect(source) as connection:
+        rows = connection.execute("SELECT rowid,value FROM rowid_records ORDER BY rowid").fetchall()
+    assert changed is True
+    assert rows == [(2, "beta"), (3, "alpha")]
+    assert report.before == report.after
+    assert report.source_unchanged is False
+    assert report.outcome == "source_changed_fail_closed"
+    assert report.error_code == "authoritative_source_changed"
+
+
+def test_evidence_handles_without_rowid_and_shadowed_rowid_aliases(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "backup.db"
+    with sqlite3.connect(source) as connection:
+        connection.executescript("""
+            CREATE TABLE natural_keys (
+                name TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            ) WITHOUT ROWID;
+            INSERT INTO natural_keys VALUES ('alpha', 'one');
+            CREATE TABLE shadowed_aliases (
+                rowid INTEGER NOT NULL,
+                _rowid_ INTEGER NOT NULL,
+                oid INTEGER NOT NULL,
+                value TEXT NOT NULL
+            );
+            INSERT INTO shadowed_aliases VALUES (1, 2, 3, 'visible');
+            """)
+
+    service = SQLiteMaintenanceService()
+    manifest = service.backup(source, target)
+
+    assert service.verify(target) == manifest.evidence
+
+
 def test_migration_uses_the_copy_connection_without_a_writable_reopen(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

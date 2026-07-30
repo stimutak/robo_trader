@@ -997,7 +997,26 @@ def _table_evidence(connection: sqlite3.Connection, table_name: str) -> TableEvi
     quoted = '"' + table_name.replace('"', '""') + '"'
     # The identifier comes only from sqlite_master and is escaped as a quoted
     # SQLite identifier; DB-API parameters cannot represent identifiers.
-    cursor = connection.execute(f"SELECT * FROM {quoted}")  # nosec B608
+    column_names = {
+        str(row[1]).casefold()
+        for row in connection.execute(f"PRAGMA table_xinfo({quoted})").fetchall()  # nosec B608
+    }
+    rowid_alias = next(
+        (alias for alias in ("rowid", "_rowid_", "oid") if alias not in column_names),
+        None,
+    )
+    if rowid_alias is None:
+        cursor = connection.execute(f"SELECT * FROM {quoted}")  # nosec B608
+    else:
+        try:
+            # An unshadowed SQLite rowid alias captures row identity that is
+            # intentionally omitted by SELECT *. WITHOUT ROWID tables reject
+            # the alias and use their complete declared primary key instead.
+            cursor = connection.execute(f"SELECT {rowid_alias},* FROM {quoted}")  # nosec B608
+        except sqlite3.OperationalError as exc:
+            if "no such column" not in str(exc).casefold():
+                raise
+            cursor = connection.execute(f"SELECT * FROM {quoted}")  # nosec B608
     row_hashes: list[bytes] = []
     row_count = 0
     for row in cursor:
