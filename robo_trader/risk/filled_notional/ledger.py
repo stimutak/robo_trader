@@ -2210,6 +2210,25 @@ class DailyFilledNotional:
             raise FilledNotionalIntegrityError(
                 "checkpoint authenticated rows do not match ledger state"
             )
+        authenticated_checkpoint_sequence, authenticated_checkpoint_head = (
+            self._validate_checkpoints(
+                connection,
+                ledger_id=ledger_id,
+                database_device=database_device,
+                database_inode=database_inode,
+                fill_count=fill_count,
+                fill_head=fill_head,
+                conflict_count=conflict_count,
+                conflict_head=conflict_head,
+            )
+        )
+        if (
+            authenticated_checkpoint_sequence != event_sequence
+            or authenticated_checkpoint_head != checkpoint_head
+        ):
+            raise FilledNotionalIntegrityError(
+                "authenticated checkpoint chain does not match ledger state"
+            )
         if fill_count == 0:
             fill_matches = fill_tail is None and fill_head == _ZERO_HASH
         else:

@@ -1668,6 +1668,36 @@ def test_long_lived_service_rejects_middle_fill_rescope_before_total_read(tmp_pa
         ledger.current_gross_filled_notional()
 
 
+@pytest.mark.parametrize("operation", ["total", "record"])
+def test_long_lived_service_rejects_middle_checkpoint_deletion_before_use(tmp_path, operation):
+    path = tmp_path / "notional.db"
+    ledger = _service(path)
+    ledger.record_fill(_fill("checkpoint-one"))
+    ledger.record_fill(_fill("checkpoint-two"))
+    ledger.record_fill(_fill("checkpoint-three"))
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TRIGGER daily_filled_notional_checkpoints_no_delete")
+        connection.execute("DELETE FROM daily_filled_notional_checkpoints WHERE event_sequence = 1")
+        connection.execute(
+            ledger_module._TRIGGER_SQL["daily_filled_notional_checkpoints_no_delete"]
+        )
+
+    with pytest.raises(FilledNotionalIntegrityError, match="checkpoint sequence is not contiguous"):
+        if operation == "total":
+            ledger.current_gross_filled_notional()
+        else:
+            ledger.record_fill(_fill("must-not-append"))
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM daily_filled_notional_records"
+        ).fetchone() == (3,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM daily_filled_notional_checkpoints"
+        ).fetchone() == (3,)
+
+
 def test_conflict_quarantine_tail_deletion_is_detected_by_anchor(tmp_path):
     path = tmp_path / "notional.db"
     ledger = _service(path)
