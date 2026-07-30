@@ -674,7 +674,7 @@ event sequence. The locked settlement transaction also rejects temporary
 shadows and foreign persistent triggers on all hot settlement tables before it
 writes, and all such statements explicitly target the durable `main` schema.
 
-The full local suite passed 3,036 tests with 5 expected skips and 20 known
+The full local suite passed 3,042 tests with 5 expected skips and 20 known
 warnings. Detailed design and evidence are recorded in
 `docs/design/PR4C_FIFO_RUNTIME_SETTLEMENT.md` and
 `docs/reviews/PR4C_LOCAL_REVIEW_EVIDENCE_2026-07-30.md`.

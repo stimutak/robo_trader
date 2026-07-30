@@ -2,7 +2,7 @@
 
 Date: 2026-07-30
 Branch: `codex/pr4c-fifo-settlement`
-Base: `main` including merged PR4B
+Base: `main` at `4c7ea47`, including merged PR4B
 
 ## Scope reviewed
 
@@ -17,7 +17,9 @@ Base: `main` including merged PR4B
 
 ## Local verification
 
-- Full repository suite: `3036 passed, 5 skipped, 20 warnings`.
+- Full repository suite: `3042 passed, 5 skipped, 20 warnings`.
+- Combined FIFO, migration, exact-bootstrap, settlement, failure-injection,
+  and recovery-status matrix: `215 passed`.
 - Existing-position and stop-event suite: `168 passed`.
 - Migration, exact bootstrap, and FIFO foundation suite: `120 passed`.
 - Terminal failure-injection and recovery-status suite: `66 passed`.
