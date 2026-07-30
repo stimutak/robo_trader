@@ -148,6 +148,13 @@ async def test_source_uses_one_broker_generation_through_marks_and_runtime_bind(
         protective_mark=object(),
         assert_complete=MagicMock(),
         unpublished_bundle_size_bytes=MagicMock(return_value=1024),
+        unpublished_bundle_directory_binding=MagicMock(
+            return_value=(
+                ".runtime-reconciliation-" + "c" * 48 + ".unpublished-" + "d" * 64,
+                1,
+                1,
+            )
+        ),
         publish_complete_bundle=MagicMock(),
         published_artifact_path=MagicMock(
             side_effect=lambda artifact: tmp_path / artifact.artifact_path.name
@@ -291,6 +298,69 @@ async def test_evidence_retention_ceiling_quarantines_without_deleting_audit_bun
     assert artifact.read_bytes() == before
     assert bundle.is_dir()
     provider.produce_normalized_snapshot.assert_not_awaited()
+
+
+def test_evidence_retention_admission_rescans_after_external_bundle_addition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "ledger.db"
+    database.touch()
+    runtime = _runtime(database)
+    context = SimpleNamespace(runtime_contract=runtime)
+    monkeypatch.setattr(
+        integration,
+        "assert_validated_runtime_safety_context",
+        lambda value: value,
+    )
+    capability_directory = tmp_path / "capabilities"
+    evidence_root = tmp_path / "evidence"
+    capability_directory.mkdir(mode=0o700)
+    evidence_root.mkdir(mode=0o700)
+    source = ProductionRuntimeEvidenceSource(
+        runtime_context=context,
+        provider=SimpleNamespace(close=AsyncMock()),
+        capability_directory=capability_directory,
+        evidence_root=evidence_root,
+        max_published_bundles=1,
+    )
+
+    source._assert_retention_capacity()
+    injected_bundle = evidence_root / ("runtime-reconciliation-" + "b" * 48)
+    injected_bundle.mkdir(mode=0o700)
+    artifact = injected_bundle / "bundle_complete.json"
+    artifact.write_bytes(b"externally-added-audit-lineage")
+    artifact.chmod(0o400)
+
+    with pytest.raises(
+        RuntimeReconciliationIntegrationError,
+        match="retention ceiling reached",
+    ):
+        source._assert_retention_capacity()
+
+
+def test_evidence_usage_excludes_only_exact_current_staging_identity(tmp_path: Path) -> None:
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir(mode=0o700)
+    staging = evidence_root / (".runtime-reconciliation-" + "c" * 48 + ".unpublished-" + "d" * 64)
+    staging.mkdir(mode=0o700)
+    staged_artifact = staging / "broker_snapshot.json"
+    staged_artifact.write_bytes(b"current-staging")
+    staged_artifact.chmod(0o400)
+    metadata = staging.stat(follow_symlinks=False)
+
+    assert integration._published_evidence_usage(
+        evidence_root,
+        excluded_staging_binding=(staging.name, metadata.st_dev, metadata.st_ino),
+    ) == (0, 0)
+    with pytest.raises(
+        RuntimeReconciliationIntegrationError,
+        match="changed identity",
+    ):
+        integration._published_evidence_usage(
+            evidence_root,
+            excluded_staging_binding=(staging.name, metadata.st_dev, metadata.st_ino + 1),
+        )
 
 
 @pytest.mark.asyncio

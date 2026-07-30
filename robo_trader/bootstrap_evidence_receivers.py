@@ -716,6 +716,37 @@ class BootstrapEvidenceReceiverSet:
         state.retention_measurement = measurement
         return total + len(_completion_marker_payload(state, measurement))
 
+    def unpublished_bundle_directory_binding(self) -> tuple[str, int, int]:
+        """Return the exact staging directory identity for retention exclusion."""
+
+        state = self._state
+        if state.published:
+            raise BootstrapEvidenceReceiverError("evidence bundle was already published")
+        self._assert_lexical_publication_binding(require_final=False)
+        held = os.fstat(state.staging_output_fd)
+        try:
+            current = os.stat(
+                state.staging_output_directory.name,
+                dir_fd=state.output_parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise BootstrapEvidenceReceiverError(
+                "evidence staging directory cannot be bound for retention"
+            ) from exc
+        if (
+            not stat.S_ISDIR(held.st_mode)
+            or held.st_uid != os.geteuid()
+            or stat.S_IMODE(held.st_mode) != 0o700
+            or (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino)
+            or (held.st_dev, held.st_ino)
+            != (state.staging_output_device, state.staging_output_inode)
+        ):
+            raise BootstrapEvidenceReceiverError(
+                "evidence staging directory changed before retention admission"
+            )
+        return state.staging_output_directory.name, held.st_dev, held.st_ino
+
     def _assert_lexical_publication_binding(self, *, require_final: bool) -> None:
         state = self._state
         lexical_parent_fd: int | None = None

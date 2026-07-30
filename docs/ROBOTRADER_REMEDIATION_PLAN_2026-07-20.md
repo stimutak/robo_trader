@@ -718,7 +718,10 @@ Make broker truth visible and authoritative before any broker-writing capability
   `RT_RECONCILIATION_EVIDENCE_MAX_BYTES`). Reaching either ceiling quarantines
   new entries while portfolio cycles continue through reduce-only gates; an
   operator-reviewed archival action is required before evidence collection can
-  resume. The receiver binds admission to the exact sealed entry identities,
+  resume. Every admission performs a fresh held-root usage scan, excluding
+  only the exact device/inode binding of its own current staging directory, so
+  externally added bundles cannot hide behind cached counters. The receiver
+  binds admission to the exact sealed entry identities,
   hashes, and final completion-marker bytes immediately before publication.
   Completion-marker schema v2 commits that exact artifact manifest, and the
   loader rejects any added, replaced, removed, or rewritten directory entry;
@@ -728,7 +731,7 @@ Make broker truth visible and authoritative before any broker-writing capability
   suspended-provider recovery, broker-envelope replay, complete account-wide
   protective symbol scope, reduce-only continuity after artifact failures,
   non-destructive retention ceilings, and persisted eligibility expiry.
-- Synthetic and mocked verification on 2026-07-30: `3079 passed, 5 skipped`
+- Synthetic and mocked verification on 2026-07-30: `3081 passed, 5 skipped`
   across the complete pytest suite; Black and Flake8 passed for all changed
   Python files. No trader process, Gateway, broker session, or authoritative
   trading database was started or accessed.

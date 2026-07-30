@@ -151,8 +151,26 @@ def _runtime_staging_bundle_name(name: str) -> bool:
     )
 
 
-def _published_evidence_usage(evidence_root: Path) -> tuple[int, int]:
+def _published_evidence_usage(
+    evidence_root: Path,
+    *,
+    excluded_staging_binding: tuple[str, int, int] | None = None,
+) -> tuple[int, int]:
     """Measure every runtime-owned bundle without mutating audit evidence."""
+
+    if excluded_staging_binding is not None and (
+        type(excluded_staging_binding) is not tuple
+        or len(excluded_staging_binding) != 3
+        or type(excluded_staging_binding[0]) is not str
+        or not _runtime_staging_bundle_name(excluded_staging_binding[0])
+        or type(excluded_staging_binding[1]) is not int
+        or excluded_staging_binding[1] < 0
+        or type(excluded_staging_binding[2]) is not int
+        or excluded_staging_binding[2] <= 0
+    ):
+        raise RuntimeReconciliationIntegrationError(
+            "current reconciliation staging binding is malformed"
+        )
 
     root_descriptor = os.open(
         evidence_root,
@@ -189,6 +207,15 @@ def _published_evidence_usage(evidence_root: Path) -> tuple[int, int]:
                 raise RuntimeReconciliationIntegrationError(
                     "published reconciliation evidence bundle is unsafe"
                 )
+            if excluded_staging_binding is not None and name == excluded_staging_binding[0]:
+                if (bundle_metadata.st_dev, bundle_metadata.st_ino) != (
+                    excluded_staging_binding[1],
+                    excluded_staging_binding[2],
+                ):
+                    raise RuntimeReconciliationIntegrationError(
+                        "current reconciliation staging bundle changed identity"
+                    )
+                continue
             bundle_descriptor = os.open(
                 name,
                 os.O_RDONLY
@@ -549,12 +576,21 @@ class ProductionRuntimeEvidenceSource:
         self._published_evidence_bytes: int | None = None
         self._closed = False
 
-    def _assert_retention_capacity(self, *, staged_bytes: int = 0) -> None:
-        if self._published_bundle_count is None or self._published_evidence_bytes is None:
-            (
-                self._published_bundle_count,
-                self._published_evidence_bytes,
-            ) = _published_evidence_usage(self._evidence_root)
+    def _assert_retention_capacity(
+        self,
+        *,
+        staged_bytes: int = 0,
+        excluded_staging_binding: tuple[str, int, int] | None = None,
+    ) -> None:
+        # Admission is always based on a fresh held-directory scan. Cached
+        # counters cannot detect bundles added by another same-UID process.
+        (
+            self._published_bundle_count,
+            self._published_evidence_bytes,
+        ) = _published_evidence_usage(
+            self._evidence_root,
+            excluded_staging_binding=excluded_staging_binding,
+        )
         if (
             self._published_bundle_count >= self._max_published_bundles
             or self._published_evidence_bytes >= self._max_published_bytes
@@ -659,7 +695,11 @@ class ProductionRuntimeEvidenceSource:
             expected_marks = set(delivery.local_position_identities)
             receivers.assert_complete(expected_marks)
             staged_bytes = receivers.unpublished_bundle_size_bytes(expected_marks)
-            self._assert_retention_capacity(staged_bytes=staged_bytes)
+            staging_binding = receivers.unpublished_bundle_directory_binding()
+            self._assert_retention_capacity(
+                staged_bytes=staged_bytes,
+                excluded_staging_binding=staging_binding,
+            )
             receivers.publish_complete_bundle(
                 expected_marks,
                 expected_bundle_size_bytes=staged_bytes,
