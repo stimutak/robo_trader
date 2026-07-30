@@ -417,6 +417,7 @@ class _BundleBindings:
     broker_positions_count: int | None = None
     broker_open_orders_count: int | None = None
     marks: set[tuple[str, str]] = field(default_factory=set)
+    retention_measurement: tuple[tuple[str, int, int, int, str], ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -470,6 +471,38 @@ def _completion_marker_payload(state: _BundleBindings) -> bytes:
     ).encode("utf-8")
 
 
+def _sealed_staging_measurement(
+    state: _BundleBindings,
+) -> tuple[tuple[tuple[str, int, int, int, str], ...], int]:
+    entries: list[tuple[str, int, int, int, str]] = []
+    total = 0
+    for name in os.listdir(state.staging_output_fd):
+        metadata = os.stat(
+            name,
+            dir_fd=state.staging_output_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o400
+        ):
+            raise BootstrapEvidenceReceiverError("unpublished evidence contains an unsafe entry")
+        payload = _read_sealed_file_at(state.staging_output_fd, name)
+        entries.append(
+            (
+                name,
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                hashlib.sha256(payload).hexdigest(),
+            )
+        )
+        total += len(payload)
+    return tuple(sorted(entries)), total
+
+
 @dataclass(frozen=True, slots=True)
 class BootstrapEvidenceReceiverSet:
     broker_snapshot: "BrokerSnapshotEvidenceReceiver"
@@ -507,6 +540,8 @@ class BootstrapEvidenceReceiverSet:
     def publish_complete_bundle(
         self,
         expected_marks: set[tuple[str, str]],
+        *,
+        expected_bundle_size_bytes: int | None = None,
     ) -> Path:
         """Atomically publish the complete, provider-closed evidence directory."""
 
@@ -553,6 +588,7 @@ class BootstrapEvidenceReceiverSet:
                 "evidence publication paths changed or final output already exists"
             )
         renamed = False
+        preserve_failed_publication = False
         completion_temp = f".{_COMPLETION_MARKER_FILENAME}.stage-{secrets.token_hex(32)}"
         try:
             os.fsync(state.staging_output_fd)
@@ -577,6 +613,23 @@ class BootstrapEvidenceReceiverSet:
             self._assert_lexical_publication_binding(require_final=True)
             os.fsync(state.output_parent_fd)
             completion_payload = _completion_marker_payload(state)
+            if expected_bundle_size_bytes is not None:
+                measurement, artifact_bytes = _sealed_staging_measurement(state)
+                if (
+                    type(expected_bundle_size_bytes) is not int
+                    or expected_bundle_size_bytes <= 0
+                    or state.retention_measurement is None
+                    or measurement != state.retention_measurement
+                    or artifact_bytes + len(completion_payload) != expected_bundle_size_bytes
+                ):
+                    # The directory is already at its final random name. Leave
+                    # it there without a completion marker so injected or
+                    # raced contents are preserved for operator inspection,
+                    # never loaded, and never deleted as disposable staging.
+                    preserve_failed_publication = True
+                    raise BootstrapEvidenceReceiverError(
+                        "evidence bundle changed after retention measurement"
+                    )
             _write_new_sealed_file_at(
                 state.staging_output_fd,
                 completion_temp,
@@ -613,7 +666,7 @@ class BootstrapEvidenceReceiverSet:
                 os.unlink(completion_temp, dir_fd=state.staging_output_fd)
             except FileNotFoundError:
                 pass
-            if renamed:
+            if renamed and not preserve_failed_publication:
                 try:
                     _rename_directory_exclusive(
                         state.output_parent_fd,
@@ -639,23 +692,8 @@ class BootstrapEvidenceReceiverSet:
         if state.published:
             raise BootstrapEvidenceReceiverError("evidence bundle was already published")
         self._assert_lexical_publication_binding(require_final=False)
-        total = 0
-        for name in os.listdir(state.staging_output_fd):
-            metadata = os.stat(
-                name,
-                dir_fd=state.staging_output_fd,
-                follow_symlinks=False,
-            )
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_uid != os.geteuid()
-                or metadata.st_nlink != 1
-                or stat.S_IMODE(metadata.st_mode) != 0o400
-            ):
-                raise BootstrapEvidenceReceiverError(
-                    "unpublished evidence contains an unsafe entry"
-                )
-            total += metadata.st_size
+        measurement, total = _sealed_staging_measurement(state)
+        state.retention_measurement = measurement
         return total + len(_completion_marker_payload(state))
 
     def _assert_lexical_publication_binding(self, *, require_final: bool) -> None:

@@ -951,7 +951,9 @@ def test_status_republication_failure_preserves_complete_prior_artifact(
         )
 
     assert status_path.read_bytes() == prior
-    assert not list(tmp_path.glob(".status.json.stage-*"))
+    preserved = list(tmp_path.glob(".status.json.stage-*"))
+    assert len(preserved) == 1
+    assert json.loads(preserved[0].read_text(encoding="ascii"))["run_id"] == "run-second"
 
 
 def test_status_atomic_exchange_restores_raced_unrelated_target(
@@ -1083,6 +1085,68 @@ def test_status_failed_race_rollback_preserves_displaced_unrelated_inode(
 
     displaced = list(tmp_path.glob(".status.json.stage-*"))
     assert calls == 2
+    assert len(displaced) == 1
+    assert displaced[0].read_bytes() == b"unrelated-raced-state"
+    assert held_owned.is_file()
+
+
+def test_status_ambiguous_first_exchange_preserves_displaced_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_path = tmp_path / "status.json"
+    payload = {
+        "schema_version": 1,
+        "owner_binding": STATUS_OWNER_BINDING,
+        "state": "quarantined",
+        "trigger": None,
+        "completed_at": None,
+        "eligible_until": None,
+        "entry_eligible": False,
+        "quarantined": True,
+        "run_id": None,
+        "snapshot_id": None,
+    }
+    integration._write_status(
+        status_path,
+        payload,
+        owner_binding=STATUS_OWNER_BINDING,
+    )
+    held_owned = tmp_path / "held-owned-status.json"
+    real_exchange = integration._exchange_status_entries
+
+    def exchange_then_interrupt(parent_descriptor: int, left: str, right: str) -> None:
+        os.rename(
+            right,
+            held_owned.name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        raced = os.open(
+            right,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        os.write(raced, b"unrelated-raced-state")
+        os.close(raced)
+        real_exchange(parent_descriptor, left, right)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        integration,
+        "_exchange_status_entries",
+        exchange_then_interrupt,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        integration._write_status(
+            status_path,
+            dict(payload, state="ready"),
+            owner_binding=STATUS_OWNER_BINDING,
+        )
+
+    displaced = list(tmp_path.glob(".status.json.stage-*"))
     assert len(displaced) == 1
     assert displaced[0].read_bytes() == b"unrelated-raced-state"
     assert held_owned.is_file()

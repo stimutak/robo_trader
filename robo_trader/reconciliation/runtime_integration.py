@@ -660,7 +660,10 @@ class ProductionRuntimeEvidenceSource:
             receivers.assert_complete(expected_marks)
             staged_bytes = receivers.unpublished_bundle_size_bytes(expected_marks)
             self._assert_retention_capacity(staged_bytes=staged_bytes)
-            receivers.publish_complete_bundle(expected_marks)
+            receivers.publish_complete_bundle(
+                expected_marks,
+                expected_bundle_size_bytes=staged_bytes,
+            )
             published = True
             assert self._published_bundle_count is not None
             assert self._published_evidence_bytes is not None
@@ -682,6 +685,8 @@ class ProductionRuntimeEvidenceSource:
                 receivers.protective_mark,
             )
         except BaseException:
+            self._published_bundle_count = None
+            self._published_evidence_bytes = None
             if receivers is not None and not published:
                 receivers.discard_unpublished_bundle()
             raise
@@ -948,8 +953,8 @@ def _write_status(
             # is authenticated. A crash can expose either complete version,
             # never a partial status, and a raced unrelated target can be put
             # back rather than overwritten.
-            _exchange_status_entries(parent_descriptor, temporary_name, path.name)
             preserve_temporary = True
+            _exchange_status_entries(parent_descriptor, temporary_name, path.name)
             displaced = os.stat(
                 temporary_name,
                 dir_fd=parent_descriptor,

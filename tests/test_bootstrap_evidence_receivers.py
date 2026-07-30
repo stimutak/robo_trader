@@ -373,6 +373,65 @@ async def test_full_empty_position_evidence_chain_is_typed_and_one_shot(
         receivers.broker_snapshot.receive_broker_snapshot_producer_result(result)
 
 
+@pytest.mark.asyncio
+async def test_retention_measurement_change_preserves_unpublished_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _install_test_trust(monkeypatch, tmp_path)
+    database = tmp_path / "ledger.db"
+    _ledger(database)
+    runtime = _runtime(database)
+    output = tmp_path / "evidence"
+    receivers = create_bootstrap_evidence_receivers(
+        runtime_contract=runtime,
+        capability_directory=capability,
+        output_directory=output,
+    )
+    provider = _Provider(_broker_result(datetime.now(timezone.utc)))
+    measured_size: list[int] = []
+
+    async def inject_after_measurement(**kwargs: object) -> tuple:
+        assert kwargs["mark_identities"] == ()
+        measured_size.append(receivers.unpublished_bundle_size_bytes(set()))
+        injected = receivers._state.staging_output_directory / "raced-sealed-evidence.json"
+        injected.write_bytes(b"operator-evidence-must-survive")
+        injected.chmod(0o400)
+        return ()
+
+    original_publish = receiver_core.BootstrapEvidenceReceiverSet.publish_complete_bundle
+
+    def publish_with_admission_binding(self, expected_marks):
+        return original_publish(
+            self,
+            expected_marks,
+            expected_bundle_size_bytes=measured_size[0],
+        )
+
+    monkeypatch.setattr(
+        receiver_core.BootstrapEvidenceReceiverSet,
+        "publish_complete_bundle",
+        publish_with_admission_binding,
+    )
+
+    with pytest.raises(
+        BootstrapEvidenceReceiverError,
+        match="changed after retention measurement",
+    ):
+        await produce_bootstrap_evidence_bundle(
+            runtime_contract=runtime,
+            snapshot_provider=provider,
+            receivers=receivers,
+            protective_mark_collector=inject_after_measurement,
+        )
+
+    assert measured_size
+    assert (output / "raced-sealed-evidence.json").read_bytes() == (
+        b"operator-evidence-must-survive"
+    )
+    assert not (output / "bundle_complete.json").exists()
+
+
 def test_invalid_capability_does_not_create_output_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
