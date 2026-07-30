@@ -712,6 +712,46 @@ async def test_position_protective_receipt_exact_coverage_is_ready(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("evolution", ["closed-bootstrap-position", "later-entry"])
+async def test_bootstrap_receipts_remain_ready_after_valid_position_evolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evolution: str,
+) -> None:
+    database = tmp_path / "ledger.db"
+    runtime = _runtime(database)
+    _readiness_database(
+        database,
+        runtime,
+        include_bootstrap=True,
+        include_position=evolution == "closed-bootstrap-position",
+    )
+    with sqlite3.connect(database) as connection:
+        if evolution == "closed-bootstrap-position":
+            connection.execute("DELETE FROM positions WHERE symbol='AAPL'")
+            connection.execute("DELETE FROM paper_position_settlement_state WHERE symbol='AAPL'")
+        else:
+            connection.execute(
+                "INSERT INTO positions VALUES (?,?,?)",
+                ("default", "MSFT", 2),
+            )
+            connection.execute(
+                "INSERT INTO paper_position_settlement_state VALUES (?,?,?,?,?)",
+                ("default", "MSFT", "200", "210", BOOTSTRAP_ID),
+            )
+    context = SimpleNamespace(runtime_contract=runtime)
+    monkeypatch.setattr(
+        integration,
+        "assert_validated_runtime_safety_context",
+        lambda value: value,
+    )
+    monkeypatch.setattr(integration, "assert_exact_state_schema", AsyncMock())
+    monkeypatch.setattr(integration, "assert_reconciliation_schema", AsyncMock())
+
+    await assert_runtime_bootstrap_ready(context)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("schema_state", ["absent", "partial"])
 async def test_runtime_schema_assertion_is_byte_preserving_and_precedes_provider(
     tmp_path: Path,

@@ -2278,7 +2278,11 @@ HTML_TEMPLATE = """
                     return;
                 }
                 const data = await resp.json();
-                if (data && data.healthy) {
+                const reconciliation = data && data.reconciliation;
+                const reconciliationBlocked = !reconciliation ||
+                    reconciliation.entry_eligible !== true ||
+                    reconciliation.quarantined !== false;
+                if (data && data.healthy && !reconciliationBlocked) {
                     banner.classList.remove('visible');
                     banner.textContent = '';
                     return;
@@ -2286,16 +2290,18 @@ HTML_TEMPLATE = """
                 // Unhealthy. Build the message as a plain string assigned via
                 // textContent — defense in depth even though escHTML would
                 // also neutralize the payload.
-                let msg = '⚠ Runner offline';
+                let msg = data && data.healthy
+                    ? '⚠ New entries quarantined — broker reconciliation unavailable'
+                    : '⚠ Runner offline';
                 const secs = data && data.last_market_update_seconds_ago;
-                if (typeof secs === 'number' && isFinite(secs)) {
+                if (!(data && data.healthy) && typeof secs === 'number' && isFinite(secs)) {
                     const mins = Math.floor(secs / 60);
                     if (mins >= 1) {
                         msg += ' — last update ' + mins + ' minute' + (mins === 1 ? '' : 's') + ' ago';
                     } else {
                         msg += ' — last update ' + Math.round(secs) + 's ago';
                     }
-                } else {
+                } else if (!(data && data.healthy)) {
                     msg += ' — no updates received this session';
                 }
                 const audit = data && data.exit_audit;
@@ -2308,6 +2314,15 @@ HTML_TEMPLATE = """
                         if (!isNaN(dt.getTime())) {
                             msg += ' (' + escHTML(dt.toLocaleString()) + ')';
                         }
+                    }
+                }
+                if (reconciliationBlocked && reconciliation) {
+                    if (typeof reconciliation.state === 'string' && reconciliation.state) {
+                        msg += '. Reconciliation: ' + reconciliation.state;
+                    }
+                    if (typeof reconciliation.age_seconds === 'number' &&
+                            isFinite(reconciliation.age_seconds)) {
+                        msg += ' (' + Math.round(reconciliation.age_seconds) + 's old)';
                     }
                 }
                 banner.textContent = msg;

@@ -201,7 +201,6 @@ async def assert_runtime_bootstrap_ready(runtime_context: RuntimeSafetyContext) 
             raise RuntimeReconciliationIntegrationError("runtime portfolio state is unavailable")
         bootstrap_ids: dict[str, str] = {}
         expected_receipts: dict[str, dict[str, list[str]]] = {}
-        expected_positions: set[tuple[str, str]] = set()
         for row in portfolio_rows:
             portfolio_id, bootstrap_id = row[0], row[1]
             if (
@@ -234,9 +233,6 @@ async def assert_runtime_bootstrap_ready(runtime_context: RuntimeSafetyContext) 
                 raise RuntimeReconciliationIntegrationError(
                     "exact bootstrap candidate lineage is mismatched"
                 )
-            expected_positions.update(
-                (portfolio_id, position.symbol) for position in candidate.positions
-            )
             expected_receipts[bootstrap_id] = {
                 "broker_snapshot": [str(row[10])],
                 "reconciliation_report": [str(row[11])],
@@ -255,7 +251,6 @@ async def assert_runtime_bootstrap_ready(runtime_context: RuntimeSafetyContext) 
             ORDER BY p.portfolio_id, p.symbol
             """)
         position_rows = await cursor.fetchall()
-        observed_positions: set[tuple[str, str]] = set()
         for row in position_rows:
             if (
                 row[0] not in bootstrap_ids
@@ -268,11 +263,6 @@ async def assert_runtime_bootstrap_ready(runtime_context: RuntimeSafetyContext) 
                 raise RuntimeReconciliationIntegrationError(
                     "exact position bootstrap state is missing or partial"
                 )
-            observed_positions.add((row[0], row[1]))
-        if observed_positions != expected_positions:
-            raise RuntimeReconciliationIntegrationError(
-                "exact position bootstrap coverage is missing or mismatched"
-            )
 
         cursor = await connection.execute("""
             SELECT bootstrap_id, artifact_kind, artifact_sha256,

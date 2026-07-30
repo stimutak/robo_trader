@@ -609,6 +609,58 @@ async def test_suspended_factory_provider_recovers_with_new_transport_generation
     assert transport.protective_quote_generation == "quote-generation-2"
 
 
+@pytest.mark.asyncio
+async def test_poisoned_generation_can_suspend_then_refresh(monkeypatch):
+    provider, transport, runtime = await _factory_provider(monkeypatch)
+    replacement = _WorkerGeneration("quote-generation-recovered", Mock())
+    transport._generation = None
+    transport._connection_generation_id = None
+
+    async def connect_transport(**kwargs) -> bool:
+        transport._generation = replacement
+        transport._connected = True
+        transport._connection_identity = (
+            kwargs["host"],
+            kwargs["port"],
+            kwargs["client_id"],
+            kwargs["readonly"],
+        )
+        transport._connection_generation_id = replacement.generation_id
+        return True
+
+    transport.connect = AsyncMock(side_effect=connect_transport)
+    transport.ping = AsyncMock(return_value=True)
+
+    await provider.suspend()
+    await provider.refresh()
+
+    assert provider._closed is False
+    assert provider._suspended is False
+    assert provider._shared_gateway_transport(runtime_context=runtime) is transport
+    assert transport.protective_quote_generation == replacement.generation_id
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_remains_suspended_and_retryable(monkeypatch):
+    provider, transport, runtime = await _factory_provider(monkeypatch)
+    transport.ping = AsyncMock(return_value=True)
+    await provider.suspend()
+    transport.start = AsyncMock(side_effect=[RuntimeError("transient start failure"), None])
+
+    with pytest.raises(RuntimeError, match="transient start failure"):
+        await provider.refresh()
+
+    assert provider._closed is False
+    assert provider._suspended is True
+
+    await provider.refresh()
+
+    assert provider._closed is False
+    assert provider._suspended is False
+    assert provider._shared_gateway_transport(runtime_context=runtime) is transport
+    assert transport.start.await_count == 2
+
+
 @pytest.mark.parametrize(
     "mutate",
     [

@@ -1038,6 +1038,10 @@ def test_dashboard_html_has_stale_banner(monkeypatch):
     body = resp.get_data(as_text=True)
     assert 'id="runner-stale-banner"' in body
     assert "checkRunnerHealth" in body
+    assert "reconciliation.entry_eligible !== true" in body
+    assert "reconciliation.quarantined !== false" in body
+    assert "data && data.healthy && !reconciliationBlocked" in body
+    assert "New entries quarantined — broker reconciliation unavailable" in body
     # And it must be wired into the boot sequence.
     assert "setInterval(checkRunnerHealth" in body
 

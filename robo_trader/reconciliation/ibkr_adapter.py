@@ -1354,7 +1354,7 @@ def assert_factory_owned_diagnostic_provider(
 def _claim_factory_provider_for_refresh(
     provider: object,
 ) -> IBKRDiagnosticSnapshotProvider:
-    """Consume factory ownership even when the registered transport is suspended."""
+    """Validate factory ownership even when the registered transport is suspended."""
 
     if type(provider) is not IBKRDiagnosticSnapshotProvider:
         raise BrokerEvidenceError("exact diagnostic provider is required")
@@ -1383,7 +1383,6 @@ def _claim_factory_provider_for_refresh(
         ):
             _FACTORY_PROVIDERS.pop(id(provider), None)
             raise BrokerEvidenceError("diagnostic provider generation or runtime binding changed")
-        _FACTORY_PROVIDERS.pop(id(provider), None)
     return provider
 
 
@@ -1583,6 +1582,7 @@ class IBKRDiagnosticSnapshotProvider:
         "_factory_marker",
         "_closed",
         "_suspended",
+        "_refresh_lock",
     )
 
     def __init__(
@@ -1605,6 +1605,7 @@ class IBKRDiagnosticSnapshotProvider:
         self._factory_marker = _factory_marker
         self._closed = False
         self._suspended = False
+        self._refresh_lock = asyncio.Lock()
 
     async def get_broker_snapshot(
         self, expected_account: str, *, max_age_seconds: float
@@ -1690,61 +1691,64 @@ class IBKRDiagnosticSnapshotProvider:
         return source
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._suspended = True
-        _invalidate_factory_provider(self)
-        await _stop_transport_required(self._transport)
+        async with self._refresh_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._suspended = True
+            _invalidate_factory_provider(self)
+            await _stop_transport_required(self._transport)
 
     async def suspend(self) -> None:
         """Stop the current generation while retaining factory ownership."""
 
-        if self._closed:
-            return
-        try:
-            assert_factory_owned_diagnostic_provider(self)
-        except BaseException:
+        async with self._refresh_lock:
+            if self._closed:
+                return
+            self._suspended = True
+            try:
+                _claim_factory_provider_for_refresh(self)
+            except BaseException:
+                await _stop_transport_required(self._transport)
+                raise
             await _stop_transport_required(self._transport)
-            raise
-        self._suspended = True
-        await _stop_transport_required(self._transport)
 
     async def refresh(self) -> None:
         """Replace the owned read-only transport generation in place."""
 
-        connection = self._diagnostic_connection
-        if connection is None:
-            raise BrokerEvidenceError("diagnostic connection binding is unavailable")
-        _claim_factory_provider_for_refresh(self)
-        try:
-            await _stop_transport_required(self._transport)
-            await self._transport.start()
-            connected = await self._transport.connect(
-                host=connection.host,
-                port=connection.port,
-                client_id=connection.client_id,
-                readonly=connection.readonly,
-                timeout=30.0,
-            )
-            if connected is not True or await self._transport.ping() is not True:
-                raise BrokerEvidenceError("diagnostic broker connection did not recover")
-            self._suspended = False
-            _register_factory_provider(
-                self,
-                transport=self._transport,
-                runtime_contract=self._runtime_contract,
-            )
-        except BaseException:
-            self._closed = True
+        async with self._refresh_lock:
+            connection = self._diagnostic_connection
+            if connection is None:
+                raise BrokerEvidenceError("diagnostic connection binding is unavailable")
+            _claim_factory_provider_for_refresh(self)
             self._suspended = True
             try:
-                await await_cleanup_required(_stop_transport_required(self._transport))
-            except Exception as cleanup_exc:
-                raise BrokerEvidenceError(
-                    "diagnostic broker recovery cleanup failed"
-                ) from cleanup_exc
-            raise
+                await _stop_transport_required(self._transport)
+                await self._transport.start()
+                connected = await self._transport.connect(
+                    host=connection.host,
+                    port=connection.port,
+                    client_id=connection.client_id,
+                    readonly=connection.readonly,
+                    timeout=30.0,
+                )
+                if connected is not True or await self._transport.ping() is not True:
+                    raise BrokerEvidenceError("diagnostic broker connection did not recover")
+                self._suspended = False
+                _register_factory_provider(
+                    self,
+                    transport=self._transport,
+                    runtime_contract=self._runtime_contract,
+                )
+            except BaseException:
+                self._suspended = True
+                try:
+                    await await_cleanup_required(_stop_transport_required(self._transport))
+                except Exception as cleanup_exc:
+                    raise BrokerEvidenceError(
+                        "diagnostic broker recovery cleanup failed"
+                    ) from cleanup_exc
+                raise
 
     def _shared_gateway_transport(
         self,
