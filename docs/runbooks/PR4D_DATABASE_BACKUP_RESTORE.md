@@ -179,7 +179,9 @@ views, or triggers. Before any plan write, the service compares persistent
 schema SQL with the isolated connection's registered function list. SQLite
 block and line comments outside quoted tokens are normalized to whitespace
 before matching, so comments between a function name and `(` cannot bypass the
-screen. A named schema function makes the dry run return
+screen. Matching follows SQLite's line-comment rule: a bare carriage return
+does not end a `--` comment; line-feed or end-of-input does. A named schema
+function makes the dry run return
 `migration_plan_failed` without executing the plan. This conservative
 fail-closed policy can reject a harmless schema expression; such a migration
 needs a separately reviewed adapter rather than a bypass.

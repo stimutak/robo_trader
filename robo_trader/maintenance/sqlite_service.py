@@ -1217,7 +1217,7 @@ def _schema_sql_without_comments(sql: str) -> str:
         if sql.startswith("--", index):
             normalized.extend((" ", " "))
             index += 2
-            while index < len(sql) and sql[index] not in {"\r", "\n"}:
+            while index < len(sql) and sql[index] != "\n":
                 normalized.append(" ")
                 index += 1
             continue

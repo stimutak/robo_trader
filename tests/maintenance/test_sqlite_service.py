@@ -1134,6 +1134,32 @@ def test_migration_rejects_commented_schema_function_calls(
     assert report.source_unchanged is True
 
 
+def test_schema_line_comment_continues_through_carriage_return(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    with sqlite3.connect(source) as connection:
+        connection.execute(
+            "CREATE TABLE guarded ("
+            "value INTEGER NOT NULL CHECK(1 -- note\rrandomblob/**/(50000000)\n)"
+            ")"
+        )
+        assert sqlite_service_module._schema_function_calls(connection) == ()
+
+    report = SQLiteMaintenanceService(max_migration_seconds=1).dry_run_migration(
+        source,
+        target,
+        plan=MigrationPlan(
+            migration_id="accept-function-name-inside-line-comment",
+            steps=(MigrationStep("INSERT INTO guarded(value) VALUES (?)", (1,)),),
+        ),
+    )
+
+    assert report.outcome == "applied_to_synthetic_copy"
+    assert report.error_code is None
+    assert report.before != report.after
+    assert report.source_unchanged is True
+
+
 def test_migration_authorizer_denies_native_pointer_and_virtual_table_actions(
     tmp_path: Path,
 ) -> None:
