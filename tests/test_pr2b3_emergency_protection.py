@@ -11,8 +11,8 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from robo_trader.execution import Order
-from robo_trader.runner_async import AsyncRunner
 from robo_trader.reconciliation.runtime_integration import RuntimeReconciliationController
+from robo_trader.runner_async import AsyncRunner
 
 
 def _minimal_runner() -> AsyncRunner:

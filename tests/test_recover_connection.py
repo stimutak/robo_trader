@@ -19,9 +19,9 @@ from robo_trader.market_data_contract import (
 )
 from robo_trader.paper_reduction_gateway import PaperReductionGateway
 from robo_trader.protective_quote_evidence import ProtectiveQuoteSource
+from robo_trader.reconciliation.runtime_integration import RuntimeReconciliationController
 from robo_trader.risk_manager import Position
 from robo_trader.runner_async import AsyncRunner
-from robo_trader.reconciliation.runtime_integration import RuntimeReconciliationController
 from robo_trader.stop_loss_monitor import StopLossMonitor
 
 

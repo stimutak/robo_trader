@@ -30,8 +30,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from robo_trader.connection_health import ConnectionHealth, HealthStatus
-from robo_trader.runner_async import AsyncRunner
 from robo_trader.reconciliation.runtime_integration import RuntimeReconciliationController
+from robo_trader.runner_async import AsyncRunner
 
 
 def make_fake_ib_client():

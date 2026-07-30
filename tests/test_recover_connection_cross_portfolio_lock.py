@@ -24,8 +24,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from robo_trader import connection_health
-from robo_trader.runner_async import AsyncRunner
 from robo_trader.reconciliation.runtime_integration import RuntimeReconciliationController
+from robo_trader.runner_async import AsyncRunner
 
 
 def _make_runner_for_recovery() -> AsyncRunner:
