@@ -481,6 +481,16 @@ def test_foreign_temp_trigger_targeting_fifo_table_is_rejected(connection):
         FifoLedger(connection, allow_other_objects=True)
 
 
+def test_uppercase_temp_shadow_is_rejected_with_case_sensitive_like(connection, ledger):
+    connection.execute("PRAGMA case_sensitive_like=ON")
+    connection.execute("CREATE TEMP TABLE FIFO_FILLS AS SELECT * FROM main.fifo_fills")
+
+    with pytest.raises(FifoFixtureMigrationError, match="temporary FIFO"):
+        ledger.record_fill(_fill(1, FillSide.BUY, "1", "10"))
+
+    assert _table_count(connection, "fifo_fills") == 0
+
+
 @pytest.mark.parametrize("bad_decimal", ["abc", "01", "1.0", "0", "-1", "1e2", ".5", "5."])
 def test_schema_rejects_noncanonical_or_nonpositive_fill_decimals(connection, ledger, bad_decimal):
     with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint"):

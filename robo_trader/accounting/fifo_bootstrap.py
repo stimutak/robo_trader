@@ -210,14 +210,8 @@ async def _assert_fifo_schema(connection: aiosqlite.Connection) -> None:
         raise FifoBootstrapError("FIFO accounting requires foreign-key enforcement")
     protected_tables = tuple(_TABLE_SQL)
     protected_table_names = "|" + "|".join(protected_tables) + "|"
-    temporary_query = (
-        "SELECT type,name,tbl_name,sql FROM temp.sqlite_master "
-        "WHERE name LIKE 'fifo_%' OR instr(?, '|' || tbl_name || '|') > 0 "
-        "OR type='trigger' ORDER BY type,name"
-    )
     temporary = await connection.execute(
-        temporary_query,
-        (protected_table_names,),
+        "SELECT type,name,tbl_name,sql FROM temp.sqlite_master ORDER BY type,name"
     )
     temporary_rows = await temporary.fetchall()
     if any(

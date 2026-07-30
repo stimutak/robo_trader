@@ -563,18 +563,8 @@ def _foreign_fifo_triggers(rows: Sequence[Sequence[object]]) -> set[str]:
 
 
 def _assert_no_temp_fifo_objects(connection: sqlite3.Connection) -> None:
-    protected_tables = tuple(_TABLE_SQL)
-    protected_table_names = "|" + "|".join(protected_tables) + "|"
-    shadow_query = (
-        "SELECT type, name, tbl_name, sql FROM temp.sqlite_master "
-        "WHERE name LIKE 'fifo_%' OR instr(?, '|' || tbl_name || '|') > 0 "
-        "OR type = 'trigger' "
-        "ORDER BY type, name"
-    )
-    shadows = connection.execute(
-        shadow_query,
-        (protected_table_names,),
-    ).fetchall()
+    shadow_query = "SELECT type, name, tbl_name, sql FROM temp.sqlite_master " "ORDER BY type, name"
+    shadows = connection.execute(shadow_query).fetchall()
     if any(
         str(row[1]).lower().startswith("fifo_")
         or str(row[2]).lower() in _TABLE_SQL
