@@ -406,6 +406,7 @@ class FifoLedger:
             allow_other_objects=allow_other_objects,
         )
         self._connection = connection
+        self._allow_other_objects = allow_other_objects
 
     def create_epoch(self, epoch: AccountingEpoch) -> AccountingEpoch:
         _assert_no_temp_fifo_objects(self._connection)
@@ -415,6 +416,10 @@ class FifoLedger:
             raise FifoAccountingError("epoch creation requires an idle connection")
         try:
             self._connection.execute("BEGIN IMMEDIATE")
+            assert_fifo_accounting_schema(
+                self._connection,
+                allow_other_objects=self._allow_other_objects,
+            )
             by_id = self._connection.execute(
                 "SELECT * FROM fifo_accounting_epochs WHERE epoch_id = ?",
                 (epoch.epoch_id,),
@@ -486,6 +491,10 @@ class FifoLedger:
             raise FifoAccountingError("fill recording requires an idle connection")
         try:
             self._connection.execute("BEGIN IMMEDIATE")
+            assert_fifo_accounting_schema(
+                self._connection,
+                allow_other_objects=self._allow_other_objects,
+            )
             effective_at = self._require_epoch(event.epoch_id)
             if event.occurred_at < effective_at:
                 raise FifoAccountingOrderingError("fill event time precedes epoch effective_at")

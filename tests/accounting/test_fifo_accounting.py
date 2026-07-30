@@ -451,6 +451,23 @@ def test_foreign_main_trigger_body_referencing_fifo_table_is_rejected(connection
         FifoLedger(connection, allow_other_objects=True)
 
 
+def test_durable_trigger_injected_after_construction_blocks_fill_mutation(connection, ledger):
+    operational_ledger = FifoLedger(connection, allow_other_objects=True)
+    connection.execute("""
+        CREATE TRIGGER post_construction_fifo_injector
+        AFTER INSERT ON fifo_position_snapshots
+        BEGIN
+            SELECT 1;
+        END
+        """)
+
+    with pytest.raises(FifoFixtureMigrationError, match="foreign triggers"):
+        operational_ledger.record_fill(_fill(1, FillSide.BUY, "1", "10"))
+
+    assert _table_count(connection, "fifo_fills") == 0
+    assert _table_count(connection, "fifo_position_snapshots") == 0
+
+
 def test_foreign_temp_trigger_targeting_fifo_table_is_rejected(connection):
     connection.execute("""
         CREATE TEMP TRIGGER unrelated_temp_capture
@@ -945,15 +962,17 @@ def test_integrity_verifier_rejects_non_fifo_match_structure(connection, ledger)
 
 
 def test_failed_snapshot_insert_rolls_back_fill_commission_matches_and_lots(connection, ledger):
-    connection.execute("""
-        CREATE TRIGGER fixture_reject_snapshot
-        BEFORE INSERT ON fifo_position_snapshots
-        BEGIN
-            SELECT RAISE(ABORT, 'injected snapshot failure');
-        END
-        """)
-    with pytest.raises(sqlite3.IntegrityError, match="injected snapshot failure"):
-        ledger.record_fill(_fill(1, FillSide.BUY, "1", "10", 1))
+    def reject_snapshot_insert(action, argument_one, _argument_two, _database, _trigger):
+        if action == sqlite3.SQLITE_INSERT and argument_one == "fifo_position_snapshots":
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    connection.set_authorizer(reject_snapshot_insert)
+    try:
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            ledger.record_fill(_fill(1, FillSide.BUY, "1", "10", 1))
+    finally:
+        connection.set_authorizer(None)
     for table in (
         "fifo_fills",
         "fifo_commissions",
