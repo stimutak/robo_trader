@@ -24,6 +24,7 @@ from robo_trader.accounting.fifo_runtime import (
 from robo_trader.config import RuntimeContract
 from robo_trader.database_async import AsyncTradingDatabase
 from robo_trader.database_validator import ValidationError as DatabaseValidationError
+from robo_trader.multiuser.migration import MultiuserMigration
 from robo_trader.paper_terminal_settlement import (
     PaperAccountSettlementState,
     PaperTerminalSettlementConflict,
@@ -45,6 +46,7 @@ from robo_trader.safety import (
 from robo_trader.safety.models import ValidationError, _strict_database_identity
 from tests.fifo_runtime_test_support import install_synthetic_fifo_epoch
 from tests.safety.conftest import make_case
+from tests.test_multiuser import create_legacy_schema
 
 ACCOUNT_SCOPE = "acct_v1_0123456789abcdef0123456789abcdef" "fedcba9876543210fedcba9876543210"
 
@@ -749,6 +751,72 @@ async def test_malformed_hot_table_index_fails_before_mutation(tmp_path: Path):
             )
 
         await _assert_no_partial_settlement(database)
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_quoted_literal_case_change_fails_before_mutation(tmp_path: Path):
+    contract = _runtime_contract(tmp_path)
+    database = AsyncTradingDatabase(Path(contract.database_path), pool_size=1)
+    await database.initialize()
+    try:
+        await _seed(database)
+        async with database.get_connection() as connection:
+            schema_version = await (
+                await connection.execute("PRAGMA main.schema_version")
+            ).fetchone()
+            await connection.execute("PRAGMA writable_schema=ON")
+            await connection.execute(
+                """
+                UPDATE main.sqlite_master
+                SET sql=replace(sql,?,?)
+                WHERE type='table' AND name='paper_fifo_settlement_links'
+                """,
+                ("commission_currency = 'USD'", "commission_currency = 'usd'"),
+            )
+            await connection.execute("PRAGMA writable_schema=OFF")
+            await connection.execute(f"PRAGMA main.schema_version={schema_version[0] + 1}")
+            await connection.commit()
+
+        with pytest.raises(PaperTerminalSettlementError, match="hot schema"):
+            await database.commit_paper_reduction_outcome(
+                _request(outcome_at=datetime.now(timezone.utc) - timedelta(seconds=1)),
+                runtime_contract=contract,
+            )
+
+        await _assert_no_partial_settlement(database)
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_supported_multiuser_v1_hot_schema_can_settle(tmp_path: Path):
+    contract = _runtime_contract(tmp_path)
+    database_path = Path(contract.database_path)
+    await create_legacy_schema(database_path)
+    assert await MultiuserMigration(database_path).migrate() is True
+
+    database = AsyncTradingDatabase(database_path, pool_size=1)
+    await database.initialize()
+    try:
+        async with database.get_connection() as connection:
+            await connection.execute("""
+                UPDATE main.positions SET quantity=0
+                WHERE portfolio_id='default' AND symbol='AAPL'
+                """)
+            await connection.commit()
+        await _seed(database)
+
+        receipt = await database.commit_paper_reduction_outcome(
+            _request(outcome_at=datetime.now(timezone.utc) - timedelta(seconds=1)),
+            runtime_contract=contract,
+        )
+
+        assert receipt.trade_id is not None
+        position = await database.get_position("AAPL", portfolio_id="portfolio-a")
+        assert position is not None
+        assert position["quantity"] == 3
     finally:
         await database.close()
 

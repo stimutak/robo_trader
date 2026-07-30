@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 import pytest
 
@@ -174,6 +174,61 @@ def test_epoch_realized_pnl_accumulates_across_symbols() -> None:
         assert second_close.fill_realized_pnl == Decimal("20")
         assert second_close.epoch_realized_pnl == Decimal("30")
         assert second_close.total_realized_pnl == Decimal("30")
+    finally:
+        connection.close()
+
+
+def test_epoch_realized_pnl_is_independent_of_ambient_decimal_precision() -> None:
+    connection, effective = _connection()
+    try:
+        events = (
+            _evidence(
+                1,
+                side=FillSide.BUY,
+                quantity="1",
+                price="10000",
+                commission_minor=0,
+                occurred_at=effective,
+            ),
+            _evidence(
+                2,
+                side=FillSide.SELL,
+                quantity="1",
+                price="22345.67",
+                commission_minor=0,
+                occurred_at=effective + timedelta(seconds=1),
+            ),
+            _evidence(
+                3,
+                side=FillSide.BUY,
+                quantity="1",
+                price="20000",
+                commission_minor=0,
+                occurred_at=effective + timedelta(seconds=2),
+                con_id=272093,
+                symbol="MSFT",
+            ),
+            _evidence(
+                4,
+                side=FillSide.SELL,
+                quantity="1",
+                price="7654.34",
+                commission_minor=0,
+                occurred_at=effective + timedelta(seconds=3),
+                con_id=272093,
+                symbol="MSFT",
+            ),
+        )
+        with localcontext() as context:
+            context.prec = 6
+            for event in events:
+                connection.execute("BEGIN IMMEDIATE")
+                projection = append_runtime_fill_in_transaction(connection, event)
+                connection.commit()
+
+        assert projection.fill_realized_pnl == Decimal("-12345.66")
+        assert projection.epoch_realized_pnl == Decimal("0.01")
+        assert projection.total_realized_pnl == Decimal("0.01")
     finally:
         connection.close()
 

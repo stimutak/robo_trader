@@ -7,7 +7,6 @@ version would incorrectly make that migration appear complete.
 
 from __future__ import annotations
 
-import re
 from collections.abc import Awaitable, Callable
 
 import aiosqlite
@@ -747,6 +746,51 @@ _PAPER_SETTLEMENT_HOT_TABLE_SQL = {
     "paper_fifo_settlement_links": _EXPECTED_TABLE_SQL["paper_fifo_settlement_links"],
 }
 
+# MultiuserMigration v1 rebuilt these three compatibility tables before the
+# canonical initializer added stricter fresh-database DDL.  They remain an
+# explicitly supported, byte-for-byte reviewed operational schema variant;
+# accepting them does not relax any other table shape.
+_PAPER_SETTLEMENT_SUPPORTED_LEGACY_TABLE_SQL = {
+    "positions": """
+        CREATE TABLE "positions" (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            portfolio_id TEXT NOT NULL DEFAULT 'default',
+            symbol TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            avg_cost REAL NOT NULL,
+            market_price REAL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(portfolio_id, symbol)
+        )
+    """,
+    "trades": """
+        CREATE TABLE "trades" (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            portfolio_id TEXT NOT NULL DEFAULT 'default',
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            price REAL NOT NULL,
+            notional REAL DEFAULT 0,
+            slippage REAL DEFAULT 0,
+            commission REAL DEFAULT 0,
+            pnl REAL DEFAULT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+    "account": """
+        CREATE TABLE "account" (
+            portfolio_id TEXT PRIMARY KEY,
+            cash REAL NOT NULL,
+            equity REAL NOT NULL,
+            daily_pnl REAL DEFAULT 0,
+            realized_pnl REAL DEFAULT 0,
+            unrealized_pnl REAL DEFAULT 0,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+}
+
 _PAPER_SETTLEMENT_HOT_INDEX_SQL = {
     "idx_positions_portfolio": """
         CREATE INDEX idx_positions_portfolio ON positions (portfolio_id)
@@ -769,7 +813,40 @@ _PAPER_SETTLEMENT_HOT_INDEX_SQL = {
 def _normalized_sql(value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         return ""
-    return re.sub(r"\s+", " ", value.strip().lower())
+    normalized: list[str] = []
+    quote_end: str | None = None
+    pending_space = False
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if quote_end is not None:
+            normalized.append(character)
+            if character == quote_end:
+                if quote_end in {"'", '"', "`"} and index + 1 < len(value):
+                    if value[index + 1] == quote_end:
+                        normalized.append(value[index + 1])
+                        index += 2
+                        continue
+                quote_end = None
+            index += 1
+            continue
+        if character in {"'", '"', "`", "["}:
+            if pending_space and normalized:
+                normalized.append(" ")
+            pending_space = False
+            quote_end = "]" if character == "[" else character
+            normalized.append(character)
+        elif character.isspace():
+            pending_space = True
+        else:
+            if pending_space and normalized:
+                normalized.append(" ")
+            pending_space = False
+            normalized.append(character.lower())
+        index += 1
+    if quote_end is not None:
+        return ""
+    return "".join(normalized).strip()
 
 
 async def _table_info(
@@ -1008,7 +1085,11 @@ async def assert_paper_settlement_hot_schema(connection: aiosqlite.Connection) -
     if set(table_sql) != set(_PAPER_SETTLEMENT_HOT_TABLE_SQL):
         raise RuntimeError("paper settlement hot-table definition set is malformed")
     for name, expected_sql in _PAPER_SETTLEMENT_HOT_TABLE_SQL.items():
-        if table_sql.get(name) != _normalized_sql(expected_sql):
+        allowed_definitions = {_normalized_sql(expected_sql)}
+        supported_legacy_sql = _PAPER_SETTLEMENT_SUPPORTED_LEGACY_TABLE_SQL.get(name)
+        if supported_legacy_sql is not None:
+            allowed_definitions.add(_normalized_sql(supported_legacy_sql))
+        if table_sql.get(name) not in allowed_definitions:
             raise RuntimeError(f"paper settlement hot table {name} definition is malformed")
 
     index_rows = await connection.execute(

@@ -17,9 +17,9 @@ Base: `main` at `4c7ea47`, including merged PR4B
 
 ## Local verification
 
-- Full repository suite: `3044 passed, 5 skipped, 20 warnings`.
+- Full repository suite: `3047 passed, 5 skipped, 20 warnings`.
 - Combined FIFO, migration, exact-bootstrap, settlement, failure-injection,
-  and recovery-status matrix: `217 passed`.
+  and recovery-status matrix: `220 passed`.
 - Existing-position and stop-event suite: `168 passed`.
 - Migration, exact bootstrap, and FIFO foundation suite: `120 passed`.
 - Terminal failure-injection and recovery-status suite: `66 passed`.
@@ -37,6 +37,11 @@ Base: `main` at `4c7ea47`, including merged PR4B
 - The persistent-trigger regression uses SQLite's case-insensitive `Trades`
   spelling, and complete-definition regressions reject both a same-column
   replacement table with an added `CHECK` and a malformed hot-table index.
+- Quoted SQL literals retain their exact case during DDL authentication;
+  lowercase `'usd'` is rejected. The reviewed multiuser-v1 compatibility DDL
+  is accepted as an exact alternate schema and completes an end-to-end
+  settlement. FIFO subtotal tests also lower the ambient Decimal precision and
+  prove the 96-digit local context preserves an exact cross-symbol result.
 - Settlement failure injection covers failures immediately after FIFO append,
   after compatibility trade insertion, and after immutable FIFO-link insertion;
   every case leaves zero fill, commission, trade, settlement, and link rows.

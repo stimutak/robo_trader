@@ -179,9 +179,11 @@ def _projection_from_result(
         """,
         (epoch_id, fill_id),
     ).fetchall()
-    fill_realized = Decimal("0")
-    for row in realized_rows:
-        fill_realized += _parse_decimal(row[0], "runtime fill realized P&L")
+    with localcontext() as context:
+        context.prec = 96
+        fill_realized = Decimal("0")
+        for row in realized_rows:
+            fill_realized += _parse_decimal(row[0], "runtime fill realized P&L")
     epoch_realized_rows = connection.execute(
         """
         SELECT m.realized_pnl_text
@@ -193,9 +195,11 @@ def _projection_from_result(
         """,
         (epoch_id, event_sequence),
     ).fetchall()
-    epoch_realized = Decimal("0")
-    for row in epoch_realized_rows:
-        epoch_realized += _parse_decimal(row[0], "FIFO epoch realized P&L")
+    with localcontext() as context:
+        context.prec = 96
+        epoch_realized = Decimal("0")
+        for row in epoch_realized_rows:
+            epoch_realized += _parse_decimal(row[0], "FIFO epoch realized P&L")
     baseline_row = connection.execute(
         "SELECT realized_pnl_text FROM fifo_epoch_account_baselines WHERE epoch_id=?",
         (epoch_id,),

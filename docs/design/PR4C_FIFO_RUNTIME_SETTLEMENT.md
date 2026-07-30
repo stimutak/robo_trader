@@ -55,12 +55,20 @@ It rejects temporary shadows and any persistent hot-table trigger other than
 the exact append-only guards, matching trigger targets case-insensitively as
 SQLite does. The audit compares complete canonical table and explicit-index
 DDL, including constraints, uniqueness, foreign keys, defaults, and required
-indexes. Every settlement statement is explicitly qualified to the durable
-`main` schema. The FIFO ledger separately performs the same in-transaction
-protection for all FIFO tables and triggers. Thus a temporary settlement-link
-table cannot divert lineage, a same-shaped table cannot substitute altered
-constraints, and an injected trade trigger cannot add an unreviewed
-compatibility row after projection checks.
+indexes. SQL normalization preserves quoted literal contents. The exact
+multiuser-v1 compatibility definitions for `positions`, `trades`, and
+`account` are separately allowlisted so an already-supported upgraded ledger
+is not quarantined merely for predating the fresh-database DDL. Every
+settlement statement is explicitly qualified to the durable `main` schema.
+The FIFO ledger separately performs the same in-transaction protection for all
+FIFO tables and triggers. Thus a temporary settlement-link table cannot divert
+lineage, a same-shaped table cannot substitute altered constraints, and an
+injected trade trigger cannot add an unreviewed compatibility row after
+projection checks.
+
+Every fill-local and epoch-wide realized-P&L subtotal is accumulated in an
+explicit 96-digit local Decimal context, independent of same-process ambient
+context changes.
 
 `paper_fifo_settlement_links` binds each terminal settlement to exactly one
 FIFO fill, sequence, execution ID, commission source, and state fingerprint.
