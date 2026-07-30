@@ -939,11 +939,22 @@ def test_migration_plan_deadline_interrupts_and_rolls_back(tmp_path: Path) -> No
         ),
     )
 
-    assert time.monotonic() - started < 2.0
+    # Copying and hashing the fixture is intentionally outside the migration
+    # execution deadline and varies substantially across CI filesystems. The
+    # typed result proves that the plan itself hit the deadline; this generous
+    # ceiling only guards against a lost interrupt or hang.
+    assert time.monotonic() - started < 10.0
     assert report.outcome == "rolled_back"
-    assert report.error_code == "migration_plan_failed"
+    assert report.error_code == "migration_deadline_exceeded"
     assert report.before == report.after
     assert report.source_unchanged is True
+    with sqlite3.connect(target) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM deadline_rows WHERE value='after'"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM deadline_rows WHERE value='before'"
+        ).fetchone() == (100_000,)
 
 
 def test_migration_denies_native_function_that_can_evade_vm_deadline(tmp_path: Path) -> None:

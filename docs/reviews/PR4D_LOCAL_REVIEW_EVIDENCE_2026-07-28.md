@@ -51,7 +51,7 @@ Final full repository regression:
 
 ```text
 python3 -m pytest tests/ -q --tb=short
-3110 passed, 5 skipped, 20 known warnings in 85.92s
+3110 passed, 5 skipped, 20 known warnings in 82.67s
 ```
 
 After PR 4C merged to `main`, that exact head was merge-integrated into this
@@ -164,7 +164,10 @@ claiming isolation that an in-process filesystem library cannot provide:
   internal ALTER TABLE helper calls are reserved from plan SQL. The deadline is
   checked after every VM opcode and after each statement. Separate main and
   temporary page ceilings limit synthetic growth to 64 MiB each by default,
-  and plan-controlled TEMP DDL is denied.
+  and plan-controlled TEMP DDL is denied. Deadline rollback has a distinct
+  `migration_deadline_exceeded` result, so its regression proves the interrupt
+  without relying on CI filesystem speed; a ten-second outer ceiling still
+  catches a lost interrupt or hang.
 - Migration plans are not arbitrary SQL. Full-match validation permits only a
   small documented grammar of basic DDL plus parameter-only INSERT and
   predicate-required UPDATE/DELETE. Functions, expressions, comments,

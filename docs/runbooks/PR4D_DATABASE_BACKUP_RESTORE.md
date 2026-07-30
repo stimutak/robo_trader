@@ -170,7 +170,8 @@ allocation chains cannot accumulate between checks. The main and temporary
 synthetic databases can each grow by at most 64 MiB by default (configurable
 from 1 MiB to 1 GiB) through separate SQLite page limits. Plan-controlled TEMP
 DDL is denied as an additional boundary. Exceeding either time or storage bound
-returns `migration_plan_failed`.
+rolls back; deadline interruption returns `migration_deadline_exceeded`, while
+other resource or execution failures return `migration_plan_failed`.
 
 SQLite does not consistently send authorizer callbacks for functions embedded
 in copied CHECK constraints, generated columns, defaults, expression indexes,

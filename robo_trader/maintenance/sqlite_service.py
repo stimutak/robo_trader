@@ -448,9 +448,13 @@ class SQLiteMaintenanceService:
             connection.execute("BEGIN IMMEDIATE")
             connection.set_authorizer(_migration_authorizer)
             migration_started = time.monotonic()
+            migration_deadline_interrupted = False
 
             def migration_deadline_exceeded() -> bool:
-                return time.monotonic() - migration_started > self._max_migration_seconds
+                nonlocal migration_deadline_interrupted
+                if time.monotonic() - migration_started > self._max_migration_seconds:
+                    migration_deadline_interrupted = True
+                return migration_deadline_interrupted
 
             def enforce_migration_deadline() -> int:
                 return int(migration_deadline_exceeded())
@@ -480,7 +484,11 @@ class SQLiteMaintenanceService:
                 connection.set_authorizer(_migration_completion_authorizer)
                 connection.rollback()
                 outcome = "rolled_back"
-                error_code = "migration_plan_failed"
+                error_code = (
+                    "migration_deadline_exceeded"
+                    if migration_deadline_interrupted
+                    else "migration_plan_failed"
+                )
             else:
                 connection.set_authorizer(_migration_completion_authorizer)
                 connection.commit()
