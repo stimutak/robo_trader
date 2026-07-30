@@ -133,14 +133,25 @@ async def test_source_uses_one_broker_generation_through_marks_and_runtime_bind(
     quote_source = SimpleNamespace(
         get_protective_quotes=AsyncMock(side_effect=collect_quote),
     )
+    lease_token = object()
     provider = SimpleNamespace(
         produce_normalized_snapshot=AsyncMock(return_value=broker_envelope),
         issue_protective_quote_source=MagicMock(return_value=quote_source),
+        _acquire_generation_lease=AsyncMock(return_value=(lease_token, "generation-1")),
+        _release_generation_lease=MagicMock(),
         close=AsyncMock(),
     )
     broker_artifact = _artifact(tmp_path, "broker_snapshot")
     reconciliation_artifact = _artifact(tmp_path, "reconciliation_report")
     mark_artifact = _artifact(tmp_path, "protective_mark")
+
+    def publish_while_admission_is_locked(*_args: object, **_kwargs: object) -> None:
+        with pytest.raises(
+            RuntimeReconciliationIntegrationError,
+            match="already in progress",
+        ):
+            integration._acquire_evidence_admission_lock(evidence_root)
+
     receivers = SimpleNamespace(
         broker_snapshot=object(),
         broker_artifact=broker_artifact,
@@ -155,7 +166,7 @@ async def test_source_uses_one_broker_generation_through_marks_and_runtime_bind(
                 1,
             )
         ),
-        publish_complete_bundle=MagicMock(),
+        publish_complete_bundle=MagicMock(side_effect=publish_while_admission_is_locked),
         published_artifact_path=MagicMock(
             side_effect=lambda artifact: tmp_path / artifact.artifact_path.name
         ),
@@ -221,6 +232,11 @@ async def test_source_uses_one_broker_generation_through_marks_and_runtime_bind(
         receivers.reconciliation_report,
     )
     provider.issue_protective_quote_source.assert_called_once_with(runtime_contract=runtime)
+    provider._acquire_generation_lease.assert_awaited_once_with()
+    provider._release_generation_lease.assert_called_once_with(
+        lease_token,
+        "generation-1",
+    )
     assert quote_source.get_protective_quotes.await_args_list == [
         call(("AAPL",), active_symbols=("AAPL", "MSFT")),
         call(("MSFT",), active_symbols=("AAPL", "MSFT")),

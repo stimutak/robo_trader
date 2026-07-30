@@ -23,6 +23,11 @@ from typing import Mapping
 
 import aiosqlite
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - production runtime is POSIX
+    fcntl = None  # type: ignore[assignment]
+
 from robo_trader.bootstrap_evidence_receivers import (
     BootstrapEvidenceReceiverSet,
     SealedBootstrapEvidenceArtifact,
@@ -247,6 +252,65 @@ def _published_evidence_usage(
     finally:
         os.close(root_descriptor)
     return count, total
+
+
+def _acquire_evidence_admission_lock(evidence_root: Path) -> int:
+    """Exclusively serialize capacity admission through final publication."""
+
+    if fcntl is None:
+        raise RuntimeReconciliationIntegrationError(
+            "interprocess evidence admission locking is unavailable"
+        )
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            evidence_root,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        held = os.fstat(descriptor)
+        current = os.stat(evidence_root, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(held.st_mode)
+            or held.st_uid != os.geteuid()
+            or stat.S_IMODE(held.st_mode) != 0o700
+            or (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise RuntimeReconciliationIntegrationError(
+                "reconciliation evidence root changed before admission"
+            )
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        acquired = descriptor
+        descriptor = None
+        return acquired
+    except BlockingIOError as exc:
+        raise RuntimeReconciliationIntegrationError(
+            "reconciliation evidence admission is already in progress"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeReconciliationIntegrationError(
+            "reconciliation evidence admission lock cannot be acquired"
+        ) from exc
+    finally:
+        if descriptor is not None and descriptor >= 0:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
+def _release_evidence_admission_lock(descriptor: int) -> None:
+    if fcntl is None:
+        raise RuntimeReconciliationIntegrationError(
+            "interprocess evidence admission locking is unavailable"
+        )
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def runtime_reconciliation_status_path(
@@ -625,6 +689,7 @@ class ProductionRuntimeEvidenceSource:
         output = self._evidence_root / ("runtime-reconciliation-" + secrets.token_hex(24))
         receivers: BootstrapEvidenceReceiverSet | None = None
         published = False
+        lease_token, leased_generation = await self._provider._acquire_generation_lease()
         try:
             receivers = create_bootstrap_evidence_receivers(
                 runtime_contract=runtime,
@@ -651,6 +716,10 @@ class ProductionRuntimeEvidenceSource:
                 quote_source,
                 runtime_contract=runtime,
             )
+            if quote_identity.transport_generation != leased_generation:
+                raise RuntimeReconciliationIntegrationError(
+                    "broker snapshot and protective marks crossed transport generations"
+                )
             mark_artifacts: list[SealedBootstrapEvidenceArtifact] = []
             active_symbols = tuple(
                 sorted({symbol for _, symbol in delivery.local_position_identities})
@@ -696,15 +765,19 @@ class ProductionRuntimeEvidenceSource:
             receivers.assert_complete(expected_marks)
             staged_bytes = receivers.unpublished_bundle_size_bytes(expected_marks)
             staging_binding = receivers.unpublished_bundle_directory_binding()
-            self._assert_retention_capacity(
-                staged_bytes=staged_bytes,
-                excluded_staging_binding=staging_binding,
-            )
-            receivers.publish_complete_bundle(
-                expected_marks,
-                expected_bundle_size_bytes=staged_bytes,
-            )
-            published = True
+            admission_descriptor = _acquire_evidence_admission_lock(self._evidence_root)
+            try:
+                self._assert_retention_capacity(
+                    staged_bytes=staged_bytes,
+                    excluded_staging_binding=staging_binding,
+                )
+                receivers.publish_complete_bundle(
+                    expected_marks,
+                    expected_bundle_size_bytes=staged_bytes,
+                )
+                published = True
+            finally:
+                _release_evidence_admission_lock(admission_descriptor)
             assert self._published_bundle_count is not None
             assert self._published_evidence_bytes is not None
             self._published_bundle_count += 1
@@ -731,8 +804,14 @@ class ProductionRuntimeEvidenceSource:
                 receivers.discard_unpublished_bundle()
             raise
         finally:
-            if receivers is not None:
-                receivers.close()
+            try:
+                if receivers is not None:
+                    receivers.close()
+            finally:
+                self._provider._release_generation_lease(
+                    lease_token,
+                    leased_generation,
+                )
 
     async def close(self) -> None:
         if self._closed:

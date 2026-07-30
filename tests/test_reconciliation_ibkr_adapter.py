@@ -574,6 +574,29 @@ async def test_factory_provider_refreshes_one_shared_read_only_transport(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_generation_lease_blocks_refresh_until_evidence_collection_releases(
+    monkeypatch,
+):
+    provider, transport, _runtime = await _factory_provider(monkeypatch)
+    transport.ping = AsyncMock(return_value=True)
+    transport.start.reset_mock()
+
+    token, generation = await provider._acquire_generation_lease()
+    refresh = asyncio.create_task(provider.refresh())
+    await asyncio.sleep(0)
+
+    assert generation == "quote-generation-1"
+    assert refresh.done() is False
+    transport.stop.assert_not_awaited()
+
+    provider._release_generation_lease(token, generation)
+    await refresh
+
+    transport.stop.assert_awaited_once_with()
+    transport.start.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
 async def test_suspended_factory_provider_recovers_with_new_transport_generation(monkeypatch):
     provider, transport, runtime = await _factory_provider(monkeypatch)
     replacement = _WorkerGeneration("quote-generation-2", Mock())

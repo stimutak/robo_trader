@@ -696,7 +696,9 @@ Make broker truth visible and authoritative before any broker-writing capability
 
 - Startup, reconnect, and fixed-period triggers use one read-only diagnostic
   provider and publish a fresh, one-shot signed reconciliation result from the
-  same broker transport generation.
+  same broker transport generation. An exact provider-generation lease is held
+  from snapshot collection through protective marks and publication, so health
+  refresh, suspension, and close cannot splice two generations into one bundle.
 - Runtime database and bootstrap-receipt readiness are verified read-only before
   broker collection; absent, partial, or unauthenticated state fails closed
   without schema repair or data mutation.
@@ -720,8 +722,10 @@ Make broker truth visible and authoritative before any broker-writing capability
   operator-reviewed archival action is required before evidence collection can
   resume. Every admission performs a fresh held-root usage scan, excluding
   only the exact device/inode binding of its own current staging directory, so
-  externally added bundles cannot hide behind cached counters. The receiver
-  binds admission to the exact sealed entry identities,
+  externally added bundles cannot hide behind cached counters. A non-blocking
+  POSIX lock on the held evidence-root directory serializes that final scan
+  through completion-marker publication across cooperating processes. The
+  receiver binds admission to the exact sealed entry identities,
   hashes, and final completion-marker bytes immediately before publication.
   Completion-marker schema v2 commits that exact artifact manifest, and the
   loader rejects any added, replaced, removed, or rewritten directory entry;
@@ -731,7 +735,7 @@ Make broker truth visible and authoritative before any broker-writing capability
   suspended-provider recovery, broker-envelope replay, complete account-wide
   protective symbol scope, reduce-only continuity after artifact failures,
   non-destructive retention ceilings, and persisted eligibility expiry.
-- Synthetic and mocked verification on 2026-07-30: `3081 passed, 5 skipped`
+- Synthetic and mocked verification on 2026-07-30: `3082 passed, 5 skipped`
   across the complete pytest suite; Black and Flake8 passed for all changed
   Python files. No trader process, Gateway, broker session, or authoritative
   trading database was started or accessed.

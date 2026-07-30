@@ -1583,6 +1583,7 @@ class IBKRDiagnosticSnapshotProvider:
         "_closed",
         "_suspended",
         "_refresh_lock",
+        "_generation_lease_token",
     )
 
     def __init__(
@@ -1606,6 +1607,36 @@ class IBKRDiagnosticSnapshotProvider:
         self._closed = False
         self._suspended = False
         self._refresh_lock = asyncio.Lock()
+        self._generation_lease_token: object | None = None
+
+    async def _acquire_generation_lease(self) -> tuple[object, str]:
+        """Hold the exact transport generation against suspend/refresh/close."""
+
+        await self._refresh_lock.acquire()
+        try:
+            provider = assert_factory_owned_diagnostic_provider(self)
+            generation = provider._transport.protective_quote_generation
+            if self._generation_lease_token is not None:
+                raise BrokerEvidenceError("diagnostic provider generation is already leased")
+            token = object()
+            self._generation_lease_token = token
+            return token, generation
+        except BaseException:
+            self._refresh_lock.release()
+            raise
+
+    def _release_generation_lease(self, token: object, generation: str) -> None:
+        """Release only the exact lease after proving its generation stayed fixed."""
+
+        if token is not self._generation_lease_token or not self._refresh_lock.locked():
+            raise BrokerEvidenceError("diagnostic provider generation lease is invalid")
+        try:
+            provider = assert_factory_owned_diagnostic_provider(self)
+            if provider._transport.protective_quote_generation != generation:
+                raise BrokerEvidenceError("diagnostic provider changed during generation lease")
+        finally:
+            self._generation_lease_token = None
+            self._refresh_lock.release()
 
     async def get_broker_snapshot(
         self, expected_account: str, *, max_age_seconds: float
