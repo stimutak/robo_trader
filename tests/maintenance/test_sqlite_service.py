@@ -179,40 +179,58 @@ def test_preexisting_target_sidecar_is_preserved_without_main_creation(
 
 
 def test_sqlite_uses_private_namespace_and_never_unlinks_public_wal_replacement(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     source = tmp_path / "source.db"
     target = tmp_path / "target.db"
     public_wal = target.with_name(target.name + "-wal")
     protected_payload = b"irreplaceable-user-evidence"
     writer = _create_multiportfolio_database(source, wal=True)
-    service = SQLiteMaintenanceService()
-    real_connect = service._connect_bound
-    writable_paths: list[Path] = []
+    invoked = False
 
-    def observe_connect(binding, *, readonly, journal_off=False, immutable_readonly=False):
-        if not readonly:
-            writable_paths.append(binding.path)
+    def inject_public_sidecar(_operation: str, _remaining: int, _total: int) -> None:
+        nonlocal invoked
+        if not invoked:
+            invoked = True
             public_wal.write_bytes(protected_payload)
-        return real_connect(
-            binding,
-            readonly=readonly,
-            journal_off=journal_off,
-            immutable_readonly=immutable_readonly,
-        )
 
-    monkeypatch.setattr(service, "_connect_bound", observe_connect)
     try:
         with pytest.raises(SQLiteMaintenanceError, match="new exclusively-created SQLite family"):
-            service.backup(source, target)
+            SQLiteMaintenanceService(progress_hook=inject_public_sidecar).backup(source, target)
     finally:
         writer.close()
 
-    assert writable_paths
-    assert all(path != target and path.parent != target.parent for path in writable_paths)
-    assert stat.S_IMODE(writable_paths[0].parent.stat().st_mode) == 0o700
-    assert writable_paths[0].parent.name.startswith(f".{target.name}.robo-trader-stage-")
+    assert invoked
     assert public_wal.read_bytes() == protected_payload
+    assert not target.exists()
+    forensic_targets = list(tmp_path.glob(f".{target.name}.robo-trader-stage-*"))
+    assert len(forensic_targets) == 1
+    assert forensic_targets[0].is_file()
+    assert stat.S_IMODE(forensic_targets[0].stat().st_mode) == 0o400
+
+
+def test_staging_symlink_cannot_redirect_sqlite_into_attacker_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "target.db"
+    attacker_directory = tmp_path / "attacker"
+    attacker_directory.mkdir()
+    planted_wal = attacker_directory / "database.db-wal"
+    planted_wal.write_bytes(b"irreplaceable-user-data")
+    token = "a" * 32
+    staged_name = f".{target.name}.robo-trader-stage-{token}"
+    (tmp_path / staged_name).symlink_to(attacker_directory, target_is_directory=True)
+    writer = _create_multiportfolio_database(source, wal=True)
+    monkeypatch.setattr(sqlite_service_module.secrets, "token_hex", lambda _size: token)
+
+    try:
+        with pytest.raises(SQLiteMaintenanceError, match="staging name could not be reserved"):
+            SQLiteMaintenanceService().backup(source, target)
+    finally:
+        writer.close()
+
+    assert planted_wal.read_bytes() == b"irreplaceable-user-data"
     assert not target.exists()
 
 
@@ -313,7 +331,7 @@ def test_interrupted_backup_preserves_source_and_seals_forensic_target(tmp_path:
 
     assert source.read_bytes() == before
     assert not target.exists()
-    forensic_targets = list(tmp_path.glob(f".{target.name}.robo-trader-stage-*/database.db"))
+    forensic_targets = list(tmp_path.glob(f".{target.name}.robo-trader-stage-*"))
     assert len(forensic_targets) == 1
     assert stat.S_IMODE(forensic_targets[0].stat().st_mode) == 0o400
 
@@ -367,7 +385,7 @@ def test_hardlink_race_during_backup_fails_closed(
     def capture_stage(requested_path):
         nonlocal staged_path
         staged = real_stage(requested_path)
-        staged_path = staged.binding.path
+        staged_path = staged.forensic_path
         return staged
 
     def add_link(_operation: str, _remaining: int, _total: int) -> None:
@@ -378,7 +396,7 @@ def test_hardlink_race_during_backup_fails_closed(
             os.link(staged_path, alias)
 
     monkeypatch.setattr(service, "_stage_target", capture_stage)
-    with pytest.raises(SQLiteMaintenanceError, match="another filesystem link"):
+    with pytest.raises(SQLiteMaintenanceError, match="staged database identity changed"):
         service._progress_hook = add_link
         service.backup(source, target)
     assert source.exists()
@@ -404,7 +422,7 @@ def test_interrupted_restore_preserves_backup_and_seals_target(tmp_path: Path) -
         )
     assert backup.read_bytes() == backup_before
     assert not target.exists()
-    forensic_targets = list(tmp_path.glob(f".{target.name}.robo-trader-stage-*/database.db"))
+    forensic_targets = list(tmp_path.glob(f".{target.name}.robo-trader-stage-*"))
     assert len(forensic_targets) == 1
     assert stat.S_IMODE(forensic_targets[0].stat().st_mode) == 0o400
 
@@ -475,9 +493,7 @@ def test_migration_uses_the_copy_connection_without_a_writable_reopen(
     )
 
     assert report.outcome == "applied_to_synthetic_copy"
-    assert len(writable_paths) == 1
-    assert writable_paths[0] != target
-    assert writable_paths[0].parent != target.parent
+    assert writable_paths == []
     assert target not in all_opened_paths
 
 

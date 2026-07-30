@@ -76,9 +76,9 @@ type debt.
   online copy progress. Backup and restore artifacts are integrity-checked,
   foreign-key-checked, logically hashed, raw-file hashed, fsynced, and sealed
   read-only.
-- Failed or interrupted staged outputs are retained read-only inside their
-  private staging directory for forensic inspection and have no successful
-  manifest. They are never promoted or reused.
+- Failed or interrupted staged outputs are retained as randomly named,
+  read-only files for forensic inspection and have no successful manifest.
+  They are never promoted or reused.
 - Declarative migration plans run only against the new synthetic copy in a
   service-owned transaction. Transaction control, `ATTACH`, `DETACH`, and
   dangerous path/schema pragmas are denied; failures roll back and return a
@@ -86,13 +86,18 @@ type debt.
 
 ## 2026-07-30 exact-review follow-up
 
-Five additional exact-head P1 findings and the Python 3.10 CI failures were
+Six additional exact-head P1 findings and the Python 3.10 CI failures were
 remediated without touching authoritative data or runtime services:
 
-- SQLite now operates only in a fresh, unpredictable, owner-only staging
-  directory. It never opens the requested output path or any public sidecar
-  pathname. After close, the sealed main inode is published with an atomic
-  no-replace rename; the service performs no pathname unlink.
+- SQLite now operates only in memory. It never opens the requested output path,
+  a staging-directory path, or any public sidecar pathname. The exact finished
+  image is serialized into an exclusive file created with `openat` under a
+  bound parent-directory descriptor. The sealed inode is published with a
+  descriptor-relative atomic no-replace rename; the service performs no
+  pathname unlink.
+- A planted staging-name symlink cannot redirect SQLite into an attacker-owned
+  directory because no filesystem target connection exists. Exclusive file
+  creation refuses the symlink and preserves planted `database.db-wal` bytes.
 - A public `-wal`, `-shm`, or `-journal` substitution while SQLite is active is
   preserved byte-for-byte and causes publication to fail closed. This closes
   the Linux behavior where SQLite itself could unlink a replacement before a
@@ -111,8 +116,8 @@ remediated without touching authoritative data or runtime services:
 Current verification:
 
 ```text
-focused maintenance + multiuser + DB isolation: 197 passed
-full repository: 3036 passed, 5 skipped, 20 known warnings
+focused maintenance + multiuser + DB isolation: 198 passed
+full repository: 3037 passed, 5 skipped, 20 known warnings
 Python 3.10 direct authorizer commit/rollback probe: passed
 Black, isort, flake8, Bandit, mypy, and git diff checks on changed scope: passed
 ```

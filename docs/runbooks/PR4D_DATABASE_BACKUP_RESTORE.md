@@ -9,13 +9,14 @@ output path must be absolute, canonical, and nonexistent. Existing files,
 symlink leaves, hard-linked databases, and path substitution fail closed.
 SQLite `-wal`, `-shm`, and `-journal` companions are checked for safe type,
 link count, and stable identity while a snapshot is running. SQLite never opens
-the requested output path. It operates only inside a fresh, unpredictable,
-owner-only `.TARGET.robo-trader-stage-RANDOM/` directory. After SQLite closes,
-the service verifies that the staged family has no companions, seals the main
-file, and publishes that inode with an atomic no-replace rename. A public
-`-wal`, `-shm`, or `-journal` path is therefore never touched or deleted by the
-service or its SQLite connection. Staging directories are intentionally retained
-rather than removed through a pathname race.
+the requested output path or any other filesystem target. Online backup and
+migration run in an in-memory SQLite database. The service serializes the exact
+finished image into an `O_EXCL|O_NOFOLLOW` file created with `openat` beneath a
+bound `O_DIRECTORY|O_NOFOLLOW` parent descriptor, then publishes that inode
+with descriptor-relative atomic no-replace rename. A public `-wal`, `-shm`, or
+`-journal` path is therefore never touched or deleted by the service or its
+SQLite connection. There is no staging directory that a concurrent process
+can replace with a symlink.
 
 The supported operations are:
 
@@ -36,7 +37,7 @@ credentials, account identifiers, or broker configuration. They always state
 
 If backup, restore, or verification is interrupted, the source remains
 untouched. Any interrupted staged database is retained read-only in its private
-staging directory for forensic inspection; the requested output path remains
+randomly named file for forensic inspection; the requested output path remains
 absent, there is no successful manifest, and the partial file cannot be reused
 as a target.
 
@@ -71,8 +72,9 @@ startup.
 
 `SQLiteMaintenanceService.dry_run_migration(...)` first creates a SQLite online
 snapshot at a new synthetic path. The declarative plan runs within a
-service-owned transaction on the same descriptor-bound connection used to
-create and verify the copy; there is no writable reopen gap. Plan-supplied
+service-owned transaction on the same in-memory connection used to create and
+verify the copy; there is no writable reopen gap or filesystem SQLite target.
+Plan-supplied
 transaction control, `ATTACH`, and `DETACH` are denied. Success and rollback
 reports include before/after schema, row counts, content hashes, integrity
 state, and a source-unchanged result. Final report evidence and the artifact

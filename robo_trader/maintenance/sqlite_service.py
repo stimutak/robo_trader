@@ -35,6 +35,7 @@ from robo_trader.safety.sqlite_identity import (
     SQLitePathBinding,
     lexical_path_preserving_leaf,
     sqlite_connection_file_identity,
+    sqlite_connection_serialize,
 )
 
 ProgressHook = Callable[[str, int, int], None]
@@ -46,25 +47,86 @@ class SQLiteMaintenanceError(RuntimeError):
 
 @dataclass(slots=True)
 class _StagedTarget:
-    """Private SQLite namespace published only after the connection is closed."""
+    """Descriptor-bound artifact that SQLite never opens by pathname."""
 
-    binding: SQLitePathBinding
     requested_path: Path
-    staging_directory: Path
+    parent_file_descriptor: int
+    staging_name: str
+    guardian_file_descriptor: int
+    device: int
+    inode: int
     published: bool = False
 
-    def publish(self) -> None:
-        """Publish the sealed main inode without exposing SQLite to target sidecars."""
+    @property
+    def forensic_path(self) -> Path:
+        return self.requested_path.parent / self.staging_name
 
-        self.binding.assert_path_identity()
-        if _safe_companion_identities(self.binding.path):
-            raise SQLiteMaintenanceError("private staged SQLite database retained companion files")
-        _assert_target_family_absent(self.requested_path)
-        _rename_noreplace(self.binding.path, self.requested_path)
+    def assert_identity(self) -> None:
+        parent = os.fstat(self.parent_file_descriptor)
+        current_parent = os.lstat(self.requested_path.parent)
+        guardian = os.fstat(self.guardian_file_descriptor)
+        staged = os.stat(
+            self.staging_name,
+            dir_fd=self.parent_file_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or stat.S_ISLNK(current_parent.st_mode)
+            or not stat.S_ISDIR(current_parent.st_mode)
+            or (parent.st_dev, parent.st_ino) != (current_parent.st_dev, current_parent.st_ino)
+            or not stat.S_ISREG(guardian.st_mode)
+            or guardian.st_nlink != 1
+            or (guardian.st_dev, guardian.st_ino) != (self.device, self.inode)
+            or stat.S_ISLNK(staged.st_mode)
+            or not stat.S_ISREG(staged.st_mode)
+            or (staged.st_dev, staged.st_ino) != (self.device, self.inode)
+        ):
+            raise SQLiteMaintenanceError("staged database identity changed")
+
+    def write_database_image(self, payload: bytes) -> None:
+        self.assert_identity()
+        if os.fstat(self.guardian_file_descriptor).st_size != 0:
+            raise SQLiteMaintenanceError("staged database is not empty")
+        _pwrite_all(self.guardian_file_descriptor, payload)
+        self.assert_identity()
+
+    def seal_readonly(self) -> None:
+        self.assert_identity()
+        os.fsync(self.guardian_file_descriptor)
+        os.fchmod(self.guardian_file_descriptor, 0o400)
+        os.fsync(self.guardian_file_descriptor)
+        self.assert_identity()
+
+    def digest(self) -> tuple[str, int]:
+        self.assert_identity()
+        result = _descriptor_digest(self.guardian_file_descriptor)
+        self.assert_identity()
+        return result
+
+    def publish(self) -> None:
+        """Publish the sealed main inode with descriptor-relative no-replace rename."""
+
+        self.assert_identity()
+        _assert_target_family_absent_at(
+            self.parent_file_descriptor,
+            self.requested_path.name,
+        )
+        _rename_noreplace_at(
+            self.parent_file_descriptor,
+            self.staging_name,
+            self.parent_file_descriptor,
+            self.requested_path.name,
+        )
         self.published = True
-        descriptor_metadata = os.fstat(self.binding.guardian_file_descriptor)
+        descriptor_metadata = os.fstat(self.guardian_file_descriptor)
         path_metadata = os.lstat(self.requested_path)
-        expected = (self.binding.device, self.binding.inode)
+        bound_metadata = os.stat(
+            self.requested_path.name,
+            dir_fd=self.parent_file_descriptor,
+            follow_symlinks=False,
+        )
+        expected = (self.device, self.inode)
         if (
             not stat.S_ISREG(descriptor_metadata.st_mode)
             or descriptor_metadata.st_nlink != 1
@@ -72,6 +134,9 @@ class _StagedTarget:
             or stat.S_ISLNK(path_metadata.st_mode)
             or not stat.S_ISREG(path_metadata.st_mode)
             or (path_metadata.st_dev, path_metadata.st_ino) != expected
+            or stat.S_ISLNK(bound_metadata.st_mode)
+            or not stat.S_ISREG(bound_metadata.st_mode)
+            or (bound_metadata.st_dev, bound_metadata.st_ino) != expected
         ):
             raise SQLiteMaintenanceError("published database identity changed")
         if _safe_companion_identities(self.requested_path):
@@ -79,6 +144,33 @@ class _StagedTarget:
                 "target SQLite companion appeared during atomic publication"
             )
         _fsync_directory(self.requested_path.parent)
+
+    def seal_forensic(self) -> None:
+        try:
+            os.fsync(self.guardian_file_descriptor)
+        except OSError:
+            pass
+        try:
+            os.fchmod(self.guardian_file_descriptor, 0o400)
+        except OSError:
+            pass
+        try:
+            os.fsync(self.guardian_file_descriptor)
+            os.fsync(self.parent_file_descriptor)
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        errors: list[OSError] = []
+        for descriptor in (self.guardian_file_descriptor, self.parent_file_descriptor):
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                errors.append(exc)
+        if errors:
+            raise SQLiteMaintenanceError(
+                "staged database descriptor was already closed"
+            ) from errors[0]
 
 
 class SQLiteMaintenanceService:
@@ -367,7 +459,6 @@ class SQLiteMaintenanceService:
             ):
                 raise SQLiteMaintenanceError("copy source does not match the supplied manifest")
             staged_target = self._stage_target(target_candidate)
-            target = staged_target.binding
         except (sqlite3.Error, SQLiteIdentityError, OSError) as exc:
             if source_connection is not None:
                 source_connection.close()
@@ -383,22 +474,28 @@ class SQLiteMaintenanceService:
         try:
             if source_connection is None:
                 raise SQLiteMaintenanceError("copy source connection is unavailable")
-            if (source.device, source.inode) == (target.device, target.inode):
+            if (source.device, source.inode) == (
+                staged_target.device,
+                staged_target.inode,
+            ):
                 raise SQLiteMaintenanceError("source and target identities must differ")
-            target_connection, target = self._connect_bound(
-                target, readonly=False, journal_off=True
-            )
+            # SQLite operates only on an in-memory database.  The finished
+            # image is serialized into the descriptor-bound staged file, so no
+            # SQLite journal/WAL pathname can ever be redirected or removed.
+            target_connection = sqlite3.connect(":memory:", timeout=10.0)
+            mode_row = target_connection.execute("PRAGMA journal_mode=MEMORY").fetchone()
+            if mode_row is None or str(mode_row[0]).lower() != "memory":
+                raise SQLiteMaintenanceError("copy target in-memory journaling is unavailable")
+            target_connection.execute("PRAGMA foreign_keys=ON")
             source_db = source_connection
-            target_db = target_connection
             copy_started = time.monotonic()
 
             def progress(_status: int, remaining: int, total: int) -> None:
                 if time.monotonic() - copy_started > self._max_copy_seconds:
                     raise SQLiteMaintenanceError("SQLite online copy exceeded its deadline")
                 source.assert_connection_identity(sqlite_connection_file_identity(source_db))
-                target.assert_connection_identity(sqlite_connection_file_identity(target_db))
                 _assert_single_link(source)
-                _assert_single_link(target)
+                staged_target.assert_identity()
                 _assert_companion_identities(source.path, source_companions)
                 if self._progress_hook is not None:
                     self._progress_hook(operation, remaining, total)
@@ -406,9 +503,8 @@ class SQLiteMaintenanceService:
             source_connection.backup(target_connection, pages=64, progress=progress, sleep=0.001)
             target_connection.commit()
             source.assert_connection_identity(sqlite_connection_file_identity(source_connection))
-            target.assert_connection_identity(sqlite_connection_file_identity(target_connection))
             _assert_single_link(source)
-            _assert_single_link(target)
+            staged_target.assert_identity()
             _assert_companion_identities(source.path, source_companions)
             evidence = _database_evidence(target_connection)
             final_source_sha256, final_source_size = _descriptor_digest(
@@ -426,22 +522,17 @@ class SQLiteMaintenanceService:
                 raise SQLiteMaintenanceError("copied evidence differs from supplied manifest")
             hook_result: object | None = None
             if target_hook is not None:
-                target.assert_connection_identity(
-                    sqlite_connection_file_identity(target_connection)
-                )
-                _assert_single_link(target)
+                staged_target.assert_identity()
                 hook_result = target_hook(target_connection, evidence)
-                target.assert_connection_identity(
-                    sqlite_connection_file_identity(target_connection)
-                )
-                _assert_single_link(target)
+                staged_target.assert_identity()
                 evidence = _database_evidence(target_connection)
+            database_image = sqlite_connection_serialize(target_connection)
             target_connection.close()
             target_connection = None
-            _seal_readonly(target)
-            _fsync_directory(target.path.parent)
-            artifact_sha256, artifact_size = _descriptor_digest(target.guardian_file_descriptor)
-            target.assert_path_identity()
+            staged_target.write_database_image(database_image)
+            staged_target.seal_readonly()
+            os.fsync(staged_target.parent_file_descriptor)
+            artifact_sha256, artifact_size = staged_target.digest()
             manifest = MaintenanceManifest(
                 manifest_version=1,
                 operation=operation,
@@ -462,10 +553,10 @@ class SQLiteMaintenanceService:
                 source_connection.close()
             try:
                 if not succeeded:
-                    _seal_forensic_target(target)
+                    staged_target.seal_forensic()
             finally:
                 source.close()
-                target.close()
+                staged_target.close()
 
     @staticmethod
     def _open_source(
@@ -496,41 +587,68 @@ class SQLiteMaintenanceService:
     @staticmethod
     def _stage_target(target_path: Path | str) -> _StagedTarget:
         path = _absolute_canonical_path(target_path)
+        if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+            raise SQLiteMaintenanceError("platform lacks descriptor-relative target isolation")
+        parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
         try:
-            parent = os.lstat(path.parent)
+            parent_file_descriptor = os.open(path.parent, parent_flags)
         except OSError as exc:
-            raise SQLiteMaintenanceError("target parent does not exist") from exc
-        if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
-            raise SQLiteMaintenanceError("target parent must be a non-symlink directory")
-        _assert_target_family_absent(path)
-        for _attempt in range(4):
-            staging_directory = path.parent / (
-                f".{path.name}.robo-trader-stage-{secrets.token_hex(16)}"
-            )
-            try:
-                os.mkdir(staging_directory, 0o700)
-            except FileExistsError:
-                continue
-            except OSError as exc:
-                raise SQLiteMaintenanceError(
-                    "private target staging directory cannot be created"
-                ) from exc
-            staged_path = staging_directory / "database.db"
-            try:
-                binding = SQLitePathBinding.open_for_initialization(
-                    staged_path,
-                    create=True,
-                )
-            except SQLiteIdentityError as exc:
-                raise SQLiteMaintenanceError(
-                    "private staged database identity cannot be established"
-                ) from exc
-            return _StagedTarget(
-                binding=binding,
-                requested_path=path,
-                staging_directory=staging_directory,
-            )
-        raise SQLiteMaintenanceError("private target staging name could not be reserved")
+            raise SQLiteMaintenanceError("target parent cannot be opened safely") from exc
+        try:
+            parent = os.fstat(parent_file_descriptor)
+            current_parent = os.lstat(path.parent)
+            if (
+                not stat.S_ISDIR(parent.st_mode)
+                or stat.S_ISLNK(current_parent.st_mode)
+                or not stat.S_ISDIR(current_parent.st_mode)
+                or (parent.st_dev, parent.st_ino) != (current_parent.st_dev, current_parent.st_ino)
+            ):
+                raise SQLiteMaintenanceError("target parent identity changed")
+            _assert_target_family_absent_at(parent_file_descriptor, path.name)
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+            for _attempt in range(4):
+                staging_name = f".{path.name}.robo-trader-stage-{secrets.token_hex(16)}"
+                try:
+                    guardian = os.open(
+                        staging_name,
+                        flags,
+                        0o600,
+                        dir_fd=parent_file_descriptor,
+                    )
+                except FileExistsError:
+                    continue
+                except OSError as exc:
+                    raise SQLiteMaintenanceError(
+                        "private staged database cannot be created"
+                    ) from exc
+                try:
+                    metadata = os.fstat(guardian)
+                    staged = os.stat(
+                        staging_name,
+                        dir_fd=parent_file_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        not stat.S_ISREG(metadata.st_mode)
+                        or metadata.st_nlink != 1
+                        or (metadata.st_dev, metadata.st_ino) != (staged.st_dev, staged.st_ino)
+                    ):
+                        raise SQLiteMaintenanceError("private staged database identity changed")
+                    return _StagedTarget(
+                        requested_path=path,
+                        parent_file_descriptor=parent_file_descriptor,
+                        staging_name=staging_name,
+                        guardian_file_descriptor=guardian,
+                        device=metadata.st_dev,
+                        inode=metadata.st_ino,
+                    )
+                except BaseException:
+                    os.close(guardian)
+                    raise
+            raise SQLiteMaintenanceError("private target staging name could not be reserved")
+        except BaseException:
+            os.close(parent_file_descriptor)
+            raise
 
     @staticmethod
     def _connect_bound(
@@ -782,7 +900,12 @@ def _post_migration_authorizer(
     return _migration_authorizer(action, arg1, arg2, database, trigger)
 
 
-def _rename_noreplace(source: Path, target: Path) -> None:
+def _rename_noreplace_at(
+    source_directory_descriptor: int,
+    source_name: str,
+    target_directory_descriptor: int,
+    target_name: str,
+) -> None:
     """Atomically move a pathname without replacing any destination.
 
     Python does not expose the platform no-replace rename flags.  Maintenance
@@ -791,9 +914,8 @@ def _rename_noreplace(source: Path, target: Path) -> None:
     """
 
     libc = ctypes.CDLL(None, use_errno=True)
-    at_fdcwd = -100
-    source_bytes = os.fsencode(source)
-    target_bytes = os.fsencode(target)
+    source_bytes = os.fsencode(source_name)
+    target_bytes = os.fsencode(target_name)
     if sys.platform.startswith("linux"):
         try:
             rename = libc.renameat2
@@ -809,7 +931,13 @@ def _rename_noreplace(source: Path, target: Path) -> None:
             ctypes.c_uint,
         )
         rename.restype = ctypes.c_int
-        result = rename(at_fdcwd, source_bytes, at_fdcwd, target_bytes, 1)
+        result = rename(
+            source_directory_descriptor,
+            source_bytes,
+            target_directory_descriptor,
+            target_bytes,
+            1,
+        )
     elif sys.platform == "darwin":
         try:
             rename = libc.renameatx_np
@@ -825,12 +953,18 @@ def _rename_noreplace(source: Path, target: Path) -> None:
             ctypes.c_uint,
         )
         rename.restype = ctypes.c_int
-        result = rename(at_fdcwd, source_bytes, at_fdcwd, target_bytes, 0x00000004)
+        result = rename(
+            source_directory_descriptor,
+            source_bytes,
+            target_directory_descriptor,
+            target_bytes,
+            0x00000004,
+        )
     else:
         raise SQLiteMaintenanceError("platform cannot quarantine a reservation without replacement")
     if result != 0:
         error_number = ctypes.get_errno()
-        raise OSError(error_number, os.strerror(error_number), str(source))
+        raise OSError(error_number, os.strerror(error_number), source_name)
 
 
 def _assert_single_link(binding: SQLitePathBinding) -> None:
@@ -841,30 +975,6 @@ def _assert_single_link(binding: SQLitePathBinding) -> None:
         binding.assert_path_identity()
     except SQLiteIdentityError as exc:
         raise SQLiteMaintenanceError("database path identity changed") from exc
-
-
-def _seal_readonly(binding: SQLitePathBinding) -> None:
-    _assert_single_link(binding)
-    os.fsync(binding.guardian_file_descriptor)
-    os.fchmod(binding.guardian_file_descriptor, 0o400)
-    os.fsync(binding.guardian_file_descriptor)
-    _assert_single_link(binding)
-
-
-def _seal_forensic_target(binding: SQLitePathBinding) -> None:
-    try:
-        os.fsync(binding.guardian_file_descriptor)
-    except OSError:
-        pass
-    try:
-        os.fchmod(binding.guardian_file_descriptor, 0o400)
-    except OSError:
-        pass
-    try:
-        os.fsync(binding.guardian_file_descriptor)
-        _fsync_directory(binding.path.parent)
-    except OSError:
-        pass
 
 
 def _sqlite_resource_family(path: Path) -> frozenset[Path]:
@@ -882,6 +992,21 @@ def _assert_target_family_absent(path: Path) -> None:
     for member in _sqlite_resource_family(path):
         try:
             os.lstat(member)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise SQLiteMaintenanceError("target SQLite family cannot be inspected") from exc
+        raise SQLiteMaintenanceError("target must be a new exclusively-created SQLite family")
+
+
+def _assert_target_family_absent_at(parent_descriptor: int, database_name: str) -> None:
+    for suffix in ("", "-journal", "-shm", "-wal"):
+        try:
+            os.stat(
+                database_name + suffix,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
         except FileNotFoundError:
             continue
         except OSError as exc:
@@ -961,6 +1086,15 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         written = os.write(descriptor, payload[offset:])
         if written <= 0:
             raise SQLiteMaintenanceError("manifest write did not make progress")
+        offset += written
+
+
+def _pwrite_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.pwrite(descriptor, payload[offset:], offset)
+        if written <= 0:
+            raise SQLiteMaintenanceError("database image write did not make progress")
         offset += written
 
 
