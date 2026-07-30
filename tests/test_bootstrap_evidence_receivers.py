@@ -281,6 +281,36 @@ class _Provider:
 
 
 @pytest.mark.asyncio
+async def test_runtime_consumed_broker_envelope_cannot_be_handed_off_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _install_test_trust(monkeypatch, tmp_path)
+    database = tmp_path / "ledger.db"
+    _ledger(database)
+    receivers = create_bootstrap_evidence_receivers(
+        runtime_contract=_runtime(database),
+        capability_directory=capability,
+        output_directory=tmp_path / "evidence",
+    )
+    provider = _Provider(_broker_result(datetime.now(timezone.utc)))
+    envelope = await provider.produce_normalized_snapshot(
+        receiver=receivers.broker_snapshot,
+        max_age_seconds=30.0,
+    )
+
+    receiver_core.assert_and_consume_verified_broker_evidence(envelope)
+    receiver_core._handoff_consumed_verified_broker_evidence_to_runtime(envelope)
+    receiver_core.assert_and_consume_verified_broker_evidence(envelope)
+
+    with pytest.raises(BootstrapEvidenceReceiverError, match="already handed off"):
+        receiver_core._handoff_consumed_verified_broker_evidence_to_runtime(envelope)
+    with pytest.raises(BootstrapEvidenceReceiverError, match="already consumed"):
+        receiver_core.assert_and_consume_verified_broker_evidence(envelope)
+    receivers.close()
+
+
+@pytest.mark.asyncio
 async def test_full_empty_position_evidence_chain_is_typed_and_one_shot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

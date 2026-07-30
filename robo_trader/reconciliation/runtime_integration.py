@@ -32,7 +32,7 @@ from robo_trader.bootstrap_mark_producer import (
 from robo_trader.config import RuntimeContract
 from robo_trader.database_migrations import assert_exact_state_schema
 from robo_trader.financial_state_bootstrap import load_exact_state_bootstrap_evidence
-from robo_trader.safety.sqlite_identity import SQLitePathBinding
+from robo_trader.safety.sqlite_identity import SQLitePathBinding, lexical_path_preserving_leaf
 
 from .bootstrap_producer import produce_bootstrap_reconciliation
 from .ibkr_adapter import (
@@ -92,6 +92,44 @@ def runtime_reconciliation_status_path(
     if configured:
         return _absolute_lexical_path(configured, "reconciliation status path")
     return Path(runtime_contract.database_path).parent / _STATUS_FILENAME
+
+
+def _assert_status_path_is_unprotected(
+    status_path: Path,
+    *,
+    runtime_contract: RuntimeContract,
+    capability_directory: Path,
+    evidence_root: Path,
+) -> None:
+    """Reject status targets that could replace protected runtime artifacts."""
+
+    protected_files: set[Path] = set()
+    for configured in (
+        runtime_contract.database_path,
+        runtime_contract.safety_journal_path,
+    ):
+        if not isinstance(configured, str) or not configured:
+            continue
+        protected = lexical_path_preserving_leaf(configured)
+        protected_files.update(
+            {
+                protected,
+                Path(f"{protected}-wal"),
+                Path(f"{protected}-shm"),
+                Path(f"{protected}-journal"),
+            }
+        )
+    target = lexical_path_preserving_leaf(status_path)
+    protected_directories = (
+        lexical_path_preserving_leaf(capability_directory),
+        lexical_path_preserving_leaf(evidence_root),
+    )
+    if target in protected_files or any(
+        target == directory or directory in target.parents for directory in protected_directories
+    ):
+        raise RuntimeReconciliationIntegrationError(
+            "reconciliation status path overlaps protected runtime state"
+        )
 
 
 async def assert_runtime_bootstrap_ready(runtime_context: RuntimeSafetyContext) -> None:
@@ -522,23 +560,53 @@ def read_runtime_reconciliation_status(path: Path) -> dict[str, object]:
         }
         if type(payload) is not dict or set(payload) != allowed:
             return unavailable
+        if payload["schema_version"] != 1:
+            return unavailable
+        entry_eligible = payload["entry_eligible"]
+        quarantined = payload["quarantined"]
+        if type(entry_eligible) is not bool or type(quarantined) is not bool:
+            return unavailable
+        if entry_eligible is quarantined:
+            return unavailable
         completed_at = payload["completed_at"]
+        eligible_until = payload["eligible_until"]
         age_seconds = None
+        now = datetime.now(timezone.utc)
         if isinstance(completed_at, str):
             observed = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
             if observed.tzinfo is None:
                 return unavailable
+            observed = observed.astimezone(timezone.utc)
+            if observed > now:
+                return unavailable
             age_seconds = max(
                 0.0,
-                (datetime.now(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds(),
+                (now - observed).total_seconds(),
             )
+        elif completed_at is not None:
+            return unavailable
+        if isinstance(eligible_until, str):
+            expires = datetime.fromisoformat(eligible_until.replace("Z", "+00:00"))
+            if expires.tzinfo is None:
+                return unavailable
+            expires = expires.astimezone(timezone.utc)
+            if not isinstance(completed_at, str) or expires < observed:
+                return unavailable
+        elif eligible_until is not None:
+            return unavailable
+        if entry_eligible and (
+            not isinstance(completed_at, str)
+            or not isinstance(eligible_until, str)
+            or now > expires
+        ):
+            return unavailable
         return {
             "state": payload["state"],
             "trigger": payload["trigger"],
             "completed_at": completed_at,
-            "eligible_until": payload["eligible_until"],
-            "entry_eligible": payload["entry_eligible"] is True,
-            "quarantined": payload["quarantined"] is True,
+            "eligible_until": eligible_until,
+            "entry_eligible": entry_eligible,
+            "quarantined": quarantined,
             "age_seconds": None if age_seconds is None else round(age_seconds, 3),
         }
     except Exception:
@@ -568,6 +636,13 @@ async def build_runtime_reconciliation_controller(
     )
     _require_private_directory(capability_directory, "signing capability directory")
     _require_private_directory(evidence_root, "reconciliation evidence root")
+    status_path = runtime_reconciliation_status_path(runtime, environment)
+    _assert_status_path_is_unprotected(
+        status_path,
+        runtime_contract=runtime,
+        capability_directory=capability_directory,
+        evidence_root=evidence_root,
+    )
     await assert_runtime_bootstrap_ready(context)
     provider = await build_diagnostic_provider(context)
     try:
@@ -584,7 +659,7 @@ async def build_runtime_reconciliation_controller(
         )
         controller = RuntimeReconciliationController(
             service,
-            status_path=runtime_reconciliation_status_path(runtime, environment),
+            status_path=status_path,
         )
         return controller, provider
     except BaseException:

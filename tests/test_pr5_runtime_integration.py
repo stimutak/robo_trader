@@ -265,6 +265,41 @@ def test_missing_or_malformed_status_is_quarantined(tmp_path: Path) -> None:
     assert read_runtime_reconciliation_status(malformed) == expected
 
 
+@pytest.mark.parametrize(
+    "eligible_until",
+    [
+        (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+        "not-a-timestamp",
+        "2026-07-30T12:00:00",
+    ],
+)
+def test_expired_or_malformed_persisted_eligibility_is_quarantined(
+    tmp_path: Path,
+    eligible_until: str,
+) -> None:
+    status_path = tmp_path / "status.json"
+    integration._write_status(
+        status_path,
+        {
+            "schema_version": 1,
+            "state": "ready",
+            "trigger": "startup",
+            "completed_at": (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat(),
+            "eligible_until": eligible_until,
+            "entry_eligible": True,
+            "quarantined": False,
+            "run_id": "not-exposed",
+            "snapshot_id": "not-exposed",
+        },
+    )
+
+    status = read_runtime_reconciliation_status(status_path)
+
+    assert status["state"] == "unavailable"
+    assert status["entry_eligible"] is False
+    assert status["quarantined"] is True
+
+
 @pytest.mark.asyncio
 async def test_builder_requires_explicit_signing_paths_before_provider_start(
     tmp_path: Path,
@@ -290,6 +325,59 @@ async def test_builder_requires_explicit_signing_paths_before_provider_start(
     ):
         await build_runtime_reconciliation_controller(context)
 
+    readiness.assert_not_awaited()
+    provider.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protected_target", ["database", "journal", "capability"])
+async def test_builder_rejects_protected_status_target_before_overwrite_or_provider_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    protected_target: str,
+) -> None:
+    database = tmp_path / "ledger.db"
+    database.write_bytes(b"ledger-state")
+    runtime = _runtime(database)
+    journal = Path(runtime.safety_journal_path)
+    journal.write_bytes(b"journal-state")
+    capability_directory = tmp_path / "capabilities"
+    evidence_root = tmp_path / "evidence"
+    capability_directory.mkdir(mode=0o700)
+    evidence_root.mkdir(mode=0o700)
+    capability_file = capability_directory / "broker_snapshot_private.pem"
+    capability_file.write_bytes(b"signing-capability")
+    targets = {
+        "database": database,
+        "journal": journal,
+        "capability": capability_file,
+    }
+    target = targets[protected_target]
+    before = target.read_bytes()
+    context = SimpleNamespace(runtime_contract=runtime)
+    monkeypatch.setattr(
+        integration,
+        "assert_validated_runtime_safety_context",
+        lambda value: value,
+    )
+    monkeypatch.setenv(
+        "RT_RECONCILIATION_SIGNING_CAPABILITY_DIR",
+        str(capability_directory),
+    )
+    monkeypatch.setenv("RT_RECONCILIATION_EVIDENCE_ROOT", str(evidence_root))
+    monkeypatch.setenv("RT_RECONCILIATION_STATUS_PATH", str(target))
+    readiness = AsyncMock()
+    provider = AsyncMock()
+    monkeypatch.setattr(integration, "assert_runtime_bootstrap_ready", readiness)
+    monkeypatch.setattr(integration, "build_diagnostic_provider", provider)
+
+    with pytest.raises(
+        RuntimeReconciliationIntegrationError,
+        match="overlaps protected runtime state",
+    ):
+        await build_runtime_reconciliation_controller(context)
+
+    assert target.read_bytes() == before
     readiness.assert_not_awaited()
     provider.assert_not_awaited()
 

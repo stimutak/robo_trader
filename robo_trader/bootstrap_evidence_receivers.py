@@ -252,10 +252,17 @@ class VerifiedBrokerEvidenceEnvelope:
         raise TypeError("verified broker envelope cannot be pickled")
 
 
-_VerifiedBrokerRegistryEntry = tuple[
-    weakref.ReferenceType[VerifiedBrokerEvidenceEnvelope],
-    str,
-]
+@dataclass(frozen=True, slots=True)
+class _VerifiedBrokerRegistryEntry:
+    reference: weakref.ReferenceType[VerifiedBrokerEvidenceEnvelope]
+    digest: str
+    phase: str
+
+
+_BROKER_PHASE_PRODUCER_READY = "producer_ready"
+_BROKER_PHASE_PRODUCER_CONSUMED = "producer_consumed"
+_BROKER_PHASE_RUNTIME_READY = "runtime_ready"
+_BROKER_PHASE_RUNTIME_CONSUMED = "runtime_consumed"
 _VERIFIED_BROKER_REGISTRY: dict[int, _VerifiedBrokerRegistryEntry] = {}
 
 
@@ -288,14 +295,18 @@ def _register_verified_broker_envelope(
     def discard(reference: weakref.ReferenceType[VerifiedBrokerEvidenceEnvelope]) -> None:
         with _VERIFIED_BROKER_REGISTRY_LOCK:
             current = _VERIFIED_BROKER_REGISTRY.get(object_id)
-            if current is not None and current[0] is reference:
+            if current is not None and current.reference is reference:
                 _VERIFIED_BROKER_REGISTRY.pop(object_id, None)
 
     reference = weakref.ref(envelope, discard)
     with _VERIFIED_BROKER_REGISTRY_LOCK:
-        _VERIFIED_BROKER_REGISTRY[object_id] = (
-            reference,
-            _verified_broker_digest(envelope),
+        current = _VERIFIED_BROKER_REGISTRY.get(object_id)
+        if current is not None and current.reference() is not None:
+            raise BootstrapEvidenceReceiverError("verified broker envelope is already registered")
+        _VERIFIED_BROKER_REGISTRY[object_id] = _VerifiedBrokerRegistryEntry(
+            reference=reference,
+            digest=_verified_broker_digest(envelope),
+            phase=_BROKER_PHASE_PRODUCER_READY,
         )
     return envelope
 
@@ -309,16 +320,27 @@ def assert_and_consume_verified_broker_evidence(
         raise BootstrapEvidenceReceiverError("exact verified broker envelope is required")
     digest = _verified_broker_digest(envelope)
     with _VERIFIED_BROKER_REGISTRY_LOCK:
-        registered = _VERIFIED_BROKER_REGISTRY.pop(id(envelope), None)
+        registered = _VERIFIED_BROKER_REGISTRY.get(id(envelope))
         if (
             registered is None
-            or registered[0]() is not envelope
+            or registered.reference() is not envelope
             or envelope._marker is not _VERIFIED_BROKER_MARKER
-            or not secrets.compare_digest(registered[1], digest)
+            or not secrets.compare_digest(registered.digest, digest)
+            or registered.phase not in {_BROKER_PHASE_PRODUCER_READY, _BROKER_PHASE_RUNTIME_READY}
         ):
             raise BootstrapEvidenceReceiverError(
                 "verified broker envelope is forged, changed, or already consumed"
             )
+        phase = (
+            _BROKER_PHASE_PRODUCER_CONSUMED
+            if registered.phase == _BROKER_PHASE_PRODUCER_READY
+            else _BROKER_PHASE_RUNTIME_CONSUMED
+        )
+        _VERIFIED_BROKER_REGISTRY[id(envelope)] = _VerifiedBrokerRegistryEntry(
+            reference=registered.reference,
+            digest=registered.digest,
+            phase=phase,
+        )
     return envelope
 
 
@@ -336,10 +358,25 @@ def _handoff_consumed_verified_broker_evidence_to_runtime(
 
     if type(envelope) is not VerifiedBrokerEvidenceEnvelope:
         raise BootstrapEvidenceReceiverError("exact verified broker envelope is required")
+    digest = _verified_broker_digest(envelope)
     with _VERIFIED_BROKER_REGISTRY_LOCK:
-        if id(envelope) in _VERIFIED_BROKER_REGISTRY:
-            raise BootstrapEvidenceReceiverError("verified broker envelope is already registered")
-    return _register_verified_broker_envelope(envelope)
+        registered = _VERIFIED_BROKER_REGISTRY.get(id(envelope))
+        if (
+            registered is None
+            or registered.reference() is not envelope
+            or envelope._marker is not _VERIFIED_BROKER_MARKER
+            or not secrets.compare_digest(registered.digest, digest)
+            or registered.phase != _BROKER_PHASE_PRODUCER_CONSUMED
+        ):
+            raise BootstrapEvidenceReceiverError(
+                "verified broker envelope was not producer-consumed or was already handed off"
+            )
+        _VERIFIED_BROKER_REGISTRY[id(envelope)] = _VerifiedBrokerRegistryEntry(
+            reference=registered.reference,
+            digest=registered.digest,
+            phase=_BROKER_PHASE_RUNTIME_READY,
+        )
+    return envelope
 
 
 @dataclass(slots=True)

@@ -20,6 +20,7 @@ from robo_trader.reconciliation.ibkr_adapter import (
     IBKRDiagnosticSnapshotProvider,
     ProtectiveQuoteSourceCapability,
     ProtectiveQuoteSourceIdentity,
+    assert_factory_owned_diagnostic_provider,
     assert_factory_owned_protective_quote_source,
     assert_producer_owned_broker_snapshot_result,
     build_diagnostic_provider,
@@ -570,6 +571,42 @@ async def test_factory_provider_refreshes_one_shared_read_only_transport(monkeyp
     )
     transport.ping.assert_awaited_once_with()
     assert provider._shared_gateway_transport(runtime_context=runtime) is transport
+
+
+@pytest.mark.asyncio
+async def test_suspended_factory_provider_recovers_with_new_transport_generation(monkeypatch):
+    provider, transport, runtime = await _factory_provider(monkeypatch)
+    replacement = _WorkerGeneration("quote-generation-2", Mock())
+
+    async def stop_transport() -> None:
+        transport._generation = None
+        transport._connected = False
+        transport._connection_generation_id = None
+
+    async def connect_transport(**kwargs) -> bool:
+        assert kwargs["readonly"] is True
+        transport._generation = replacement
+        transport._connected = True
+        transport._connection_identity = ("127.0.0.1", 4002, 997, True)
+        transport._connection_generation_id = replacement.generation_id
+        return True
+
+    transport.stop = AsyncMock(side_effect=stop_transport)
+    transport.connect = AsyncMock(side_effect=connect_transport)
+    transport.ping = AsyncMock(return_value=True)
+
+    await provider.suspend()
+
+    with pytest.raises(BrokerEvidenceError, match="factory-owned"):
+        assert_factory_owned_diagnostic_provider(provider)
+    with pytest.raises(BrokerEvidenceError, match="factory-owned"):
+        provider._shared_gateway_transport(runtime_context=runtime)
+
+    await provider.refresh()
+
+    assert transport.stop.await_count == 2
+    assert provider._shared_gateway_transport(runtime_context=runtime) is transport
+    assert transport.protective_quote_generation == "quote-generation-2"
 
 
 @pytest.mark.parametrize(

@@ -1333,6 +1333,7 @@ def assert_factory_owned_diagnostic_provider(
         or entry.provider is not provider
         or provider._factory_marker is not _FACTORY_PROVIDER_MARKER
         or provider._closed is not False
+        or provider._suspended is not False
         or type(provider._transport) is not SubprocessIBKRClient
         or entry.transport is not provider._transport
         or entry.runtime_contract is not provider._runtime_contract
@@ -1347,6 +1348,42 @@ def assert_factory_owned_diagnostic_provider(
     if generation != entry.transport_generation or not hmac.compare_digest(entry.digest, digest):
         _invalidate_factory_provider(provider)
         raise BrokerEvidenceError("diagnostic provider generation or runtime binding changed")
+    return provider
+
+
+def _claim_factory_provider_for_refresh(
+    provider: object,
+) -> IBKRDiagnosticSnapshotProvider:
+    """Consume factory ownership even when the registered transport is suspended."""
+
+    if type(provider) is not IBKRDiagnosticSnapshotProvider:
+        raise BrokerEvidenceError("exact diagnostic provider is required")
+    with _FACTORY_PROVIDER_LOCK:
+        entry = _FACTORY_PROVIDERS.get(id(provider))
+        if (
+            entry is None
+            or entry.provider is not provider
+            or provider._factory_marker is not _FACTORY_PROVIDER_MARKER
+            or provider._closed is not False
+            or type(provider._transport) is not SubprocessIBKRClient
+            or entry.transport is not provider._transport
+            or entry.runtime_contract is not provider._runtime_contract
+            or provider._diagnostic_connection is None
+        ):
+            raise BrokerEvidenceError("diagnostic provider is not factory-owned")
+        generation = entry.transport_generation
+        if provider._suspended is not True:
+            try:
+                generation = entry.transport.protective_quote_generation
+            except Exception as exc:
+                raise BrokerEvidenceError("diagnostic provider generation is unavailable") from exc
+        digest = _factory_provider_digest(provider, transport_generation=generation)
+        if generation != entry.transport_generation or not hmac.compare_digest(
+            entry.digest, digest
+        ):
+            _FACTORY_PROVIDERS.pop(id(provider), None)
+            raise BrokerEvidenceError("diagnostic provider generation or runtime binding changed")
+        _FACTORY_PROVIDERS.pop(id(provider), None)
     return provider
 
 
@@ -1545,6 +1582,7 @@ class IBKRDiagnosticSnapshotProvider:
         "_diagnostic_connection",
         "_factory_marker",
         "_closed",
+        "_suspended",
     )
 
     def __init__(
@@ -1566,6 +1604,7 @@ class IBKRDiagnosticSnapshotProvider:
         self._diagnostic_connection = diagnostic_connection
         self._factory_marker = _factory_marker
         self._closed = False
+        self._suspended = False
 
     async def get_broker_snapshot(
         self, expected_account: str, *, max_age_seconds: float
@@ -1654,6 +1693,7 @@ class IBKRDiagnosticSnapshotProvider:
         if self._closed:
             return
         self._closed = True
+        self._suspended = True
         _invalidate_factory_provider(self)
         await _stop_transport_required(self._transport)
 
@@ -1667,16 +1707,16 @@ class IBKRDiagnosticSnapshotProvider:
         except BaseException:
             await _stop_transport_required(self._transport)
             raise
+        self._suspended = True
         await _stop_transport_required(self._transport)
 
     async def refresh(self) -> None:
         """Replace the owned read-only transport generation in place."""
 
-        assert_factory_owned_diagnostic_provider(self)
         connection = self._diagnostic_connection
         if connection is None:
             raise BrokerEvidenceError("diagnostic connection binding is unavailable")
-        _invalidate_factory_provider(self)
+        _claim_factory_provider_for_refresh(self)
         try:
             await _stop_transport_required(self._transport)
             await self._transport.start()
@@ -1689,6 +1729,7 @@ class IBKRDiagnosticSnapshotProvider:
             )
             if connected is not True or await self._transport.ping() is not True:
                 raise BrokerEvidenceError("diagnostic broker connection did not recover")
+            self._suspended = False
             _register_factory_provider(
                 self,
                 transport=self._transport,
@@ -1696,6 +1737,7 @@ class IBKRDiagnosticSnapshotProvider:
             )
         except BaseException:
             self._closed = True
+            self._suspended = True
             try:
                 await await_cleanup_required(_stop_transport_required(self._transport))
             except Exception as cleanup_exc:

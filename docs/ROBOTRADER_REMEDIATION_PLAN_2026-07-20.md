@@ -706,7 +706,9 @@ Make broker truth visible and authoritative before any broker-writing capability
 - Dashboard status exposes only sanitized reconciliation state, age, trigger,
   and quarantine/eligibility fields; signing-capability paths and broker
   evidence are not exposed.
-- Synthetic and mocked verification on 2026-07-30: `3029 passed, 5 skipped`
+- Adversarial regressions cover protected status targets, suspended-provider
+  recovery, broker-envelope replay, and persisted eligibility expiry.
+- Synthetic and mocked verification on 2026-07-30: `3037 passed, 5 skipped`
   across the complete pytest suite; Black and Flake8 passed for all changed
   Python files. No trader process, Gateway, broker session, or authoritative
   trading database was started or accessed.
