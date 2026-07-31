@@ -301,6 +301,7 @@ class SQLiteMaintenanceService:
         max_copy_seconds: float = 120.0,
         max_migration_seconds: float = 30.0,
         max_migration_growth_bytes: int = 64 * 1024 * 1024,
+        max_source_bytes: int = 256 * 1024 * 1024,
     ) -> None:
         if not math.isfinite(max_copy_seconds) or not 1.0 <= max_copy_seconds <= 3600.0:
             raise ValueError("max_copy_seconds must be between 1 and 3600")
@@ -311,10 +312,16 @@ class SQLiteMaintenanceService:
             or not 1024 * 1024 <= max_migration_growth_bytes <= 1024 * 1024 * 1024
         ):
             raise ValueError("max_migration_growth_bytes must be between 1 MiB and 1 GiB")
+        if (
+            type(max_source_bytes) is not int
+            or not 1024 * 1024 <= max_source_bytes <= 1024 * 1024 * 1024
+        ):
+            raise ValueError("max_source_bytes must be between 1 MiB and 1 GiB")
         self._progress_hook = progress_hook
         self._max_copy_seconds = max_copy_seconds
         self._max_migration_seconds = max_migration_seconds
         self._max_migration_growth_bytes = max_migration_growth_bytes
+        self._max_source_bytes = max_source_bytes
 
     def verify(
         self,
@@ -413,12 +420,12 @@ class SQLiteMaintenanceService:
 
         _validate_migration_plan(plan)
         plan_can_write = any(step.sql.strip().upper() != "SELECT 1" for step in plan.steps)
-        source_schema_functions: tuple[str, ...] = ()
 
         def screen_source_schema(connection: sqlite3.Connection) -> None:
-            nonlocal source_schema_functions
-            if plan_can_write:
-                source_schema_functions = _schema_function_calls(connection)
+            if plan_can_write and _schema_function_calls(connection):
+                raise SQLiteMaintenanceError(
+                    "write-capable migration rejects callable expressions in source schema"
+                )
 
         def apply_plan(
             connection: sqlite3.Connection,
@@ -426,7 +433,7 @@ class SQLiteMaintenanceService:
         ) -> tuple[DatabaseEvidence, str, str | None]:
             outcome = "applied_to_synthetic_copy"
             error_code: str | None = None
-            if plan_can_write and (source_schema_functions or _schema_function_calls(connection)):
+            if plan_can_write and _schema_function_calls(connection):
                 connection.set_authorizer(_post_migration_authorizer)
                 return before, "rolled_back", "migration_plan_failed"
             page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
@@ -455,6 +462,7 @@ class SQLiteMaintenanceService:
             connection.set_authorizer(_migration_authorizer)
             migration_started = time.monotonic()
             migration_deadline_interrupted = False
+            migration_progress_interrupted = False
 
             def migration_deadline_exceeded() -> bool:
                 nonlocal migration_deadline_interrupted
@@ -463,7 +471,11 @@ class SQLiteMaintenanceService:
                 return migration_deadline_interrupted
 
             def enforce_migration_deadline() -> int:
-                return int(migration_deadline_exceeded())
+                nonlocal migration_progress_interrupted
+                if migration_deadline_exceeded():
+                    migration_progress_interrupted = True
+                    return 1
+                return 0
 
             try:
                 connection.set_progress_handler(enforce_migration_deadline, 1)
@@ -491,9 +503,13 @@ class SQLiteMaintenanceService:
                 connection.rollback()
                 outcome = "rolled_back"
                 error_code = (
-                    "migration_deadline_exceeded"
-                    if migration_deadline_interrupted
-                    else "migration_plan_failed"
+                    "migration_progress_deadline_exceeded"
+                    if migration_progress_interrupted
+                    else (
+                        "migration_deadline_exceeded"
+                        if migration_deadline_interrupted
+                        else "migration_plan_failed"
+                    )
                 )
             else:
                 connection.set_authorizer(_migration_completion_authorizer)
@@ -740,6 +756,11 @@ class SQLiteMaintenanceService:
             source_connection.execute("BEGIN")
             if source_pre_evidence_hook is not None:
                 source_pre_evidence_hook(source_connection)
+            _assert_supported_copy_source_size(
+                source_connection,
+                source,
+                max_source_bytes=self._max_source_bytes,
+            )
             source_evidence = _database_evidence(source_connection)
             source_companions = _adopt_connection_companions(
                 source.path,
@@ -1189,6 +1210,24 @@ def _schema_function_calls(connection: sqlite3.Connection) -> tuple[str, ...]:
         ):
             found.append(name)
     return tuple(found)
+
+
+def _assert_supported_copy_source_size(
+    connection: sqlite3.Connection,
+    binding: SQLitePathBinding,
+    *,
+    max_source_bytes: int,
+) -> None:
+    """Reject copy inputs before an in-memory database image is materialized."""
+
+    descriptor_size = os.fstat(binding.guardian_file_descriptor).st_size
+    page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+    page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
+    logical_size = page_size * page_count
+    if descriptor_size > max_source_bytes or logical_size > max_source_bytes:
+        raise SQLiteMaintenanceError(
+            "copy source exceeds the configured in-memory artifact size limit"
+        )
 
 
 def _schema_sql_without_comments(sql: str) -> str:

@@ -32,10 +32,10 @@ Focused maintenance, legacy migration, and database-isolation matrix:
 ```text
 python3 -m pytest tests/maintenance/test_sqlite_service.py \
   tests/test_multiuser.py tests/security/test_db_isolation.py -q --tb=short
-236 passed
+242 passed
 ```
 
-The PR 4D maintenance module has 69 direct tests covering active WAL state,
+The PR 4D maintenance module has 75 direct tests covering active WAL state,
 multiportfolio preservation, backup/restore manifests, clean-room equivalence,
 corruption, preexisting targets, symlinks, hardlinks, companion files,
 substitution races, backup/restore interruption, migration rollback,
@@ -46,20 +46,26 @@ schema-cookie protection and tracking, native-function denial, bounded
 synthetic database growth, pre-publication final-evidence failure, CLI output,
 embedded-schema-function rejection, per-opcode deadline enforcement, TEMP
 storage containment, narrow migration-grammar rejection, and legacy quarantine.
-Block and line comments between a copied-schema function name and its opening
-parenthesis are normalized before screening and covered by integration tests.
+Block and line comments before a copied-schema function name, and between that
+name and its opening parenthesis, are normalized before screening and covered
+by integration tests.
 Line comments follow SQLite's lexer and continue through a bare carriage return
 until line-feed; an apply-success regression prevents conservative false alarms.
-Write-capable plans screen the bound source schema before row evidence. VIRTUAL
-generated values are excluded from row hashes because schema plus stored base
-columns fully determine them; ordinary and STORED generated values remain
-covered. A tracked-order regression covers a native allocating expression.
+Write-capable plans screen the bound source schema before quick/integrity
+checks, row evidence, or target staging. VIRTUAL generated values are excluded
+from row hashes because schema plus stored base columns fully determine them;
+ordinary and STORED generated values remain covered. A tracked-order
+regression covers a native allocating expression. A subprocess-bounded
+deadline regression identifies VM progress-handler interruption, and a
+source-size regression proves oversized copy input is rejected before target
+materialization or copy progress.
 
 Final full repository regression:
 
 ```text
-python3 -m pytest tests/ -q --tb=short
-3114 passed, 5 skipped, 20 known warnings in 123.99s
+python3 -m pytest -q --tb=short -o faulthandler_timeout=120 \
+  -o faulthandler_exit_on_timeout=true
+3120 passed, 5 skipped, 20 known warnings in 89.78s
 ```
 
 After PR 4C merged to `main`, that exact head was merge-integrated into this
@@ -173,9 +179,12 @@ claiming isolation that an in-process filesystem library cannot provide:
   checked after every VM opcode and after each statement. Separate main and
   temporary page ceilings limit synthetic growth to 64 MiB each by default,
   and plan-controlled TEMP DDL is denied. Deadline rollback has a distinct
-  `migration_deadline_exceeded` result, so its regression proves the interrupt
-  without relying on CI filesystem speed; a ten-second outer ceiling still
-  catches a lost interrupt or hang.
+  `migration_progress_deadline_exceeded` result for a VM-handler interrupt;
+  its subprocess regression has a ten-second parent timeout that catches a
+  lost interrupt or hang.
+- Copy inputs have an explicit 256 MiB default source-file/logical-page-image
+  limit (configurable from 1 MiB to 1 GiB). The service checks it before
+  materializing an in-memory target, so an oversized input publishes nothing.
 - Migration plans are not arbitrary SQL. Full-match validation permits only a
   small documented grammar of basic DDL plus parameter-only INSERT and
   predicate-required UPDATE/DELETE. Functions, expressions, comments,
@@ -184,8 +193,8 @@ claiming isolation that an in-process filesystem library cannot provide:
   controls are defense in depth rather than a claimed complete SQL sandbox.
 - Functions embedded in persistent source schema can execute without an
   authorizer callback. The service now detects registered function names in
-  copied schema SQL before plan execution and returns a rollback-only failure
-  report rather than evaluating the schema expression.
+  copied schema SQL and fails before quick/integrity checks, row evidence,
+  target staging, or plan execution rather than evaluating the expression.
 - Final live-source evidence is captured after the descriptor-bound synthetic
   artifact is verified but before publication. A failed final evidence read
   closes the still-anonymous artifact and leaves no target path.

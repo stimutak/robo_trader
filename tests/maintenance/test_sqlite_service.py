@@ -121,6 +121,35 @@ def test_wal_checkpoint_during_online_backup_is_not_treated_as_source_mutation(
     assert SQLiteMaintenanceService().verify(target) == manifest.evidence
 
 
+def test_online_copy_rejects_oversized_source_before_materializing_target(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "oversized.db"
+    target = tmp_path / "backup.db"
+    progress_events: list[tuple[str, int, int]] = []
+    with sqlite3.connect(source) as connection:
+        connection.execute("CREATE TABLE payloads (value BLOB NOT NULL)")
+        connection.execute("INSERT INTO payloads(value) VALUES (zeroblob(2000000))")
+
+    with pytest.raises(SQLiteMaintenanceError, match="artifact size limit"):
+        SQLiteMaintenanceService(
+            max_source_bytes=1024 * 1024,
+            progress_hook=lambda *event: progress_events.append(event),
+        ).backup(source, target)
+
+    assert progress_events == []
+    assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    "invalid_limit",
+    [True, 1024 * 1024 - 1, 1024 * 1024 * 1024 + 1],
+)
+def test_online_copy_source_size_limit_is_bounded(invalid_limit: object) -> None:
+    with pytest.raises(ValueError, match="max_source_bytes"):
+        SQLiteMaintenanceService(max_source_bytes=invalid_limit)  # type: ignore[arg-type]
+
+
 def test_cleanly_closed_wal_source_accounts_for_connection_sidecars(
     tmp_path: Path,
 ) -> None:
@@ -923,32 +952,48 @@ def test_migration_plan_deadline_interrupts_and_rolls_back(tmp_path: Path) -> No
             "INSERT INTO deadline_rows(id, marker, value) VALUES (?, 1, 'before')",
             ((row_id,) for row_id in range(100_000)),
         )
-    started = time.monotonic()
-
-    report = SQLiteMaintenanceService(max_migration_seconds=0.01).dry_run_migration(
-        source,
-        target,
-        plan=MigrationPlan(
-            migration_id="bounded-bulk-update",
-            steps=(
-                MigrationStep(
-                    "UPDATE deadline_rows SET value=? WHERE marker=?",
-                    ("after", 1),
-                ),
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "\n".join(
+                (
+                    "import sys",
+                    "from robo_trader.maintenance import MigrationPlan, MigrationStep, SQLiteMaintenanceService",
+                    "report = SQLiteMaintenanceService(max_migration_seconds=0.01).dry_run_migration(",
+                    "    sys.argv[1], sys.argv[2],",
+                    "    plan=MigrationPlan(migration_id='bounded-bulk-update', steps=(",
+                    "        MigrationStep('UPDATE deadline_rows SET value=? WHERE marker=?', ('after', 1)),",
+                    "    )),",
+                    ")",
+                    "print(report.outcome)",
+                    "print(report.error_code)",
+                )
             ),
-        ),
+            str(source),
+            str(target),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
 
-    # Copying and hashing the fixture is intentionally outside the migration
-    # execution deadline and varies substantially across CI filesystems. The
-    # typed result proves that the plan itself hit the deadline; this generous
-    # ceiling only guards against a lost interrupt or hang.
-    assert time.monotonic() - started < 10.0
-    assert report.outcome == "rolled_back"
-    assert report.error_code == "migration_deadline_exceeded"
-    assert report.before == report.after
-    assert report.source_unchanged is True
+    # The child process is a hard outer boundary: a lost SQLite interrupt
+    # cannot hang the test runner. The progress-specific result proves that
+    # SQLite's VM handler, rather than only a post-statement check, stopped it.
+    assert child.stdout.strip().splitlines()[-2:] == [
+        "rolled_back",
+        "migration_progress_deadline_exceeded",
+    ]
     with sqlite3.connect(target) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM deadline_rows WHERE value='after'"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM deadline_rows WHERE value='before'"
+        ).fetchone() == (100_000,)
+    with sqlite3.connect(source) as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM deadline_rows WHERE value='after'"
         ).fetchone() == (0,)
@@ -1088,20 +1133,18 @@ def test_migration_rejects_functions_embedded_in_source_schema(tmp_path: Path) -
         )
     started = time.monotonic()
 
-    report = SQLiteMaintenanceService(max_migration_seconds=0.01).dry_run_migration(
-        source,
-        target,
-        plan=MigrationPlan(
-            migration_id="reject-schema-function",
-            steps=(MigrationStep("INSERT INTO guarded(value) VALUES (?)", (1,)),),
-        ),
-    )
+    with pytest.raises(SQLiteMaintenanceError, match="source schema"):
+        SQLiteMaintenanceService(max_migration_seconds=0.01).dry_run_migration(
+            source,
+            target,
+            plan=MigrationPlan(
+                migration_id="reject-schema-function",
+                steps=(MigrationStep("INSERT INTO guarded(value) VALUES (?)", (1,)),),
+            ),
+        )
 
     assert time.monotonic() - started < 2.0
-    assert report.outcome == "rolled_back"
-    assert report.error_code == "migration_plan_failed"
-    assert report.before == report.after
-    assert report.source_unchanged is True
+    assert not target.exists()
 
 
 def test_migration_screens_virtual_generated_functions_before_row_evidence(
@@ -1144,55 +1187,59 @@ def test_migration_screens_virtual_generated_functions_before_row_evidence(
         tracked_database_evidence,
     )
 
-    report = SQLiteMaintenanceService(max_migration_seconds=0.01).dry_run_migration(
-        source,
-        target,
-        plan=MigrationPlan(
-            migration_id="screen-before-generated-evidence",
-            steps=(
-                MigrationStep(
-                    "UPDATE generated_rows SET base=? WHERE base=?",
-                    (2, 1),
+    with pytest.raises(SQLiteMaintenanceError, match="source schema"):
+        SQLiteMaintenanceService(max_migration_seconds=0.01).dry_run_migration(
+            source,
+            target,
+            plan=MigrationPlan(
+                migration_id="screen-before-generated-evidence",
+                steps=(
+                    MigrationStep(
+                        "UPDATE generated_rows SET base=? WHERE base=?",
+                        (2, 1),
+                    ),
                 ),
             ),
-        ),
-    )
+        )
 
-    assert events[:2] == ["schema_screen", "row_evidence"]
-    assert report.outcome == "rolled_back"
-    assert report.error_code == "migration_plan_failed"
-    assert report.before == report.after
-    assert report.source_unchanged is True
+    assert events == ["schema_screen"]
+    assert not target.exists()
 
 
-@pytest.mark.parametrize("separator", ["/**/", "-- split token\n"])
+@pytest.mark.parametrize(
+    "schema_expression",
+    [
+        "randomblob/**/(50000000)",
+        "randomblob-- split token\n(50000000)",
+        "/**/randomblob(50000000)",
+        "-- prefix comment\nrandomblob(50000000)",
+    ],
+)
 def test_migration_rejects_commented_schema_function_calls(
     tmp_path: Path,
-    separator: str,
+    schema_expression: str,
 ) -> None:
     source = tmp_path / "source.db"
     target = tmp_path / "dry-run.db"
     with sqlite3.connect(source) as connection:
         connection.execute(
             "CREATE TABLE guarded ("
-            f"value INTEGER NOT NULL CHECK(randomblob{separator}(50000000) IS NOT NULL)"
+            f"value INTEGER NOT NULL CHECK({schema_expression} IS NOT NULL)"
             ")"
         )
         assert sqlite_service_module._schema_function_calls(connection) == ("randomblob",)
 
-    report = SQLiteMaintenanceService(max_migration_seconds=0.01).dry_run_migration(
-        source,
-        target,
-        plan=MigrationPlan(
-            migration_id="reject-commented-schema-function",
-            steps=(MigrationStep("INSERT INTO guarded(value) VALUES (?)", (1,)),),
-        ),
-    )
+    with pytest.raises(SQLiteMaintenanceError, match="source schema"):
+        SQLiteMaintenanceService(max_migration_seconds=0.01).dry_run_migration(
+            source,
+            target,
+            plan=MigrationPlan(
+                migration_id="reject-commented-schema-function",
+                steps=(MigrationStep("INSERT INTO guarded(value) VALUES (?)", (1,)),),
+            ),
+        )
 
-    assert report.outcome == "rolled_back"
-    assert report.error_code == "migration_plan_failed"
-    assert report.before == report.after
-    assert report.source_unchanged is True
+    assert not target.exists()
 
 
 def test_schema_line_comment_continues_through_carriage_return(tmp_path: Path) -> None:

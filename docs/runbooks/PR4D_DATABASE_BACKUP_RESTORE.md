@@ -170,8 +170,18 @@ allocation chains cannot accumulate between checks. The main and temporary
 synthetic databases can each grow by at most 64 MiB by default (configurable
 from 1 MiB to 1 GiB) through separate SQLite page limits. Plan-controlled TEMP
 DDL is denied as an additional boundary. Exceeding either time or storage bound
-rolls back; deadline interruption returns `migration_deadline_exceeded`, while
-other resource or execution failures return `migration_plan_failed`.
+rolls back. A VM progress-handler interrupt returns
+`migration_progress_deadline_exceeded`; a deadline caught immediately after a
+statement returns `migration_deadline_exceeded`; other resource or execution
+failures return `migration_plan_failed`. The process-level regression also has
+a ten-second parent timeout, so a lost handler cannot hang the suite.
+
+Backup, restore, and synthetic migration copies are supported only when both
+the bound source file and its logical SQLite page image are at most 256 MiB by
+default. Operators may configure this from 1 MiB to 1 GiB. The check runs
+before the in-memory target is materialized; an oversized source fails closed
+without publishing a target. This is an explicit memory-safety boundary, not a
+promise that arbitrarily large databases can be copied in-process.
 
 SQLite does not consistently send authorizer callbacks for functions embedded
 in copied CHECK constraints, generated columns, defaults, expression indexes,
@@ -186,10 +196,10 @@ block and line comments outside quoted tokens are normalized to whitespace
 before matching, so comments between a function name and `(` cannot bypass the
 screen. Matching follows SQLite's line-comment rule: a bare carriage return
 does not end a `--` comment; line-feed or end-of-input does. A named schema
-function makes the dry run return
-`migration_plan_failed` without executing the plan. This conservative
-fail-closed policy can reject a harmless schema expression; such a migration
-needs a separately reviewed adapter rather than a bypass.
+function makes the dry run fail before quick/integrity checks, row evidence,
+target staging, or plan execution. This conservative fail-closed policy can
+reject a harmless schema expression; such a migration needs a separately
+reviewed adapter rather than a bypass.
 
 The final bound live-source evidence check runs after the synthetic bytes and
 manifest have been verified but before the anonymous target is published. If
